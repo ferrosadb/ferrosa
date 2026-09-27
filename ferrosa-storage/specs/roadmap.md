@@ -197,3 +197,11 @@ without weakening admission or repeatedly cancelling tasks before reclamation.
 - T-025 lifecycle: shared admission/task tracker, invalidatable pre-selection
   tickets, async DROP/TRUNCATE drain wrappers across CQL/pair/cluster/Raft, and
   synchronous busy semantics. Operator CLI wiring remains a separate slice.
+
+### Completed: T-026 S3 compaction recovery
+
+The replacement record remains the durable cursor through upload confirmation,
+manifest publication, and S3 input-delete enqueue. Startup rebuilds absent upload
+ledger entries from replacement records, replays the uploads, and retries deletes
+after manifest publication. Enqueue failures preserve the record for another
+attempt. A mock-store crash sweep covers the S3 and pinned-local boundaries.

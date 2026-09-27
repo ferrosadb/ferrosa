@@ -3030,6 +3030,161 @@ impl StorageEngine {
         Ok((engine, pending_mutations))
     }
 
+    /// Rebuild S3 upload work from replacement records before replaying the
+    /// upload ledger. The intent is the authoritative cursor; the ledger is a
+    /// compact queue payload and may be missing if the process died before it
+    /// was appended.
+    fn prepare_compaction_s3_replay(&self, pending_log: &crate::upload::PendingUploadsLog) {
+        if self.upload_manager.is_none() && self.compaction_upload_manager.is_none() {
+            return;
+        }
+        let mut existing = match pending_log.pending_records() {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| (record.table_id, record.sstable_id))
+                .collect::<std::collections::HashSet<_>>(),
+            Err(e) => {
+                tracing::error!(%e, "compaction recovery could not read the upload ledger");
+                return;
+            }
+        };
+
+        let pending_phase = |phase: crate::compaction::intent::CompactionIntentPhase| {
+            matches!(
+                phase,
+                crate::compaction::intent::CompactionIntentPhase::Retired
+                    | crate::compaction::intent::CompactionIntentPhase::S3Uploaded
+            )
+        };
+        let tables = self.tables.read();
+        for (table_id, state) in tables.iter() {
+            if state.pin_config.is_some() {
+                continue;
+            }
+            let table_dir = self.table_sstable_dir(table_id);
+            let entries = match std::fs::read_dir(&table_dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, path = %table_dir.display(), "compaction recovery could not scan replacement records");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !crate::compaction::intent::CompactionIntentRecord::is_record_name(&name) {
+                    continue;
+                }
+                let intent = match crate::compaction::intent::CompactionIntentRecord::read_at(
+                    &entry.path(),
+                ) {
+                    Ok(Some(intent)) if pending_phase(intent.phase) => intent,
+                    Ok(Some(_)) | Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!(%e, %table_id, path = %entry.path().display(), "compaction recovery could not read replacement record");
+                        continue;
+                    }
+                };
+                let table_key = table_id.to_string();
+                let key = (table_key.clone(), intent.output_gen.clone());
+                if existing.contains(&key) {
+                    continue;
+                }
+                let Some(output) = state
+                    .store
+                    .sstable_metadata(&table_dir)
+                    .into_iter()
+                    .find(|metadata| metadata.id == intent.output_gen)
+                else {
+                    tracing::error!(%table_id, output = %intent.output_gen, "compaction replacement record points to a missing output during S3 recovery");
+                    continue;
+                };
+                let size = intent
+                    .output_gen
+                    .parse::<u64>()
+                    .map(|generation| Self::collect_sstable_files(&table_dir, generation))
+                    .map(|files| files.iter().map(|file| file.size_bytes).sum())
+                    .unwrap_or(output.size_bytes);
+                let compaction = crate::upload::pending_log::PendingCompactionUpload {
+                    intent_task_id: Some(intent.task_id.clone()),
+                    remove_input_ids: intent.inputs.clone(),
+                    output: crate::manifest::ManifestEntry {
+                        id: intent.output_gen.clone(),
+                        size,
+                        min_token: output.min_token,
+                        max_token: output.max_token,
+                        min_timestamp: output.min_timestamp,
+                        max_timestamp: output.max_timestamp,
+                    },
+                };
+                match pending_log.add_compaction_entry(&table_key, &intent.output_gen, compaction) {
+                    Ok(()) => {
+                        existing.insert(key);
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, %table_id, output = %intent.output_gen, "compaction recovery could not rebuild the pending upload entry")
+                    }
+                }
+            }
+        }
+        drop(tables);
+    }
+
+    /// Remove replacement records that only protect local pinned or
+    /// non-S3 compactions. Their local retirement is complete, so there is no
+    /// remote phase for startup to resume.
+    fn prune_local_only_compaction_intents(&self) {
+        let no_object_store = self.object_store.is_none();
+        let tables = self
+            .tables
+            .read()
+            .iter()
+            .map(|(table_id, state)| {
+                (
+                    table_id.clone(),
+                    no_object_store || state.pin_config.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (table_id, local_only) in tables {
+            if !local_only {
+                continue;
+            }
+            let table_dir = self.table_sstable_dir(&table_id);
+            let entries = match std::fs::read_dir(&table_dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, path = %table_dir.display(), "local compaction recovery could not scan replacement records");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !crate::compaction::intent::CompactionIntentRecord::is_record_name(&name) {
+                    continue;
+                }
+                match crate::compaction::intent::CompactionIntentRecord::read_at(&entry.path()) {
+                    Ok(Some(intent))
+                        if intent.phase
+                            == crate::compaction::intent::CompactionIntentPhase::Retired =>
+                    {
+                        if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                            &table_dir,
+                            &intent.task_id,
+                        ) {
+                            tracing::warn!(%e, %table_id, task_id = %intent.task_id, "could not delete local-only replacement record after retirement");
+                        }
+                    }
+                    Ok(Some(_)) | Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(%e, %table_id, path = %entry.path().display(), "could not read local-only replacement record")
+                    }
+                }
+            }
+        }
+    }
+
     /// Replays pending S3 uploads that were interrupted by a crash.
     ///
     /// Reads the pending-uploads.log and re-submits upload tasks for each
@@ -3039,11 +3194,19 @@ impl StorageEngine {
         let pending_log_path = self.config.data_dir.join("pending-uploads.log");
         let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
             Ok(log) => log,
-            Err(_) => return, // No log file — nothing to replay
+            Err(e) => {
+                tracing::error!(%e, path = %pending_log_path.display(), "could not open pending upload ledger during compaction recovery");
+                return;
+            }
         };
+        self.prune_local_only_compaction_intents();
+        self.prepare_compaction_s3_replay(&pending_log);
 
         let records = match pending_log.pending_records() {
-            Ok(e) if e.is_empty() => return,
+            Ok(e) if e.is_empty() => {
+                self.resume_compaction_s3_deletions().await;
+                return;
+            }
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("failed to read pending-uploads.log: {e}");
@@ -3051,14 +3214,14 @@ impl StorageEngine {
             }
         };
 
-        let Some(upload_mgr) = self.upload_manager.as_ref() else {
+        if self.upload_manager.is_none() && self.compaction_upload_manager.is_none() {
             tracing::warn!(
                 "pending-uploads.log has {} entries but no upload manager configured — \
                  these SSTables may not be in S3",
                 records.len()
             );
             return;
-        };
+        }
 
         tracing::info!(
             count = records.len(),
@@ -3077,6 +3240,18 @@ impl StorageEngine {
         let mut finalize_handles = Vec::new();
 
         for (idx, record) in records.iter().enumerate() {
+            let upload_mgr = if record.compaction.is_some() {
+                self.compaction_upload_manager
+                    .as_ref()
+                    .or(self.upload_manager.as_ref())
+            } else {
+                self.upload_manager
+                    .as_ref()
+                    .or(self.compaction_upload_manager.as_ref())
+            };
+            let Some(upload_mgr) = upload_mgr else {
+                continue;
+            };
             let Some(files) = crate::upload::replay::find_pending_upload_files(
                 &self.config.data_dir,
                 &self.config.compaction.output_dir,
@@ -3142,6 +3317,109 @@ impl StorageEngine {
             };
             let _ = tokio::time::timeout(std::time::Duration::from_millis(100), drain).await;
         }
+        self.resume_compaction_s3_deletions().await;
+    }
+
+    /// Retry S3 input deletion for records whose upload and manifest phases
+    /// are durable. Duplicate deletes are safe and close crashes between queue
+    /// submission and replacement-record removal.
+    async fn resume_compaction_s3_deletions(&self) {
+        let Some(upload_mgr) = self
+            .compaction_upload_manager
+            .as_ref()
+            .or(self.upload_manager.as_ref())
+        else {
+            return;
+        };
+        let tables = self
+            .tables
+            .read()
+            .iter()
+            .map(|(table_id, state)| (table_id.clone(), state.pin_config.is_some()))
+            .collect::<Vec<_>>();
+        for (table_id, pinned) in tables {
+            if pinned {
+                continue;
+            }
+            let table_dir = self.table_sstable_dir(&table_id);
+            let entries = match std::fs::read_dir(&table_dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, path = %table_dir.display(), "compaction recovery could not scan for S3 delete work");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !crate::compaction::intent::CompactionIntentRecord::is_record_name(&name) {
+                    continue;
+                }
+                let mut intent = match crate::compaction::intent::CompactionIntentRecord::read_at(
+                    &entry.path(),
+                ) {
+                    Ok(Some(intent)) => intent,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!(%e, %table_id, path = %entry.path().display(), "compaction recovery could not read replacement record before S3 deletion");
+                        continue;
+                    }
+                };
+                if !matches!(
+                    intent.phase,
+                    crate::compaction::intent::CompactionIntentPhase::S3Manifested
+                        | crate::compaction::intent::CompactionIntentPhase::S3DeletesEnqueued
+                ) {
+                    continue;
+                }
+                let stubs = intent
+                    .inputs
+                    .iter()
+                    .map(|generation| {
+                        Self::compaction_input_retirement_stub(&table_dir, generation)
+                    })
+                    .collect::<Vec<_>>();
+                let deletion_plan = crate::compaction::finalize::plan_input_deletions(
+                    &table_id.to_string(),
+                    &stubs,
+                    std::time::Duration::from_secs(3600),
+                );
+                let mut submitted = true;
+                for task in deletion_plan.tasks {
+                    let (on_complete, completion) = tokio::sync::oneshot::channel();
+                    match upload_mgr
+                        .submit(crate::upload::UploadTask::DeleteSSTable {
+                            table_id: task.table_id,
+                            sstable_id: task.sstable_id,
+                            grace_period: task.grace_period,
+                            on_complete: Some(on_complete),
+                        })
+                        .await
+                    {
+                        Ok(()) => drop(completion),
+                        Err(e) => {
+                            tracing::error!(%e, %table_id, task_id = %intent.task_id, "compaction recovery failed to enqueue an S3 input delete");
+                            submitted = false;
+                            break;
+                        }
+                    }
+                }
+                if !submitted {
+                    continue;
+                }
+                intent.phase = crate::compaction::intent::CompactionIntentPhase::S3DeletesEnqueued;
+                if let Err(e) = intent.write(&table_dir) {
+                    tracing::error!(%e, %table_id, task_id = %intent.task_id, "compaction recovery enqueued S3 deletes but could not persist that phase");
+                    continue;
+                }
+                if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                    &table_dir,
+                    &intent.task_id,
+                ) {
+                    tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction recovery completed S3 enqueue but could not delete replacement record");
+                }
+            }
+        }
     }
 
     async fn finalize_replayed_pending_upload(
@@ -3183,10 +3461,10 @@ impl StorageEngine {
             }
         };
 
-        let removals_for_cas_retry = if let Some(compaction) = ctx.compaction {
+        let removals_for_cas_retry = if let Some(compaction) = ctx.compaction.as_ref() {
             manifest.remove_sstables(&ctx.table_id, &compaction.remove_input_ids);
-            manifest.add_sstable(&ctx.table_id, compaction.output);
-            vec![(ctx.table_id.clone(), compaction.remove_input_ids)]
+            manifest.add_sstable(&ctx.table_id, compaction.output.clone());
+            vec![(ctx.table_id.clone(), compaction.remove_input_ids.clone())]
         } else {
             tracing::warn!(
                 table = ctx.table_id,
@@ -3232,6 +3510,45 @@ impl StorageEngine {
                 "pending upload replay uploaded SSTable but could not save manifest; leaving entry for later retry"
             );
             return;
+        }
+
+        if let Some(task_id) = ctx
+            .compaction
+            .as_ref()
+            .and_then(|compaction| compaction.intent_task_id.as_deref())
+        {
+            let table_dir = ctx
+                .pending_log_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("sstables")
+                .join(&ctx.table_id);
+            match crate::compaction::intent::CompactionIntentRecord::read_at(
+                &crate::compaction::intent::CompactionIntentRecord::path(&table_dir, task_id),
+            ) {
+                Ok(Some(mut intent)) if intent.output_gen == ctx.sstable_id => {
+                    intent.phase = crate::compaction::intent::CompactionIntentPhase::S3Manifested;
+                    if let Err(e) = intent.write(&table_dir) {
+                        tracing::warn!(
+                            %e,
+                            table = ctx.table_id,
+                            sstable = ctx.sstable_id,
+                            "pending upload replay saved the manifest but could not advance the replacement record; leaving the upload durable for retry"
+                        );
+                        return;
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        table = ctx.table_id,
+                        sstable = ctx.sstable_id,
+                        "pending upload replay saved the manifest but could not read its replacement record"
+                    );
+                    return;
+                }
+            }
         }
 
         match crate::upload::PendingUploadsLog::open(&ctx.pending_log_path)
@@ -3490,6 +3807,8 @@ impl StorageEngine {
             state.pin_config = Some(pin_config);
             self.pin_metrics.inc_pinned_tables();
         }
+        drop(tables);
+        self.prune_local_only_compaction_intents();
         Ok(())
     }
 
@@ -3714,6 +4033,7 @@ impl StorageEngine {
         // An index whose CREATE INDEX outran this CREATE TABLE is built now,
         // not at the next restart.
         self.drain_deferred_index_builds(&table_id);
+        self.prune_local_only_compaction_intents();
 
         Ok(())
     }
@@ -5889,15 +6209,20 @@ impl StorageEngine {
             return;
         }
 
-        if let Err(e) =
-            crate::compaction::intent::CompactionIntentRecord::delete(table_dir, &record.task_id)
-        {
-            tracing::warn!(
-                %e, task_id = %record.task_id,
-                "storage-engine: rolled a compaction forward but failed to delete its \
-                 replacement record; harmless, the next startup retries the same idempotent \
-                 retirement"
-            );
+        if matches!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Promoting
+                | crate::compaction::intent::CompactionIntentPhase::Swapped
+        ) {
+            let mut retired = record.clone();
+            retired.phase = crate::compaction::intent::CompactionIntentPhase::Retired;
+            if let Err(e) = retired.write(table_dir) {
+                tracing::error!(
+                    %e, task_id = %record.task_id,
+                    "storage-engine: inputs were retired but replacement record could not advance to Retired; startup will retry idempotently"
+                );
+                return;
+            }
         }
         crate::metrics::inc_compaction_reconcile_rolled_forward();
         tracing::warn!(
@@ -5906,7 +6231,7 @@ impl StorageEngine {
             inputs = ?record.inputs,
             dir = %table_dir.display(),
             "storage-engine: rolled a compaction forward at startup, finishing retirement of \
-             inputs a crash left live (forge t_fca66994)"
+             inputs a crash left live; replacement record retained for S3 convergence (forge t_fca66994)"
         );
     }
 
@@ -9844,35 +10169,28 @@ impl StorageEngine {
             // Register in local cache.
             self.local_cache
                 .register(&output.id, output.path.clone(), output.size_bytes);
-            // Retires every input, then advances the replacement record to
-            // `Retired` and deletes it. Once every listed input is off disk
-            // (or was already gone) and that phase write is fsynced, the
-            // local half of the invariant already holds regardless of S3
-            // status (I2: exactly one of {inputs, output} discoverable), so
-            // the record has nothing left to protect. S3 convergence (I6)
-            // is independently guaranteed by `upload::PendingUploadsLog`,
-            // which `poll_compactions` still writes further down on the S3
-            // path exactly as before -- deleting this record early does not
-            // touch that separate mechanism.
-            let mut cleanup_inputs = || {
-                let cleanup_start = Instant::now();
-                if !Self::evict_local_input_sstable_files(table_id, &result.task.inputs) {
-                    return;
-                }
-                crate::metrics::observe_compaction_phase(
-                    crate::metrics::CompactionPhase::InputCleanup,
-                    cleanup_start.elapsed(),
-                );
-                intent.phase = crate::compaction::intent::CompactionIntentPhase::Retired;
-                if let Err(e) = intent.write(&table_dir) {
-                    tracing::error!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to advance replacement record to Retired; startup reconciliation will retry retirement (idempotent)");
-                } else if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
-                    &table_dir,
-                    &intent.task_id,
-                ) {
-                    tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to delete replacement record after retirement; harmless leak, startup reconciliation cleans it up");
-                }
-            };
+            // Retire every input and persist the phase. For S3-backed tables,
+            // the record remains the recovery cursor through manifest save and
+            // input-delete enqueue. The pending-upload log carries the upload
+            // payload; it does not replace this record's phase.
+            let cleanup_inputs =
+                |record: &mut crate::compaction::intent::CompactionIntentRecord| -> bool {
+                    let cleanup_start = Instant::now();
+                    if !Self::evict_local_input_sstable_files(table_id, &result.task.inputs) {
+                        return false;
+                    }
+                    crate::metrics::observe_compaction_phase(
+                        crate::metrics::CompactionPhase::InputCleanup,
+                        cleanup_start.elapsed(),
+                    );
+                    record.phase = crate::compaction::intent::CompactionIntentPhase::Retired;
+                    if let Err(e) = record.write(&table_dir) {
+                        tracing::error!(%e, %table_id, task_id = %record.task_id, "compaction: failed to advance replacement record to Retired; startup reconciliation will retry retirement (idempotent)");
+                        false
+                    } else {
+                        true
+                    }
+                };
 
             // ── Skip S3 upload for pinned tables ────────────────────────────
             //
@@ -9899,18 +10217,27 @@ impl StorageEngine {
                 }
                 self.pin_metrics.add_pinned_bytes(size as i64);
                 self.enforce_pin_max_bytes(table_id);
-                cleanup_inputs();
+                if !cleanup_inputs(&mut intent) {
+                    continue;
+                }
+                if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                    &table_dir,
+                    &intent.task_id,
+                ) {
+                    tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to delete pinned replacement record after retirement");
+                }
                 continue;
             }
 
             // ── Crash-safe S3 upload + manifest update ─────────────────────
             //
-            // 5-step pattern (mirrors sync_sstables_to_s3):
+            // S3 steps are checkpoints in the replacement record:
             //   1. Write pending-log entry (fsynced)
             //   2. Submit UploadTask with on_complete channel
             //   3. Await S3 confirmation
-            //   4. Remove pending-log entry
-            //   5. Update manifest (remove inputs, add output)
+            //   4. Update manifest (remove inputs, add output)
+            //   5. Remove pending-log entry
+            //   6. Enqueue input deletes, then retire the replacement record
             //
             // If upload_manager is None (no S3 configured) we skip silently.
             let upload_mgr = self
@@ -9918,11 +10245,25 @@ impl StorageEngine {
                 .as_ref()
                 .or(self.upload_manager.as_ref());
             let Some(upload_mgr) = upload_mgr else {
-                cleanup_inputs();
+                if cleanup_inputs(&mut intent) {
+                    if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                        &table_dir,
+                        &intent.task_id,
+                    ) {
+                        tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to delete replacement record for a table without S3");
+                    }
+                }
                 continue;
             };
             let Some((store, prefix)) = self.resolve_store_and_prefix() else {
-                cleanup_inputs();
+                if cleanup_inputs(&mut intent) {
+                    if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                        &table_dir,
+                        &intent.task_id,
+                    ) {
+                        tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to delete replacement record without an object store");
+                    }
+                }
                 continue;
             };
 
@@ -9964,12 +10305,14 @@ impl StorageEngine {
 
             cancel_point!(&table_id_str, CancelPoint::S3PendingLog);
             // Step 1: record the pending upload before deleting any input.
-            // Without this fsynced marker, a crash can strand the local-only
-            // output after its inputs are reclaimed (#235).
+            // This is paired with the replacement record: if a crash happens
+            // after input retirement, startup can replay the upload and resume
+            // from the record's phase.
             let pending_log_path = self.config.data_dir.join("pending-uploads.log");
             let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
                 Ok(pending_log) => {
                     let compaction = crate::upload::pending_log::PendingCompactionUpload {
+                        intent_task_id: Some(intent.task_id.clone()),
                         remove_input_ids: manifest_plan.remove_input_ids.clone(),
                         output: manifest_plan.add_output.clone(),
                     };
@@ -9995,9 +10338,11 @@ impl StorageEngine {
                 }
             };
 
-            // The output is now recoverable after a crash, so reclaiming the
-            // superseded inputs cannot leave the manifest without a readable copy.
-            cleanup_inputs();
+            // Inputs are now recoverable through the durable upload entry, so
+            // their local components can be retired before uploading.
+            if !cleanup_inputs(&mut intent) {
+                continue;
+            }
 
             // Step 2: create completion channel and submit the upload.
             //
@@ -10093,6 +10438,12 @@ impl StorageEngine {
                 continue;
             }
 
+            intent.phase = crate::compaction::intent::CompactionIntentPhase::S3Uploaded;
+            if let Err(e) = intent.write(&table_dir) {
+                tracing::error!(%e, %table_id, task_id = %intent.task_id, "compaction: S3 upload succeeded but replacement record could not advance to S3Uploaded; pending upload remains retryable");
+                continue;
+            }
+
             // Step 4: update manifest — load fresh copy, remove inputs, add output, save.
             // Keep full input metadata for local eviction after manifest update.
             let input_ids = manifest_plan.remove_input_ids.clone();
@@ -10166,11 +10517,19 @@ impl StorageEngine {
                     if let Err(e) = save_result {
                         tracing::error!(%e, %sstable_id, "compaction: manifest save failed");
                     } else {
-                        manifest_saved = true;
-                        tracing::info!(%sstable_id, removed = input_ids.len(), "compaction: manifest updated");
-                        // Record bytes freed by this compaction in the metrics gauge.
-                        self.compaction_metrics
-                            .add_bytes_reclaimed(input_bytes_total);
+                        intent.phase =
+                            crate::compaction::intent::CompactionIntentPhase::S3Manifested;
+                        match intent.write(&table_dir) {
+                            Ok(()) => {
+                                manifest_saved = true;
+                                tracing::info!(%sstable_id, removed = input_ids.len(), "compaction: manifest updated");
+                                self.compaction_metrics
+                                    .add_bytes_reclaimed(input_bytes_total);
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, %sstable_id, task_id = %intent.task_id, "compaction: manifest saved but replacement record could not advance to S3Manifested; retaining pending upload for replay")
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -10208,23 +10567,43 @@ impl StorageEngine {
                 &result.task.inputs,
                 std::time::Duration::from_secs(3600),
             );
+            let mut deletes_enqueued = true;
             for task_plan in deletion_plan.tasks {
                 cancel_point!(&table_id_str, CancelPoint::S3Delete);
                 let (del_tx, del_rx) = tokio::sync::oneshot::channel();
-                let _ = upload_mgr
+                if let Err(e) = upload_mgr
                     .submit(crate::upload::UploadTask::DeleteSSTable {
                         table_id: task_plan.table_id,
                         sstable_id: task_plan.sstable_id,
                         grace_period: task_plan.grace_period,
                         on_complete: Some(del_tx),
                     })
-                    .await;
+                    .await
+                {
+                    tracing::error!(%e, %table_id_str, %sstable_id, "compaction: failed to enqueue S3 input deletion; replacement record retained for retry");
+                    deletes_enqueued = false;
+                    break;
+                }
                 // Increment the S3 delete counter for each enqueued deletion.
                 self.compaction_metrics.inc_s3_deletes();
                 if deletion_plan.fire_and_forget {
                     // Fire-and-forget: S3 deletions are best-effort.
                     drop(del_rx);
                 }
+            }
+            if !deletes_enqueued {
+                continue;
+            }
+            intent.phase = crate::compaction::intent::CompactionIntentPhase::S3DeletesEnqueued;
+            if let Err(e) = intent.write(&table_dir) {
+                tracing::error!(%e, %table_id_str, task_id = %intent.task_id, "compaction: S3 input deletes were enqueued but replacement record could not advance; duplicate deletes may be retried");
+                continue;
+            }
+            if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                &table_dir,
+                &intent.task_id,
+            ) {
+                tracing::warn!(%e, %table_id_str, task_id = %intent.task_id, "compaction: all S3 steps completed but replacement record could not be deleted");
             }
         }
     }
@@ -22094,18 +22473,34 @@ mod tests {
         String,
         TableId,
     ) {
+        make_engine_with_pending_compaction_for_table(dir, "test_table").await
+    }
+
+    /// Use a dedicated table name for cancel-hook tests so the process-wide
+    /// test hook registry cannot collide with the many engine tests that use
+    /// `test_ks.test_table` concurrently.
+    async fn make_engine_with_pending_compaction_for_table(
+        dir: &tempfile::TempDir,
+        table_name: &str,
+    ) -> (
+        StorageEngine,
+        Arc<dyn object_store::ObjectStore>,
+        String,
+        TableId,
+    ) {
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let prefix = "test-node".to_string();
+        let mut schema = test_schema();
+        schema.table = table_name.to_string();
+        let tid = TableId::new(&schema.keyspace, &schema.table);
 
         let config = StorageEngineConfig::test_config(dir.path());
         let rt = tokio::runtime::Handle::current();
         let engine =
             StorageEngine::new_with_upload_store(config, Arc::clone(&store), prefix.clone(), &rt)
                 .unwrap();
-        engine.register_table(test_schema()).unwrap();
-
-        let tid = table_id();
+        engine.register_table(schema.clone()).unwrap();
 
         // Flush 1: write k1 → SSTable #1.
         engine
@@ -22130,7 +22525,7 @@ mod tests {
             let task = crate::compaction::metadata::CompactionTask {
                 inputs: metadata,
                 output_dir: compaction_output_dir,
-                schema: test_schema(),
+                schema,
                 table_id: tid.clone(),
                 purge: None,
             };
@@ -22213,6 +22608,151 @@ mod tests {
         assert!(
             store.get(&data_path).await.is_ok(),
             "compacted SSTable Data.db must be present in S3 at {data_path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_s3_crash_sweep_replays_from_replacement_record() {
+        use futures::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        for point in [
+            crate::compaction::cancel_harness::CancelPoint::S3PendingLog,
+            crate::compaction::cancel_harness::CancelPoint::S3ManifestCas,
+            crate::compaction::cancel_harness::CancelPoint::S3Delete,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let table_name = "test_t026_s3_crash_sweep";
+            let (engine, store, prefix, tid) =
+                make_engine_with_pending_compaction_for_table(&dir, table_name).await;
+            wait_for_compaction_result(&engine);
+            let crash_point = point;
+            let guard = crate::compaction::cancel_harness::CancelHookGuard::install(
+                tid.to_string(),
+                Arc::new(move |observed| {
+                    if observed == crash_point {
+                        panic!("simulated crash at {crash_point}");
+                    }
+                }),
+            );
+            assert!(
+                AssertUnwindSafe(engine.poll_compactions())
+                    .catch_unwind()
+                    .await
+                    .is_err(),
+                "the test hook must interrupt compaction at {point}"
+            );
+            drop(guard);
+            drop(engine);
+
+            let runtime = tokio::runtime::Handle::current();
+            let reopened = StorageEngine::new_with_upload_store(
+                StorageEngineConfig::test_config(dir.path()),
+                Arc::clone(&store),
+                prefix.clone(),
+                &runtime,
+            )
+            .unwrap();
+            let mut schema = test_schema();
+            schema.table = table_name.to_string();
+            reopened.register_table(schema).unwrap();
+            reopened.replay_pending_uploads().await;
+            for _ in 0..20 {
+                if leftover_intent_records(&reopened.table_sstable_dir(&tid)).is_empty() {
+                    break;
+                }
+                reopened.replay_pending_uploads().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+                .await
+                .unwrap();
+            let entries = manifest
+                .sstables
+                .get(&tid.to_string())
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                entries.len(),
+                1,
+                "replay from {point} must publish only the compacted output"
+            );
+            assert!(
+                crate::upload::PendingUploadsLog::open(&dir.path().join("pending-uploads.log"))
+                    .unwrap()
+                    .pending_records()
+                    .unwrap()
+                    .is_empty(),
+                "replay from {point} must remove the upload entry after the manifest save"
+            );
+            assert!(
+                leftover_intent_records(&reopened.table_sstable_dir(&tid)).is_empty(),
+                "replay from {point} must remove the record after re-enqueuing input deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_s3_pinned_crash_finishes_local_retirement_without_upload() {
+        use futures::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_name = "test_t026_pinned_crash";
+        let (engine, store, prefix, tid) =
+            make_engine_with_pending_compaction_for_table(&dir, table_name).await;
+        engine
+            .update_table_pin_config(&tid, Some(PinConfig { max_bytes: None }))
+            .await
+            .unwrap();
+        wait_for_compaction_result(&engine);
+        let guard = crate::compaction::cancel_harness::CancelHookGuard::install(
+            tid.to_string(),
+            Arc::new(|point| {
+                if point == crate::compaction::cancel_harness::CancelPoint::RetireInput(0) {
+                    panic!("simulated crash during pinned input retirement");
+                }
+            }),
+        );
+        assert!(
+            AssertUnwindSafe(engine.poll_compactions())
+                .catch_unwind()
+                .await
+                .is_err(),
+            "the test hook must interrupt pinned input retirement"
+        );
+        drop(guard);
+        drop(engine);
+
+        let runtime = tokio::runtime::Handle::current();
+        let reopened = StorageEngine::new_with_upload_store(
+            StorageEngineConfig::test_config(dir.path()),
+            Arc::clone(&store),
+            prefix.clone(),
+            &runtime,
+        )
+        .unwrap();
+        let mut schema = test_schema();
+        schema.table = table_name.to_string();
+        reopened
+            .register_table_pinned(schema, PinConfig { max_bytes: None })
+            .unwrap();
+        reopened.replay_pending_uploads().await;
+
+        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        assert!(
+            manifest
+                .sstables
+                .get(&tid.to_string())
+                .is_none_or(Vec::is_empty),
+            "pinned compaction must not publish an S3 manifest entry"
+        );
+        assert!(
+            leftover_intent_records(&reopened.table_sstable_dir(&tid)).is_empty(),
+            "startup reconciliation finishes local pinned retirement and prunes its record"
         );
     }
 
@@ -22351,6 +22891,7 @@ mod tests {
                 &tid_str,
                 &output_id,
                 crate::upload::pending_log::PendingCompactionUpload {
+                    intent_task_id: None,
                     remove_input_ids: manifest_plan.remove_input_ids.clone(),
                     output: manifest_plan.add_output.clone(),
                 },
@@ -23230,7 +23771,19 @@ mod tests {
         );
         std::fs::remove_file(obstruction).unwrap();
         StorageEngine::reconcile_compaction_intents(&table_dir);
-        assert!(leftover_intent_records(&table_dir).is_empty());
+        let records = leftover_intent_records(&table_dir);
+        assert_eq!(
+            records.len(),
+            1,
+            "S3 recovery still owns the retired record"
+        );
+        let record = crate::compaction::intent::CompactionIntentRecord::read_at(&records[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Retired
+        );
         assert!(!StorageEngine::scan_generations(&table_dir).contains(&generation.parse().unwrap()));
     }
 
@@ -23708,9 +24261,14 @@ mod tests {
                 .is_none(),
             "startup reconciliation must finish retiring A"
         );
-        assert!(
-            leftover_intent_records(&sstable_dir).is_empty(),
-            "reconciliation must delete the replacement record once retirement is complete"
+        let records = leftover_intent_records(&sstable_dir);
+        assert_eq!(records.len(), 1, "S3 convergence still owns the record");
+        let record = crate::compaction::intent::CompactionIntentRecord::read_at(&records[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Retired
         );
     }
 

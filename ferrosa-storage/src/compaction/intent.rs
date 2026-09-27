@@ -34,8 +34,9 @@
 //! promote/swap/retire *itself* completed safely; it exists and is enforced
 //! regardless of whether S3 is configured at all. `poll_compactions` writes
 //! both, in order: this record first (commit), then, on the S3 path, the
-//! pending-upload log entry (Step 1 of the S3 dance). They are not redundant:
-//! deleting this record does not touch the pending-upload log, and vice versa.
+//! pending-upload log entry (Step 1 of the S3 dance). The replacement record
+//! remains authoritative through manifest publication and input-delete enqueue;
+//! the pending-upload log carries the upload payload needed to replay that step.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -46,8 +47,8 @@ const INTENT_PREFIX: &str = ".compaction-";
 const INTENT_SUFFIX: &str = ".intent";
 
 /// Where a compaction's commit protocol currently stands. Recorded phases
-/// only ever move forward (`Promoting` -> `Swapped` -> `Retired`); a phase
-/// going backward would mean two writers raced on the same intent file,
+/// only ever move forward (`Promoting` -> `Swapped` -> `Retired` -> S3
+/// completion); a phase going backward would mean two writers raced on the same intent file,
 /// which never happens because only the task that created it advances it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompactionIntentPhase {
@@ -60,10 +61,17 @@ pub enum CompactionIntentPhase {
     /// the inputs has not yet been confirmed complete.
     Swapped,
     /// Every input listed in this record has been retired (or was already
-    /// gone). The local half of the invariant already holds; only S3
-    /// convergence (driven by the separate pending-upload log) may still be
-    /// outstanding.
+    /// gone). The local half of the invariant holds; S3 work starts from this
+    /// durable phase.
     Retired,
+    /// The output is confirmed in S3. Manifest publication remains pending.
+    S3Uploaded,
+    /// Upload confirmation and manifest publication completed. The input
+    /// object deletes still need to be enqueued before this record can retire.
+    S3Manifested,
+    /// Every S3 input delete was accepted by the upload manager. This phase is
+    /// replayable because the manager queue is process-local.
+    S3DeletesEnqueued,
 }
 
 /// The durable replacement record for one compaction task.
@@ -201,10 +209,19 @@ mod tests {
         record(CompactionIntentPhase::Retired)
             .write(dir.path())
             .unwrap();
+        record(CompactionIntentPhase::S3Uploaded)
+            .write(dir.path())
+            .unwrap();
+        record(CompactionIntentPhase::S3Manifested)
+            .write(dir.path())
+            .unwrap();
+        record(CompactionIntentPhase::S3DeletesEnqueued)
+            .write(dir.path())
+            .unwrap();
 
         let path = CompactionIntentRecord::path(dir.path(), "42");
         let read_back = CompactionIntentRecord::read_at(&path).unwrap().unwrap();
-        assert_eq!(read_back.phase, CompactionIntentPhase::Retired);
+        assert_eq!(read_back.phase, CompactionIntentPhase::S3DeletesEnqueued);
     }
 
     #[test]

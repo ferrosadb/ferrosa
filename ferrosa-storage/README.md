@@ -580,7 +580,7 @@ cargo test -p ferrosa-storage --features race-stress --release \
 
 Scale with `RACE_KEYS` / `RACE_READERS` / `RACE_SECS` / `RACE_FLUSH_EVERY`.
 
-### Compaction cancel-safety and crash recovery (T-020–T-023)
+### Compaction cancel-safety and crash recovery (T-020–T-026)
 
 The T-023 retirement crash seam is scoped to the explicitly injected Tokio
 poll task. Concurrent tests and startup reconciliation do not inherit the
@@ -638,7 +638,13 @@ real, already-reserved output generation id before promotion runs (forge
 t_cb6fa288 — `StorageEngine::reserve_compaction_promotion_target`), and
 T-023's startup reconciliation retires every input the record lists,
 unconditionally and idempotently, regardless of how far retirement got
-before the crash. All `cancel_crash_sweep_*` cases therefore run
+before the crash. T-026 keeps the replacement record authoritative through
+S3 upload, manifest publication, and input-delete enqueue. Startup rebuilds
+missing upload work from the record, replays the pending-upload ledger, and
+retries deletion for manifested records. Pinned and local-only compactions
+finish local retirement without publishing an S3 manifest. The mock-store
+crash sweep covers pending-log, manifest-CAS, delete-enqueue, and pinned
+retirement interruption. All `cancel_crash_sweep_*` cases therefore run
 unconditionally today; there is no `known-open-window`-gated case (the
 feature that used to exist under that name was deleted 2026-09-26 once
 nothing gated on it):

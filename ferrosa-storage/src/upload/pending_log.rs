@@ -30,6 +30,8 @@ use crate::manifest::ManifestEntry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCompactionUpload {
+    #[serde(default)]
+    pub intent_task_id: Option<String>,
     pub remove_input_ids: Vec<String>,
     pub output: ManifestEntry,
 }
@@ -291,6 +293,7 @@ mod tests {
         let log = PendingUploadsLog::open(&log_path).unwrap();
 
         let compaction = PendingCompactionUpload {
+            intent_task_id: Some("task-3".to_string()),
             remove_input_ids: vec!["1".to_string(), "2".to_string()],
             output: ManifestEntry {
                 id: "3".to_string(),

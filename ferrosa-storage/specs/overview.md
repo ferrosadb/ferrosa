@@ -231,3 +231,15 @@ async callers use `unregister_table_and_wait` or `truncate_and_wait`.
 Async APIs take `Arc<StorageEngine>` so an owned finalization job can survive a
 request disconnect. TRUNCATE retains its pause through asynchronous S3 cleanup;
 a dropped DDL waiter cannot strand a dequeued result or release its claim early.
+
+### Durable S3 compaction completion (T-026)
+
+The replacement record remains the recovery cursor after local input retirement.
+It advances through `Retired`, `S3Uploaded`, `S3Manifested`, and
+`S3DeletesEnqueued`; the pending-upload log carries replayable upload work and
+is removed only after manifest publication. Startup reconstructs missing upload
+entries from `Retired` or `S3Uploaded` records, then resumes idempotent deletes
+from manifested records. A failed S3-delete enqueue is logged and leaves the
+record for retry. Pinned and local-only compactions remove the record after
+local retirement without attempting S3 work. Mock-store crash tests interrupt
+pending-log, manifest-CAS, delete-enqueue, and pinned-retirement phases.
