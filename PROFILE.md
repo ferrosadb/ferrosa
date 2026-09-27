@@ -94,6 +94,40 @@ maximum.
 These are CQL/Accord controls. They do not configure PostgreSQL transactions or
 PostgreSQL MVCC history.
 
+### SSTable write, compression, and reader buffers
+
+These process-start settings tune SSTable output buffering, compression working
+sets, and decompressed chunk-cache residency. Invalid, unreadable, or
+out-of-range values log `ERROR` and fall back to defaults. Raising a limit can
+increase memory use per active writer, compressor, or reader; budget it against
+the number of concurrent operations.
+
+| Setting | What it changes | Default and accepted range |
+|---|---|---|
+| `FERROSA_SSTABLE_WRITE_SEGMENT_BYTES` | Aligned segment size used by each component writer | `1 MiB`; positive up to `FERROSA_SSTABLE_MAX_WRITE_SEGMENT_BYTES`; rounded up to a direct-I/O block multiple with a one-time `WARN` |
+| `FERROSA_SSTABLE_MAX_WRITE_SEGMENT_BYTES` | Maximum requested segment size | `16 MiB`; minimum `1 MiB`, maximum `1 GiB - 256 bytes - 4 KiB` for the per-pump safety budget and block rounding |
+| `FERROSA_SSTABLE_WRITE_QUEUE_DEPTH` | Segments queued ahead of the writer | `3`; `0` selects synchronous writes; upper bound is the configured queue maximum and actual segment/depth combination must fit the 1 GiB per-pump budget |
+| `FERROSA_SSTABLE_MAX_WRITE_QUEUE_DEPTH` | Maximum queue depth | `16`; minimum `3`, safety ceiling `floor(1 GiB / 257 bytes) - 1`; the active segment/depth combination has a stricter checked budget |
+| `FERROSA_SSTABLE_COMPRESSION_THREADS` | Compression worker count | Available parallelism capped at `4`; from `1` to the configured maximum |
+| `FERROSA_SSTABLE_MAX_COMPRESSION_THREADS` | Maximum compression workers | `4`; from `4` to `64` (bounds thread stack and scheduler overhead) |
+| `FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS` | Chunks held in one compression batch | `16`; from `1` to the configured maximum; combined input and `compress_bound` output buffers per compressor must fit within `1 GiB` |
+| `FERROSA_SSTABLE_MAX_COMPRESSION_BATCH_CHUNKS` | Maximum batch size | `64`; minimum `16`; also limited by the checked 1 GiB per-compressor working-set budget |
+| `FERROSA_SSTABLE_COMPRESSION_CHUNK_BYTES` | Default compression chunk size | `16 KiB`; from `1 KiB` to the configured maximum |
+| `FERROSA_SSTABLE_MAX_COMPRESSION_CHUNK_BYTES` | Maximum compression chunk size | `1 MiB`; minimum `16 KiB`; also limited by the checked 1 GiB per-compressor working-set budget |
+| `FERROSA_SSTABLE_ROW_INDEX_MIN_ROWS` | Rows per row-index entry for wide partitions | `32`; from `1` to the configured maximum |
+| `FERROSA_SSTABLE_MAX_ROW_INDEX_MIN_ROWS` | Maximum row-index spacing | `4096`; minimum `4096`; larger values are accepted and reduce index density |
+| `FERROSA_SSTABLE_CHUNK_CACHE_ENTRIES` | Maximum decompressed chunks retained by one reader | `128`; any positive count, with no eager reservation |
+| `FERROSA_SSTABLE_CHUNK_CACHE_BYTES` | Maximum decompressed chunk bytes retained by one reader | `8,396,800` bytes (128 × (64 KiB + 64 bytes)); from `1` byte to `1 GiB`, with no eager reservation |
+
+The pump checks `(queue depth + 1) × (rounded segment bytes + 256 bytes)` before
+allocating and falls back to defaults if the per-pump total exceeds 1 GiB.
+Compression checks the input plus worst-case output buffers before allocating;
+if the requested batch/chunk combination exceeds 1 GiB per compressor, it uses
+the default 16 KiB chunks and 16-chunk batch. The chunk cache evicts least
+recently used entries when either its byte or entry limit is reached. These are
+allocation safety guards; ordinary performance tuning remains available through
+the settings above.
+
 ### Storage and query throughput
 
 These storage settings affect memory limits, write batching, read working sets,
