@@ -715,3 +715,9 @@ sidecars; generation directories move atomically. Failures emit WARN, increment
 `ferrosa_storage_compaction_retire_failures_total`, and retain the replacement
 intent so startup reconciliation can retry. Component names stream from the
 directory without collecting file contents or a component inventory.
+
+Completed compactions wait on the bounded result sender together with cancellation
+and shutdown channels. Cancellation while that queue is full wakes the worker
+without a sleep interval, removes its unpromoted staging components and releases
+input claims. Result accounting increments before publication so an immediate
+consumer cannot underflow the pending-result counter.

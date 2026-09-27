@@ -1,3 +1,6 @@
+//! Correctness: A completed result is published once or its staging is reclaimed.
+//! Last revised: 2026-09-27
+//! Last changed: Wake bounded result delivery directly on cancellation and shutdown.
 //! Module: Execute bounded streaming compaction work on background threads.
 //! Correctness: Correct when input claims prevent overlap, completed outputs are
 //! finalized once, and maintenance result batches remain explicitly bounded.
@@ -475,9 +478,17 @@ pub(crate) fn remove_staged_output_components(dir: &std::path::Path, gen: &str) 
             return;
         }
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::error!(%error, dir = %dir.display(),
+                    "compaction cancel: failed to inspect staged output entry");
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(&prefix) {
             if let Err(e) = std::fs::remove_file(entry.path()) {
                 tracing::error!(
                     %e,
@@ -524,6 +535,32 @@ impl CompactionDirectUpload {
             .iter()
             .map(SstableComponentBytes::size_bytes)
             .sum()
+    }
+}
+
+/// Move a completed result into the bounded queue, or return ownership when
+/// cancellation/shutdown wins. Count it before publishing so a fast receiver
+/// cannot decrement an as-yet-unincremented counter. No retry loop or cloning.
+fn send_result_or_cancel<T>(
+    sender: &Sender<T>,
+    result: T,
+    pending: &AtomicUsize,
+    cancel: &CancelToken,
+    shutdown: &Receiver<()>,
+) -> Option<T> {
+    crossbeam_channel::select! {
+        send(sender, {
+            pending.fetch_add(1, Ordering::Release);
+            result
+        }) -> sent => match sent {
+            Ok(()) => None,
+            Err(error) => {
+                pending.fetch_sub(1, Ordering::Release);
+                Some(error.0)
+            }
+        },
+        recv(cancel.closed()) -> _ => Some(result),
+        recv(shutdown) -> _ => Some(result),
     }
 }
 
@@ -683,50 +720,29 @@ impl CompactionExecutor {
                                     elapsed_ms = task_start.elapsed().as_millis() as u64,
                                     "compaction: task finished"
                                 );
-                                let mut completed = CompactionResult {
+                                let completed = CompactionResult {
                                     task,
                                     output: output.metadata,
                                     direct_upload: output.direct_upload,
                                     cancel: cancel.clone(),
                                 };
-                                loop {
-                                    match result_tx.try_send(completed) {
-                                        Ok(()) => {
-                                            pending_results.fetch_add(1, Ordering::Release);
-                                            break;
+                                if let Some(unsent) = send_result_or_cancel(
+                                    &result_tx, completed, &pending_results, &cancel, &shutdown_rx,
+                                ) {
+                                    remove_staged_output_components(&unsent.output.path, &unsent.output.id);
+                                    Self::release_in_flight_inputs(
+                                        &in_flight_inputs, &in_flight_tokens, &unsent.task,
+                                    );
+                                    if let Some(reason) = cancel.reason() {
+                                        crate::metrics::inc_compaction_cancelled();
+                                        if let Some(started) = cancel.cancelled_at() {
+                                            crate::metrics::observe_compaction_cancel_latency(started.elapsed());
                                         }
-                                        Err(crossbeam_channel::TrySendError::Full(result)) => {
-                                            completed = result;
-                                            if stop.load(Ordering::Acquire) {
-                                                Self::release_in_flight_inputs(
-                                                    &in_flight_inputs,
-                                                    &in_flight_tokens,
-                                                    &completed.task,
-                                                );
-                                                tracing::error!(
-                                                    table_id = %completed.task.table_id,
-                                                    "compaction: shutdown while bounded result queue was full; inputs remain live and task will be retried after restart"
-                                                );
-                                                break;
-                                            }
-                                            std::thread::sleep(
-                                                std::time::Duration::from_millis(10),
-                                            );
-                                        }
-                                        Err(crossbeam_channel::TrySendError::Disconnected(
-                                            result,
-                                        )) => {
-                                            Self::release_in_flight_inputs(
-                                                &in_flight_inputs,
-                                                &in_flight_tokens,
-                                                &result.task,
-                                            );
-                                            tracing::error!(
-                                                table_id = %result.task.table_id,
-                                                "compaction: result receiver closed; inputs remain live"
-                                            );
-                                            break;
-                                        }
+                                        tracing::info!(table_id = %unsent.task.table_id, %reason,
+                                            "compaction: cancelled while delivering result; staged output removed");
+                                    } else {
+                                        tracing::warn!(table_id = %unsent.task.table_id,
+                                            "compaction: result delivery stopped; staged output removed, inputs remain live");
                                     }
                                 }
                             }
@@ -1952,6 +1968,90 @@ fn validate_row_writable(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn cancel_source_result_full_queue_wakes_on_cancel() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(11).unwrap();
+        let pending = AtomicUsize::new(1);
+        let (_shutdown, shutdown_rx) = crossbeam_channel::bounded(0);
+        let cancel = CancelToken::new();
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(0);
+            let (done_tx, done_rx) = crossbeam_channel::bounded(0);
+            let (tx, pending, cancel, shutdown_rx) = (&tx, &pending, &cancel, &shutdown_rx);
+            scope.spawn(move || {
+                entered_tx.send(()).unwrap();
+                done_tx
+                    .send(send_result_or_cancel(tx, 22, pending, cancel, shutdown_rx))
+                    .unwrap();
+            });
+            entered_rx.recv().unwrap();
+            cancel.cancel(CancelReason::Operator);
+            assert_eq!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                Some(22)
+            );
+        });
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert_eq!(rx.recv().unwrap(), 11);
+    }
+
+    #[test]
+    fn cancel_source_result_full_queue_wakes_on_shutdown() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(11).unwrap();
+        let pending = AtomicUsize::new(1);
+        let (shutdown, shutdown_rx) = crossbeam_channel::bounded(0);
+        let cancel = CancelToken::new();
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(0);
+            let (done_tx, done_rx) = crossbeam_channel::bounded(0);
+            let (tx, pending, cancel, shutdown_rx) = (&tx, &pending, &cancel, &shutdown_rx);
+            scope.spawn(move || {
+                entered_tx.send(()).unwrap();
+                done_tx
+                    .send(send_result_or_cancel(tx, 22, pending, cancel, shutdown_rx))
+                    .unwrap();
+            });
+            entered_rx.recv().unwrap();
+            drop(shutdown);
+            assert_eq!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                Some(22)
+            );
+        });
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert_eq!(rx.recv().unwrap(), 11);
+    }
+
+    #[test]
+    fn cancel_source_result_counter_precedes_delivery_and_disconnect_reverses_it() {
+        let (tx, rx) = crossbeam_channel::bounded(0);
+        let pending = AtomicUsize::new(0);
+        let (_shutdown, shutdown_rx) = crossbeam_channel::bounded(0);
+        let cancel = CancelToken::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert_eq!(
+                    send_result_or_cancel(&tx, 22, &pending, &cancel, &shutdown_rx),
+                    None
+                );
+            });
+            assert_eq!(rx.recv().unwrap(), 22);
+            assert_eq!(pending.fetch_sub(1, Ordering::AcqRel), 1);
+        });
+        drop(rx);
+        assert_eq!(
+            send_result_or_cancel(&tx, 33, &pending, &cancel, &shutdown_rx),
+            Some(33)
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
 
     fn make_metadata(id: &str, size: u64) -> SSTableMetadata {
         SSTableMetadata {

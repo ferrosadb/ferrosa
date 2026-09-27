@@ -89,3 +89,9 @@ Read-ahead config: `FERROSA_COMPACTION_READAHEAD_BYTES`, default 1 MiB,
 range 1..=256 MiB, rounded up to 4096 bytes. Invalid values emit ERROR and fall back;
 valid normalization emits WARN with configured/effective sizes. Shutdown can
 cancel a parked producer, then joins once the outstanding device call returns.
+
+T-025 result-delivery coverage extends ST-33: a completed worker blocked by the
+bounded result queue wakes directly on cancellation/shutdown and reclaims its
+unpromoted output. `cancel_source_result_*` covers both wake sources, channel
+disconnection and result-counter publication order. DROP/TRUNCATE coordination,
+disk-reserve selection and operator source wiring remain separate work.

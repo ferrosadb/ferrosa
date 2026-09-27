@@ -199,3 +199,11 @@ including index sidecars. Directory fsyncs precede reclamation and follow remova
 Any failure retains the replacement intent and records a warning and counter.
 The scoped `RetireInput` fault hook exercises failure after Data.db moved; restart
 and subsequent retries finish the remaining components idempotently.
+
+### Cancellation while delivering completed results (T-025 slice)
+
+Result delivery uses crossbeam `select!` over the bounded result sender, the
+task cancellation channel and executor shutdown. The unsent result remains owned
+by the worker; cancellation drops direct-upload buffers, removes staged component
+files and releases input claims. The pending-result counter is incremented inside
+the selected send expression, before the receiver can observe the result.

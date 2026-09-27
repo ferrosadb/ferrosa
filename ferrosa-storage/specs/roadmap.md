@@ -181,3 +181,11 @@ Generation directories and flat components, including secondary/full-text/vector
 sidecars, retire through durable hidden paths. Failures retain their intent and
 retry on startup. The remaining T-060 extension is a grace period at the single
 `remove_retired` reclamation seam; current retirement removes the files immediately.
+
+### T-025 progress: event-driven result delivery
+
+Completed-result delivery now blocks on channel readiness, cancellation and
+shutdown without sleep polling, retaining move ownership until delivery succeeds.
+Source coordination remains open: synchronous DROP/TRUNCATE storage APIs need
+an async completion/submission-gate contract before they can safely await committed
+S3 finalization. Disk reserve and operator source wiring remain to be completed.
