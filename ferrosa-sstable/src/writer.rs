@@ -596,8 +596,8 @@ impl ChunkCompressor {
         Ok(())
     }
 
-    /// Compress every chunk currently staged in `inputs[0..lens.len()]` in
-    /// parallel on `compression_pool()`, then write each `payload ‖ crc` to
+    /// Compress every chunk currently staged in `inputs[0..lens.len()]` into
+    /// its reusable output buffer, then write each `payload ‖ crc` to
     /// `data_pump` and each chunk's starting offset to `info_pump`, in order.
     fn flush_batch(&mut self, data_pump: &mut AlignedPump) -> Result<()> {
         let n = self.lens.len();
@@ -606,21 +606,11 @@ impl ChunkCompressor {
         }
         let compression = &self.compression;
         let inputs = &self.inputs;
-        let outputs = &mut self.outputs;
-        let lens = &self.lens;
-        let written_lens = &mut self.written_lens;
-        compression_pool().install(|| {
-            outputs[..n]
-                .par_iter_mut()
-                .zip(inputs[..n].par_iter())
-                .zip(lens[..n].par_iter())
-                .zip(written_lens[..n].par_iter_mut())
-                .try_for_each(|(((out, inp), &len), written_len)| -> Result<()> {
-                    *written_len = compression.compress_into(&inp[..len], out)?;
-                    Ok(())
-                })
-        })?;
-        for (i, &written_len) in written_lens[..n].iter().enumerate() {
+        for i in 0..n {
+            self.written_lens[i] =
+                compression.compress_into(&inputs[i][..self.lens[i]], &mut self.outputs[i])?;
+        }
+        for (i, &written_len) in self.written_lens[..n].iter().enumerate() {
             let payload = &self.outputs[i][..written_len];
             let crc = crc32fast::hash(payload).to_be_bytes();
             let stored_size = written_len + std::mem::size_of::<u32>();
