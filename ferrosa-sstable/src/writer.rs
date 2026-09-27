@@ -70,6 +70,8 @@ const MIN_COMPRESSION_THREADS: usize = 1;
 const DEFAULT_MAX_COMPRESSION_THREADS: usize = 4;
 const MIN_COMPRESSION_CHUNK_BYTES: usize = 1024;
 const DEFAULT_MAX_COMPRESSION_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_COMPRESSION_WORKING_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_COMPRESSION_THREADS: usize = 64;
 const DEFAULT_ROW_INDEX_MIN_ROWS: usize = ROW_INDEX_MIN_ROWS;
 const DEFAULT_MAX_ROW_INDEX_MIN_ROWS: usize = 4096;
 const MAX_COMPRESSION_THREADS_ENV: &str = "FERROSA_SSTABLE_MAX_COMPRESSION_THREADS";
@@ -151,7 +153,7 @@ fn compression_pool() -> Option<&'static rayon::ThreadPool> {
         let max_threads = configured_max(
             MAX_COMPRESSION_THREADS_ENV,
             DEFAULT_MAX_COMPRESSION_THREADS,
-            usize::MAX,
+            MAX_COMPRESSION_THREADS,
         );
         let default_threads = std::thread::available_parallelism()
             .map(usize::from)
@@ -679,15 +681,25 @@ impl ChunkCompressor {
         batch_chunks: usize,
         info_path: &Path,
     ) -> Result<Self> {
-        assert!(
-            chunk_size > 0,
-            "ChunkCompressor: chunk_size must be positive"
-        );
-        assert!(
-            batch_chunks > 0,
-            "ChunkCompressor: batch_chunks must be positive"
-        );
-        let bound = compression.compress_bound(chunk_size);
+        let (chunk_size, batch_chunks, bound) =
+            if compression_buffers_fit(&compression, chunk_size, batch_chunks) {
+                (
+                    chunk_size,
+                    batch_chunks,
+                    compression.compress_bound(chunk_size),
+                )
+            } else {
+                tracing::error!(
+                chunk_size,
+                batch_chunks,
+                max_working_bytes = MAX_COMPRESSION_WORKING_BYTES,
+                "SSTable compression buffers exceed the working-set safety budget; using defaults"
+            );
+                let chunk_size = Compression::DEFAULT_CHUNK_SIZE;
+                let batch_chunks = DEFAULT_COMPRESSION_BATCH_CHUNKS;
+                let bound = compression.compress_bound(chunk_size);
+                (chunk_size, batch_chunks, bound)
+            };
         let inputs = (0..batch_chunks)
             .map(|_| vec![0u8; chunk_size].into_boxed_slice())
             .collect::<Vec<_>>()
@@ -822,6 +834,21 @@ impl ChunkCompressor {
         };
         Ok(CompressionInfoFinish { path, len })
     }
+}
+
+fn compression_buffers_fit(
+    compression: &Compression,
+    chunk_size: usize,
+    batch_chunks: usize,
+) -> bool {
+    if chunk_size == 0 || batch_chunks == 0 || chunk_size > MAX_COMPRESSION_WORKING_BYTES {
+        return false;
+    }
+    let output_bound = compression.compress_bound(chunk_size);
+    chunk_size
+        .checked_add(output_bound)
+        .and_then(|per_chunk| per_chunk.checked_mul(batch_chunks))
+        .is_some_and(|bytes| bytes <= MAX_COMPRESSION_WORKING_BYTES)
 }
 
 /// A destination for row-body bytes. The row-body serializers
@@ -2756,6 +2783,17 @@ mod tests {
     use crate::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
     use proptest::prelude::*;
+
+    #[test]
+    fn compression_buffers_reject_working_sets_over_safety_budget() {
+        let compression = Compression::Lz4;
+        assert!(compression_buffers_fit(&compression, 16 * 1024, 16));
+        assert!(!compression_buffers_fit(
+            &compression,
+            MAX_COMPRESSION_WORKING_BYTES,
+            2
+        ));
+    }
 
     #[test]
     fn tuning_values_enforce_bounds_and_default_on_invalid_input() {

@@ -81,6 +81,14 @@ pub const MAX_QUEUE_DEPTH_ENV: &str = "FERROSA_SSTABLE_MAX_WRITE_QUEUE_DEPTH";
 const DEFAULT_SEGMENT_BYTES: usize = 1024 * 1024; // 1 MiB
 const MIN_SEGMENT_BYTES: usize = 1;
 const DEFAULT_MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+/// Per-pump safety budget for all aligned segments, including the current
+/// producer segment. This is an OOM guard; queue/segment defaults remain the
+/// normal performance settings and MAX_* values may be raised within it.
+const MAX_PUMP_BUFFER_BYTES: usize = 1024 * 1024 * 1024;
+/// Conservative descriptor/channel/iovec allowance per in-flight segment.
+const PUMP_SEGMENT_METADATA_BYTES: usize = 256;
+const MAX_SAFE_REQUESTED_SEGMENT_BYTES: usize =
+    MAX_PUMP_BUFFER_BYTES - PUMP_SEGMENT_METADATA_BYTES - crate::direct::MIN_BLOCK;
 
 const DEFAULT_QUEUE_DEPTH: usize = 3;
 const MIN_QUEUE_DEPTH: usize = 0; // 0 = synchronous
@@ -127,31 +135,64 @@ impl PumpConfig {
     /// default applies and the rejection is logged once per process (never
     /// silently, per the standing order on silent failures).
     pub fn from_env() -> Self {
-        Self {
-            segment_bytes: Self::segment_bytes_from_env(),
-            queue_depth: resolve_env(
-                QUEUE_DEPTH_ENV,
-                std::env::var(QUEUE_DEPTH_ENV).ok().as_deref(),
-                DEFAULT_QUEUE_DEPTH,
-                MIN_QUEUE_DEPTH,
-                max_queue_depth_from_env(),
-                &QUEUE_DEPTH_WARNED,
+        let max_queue_depth = max_queue_depth_from_env();
+        let segment_bytes = resolve_env_result(
+            SEGMENT_BYTES_ENV,
+            std::env::var(SEGMENT_BYTES_ENV),
+            DEFAULT_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
+            resolve_max_env_result(
+                MAX_SEGMENT_BYTES_ENV,
+                std::env::var(MAX_SEGMENT_BYTES_ENV),
+                DEFAULT_MAX_SEGMENT_BYTES,
+                DEFAULT_SEGMENT_BYTES,
+                MAX_SAFE_REQUESTED_SEGMENT_BYTES,
+                &MAX_SEGMENT_BYTES_WARNED,
             ),
+            &SEGMENT_BYTES_WARNED,
+        );
+        let queue_depth = resolve_env_result(
+            QUEUE_DEPTH_ENV,
+            std::env::var(QUEUE_DEPTH_ENV),
+            DEFAULT_QUEUE_DEPTH,
+            MIN_QUEUE_DEPTH,
+            max_queue_depth,
+            &QUEUE_DEPTH_WARNED,
+        );
+        let minimum_block = crate::direct::MIN_BLOCK;
+        let effective_segment =
+            segment_bytes.max(minimum_block).div_ceil(minimum_block) * minimum_block;
+        let segment_count = queue_depth.checked_add(1);
+        let per_segment = effective_segment.checked_add(PUMP_SEGMENT_METADATA_BYTES);
+        let total =
+            segment_count.and_then(|count| per_segment.and_then(|size| count.checked_mul(size)));
+        if total.is_none_or(|bytes| bytes > MAX_PUMP_BUFFER_BYTES) {
+            tracing::error!(
+                segment_bytes,
+                queue_depth,
+                max_buffer_bytes = MAX_PUMP_BUFFER_BYTES,
+                "write pump settings exceed the per-pump memory safety budget; using defaults"
+            );
+            return Self::default();
+        }
+        Self {
+            segment_bytes,
+            queue_depth,
         }
     }
 
     pub(crate) fn segment_bytes_from_env() -> usize {
-        let max = resolve_max_env(
+        let max = resolve_max_env_result(
             MAX_SEGMENT_BYTES_ENV,
-            std::env::var(MAX_SEGMENT_BYTES_ENV).ok().as_deref(),
+            std::env::var(MAX_SEGMENT_BYTES_ENV),
             DEFAULT_MAX_SEGMENT_BYTES,
             DEFAULT_SEGMENT_BYTES,
-            (isize::MAX as usize).saturating_sub(crate::dio_align::MAX_BLOCK),
+            MAX_SAFE_REQUESTED_SEGMENT_BYTES,
             &MAX_SEGMENT_BYTES_WARNED,
         );
-        resolve_env(
+        resolve_env_result(
             SEGMENT_BYTES_ENV,
-            std::env::var(SEGMENT_BYTES_ENV).ok().as_deref(),
+            std::env::var(SEGMENT_BYTES_ENV),
             DEFAULT_SEGMENT_BYTES,
             MIN_SEGMENT_BYTES,
             max,
@@ -241,6 +282,26 @@ fn resolve_env(
     resolved
 }
 
+fn resolve_env_result(
+    name: &str,
+    value: std::result::Result<String, std::env::VarError>,
+    default: usize,
+    min: usize,
+    max: usize,
+    warned: &AtomicBool,
+) -> usize {
+    match value {
+        Ok(value) => resolve_env(name, Some(&value), default, min, max, warned),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error @ std::env::VarError::NotUnicode(_)) => {
+            if !warned.swap(true, Ordering::Relaxed) {
+                tracing::error!(var = name, %error, default, "could not read write pump tunable; using default");
+            }
+            default
+        }
+    }
+}
+
 fn resolve_max_env(
     name: &str,
     value: Option<&str>,
@@ -262,15 +323,39 @@ fn resolve_max_env(
     resolved
 }
 
+fn resolve_max_env_result(
+    name: &str,
+    value: std::result::Result<String, std::env::VarError>,
+    default: usize,
+    min: usize,
+    max: usize,
+    warned: &AtomicBool,
+) -> usize {
+    match value {
+        Ok(value) => resolve_max_env(name, Some(&value), default, min, max, warned),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error @ std::env::VarError::NotUnicode(_)) => {
+            if !warned.swap(true, Ordering::Relaxed) {
+                tracing::error!(var = name, %error, default, "could not read write pump maximum; using default");
+            }
+            default
+        }
+    }
+}
+
 pub(super) fn max_queue_depth_from_env() -> usize {
-    resolve_max_env(
+    resolve_max_env_result(
         MAX_QUEUE_DEPTH_ENV,
-        std::env::var(MAX_QUEUE_DEPTH_ENV).ok().as_deref(),
+        std::env::var(MAX_QUEUE_DEPTH_ENV),
         DEFAULT_MAX_QUEUE_DEPTH,
         DEFAULT_QUEUE_DEPTH,
-        isize::MAX as usize / std::mem::size_of::<Filled>() - 1,
+        max_queue_depth_from_env_ceiling(),
         &MAX_QUEUE_DEPTH_WARNED,
     )
+}
+
+const fn max_queue_depth_from_env_ceiling() -> usize {
+    (MAX_PUMP_BUFFER_BYTES / (MIN_SEGMENT_BYTES + PUMP_SEGMENT_METADATA_BYTES)).saturating_sub(1)
 }
 
 /// A destination for one aligned SSTable component's device writes, seamed out
@@ -2531,6 +2616,54 @@ mod tests {
         let config = PumpConfig::default();
         assert_eq!(config.segment_bytes, 1024 * 1024);
         assert_eq!(config.queue_depth, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_pump_tunables_use_defaults() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = || {
+            Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from_vec(vec![0xff]),
+            ))
+        };
+        let value_logged = AtomicBool::new(false);
+        assert_eq!(
+            resolve_env_result(
+                QUEUE_DEPTH_ENV,
+                invalid(),
+                DEFAULT_QUEUE_DEPTH,
+                MIN_QUEUE_DEPTH,
+                DEFAULT_MAX_QUEUE_DEPTH,
+                &value_logged,
+            ),
+            DEFAULT_QUEUE_DEPTH
+        );
+        assert!(value_logged.load(Ordering::Relaxed));
+
+        let max_logged = AtomicBool::new(false);
+        assert_eq!(
+            resolve_max_env_result(
+                MAX_QUEUE_DEPTH_ENV,
+                invalid(),
+                DEFAULT_MAX_QUEUE_DEPTH,
+                DEFAULT_QUEUE_DEPTH,
+                1023,
+                &max_logged,
+            ),
+            DEFAULT_MAX_QUEUE_DEPTH
+        );
+        assert!(max_logged.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pump_memory_budget_rejects_large_queue_segment_product() {
+        assert!(1025usize.checked_mul(1024 * 1024).unwrap() > MAX_PUMP_BUFFER_BYTES);
+        assert_eq!(
+            (MAX_PUMP_BUFFER_BYTES / (MIN_SEGMENT_BYTES + PUMP_SEGMENT_METADATA_BYTES)) - 1,
+            max_queue_depth_from_env_ceiling()
+        );
     }
 
     /// `unset, empty, garbage, 0, 1, 4095, 4097, above max` for the segment

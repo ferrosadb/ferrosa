@@ -23,7 +23,10 @@ use std::sync::{Arc, Mutex};
 const DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES: usize = 128;
 const CHUNK_CACHE_ENTRY_OVERHEAD_BYTES: usize = 64;
 const DEFAULT_CHUNK_CACHE_BUDGET_BYTES: usize =
-    DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES * (16 * 1024 + CHUNK_CACHE_ENTRY_OVERHEAD_BYTES);
+    DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES * (64 * 1024 + CHUNK_CACHE_ENTRY_OVERHEAD_BYTES);
+/// Per-reader resident cache safety budget. The LRU does not preallocate, but
+/// a configured budget can otherwise let it retain unbounded memory over time.
+const MAX_CHUNK_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 static CHUNK_CACHE_ENTRIES_WARNED: AtomicBool = AtomicBool::new(false);
 static CHUNK_CACHE_BYTES_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -53,7 +56,12 @@ impl ChunkCacheConfig {
 fn configured_cache_value(name: &'static str, default: usize, warned: &AtomicBool) -> usize {
     match std::env::var(name) {
         Ok(value) => {
-            let (resolved, rejected) = resolve_cache_value(Some(&value), default);
+            let max = if name == "FERROSA_SSTABLE_CHUNK_CACHE_BYTES" {
+                MAX_CHUNK_CACHE_BUDGET_BYTES
+            } else {
+                usize::MAX
+            };
+            let (resolved, rejected) = resolve_cache_value(Some(&value), default, max);
             if rejected && !warned.swap(true, Ordering::Relaxed) {
                 tracing::error!(
                     name,
@@ -74,11 +82,11 @@ fn configured_cache_value(name: &'static str, default: usize, warned: &AtomicBoo
     }
 }
 
-fn resolve_cache_value(value: Option<&str>, default: usize) -> (usize, bool) {
+fn resolve_cache_value(value: Option<&str>, default: usize, max: usize) -> (usize, bool) {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         None => (default, false),
         Some(value) => match value.parse::<usize>() {
-            Ok(parsed) if parsed > 0 => (parsed, false),
+            Ok(parsed) if parsed > 0 && parsed <= max => (parsed, false),
             _ => (default, true),
         },
     }
@@ -1644,12 +1652,43 @@ mod tests {
 
     #[test]
     fn chunk_cache_settings_default_and_reject_non_positive_values() {
-        assert_eq!(resolve_cache_value(None, 128), (128, false));
-        assert_eq!(resolve_cache_value(Some(""), 128), (128, false));
-        assert_eq!(resolve_cache_value(Some("256"), 128), (256, false));
-        assert_eq!(resolve_cache_value(Some("0"), 128), (128, true));
-        assert_eq!(resolve_cache_value(Some("-1"), 128), (128, true));
-        assert_eq!(resolve_cache_value(Some("huge"), 128), (128, true));
+        assert_eq!(DEFAULT_CHUNK_CACHE_BUDGET_BYTES, 8_396_800);
+        assert_eq!(resolve_cache_value(None, 128, usize::MAX), (128, false));
+        assert_eq!(resolve_cache_value(Some(""), 128, usize::MAX), (128, false));
+        assert_eq!(
+            resolve_cache_value(Some("256"), 128, usize::MAX),
+            (256, false)
+        );
+        assert_eq!(resolve_cache_value(Some("0"), 128, usize::MAX), (128, true));
+        assert_eq!(
+            resolve_cache_value(Some("-1"), 128, usize::MAX),
+            (128, true)
+        );
+        assert_eq!(
+            resolve_cache_value(Some("huge"), 128, usize::MAX),
+            (128, true)
+        );
+        assert_eq!(
+            resolve_cache_value(
+                Some("1073741825"),
+                DEFAULT_CHUNK_CACHE_BUDGET_BYTES,
+                MAX_CHUNK_CACHE_BUDGET_BYTES
+            ),
+            (DEFAULT_CHUNK_CACHE_BUDGET_BYTES, true)
+        );
+    }
+
+    #[test]
+    fn default_chunk_cache_budget_retains_128_common_64k_chunks() {
+        let mut cache = ChunkCache::new(ChunkCacheConfig {
+            max_entries: DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES,
+            max_bytes: DEFAULT_CHUNK_CACHE_BUDGET_BYTES,
+        });
+        for key in 0..DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES {
+            cache.insert(key, Arc::new(vec![0; 64 * 1024]));
+        }
+        assert_eq!(cache.entries.len(), 128);
+        assert_eq!(cache.resident_bytes, DEFAULT_CHUNK_CACHE_BUDGET_BYTES);
     }
 
     #[test]

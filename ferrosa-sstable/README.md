@@ -111,9 +111,9 @@ ceilings and can be raised after budgeting the added memory.
 | Setting | Default | Behavior |
 |---|---:|---|
 | `FERROSA_SSTABLE_WRITE_SEGMENT_BYTES` | 1 MiB | 1 byte to configured maximum; rounds up to a direct-I/O block multiple with a one-time `WARN`. |
-| `FERROSA_SSTABLE_MAX_WRITE_SEGMENT_BYTES` | 16 MiB | Minimum accepted maximum is 1 MiB; upper bound is representable aligned-allocation size. |
+| `FERROSA_SSTABLE_MAX_WRITE_SEGMENT_BYTES` | 16 MiB | Minimum accepted maximum is 1 MiB; safety ceiling is `1 GiB - 256 bytes - 4 KiB` for block rounding and metadata. |
 | `FERROSA_SSTABLE_WRITE_QUEUE_DEPTH` | 3 | 0 to configured maximum; 0 selects synchronous writes. |
-| `FERROSA_SSTABLE_MAX_WRITE_QUEUE_DEPTH` | 16 | Minimum accepted maximum is 3; upper bound is representable queue storage. |
+| `FERROSA_SSTABLE_MAX_WRITE_QUEUE_DEPTH` | 16 | Minimum accepted maximum is 3; hard safety ceiling is `floor(1 GiB / 257 bytes) - 1`. |
 
 An asynchronous pump holds up to `queue_depth + 1` aligned segments, or about
 `(queue_depth + 1) * rounded_segment_bytes` per active component writer. It
@@ -122,37 +122,46 @@ opens. These two metadata allocations replace the former fixed stack iovec;
 the allocation regression test checks that they do not grow per batch, segment,
 or write. Larger batches are split at the OS `pwritev` vector limit. The
 `DirectWriter` honors the segment setting but always uses queue depth zero.
+The pump rejects an actual segment/queue combination above 1 GiB, counting
+rounded segment bytes plus a conservative 256-byte descriptor allowance per
+segment, with an ERROR and both defaults. This is a per-pump allocation safety
+guard; lower queue depths can use larger segments within the same budget.
 
 ### Compression and row index
 
 | Setting | Default | Accepted range |
 |---|---:|---|
 | `FERROSA_SSTABLE_COMPRESSION_THREADS` | Available parallelism capped at 4 | 1 to configured maximum |
-| `FERROSA_SSTABLE_MAX_COMPRESSION_THREADS` | 4 | 4 to `usize::MAX` |
+| `FERROSA_SSTABLE_MAX_COMPRESSION_THREADS` | 4 | 4 to 64 threads |
 | `FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS` | 16 | 1 to configured maximum |
-| `FERROSA_SSTABLE_MAX_COMPRESSION_BATCH_CHUNKS` | 64 | 16 to `usize::MAX` |
+| `FERROSA_SSTABLE_MAX_COMPRESSION_BATCH_CHUNKS` | 64 | 16 to `usize::MAX`, subject to the 1 GiB working-set guard |
 | `FERROSA_SSTABLE_COMPRESSION_CHUNK_BYTES` | 16 KiB | 1 KiB to configured maximum |
-| `FERROSA_SSTABLE_MAX_COMPRESSION_CHUNK_BYTES` | 1 MiB | 16 KiB to `usize::MAX` |
+| `FERROSA_SSTABLE_MAX_COMPRESSION_CHUNK_BYTES` | 1 MiB | 16 KiB to `usize::MAX`, subject to the 1 GiB working-set guard |
 | `FERROSA_SSTABLE_ROW_INDEX_MIN_ROWS` | 32 | 1 to configured maximum |
 | `FERROSA_SSTABLE_MAX_ROW_INDEX_MIN_ROWS` | 4096 | 4096 to `usize::MAX` |
 
 Increasing compression chunk and batch sizes increases working memory. Each
 batch uses input buffers of about `batch_chunks * chunk_bytes`, plus output
-buffers up to `batch_chunks * compress_bound(chunk_bytes)`. Thread count adds
-concurrent work and codec state. `WriteOptions::chunk_size` defaults to 16 KiB;
+buffers up to `batch_chunks * compress_bound(chunk_bytes)`. Their checked sum
+may not exceed 1 GiB; an oversized combination logs ERROR and uses default
+chunk and batch sizes before allocation. Thread count adds concurrent work
+and codec state; its MAX setting is capped at 64 to bound native thread stack
+and scheduler overhead. `WriteOptions::chunk_size` defaults to 16 KiB;
 the chunk-bytes environment setting supplies that default when using
-`WriteOptions::default()`. An explicitly constructed value is preserved.
+`WriteOptions::default()`. Explicit values are preserved when they fit the
+working-set budget.
 
 ### Reader chunk cache
 
 | Setting | Default | Accepted range |
 |---|---:|---|
 | `FERROSA_SSTABLE_CHUNK_CACHE_ENTRIES` | 128 | Any positive integer; no eager reservation |
-| `FERROSA_SSTABLE_CHUNK_CACHE_BYTES` | 2,105,344 bytes (about 2.01 MiB) | Any positive integer; no eager reservation |
+| `FERROSA_SSTABLE_CHUNK_CACHE_BYTES` | 8,396,800 bytes (about 8 MiB) | 1 byte to 1 GiB; no eager reservation |
 
-The byte default is `128 * (16 KiB + 64 bytes)`, preserving approximately the
-old 128-entry behavior for 16 KiB chunks and charging an estimated 64 bytes for
-each key, handle, and LRU/hash entry. The non-preallocating LRU evicts least
+The byte default is `128 * (64 KiB + 64 bytes)`, preserving approximately 128
+entries for common 64 KiB chunks and charging an estimated 64 bytes for each
+key, handle, and LRU/hash entry. The per-reader budget cannot exceed 1 GiB;
+larger or invalid values log ERROR and use the 8 MiB default. The non-preallocating LRU evicts least
 recently used entries until both limits are met. A chunk larger than the entire
 byte budget is returned but not cached. Both limits apply to decompressed and
 CRC-verified uncompressed chunks. Allocator overhead and `Arc`s retained by
@@ -486,15 +495,8 @@ walking them or allocating the offset vector. The `fuzz/` package keeps
 golden SSTables; the offset target pairs mutated metadata with the golden
 Data.db and compares any accepted chunk reads with the golden decoded bytes.
 
-The writer accepts these process-start tuning variables; each value is read
-once and an invalid value logs an error before falling back to its default:
-
-| Variable | Default | Accepted values |
-|---|---:|---:|
-| `FERROSA_SSTABLE_COMPRESSION_CHUNK_BYTES` | 16 KiB | 1 KiB–1 MiB |
-| `FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS` | 16 | 1–64 |
-| `FERROSA_SSTABLE_COMPRESSION_THREADS` | available CPUs, capped at 4 | 1–4 |
-| `FERROSA_SSTABLE_ROW_INDEX_MIN_ROWS` | 32 | 1–4096 |
+The process-start writer tuning variables, configurable maxima, defaults, and
+allocation guards are listed in [Runtime tuning](#runtime-tuning).
 
 A schema's explicit `compression.chunk_length_kb` setting takes precedence over
 the chunk-size environment variable. Larger chunks reduce chunk and index
