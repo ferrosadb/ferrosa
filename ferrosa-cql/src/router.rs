@@ -11,8 +11,8 @@
 //! Correctness: compound clustering restrictions validate declared key order,
 //! and bounded single-column clustering resumes stop before materializing a
 //! wide partition tail.
-//! Last revised: 2026-09-16.
-//! Last changed: persist standalone role mutations to system_auth before reply.
+//! Last revised: 2026-09-27
+//! Last changed: Coordinate table DDL with compaction cancellation and completion.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -9564,9 +9564,18 @@ async fn route_drop_keyspace(
                 .filter(|(ks, _)| ks == &s.name)
                 .map(|(ks, tbl)| ferrosa_storage::TableId::new(ks, tbl))
                 .collect();
+            let mut pauses = Vec::with_capacity(table_ids.len());
+            for tid in &table_ids {
+                pauses.push(
+                    state
+                        .engine
+                        .pause_table_compactions(tid, ferrosa_common::CancelReason::TableDropped)
+                        .await?,
+                );
+            }
             state.schema.drop_keyspace(&s.name, ctx.auth)?;
             for tid in &table_ids {
-                let _ = state.engine.unregister_table(tid);
+                state.engine.unregister_table(tid)?;
             }
         }
         DdlPath::Pair(coordinator) => {
@@ -10063,9 +10072,13 @@ async fn route_drop_table(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.drop_table(ks, &s.table, ctx.auth)?;
             let tid = ferrosa_storage::TableId::new(ks, &s.table);
-            let _ = state.engine.unregister_table(&tid);
+            let _pause = state
+                .engine
+                .pause_table_compactions(&tid, ferrosa_common::CancelReason::TableDropped)
+                .await?;
+            state.schema.drop_table(ks, &s.table, ctx.auth)?;
+            state.engine.unregister_table(&tid)?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropTable {

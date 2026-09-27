@@ -1,6 +1,6 @@
 //! Correctness: A completed result is published once or its staging is reclaimed.
 //! Last revised: 2026-09-27
-//! Last changed: Track one cancellation record per task and select disk-pressure work by size.
+//! Last changed: Coordinate table DDL with compaction cancellation and completion.
 //! Module: Execute bounded streaming compaction work on background threads.
 //! Correctness: Correct when input claims prevent overlap, completed outputs are
 //! finalized once, and maintenance result batches remain explicitly bounded.
@@ -27,15 +27,14 @@
 //! workers, so shutdown waits out one checkpoint interval rather than a
 //! whole merge.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 use ferrosa_common::{CancelReason, CancelToken};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::compaction::cancel_harness::CancelPoint;
@@ -43,6 +42,7 @@ use crate::compaction::cancel_point;
 use crate::store::SharedReaderPool;
 use crate::upload::manager::SstableComponentBytes;
 
+use super::control::{SubmissionTicket, TableCompactionPause, TaskTracker};
 use super::metadata::{CompactionTask, SSTableMetadata};
 
 /// One queued task per worker is sufficient to keep every worker busy while
@@ -177,50 +177,45 @@ fn configured_compaction_workers() -> usize {
 /// task finishes, so at most `cap` tasks ever execute concurrently regardless
 /// of how many worker threads exist.
 struct CompactionGate {
-    cap: usize,
-    available: Mutex<usize>,
-    cv: Condvar,
+    permits: Receiver<()>,
+    returned: Sender<()>,
 }
 
 impl CompactionGate {
     fn new(cap: usize) -> Self {
-        let cap = cap.max(1);
-        Self {
-            cap,
-            available: Mutex::new(cap),
-            cv: Condvar::new(),
+        let (returned, permits) = crossbeam_channel::bounded(cap.max(1));
+        for _ in 0..cap.max(1) {
+            returned.send(()).expect("new permit channel");
         }
+        Self { permits, returned }
     }
 
-    /// Block until a permit is available, then take it. Returns a guard that
-    /// returns the permit on drop. `stop` is polled so a shutting-down executor
-    /// does not deadlock waiting on a permit that never frees.
-    fn acquire<'a>(&'a self, stop: &AtomicBool) -> Option<CompactionPermit<'a>> {
-        let mut available = self.available.lock();
-        while *available == 0 {
-            if stop.load(Ordering::Acquire) {
-                return None;
-            }
-            // Bounded wait so shutdown is observed promptly even if no permit
-            // frees up (Rule 2: no unbounded blocking).
-            self.cv
-                .wait_for(&mut available, std::time::Duration::from_millis(100));
+    fn acquire<'a>(
+        &'a self,
+        cancel: &CancelToken,
+        shutdown: &Receiver<()>,
+    ) -> Option<CompactionPermit<'a>> {
+        if cancel.is_cancelled() {
+            return None;
         }
-        *available -= 1;
-        Some(CompactionPermit { gate: self })
+        crossbeam_channel::select! {
+            recv(self.permits) -> _ => Some(CompactionPermit { gate: self }),
+            recv(cancel.closed()) -> _ => None,
+            recv(shutdown) -> _ => None,
+        }
     }
 }
 
-/// RAII permit: returns its slot to the [`CompactionGate`] on drop.
 struct CompactionPermit<'a> {
     gate: &'a CompactionGate,
 }
 
 impl Drop for CompactionPermit<'_> {
     fn drop(&mut self) {
-        let mut available = self.gate.available.lock();
-        *available = (*available + 1).min(self.gate.cap);
-        self.gate.cv.notify_one();
+        self.gate
+            .returned
+            .try_send(())
+            .expect("permit returned exactly once");
     }
 }
 
@@ -564,12 +559,6 @@ fn send_result_or_cancel<T>(
     }
 }
 
-/// One cancellation record per task, keyed by its first claimed input.
-struct InFlightCompaction {
-    cancel: CancelToken,
-    input_bytes: u64,
-}
-
 /// Runs compaction tasks on a background thread.
 ///
 /// `StorageEngine` submits tasks via `submit()` and polls results via
@@ -582,8 +571,7 @@ pub struct CompactionExecutor {
     /// handed to a poll. Lock order: this slot, then `result_rx`.
     held_result: Mutex<Option<CompactionResult>>,
     handles: Mutex<Vec<thread::JoinHandle<()>>>,
-    stop_flag: Arc<AtomicBool>,
-    in_flight_inputs: Arc<Mutex<HashSet<String>>>,
+    tracker: TaskTracker,
     /// Count of completed results sitting in `result_rx`, waiting to be
     /// drained by `poll_results`/`poll_results_bounded`. Incremented by a
     /// worker thread the instant it enqueues a finished result, decremented
@@ -592,12 +580,6 @@ pub struct CompactionExecutor {
     /// unlike "does a file exist under compaction/", it cannot observe a
     /// half-written staging artifact as "done".
     pending_results: Arc<AtomicUsize>,
-    /// One cancellation record per currently-claimed task, keyed by its first
-    /// input key (T-025); total input bytes drive disk-reserve selection. `shutdown()` cancels every
-    /// token here before joining workers, which reaches both tasks actively
-    /// merging AND completed tasks whose `CompactionResult` is still sitting
-    /// in the result queue, unfinalized by `poll_compactions`.
-    in_flight_tokens: Arc<Mutex<std::collections::HashMap<String, InFlightCompaction>>>,
     /// Closing this (dropping the sole sender in `shutdown()`) wakes every
     /// worker blocked in `select!` on its task channel immediately — no poll
     /// interval (T-021 CD1, decisions.md D7).
@@ -642,10 +624,8 @@ impl CompactionExecutor {
         let (result_tx, result_rx) = crossbeam_channel::bounded::<CompactionResult>(
             worker_count.saturating_mul(RESULT_QUEUE_CAPACITY_PER_WORKER),
         );
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let in_flight_inputs = Arc::new(Mutex::new(HashSet::new()));
+        let tracker = TaskTracker::default();
         let pending_results = Arc::new(AtomicUsize::new(0));
-        let in_flight_tokens = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let gate = Arc::new(CompactionGate::new(max_concurrent));
         // The sole sender lives on `Self`; dropping it in `shutdown()` closes
         // this channel and wakes every worker's `select!` at once — no poll
@@ -660,10 +640,8 @@ impl CompactionExecutor {
                 crossbeam_channel::bounded::<QueuedCompactionTask>(TASK_QUEUE_CAPACITY_PER_WORKER);
             task_txs.push(task_tx);
             let result_tx = result_tx.clone();
-            let stop = Arc::clone(&stop_flag);
-            let in_flight_inputs = Arc::clone(&in_flight_inputs);
+            let tracker = tracker.clone();
             let pending_results = Arc::clone(&pending_results);
-            let in_flight_tokens = Arc::clone(&in_flight_tokens);
             let gate = Arc::clone(&gate);
             let reader_pool = reader_pool.clone();
             let shutdown_rx = shutdown_rx.clone();
@@ -698,18 +676,17 @@ impl CompactionExecutor {
                         // `compaction_running_max` reflects tasks
                         // actually executing, never those blocked at the
                         // gate.
-                        let permit = match gate.acquire(&stop) {
+                        let permit = match gate.acquire(&cancel, &shutdown_rx) {
                             Some(permit) => permit,
                             None => {
-                                // Shutting down before a permit freed:
+                                // Cancelled before a permit freed:
                                 // requeued inputs are released so a
                                 // restart can reschedule them.
                                 Self::release_in_flight_inputs(
-                                    &in_flight_inputs,
-                                    &in_flight_tokens,
+                                    &tracker,
                                     &task,
                                 );
-                                break;
+                                continue;
                             }
                         };
                         crate::metrics::inc_compaction_running();
@@ -737,7 +714,7 @@ impl CompactionExecutor {
                                 ) {
                                     remove_staged_output_components(&unsent.output.path, &unsent.output.id);
                                     Self::release_in_flight_inputs(
-                                        &in_flight_inputs, &in_flight_tokens, &unsent.task,
+                                        &tracker, &unsent.task,
                                     );
                                     if let Some(reason) = cancel.reason() {
                                         crate::metrics::inc_compaction_cancelled();
@@ -751,11 +728,11 @@ impl CompactionExecutor {
                                             "compaction: result delivery stopped; staged output removed, inputs remain live");
                                     }
                                 }
+                                tracker.changed.notify_waiters();
                             }
                             Err(e) => {
                                 Self::release_in_flight_inputs(
-                                    &in_flight_inputs,
-                                    &in_flight_tokens,
+                                    &tracker,
                                     &task,
                                 );
                                 crate::metrics::observe_compaction_phase(
@@ -796,10 +773,8 @@ impl CompactionExecutor {
             result_rx: Mutex::new(result_rx),
             held_result: Mutex::new(None),
             handles: Mutex::new(handles),
-            stop_flag,
-            in_flight_inputs,
+            tracker,
             pending_results,
-            in_flight_tokens,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         }
     }
@@ -811,34 +786,38 @@ impl CompactionExecutor {
     /// a bounded maintenance batch was actually accepted can use this result
     /// instead of treating overlap suppression as a successful submission.
     pub fn try_submit(&self, task: CompactionTask) -> ferrosa_common::Result<bool> {
-        crate::metrics::inc_compaction_submitted();
-        if !Self::try_claim_in_flight_inputs(&self.in_flight_inputs, &task) {
-            crate::metrics::inc_compaction_skipped_overlap();
-            tracing::debug!(
-                table_id = %task.table_id,
-                inputs = task.inputs.len(),
-                "compaction: skipping overlapping task already in flight"
-            );
+        let Some(ticket) = self.submission_ticket(&task.table_id) else {
             return Ok(false);
-        }
+        };
+        self.try_submit_with_ticket(task, &ticket)
+    }
 
-        // One CancelToken per task (T-021, compaction-cancel-safety.md C1),
-        // created alongside the in-flight claim and registered under the
-        // same input keys so `shutdown()` can find and cancel it.
-        let cancel = CancelToken::new();
-        if let Some(first) = task.inputs.first() {
-            let input_bytes = task
-                .inputs
-                .iter()
-                .fold(0u64, |sum, input| sum.saturating_add(input.size_bytes));
-            self.in_flight_tokens.lock().insert(
-                Self::input_key(&task, &first.id),
-                InFlightCompaction {
-                    cancel: cancel.clone(),
-                    input_bytes,
-                },
-            );
-        }
+    pub(crate) fn submission_ticket(&self, table: &crate::TableId) -> Option<SubmissionTicket> {
+        self.tracker.submission_ticket(table)
+    }
+
+    pub(crate) fn pause_table(
+        &self,
+        table: &crate::TableId,
+        reason: CancelReason,
+    ) -> TableCompactionPause {
+        self.tracker.pause_table(table, reason)
+    }
+
+    pub(crate) fn changed(&self) -> &tokio::sync::Notify {
+        &self.tracker.changed
+    }
+
+    pub(crate) fn try_submit_with_ticket(
+        &self,
+        task: CompactionTask,
+        ticket: &SubmissionTicket,
+    ) -> ferrosa_common::Result<bool> {
+        crate::metrics::inc_compaction_submitted();
+        let Some(cancel) = self.tracker.try_register(&task, ticket) else {
+            crate::metrics::inc_compaction_skipped_overlap();
+            return Ok(false);
+        };
         // Registers `cancel` for the harness (T-021), scoped by table id —
         // the same scope `cancel_point!` passes. A test's cancel-point hook
         // can look this exact token up (`cancel_harness::cancel_now`) and
@@ -864,11 +843,7 @@ impl CompactionExecutor {
             Ok(()) => Ok(true),
             Err(crossbeam_channel::TrySendError::Full(queued)) => {
                 crate::metrics::dec_compaction_queue_depth();
-                Self::release_in_flight_inputs(
-                    &self.in_flight_inputs,
-                    &self.in_flight_tokens,
-                    &queued.task,
-                );
+                Self::release_in_flight_inputs(&self.tracker, &queued.task);
                 tracing::debug!(
                     table_id = %queued.task.table_id,
                     inputs = queued.task.inputs.len(),
@@ -878,11 +853,7 @@ impl CompactionExecutor {
             }
             Err(crossbeam_channel::TrySendError::Disconnected(queued)) => {
                 crate::metrics::dec_compaction_queue_depth();
-                Self::release_in_flight_inputs(
-                    &self.in_flight_inputs,
-                    &self.in_flight_tokens,
-                    &queued.task,
-                );
+                Self::release_in_flight_inputs(&self.tracker, &queued.task);
                 Err(ferrosa_common::Error::InvalidFormat(
                     "compaction channel closed".into(),
                 ))
@@ -911,7 +882,10 @@ impl CompactionExecutor {
         let rx = self.result_rx.lock();
         let mut results = Vec::with_capacity(max_results.min(8));
         if max_results > 0 {
-            results.extend(held.take());
+            if let Some(result) = held.take() {
+                self.pending_results.fetch_sub(1, Ordering::Release);
+                results.push(result);
+            }
         }
         while results.len() < max_results {
             let Ok(result) = rx.try_recv() else {
@@ -990,21 +964,7 @@ impl CompactionExecutor {
     /// so a burst of rejected writes cannot cancel every compaction at once.
     /// Admission must still independently verify that free space recovered.
     pub fn cancel_largest_for_disk_reserve(&self) -> Option<u64> {
-        let tasks = self.in_flight_tokens.lock();
-        if tasks
-            .values()
-            .any(|task| task.cancel.reason() == Some(CancelReason::DiskReserve))
-        {
-            return None;
-        }
-        let (key, task) = tasks
-            .iter()
-            .filter(|(_, task)| !task.cancel.is_cancelled())
-            .max_by_key(|(_, task)| task.input_bytes)?;
-        task.cancel.cancel(CancelReason::DiskReserve);
-        tracing::warn!(task = %key, input_bytes = task.input_bytes,
-            "compaction: cancelling largest task to reclaim disk reserve");
-        Some(task.input_bytes)
+        self.tracker.cancel_largest_for_disk_reserve()
     }
 
     /// Releases a successful task's inputs after its result has been finalized.
@@ -1014,7 +974,7 @@ impl CompactionExecutor {
     /// and the first finalized result can delete files the duplicate task still
     /// expects to read.
     pub fn release_task_inputs(&self, task: &CompactionTask) {
-        Self::release_in_flight_inputs(&self.in_flight_inputs, &self.in_flight_tokens, task);
+        Self::release_in_flight_inputs(&self.tracker, task);
     }
 
     /// Shuts down the compaction executor, waiting for the background thread.
@@ -1027,10 +987,7 @@ impl CompactionExecutor {
     /// unfinalized by `poll_compactions`: `poll_compactions` checks the same
     /// token before promoting and discards the staged output instead.
     pub fn shutdown(&self) {
-        self.stop_flag.store(true, Ordering::Release);
-        for task in self.in_flight_tokens.lock().values() {
-            task.cancel.cancel(CancelReason::Shutdown);
-        }
+        self.tracker.cancel_all(CancelReason::Shutdown);
         // Dropping the sole sender closes the channel: every worker blocked
         // in `select!` on it wakes at once (no poll interval).
         self.shutdown_tx.lock().take();
@@ -1055,41 +1012,8 @@ impl CompactionExecutor {
         }
     }
 
-    fn input_key(task: &CompactionTask, input_id: &str) -> String {
-        format!("{}:{input_id}", task.table_id)
-    }
-
-    fn try_claim_in_flight_inputs(
-        in_flight_inputs: &Mutex<HashSet<String>>,
-        task: &CompactionTask,
-    ) -> bool {
-        let keys: Vec<String> = task
-            .inputs
-            .iter()
-            .map(|input| Self::input_key(task, &input.id))
-            .collect();
-        let mut in_flight = in_flight_inputs.lock();
-        if keys.iter().any(|key| in_flight.contains(key)) {
-            return false;
-        }
-        in_flight.extend(keys);
-        true
-    }
-
-    fn release_in_flight_inputs(
-        in_flight_inputs: &Mutex<HashSet<String>>,
-        in_flight_tokens: &Mutex<std::collections::HashMap<String, InFlightCompaction>>,
-        task: &CompactionTask,
-    ) {
-        let mut in_flight = in_flight_inputs.lock();
-        for input in &task.inputs {
-            in_flight.remove(&Self::input_key(task, &input.id));
-        }
-        if let Some(first) = task.inputs.first() {
-            in_flight_tokens
-                .lock()
-                .remove(&Self::input_key(task, &first.id));
-        }
+    fn release_in_flight_inputs(tracker: &TaskTracker, task: &CompactionTask) {
+        tracker.release(task);
         // The task is fully finalized (failed/cancelled during merge, or
         // promoted/rolled-back by `poll_compactions`): the harness registry
         // entry for this table (`try_submit` registered it) has no further
@@ -2006,63 +1930,49 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn register_pressure_task(
+        executor: &CompactionExecutor,
+        id: &str,
+        bytes: u64,
+    ) -> (CompactionTask, CancelToken) {
+        let task = CompactionTask {
+            inputs: vec![make_metadata(id, bytes)],
+            output_dir: PathBuf::from("unused"),
+            schema: test_table_schema(),
+            table_id: test_table_id(),
+            purge: None,
+        };
+        let ticket = executor.submission_ticket(&task.table_id).unwrap();
+        let token = executor.tracker.try_register(&task, &ticket).unwrap();
+        (task, token)
+    }
+
     #[test]
     fn cancel_source_disk_reserve_selects_largest_and_coalesces_until_release() {
         let executor = CompactionExecutor::new();
-        let small = CancelToken::new();
-        let large = CancelToken::new();
-        {
-            let mut tasks = executor.in_flight_tokens.lock();
-            tasks.insert(
-                "ks.small:1".into(),
-                InFlightCompaction {
-                    cancel: small.clone(),
-                    input_bytes: 10,
-                },
-            );
-            tasks.insert(
-                "ks.large:1".into(),
-                InFlightCompaction {
-                    cancel: large.clone(),
-                    input_bytes: 100,
-                },
-            );
-        }
+        let (small_task, small) = register_pressure_task(&executor, "small", 10);
+        let (large_task, large) = register_pressure_task(&executor, "large", 100);
         assert_eq!(executor.cancel_largest_for_disk_reserve(), Some(100));
         assert_eq!(large.reason(), Some(CancelReason::DiskReserve));
         assert!(!small.is_cancelled());
         assert_eq!(executor.cancel_largest_for_disk_reserve(), None);
-        executor.in_flight_tokens.lock().remove("ks.large:1");
+        executor.release_task_inputs(&large_task);
         assert_eq!(executor.cancel_largest_for_disk_reserve(), Some(10));
         assert_eq!(small.reason(), Some(CancelReason::DiskReserve));
+        executor.release_task_inputs(&small_task);
     }
 
     #[test]
     fn cancel_source_disk_reserve_skips_tasks_cancelled_by_other_sources() {
         let executor = CompactionExecutor::new();
-        let small = CancelToken::new();
-        let large = CancelToken::new();
+        let (small_task, small) = register_pressure_task(&executor, "small", 10);
+        let (large_task, large) = register_pressure_task(&executor, "large", 100);
         large.cancel(CancelReason::Operator);
-        {
-            let mut tasks = executor.in_flight_tokens.lock();
-            tasks.insert(
-                "ks.small:1".into(),
-                InFlightCompaction {
-                    cancel: small.clone(),
-                    input_bytes: 10,
-                },
-            );
-            tasks.insert(
-                "ks.large:1".into(),
-                InFlightCompaction {
-                    cancel: large.clone(),
-                    input_bytes: 100,
-                },
-            );
-        }
         assert_eq!(executor.cancel_largest_for_disk_reserve(), Some(10));
         assert_eq!(large.reason(), Some(CancelReason::Operator));
         assert_eq!(small.reason(), Some(CancelReason::DiskReserve));
+        executor.release_task_inputs(&small_task);
+        executor.release_task_inputs(&large_task);
     }
 
     #[test]
@@ -2436,20 +2346,14 @@ mod tests {
             purge: None,
         };
 
-        assert!(CompactionExecutor::try_claim_in_flight_inputs(
-            &executor.in_flight_inputs,
-            &task
-        ));
+        let ticket = executor.submission_ticket(&task.table_id).unwrap();
+        assert!(executor.tracker.try_register(&task, &ticket).is_some());
         assert!(
-            !CompactionExecutor::try_claim_in_flight_inputs(&executor.in_flight_inputs, &task),
-            "overlapping compaction must stay blocked while a completed result waits to be finalized"
+            executor.tracker.try_register(&task, &ticket).is_none(),
+            "inputs remain claimed until finalization"
         );
-
         executor.release_task_inputs(&task);
-        assert!(
-            CompactionExecutor::try_claim_in_flight_inputs(&executor.in_flight_inputs, &task),
-            "poll_compactions finalization should release inputs for future compaction"
-        );
+        assert!(executor.tracker.try_register(&task, &ticket).is_some());
         executor.release_task_inputs(&task);
         executor.shutdown();
     }
@@ -3455,19 +3359,23 @@ mod tests {
         const ITERS: usize = 50;
 
         let gate = Arc::new(CompactionGate::new(CAP));
-        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
+        let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(0);
         let live = Arc::new(AtomicUsize::new(0));
         let max_live = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::new();
         for _ in 0..WORKERS {
             let gate = Arc::clone(&gate);
-            let stop = Arc::clone(&stop);
+            let cancel = cancel.clone();
+            let shutdown_rx = shutdown_rx.clone();
             let live = Arc::clone(&live);
             let max_live = Arc::clone(&max_live);
             handles.push(std::thread::spawn(move || {
                 for _ in 0..ITERS {
-                    let permit = gate.acquire(&stop).expect("permit while not stopped");
+                    let permit = gate
+                        .acquire(&cancel, &shutdown_rx)
+                        .expect("permit while not stopped");
                     let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                     max_live.fetch_max(now, Ordering::SeqCst);
                     // Hold the permit briefly so contention is real.
@@ -3489,28 +3397,52 @@ mod tests {
     }
 
     /// A shutting-down executor must not deadlock a worker blocked on the gate:
-    /// `acquire` returns `None` once `stop` is set.
+    /// `acquire` returns `None` once the shutdown sender closes.
     #[test]
     fn compaction_gate_unblocks_on_shutdown() {
         let gate = Arc::new(CompactionGate::new(1));
-        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
+        let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(0);
 
         // Exhaust the single permit and hold it.
-        let held = gate.acquire(&stop).expect("first permit");
+        let held = gate.acquire(&cancel, &shutdown_rx).expect("first permit");
 
         let waiter = {
             let gate = Arc::clone(&gate);
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || gate.acquire(&stop).is_none())
+            let cancel = cancel.clone();
+            let shutdown_rx = shutdown_rx.clone();
+            std::thread::spawn(move || gate.acquire(&cancel, &shutdown_rx).is_none())
         };
-        // Give the waiter time to block on the unavailable permit.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        stop.store(true, Ordering::Release);
+        drop(_shutdown_tx);
         let returned_none = waiter.join().unwrap();
         assert!(
             returned_none,
             "waiter must observe shutdown and stop blocking, not wait forever"
         );
+        drop(held);
+    }
+
+    #[test]
+    fn compaction_gate_unblocks_on_table_cancellation() {
+        let gate = CompactionGate::new(1);
+        let cancel = CancelToken::new();
+        let (_shutdown, shutdown_rx) = crossbeam_channel::bounded(0);
+        let held = gate.acquire(&cancel, &shutdown_rx).unwrap();
+        std::thread::scope(|scope| {
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            let gate_ref = &gate;
+            let cancel_ref = &cancel;
+            let shutdown_ref = &shutdown_rx;
+            scope.spawn(move || {
+                done_tx
+                    .send(gate_ref.acquire(cancel_ref, shutdown_ref).is_none())
+                    .unwrap();
+            });
+            cancel.cancel(CancelReason::TableDropped);
+            assert!(done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap());
+        });
         drop(held);
     }
 

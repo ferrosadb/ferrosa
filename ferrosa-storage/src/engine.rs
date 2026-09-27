@@ -1,8 +1,8 @@
 //! Module: Compose commit log, memtable, flush, compaction, object storage, and cache.
 //! Correctness: Correct when admitted writes are durable before visibility and reads,
 //! replay, flush, and maintenance preserve table and cursor invariants.
-//! Last revised: 2026-09-26
-//! Last changed: Retain recovery intents on atomic input retirement failures.
+//! Last revised: 2026-09-27
+//! Last changed: Coordinate table DDL with compaction cancellation and completion.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -3875,6 +3875,29 @@ impl StorageEngine {
     /// from this path). Local deletion is sufficient to prevent stale data
     /// from being loaded on re-creation.
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        let pause = self
+            .compaction_executor
+            .pause_table(table_id, ferrosa_common::CancelReason::TableDropped);
+        if !pause.is_drained() {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "table {table_id} has active compaction; use unregister_table_and_wait"
+            )));
+        }
+        self.unregister_table_quiesced(table_id)
+    }
+
+    /// Cancel compactions, await their complete finalization, then change table storage.
+    pub async fn unregister_table_and_wait(
+        self: &Arc<Self>,
+        table_id: &TableId,
+    ) -> ferrosa_common::Result<()> {
+        let _pause = self
+            .pause_table_compactions(table_id, ferrosa_common::CancelReason::TableDropped)
+            .await?;
+        self.unregister_table_quiesced(table_id)
+    }
+
+    fn unregister_table_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         if let Some(state) = self.tables.write().remove(table_id) {
             if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
                 self.soft_pressure_table_count
@@ -8643,6 +8666,46 @@ impl StorageEngine {
     /// Subsequent reads for this table will return empty results. Existing
     /// readers holding `Arc` references to old data will complete normally.
     pub fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        let pause = self
+            .compaction_executor
+            .pause_table(table_id, ferrosa_common::CancelReason::Truncated);
+        if !pause.is_drained() {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "table {table_id} has active compaction; use truncate_and_wait"
+            )));
+        }
+        self.truncate_quiesced(table_id)
+    }
+
+    /// Cancel compactions, await their complete finalization, then change table storage.
+    pub async fn truncate_and_wait(
+        self: &Arc<Self>,
+        table_id: &TableId,
+    ) -> ferrosa_common::Result<()> {
+        let engine = Arc::clone(self);
+        let table_id = table_id.clone();
+        TaskPool::current("storage-truncate")
+            .spawn(async move {
+                let _pause = engine
+                    .pause_table_compactions(&table_id, ferrosa_common::CancelReason::Truncated)
+                    .await?;
+                engine.truncate_local(&table_id)?;
+                engine.truncate_s3_async(&table_id).await;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                ferrosa_common::Error::InvalidFormat(format!("TRUNCATE task failed: {error}"))
+            })?
+    }
+
+    fn truncate_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        self.truncate_local(table_id)?;
+        self.truncate_s3(table_id);
+        Ok(())
+    }
+
+    fn truncate_local(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         let tables = self.tables.read();
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
@@ -8669,10 +8732,6 @@ impl StorageEngine {
             let _ = std::fs::create_dir_all(&table_dir);
         }
 
-        // Delete S3 objects + manifest entry for this table synchronously
-        // so stale data doesn't reappear on bootstrap from S3.
-        self.truncate_s3(table_id);
-
         Ok(())
     }
 
@@ -8683,6 +8742,24 @@ impl StorageEngine {
     /// S3 deletions complete — this ensures stale data doesn't reappear
     /// when other nodes bootstrap from S3 after a TRUNCATE.
     fn truncate_s3(&self, table_id: &TableId) {
+        if self.resolve_store_and_prefix().is_none() {
+            return;
+        }
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("truncate S3 runtime");
+                rt.block_on(self.truncate_s3_async(table_id));
+            });
+            if let Err(error) = handle.join() {
+                tracing::warn!(?error, "TRUNCATE: S3 cleanup thread panicked");
+            }
+        });
+    }
+
+    async fn truncate_s3_async(&self, table_id: &TableId) {
         let Some((store, prefix)) = self.resolve_store_and_prefix() else {
             return;
         };
@@ -8693,80 +8770,67 @@ impl StorageEngine {
             .as_ref()
             .map(|c| format!("{}/manifest.json", c.prefix));
 
-        // Run S3 operations on a blocking thread with its own runtime.
-        let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("truncate S3 runtime");
-            rt.block_on(async {
-                // 1. Delete all SSTable objects for this table (recursive).
-                // S3 objects are stored under: {prefix}/{table_id}/{sstable_id}/...
-                // We also need to check subdirectories, so use list_with_delimiter
-                // at the table level to find SSTable dirs, then delete each.
-                let table_path = object_store::path::Path::from(format!("{prefix}/{table_id_str}"));
-                match store.list_with_delimiter(Some(&table_path)).await {
-                    Ok(result) => {
-                        let mut deleted = 0u64;
-                        // Delete objects at the table level
-                        for obj in &result.objects {
+        // 1. Delete all SSTable objects for this table (recursive).
+        // S3 objects are stored under: {prefix}/{table_id}/{sstable_id}/...
+        // We also need to check subdirectories, so use list_with_delimiter
+        // at the table level to find SSTable dirs, then delete each.
+        let table_path = object_store::path::Path::from(format!("{prefix}/{table_id_str}"));
+        match store.list_with_delimiter(Some(&table_path)).await {
+            Ok(result) => {
+                let mut deleted = 0u64;
+                // Delete objects at the table level
+                for obj in &result.objects {
+                    let _ = store.delete(&obj.location).await;
+                    deleted += 1;
+                }
+                // Delete objects in SSTable subdirectories
+                for subdir in &result.common_prefixes {
+                    if let Ok(sub_result) = store.list_with_delimiter(Some(subdir)).await {
+                        for obj in &sub_result.objects {
                             let _ = store.delete(&obj.location).await;
                             deleted += 1;
                         }
-                        // Delete objects in SSTable subdirectories
-                        for subdir in &result.common_prefixes {
-                            if let Ok(sub_result) = store.list_with_delimiter(Some(subdir)).await {
-                                for obj in &sub_result.objects {
-                                    let _ = store.delete(&obj.location).await;
-                                    deleted += 1;
-                                }
-                            }
-                        }
-                        if deleted > 0 {
-                            tracing::info!(
-                                table = %table_id_str,
-                                deleted,
-                                "TRUNCATE: deleted S3 objects"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            table = %table_id_str,
-                            %e,
-                            "TRUNCATE: S3 list failed"
-                        );
                     }
                 }
+                if deleted > 0 {
+                    tracing::info!(
+                        table = %table_id_str,
+                        deleted,
+                        "TRUNCATE: deleted S3 objects"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_id_str,
+                    %e,
+                    "TRUNCATE: S3 list failed"
+                );
+            }
+        }
 
-                // 2. Remove this table from the S3 manifest.
-                if let Some(mpath) = manifest_path {
-                    let path = object_store::path::Path::from(mpath);
-                    if let Ok(data) = store.get(&path).await {
-                        if let Ok(bytes) = data.bytes().await {
-                            if let Ok(mut manifest) =
-                                serde_json::from_slice::<crate::manifest::Manifest>(&bytes)
-                            {
-                                if manifest.sstables.remove(&table_id_str).is_some() {
-                                    if let Ok(updated) = serde_json::to_vec_pretty(&manifest) {
-                                        let _ = store
-                                            .put(&path, object_store::PutPayload::from(updated))
-                                            .await;
-                                        tracing::info!(
-                                            table = %table_id_str,
-                                            "TRUNCATE: removed table from S3 manifest"
-                                        );
-                                    }
-                                }
+        // 2. Remove this table from the S3 manifest.
+        if let Some(mpath) = manifest_path {
+            let path = object_store::path::Path::from(mpath);
+            if let Ok(data) = store.get(&path).await {
+                if let Ok(bytes) = data.bytes().await {
+                    if let Ok(mut manifest) =
+                        serde_json::from_slice::<crate::manifest::Manifest>(&bytes)
+                    {
+                        if manifest.sstables.remove(&table_id_str).is_some() {
+                            if let Ok(updated) = serde_json::to_vec_pretty(&manifest) {
+                                let _ = store
+                                    .put(&path, object_store::PutPayload::from(updated))
+                                    .await;
+                                tracing::info!(
+                                    table = %table_id_str,
+                                    "TRUNCATE: removed table from S3 manifest"
+                                );
                             }
                         }
                     }
                 }
-            });
-        });
-        // Wait for S3 cleanup to complete before returning.
-        if let Err(e) = handle.join() {
-            tracing::warn!("TRUNCATE: S3 cleanup thread panicked: {:?}", e);
+            }
         }
     }
 
@@ -9413,6 +9477,50 @@ impl StorageEngine {
         let results = self
             .compaction_executor
             .poll_results_bounded(MAX_RESULTS_PER_MAINTENANCE_POLL);
+        self.finalize_compactions(results).await;
+        self.schedule_compaction_backlog_round();
+    }
+
+    /// Pause admission before cancellation. Enable the notification before checking
+    /// claims/results so a result publication or release cannot be missed.
+    pub async fn pause_table_compactions(
+        self: &Arc<Self>,
+        table_id: &TableId,
+        reason: ferrosa_common::CancelReason,
+    ) -> ferrosa_common::Result<crate::compaction::TableCompactionPause> {
+        let pause = self.compaction_executor.pause_table(table_id, reason);
+        loop {
+            let changed = self.compaction_executor.changed().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if pause.is_drained() {
+                return Ok(pause);
+            }
+            let results = self.compaction_executor.poll_results_bounded(8);
+            if results.is_empty() {
+                changed.await;
+            } else {
+                let engine = Arc::clone(self);
+                // Dropping a DDL waiter detaches this job; committed finalization
+                // and claim release must survive a request disconnect.
+                TaskPool::current("storage-compaction-finalize")
+                    .spawn(async move {
+                        engine.finalize_compactions(results).await;
+                    })
+                    .await
+                    .map_err(|error| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "compaction finalizer failed while draining {table_id}: {error}"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    async fn finalize_compactions(
+        &self,
+        results: Vec<crate::compaction::executor::CompactionResult>,
+    ) {
         for result in results {
             let _input_claim = CompactionResultInputClaim {
                 executor: &self.compaction_executor,
@@ -10119,11 +10227,6 @@ impl StorageEngine {
                 }
             }
         }
-
-        // A restarted node may already own thousands of SSTables but receive no
-        // new writes. Schedule another bounded round after every maintenance
-        // poll so backlog reduction cannot depend on a future flush event.
-        self.schedule_compaction_backlog_round();
     }
 
     /// Opens an SSTable from component files in a directory.
@@ -10334,6 +10437,9 @@ impl StorageEngine {
     pub fn force_compact_all(&self) {
         let tables = self.tables.read();
         for (table_id, state) in tables.iter() {
+            let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
+                continue;
+            };
             let metadata = self.collect_sstable_metadata(table_id, state);
             tracing::info!(%table_id, count = metadata.len(), "force-compact: table SSTables");
             if metadata.len() >= 2 {
@@ -10345,7 +10451,10 @@ impl StorageEngine {
                     table_id: table_id.clone(),
                     purge,
                 };
-                if let Err(e) = self.compaction_executor.submit(task) {
+                if let Err(e) = self
+                    .compaction_executor
+                    .try_submit_with_ticket(task, &ticket)
+                {
                     tracing::error!(%e, %table_id, "force-compact: submit failed");
                 }
             }
@@ -10371,6 +10480,12 @@ impl StorageEngine {
             });
         }
 
+        let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
+            return Ok(IncrementalCompactionSchedule::InFlight {
+                input_sstables: 0,
+                input_bytes: 0,
+            });
+        };
         let (available_sstables, inputs, schema, purge) = {
             let tables = self.tables.read();
             let Some(state) = tables.get(table_id) else {
@@ -10423,7 +10538,10 @@ impl StorageEngine {
             purge,
         };
         let input_sstables = task.inputs.len();
-        match self.compaction_executor.try_submit(task)? {
+        match self
+            .compaction_executor
+            .try_submit_with_ticket(task, &ticket)?
+        {
             true => {
                 tracing::info!(
                     %table_id,
@@ -10446,6 +10564,9 @@ impl StorageEngine {
     }
 
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) -> bool {
+        let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
+            return false;
+        };
         let sstable_count = state.store.sstable_count();
         let (min_inputs, max_inputs) = effective_compaction_input_bounds(
             self.config.compaction.min_threshold,
@@ -10476,7 +10597,10 @@ impl StorageEngine {
                 table_id: table_id.clone(),
                 purge,
             };
-            return match self.compaction_executor.try_submit(task) {
+            return match self
+                .compaction_executor
+                .try_submit_with_ticket(task, &ticket)
+            {
                 Ok(accepted) => {
                     if accepted {
                         tracing::info!(
@@ -10538,7 +10662,10 @@ impl StorageEngine {
         let mut accepted_any = false;
         for mut task in tasks {
             task.purge = self.purge_policy_for(table_id, state, &task.inputs);
-            match self.compaction_executor.try_submit(task) {
+            match self
+                .compaction_executor
+                .try_submit_with_ticket(task, &ticket)
+            {
                 Ok(accepted) => accepted_any |= accepted,
                 Err(error) => {
                     tracing::error!(%error, %table_id, "storage-engine: compaction submit failed");
@@ -22931,6 +23058,130 @@ mod tests {
              a pass. Implement the steps in this test's doc comment (T-070) \
              before removing this panic."
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_source_ddl_abandoned_waiter_does_not_abandon_owned_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        let mut drain = Box::pin(
+            engine.pause_table_compactions(&tid, ferrosa_common::CancelReason::TableDropped),
+        );
+        // This poll dequeues the result and spawns its finalizer. The spawned
+        // job cannot run yet on this single-thread runtime.
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        assert_eq!(engine.compaction_executor.pending_result_count(), 0);
+        drop(drain);
+        let pause = tokio::time::timeout(
+            COMPACTION_HANG_GUARD,
+            engine.pause_table_compactions(&tid, ferrosa_common::CancelReason::TableDropped),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(pause.is_drained());
+        assert_eq!(
+            engine.sstable_count(&tid),
+            2,
+            "abandoned DROP does not remove table data"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_source_ddl_truncate_drains_result_and_rejects_stale_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        let ticket = engine.compaction_executor.submission_ticket(&tid).unwrap();
+        let stale = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            crate::compaction::metadata::CompactionTask {
+                inputs: engine.collect_sstable_metadata(&tid, state),
+                output_dir: dir.path().join("compaction").join(tid.to_string()),
+                schema: test_schema(),
+                table_id: tid.clone(),
+                purge: None,
+            }
+        };
+        // The synchronous boundary fails before altering table contents.
+        assert!(engine
+            .truncate(&tid)
+            .unwrap_err()
+            .to_string()
+            .contains("active compaction"));
+        assert_eq!(engine.sstable_count(&tid), 2);
+        // Exercise the held-result slot as well as the normal result queue.
+        assert!(engine
+            .compaction_executor
+            .await_result_available(COMPACTION_HANG_GUARD));
+        tokio::time::timeout(COMPACTION_HANG_GUARD, engine.truncate_and_wait(&tid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.compaction_executor.pending_result_count(), 0);
+        assert_eq!(engine.sstable_count(&tid), 0);
+        assert!(engine.read(&tid, &make_key("k1")).unwrap().is_none());
+        assert!(!engine
+            .compaction_executor
+            .try_submit_with_ticket(stale, &ticket)
+            .unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_source_ddl_drop_drains_before_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        assert!(engine
+            .unregister_table(&tid)
+            .unwrap_err()
+            .to_string()
+            .contains("active compaction"));
+        assert_eq!(engine.sstable_count(&tid), 2);
+        tokio::time::timeout(
+            COMPACTION_HANG_GUARD,
+            engine.unregister_table_and_wait(&tid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(engine.compaction_executor.pending_result_count(), 0);
+        assert!(!dir.path().join("sstables").join(tid.to_string()).exists());
+        engine.register_table(test_schema()).unwrap();
+        assert!(engine.read(&tid, &make_key("k1")).unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_source_ddl_wait_yields_until_finalizer_releases_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        // Model a maintenance finalizer that already owns the completed result.
+        let result = engine.compaction_executor.poll_results().pop().unwrap();
+        let ddl = engine.truncate_and_wait(&tid);
+        let release = async {
+            let cancelled = result.cancel.clone();
+            tokio::task::spawn_blocking(move || cancelled.closed().recv())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(result.cancel.is_cancelled());
+            assert_eq!(engine.sstable_count(&tid), 2);
+            crate::compaction::executor::remove_staged_output_components(
+                &result.output.path,
+                &result.output.id,
+            );
+            engine.compaction_executor.release_task_inputs(&result.task);
+        };
+        tokio::time::timeout(COMPACTION_HANG_GUARD, async {
+            let (outcome, ()) = tokio::join!(ddl, release);
+            outcome.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(engine.sstable_count(&tid), 0);
     }
 
     #[tokio::test]

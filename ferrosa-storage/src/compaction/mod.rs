@@ -28,6 +28,8 @@ pub mod cancel_oracle;
 /// after cancel), CD1 (a parked worker exits shutdown immediately).
 #[cfg(test)]
 mod cancel_token_tests;
+pub(crate) mod control;
+pub use control::TableCompactionPause;
 pub mod executor;
 pub mod finalize;
 pub mod intent;

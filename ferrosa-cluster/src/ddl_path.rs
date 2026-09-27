@@ -6,8 +6,8 @@
 //! current deployment mode.
 //! Correctness: formation buffering is explicitly bounded and saturated
 //! producers fail immediately; the queue can never become an unbounded heap.
-//! Last revised: 2026-08-26.
-//! Last changed: replace the unbounded formation queue with bounded admission.
+//! Last revised: 2026-09-27
+//! Last changed: Coordinate table DDL with compaction cancellation and completion.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -142,6 +142,7 @@ impl DdlPath {
                 // (which requires a peer_host_id and peer_manager) by reusing
                 // the same Schema/StorageEngine operations that DdlCoordinator
                 // would perform.
+                let _pauses = pause_ddl_compactions(&op, schema, engine).await?;
                 apply_direct(&op, schema, engine)
             }
             Self::Pair(coordinator) => coordinator.coordinate_ddl(op).await,
@@ -229,6 +230,43 @@ impl DdlPath {
 ///
 /// This mirrors [`DdlCoordinator::apply_ddl_locally`] exactly but does not
 /// require constructing a coordinator (which needs a peer ID and PeerManager).
+pub(crate) async fn pause_ddl_compactions(
+    op: &DdlOperation,
+    schema: &Schema,
+    engine: &Arc<StorageEngine>,
+) -> Result<Vec<ferrosa_storage::compaction::TableCompactionPause>> {
+    let mut pauses = Vec::new();
+    match op {
+        DdlOperation::DropTable { keyspace, table } => {
+            pauses.push(
+                engine
+                    .pause_table_compactions(
+                        &ferrosa_storage::TableId::new(keyspace, table),
+                        ferrosa_common::CancelReason::TableDropped,
+                    )
+                    .await
+                    .map_err(ClusterError::Storage)?,
+            );
+        }
+        DdlOperation::DropKeyspace(name) => {
+            let snapshot = schema.snapshot();
+            for (keyspace, table) in snapshot.tables.keys().filter(|(ks, _)| ks == name) {
+                pauses.push(
+                    engine
+                        .pause_table_compactions(
+                            &ferrosa_storage::TableId::new(keyspace, table),
+                            ferrosa_common::CancelReason::TableDropped,
+                        )
+                        .await
+                        .map_err(ClusterError::Storage)?,
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(pauses)
+}
+
 fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>) -> Result<()> {
     match op {
         DdlOperation::CreateKeyspace(ks) => {
@@ -1902,6 +1940,33 @@ mod tests {
             .snapshot()
             .tables
             .contains_key(&("dtks".into(), "tbl".into())));
+
+        // Exercise the async boundary with a real queued/running compaction.
+        let tid = ferrosa_storage::TableId::new("dtks", "tbl");
+        for value in 0u8..2 {
+            let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(vec![
+                    value;
+                    16
+                ]));
+            let row = ferrosa_sstable::types::Row {
+                clustering: vec![],
+                cells: vec![],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                    1000 + i64::from(value),
+                ),
+            };
+            engine
+                .write(&tid, &key, row, 1000 + i64::from(value))
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+        engine.force_compact_all();
+        assert!(engine
+            .unregister_table(&tid)
+            .unwrap_err()
+            .to_string()
+            .contains("active compaction"));
 
         ddl.execute(DdlOperation::DropTable {
             keyspace: "dtks".into(),

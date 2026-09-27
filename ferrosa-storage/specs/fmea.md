@@ -101,3 +101,11 @@ the largest registered task by input bytes, with one outstanding pressure reques
 at a time. It retains fail-closed admission until free space recovers. Tests
 `cancel_source_disk_reserve_*` cover selection, coalescing, pre-cancelled tasks,
 and the actual engine admission hook.
+
+T-025 DDL coverage extends ST-33: admission and cancellation share a task tracker,
+and old submission tickets remain invalid after DROP/re-create. Async DDL waits
+for queued, running and finalizing claims without blocking Tokio. Synchronous
+DDL fails before changing storage while claims remain. `cancel_source_tracker_*`
+and `cancel_source_ddl_*` cover nested pauses, stale selection, result draining,
+held-result accounting and a finalizer releasing its claim on a single-thread
+runtime. Permit acquisition also selects on cancellation and shutdown.

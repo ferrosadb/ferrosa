@@ -1346,8 +1346,13 @@ impl WritePath {
     /// In cluster mode the coordinator fans out to all nodes.
     pub async fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         match self {
-            Self::Direct(engine) => engine.truncate(table_id),
-            Self::Pair(coordinator) => coordinator.local_storage().truncate(table_id),
+            Self::Direct(engine) => engine.truncate_and_wait(table_id).await,
+            Self::Pair(coordinator) => {
+                coordinator
+                    .local_storage()
+                    .truncate_and_wait(table_id)
+                    .await
+            }
             Self::Cluster(coordinator) => coordinator
                 .coordinate_truncate(table_id)
                 .await

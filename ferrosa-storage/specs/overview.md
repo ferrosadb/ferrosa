@@ -216,3 +216,18 @@ task; it excludes already-cancelled tasks and waits for an outstanding disk-rese
 cancellation to release before selecting another. Cancellation never substitutes
 for the actual free-space check: the current write still fails closed while the
 reserve is exhausted, and later writes can proceed once space recovers.
+
+### Table DDL and compaction cancellation (T-025)
+
+DROP TABLE, DROP KEYSPACE and TRUNCATE pause compaction admission, invalidate
+submission tickets captured before input selection, cancel active tasks, and
+await claim release before removing table data. The task registry and input
+claims share one lock. Result publication and finalization notify async waiters;
+no Tokio worker blocks on compaction completion. A committed replacement still
+finishes its existing finalization before DDL proceeds. CQL, pair, cluster and
+Raft application boundaries hold the pause through schema/storage changes.
+Synchronous storage entry points return a busy error while work is active;
+async callers use `unregister_table_and_wait` or `truncate_and_wait`.
+Async APIs take `Arc<StorageEngine>` so an owned finalization job can survive a
+request disconnect. TRUNCATE retains its pause through asynchronous S3 cleanup;
+a dropped DDL waiter cannot strand a dequeued result or release its claim early.

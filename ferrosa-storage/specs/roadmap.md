@@ -193,3 +193,7 @@ S3 finalization. Operator source wiring remains to be completed.
 Disk-reserve cancellation is implemented: one task record supplies its token and
 total input bytes; the largest eligible task is cancelled on reserve exhaustion,
 without weakening admission or repeatedly cancelling tasks before reclamation.
+
+- T-025 lifecycle: shared admission/task tracker, invalidatable pre-selection
+  tickets, async DROP/TRUNCATE drain wrappers across CQL/pair/cluster/Raft, and
+  synchronous busy semantics. Operator CLI wiring remains a separate slice.
