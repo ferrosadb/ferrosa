@@ -29093,7 +29093,8 @@ mod tests {
                 Arc::new(ferrosa_storage::accord::sync_writer::MockSyncWriter::new()),
             ),
         ));
-        ferrosa_cluster::accord::publish_accord_state(&state.accord_state, local_state.clone());
+        ferrosa_cluster::accord::publish_accord_state(&state.accord_state, local_state.clone())
+            .expect("publish local Accord state");
 
         let loaded = require_local_accord_state_for_lwt(&state)
             .expect("published local Accord state must be available to LWT");
