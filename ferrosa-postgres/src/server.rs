@@ -1572,10 +1572,8 @@ mod txn_atomicity_tests {
 
         let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations).unwrap();
         let metadata = serde_json::to_vec(&changes).unwrap();
-        let txn_id = ferrosa_common::accord::TxnId::new(
-            1,
-            ferrosa_common::accord::Timestamp::synthetic(21),
-        );
+        let txn_id =
+            ferrosa_common::accord::TxnId::new(1, ferrosa_common::accord::Timestamp::synthetic(21));
         let metadata_batch = [metadata];
         <MvccManager as ferrosa_storage::accord::PostgresMvccApplyObserver>::prepare_postgres_apply(
             &ctx.mvcc,
@@ -1606,7 +1604,10 @@ mod txn_atomicity_tests {
                 })
                 .collect::<Vec<_>>()
         };
-        async fn read_at(ctx: &QueryContext, snapshot: &crate::mvcc::MvccSnapshot) -> Vec<BackendMessage> {
+        async fn read_at(
+            ctx: &QueryContext,
+            snapshot: &crate::mvcc::MvccSnapshot,
+        ) -> Vec<BackendMessage> {
             query::execute_query_with_mvcc(
                 &ctx.engine,
                 &ctx.schema,
@@ -1620,9 +1621,21 @@ mod txn_atomicity_tests {
         }
 
         let old_rows = read_at(&ctx, &old_snapshot).await;
-        assert_eq!(rows_for(&old_rows), vec![("row-a".into(), "before-a".into()), ("row-b".into(), "before-b".into())]);
+        assert_eq!(
+            rows_for(&old_rows),
+            vec![
+                ("row-a".into(), "before-a".into()),
+                ("row-b".into(), "before-b".into())
+            ]
+        );
         let committed_rows = read_at(&ctx, &committed_snapshot).await;
-        assert_eq!(rows_for(&committed_rows), vec![("row-a".into(), "after-a".into()), ("row-b".into(), "after-b".into())]);
+        assert_eq!(
+            rows_for(&committed_rows),
+            vec![
+                ("row-a".into(), "after-a".into()),
+                ("row-b".into(), "after-b".into())
+            ]
+        );
 
         ctx.engine
             .write_atomic_batch(vec![mutations[1].clone()])
@@ -1665,8 +1678,11 @@ mod txn_atomicity_tests {
         drop(abandoned);
 
         ctx.engine.shutdown().unwrap();
-        let recovered_engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
-        recovered_engine.register_table(kv_storage_schema()).unwrap();
+        let recovered_engine =
+            Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        recovered_engine
+            .register_table(kv_storage_schema())
+            .unwrap();
         let recovered_ctx = ctx_with(recovered_engine, ctx.schema.clone());
 
         assert_eq!(row_count(&recovered_ctx, "restart-committed").await, 1);
@@ -1687,9 +1703,8 @@ mod txn_atomicity_tests {
         .await;
 
         let oversized_value = "x".repeat(300 * 1024);
-        let oversized_insert = format!(
-            "INSERT INTO kv (k, v) VALUES ('atomic-oversized', '{oversized_value}')"
-        );
+        let oversized_insert =
+            format!("INSERT INTO kv (k, v) VALUES ('atomic-oversized', '{oversized_value}')");
         let staged = execute_simple(&ctx, &mut session, &oversized_insert).await;
         assert!(
             matches!(&staged[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),

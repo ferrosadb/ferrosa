@@ -830,15 +830,11 @@ mod tests {
         let committed_rows = manager.table_overlay(&committed_snapshot, "public.items");
 
         assert_eq!(
-            old_rows
-                .get(&vec![Value::Int(1)])
-                .and_then(Option::as_ref),
+            old_rows.get(&vec![Value::Int(1)]).and_then(Option::as_ref),
             Some(&row("left-before"))
         );
         assert_eq!(
-            old_rows
-                .get(&vec![Value::Int(2)])
-                .and_then(Option::as_ref),
+            old_rows.get(&vec![Value::Int(2)]).and_then(Option::as_ref),
             Some(&row("right-before"))
         );
         assert_eq!(
