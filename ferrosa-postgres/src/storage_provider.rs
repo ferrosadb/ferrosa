@@ -202,7 +202,8 @@ impl std::error::Error for LoadError {}
 /// representation — consistent with `catalog::type_oid`'s text fallback.
 fn engine_column_type(cql_type: &str) -> ColumnType {
     match normalize_type_head(cql_type).as_str() {
-        "int" | "bigint" | "counter" | "smallint" | "tinyint" => ColumnType::Int,
+        "int" | "smallint" | "tinyint" => ColumnType::Int,
+        "bigint" | "counter" => ColumnType::BigInt,
         "boolean" | "bool" => ColumnType::Bool,
         "text" | "varchar" | "ascii" => ColumnType::Text,
         "uuid" | "timeuuid" => ColumnType::Uuid,
@@ -911,7 +912,8 @@ mod tests {
     #[test]
     fn engine_column_type_maps_families() {
         assert_eq!(engine_column_type("int"), ColumnType::Int);
-        assert_eq!(engine_column_type("bigint"), ColumnType::Int);
+        assert_eq!(engine_column_type("bigint"), ColumnType::BigInt);
+        assert_eq!(engine_column_type("counter"), ColumnType::BigInt);
         assert_eq!(engine_column_type("text"), ColumnType::Text);
         assert_eq!(engine_column_type("ASCII"), ColumnType::Text);
         assert_eq!(engine_column_type("boolean"), ColumnType::Bool);

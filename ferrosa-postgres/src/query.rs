@@ -60,7 +60,7 @@ pub(crate) fn error_response(sqlstate: &str, message: &str) -> BackendMessage {
 
 /// The Postgres type OID for a relational [`ColumnType`].
 ///
-/// `Int -> 23` (int4), `Text -> 25` (text), `Bool -> 16` (bool),
+/// `Int -> 23` (int4), `BigInt -> 20` (int8), `Text -> 25` (text), `Bool -> 16` (bool),
 /// `Float -> 701` (float8), `Uuid -> 2950` (uuid), `Bytea -> 17` (bytea),
 /// `Timestamp -> 1114` (timestamp without tz), `Date -> 1082` (date),
 /// `Time -> 1083` (time without tz), `Inet -> 869` (inet),
@@ -68,6 +68,7 @@ pub(crate) fn error_response(sqlstate: &str, message: &str) -> BackendMessage {
 pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
     match ty {
         ColumnType::Int => 23,
+        ColumnType::BigInt => 20,
         ColumnType::Text => 25,
         ColumnType::Bool => 16,
         ColumnType::Float => 701,
@@ -88,6 +89,7 @@ pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
 fn column_type_size(ty: ColumnType) -> i16 {
     match ty {
         ColumnType::Int => 4,
+        ColumnType::BigInt => 8,
         ColumnType::Bool => 1,
         ColumnType::Float => 8,
         ColumnType::Uuid => 16,
@@ -672,14 +674,14 @@ pub fn encode_value(
     })
 }
 
-/// Binary integer encoding honoring the column's declared width: `ColumnType::Int`
-/// is int4 ⇒ 4-byte BE (saturating to `i32` range); anything else falls back to
-/// int8 ⇒ 8-byte BE. Keeps the bytes consistent with the RowDescription OID/size.
+/// Binary integer encoding honoring the column's declared width. `Int` is int4;
+/// `BigInt` is int8. Keeps bytes consistent with the RowDescription OID/size.
 fn encode_int_binary(col_type: ColumnType, i: i64) -> Result<Vec<u8>, String> {
     match col_type {
         ColumnType::Int => i32::try_from(i)
             .map(|value| value.to_be_bytes().to_vec())
             .map_err(|_| format!("integer {i} is outside the PostgreSQL int4 range")),
+        ColumnType::BigInt => Ok(i.to_be_bytes().to_vec()),
         _ => Ok(i.to_be_bytes().to_vec()),
     }
 }
@@ -1595,11 +1597,8 @@ pub(crate) fn describe_insert_returning(
 /// CQL types default to `Text` (their text rendering is always valid).
 fn cql_type_to_column_type(ty: &CqlType) -> ColumnType {
     match ty {
-        CqlType::Int
-        | CqlType::Smallint
-        | CqlType::Tinyint
-        | CqlType::Bigint
-        | CqlType::Counter => ColumnType::Int,
+        CqlType::Int | CqlType::Smallint | CqlType::Tinyint => ColumnType::Int,
+        CqlType::Bigint | CqlType::Counter => ColumnType::BigInt,
         CqlType::Boolean => ColumnType::Bool,
         CqlType::Float | CqlType::Double => ColumnType::Float,
         CqlType::Uuid | CqlType::Timeuuid => ColumnType::Uuid,
@@ -2160,6 +2159,18 @@ mod tests {
         assert_eq!(column_type_oid(ColumnType::Text), 25);
         assert_eq!(column_type_oid(ColumnType::Bool), 16);
         assert_eq!(column_type_oid(ColumnType::Float), 701); // float8
+    }
+
+    #[test]
+    fn cql_bigint_columns_use_postgres_int8_on_the_wire() {
+        let ty = cql_type_to_column_type(&CqlType::Bigint);
+        assert_eq!(column_type_oid(ty), 20);
+        assert_eq!(column_type_size(ty), 8);
+        let value = i64::from(i32::MAX) + 1;
+        assert_eq!(
+            encode_value(1, ty, &SqlValue::Int(value)),
+            Some(value.to_be_bytes().to_vec())
+        );
     }
 
     #[test]
