@@ -655,15 +655,6 @@ fn agreed_row(reads: &[Vec<u8>], quorum: usize) -> Option<Vec<u8>> {
     None
 }
 
-fn snapshot_barrier_votes_sufficient(
-    votes_true: usize,
-    replica_count: usize,
-    slow_quorum: usize,
-    local_vote: bool,
-) -> bool {
-    local_vote && votes_true >= slow_quorum && votes_true <= replica_count
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExistenceVoteDecision {
     Apply,
@@ -1764,16 +1755,25 @@ impl AccordCoordinatorDriver {
                 }
             }
 
-            let remote_read_futs: Vec<_> = self
-                .replica_ids
-                .iter()
-                .filter(|&&id| id != self_id)
-                .map(|&peer_id| {
-                    let peers = Arc::clone(&self.peers);
-                    let msg = read_msg.clone();
-                    async move { peers.send(peer_id, msg, Lane::Data).await }
-                })
-                .collect();
+            // Commit above already established Accord's slow quorum for a
+            // snapshot barrier. Only this node's engine can serve the session
+            // that is beginning here, so wait for its local conflicting deps
+            // below but do not ask remote engines for redundant ReadVotes. A
+            // remote can be waiting for an earlier barrier to finish applying,
+            // which would make this barrier wait on the transaction behind it.
+            let remote_read_futs: Vec<_> = if is_snapshot_barrier {
+                Vec::new()
+            } else {
+                self.replica_ids
+                    .iter()
+                    .filter(|&&id| id != self_id)
+                    .map(|&peer_id| {
+                        let peers = Arc::clone(&self.peers);
+                        let msg = read_msg.clone();
+                        async move { peers.send(peer_id, msg, Lane::Data).await }
+                    })
+                    .collect()
+            };
             let read_responses = futures::future::join_all(remote_read_futs).await;
 
             for result in &read_responses {
@@ -1817,24 +1817,13 @@ impl AccordCoordinatorDriver {
                 }
             }
 
-            // The local replica must have applied the barrier's dependencies so
-            // this PostgreSQL session cannot read a stale local view. A slow
-            // quorum then orders the barrier with every prior committed write;
-            // replicas outside that quorum cannot serve this snapshot without
-            // first establishing their own barrier.
-            if is_snapshot_barrier
-                && !snapshot_barrier_votes_sufficient(
-                    votes_true,
-                    self.replica_ids.len(),
-                    sq,
-                    local_snapshot_vote,
-                )
-            {
-                return Err(AccordDriverError::Network(format!(
-                    "PostgreSQL snapshot barrier received {} of {} replica votes",
-                    votes_true,
-                    self.replica_ids.len()
-                )));
+            // A successful Commit phase already proves the Accord slow quorum.
+            // This local dep-wait is the remaining condition: the node serving
+            // this session must not expose an older engine view.
+            if is_snapshot_barrier && !local_snapshot_vote {
+                return Err(AccordDriverError::Network(
+                    "PostgreSQL snapshot barrier dependencies were not applied locally".into(),
+                ));
             }
 
             if is_generic {
@@ -2398,28 +2387,6 @@ mod tests {
         assert_eq!(super::slow_quorum_size(5), 3);
         assert_eq!(super::slow_quorum_size(7), 4);
         assert_eq!(super::slow_quorum_size(9), 5);
-    }
-
-    #[test]
-    fn postgres_snapshot_barrier_accepts_slow_quorum_when_coordinator_applied() {
-        assert!(super::snapshot_barrier_votes_sufficient(
-            2,
-            3,
-            super::slow_quorum_size(3),
-            true,
-        ));
-        assert!(!super::snapshot_barrier_votes_sufficient(
-            1,
-            3,
-            super::slow_quorum_size(3),
-            true,
-        ));
-        assert!(!super::snapshot_barrier_votes_sufficient(
-            2,
-            3,
-            super::slow_quorum_size(3),
-            false,
-        ));
     }
 
     // -----------------------------------------------------------------------
