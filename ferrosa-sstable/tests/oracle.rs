@@ -30,7 +30,12 @@ fn oracle_golden_reproduction() {
         let fresh = if spec.file_backed {
             let dir =
                 tempfile::tempdir().unwrap_or_else(|e| panic!("case {}: tempdir: {e}", spec.name));
-            let raw_data_path = dir.path().join("raw-data.tmp");
+            // T-038: `new_file_backed`'s path argument's PARENT is the
+            // staging directory (its filename is ignored — there is no more
+            // Data.raw); it must be a child of the same `staging_dir` passed
+            // to `finish_to_directory` below, so both name the same
+            // directory `new_file_backed` opens Data.db in.
+            let raw_data_path = dir.path().join("staging").join("Data.raw");
             legacy_write_file_backed(
                 &partitions,
                 &header,
@@ -114,7 +119,9 @@ proptest! {
             .expect("in-memory writer must succeed for generated input");
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let raw_data_path = dir.path().join("raw-data.tmp");
+        // T-038: parent of this path is the staging directory the writer
+        // opens Data.db in — must match `staging_dir` below.
+        let raw_data_path = dir.path().join("staging").join("Data.raw");
         let file_backed = legacy_write_file_backed(
             &case.partitions,
             &header,

@@ -51,6 +51,74 @@ thread_local! {
     /// requested level changes, which does not happen mid-table.
     static ZSTD_CCTX: RefCell<Option<(i32, zstd::zstd_safe::CCtx<'static>)>> =
         const { RefCell::new(None) };
+
+    /// Per-thread, lazily-created LZ4 match-finding hash tables, reused
+    /// across `compress_into` calls (T-038, forge t_8b85877d).
+    ///
+    /// `lz4_flex` 0.11's public `block::compress_into` allocated a fresh
+    /// boxed hash table (`HashTable4KU16` or `HashTable4K`) on every call —
+    /// documented as an unavoidable-at-that-version cost in
+    /// `tests/compress_into_alloc.rs`. 0.14 added
+    /// `block::compress_into_with_table`, which takes a caller-owned
+    /// `CompressTable` and only `clear()`s it (an in-place `fill(0)`, not a
+    /// realloc) on each call. This crate now depends on 0.14 for exactly
+    /// this API.
+    ///
+    /// Two tables are kept, not one, because which hash function `lz4_flex`
+    /// uses is not just a performance choice: `Small` (`HashTable4KU16`,
+    /// 16-bit entries) hashes 4 bytes at a time, `Large` (`HashTable4K`,
+    /// 32-bit entries) hashes a full register's worth — different
+    /// candidates, different matches, different compressed bytes for the
+    /// same input, even though both decode correctly. `compress`/
+    /// `compress_prepend_size` (what the frozen oracle in `tests/oracle.rs`
+    /// exercises) pick between them **per call**, purely on
+    /// `input.len() < u16::MAX`. `compress_into_with_table` instead
+    /// transparently upgrades a `Small` table to `Large` the first time it
+    /// sees a large input and never downgrades it back — fine for a single
+    /// long-lived table, but wrong here: a compressed table's chunks are
+    /// almost all `chunk_size` bytes with one shorter final chunk, and if
+    /// `chunk_size >= 65535` the full chunks would permanently upgrade a
+    /// single shared table to `Large`, so the final, shorter chunk would
+    /// then hash with `Large` where the oracle's `compress` would have used
+    /// `Small` for that specific call — a byte mismatch (P1) for exactly the
+    /// one table shape (`chunk_size` at or above 64 KiB) most likely to
+    /// matter, since Cassandra's own default chunk length is 65536.
+    /// Keeping both tables and picking per call by the same
+    /// `len < u16::MAX` test the oracle uses reproduces its choice exactly,
+    /// call for call, while still allocating each table's backing `Box`
+    /// only once.
+    static LZ4_TABLES: RefCell<Option<Lz4Tables>> = const { RefCell::new(None) };
+}
+
+/// The two reusable LZ4 hash tables described on [`LZ4_TABLES`]. `small` is
+/// always the `CompressTable::Small` variant and `large` always `Large` —
+/// each is fed only inputs on its own side of the `u16::MAX` threshold, so
+/// neither ever hits `compress_into_with_table`'s internal auto-upgrade
+/// branch (which would otherwise replace `small` with a freshly allocated
+/// `Large` table the first time a big chunk arrived).
+struct Lz4Tables {
+    small: lz4_flex::block::CompressTable,
+    large: lz4_flex::block::CompressTable,
+}
+
+impl Lz4Tables {
+    fn new() -> Self {
+        Self {
+            small: lz4_flex::block::CompressTable::small(),
+            large: lz4_flex::block::CompressTable::large(),
+        }
+    }
+
+    /// The table matching `compress`/`compress_prepend_size`'s own per-call
+    /// selection for an input of this length (no external dictionary, so the
+    /// threshold is exactly `len < u16::MAX`).
+    fn for_len(&mut self, len: usize) -> &mut lz4_flex::block::CompressTable {
+        if len < u16::MAX as usize {
+            &mut self.small
+        } else {
+            &mut self.large
+        }
+    }
 }
 
 /// Converts a `zstd_safe` error code into a `ferrosa_common::Error`.
@@ -109,8 +177,13 @@ impl Compression {
             }
             Compression::Lz4 => {
                 dst[..4].copy_from_slice(&(src.len() as u32).to_le_bytes());
-                let written = lz4_flex::block::compress_into(src, &mut dst[4..])
-                    .map_err(|e| Error::InvalidData(format!("LZ4 compression failed: {e}")))?;
+                let written = LZ4_TABLES.with(|cell| {
+                    let mut slot = cell.borrow_mut();
+                    let tables = slot.get_or_insert_with(Lz4Tables::new);
+                    let table = tables.for_len(src.len());
+                    lz4_flex::block::compress_into_with_table(src, &mut dst[4..], table)
+                })
+                .map_err(|e| Error::InvalidData(format!("LZ4 compression failed: {e}")))?;
                 Ok(4 + written)
             }
             Compression::Zstd { level } => {
@@ -351,33 +424,47 @@ impl CompressionInfo {
         let name = self.compression.compressor_name().ok_or_else(|| {
             Error::InvalidData("cannot write CompressionInfo for Compression::None".into())
         })?;
-
-        let mut buf = Vec::new();
-
-        // Compressor name: Java UTF-8
-        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
-        buf.extend_from_slice(name.as_bytes());
-
-        // Options: 0
-        buf.extend_from_slice(&0i32.to_be_bytes());
-
-        // Chunk length
-        buf.extend_from_slice(&(self.chunk_length as i32).to_be_bytes());
-
-        // Max compressed size
-        buf.extend_from_slice(&(self.max_compressed_size as i32).to_be_bytes());
-
-        // Data length
-        buf.extend_from_slice(&(self.data_length as i64).to_be_bytes());
-
-        // Chunk count + offsets
-        buf.extend_from_slice(&(self.chunk_offsets.len() as i32).to_be_bytes());
+        let mut buf = write_compression_info_header(
+            name,
+            self.chunk_length,
+            self.max_compressed_size,
+            self.data_length,
+            self.chunk_offsets.len() as u32,
+        );
         for &offset in &self.chunk_offsets {
             buf.extend_from_slice(&(offset as i64).to_be_bytes());
         }
-
         Ok(buf)
     }
+}
+
+/// Everything in `CompressionInfo.db` before the offset list: compressor
+/// name, a zero option count, `chunk_length`, and the three fields
+/// [`CompressionInfo::write`] fills in only once every chunk has been seen —
+/// `max_compressed_size`, `data_length`, `chunk_count`.
+///
+/// Factored out of [`CompressionInfo::write`] so T-038's `ChunkCompressor`
+/// (`writer.rs`) can build the exact same header bytes twice — once as an
+/// all-zero placeholder at open (reserving the pump's held-back first block),
+/// once patched with the real values at `finish` — using this one function
+/// both times, so the two calls can never drift into different byte layouts
+/// (architecture.md § Bounded-ring rule, "Chunk offsets stream out").
+pub(crate) fn write_compression_info_header(
+    compressor_name: &str,
+    chunk_length: usize,
+    max_compressed_size: usize,
+    data_length: u64,
+    chunk_count: u32,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + compressor_name.len() + 4 + 4 + 4 + 8 + 4);
+    buf.extend_from_slice(&(compressor_name.len() as u16).to_be_bytes());
+    buf.extend_from_slice(compressor_name.as_bytes());
+    buf.extend_from_slice(&0i32.to_be_bytes()); // option count
+    buf.extend_from_slice(&(chunk_length as i32).to_be_bytes());
+    buf.extend_from_slice(&(max_compressed_size as i32).to_be_bytes());
+    buf.extend_from_slice(&(data_length as i64).to_be_bytes());
+    buf.extend_from_slice(&(chunk_count as i32).to_be_bytes());
+    buf
 }
 
 #[cfg(test)]
@@ -610,6 +697,41 @@ mod tests {
                 "{compression:?}: a failed compress_into must not have written into dst"
             );
         }
+    }
+
+    /// LZ4's `u16::MAX` small/large table threshold, exact boundary values.
+    /// `compress_into` must match `compress()`'s per-call table choice even
+    /// though it holds both tables across calls (see `LZ4_TABLES`'s doc
+    /// comment): this pins the three sizes straddling the threshold.
+    #[test]
+    fn compress_into_matches_compress_lz4_at_u16_max_boundary() {
+        for len in [
+            u16::MAX as usize - 1,
+            u16::MAX as usize,
+            u16::MAX as usize + 1,
+        ] {
+            let data = pseudo_random_bytes(len, len as u64);
+            assert_compress_into_matches_compress(&Compression::Lz4, &data);
+        }
+    }
+
+    /// A `ChunkCompressor` with `chunk_size >= u16::MAX` (Cassandra's default
+    /// chunk length, 65536, is exactly this) compresses many full-size
+    /// (large-table) chunks followed by one shorter (small-table) final
+    /// chunk, all in `compression_pool`'s same worker thread. Reproduces that
+    /// call order directly: without the two-table split in `LZ4_TABLES`, a
+    /// single auto-upgrading table would still be `Large` for the final
+    /// short chunk, diverging from what `compress()` — and therefore the
+    /// legacy-writer oracle (P1) — would produce for it.
+    #[test]
+    fn compress_into_lz4_final_short_chunk_after_large_chunks_matches_compress() {
+        let large_chunk = pseudo_random_bytes(70_000, 0xA11CE);
+        let short_final_chunk = pseudo_random_bytes(1_234, 0xF00D);
+
+        for _ in 0..5 {
+            assert_compress_into_matches_compress(&Compression::Lz4, &large_chunk);
+        }
+        assert_compress_into_matches_compress(&Compression::Lz4, &short_final_chunk);
     }
 
     proptest! {

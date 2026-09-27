@@ -11,20 +11,17 @@
 //! what initializes each codec's per-thread state), further calls at the
 //! same level must not allocate.
 //!
-//! **`Compression::Lz4` is the documented exception.** `lz4_flex` 0.11's
-//! public block API (`lz4_flex::block::compress_into`, used here to avoid
-//! the *output* `Vec`) always internally allocates a fresh match-finding
-//! hash table — a `Box<[u16; 4096]>` or `Box<[u32; 4096]>` — on every call
-//! (`lz4_flex-0.11.6/src/block/hashtable.rs`, `HashTable4KU16::new` /
-//! `HashTable4K::new`). Nothing in that version's public surface exposes a
-//! reusable table to hold across calls; the private `compress_internal` and
-//! `HashTable` types that would need to be reused are `pub(crate)`. This is
-//! reported here rather than hidden: the Lz4 test measures and asserts the
-//! *actual* allocation count (one, bounded, independent of chunk size) so a
-//! regression that made it scale with data size would still fail loud, but
-//! does not claim the "zero" bar `Compression::None` and `Compression::Zstd`
-//! meet. See the deferred follow-up item for investigating an upgrade or a
-//! vendored patch for T-038.
+//! **`Compression::Lz4` used to be a documented exception** (forge
+//! t_8b85877d): `lz4_flex` 0.11's public block API
+//! (`lz4_flex::block::compress_into`) always internally allocated a fresh
+//! match-finding hash table — a `Box<[u16; 4096]>` or `Box<[u32; 4096]>` — on
+//! every call, and nothing in that version's public surface exposed a
+//! reusable table to hold across calls. T-038 upgrades to `lz4_flex` 0.14,
+//! which added `block::compress_into_with_table` taking a caller-owned
+//! `CompressTable` that is only `clear()`ed (a `fill(0)`, not a realloc) per
+//! call. `compression.rs`'s `LZ4_TABLES` keeps one `Small` and one `Large`
+//! table per thread, allocated once, so `Compression::Lz4` now meets the
+//! same zero-after-warmup bar as `None` and `Zstd`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -154,21 +151,41 @@ fn compress_into_alloc_zstd_is_zero_after_warmup() {
     );
 }
 
-/// Documents, rather than hides, the one case that cannot reach zero: see
-/// this file's module doc comment. `lz4_flex` 0.11.6 allocates one boxed
-/// hash table per call to `block::compress_into` regardless of caller-side
-/// buffer reuse — a per-call cost of the vendored dependency, not a
-/// per-chunk `Vec` introduced by `ferrosa-sstable`. This test's job is to
-/// catch a *regression* (the count growing with chunk count or size), not
-/// to claim the same zero bar as `None`/`Zstd`.
+/// T-038 (forge t_8b85877d): with `lz4_flex` 0.14's `compress_into_with_table`
+/// and a per-thread reusable `CompressTable`, `Compression::Lz4` now meets
+/// the same zero-after-warmup bar as `None` and `Zstd`.
 #[test]
-fn compress_into_alloc_lz4_is_one_bounded_allocation_per_call_not_zero() {
+fn compress_into_alloc_lz4_is_zero_after_warmup() {
     let allocs = warm_up_then_measure_ten_calls(&Compression::Lz4);
     assert_eq!(
-        allocs, 10,
-        "Compression::Lz4 allocates lz4_flex's internal match-finding hash table on every call \
-         to block::compress_into (one per call, not per byte); this documents that constant, \
-         unavoidable-with-lz4_flex-0.11 cost rather than hiding it. If this fails with a HIGHER \
-         count, that is a real regression (e.g. an internal Vec reintroduced on top of it)"
+        allocs, 0,
+        "Compression::Lz4 must not allocate after the first call: compress_into now reuses a \
+         per-thread lz4_flex::block::CompressTable across calls instead of allocating a fresh \
+         hash table per chunk (T-038, forge t_8b85877d)"
+    );
+}
+
+/// 10x the estimated chunk count, at DEFAULT_CHUNK_SIZE: the pump's own
+/// packet requirement ("counts zero when chunk count is 10x the size
+/// estimate"). Proves the reused tables don't grow or reallocate with
+/// call count.
+#[test]
+fn compress_into_alloc_lz4_is_zero_over_many_calls() {
+    let chunk = pseudo_random_bytes(Compression::DEFAULT_CHUNK_SIZE, 0x5EED);
+    let bound = Compression::Lz4.compress_bound(chunk.len());
+    let mut dst = vec![0u8; bound];
+    Compression::Lz4.compress_into(&chunk, &mut dst).unwrap();
+
+    let inputs: Vec<Vec<u8>> = (0..2_500u64)
+        .map(|i| pseudo_random_bytes(Compression::DEFAULT_CHUNK_SIZE, 0xBEEF + i))
+        .collect();
+    let (_, allocs) = count_allocs(|| {
+        for data in &inputs {
+            Compression::Lz4.compress_into(data, &mut dst).unwrap();
+        }
+    });
+    assert_eq!(
+        allocs, 0,
+        "2500 calls (10x a typical chunk-count estimate) must not allocate beyond warm-up"
     );
 }

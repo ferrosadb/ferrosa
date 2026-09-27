@@ -12,7 +12,7 @@ crossbeam-channel = "0.5"
 ferrosa-common = { path = "../ferrosa-common" }
 libc = "0.2"
 lru = "0.12"
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 memmap2 = "0.9"
 rayon = "1"
 tracing = "0.1"

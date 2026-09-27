@@ -510,6 +510,69 @@ impl SegmentSink for FileSink {
     }
 }
 
+/// A plain (page-cached) file [`SegmentSink`] with no alignment requirement —
+/// [`DirectMode::Buffered`] always, block [`MIN_BLOCK`].
+///
+/// Two T-038 callers need this instead of [`FileSink`]:
+///
+/// 1. `StreamSink::open` (`writer.rs`), when the operator has explicitly
+///    disabled O_DIRECT (`sstable_direct_io_enabled()` is false —
+///    `FERROSA_SSTABLE_DIRECT_IO=0`/`FERROSA_DIRECT_IO=0`). `FileSink::create`
+///    always *attempts* O_DIRECT (falling back only on OS rejection, an
+///    unrelated concern — decisions.md D4); honoring the operator's own
+///    switch under the unified pump means never attempting O_DIRECT at all
+///    here, while every write still goes through the same `AlignedPump`
+///    machinery (D3: one sink owns alignment, tail truncate, fsync, fallback
+///    accounting, whichever mode is chosen).
+/// 2. `ChunkCompressor`'s `CompressionInfo.db` pump, unconditionally.
+///    [`AlignedPump::finish_with_patched_header`] issues a raw
+///    [`SegmentSink::pwrite`] of `header.len()` bytes at offset 0 that bypass
+///    the pump's own block-aligned segment buffering; under O_DIRECT that
+///    pwrite's offset (0, always aligned), length (the header's byte length,
+///    almost never a block multiple) and buffer address (an ordinary
+///    heap-allocated `Vec<u8>`, not an [`AlignedBuf`]) would all need to
+///    satisfy the direct-I/O alignment triple, and in general none of the
+///    latter two do. `CompressionInfo.db` is small — at most one segment plus
+///    one block, independent of chunk count (architecture.md § Bounded-ring
+///    rule) — so bypassing O_DIRECT for it costs nothing worth avoiding that
+///    failure mode for.
+pub(crate) struct BufferedFileSink(std::fs::File);
+
+impl BufferedFileSink {
+    pub(crate) fn create(path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Self(file))
+    }
+}
+
+impl SegmentSink for BufferedFileSink {
+    fn pwrite(&mut self, buf: &[u8], offset: u64) -> Result<()> {
+        write_all_at(&mut self.0, buf, offset, DirectMode::Buffered, MIN_BLOCK)
+    }
+
+    fn sync_data(&mut self) -> Result<()> {
+        crate::direct::sync_data(&self.0)
+    }
+
+    fn set_len(&mut self, len: u64) -> Result<()> {
+        self.0.set_len(len)?;
+        Ok(())
+    }
+
+    fn fadvise_dontneed(&mut self) -> Result<()> {
+        crate::direct::fadvise_dontneed(&self.0);
+        Ok(())
+    }
+
+    fn mode(&self) -> DirectMode {
+        DirectMode::Buffered
+    }
+}
+
 /// Wrap a [`SegmentSink`] error with the pump's path and the offset the
 /// failing operation was at, so a fault surfaces with enough context to find
 /// the file without a debugger (`architecture.md` acceptance criterion 4).
@@ -1115,8 +1178,10 @@ impl AlignedPump {
     /// The `Digest.crc32` of every byte accepted by [`Self::write_all`] so
     /// far — the producer-side checksum, independent of what the sink (or
     /// flusher) actually stored. Call before [`Self::finish`] consumes the
-    /// pump.
-    #[allow(dead_code)]
+    /// pump. T-038's `StreamSink` uses this directly: for a compressed table
+    /// the bytes `write_all` sees are the compressed payload+CRC stream (what
+    /// actually lands in Data.db), so this digest already matches
+    /// `Digest.crc32`'s documented contract with no separate readback.
     pub fn digest(&self) -> u32 {
         self.digest.clone().finalize()
     }
@@ -1403,6 +1468,74 @@ impl AlignedPump {
             PumpBackend::Sync { .. } => self.finish_sync(),
             PumpBackend::Async(_) => self.finish_async(),
         }
+    }
+
+    /// For a depth-0 pump only: overwrite the file's first `header.len()`
+    /// bytes with `header` via one direct sink [`SegmentSink::pwrite`] at
+    /// offset 0, then run the ordinary synchronous [`Self::finish`] sequence.
+    ///
+    /// T-038's `ChunkCompressor` uses this for `CompressionInfo.db`
+    /// (architecture.md § Bounded-ring rule, "Chunk offsets stream out"): the
+    /// header's three unknowns (`max_compressed_size`, `data_length`,
+    /// `chunk_count`) aren't known until every chunk has been compressed, so
+    /// the caller writes a same-length placeholder header via an ordinary
+    /// [`Self::write_all`] at open (reserving the first block), streams each
+    /// chunk offset as it is produced, and patches the real header in here,
+    /// last, before the file is fsynced — never holding the offset list in
+    /// memory as a `Vec` to rewrite the header some other way.
+    ///
+    /// **Not** a raw sink write followed by the ordinary finish — that would
+    /// be silently clobbered. `finish_sync` always flushes `current` (the
+    /// in-progress segment buffer) starting at offset 0 whenever nothing has
+    /// been flushed to the sink yet (`physical == 0`), which is true for
+    /// every caller so far (`CompressionInfo.db` is small — one segment plus
+    /// one block, architecture.md § Bounded-ring rule — so its header and
+    /// offsets typically never reach a full segment before `finish` runs).
+    /// A sink write at offset 0 in that case would land, then immediately be
+    /// overwritten by `finish_sync`'s own flush of the still-stale (zeroed
+    /// placeholder) bytes still sitting in `current`. So: if nothing has
+    /// reached the sink yet, the header is patched **in `current`** instead,
+    /// so the ordinary flush below writes the corrected bytes; only once a
+    /// full segment has already gone to the sink (`physical > 0` — meaning
+    /// the header, always `<= block <= segment`, already landed durably) does
+    /// this issue the direct sink `pwrite`.
+    ///
+    /// This does not and cannot re-check that `header.len()` fits the first
+    /// block — that was the caller's placeholder-write assertion at open, and
+    /// by the time `finish` runs this method no longer knows how many bytes
+    /// of the first block were the placeholder versus later data. Not offered
+    /// for an async (`depth >= 1`) pump: the flusher thread owns the sink and
+    /// `current` there, and a direct patch from the producer while segments
+    /// may still be in flight would race.
+    pub fn finish_with_patched_header(mut self, header: &[u8]) -> Result<u64> {
+        if !matches!(self.backend, PumpBackend::Sync { .. }) {
+            return Err(Error::Io(io::Error::other(
+                "write pump: finish_with_patched_header only supports a depth-0 \
+                 (synchronous) pump",
+            )));
+        }
+        if self.physical == 0 {
+            let cur = self
+                .current
+                .as_mut()
+                .expect("sync current is always present before finish");
+            debug_assert!(
+                header.len() <= self.filled,
+                "finish_with_patched_header: header ({} bytes) is longer than what has been \
+                 written so far ({} bytes); the placeholder written at open must be at least \
+                 header.len() bytes",
+                header.len(),
+                self.filled
+            );
+            cur.as_mut_slice()[..header.len()].copy_from_slice(header);
+        } else {
+            let PumpBackend::Sync { sink } = &mut self.backend else {
+                unreachable!("checked above")
+            };
+            sink.pwrite(header, 0)
+                .map_err(|e| wrap_sink_error(&self.path, 0, e))?;
+        }
+        self.finish_sync()
     }
 
     fn finish_sync(mut self) -> Result<u64> {

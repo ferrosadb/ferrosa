@@ -34,9 +34,9 @@
 //! per-column complex `DeletionTime` on write are still deferred (Ferrosa's
 //! collection ops are element add/remove, not whole-collection clears).
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use ferrosa_common::{CellValue, Result};
 use rayon::prelude::*;
@@ -45,7 +45,9 @@ use crate::bloom::BloomFilter;
 use crate::byte_comparable;
 use crate::checksum::{self, ChunkCrc, DigestCrc32};
 use crate::compression::{Compression, CompressionInfo};
+use crate::direct::MIN_BLOCK;
 use crate::io::FileReadAt;
+use crate::pump::{AbortSignal, AlignedPump, BufferedFileSink, FileSink, NeverAbort, PumpConfig, SegmentSink};
 use crate::reader::{SSTableComponents, SSTableReader};
 use crate::statistics::{
     build_simple_bti_stats_metadata, write_statistics, CompactionMetadata, SerializationHeader,
@@ -220,63 +222,49 @@ impl ChecksummedDataDbWriter {
     }
 }
 
-enum DataBuffer {
+/// Where `SSTableWriter` sends Data.db content — either entirely in memory
+/// (`SSTableWriter::new`) or streamed through the aligned write pump
+/// (`SSTableWriter::new_file_backed`) as bytes are produced. Replaces
+/// `DataBuffer`/`DataSource` (T-038, decisions.md D1): there is no more
+/// `Data.raw` intermediate file for the `Stream` case to buffer into and then
+/// read back — `StreamSink` compresses (or checksums, for uncompressed
+/// tables) each byte as it arrives and hands it straight to `AlignedPump`.
+enum DataSink {
     Memory(Vec<u8>),
-    File {
-        file: std::fs::File,
-        path: PathBuf,
-        len: u64,
-        /// Digest and per-chunk CRC accumulated as bytes are written to
-        /// `file`. Tracked unconditionally (cheap, SIMD CRC32) so the
-        /// uncompressed rename path (`build_data_file_to_file`) can use
-        /// them without re-reading the file; discarded when the table
-        /// turns out to be compressed, since that path re-checksums the
-        /// compressed on-disk bytes instead.
-        digest: DigestCrc32,
-        chunk_crc: ChunkCrc,
-    },
+    // Boxed: `StreamSink` (an `AlignedPump` plus an optional `ChunkCompressor`,
+    // itself another `AlignedPump` plus its reusable chunk buffers) is far
+    // larger than the `Memory` variant's `Vec<u8>` header, tripping clippy's
+    // `large_enum_variant`.
+    Stream(Box<StreamSink>),
 }
 
-enum DataSource {
-    Memory(Vec<u8>),
-    File {
-        path: PathBuf,
-        len: u64,
-        /// Digest and CRC.db bytes for the raw (uncompressed) content of
-        /// `path`, accumulated while it was written. Valid only for the
-        /// uncompressed case — see `DataBuffer::File`'s doc comment.
-        digest: u32,
-        crc_db: Vec<u8>,
-    },
-}
-
-impl DataBuffer {
+impl DataSink {
     fn memory() -> Self {
         Self::Memory(Vec::new())
     }
 
-    fn file(path: PathBuf, chunk_size: usize) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        Ok(Self::File {
-            file: std::fs::File::create(&path)?,
-            path,
-            len: 0,
-            digest: DigestCrc32::new(),
-            chunk_crc: ChunkCrc::new(chunk_size),
-        })
+    /// Open a file-backed sink. `data_path`/`info_path` are the FINAL
+    /// component paths (`staging_dir.join("Data.db")` /
+    /// `staging_dir.join("CompressionInfo.db")`) — there is no separate raw
+    /// staging file to open first.
+    fn stream(data_path: PathBuf, info_path: PathBuf, options: &WriteOptions) -> Result<Self> {
+        Ok(Self::Stream(Box::new(StreamSink::open(
+            data_path, info_path, options,
+        )?)))
     }
 
+    /// Uncompressed logical length written so far — what partition and row
+    /// offsets are measured in (`architecture.md` § `DataSink`), regardless
+    /// of whether the underlying bytes end up compressed on disk.
     fn len(&self) -> u64 {
         match self {
             Self::Memory(buf) => buf.len() as u64,
-            Self::File { len, .. } => *len,
+            Self::Stream(s) => s.uncompressed_len,
         }
     }
 
     fn push(&mut self, byte: u8) -> Result<()> {
-        self.extend_from_slice(&[byte])
+        self.extend_from_slice(std::slice::from_ref(&byte))
     }
 
     fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
@@ -285,51 +273,309 @@ impl DataBuffer {
                 buf.extend_from_slice(bytes);
                 Ok(())
             }
-            Self::File {
-                file,
-                len,
-                digest,
-                chunk_crc,
-                ..
-            } => {
-                file.write_all(bytes)?;
-                *len += bytes.len() as u64;
-                digest.update(bytes);
-                chunk_crc.update(bytes);
+            Self::Stream(s) => s.write_all(bytes),
+        }
+    }
+}
+
+/// What finishing a [`StreamSink`] produces. `Data.db` (and
+/// `CompressionInfo.db`, if any) are already on disk — streamed there as they
+/// were produced — so this carries their paths and lengths rather than bytes;
+/// `finish_to_directory` uses them directly, and `finish` (the in-memory
+/// `SSTableOutput` path, only reachable if a file-backed writer's caller
+/// chooses the in-memory finalizer instead of `finish_to_directory`) reads
+/// them back once, exactly as `SSTableOutputFiles::read_to_memory` already
+/// does for its own callers.
+struct StreamFinish {
+    data_path: PathBuf,
+    data_len: u64,
+    /// `Digest.crc32`: computed by [`AlignedPump::digest`] over the exact
+    /// bytes handed to `write_all` — the compressed payload+CRC stream for a
+    /// compressed table, the raw bytes for an uncompressed one — never by
+    /// re-reading `data_path` afterward (D6).
+    digest: u32,
+    /// `CRC.db`: `Some` only for uncompressed tables.
+    crc_db: Option<Vec<u8>>,
+    compression_info: Option<CompressionInfoFinish>,
+}
+
+struct CompressionInfoFinish {
+    path: PathBuf,
+    len: u64,
+}
+
+/// The file-backed [`DataSink`] variant (T-038). Owns the `Data.db`
+/// [`AlignedPump`] and, for compressed tables, the [`ChunkCompressor`] that
+/// sits in front of it; for uncompressed tables bytes go straight to the pump
+/// (decisions.md D1 — direct I/O now covers uncompressed tables too) and this
+/// also tracks `CRC.db`.
+struct StreamSink {
+    pump: AlignedPump,
+    compressor: Option<ChunkCompressor>,
+    uncompressed_len: u64,
+    /// `Some` only when `compressor` is `None`: `CRC.db` is a property of the
+    /// uncompressed Data.db, which a compressed table doesn't have (T-011).
+    chunk_crc: Option<ChunkCrc>,
+    data_path: PathBuf,
+}
+
+impl StreamSink {
+    fn open(data_path: PathBuf, info_path: PathBuf, options: &WriteOptions) -> Result<Self> {
+        let pump_config = PumpConfig::from_env();
+        let direct = sstable_direct_io_enabled();
+        let (sink, block): (Box<dyn SegmentSink>, usize) = if direct {
+            let (sink, block) = FileSink::create(&data_path)?;
+            (Box::new(sink), block)
+        } else {
+            (Box::new(BufferedFileSink::create(&data_path)?), MIN_BLOCK)
+        };
+        let segment = pump_config.effective_segment(block);
+        let abort: Arc<dyn AbortSignal> = Arc::new(NeverAbort::new());
+        let pump = AlignedPump::open_with_depth(
+            sink,
+            block,
+            segment,
+            data_path.clone(),
+            pump_config.queue_depth,
+            abort,
+        );
+
+        let (compressor, chunk_crc) = match &options.compression {
+            Some(compression) if !matches!(compression, Compression::None) => {
+                let compressor = ChunkCompressor::open(
+                    compression.clone(),
+                    options.chunk_size,
+                    compression_batch_chunks(),
+                    &info_path,
+                )?;
+                (Some(compressor), None)
+            }
+            _ => (None, Some(ChunkCrc::new(options.chunk_size))),
+        };
+
+        Ok(Self {
+            pump,
+            compressor,
+            uncompressed_len: 0,
+            chunk_crc,
+            data_path,
+        })
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        self.uncompressed_len += bytes.len() as u64;
+        match &mut self.compressor {
+            Some(compressor) => compressor.write_all(bytes, &mut self.pump),
+            None => {
+                self.pump.write_all(bytes)?;
+                if let Some(chunk_crc) = &mut self.chunk_crc {
+                    chunk_crc.update(bytes);
+                }
                 Ok(())
             }
         }
     }
 
-    fn into_source(self) -> Result<DataSource> {
-        match self {
-            Self::Memory(buf) => Ok(DataSource::Memory(buf)),
-            Self::File {
-                mut file,
-                path,
-                len,
-                digest,
-                chunk_crc,
-            } => {
-                file.flush()?;
-                file.sync_data()?;
-                drop(file);
-                Ok(DataSource::File {
-                    path,
-                    len,
-                    digest: digest.finalize(),
-                    crc_db: chunk_crc.into_bytes(),
-                })
+    fn finish(mut self) -> Result<StreamFinish> {
+        let compression_info = match self.compressor.take() {
+            Some(compressor) => Some(compressor.finish(&mut self.pump, self.uncompressed_len)?),
+            None => None,
+        };
+        // Captured before `finish()` consumes the pump.
+        let digest = self.pump.digest();
+        let data_len = self.pump.finish()?;
+        let crc_db = self.chunk_crc.map(ChunkCrc::into_bytes);
+        Ok(StreamFinish {
+            data_path: self.data_path,
+            data_len,
+            digest,
+            crc_db,
+            compression_info,
+        })
+    }
+}
+
+/// Compresses `Data.db` content in bounded batches as bytes are produced,
+/// replacing the old `build_data_file_to_file` (which re-read a whole
+/// `Data.raw` staging file back through the page cache after the fact —
+/// decisions.md D1). `inputs`/`outputs` are allocated once, at open, and
+/// reused for every chunk (T-036 `compress_into`, bounded-ring rule); no
+/// per-chunk `Vec` is ever allocated on the write path.
+///
+/// `CompressionInfo.db`'s offsets stream out through `info_pump` as each
+/// chunk is compressed — `chunk_offsets` is never held as a `Vec`
+/// (architecture.md § Bounded-ring rule) — and its header is patched at
+/// `finish` via [`AlignedPump::finish_with_patched_header`].
+struct ChunkCompressor {
+    compression: Compression,
+    /// Reusable input buffers, `batch_chunks` of them, each `chunk_size`
+    /// bytes. `lens.len()` of them (starting at index 0) hold live data.
+    inputs: Box<[Box<[u8]>]>,
+    /// Reusable output buffers, `batch_chunks` of them, each
+    /// `compression.compress_bound(chunk_size)` bytes.
+    outputs: Box<[Box<[u8]>]>,
+    chunk_size: usize,
+    /// Byte lengths of the chunks currently staged in `inputs[0..]` — always
+    /// `chunk_size` except possibly the last one ever pushed (`finish`'s
+    /// final, possibly-partial chunk). Capacity fixed at `batch_chunks`,
+    /// cleared and refilled per batch — never grows past it (bounded-ring
+    /// rule).
+    lens: Vec<usize>,
+    /// Bytes already written into `inputs[lens.len()]`, the chunk not yet
+    /// complete.
+    fill: usize,
+    info_pump: AlignedPump,
+    info_path: PathBuf,
+    chunk_count: u32,
+    max_compressed_size: usize,
+}
+
+impl ChunkCompressor {
+    fn open(
+        compression: Compression,
+        chunk_size: usize,
+        batch_chunks: usize,
+        info_path: &Path,
+    ) -> Result<Self> {
+        assert!(chunk_size > 0, "ChunkCompressor: chunk_size must be positive");
+        assert!(
+            batch_chunks > 0,
+            "ChunkCompressor: batch_chunks must be positive"
+        );
+        let bound = compression.compress_bound(chunk_size);
+        let inputs = (0..batch_chunks)
+            .map(|_| vec![0u8; chunk_size].into_boxed_slice())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let outputs = (0..batch_chunks)
+            .map(|_| vec![0u8; bound].into_boxed_slice())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        // CompressionInfo.db is always plain-buffered (see
+        // `BufferedFileSink`'s doc comment: the header patch's raw `pwrite`
+        // cannot satisfy O_DIRECT's alignment triple in general).
+        let sink = BufferedFileSink::create(info_path)?;
+        let block = MIN_BLOCK;
+        let segment = PumpConfig::from_env().effective_segment(block);
+        let mut info_pump = AlignedPump::open(Box::new(sink), block, segment, info_path.to_path_buf());
+
+        let name = compression
+            .compressor_name()
+            .expect("ChunkCompressor is only opened for a real compressor (None is filtered out by the caller)");
+        let placeholder = crate::compression::write_compression_info_header(name, chunk_size, 0, 0, 0);
+        assert!(
+            placeholder.len() <= block,
+            "CompressionInfo header ({} bytes) exceeds the pump's block ({block}); a \
+             compressor name too long to fit was not caught earlier",
+            placeholder.len()
+        );
+        info_pump.write_all(&placeholder)?;
+
+        Ok(Self {
+            compression,
+            inputs,
+            outputs,
+            chunk_size,
+            lens: Vec::with_capacity(batch_chunks),
+            fill: 0,
+            info_pump,
+            info_path: info_path.to_path_buf(),
+            chunk_count: 0,
+            max_compressed_size: 0,
+        })
+    }
+
+    fn write_all(&mut self, mut data: &[u8], data_pump: &mut AlignedPump) -> Result<()> {
+        while !data.is_empty() {
+            let batch_chunks = self.inputs.len();
+            let dst = &mut self.inputs[self.lens.len()];
+            let space = self.chunk_size - self.fill;
+            let n = space.min(data.len());
+            dst[self.fill..self.fill + n].copy_from_slice(&data[..n]);
+            self.fill += n;
+            data = &data[n..];
+            if self.fill == self.chunk_size {
+                self.lens.push(self.chunk_size);
+                self.fill = 0;
+                if self.lens.len() == batch_chunks {
+                    self.flush_batch(data_pump)?;
+                }
             }
         }
+        Ok(())
     }
+
+    /// Compress every chunk currently staged in `inputs[0..lens.len()]` in
+    /// parallel on `compression_pool()`, then write each `payload ‖ crc` to
+    /// `data_pump` and each chunk's starting offset to `info_pump`, in order.
+    fn flush_batch(&mut self, data_pump: &mut AlignedPump) -> Result<()> {
+        let n = self.lens.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let compression = &self.compression;
+        let inputs = &self.inputs;
+        let outputs = &mut self.outputs;
+        let lens = &self.lens;
+        let written: Result<Vec<usize>> = compression_pool().install(|| {
+            outputs[..n]
+                .par_iter_mut()
+                .zip(inputs[..n].par_iter())
+                .zip(lens[..n].par_iter())
+                .map(|((out, inp), &len)| compression.compress_into(&inp[..len], out))
+                .collect()
+        });
+        let written = written?;
+        for (i, &written_len) in written.iter().enumerate() {
+            let payload = &self.outputs[i][..written_len];
+            let crc = crc32fast::hash(payload).to_be_bytes();
+            let stored_size = written_len + std::mem::size_of::<u32>();
+            self.max_compressed_size = self.max_compressed_size.max(stored_size);
+            let offset = data_pump.position();
+            data_pump.write_all(payload)?;
+            data_pump.write_all(&crc)?;
+            self.info_pump.write_all(&(offset as i64).to_be_bytes())?;
+            self.chunk_count += 1;
+        }
+        self.lens.clear();
+        Ok(())
+    }
+
+    /// Flush any partial final chunk, then patch and finish
+    /// `CompressionInfo.db`. `data_length` is the uncompressed length
+    /// (`StreamSink::uncompressed_len`) — one of the three header fields the
+    /// placeholder at `open` could not have known.
+    fn finish(mut self, data_pump: &mut AlignedPump, data_length: u64) -> Result<CompressionInfoFinish> {
+        if self.fill > 0 {
+            self.lens.push(self.fill);
+            self.fill = 0;
+        }
+        self.flush_batch(data_pump)?;
+
+        let name = self
+            .compression
+            .compressor_name()
+            .expect("checked at open");
+        let header = crate::compression::write_compression_info_header(
+            name,
+            self.chunk_size,
+            self.max_compressed_size,
+            data_length,
+            self.chunk_count,
+        );
+        let path = self.info_path;
+        let len = self.info_pump.finish_with_patched_header(&header)?;
+        Ok(CompressionInfoFinish { path, len })
+    }
+
 }
 
 /// A destination for row-body bytes. The row-body serializers
 /// (`push_unsigned_vint_to`, `write_columns_subset`, `write_complex_deletion`,
 /// `serialize_cell`) are generic over this trait so the same encoder function
 /// can run twice per row: once into a [`SizeCounter`] to learn the body's
-/// encoded length, then again into the real [`DataBuffer`] to write it. See
+/// encoded length, then again into the real [`DataSink`] to write it. See
 /// `architecture.md` § "Row encoding without a scratch buffer".
 trait RowSink {
     fn put(&mut self, bytes: &[u8]) -> Result<()>;
@@ -355,7 +601,7 @@ impl RowSink for SizeCounter {
     }
 }
 
-impl RowSink for DataBuffer {
+impl RowSink for DataSink {
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
         self.extend_from_slice(bytes)
     }
@@ -520,7 +766,7 @@ pub struct SSTableWriter {
     options: WriteOptions,
     header: SerializationHeader,
     /// Raw (uncompressed) data buffer — the Data.db content.
-    data_buf: DataBuffer,
+    data_buf: DataSink,
     /// Raw Rows.db buffer containing per-partition clustering row indexes for
     /// wide clustered partitions.
     rows_buf: Vec<u8>,
@@ -561,7 +807,7 @@ impl SSTableWriter {
         SSTableWriter {
             options,
             header,
-            data_buf: DataBuffer::memory(),
+            data_buf: DataSink::memory(),
             rows_buf: Vec::new(),
             bloom,
             trie_builder: TrieBuilder::new(),
@@ -577,19 +823,41 @@ impl SSTableWriter {
         }
     }
 
-    /// Create an SSTable writer whose Data.db serialization buffer is backed
-    /// by a raw staging file instead of heap memory.
+    /// Create an SSTable writer whose Data.db content is streamed through the
+    /// aligned write pump as it is produced, instead of buffered in heap
+    /// memory.
+    ///
+    /// **T-038: `raw_data_path`'s FILENAME is ignored.** There is no more
+    /// `Data.raw` intermediate file (decisions.md D1) — `raw_data_path`'s
+    /// PARENT directory is taken as the staging directory, and `Data.db`
+    /// (plus `CompressionInfo.db`, for a compressed table) is opened there
+    /// directly, right now, rather than waiting for
+    /// [`finish_to_directory`](Self::finish_to_directory). Every current
+    /// caller already passes `staging_dir.join("Data.raw")` here and the
+    /// identical `staging_dir` to `finish_to_directory` (T-039 updates them
+    /// to pass a real `Data.db`-rooted path and drop the now-redundant
+    /// `staging_dir` plumbing this doubles up on).
     pub fn new_file_backed(
         options: WriteOptions,
         header: SerializationHeader,
         raw_data_path: impl Into<PathBuf>,
     ) -> Result<Self> {
+        let raw_data_path = raw_data_path.into();
+        let staging_dir = raw_data_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        std::fs::create_dir_all(&staging_dir)?;
         let bloom = BloomFilter::new(10_000, options.bloom_fp_chance);
-        let chunk_size = options.chunk_size;
+        let data_buf = DataSink::stream(
+            staging_dir.join("Data.db"),
+            staging_dir.join("CompressionInfo.db"),
+            &options,
+        )?;
         Ok(SSTableWriter {
             options,
             header,
-            data_buf: DataBuffer::file(raw_data_path.into(), chunk_size)?,
+            data_buf,
             rows_buf: Vec::new(),
             bloom,
             trie_builder: TrieBuilder::new(),
@@ -732,33 +1000,58 @@ impl SSTableWriter {
             total_columns_set,
         );
 
-        // 4. Optionally compress data chunks -> Data.db + CompressionInfo.db
-        let data_source = self.data_buf.into_source()?;
-        let (data, compression_info) = match data_source {
-            DataSource::Memory(data_buf) => Self::build_data_db(data_buf, &self.options)?,
-            DataSource::File { path, .. } => {
-                let data_buf = std::fs::read(&path)?;
-                if let Err(e) = std::fs::remove_file(&path) {
+        // 4. Optionally compress data chunks -> Data.db + CompressionInfo.db,
+        // plus source checksums (T-011, D6). For `DataSink::Memory` these are
+        // computed now, over the bytes just assembled; for `DataSink::Stream`
+        // they were already computed as bytes were produced (never by
+        // re-reading Data.db afterward) — this in-memory `finish` just reads
+        // the already-finished files back, exactly as
+        // `SSTableOutputFiles::read_to_memory` does for its own callers. No
+        // current caller pairs `new_file_backed` with `finish` (every one
+        // uses `finish_to_directory` — see `tests/support/legacy_writer.rs`),
+        // but this stays a real, exercised path rather than an unreachable
+        // one: `oracle_file_backed_matches_in_memory` and the golden corpus
+        // reproduce every other combination byte-exactly, and a silently
+        // unsupported combination here would be exactly the kind of gap the
+        // fail-loud standing order exists to catch.
+        let (data, compression_info, digest, crc) = match self.data_buf {
+            DataSink::Memory(data_buf) => {
+                let (data, compression_info) = Self::build_data_db(data_buf, &self.options)?;
+                let digest = checksum::format_digest(checksum::digest_bytes(&data));
+                let crc = if has_compression {
+                    None
+                } else {
+                    Some(checksum::compute_chunk_crc(&data, self.options.chunk_size))
+                };
+                (data, compression_info, digest, crc)
+            }
+            DataSink::Stream(stream) => {
+                let artifacts = stream.finish()?;
+                let data = std::fs::read(&artifacts.data_path)?;
+                if let Err(e) = std::fs::remove_file(&artifacts.data_path) {
                     tracing::warn!(
-                        path = %path.display(),
+                        path = %artifacts.data_path.display(),
                         error = %e,
-                        "failed to remove raw Data.db staging file after reading it back"
+                        "failed to remove staged Data.db after reading it into memory"
                     );
                 }
-                Self::build_data_db(data_buf, &self.options)?
+                let compression_info = match artifacts.compression_info {
+                    Some(info) => {
+                        let bytes = std::fs::read(&info.path)?;
+                        if let Err(e) = std::fs::remove_file(&info.path) {
+                            tracing::warn!(
+                                path = %info.path.display(),
+                                error = %e,
+                                "failed to remove staged CompressionInfo.db after reading it into memory"
+                            );
+                        }
+                        Some(bytes)
+                    }
+                    None => None,
+                };
+                let digest = checksum::format_digest(artifacts.digest);
+                (data, compression_info, digest, artifacts.crc_db)
             }
-        };
-
-        // 4b. Source checksums, computed over the final on-disk Data.db
-        // bytes already resident in `data` (no re-read needed here — this
-        // is the in-memory path). `Digest.crc32` for every table; `CRC.db`
-        // (per-chunk CRC32) for uncompressed tables only. See `checksum`
-        // module docs and `publication-safety.md` M1.
-        let digest = checksum::format_digest(checksum::digest_bytes(&data));
-        let crc = if has_compression {
-            None
-        } else {
-            Some(checksum::compute_chunk_crc(&data, self.options.chunk_size))
         };
 
         // 5. Rows.db: empty for simple partitions, indexed for wide clustered
@@ -848,22 +1141,59 @@ impl SSTableWriter {
         );
         let statistics_len = write_component_file(&statistics_path, &statistics)?;
 
-        let data_source = self.data_buf.into_source()?;
-        let artifacts = Self::build_data_source_to_file(data_source, &self.options, &data_path)?;
-        let compression_info = artifacts.compression_info;
-        let compression_info_len = if let Some(info) = compression_info.as_ref() {
-            write_component_file(&compression_info_path, info)?
-        } else {
-            0
+        // T-038: `DataSink::Stream` already streamed Data.db (and
+        // CompressionInfo.db, if compressed) to `data_path`/
+        // `compression_info_path` as bytes were produced — F12: their
+        // lengths below come only from the producer-side counters
+        // (`StreamFinish`/`CompressionInfoFinish`), never a post-hoc
+        // `fs::metadata` guess. `DataSink::Memory` has no such producer-side
+        // length yet, so it still stats the file it just finished writing.
+        let (compression_info, compression_info_len, digest, crc_db, data_len) = match self.data_buf
+        {
+            DataSink::Memory(data_buf) => {
+                let artifacts = Self::build_data_db_to_file(data_buf, &self.options, &data_path)?;
+                let compression_info_len = if let Some(info) = artifacts.compression_info.as_ref() {
+                    write_component_file(&compression_info_path, info)?
+                } else {
+                    0
+                };
+                let data_len = std::fs::metadata(&data_path)?.len();
+                (
+                    artifacts.compression_info.map(|_| compression_info_path.clone()),
+                    compression_info_len,
+                    artifacts.digest,
+                    artifacts.crc_db,
+                    data_len,
+                )
+            }
+            DataSink::Stream(stream) => {
+                let artifacts = stream.finish()?;
+                debug_assert_eq!(
+                    artifacts.data_path, data_path,
+                    "StreamSink was opened at a different Data.db path than finish_to_directory \
+                     was called with — every current caller passes the same staging_dir to \
+                     new_file_backed and finish_to_directory (T-038 doc comment on \
+                     new_file_backed)"
+                );
+                let (compression_info, compression_info_len) = match artifacts.compression_info {
+                    Some(info) => (Some(info.path), info.len),
+                    None => (None, 0),
+                };
+                (
+                    compression_info,
+                    compression_info_len,
+                    artifacts.digest,
+                    artifacts.crc_db,
+                    artifacts.data_len,
+                )
+            }
         };
 
-        // Source checksums, computed while Data.db was written (never by
-        // re-reading it). `Digest.crc32` for every table; `CRC.db` only for
-        // uncompressed tables. See `checksum` module docs and
-        // `publication-safety.md` M1.
-        let digest_bytes = checksum::format_digest(artifacts.digest);
+        // Source checksums (T-011, D6): `Digest.crc32` for every table;
+        // `CRC.db` only for uncompressed tables.
+        let digest_bytes = checksum::format_digest(digest);
         let digest_len = write_component_file(&digest_path, &digest_bytes)?;
-        let crc_len = if let Some(crc_db) = artifacts.crc_db.as_ref() {
+        let crc_len = if let Some(crc_db) = crc_db.as_ref() {
             write_component_file(&crc_path, crc_db)?
         } else {
             0
@@ -873,17 +1203,16 @@ impl SSTableWriter {
 
         let toc = Self::build_toc(has_compression);
         let toc_len = write_component_file(&toc_path, &toc)?;
-        let data_len = std::fs::metadata(&data_path)?.len();
 
         let output = SSTableOutputFiles {
             data: data_path,
             partitions: partitions_path,
             rows: rows_path,
             filter: filter_path,
-            compression_info: compression_info.as_ref().map(|_| compression_info_path),
+            compression_info,
             statistics: statistics_path,
             digest: digest_path,
-            crc: artifacts.crc_db.as_ref().map(|_| crc_path),
+            crc: crc_db.as_ref().map(|_| crc_path),
             toc: toc_path,
             data_len,
             partitions_len,
@@ -1773,142 +2102,6 @@ impl SSTableWriter {
                     compression_info: None,
                     digest,
                     crc_db,
-                })
-            }
-        }
-    }
-
-    fn build_data_source_to_file(
-        data_source: DataSource,
-        options: &WriteOptions,
-        data_path: &Path,
-    ) -> Result<DataDbArtifacts> {
-        match data_source {
-            DataSource::Memory(data_buf) => {
-                Self::build_data_db_to_file(data_buf, options, data_path)
-            }
-            DataSource::File {
-                path,
-                len,
-                digest,
-                crc_db,
-            } => {
-                let result =
-                    Self::build_data_file_to_file(&path, len, options, data_path, digest, crc_db);
-                if result.is_ok() {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "failed to remove raw Data.db staging file after building the final Data.db"
-                        );
-                    }
-                }
-                result
-            }
-        }
-    }
-
-    /// `raw_digest`/`raw_crc_db` are the checksums [`DataBuffer::File`]
-    /// accumulated while `raw_path` was written, covering its raw
-    /// (uncompressed) bytes. The uncompressed branch below uses them
-    /// directly — `raw_path` becomes `data_path` verbatim via rename, so
-    /// those bytes are already the final Data.db content and re-reading the
-    /// file to recompute a checksum would be pure waste. The compressed
-    /// branch discards them and checksums the compressed on-disk bytes as
-    /// it writes them instead, since compression changes what is on disk.
-    fn build_data_file_to_file(
-        raw_path: &Path,
-        data_length: u64,
-        options: &WriteOptions,
-        data_path: &Path,
-        raw_digest: u32,
-        raw_crc_db: Vec<u8>,
-    ) -> Result<DataDbArtifacts> {
-        match &options.compression {
-            Some(compression) if !matches!(compression, Compression::None) => {
-                struct CompressedChunk {
-                    payload: Vec<u8>,
-                    crc: [u8; 4],
-                    stored_size: usize,
-                }
-
-                let chunk_size = options.chunk_size;
-                let chunk_count = data_length.div_ceil(chunk_size as u64) as usize;
-                let mut chunk_offsets = Vec::with_capacity(chunk_count);
-                let mut max_compressed_size: usize = 0;
-                let batch_chunks = compression_batch_chunks();
-                let mut raw = std::fs::File::open(raw_path)?;
-                let mut out =
-                    ChecksummedDataDbWriter::create(data_path, sstable_direct_io_enabled(), None)?;
-
-                loop {
-                    let mut batch = Vec::with_capacity(batch_chunks);
-                    for _ in 0..batch_chunks {
-                        let mut chunk = vec![0u8; chunk_size];
-                        let mut read = 0usize;
-                        while read < chunk_size {
-                            let n = raw.read(&mut chunk[read..])?;
-                            if n == 0 {
-                                break;
-                            }
-                            read += n;
-                        }
-                        if read == 0 {
-                            break;
-                        }
-                        chunk.truncate(read);
-                        batch.push(chunk);
-                    }
-                    if batch.is_empty() {
-                        break;
-                    }
-
-                    let compressed_chunks: Result<Vec<CompressedChunk>> = compression_pool()
-                        .install(|| {
-                            batch
-                                .par_iter()
-                                .map(|chunk| {
-                                    let payload = compression.compress(chunk)?;
-                                    let crc = crc32fast::hash(&payload).to_be_bytes();
-                                    let stored_size = payload.len() + std::mem::size_of::<u32>();
-                                    Ok(CompressedChunk {
-                                        payload,
-                                        crc,
-                                        stored_size,
-                                    })
-                                })
-                                .collect()
-                        });
-
-                    for chunk in compressed_chunks? {
-                        chunk_offsets.push(out.position());
-                        max_compressed_size = max_compressed_size.max(chunk.stored_size);
-                        out.write_all(&chunk.payload)?;
-                        out.write_all(&chunk.crc)?;
-                    }
-                }
-                let (digest, _) = out.finish()?;
-
-                let info = CompressionInfo {
-                    compression: compression.clone(),
-                    chunk_length: chunk_size,
-                    max_compressed_size,
-                    data_length,
-                    chunk_offsets,
-                };
-                Ok(DataDbArtifacts {
-                    compression_info: Some(info.write()?),
-                    digest,
-                    crc_db: None,
-                })
-            }
-            _ => {
-                std::fs::rename(raw_path, data_path)?;
-                Ok(DataDbArtifacts {
-                    compression_info: None,
-                    digest: raw_digest,
-                    crc_db: Some(raw_crc_db),
                 })
             }
         }

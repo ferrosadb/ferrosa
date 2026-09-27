@@ -2374,7 +2374,7 @@ dependencies = [
  "hmac 0.12.1",
  "indexmap 2.14.0",
  "libc",
- "lz4_flex",
+ "lz4_flex 0.11.6",
  "md-5 0.11.0",
  "memchr",
  "moka",
@@ -2590,7 +2590,7 @@ dependencies = [
  "ferrosa-common",
  "futures",
  "hmac 0.12.1",
- "lz4_flex",
+ "lz4_flex 0.11.6",
  "parking_lot 0.12.5",
  "proptest",
  "rand 0.10.1",
@@ -2755,7 +2755,7 @@ dependencies = [
  "libc",
  "loom",
  "lru",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "memmap2",
  "proptest",
  "rayon",
@@ -4079,6 +4079,15 @@ name = "lz4_flex"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
 ]
@@ -6501,7 +6510,7 @@ dependencies = [
  "bytes",
  "chrono",
  "itertools 0.14.0",
- "lz4_flex",
+ "lz4_flex 0.11.6",
  "scylla-macros",
  "snap",
  "stable_deref_trait",

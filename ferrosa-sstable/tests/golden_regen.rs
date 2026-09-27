@@ -61,7 +61,9 @@ fn regenerate() {
         let bytes = if spec.file_backed {
             let dir =
                 tempfile::tempdir().unwrap_or_else(|e| panic!("case {}: tempdir: {e}", spec.name));
-            let raw_data_path = dir.path().join("raw-data.tmp");
+            // T-038: parent of this path is the staging directory the writer
+            // opens Data.db in — must match `staging_dir` below.
+            let raw_data_path = dir.path().join("staging").join("Data.raw");
             legacy_write_file_backed(
                 &partitions,
                 &header,
