@@ -11383,7 +11383,7 @@ mod tests {
             "component writes bypassed pump: {:?}",
             trace.bypasses()
         );
-        trace.assert_complete_sstables(2);
+        trace.assert_complete_sstables_with_deferred_sync(2);
         let files = trace.files();
         assert_eq!(
             files

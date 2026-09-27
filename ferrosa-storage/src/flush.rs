@@ -777,6 +777,19 @@ pub(crate) mod fsync_probe {
         Unlink(PathBuf),
     }
 
+    impl Event {
+        fn path(&self) -> &Path {
+            match self {
+                Self::Rename(path)
+                | Self::FileFsync(path)
+                | Self::ReadbackVerified(path)
+                | Self::Fadvise(path)
+                | Self::DirFsync(path)
+                | Self::Unlink(path) => path,
+            }
+        }
+    }
+
     pub(crate) struct ExclusiveGuard {
         _guard: MutexGuard<'static, ()>,
     }
@@ -884,12 +897,26 @@ pub(crate) mod fsync_probe {
             .collect()
     }
 
+    pub(crate) fn synced_files_under(base: &Path) -> HashSet<PathBuf> {
+        synced_files()
+            .into_iter()
+            .filter(|path| path.starts_with(base))
+            .collect()
+    }
+
     pub(crate) fn synced_dirs() -> HashSet<PathBuf> {
         SYNCED_DIRS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .cloned()
+            .collect()
+    }
+
+    pub(crate) fn synced_dirs_under(base: &Path) -> HashSet<PathBuf> {
+        synced_dirs()
+            .into_iter()
+            .filter(|path| path.starts_with(base))
             .collect()
     }
 
@@ -903,6 +930,13 @@ pub(crate) mod fsync_probe {
     /// The full chronological timeline of rename/fsync/unlink events.
     pub(crate) fn events() -> Vec<Event> {
         EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn events_under(base: &Path) -> Vec<Event> {
+        events()
+            .into_iter()
+            .filter(|event| event.path().starts_with(base))
+            .collect()
     }
 }
 
@@ -3243,7 +3277,7 @@ mod tests {
         let _reader = target.flush(output).unwrap();
         let gen = target.generation();
 
-        let synced = fsync_probe::synced_files();
+        let synced = fsync_probe::synced_files_under(dir.path());
         for suffix in [
             "Data.db",
             "Partitions.db",
@@ -3483,7 +3517,7 @@ mod tests {
             );
         }
 
-        let events = fsync_probe::events();
+        let events = fsync_probe::events_under(dir.path());
         let last_component_fsync = events
             .iter()
             .rposition(|event| matches!(event, fsync_probe::Event::FileFsync(_)))
@@ -3516,7 +3550,7 @@ mod tests {
             "all deferred cache advice must follow verification and precede promotion: {events:?}"
         );
         assert!(
-            fsync_probe::synced_dirs().contains(&dir.path().to_path_buf()),
+            fsync_probe::synced_dirs_under(dir.path()).contains(&dir.path().to_path_buf()),
             "containing directory was not fsynced after promote"
         );
     }
@@ -3608,7 +3642,7 @@ mod tests {
             quarantined_data.exists(),
             "the refused staged Data.db must be quarantined for salvage: {quarantined_data:?}"
         );
-        let events = fsync_probe::events();
+        let events = fsync_probe::events_under(dir.path());
         assert!(
             !events.iter().any(|event| matches!(
                 event,

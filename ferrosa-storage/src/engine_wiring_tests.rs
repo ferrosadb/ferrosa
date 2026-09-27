@@ -59,7 +59,7 @@ async fn wiring_flush_compaction_restart_components() {
 
         schemas.push(schema);
     }
-    trace.assert_complete_sstables(4);
+    trace.assert_complete_sstables_with_deferred_sync(4);
     engine.force_compact_all();
     assert!(engine.await_compaction_result(std::time::Duration::from_secs(60)));
     engine.poll_compactions().await;
@@ -77,7 +77,7 @@ async fn wiring_flush_compaction_restart_components() {
             1
         );
     }
-    trace.assert_complete_sstables(6);
+    trace.assert_complete_sstables_with_deferred_sync(6);
     for file in trace
         .files()
         .into_iter()
@@ -142,7 +142,7 @@ fn wiring_runtime_settings_preserve_component_bytes() {
             assert!(reader.digest_loaded());
             reader.verify_digest().unwrap();
         }
-        trace.assert_complete_sstables(2);
+        trace.assert_complete_sstables_with_deferred_sync(2);
         let config = ferrosa_sstable::pump::PumpConfig::from_env();
         for file in trace.files() {
             assert_eq!(
