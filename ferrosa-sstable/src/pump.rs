@@ -299,10 +299,14 @@ fn write_all_at(
     Ok(())
 }
 
+#[path = "pump_metrics.rs"]
+pub mod component_metrics;
+
 /// The production [`SegmentSink`]: an ordinary file, opened with exactly the
 /// flags [`crate::direct::open_bypassing`] always used, plus the T-031
 /// `dio_align` block probe `DirectWriter` did not yet consume before T-032.
 pub struct FileSink {
+    counters: component_metrics::Counter,
     file: std::fs::File,
     mode: DirectMode,
     block: usize,
@@ -341,6 +345,7 @@ impl FileSink {
             DirectMode::Direct => match crate::dio_align::block_for(&file) {
                 Ok(block) => Ok((
                     Self {
+                        counters: component_metrics::Counter::new(path),
                         file,
                         mode,
                         block,
@@ -365,6 +370,7 @@ impl FileSink {
                         .open(path)?;
                     Ok((
                         Self {
+                            counters: component_metrics::Counter::new(path),
                             file: buffered,
                             mode: DirectMode::Buffered,
                             block: MIN_BLOCK,
@@ -377,6 +383,7 @@ impl FileSink {
             },
             DirectMode::Buffered | DirectMode::NoCache => Ok((
                 Self {
+                    counters: component_metrics::Counter::new(path),
                     file,
                     mode,
                     block: MIN_BLOCK,
@@ -470,7 +477,9 @@ impl FileSink {
 
 impl SegmentSink for FileSink {
     fn pwrite(&mut self, buf: &[u8], offset: u64) -> Result<()> {
-        write_all_at(&mut self.file, buf, offset, self.mode, self.block)
+        write_all_at(&mut self.file, buf, offset, self.mode, self.block)?;
+        self.counters.written(buf.len());
+        Ok(())
     }
 
     fn sync_data(&mut self) -> Result<()> {
@@ -494,7 +503,10 @@ impl SegmentSink for FileSink {
     fn pwritev(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
         #[cfg(unix)]
         {
-            self.pwritev_unix(bufs, offset)
+            self.pwritev_unix(bufs, offset)?;
+            self.counters
+                .written(bufs.iter().map(|buf| buf.len()).sum());
+            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -534,7 +546,7 @@ impl SegmentSink for FileSink {
 ///    one block, independent of chunk count (architecture.md § Bounded-ring
 ///    rule) — so bypassing O_DIRECT for it costs nothing worth avoiding that
 ///    failure mode for.
-pub(crate) struct BufferedFileSink(std::fs::File);
+pub(crate) struct BufferedFileSink(std::fs::File, component_metrics::Counter);
 
 impl BufferedFileSink {
     pub(crate) fn create(path: &Path) -> Result<Self> {
@@ -543,13 +555,26 @@ impl BufferedFileSink {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(Self(file))
+        Ok(Self(file, component_metrics::Counter::new(path)))
     }
 }
 
 impl SegmentSink for BufferedFileSink {
     fn pwrite(&mut self, buf: &[u8], offset: u64) -> Result<()> {
-        write_all_at(&mut self.0, buf, offset, DirectMode::Buffered, MIN_BLOCK)
+        write_all_at(&mut self.0, buf, offset, DirectMode::Buffered, MIN_BLOCK)?;
+        self.1.written(buf.len());
+        Ok(())
+    }
+
+    fn pwritev(&mut self, bufs: &[&[u8]], mut offset: u64) -> Result<()> {
+        let mut bytes = 0;
+        for buf in bufs {
+            write_all_at(&mut self.0, buf, offset, DirectMode::Buffered, MIN_BLOCK)?;
+            offset += buf.len() as u64;
+            bytes += buf.len();
+        }
+        self.1.written(bytes);
+        Ok(())
     }
 
     fn sync_data(&mut self) -> Result<()> {
@@ -569,6 +594,14 @@ impl SegmentSink for BufferedFileSink {
     fn mode(&self) -> DirectMode {
         DirectMode::Buffered
     }
+}
+
+/// Test tripwire for legacy component writers outside the aligned pump.
+/// Production builds compile this call away.
+#[inline]
+pub fn note_component_write_outside_pump(_path: &Path) {
+    #[cfg(any(test, feature = "test-support"))]
+    hooks::note_bypass(_path);
 }
 
 /// Wrap a [`SegmentSink`] error with the pump's path and the offset the
@@ -972,6 +1005,7 @@ pub fn write_pump_blocked_seconds_total_free() -> f64 {
 /// Render the write-pump metrics (Prometheus text exposition), appended to
 /// the same block [`crate::direct::render_prometheus`] assembles.
 pub(crate) fn render_prometheus(out: &mut String) {
+    component_metrics::render_prometheus(out);
     out.push_str(
         "# HELP ferrosa_sstable_write_pump_blocked_seconds_total Seconds producers spent blocked waiting for a resource, by stage.\n\
          # TYPE ferrosa_sstable_write_pump_blocked_seconds_total counter\n",
@@ -1057,6 +1091,7 @@ impl AlignedPump {
     /// multiple of `block` — callers pass it through
     /// [`PumpConfig::effective_segment`], which guarantees this (D5).
     pub fn open(sink: Box<dyn SegmentSink>, block: usize, segment: usize, path: PathBuf) -> Self {
+        component_metrics::opened(&path, sink.mode());
         #[cfg(any(test, feature = "test-support"))]
         let (sink, segment, _) = hooks::prepare(sink, &path, block, segment, 0, false);
         Self::open_sync(sink, block, segment, path)
@@ -1098,6 +1133,7 @@ impl AlignedPump {
         depth: usize,
         abort: Arc<dyn AbortSignal>,
     ) -> Self {
+        component_metrics::opened(&path, sink.mode());
         #[cfg(any(test, feature = "test-support"))]
         let (sink, segment, depth) = hooks::prepare(sink, &path, block, segment, depth, true);
         if depth == 0 {
@@ -1734,7 +1770,10 @@ impl Drop for AlignedPump {
 #[cfg_attr(not(test), allow(dead_code))]
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
-    pub use super::hooks::{install_sink_hook, PumpOpen, PumpOverrides, SinkHook, SinkHookGuard};
+    pub use super::hooks::{
+        install_sink_hook, PumpFileTrace, PumpOpen, PumpOverrides, PumpTrace, PumpWrite, SinkHook,
+        SinkHookGuard,
+    };
 
     use super::{DirectMode, Error, Result, SegmentSink};
     use std::collections::HashMap;

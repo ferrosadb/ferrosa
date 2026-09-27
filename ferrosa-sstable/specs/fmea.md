@@ -123,3 +123,7 @@ Test-support pump hooks are scoped by output directory and wrap each real sink
 once at open. Integration tests can record effective segment/depth/mode or inject
 backpressure without process environment changes; guards unregister on drop.
 Production builds do not include the hook registry or its locks.
+
+### Pump wiring acceptance (T-045)
+
+Fixed component labels count pump opens by I/O mode, successful physical bytes (including padding), and sink write requests. The counters use atomics and resolve labels once per file; no per-write allocation or registry lock is added. Scoped test traces preserve real file I/O and detect known legacy component-write routes.
