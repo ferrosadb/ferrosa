@@ -41,7 +41,7 @@ use ferrosa_index::{FilterPredicate, IndexKey, IndexType, RowPosition};
 use ferrosa_sstable::io::ReadAt;
 use ferrosa_sstable::reader::SSTableReader;
 use ferrosa_sstable::types::{Partition, Row};
-use ferrosa_sstable::writer::{SSTableOutput, SSTableWriter};
+use ferrosa_sstable::writer::{SSTableOutput, SSTableOutputFiles, SSTableWriter};
 use ferrosa_sstable::WriteOptions;
 use rayon::prelude::*;
 
@@ -3354,51 +3354,85 @@ impl<F: FlushTarget> TableStore<F> {
         let schema = self.schema.load_full();
         let shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
 
-        // Parallel ENCODE — the ~98% cost. Each shard is independent (disjoint
-        // token range, its own writer). In-memory `finish()` keeps shards
-        // independent; each holds <= 1/N of the memtable, so transient encoded
-        // bytes stay bounded.
+        // Stage directories before entering Rayon: the target need not be Sync.
+        // Guards outlive all parallel writers and remove incomplete or unpublished
+        // files on every error. Each worker retains bounded pump buffers plus a
+        // component manifest, never a complete encoded SSTable byte image.
+        struct Staging(Option<std::path::PathBuf>);
+        impl Drop for Staging {
+            fn drop(&mut self) {
+                if let Some(path) = &self.0 {
+                    if let Err(error) = std::fs::remove_dir_all(path) {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            tracing::error!(?path, %error, "sharded flush staging cleanup failed");
+                        }
+                    }
+                }
+            }
+        }
+        enum ShardOutput {
+            Files(SSTableOutputFiles),
+            Memory(SSTableOutput),
+        }
+        let staging: Vec<Staging> = (0..shards.len())
+            .map(|_| self.flush_target.file_output_staging_dir().map(Staging))
+            .collect::<Result<_>>()?;
         let phase_start = Instant::now();
-        let encoded: Vec<Result<SSTableOutput>> = crate::flush_executor::pool().install(|| {
+        let encoded: Vec<Result<ShardOutput>> = crate::flush_executor::pool().install(|| {
             shards
                 .par_iter()
-                .map(|shard| {
+                .zip(staging.par_iter())
+                .map(|(shard, stage)| {
                     let header = flush::build_serialization_header(&schema, shard);
-                    let mut writer = SSTableWriter::new(options.clone(), header);
-                    for p in shard {
-                        writer.add_partition(p)?;
+                    let mut writer = match &stage.0 {
+                        Some(dir) => SSTableWriter::new_file_backed(
+                            options.clone(),
+                            header,
+                            dir.join("Data.db"),
+                        )?,
+                        None => SSTableWriter::new(options.clone(), header),
+                    };
+                    for partition in shard {
+                        writer.add_partition(partition)?;
                     }
-                    writer.finish()
+                    match &stage.0 {
+                        Some(dir) => writer.finish_to_directory(dir).map(ShardOutput::Files),
+                        None => writer.finish().map(ShardOutput::Memory),
+                    }
                 })
                 .collect()
         });
-        let outputs: Vec<SSTableOutput> = encoded.into_iter().collect::<Result<_>>()?;
+        let outputs: Vec<ShardOutput> = encoded.into_iter().collect::<Result<_>>()?;
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::EncodeSstable,
             phase_start.elapsed(),
         );
 
-        // Sequential PUBLISH-TO-DISK — the flush target's generation counter is
-        // shared/serial, so write each encoded shard with its own fresh gen.
-        // This is the cheap (~0.3%) part.
+        // Publish each finished shard under its own generation; install all
+        // readers together only after every shard has been published.
         let phase_start = Instant::now();
         let flush_dir = self.flush_target.base_dir().to_path_buf();
         let mut published: Vec<(u64, Arc<SSTableReader<F::Reader>>)> =
             Vec::with_capacity(outputs.len());
         let mut total_output_bytes = 0u64;
         for output in outputs {
-            total_output_bytes += (output.data.len()
-                + output.partitions.len()
-                + output.rows.len()
-                + output.filter.len()
-                + output.statistics.len()
-                + output.toc.len()
-                + output
-                    .compression_info
-                    .as_ref()
-                    .map(|ci| ci.len())
-                    .unwrap_or(0)) as u64;
-            let reader = self.flush_target.flush(output)?;
+            let reader = match output {
+                ShardOutput::Files(output) => {
+                    total_output_bytes += output.total_size_bytes();
+                    self.flush_target.flush_files(output)?
+                }
+                ShardOutput::Memory(output) => {
+                    total_output_bytes += (output.data.len()
+                        + output.partitions.len()
+                        + output.rows.len()
+                        + output.filter.len()
+                        + output.statistics.len()
+                        + output.toc.len()
+                        + output.compression_info.as_ref().map_or(0, Vec::len))
+                        as u64;
+                    self.flush_target.flush(output)?
+                }
+            };
             let gen = self.flush_target.last_generation();
             self.next_gen
                 .fetch_max(gen + 1, std::sync::atomic::Ordering::SeqCst);
@@ -11239,6 +11273,122 @@ mod tests {
             "results must remain top-k sorted: {:?}",
             results
         );
+    }
+
+    #[test]
+    fn wiring_sharded_flush_failure_removes_all_staging() {
+        use ferrosa_sstable::pump::test_support::{
+            install_sink_hook, Fault, FaultySink, PumpOverrides,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let _hook = install_sink_hook(
+            dir.path().to_path_buf(),
+            PumpOverrides::default(),
+            Arc::new(|opened, sink| {
+                if opened.path.ends_with("Data.db") {
+                    let (faulty, _) = FaultySink::new(opened.mode);
+                    Box::new(faulty.at(0, Fault::Enospc))
+                } else {
+                    sink
+                }
+            }),
+        );
+        let store = TableStore::new(
+            test_schema(),
+            crate::flush::FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        let mut partitions: Vec<_> = (0..4)
+            .map(|i| Partition {
+                key: make_key(&format!("key{i}")),
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![make_row(b"value", 1000)],
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        let error = store
+            .flush_sharded(partitions, 2, 4, Instant::now(), &new_memtable())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("No space") || error.to_string().contains("ENOSPC"),
+            "{error}"
+        );
+        assert_eq!(store.sstable_count(), 0);
+        // The shared staging root is infrastructure; only its owned per-shard
+        // children must disappear. No generation or staged component may remain.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            assert_eq!(path, dir.path().join(".sstable-staging"));
+            assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn wiring_sharded_flush_uses_pump_and_reads_back() {
+        use ferrosa_sstable::pump::test_support::{PumpOverrides, PumpTrace};
+        let dir = tempfile::tempdir().unwrap();
+        let trace = PumpTrace::install(
+            dir.path().to_path_buf(),
+            PumpOverrides {
+                segment_bytes: Some(262_144),
+                queue_depth: Some(1),
+            },
+        );
+        let store = TableStore::new(
+            test_schema(),
+            crate::flush::FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        let mut partitions: Vec<_> = (0..20)
+            .map(|i| {
+                let mut p = Partition {
+                    key: make_key(&format!("key{i:05}")),
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    static_row: None,
+                    rows: Vec::new(),
+                };
+                p.rows
+                    .push(make_row(format!("val{i:05}").as_bytes(), 1000 + i));
+                p
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        // Call the actual shard path with two shards even on a one-core runner.
+        store
+            .flush_sharded(partitions, 2, 20, Instant::now(), &new_memtable())
+            .unwrap();
+        assert_eq!(store.sstable_count(), 2);
+        assert!(
+            trace.bypasses().is_empty(),
+            "component writes bypassed pump: {:?}",
+            trace.bypasses()
+        );
+        trace.assert_complete_sstables(2);
+        let files = trace.files();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|f| f.opened.path.ends_with("Data.db"))
+                .count(),
+            2
+        );
+        assert!(files.iter().all(|f| !f.opened.path.ends_with("Data.raw")));
+        let got = store.read_range(None, None, 40).unwrap();
+        assert_eq!(got.len(), 20);
+        for p in got {
+            let key = std::str::from_utf8(p.key.key.as_bytes()).unwrap();
+            assert_eq!(
+                p.rows[0].cells[0].1.value.as_deref(),
+                Some(format!("val{}", &key[3..]).as_bytes())
+            );
+        }
     }
 
     #[test]

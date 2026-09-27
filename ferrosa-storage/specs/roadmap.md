@@ -164,3 +164,7 @@ open work lives in specs and the items below.
   `ferrosa-graph`).
 - Cluster routing/consensus — owned by `ferrosa-cluster`; this crate exposes the
   `DataStore` seam it routes through.
+
+### Pump wiring acceptance (T-045)
+
+File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.

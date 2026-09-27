@@ -664,3 +664,7 @@ hook. See [Roadmap](specs/roadmap.md).
 - [Data flow](specs/data-flow.md) — write path and read path (mermaid)
 - [FMEA / known issues](specs/fmea.md) — failure modes ranked by RPN
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+### Pump wiring acceptance (T-045)
+
+File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.

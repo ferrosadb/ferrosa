@@ -165,3 +165,7 @@ A heavyweight internal hub. Depends on `ferrosa-cdc`, `ferrosa-common`,
 `ferrosa-cluster`, `ferrosa-cql`, `ferrosa-ctl`, `ferrosa-graph`,
 `ferrosa-index-builder`, `ferrosa-loadgen`, `ferrosa-postgres`,
 `ferrosa-session`, `ferrosa-sparql`. See the root crate index for the full graph.
+
+### Pump wiring acceptance (T-045)
+
+File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.

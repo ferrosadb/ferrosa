@@ -1725,6 +1725,11 @@ fn verify_promoted_sstable(reader: &SSTableReader<FileReadAt>) -> Result<()> {
     Ok(())
 }
 
+fn write_legacy_component(path: impl AsRef<Path>, bytes: &[u8]) -> std::io::Result<()> {
+    ferrosa_sstable::pump::note_component_write_outside_pump(path.as_ref());
+    std::fs::write(path, bytes)
+}
+
 impl FlushTarget for FileFlushTarget {
     type Reader = FileReadAt;
 
@@ -1785,18 +1790,18 @@ impl FlushTarget for FileFlushTarget {
         };
         // Write components; on any failure remove the run dir so we never leak.
         let write_all = || -> Result<()> {
-            std::fs::write(&paths.data, &output.data)?;
-            std::fs::write(&paths.partitions, &output.partitions)?;
-            std::fs::write(&paths.rows, &output.rows)?;
-            std::fs::write(&paths.filter, &output.filter)?;
-            std::fs::write(&paths.statistics, &output.statistics)?;
-            std::fs::write(&paths.toc, &output.toc)?;
-            std::fs::write(&paths.digest, &output.digest)?;
+            write_legacy_component(&paths.data, &output.data)?;
+            write_legacy_component(&paths.partitions, &output.partitions)?;
+            write_legacy_component(&paths.rows, &output.rows)?;
+            write_legacy_component(&paths.filter, &output.filter)?;
+            write_legacy_component(&paths.statistics, &output.statistics)?;
+            write_legacy_component(&paths.toc, &output.toc)?;
+            write_legacy_component(&paths.digest, &output.digest)?;
             if let Some(ref ci) = output.compression_info {
-                std::fs::write(&paths.compression_info, ci)?;
+                write_legacy_component(&paths.compression_info, ci)?;
             }
             if let Some(ref crc) = output.crc {
-                std::fs::write(&paths.crc, crc)?;
+                write_legacy_component(&paths.crc, crc)?;
             }
             Ok(())
         };
@@ -1864,21 +1869,21 @@ impl FlushTarget for FileFlushTarget {
         let toc_tmp = tmp(&paths.toc);
 
         if let Some(ref ci) = output.compression_info {
-            std::fs::write(tmp(&paths.compression_info), ci)?;
+            write_legacy_component(tmp(&paths.compression_info), ci)?;
         }
         if let Some(ref crc) = output.crc {
-            std::fs::write(tmp(&paths.crc), crc)?;
+            write_legacy_component(tmp(&paths.crc), crc)?;
         }
 
         std::thread::scope(|s| {
             let handles: Vec<_> = [
-                s.spawn(|| std::fs::write(tmp(&paths.data), &output.data)),
-                s.spawn(|| std::fs::write(tmp(&paths.partitions), &output.partitions)),
-                s.spawn(|| std::fs::write(tmp(&paths.rows), &output.rows)),
-                s.spawn(|| std::fs::write(tmp(&paths.filter), &output.filter)),
-                s.spawn(|| std::fs::write(tmp(&paths.statistics), &output.statistics)),
-                s.spawn(|| std::fs::write(&toc_tmp, &output.toc)),
-                s.spawn(|| std::fs::write(tmp(&paths.digest), &output.digest)),
+                s.spawn(|| write_legacy_component(tmp(&paths.data), &output.data)),
+                s.spawn(|| write_legacy_component(tmp(&paths.partitions), &output.partitions)),
+                s.spawn(|| write_legacy_component(tmp(&paths.rows), &output.rows)),
+                s.spawn(|| write_legacy_component(tmp(&paths.filter), &output.filter)),
+                s.spawn(|| write_legacy_component(tmp(&paths.statistics), &output.statistics)),
+                s.spawn(|| write_legacy_component(&toc_tmp, &output.toc)),
+                s.spawn(|| write_legacy_component(tmp(&paths.digest), &output.digest)),
             ]
             .into_iter()
             .collect();

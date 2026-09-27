@@ -9985,6 +9985,12 @@ impl StorageEngine {
     ///
     /// Useful for testing and debugging compaction issues. Submits a compaction
     /// task for every table that has at least 2 SSTables, regardless of size
+    /// Wait for a compaction result without consuming it (acceptance harness).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn await_compaction_result(&self, timeout: std::time::Duration) -> bool {
+        self.compaction_executor.await_result_available(timeout)
+    }
+
     /// bucketing or min_threshold.
     pub fn force_compact_all(&self) {
         let tables = self.tables.read();
@@ -12335,6 +12341,8 @@ impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
 
 #[cfg(test)]
 mod tests {
+    include!("engine_wiring_tests.rs");
+
     use super::*;
 
     use ferrosa_common::cell::CellValue;

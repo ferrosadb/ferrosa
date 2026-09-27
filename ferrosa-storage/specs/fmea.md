@@ -70,3 +70,7 @@ the top of the scale: a defect here is silent data loss or corruption.
 - Metrics: `FLUSH_QUARANTINED_ROWS_TOTAL`, `sstable_publication_refused_total{reason}`,
   compaction pool/running gauges, pin gauges, `sstable_read_errors`,
   `read_sstable_fanout_max`, and `read_sstable_high_fanout_total`.
+
+### Pump wiring acceptance (T-045)
+
+File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.
