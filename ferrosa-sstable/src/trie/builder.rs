@@ -12,6 +12,7 @@
 //! [`TrieBuilder::finish`].
 
 use ferrosa_common::{Error, Result};
+use smallvec::SmallVec;
 
 use crate::trie::node::{encode_signed_bytes, NodeType, PAGE_SIZE};
 
@@ -34,7 +35,7 @@ struct BranchNode {
     /// For the root (stack index 0), this is unused.
     transition: u8,
     /// Children: (transition_byte, absolute_position_in_output).
-    children: Vec<(u8, u64)>,
+    children: SmallVec<[(u8, u64); 16]>,
     /// Payload if this node is a leaf (or an internal node with a payload).
     payload: Option<TriePayload>,
 }
@@ -59,6 +60,12 @@ pub struct TrieBuilder {
     last_node_pos: u64,
     /// Whether any key has been added yet.
     has_keys: bool,
+    /// Reused node, payload, and pointer workspaces. Trie node encoding is on
+    /// the per-key hot path, so its temporary bytes must not allocate per node.
+    encoded_node: Vec<u8>,
+    payload_scratch: Vec<u8>,
+    distance_scratch: Vec<u64>,
+    dense_distance_scratch: Vec<u64>,
 }
 
 impl TrieBuilder {
@@ -71,6 +78,10 @@ impl TrieBuilder {
             write_pos: 0,
             last_node_pos: 0,
             has_keys: false,
+            encoded_node: Vec::new(),
+            payload_scratch: Vec::new(),
+            distance_scratch: Vec::new(),
+            dense_distance_scratch: Vec::new(),
         }
     }
 
@@ -94,7 +105,7 @@ impl TrieBuilder {
             // First key: push the implicit root node.
             self.stack.push(BranchNode {
                 transition: 0, // unused for root
-                children: Vec::new(),
+                children: SmallVec::new(),
                 payload: None,
             });
         } else {
@@ -109,7 +120,7 @@ impl TrieBuilder {
         for &b in &key[prefix_len..] {
             self.stack.push(BranchNode {
                 transition: b,
-                children: Vec::new(),
+                children: SmallVec::new(),
                 payload: None,
             });
         }
@@ -120,7 +131,8 @@ impl TrieBuilder {
             leaf.payload = Some(payload);
         }
 
-        self.prev_key = key.to_vec();
+        self.prev_key.clear();
+        self.prev_key.extend_from_slice(key);
         self.has_keys = true;
         Ok(())
     }
@@ -162,26 +174,41 @@ impl TrieBuilder {
     ///
     /// Returns the absolute position of the written node in the output.
     fn write_node(&mut self, node: &BranchNode) -> Result<u64> {
-        let encoded = encode_node(node, self.write_pos as u64)?;
+        encode_node_into(
+            node,
+            self.write_pos as u64,
+            &mut self.encoded_node,
+            &mut self.payload_scratch,
+            &mut self.distance_scratch,
+            &mut self.dense_distance_scratch,
+        )?;
+        let encoded_len = self.encoded_node.len();
 
         // Page alignment: if the encoded node would cross a page boundary, pad.
         let current_page_offset = self.write_pos % PAGE_SIZE;
-        if current_page_offset != 0 && current_page_offset + encoded.len() > PAGE_SIZE {
+        if current_page_offset != 0 && current_page_offset + encoded_len > PAGE_SIZE {
             let pad = PAGE_SIZE - current_page_offset;
             self.output.resize(self.output.len() + pad, 0);
             self.write_pos += pad;
 
             // Re-encode with the new position (distances may have changed).
-            let encoded = encode_node(node, self.write_pos as u64)?;
+            encode_node_into(
+                node,
+                self.write_pos as u64,
+                &mut self.encoded_node,
+                &mut self.payload_scratch,
+                &mut self.distance_scratch,
+                &mut self.dense_distance_scratch,
+            )?;
             let pos = self.write_pos as u64;
-            self.output.extend_from_slice(&encoded);
-            self.write_pos += encoded.len();
+            self.output.extend_from_slice(&self.encoded_node);
+            self.write_pos += self.encoded_node.len();
             return Ok(pos);
         }
 
         let pos = self.write_pos as u64;
-        self.output.extend_from_slice(&encoded);
-        self.write_pos += encoded.len();
+        self.output.extend_from_slice(&self.encoded_node);
+        self.write_pos += self.encoded_node.len();
 
         Ok(pos)
     }
@@ -211,121 +238,160 @@ fn compute_pb(payload: &TriePayload) -> u8 {
     }
 }
 
-/// Encode the payload into raw bytes.
-///
-/// When `position == 0`, this produces a single `[0x00]` byte so that
-/// `pb >= 1` (the "payload present" invariant).
-fn encode_payload(payload: &TriePayload) -> Vec<u8> {
-    let mut idx_bytes = encode_signed_bytes(payload.position);
-    if idx_bytes.is_empty() {
-        idx_bytes.push(0x00);
-    }
-    match payload.hash {
-        None => idx_bytes,
-        Some(h) => {
-            let mut out = vec![h];
-            out.extend_from_slice(&idx_bytes);
-            out
-        }
-    }
-}
-
-/// Encode a complete node (header + payload) into bytes.
-fn encode_node(node: &BranchNode, current_pos: u64) -> Result<Vec<u8>> {
-    let (pb, payload_bytes) = match &node.payload {
-        Some(p) => (compute_pb(p), encode_payload(p)),
-        None => (0u8, Vec::new()),
+/// Encode a node into reusable workspaces, avoiding a temporary Vec per node.
+fn encode_node_into(
+    node: &BranchNode,
+    current_pos: u64,
+    out: &mut Vec<u8>,
+    payload_bytes: &mut Vec<u8>,
+    distances: &mut Vec<u64>,
+    dense_distances: &mut Vec<u64>,
+) -> Result<()> {
+    out.clear();
+    payload_bytes.clear();
+    let pb = if let Some(payload) = &node.payload {
+        encode_payload_into(payload, payload_bytes);
+        compute_pb(payload)
+    } else {
+        0
     };
 
     match node.children.len() {
         0 => {
-            // PayloadOnly
-            let type_byte = (NodeType::PayloadOnly as u8) << 4 | (pb & 0x0F);
-            let mut out = vec![type_byte];
-            out.extend_from_slice(&payload_bytes);
-            Ok(out)
+            out.push((NodeType::PayloadOnly as u8) << 4 | (pb & 0x0F));
+            out.extend_from_slice(payload_bytes);
         }
-        1 => encode_single_node(
+        1 => encode_single_node_into(
             node.children[0].0,
             current_pos,
             node.children[0].1,
             pb,
-            &payload_bytes,
-        ),
-        _ => encode_sparse_node(&node.children, current_pos, pb, &payload_bytes),
+            payload_bytes,
+            out,
+            &node.children,
+            distances,
+            dense_distances,
+        )?,
+        _ => encode_sparse_node_into(
+            &node.children,
+            current_pos,
+            pb,
+            payload_bytes,
+            out,
+            distances,
+            dense_distances,
+        )?,
+    }
+    Ok(())
+}
+
+fn encode_payload_into(payload: &TriePayload, out: &mut Vec<u8>) {
+    out.clear();
+    let value = payload.position;
+    let num_bytes = if value == 0 {
+        1
+    } else {
+        let abs = if value < 0 { !value } else { value };
+        let lz = abs.leading_zeros();
+        let mut bytes = (64 - lz + 1).div_ceil(8) as usize;
+        let top_byte = (value >> ((bytes - 1) * 8)) as u8;
+        if (top_byte & 0x80 != 0) != (value < 0) {
+            bytes += 1;
+        }
+        bytes
+    };
+    if let Some(hash) = payload.hash {
+        out.push(hash);
+    }
+    for i in (0..num_bytes).rev() {
+        out.push((value >> (i * 8)) as u8);
     }
 }
 
-/// Encode a single-child node, choosing the smallest type that fits.
-fn encode_single_node(
+#[allow(clippy::too_many_arguments)]
+fn encode_single_node_into(
     trans: u8,
     current_pos: u64,
     child_pos: u64,
     pb: u8,
     payload_bytes: &[u8],
-) -> Result<Vec<u8>> {
+    out: &mut Vec<u8>,
+    children: &[(u8, u64)],
+    distances: &mut Vec<u64>,
+    dense_distances: &mut Vec<u64>,
+) -> Result<()> {
     let distance = current_pos - child_pos;
-
-    // Try SingleNopayload4: 4-bit pointer, no payload.
     if pb == 0 && distance <= 0x0F {
-        let type_byte = (NodeType::SingleNopayload4 as u8) << 4 | (distance as u8 & 0x0F);
-        return Ok(vec![type_byte, trans]);
-    }
-
-    // Try Single8: 8-bit pointer, has payload.
-    if distance <= 0xFF {
-        let type_byte = (NodeType::Single8 as u8) << 4 | (pb & 0x0F);
-        let mut out = vec![type_byte, trans, distance as u8];
+        out.extend_from_slice(&[
+            ((NodeType::SingleNopayload4 as u8) << 4) | (distance as u8 & 0x0F),
+            trans,
+        ]);
+    } else if distance <= 0xFF {
+        out.extend_from_slice(&[
+            ((NodeType::Single8 as u8) << 4) | (pb & 0x0F),
+            trans,
+            distance as u8,
+        ]);
         out.extend_from_slice(payload_bytes);
-        return Ok(out);
-    }
-
-    // Try SingleNopayload12: 12-bit pointer, no payload.
-    if pb == 0 && distance <= 0xFFF {
+    } else if pb == 0 && distance <= 0xFFF {
         let ptr_hi = ((distance >> 8) & 0x0F) as u8;
-        let ptr_lo = (distance & 0xFF) as u8;
-        let type_byte = (NodeType::SingleNopayload12 as u8) << 4 | ptr_hi;
-        return Ok(vec![type_byte, ptr_lo, trans]);
-    }
-
-    // Try Single16: 16-bit pointer, has payload.
-    if distance <= 0xFFFF {
-        let type_byte = (NodeType::Single16 as u8) << 4 | (pb & 0x0F);
-        let mut out = vec![type_byte, trans, (distance >> 8) as u8, distance as u8];
+        out.extend_from_slice(&[
+            ((NodeType::SingleNopayload12 as u8) << 4) | ptr_hi,
+            distance as u8,
+            trans,
+        ]);
+    } else if distance <= 0xFFFF {
+        out.extend_from_slice(&[
+            ((NodeType::Single16 as u8) << 4) | (pb & 0x0F),
+            trans,
+            (distance >> 8) as u8,
+            distance as u8,
+        ]);
         out.extend_from_slice(payload_bytes);
-        return Ok(out);
+    } else {
+        encode_sparse_node_into(
+            children,
+            current_pos,
+            pb,
+            payload_bytes,
+            out,
+            distances,
+            dense_distances,
+        )?;
     }
-
-    // Distance too large for single types; fall through to sparse with 1 child.
-    encode_sparse_node(&[(trans, child_pos)], current_pos, pb, payload_bytes)
+    Ok(())
 }
 
-/// Encode a sparse (multi-child) node, choosing the smallest pointer width.
-fn encode_sparse_node(
+fn encode_sparse_node_into(
     children: &[(u8, u64)],
     current_pos: u64,
     pb: u8,
     payload_bytes: &[u8],
-) -> Result<Vec<u8>> {
-    let cc = children.len();
-
-    // Compute distances from current_pos to each child.
-    let distances: Vec<u64> = children
-        .iter()
-        .map(|&(_, child_pos)| current_pos - child_pos)
-        .collect();
-
-    if cc > u8::MAX as usize {
-        return encode_dense_node(children, &distances, pb, payload_bytes);
+    out: &mut Vec<u8>,
+    distances: &mut Vec<u64>,
+    dense_distances: &mut Vec<u64>,
+) -> Result<()> {
+    distances.clear();
+    distances.extend(
+        children
+            .iter()
+            .map(|&(_, child_pos)| current_pos - child_pos),
+    );
+    if children.len() > u8::MAX as usize {
+        return encode_dense_node_into(
+            children,
+            distances,
+            pb,
+            payload_bytes,
+            out,
+            dense_distances,
+        );
     }
-
-    let max_distance = *distances.iter().max().unwrap_or(&0);
-
-    // Choose the smallest sparse type that fits.
+    let max_distance = distances.iter().copied().max().unwrap_or(0);
     let (node_type, bytes_per_ptr) = if max_distance <= 0xFF {
         (NodeType::Sparse8, 1)
     } else if max_distance <= 0xFFF {
-        (NodeType::Sparse12, 0) // special 12-bit packing
+        (NodeType::Sparse12, 0)
     } else if max_distance <= 0xFFFF {
         (NodeType::Sparse16, 2)
     } else if max_distance <= 0xFF_FFFF {
@@ -337,57 +403,42 @@ fn encode_sparse_node(
             "child distance {max_distance} too large for any sparse type"
         )));
     };
-
-    let type_byte = (node_type as u8) << 4 | (pb & 0x0F);
-    let mut out = vec![type_byte, cc as u8];
-
-    // Write transition bytes.
-    for &(t, _) in children {
-        out.push(t);
-    }
-
-    // Write pointers.
+    out.push((node_type as u8) << 4 | (pb & 0x0F));
+    out.push(children.len() as u8);
+    out.extend(children.iter().map(|&(transition, _)| transition));
     if node_type == NodeType::Sparse12 {
-        write_12bit_pointers(&mut out, &distances);
+        write_12bit_pointers(out, distances);
     } else {
-        for &d in &distances {
-            write_be_unsigned(&mut out, d, bytes_per_ptr);
+        for &distance in distances.iter() {
+            write_be_unsigned(out, distance, bytes_per_ptr);
         }
     }
-
     out.extend_from_slice(payload_bytes);
-    Ok(out)
+    Ok(())
 }
 
-/// Encode a dense node for a transition span. Dense nodes can represent all
-/// 256 byte values because they store `span_len - 1` in a single byte; sparse
-/// nodes cannot represent 256 children because their child count is one byte.
-fn encode_dense_node(
+fn encode_dense_node_into(
     children: &[(u8, u64)],
     distances: &[u64],
     pb: u8,
     payload_bytes: &[u8],
-) -> Result<Vec<u8>> {
-    let (&min_transition, &max_transition) = match (
-        children.iter().map(|(transition, _)| transition).min(),
-        children.iter().map(|(transition, _)| transition).max(),
-    ) {
-        (Some(min), Some(max)) => (min, max),
-        _ => {
-            return Err(Error::InvalidData(
-                "cannot encode dense trie node with no children".to_string(),
-            ))
-        }
+    out: &mut Vec<u8>,
+    dense_distances: &mut Vec<u64>,
+) -> Result<()> {
+    let min_transition = children.iter().map(|(transition, _)| *transition).min();
+    let max_transition = children.iter().map(|(transition, _)| *transition).max();
+    let (Some(min_transition), Some(max_transition)) = (min_transition, max_transition) else {
+        return Err(Error::InvalidData(
+            "cannot encode dense trie node with no children".to_string(),
+        ));
     };
     let span = (max_transition as usize) - (min_transition as usize) + 1;
-    debug_assert!(span <= 256);
-
-    let mut dense_distances = vec![0u64; span];
+    dense_distances.clear();
+    dense_distances.resize(span, 0);
     for ((transition, _), distance) in children.iter().zip(distances.iter().copied()) {
         dense_distances[(*transition as usize) - (min_transition as usize)] = distance;
     }
-
-    let max_distance = *dense_distances.iter().max().unwrap_or(&0);
+    let max_distance = dense_distances.iter().copied().max().unwrap_or(0);
     let (node_type, bytes_per_ptr) = if max_distance <= 0xFFF {
         (NodeType::Dense12, 0)
     } else if max_distance <= 0xFFFF {
@@ -401,20 +452,20 @@ fn encode_dense_node(
     } else {
         (NodeType::LongDense, 8)
     };
-
-    let type_byte = (node_type as u8) << 4 | (pb & 0x0F);
-    let mut out = vec![type_byte, min_transition, (span - 1) as u8];
-
+    out.extend_from_slice(&[
+        (node_type as u8) << 4 | (pb & 0x0F),
+        min_transition,
+        (span - 1) as u8,
+    ]);
     if node_type == NodeType::Dense12 {
-        write_12bit_pointers(&mut out, &dense_distances);
+        write_12bit_pointers(out, dense_distances);
     } else {
-        for &d in &dense_distances {
-            write_be_unsigned(&mut out, d, bytes_per_ptr);
+        for &distance in dense_distances.iter() {
+            write_be_unsigned(out, distance, bytes_per_ptr);
         }
     }
-
     out.extend_from_slice(payload_bytes);
-    Ok(out)
+    Ok(())
 }
 
 /// Write a sequence of 12-bit values packed into bytes.

@@ -118,14 +118,26 @@ fn clustered_schema() -> Schema {
 /// partition — used to land many small `write_all` calls (one row's worth
 /// each) across chunk/segment boundaries (U2, U4, U5, U9, U11), unlike
 /// `one_big_value_partition`'s single wide write (U3, U6).
-fn many_rows_partition(key: &[u8], n: i32, row_value_len: usize, fill_from_index: bool) -> Partition {
+fn many_rows_partition(
+    key: &[u8],
+    n: i32,
+    row_value_len: usize,
+    fill_from_index: bool,
+) -> Partition {
     let rows = (0..n)
         .map(|i| Row {
             clustering: i.to_be_bytes().to_vec(),
             cells: vec![(
                 0,
                 CellValue::live(
-                    vec![if fill_from_index { (i % 251) as u8 } else { 0u8 }; row_value_len],
+                    vec![
+                        if fill_from_index {
+                            (i % 251) as u8
+                        } else {
+                            0u8
+                        };
+                        row_value_len
+                    ],
                     (i as i64) + 1,
                 ),
             )],
@@ -231,7 +243,11 @@ fn assert_digest_verifies(reader: &SSTableReader<Vec<u8>>) {
 /// `max_compressed_size`.
 fn assert_compression_info_invariants(info: &CompressionInfo, data_db_len: u64) {
     if info.data_length == 0 {
-        assert_eq!(info.chunk_offsets.len(), 0, "empty input must produce zero chunks");
+        assert_eq!(
+            info.chunk_offsets.len(),
+            0,
+            "empty input must produce zero chunks"
+        );
         return;
     }
     assert_eq!(info.chunk_offsets[0], 0, "first chunk offset must be 0");
@@ -271,7 +287,14 @@ fn assert_compression_info_invariants(info: &CompressionInfo, data_db_len: u64) 
 #[test]
 fn data_sink_u1_data_length_at_chunk_boundaries_compressed() {
     let chunk = 64usize;
-    for &value_len in &[1usize, chunk - 1, chunk, chunk + 1, 2 * chunk, 3 * chunk - 1] {
+    for &value_len in &[
+        1usize,
+        chunk - 1,
+        chunk,
+        chunk + 1,
+        2 * chunk,
+        3 * chunk - 1,
+    ] {
         let options = WriteOptions {
             compression: Some(Compression::Lz4),
             bloom_fp_chance: 0.01,
@@ -293,7 +316,14 @@ fn data_sink_u1_data_length_at_chunk_boundaries_compressed() {
 #[test]
 fn data_sink_u1_data_length_at_chunk_boundaries_uncompressed() {
     let chunk = 64usize;
-    for &value_len in &[1usize, chunk - 1, chunk, chunk + 1, 2 * chunk, 3 * chunk - 1] {
+    for &value_len in &[
+        1usize,
+        chunk - 1,
+        chunk,
+        chunk + 1,
+        2 * chunk,
+        3 * chunk - 1,
+    ] {
         let options = WriteOptions {
             compression: None,
             bloom_fp_chance: 0.01,

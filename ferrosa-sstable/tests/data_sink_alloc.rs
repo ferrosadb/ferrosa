@@ -71,7 +71,10 @@ fn single_value_header() -> SerializationHeader {
         key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
         clustering_types: vec![],
         static_columns: vec![],
-        regular_columns: vec![(b"v".to_vec(), "org.apache.cassandra.db.marshal.BytesType".into())],
+        regular_columns: vec![(
+            b"v".to_vec(),
+            "org.apache.cassandra.db.marshal.BytesType".into(),
+        )],
         complex_collections: false,
     }
 }
@@ -90,6 +93,22 @@ fn one_value_partition(key: &[u8], value: Vec<u8>) -> Partition {
     }
 }
 
+fn ordered_partitions(prefix: &str, count: usize, value: &[u8]) -> Vec<Partition> {
+    let mut partitions = Vec::with_capacity(count);
+    for i in 0..count {
+        let key = format!("{prefix}{i:05}");
+        partitions.push(one_value_partition(key.as_bytes(), value.to_vec()));
+    }
+    partitions.sort_by_key(|partition| partition.key.token);
+    assert!(
+        partitions
+            .windows(2)
+            .all(|pair| pair[0].key.token < pair[1].key.token),
+        "generated test keys must have distinct tokens"
+    );
+    partitions
+}
+
 /// RE5: a single 64 MiB row streams through the pump (default segment =
 /// 1 MiB — `PumpConfig::DEFAULT_SEGMENT_BYTES`) without any allocation
 /// scaled to the row's size. Uncompressed (`compression: None`): no
@@ -106,9 +125,12 @@ fn data_sink_alloc_re5_64mib_row_through_1mib_pump_no_row_sized_allocation() {
         chunk_size: 65536,
         verify_output: false, // the readback verify itself allocates; RE5 is about the write path
     };
-    let mut writer =
-        SSTableWriter::new_file_backed(options, single_value_header(), staging_dir.join("Data.raw"))
-            .expect("new_file_backed");
+    let mut writer = SSTableWriter::new_file_backed(
+        options,
+        single_value_header(),
+        staging_dir.join("Data.raw"),
+    )
+    .expect("new_file_backed");
 
     // Warm-up: primes the flusher thread, its channel plumbing, and any
     // lazily-initialized statics, with a small row first.
@@ -132,7 +154,9 @@ fn data_sink_alloc_re5_64mib_row_through_1mib_pump_no_row_sized_allocation() {
          anything sized to the row"
     );
 
-    let _ = writer.finish_to_directory(&staging_dir).expect("finish_to_directory");
+    let _ = writer
+        .finish_to_directory(&staging_dir)
+        .expect("finish_to_directory");
 }
 
 /// Zero allocations after open, uncompressed, at 10x an "estimated" chunk
@@ -143,20 +167,24 @@ fn data_sink_alloc_zero_after_open_uncompressed_10x_chunk_estimate() {
     let _guard = MEASURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().expect("tempdir");
     let staging_dir = dir.path().join("staging");
+    let value = vec![0x11u8; 4096];
+    let partitions = ordered_partitions("p", 1008, &value);
     let options = WriteOptions {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 4096,
         verify_output: false,
     };
-    let mut writer =
-        SSTableWriter::new_file_backed(options, single_value_header(), staging_dir.join("Data.raw"))
-            .expect("new_file_backed");
+    let mut writer = SSTableWriter::new_file_backed(
+        options,
+        single_value_header(),
+        staging_dir.join("Data.raw"),
+    )
+    .expect("new_file_backed");
 
-    let value = vec![0x11u8; 4096];
-    for i in 0..8u32 {
+    for partition in &partitions[..8] {
         writer
-            .add_partition(&one_value_partition(format!("warm{i:02}").as_bytes(), value.clone()))
+            .add_partition(partition)
             .expect("warmup add_partition");
     }
     std::thread::yield_now();
@@ -164,10 +192,8 @@ fn data_sink_alloc_zero_after_open_uncompressed_10x_chunk_estimate() {
     // A "chunk estimate" of 100 (4096-byte chunks -> ~400 KiB table), so 10x
     // is ~1000 partitions of one 4096-byte value each.
     let before = alloc_events();
-    for i in 0..1000u32 {
-        writer
-            .add_partition(&one_value_partition(format!("p{i:05}").as_bytes(), value.clone()))
-            .expect("add_partition");
+    for partition in &partitions[8..] {
+        writer.add_partition(partition).expect("add_partition");
     }
     let delta = alloc_events() - before;
     assert_eq!(
@@ -176,7 +202,9 @@ fn data_sink_alloc_zero_after_open_uncompressed_10x_chunk_estimate() {
          the pump/DataSink write path must not allocate in steady state"
     );
 
-    let _ = writer.finish_to_directory(&staging_dir).expect("finish_to_directory");
+    let _ = writer
+        .finish_to_directory(&staging_dir)
+        .expect("finish_to_directory");
 }
 
 /// Same claim, compressed: `ChunkCompressor`'s `inputs`/`outputs` are
@@ -188,32 +216,34 @@ fn assert_zero_after_open_compressed(compression: Compression) {
     let _guard = MEASURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().expect("tempdir");
     let staging_dir = dir.path().join("staging");
+    let value = vec![0x22u8; 4096];
+    let partitions = ordered_partitions("p", 1064, &value);
     let options = WriteOptions {
         compression: Some(compression),
         bloom_fp_chance: 0.01,
         chunk_size: 4096,
         verify_output: false,
     };
-    let mut writer =
-        SSTableWriter::new_file_backed(options, single_value_header(), staging_dir.join("Data.raw"))
-            .expect("new_file_backed");
+    let mut writer = SSTableWriter::new_file_backed(
+        options,
+        single_value_header(),
+        staging_dir.join("Data.raw"),
+    )
+    .expect("new_file_backed");
 
-    let value = vec![0x22u8; 4096];
     // Enough warm-up batches (default batch_chunks = 16) to touch every
     // compression_pool() worker thread's own lazily-created table/context at
     // least once, and to cycle the flusher's segments once.
-    for i in 0..64u32 {
+    for partition in &partitions[..64] {
         writer
-            .add_partition(&one_value_partition(format!("warm{i:03}").as_bytes(), value.clone()))
+            .add_partition(partition)
             .expect("warmup add_partition");
     }
     std::thread::yield_now();
 
     let before = alloc_events();
-    for i in 0..1000u32 {
-        writer
-            .add_partition(&one_value_partition(format!("p{i:05}").as_bytes(), value.clone()))
-            .expect("add_partition");
+    for partition in &partitions[64..] {
+        writer.add_partition(partition).expect("add_partition");
     }
     let delta = alloc_events() - before;
     assert_eq!(
@@ -223,7 +253,9 @@ fn assert_zero_after_open_compressed(compression: Compression) {
          allocate in steady state"
     );
 
-    let _ = writer.finish_to_directory(&staging_dir).expect("finish_to_directory");
+    let _ = writer
+        .finish_to_directory(&staging_dir)
+        .expect("finish_to_directory");
 }
 
 #[test]

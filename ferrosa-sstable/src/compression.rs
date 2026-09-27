@@ -177,13 +177,14 @@ impl Compression {
             }
             Compression::Lz4 => {
                 dst[..4].copy_from_slice(&(src.len() as u32).to_le_bytes());
-                let written = LZ4_TABLES.with(|cell| {
-                    let mut slot = cell.borrow_mut();
-                    let tables = slot.get_or_insert_with(Lz4Tables::new);
-                    let table = tables.for_len(src.len());
-                    lz4_flex::block::compress_into_with_table(src, &mut dst[4..], table)
-                })
-                .map_err(|e| Error::InvalidData(format!("LZ4 compression failed: {e}")))?;
+                let written = LZ4_TABLES
+                    .with(|cell| {
+                        let mut slot = cell.borrow_mut();
+                        let tables = slot.get_or_insert_with(Lz4Tables::new);
+                        let table = tables.for_len(src.len());
+                        lz4_flex::block::compress_into_with_table(src, &mut dst[4..], table)
+                    })
+                    .map_err(|e| Error::InvalidData(format!("LZ4 compression failed: {e}")))?;
                 Ok(4 + written)
             }
             Compression::Zstd { level } => {

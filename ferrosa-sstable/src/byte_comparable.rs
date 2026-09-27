@@ -51,6 +51,14 @@ const SIGN_BIT: u64 = 0x8000000000000000;
 /// Encode a DecoratedKey into its byte-comparable form.
 pub fn encode(key: &DecoratedKey) -> Vec<u8> {
     let mut buf = Vec::with_capacity(14 + key.key.as_bytes().len() * 2);
+    encode_into(&mut buf, key);
+    buf
+}
+
+/// Encode into caller-owned storage, retaining its capacity for the next key.
+pub fn encode_into(buf: &mut Vec<u8>, key: &DecoratedKey) {
+    buf.clear();
+    buf.reserve(14 + key.key.as_bytes().len() * 2);
 
     // Component 1: Token
     buf.push(NEXT_COMPONENT);
@@ -60,13 +68,11 @@ pub fn encode(key: &DecoratedKey) -> Vec<u8> {
     // fixed-length token source ends without an ESCAPE byte; Multi emits the
     // next component marker immediately after the eight token bytes.
     buf.push(NEXT_COMPONENT);
-    encode_bytes_with_null_escape(&mut buf, key.key.as_bytes());
+    encode_bytes_with_null_escape(buf, key.key.as_bytes());
     buf.push(ESCAPE); // end of key component
 
     // Terminator
     buf.push(TERMINATOR);
-
-    buf
 }
 
 /// Decode a byte-comparable representation back to a DecoratedKey.
