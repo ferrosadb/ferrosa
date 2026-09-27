@@ -1253,6 +1253,122 @@ async fn cross_node_serializable_transaction_keeps_its_snapshot_after_peer_commi
 }
 
 #[tokio::test]
+async fn unsupported_explicit_isolation_levels_fail_loud() {
+    let (client, _dir) = dml_client().await;
+
+    for statement in [
+        "BEGIN ISOLATION LEVEL READ COMMITTED",
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+    ] {
+        let error = client
+            .batch_execute(statement)
+            .await
+            .expect_err("unsupported explicit isolation level must be rejected");
+        assert_eq!(
+            error.code().map(|code| code.code()),
+            Some("0A000"),
+            "unsupported isolation level must use feature_not_supported: {statement}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn serializable_begin_after_peer_commit_reads_the_committed_value() {
+    let (client_a, client_b, _dirs) = dml_clients_on_two_accord_nodes().await;
+
+    client_a
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin writer transaction");
+    client_a
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"alice-committed", &1i32],
+        )
+        .await
+        .expect("buffer writer update");
+    client_a
+        .batch_execute("COMMIT")
+        .await
+        .expect("writer commit completes before the second transaction begins");
+
+    client_b
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin reader after the writer's successful COMMIT response");
+    let row = client_b
+        .query_one("SELECT name FROM users WHERE id = 1", &[])
+        .await
+        .expect("read after a real-time predecessor transaction");
+    assert_eq!(row.get::<_, &str>(0), "alice-committed");
+    client_b
+        .batch_execute("COMMIT")
+        .await
+        .expect("read-only transaction commits in real-time order");
+}
+
+#[tokio::test]
+async fn cross_node_lost_update_aborts_without_overwriting_the_winner() {
+    let (client_a, client_b, _dirs) = dml_clients_on_two_accord_nodes().await;
+
+    client_a
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin transaction on node A");
+    client_b
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin transaction on node B");
+    assert_eq!(
+        client_a
+            .query_one("SELECT name FROM users WHERE id = 1", &[])
+            .await
+            .expect("node A reads before either write")
+            .get::<_, &str>(0),
+        "alice"
+    );
+    assert_eq!(
+        client_b
+            .query_one("SELECT name FROM users WHERE id = 1", &[])
+            .await
+            .expect("node B reads the same initial value")
+            .get::<_, &str>(0),
+        "alice"
+    );
+
+    client_a
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"winner", &1i32],
+        )
+        .await
+        .expect("node A buffers the winning update");
+    client_b
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"stale-loser", &1i32],
+        )
+        .await
+        .expect("node B buffers a conflicting update");
+
+    client_a
+        .batch_execute("COMMIT")
+        .await
+        .expect("first update commits");
+    let error = client_b
+        .batch_execute("COMMIT")
+        .await
+        .expect_err("second update based on a stale snapshot must abort");
+    assert_eq!(error.code().map(|code| code.code()), Some("40001"));
+
+    let winner = client_b
+        .query_one("SELECT name FROM users WHERE id = 1", &[])
+        .await
+        .expect("read committed winner after rejected transaction");
+    assert_eq!(winner.get::<_, &str>(0), "winner");
+}
+
+#[tokio::test]
 async fn cluster_autocommit_reads_do_not_advance_the_postgres_commit_marker() {
     let (client_a, client_b, _dirs) = dml_clients_on_two_accord_nodes().await;
     client_b

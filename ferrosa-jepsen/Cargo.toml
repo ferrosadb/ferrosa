@@ -14,6 +14,9 @@ default = []
 # FERROSA_TEST_* environment prerequisites so missing infra cannot be reported
 # as a passing test body.
 live-infra-tests = []
+# Native-driver PostgreSQL transaction history workload. Requires a live
+# cluster and is deliberately separate from the default CQL Jepsen suites.
+postgres-jepsen = ["live-infra-tests"]
 
 [[bin]]
 name = "ferrosa-jepsen"
@@ -46,3 +49,4 @@ scylla = "1.5.0"
 [dev-dependencies]
 serde_yaml = "0.9"
 tempfile = "3"
+tokio-postgres = "0.7"

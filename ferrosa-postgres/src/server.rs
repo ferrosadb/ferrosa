@@ -352,10 +352,10 @@ async fn execute_simple_inner(
 
     match stmt {
         ferrosa_sql::Statement::Begin { isolation } => {
-            if isolation == Some(ferrosa_sql::IsolationLevel::RepeatableRead) {
+            if isolation.is_some_and(|level| level != ferrosa_sql::IsolationLevel::Serializable) {
                 return vec![query::error_response(
                     "0A000",
-                    "REPEATABLE READ isolation is not yet supported",
+                    "only SERIALIZABLE isolation is supported for explicit PostgreSQL transactions",
                 )];
             }
             let snapshot = if let Some(committer) = &ctx.accord_committer {
@@ -1166,6 +1166,7 @@ pub async fn serve<S>(
 where
     S: VerifierStore + Send + Sync + 'static,
 {
+    let _snapshot_reaper = crate::mvcc::MvccManager::spawn_snapshot_reaper(ctx.mvcc.clone());
     if let Some(committer) = &ctx.accord_committer {
         committer
             .register_postgres_mvcc_observer(ctx.mvcc.clone())

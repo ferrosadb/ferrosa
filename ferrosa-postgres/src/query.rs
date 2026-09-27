@@ -41,8 +41,10 @@ use ferrosa_sql::{
 use ferrosa_storage::{Mutation, StorageEngine};
 
 use crate::messages::{BackendMessage, FieldDescription};
-use crate::mvcc::{MvccCommitError, MvccManager, MvccSnapshot, PgWrite, RowChange};
-use crate::storage_provider::{load_table_with_overlay, LoadError, ScanFailure};
+use crate::mvcc::{
+    MvccCommitError, MvccManager, MvccSnapshot, PgWrite, RowChange, DEFAULT_MAX_TXN_WRITES,
+};
+use crate::storage_provider::{load_table_with_overlay, LoadError, ScanFailure, SCAN_BUFFER_ROWS};
 
 /// Build an `ErrorResponse` with the standard severity/code/message trio
 /// (`S=ERROR`, `C=<sqlstate>`, `M=<message>`).
@@ -884,17 +886,11 @@ pub(crate) async fn execute_query_with_mvcc(
     }
 }
 
-/// Max DML writes buffered in one Postgres transaction before it is rejected.
-/// A client must not be able to OOM the server with an unbounded open `BEGIN`
-/// (Power-of-10 Rule 3: every server-side dynamic collection has a hard cap).
-/// Mirrors `ferrosa_cql::session::MAX_TXN_WRITES`.
-const MAX_TXN_WRITES: usize = 10_000;
-
 /// Buffer a built `Mutation` as a PostgreSQL `PgWrite` into the open
 /// transaction's write-set, or apply it immediately via the MVCC manager when
 /// there is no open transaction (autocommit).
 ///
-/// FAIL LOUD: when buffering, exceeding [`MAX_TXN_WRITES`] returns an error
+/// FAIL LOUD: when buffering, exceeding the configured write cap returns an error
 /// response (and the server poisons the transaction) rather than growing the
 /// buffer without bound; a buffered write is NEVER applied to storage here —
 /// only the PostgreSQL MVCC manager applies it on COMMIT.
@@ -906,13 +902,14 @@ async fn apply_or_buffer(
     mutation: Mutation,
     ok_tag: &str,
 ) -> Vec<BackendMessage> {
+    let max_txn_writes = mvcc.map_or(DEFAULT_MAX_TXN_WRITES, MvccManager::max_txn_writes);
     match txn {
         Some(buffer) => {
-            if buffer.len() >= MAX_TXN_WRITES {
+            if buffer.len() >= max_txn_writes {
                 return vec![error_response(
                     "53400",
                     &format!(
-                        "transaction write-set exceeds the {MAX_TXN_WRITES}-write limit; \
+                        "transaction write-set exceeds the {max_txn_writes}-write limit; \
                          ROLLBACK required"
                     ),
                 )];
@@ -2026,6 +2023,18 @@ pub(crate) async fn load_catalog_with_mvcc(
     pending_writes: Option<&[PgWrite]>,
 ) -> Result<(MapCatalog, ScanFailure), BackendMessage> {
     let mut catalog = MapCatalog::new();
+    if let (Some(mvcc), Some(snapshot)) = (mvcc, snapshot) {
+        if mvcc
+            .validate_commit(snapshot, &std::collections::HashSet::new())
+            .is_err()
+        {
+            return Err(error_response(
+                "40001",
+                "PostgreSQL transaction snapshot expired",
+            ));
+        }
+    }
+    let scan_buffer_rows = mvcc.map_or(SCAN_BUFFER_ROWS, MvccManager::scan_buffer_rows);
     // One slot per query: every provider records into it, and the query layer
     // takes it once after `execute` returns.
     let failure = ScanFailure::default();
@@ -2059,6 +2068,7 @@ pub(crate) async fn load_catalog_with_mvcc(
             &table_ref.table,
             failure.clone(),
             overlay,
+            scan_buffer_rows,
         )
         .await
         {
@@ -3074,15 +3084,15 @@ mod txn_buffer_tests {
 
     #[tokio::test]
     async fn buffer_respects_write_cap() {
-        // Staging past MAX_TXN_WRITES fails loud (53400) rather than growing the
+        // Staging past the default write cap fails loud (53400) rather than growing the
         // buffer without bound; nothing is applied to storage.
         let (_dir, engine, schema) = new_engine_and_schema().await;
-        let mut buffer: Vec<PgWrite> = Vec::with_capacity(MAX_TXN_WRITES);
+        let mut buffer: Vec<PgWrite> = Vec::with_capacity(DEFAULT_MAX_TXN_WRITES);
         // Pre-fill to the cap with dummy writes so the next stage trips it.
         let key =
             ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text("x".into())], &[]).unwrap();
         let dummy = PgWrite(Mutation::new("public".into(), "kv".into(), key, vec![], 0));
-        for _ in 0..MAX_TXN_WRITES {
+        for _ in 0..DEFAULT_MAX_TXN_WRITES {
             buffer.push(dummy.clone());
         }
         let msgs = execute_query(
@@ -3101,7 +3111,7 @@ mod txn_buffer_tests {
         }
         assert_eq!(
             buffer.len(),
-            MAX_TXN_WRITES,
+            DEFAULT_MAX_TXN_WRITES,
             "the over-cap write was NOT buffered"
         );
         assert_eq!(
@@ -3110,6 +3120,35 @@ mod txn_buffer_tests {
             "an over-cap write is never applied to storage"
         );
 
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffer_respects_configured_write_cap() {
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+        let mvcc = MvccManager::with_max_txn_writes(2);
+        let key =
+            ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text("x".into())], &[]).unwrap();
+        let dummy = PgWrite(Mutation::new("public".into(), "kv".into(), key, vec![], 0));
+        let mut buffer = vec![dummy.clone(), dummy];
+
+        let msgs = execute_query_with_mvcc(
+            &engine,
+            &schema,
+            "INSERT INTO kv (k, v) VALUES ('over', 'cap')",
+            "public",
+            Some(&mvcc),
+            None,
+            Some(&mut buffer),
+        )
+        .await;
+        assert!(matches!(
+            &msgs[..],
+            [BackendMessage::ErrorResponse { fields }]
+                if fields[1] == (b'C', "53400".to_string())
+        ));
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(row_count(&engine, &schema, "over").await, 0);
         engine.shutdown().unwrap();
     }
 }

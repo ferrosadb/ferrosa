@@ -201,6 +201,19 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
 
 ## Position in the dependency graph
 
+## CQL Accord transaction resource bounds
+
+`TransactionRegistryConfig` reads per-node bounds at startup from
+`FERROSA_CQL_TRANSACTION_MAX_OPEN` (default 10,000 open transactions),
+`FERROSA_CQL_TRANSACTION_MAX_STATEMENTS` (10,000 staged reads and writes per
+transaction), `FERROSA_CQL_TRANSACTION_DEFAULT_TIMEOUT_MS` (10,000 ms),
+`FERROSA_CQL_TRANSACTION_MAX_TIMEOUT_MS` (600,000 ms), and
+`FERROSA_CQL_TRANSACTION_REAPER_INTERVAL_MS` (1,000 ms). Invalid overrides log
+an error and select the full default set without stopping startup. These values
+bound transaction registry memory and abandoned staged state; they do not
+configure PostgreSQL MVCC. Operator guidance is in the public
+[`PROFILE.md`](../../PROFILE.md).
+
 A hub, not a leaf. Depends on eleven sibling crates (`ferrosa-cdc`,
 `-cluster`, `-common`, `-index`, `-net`, `-row-bridge`, `-schema`, `-session`,
 `-sstable`, `-storage`, `-udf`); depended on by `ferrosa`, `ferrosa-ctl`,

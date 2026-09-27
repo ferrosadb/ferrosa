@@ -75,6 +75,25 @@ process starts.
 | `/api/debug/flamechart?seconds=N` | Duration of the authenticated tracing activity chart | Default `5` seconds, capped at `60` |
 | `RUST_LOG` | Runtime tracing log filter | For example, `info` or `ferrosa=debug` |
 
+### CQL Accord transaction bounds
+
+These per-node CQL settings bound open Accord transaction state. They take effect
+when Ferrosa starts; invalid, zero, or inconsistent values log an error and use
+the defaults without stopping startup. The maximum staged-statement count includes both reads
+and writes. `USING TIMEOUT` may choose a transaction deadline up to the configured
+maximum.
+
+| Environment variable | What it bounds | Default |
+|---|---|---:|
+| `FERROSA_CQL_TRANSACTION_MAX_OPEN` | Concurrent open CQL Accord transactions per node | `10000` |
+| `FERROSA_CQL_TRANSACTION_MAX_STATEMENTS` | Staged reads plus writes in one transaction | `10000` |
+| `FERROSA_CQL_TRANSACTION_DEFAULT_TIMEOUT_MS` | Open transaction lifetime when no override is supplied | `10000` ms |
+| `FERROSA_CQL_TRANSACTION_MAX_TIMEOUT_MS` | Largest `BEGIN ... USING TIMEOUT` override | `600000` ms |
+| `FERROSA_CQL_TRANSACTION_REAPER_INTERVAL_MS` | How often expired open transactions are evicted | `1000` ms |
+
+These are CQL/Accord controls. They do not configure PostgreSQL transactions or
+PostgreSQL MVCC history.
+
 ### Storage and query throughput
 
 These storage settings affect memory limits, write batching, read working sets,
@@ -127,10 +146,30 @@ worker limit can move pressure to the page cache, local disk, or cgroup rather
 than remove it. Keep the profiling workload and resource limits fixed between
 runs.
 
-The PostgreSQL MVCC path currently has no runtime environment tunables. Snapshot
-versions are reclaimed automatically after the oldest active snapshot advances;
-the PostgreSQL write-set cap is a fixed code limit of 10,000 mutations. Do not
-set undocumented MVCC environment variables or treat that cap as configurable.
+### PostgreSQL MVCC and SQL
+
+PostgreSQL MVCC and SQL resource bounds can be tuned at process startup without
+rebuilding Ferrosa:
+
+| Environment variable | What it bounds | Default |
+|---|---|---:|
+| `FERROSA_POSTGRES_MAX_TXN_WRITES` | Mutations buffered by one PostgreSQL transaction before it fails with a resource-limit error | `10000` |
+| `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | Rows buffered between a storage scan producer and the synchronous SQL executor | `64` |
+| `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | Maximum lifetime of an active PostgreSQL snapshot/transaction; later use fails with SQLSTATE `40001` | `600000` ms |
+| `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | Background cadence for expiring old snapshots and pruning history they retain | `1000` ms |
+
+Every value must be a positive integer. If any PostgreSQL override is invalid,
+Ferrosa logs an error and uses the complete default set without stopping
+startup. The scan buffer bounds rows in flight from storage; it does not limit
+the number of rows returned by a query. The SQL executor and protocol renderer
+still materialize query results, so increasing this buffer only changes the
+storage-side producer window.
+
+The maximum snapshot age bounds how long an abandoned or long-running
+transaction can retain old row versions. Once expired, its next query or commit
+fails with `40001`; the reaper removes its active lease and allows history
+pruning. Choose an age that accommodates legitimate transaction duration and
+tune the sweep interval separately if reclamation latency matters.
 In cluster mode, PostgreSQL commits submit the snapshot and read/write table set
 through Accord, and replica apply carries row-version metadata to support active
 snapshots on other nodes. Native-driver cross-node coverage is present; run the
