@@ -430,3 +430,7 @@ the chunk-size environment variable. Larger chunks reduce chunk and index
 operations while increasing read amplification. File-format values such as
 CRC width, offset encoding, chunk ordering, and row serialization flags remain
 fixed for compatibility.
+Test-support pump hooks are scoped by output directory and wrap each real sink
+once at open. Integration tests can record effective segment/depth/mode or inject
+backpressure without process environment changes; guards unregister on drop.
+Production builds do not include the hook registry or its locks.

@@ -97,3 +97,8 @@ warm-up partitions. The allocation stack is `crossbeam_deque::Injector<JobRef>`
 through `rayon_core::ThreadPool::install` from `ChunkCompressor::flush_batch`.
 It belongs to external job injection, not component serialization. Scheduling
 is a separate follow-up; neither strict gate is relaxed in T-081.
+
+Test-support pump hooks are scoped by output directory and wrap each real sink
+once at open. Integration tests can record effective segment/depth/mode or inject
+backpressure without process environment changes; guards unregister on drop.
+Production builds do not include the hook registry or its locks.

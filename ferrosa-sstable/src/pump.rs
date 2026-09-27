@@ -55,6 +55,10 @@ use crossbeam_channel::{bounded, select, Receiver, Select, Sender};
 
 use ferrosa_common::{Error, Result};
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "pump_hooks.rs"]
+mod hooks;
+
 use crate::checksum::DigestCrc32;
 use crate::direct::{full_block_prefix, AlignedBuf, DirectMode, MIN_BLOCK};
 
@@ -1053,6 +1057,8 @@ impl AlignedPump {
     /// multiple of `block` — callers pass it through
     /// [`PumpConfig::effective_segment`], which guarantees this (D5).
     pub fn open(sink: Box<dyn SegmentSink>, block: usize, segment: usize, path: PathBuf) -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        let (sink, segment, _) = hooks::prepare(sink, &path, block, segment, 0, false);
         Self::open_sync(sink, block, segment, path)
     }
 
@@ -1092,6 +1098,8 @@ impl AlignedPump {
         depth: usize,
         abort: Arc<dyn AbortSignal>,
     ) -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        let (sink, segment, depth) = hooks::prepare(sink, &path, block, segment, depth, true);
         if depth == 0 {
             return Self::open_sync(sink, block, segment, path);
         }
@@ -1726,6 +1734,8 @@ impl Drop for AlignedPump {
 #[cfg_attr(not(test), allow(dead_code))]
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
+    pub use super::hooks::{install_sink_hook, PumpOpen, PumpOverrides, SinkHook, SinkHookGuard};
+
     use super::{DirectMode, Error, Result, SegmentSink};
     use std::collections::HashMap;
     use std::io;
