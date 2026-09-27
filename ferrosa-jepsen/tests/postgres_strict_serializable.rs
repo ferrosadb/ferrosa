@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 2;
+const WRITE_SKEW_WRITERS: usize = 2;
 const INITIAL_BALANCE: i64 = 10_000;
 const POSTGRES_DEFAULT_SCHEMA: &str = "public";
 const CLIENT_NODE_COUNT_ENV: &str = "FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT";
@@ -163,8 +164,12 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
                     .push(predicate);
 
                 wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
-                let write_skew =
-                    write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?;
+                let write_skew = if is_write_skew_writer(actor) {
+                    write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?
+                } else {
+                    observe_predicate_once(&client, &table, 2_000 + actor as u64, &event_clock)
+                        .await?
+                };
                 history
                     .lock()
                     .expect("history mutex poisoned")
@@ -772,6 +777,10 @@ fn actor_client_urls<'a>(urls: &'a [&'a str], node_count: usize) -> Vec<&'a str>
     (0..ACTORS).map(|actor| urls[actor % node_count]).collect()
 }
 
+fn is_write_skew_writer(actor: usize) -> bool {
+    actor < WRITE_SKEW_WRITERS
+}
+
 fn convergence_node_count(total_nodes: usize, active_nodes: usize, fault_scheduled: bool) -> usize {
     if fault_scheduled {
         active_nodes
@@ -850,7 +859,8 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 mod tests {
     use super::{
         actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
-        predicate_observations, wait_for_phase, FaultSchedule, TransactionOperation,
+        is_write_skew_writer, predicate_observations, wait_for_phase, FaultSchedule,
+        TransactionOperation, ACTORS,
     };
 
     #[test]
@@ -881,6 +891,16 @@ mod tests {
         assert!(statements
             .iter()
             .any(|statement| statement.contains("VALUES ('doctor-b', 1)")));
+    }
+
+    #[test]
+    fn fault_workload_limits_write_skew_to_two_competing_actors() {
+        let writers = (0..ACTORS)
+            .filter(|actor| is_write_skew_writer(*actor))
+            .collect::<Vec<_>>();
+
+        assert_eq!(writers, [0, 1]);
+        assert!(!is_write_skew_writer(ACTORS));
     }
 
     #[test]
