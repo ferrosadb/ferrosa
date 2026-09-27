@@ -1,4 +1,8 @@
 //! Native PostgreSQL driver history test for distributed MVCC transactions.
+//! Correctness: Completed committed transactions must admit a serial order that
+//! respects real-time precedence, and all nodes must converge on the final state.
+//! Last revised: 2026-09-26
+//! Last changed: Added a coordinated one-replica pause schedule for the native-driver history.
 //!
 //! Run with `--features postgres-jepsen` and a semicolon-separated list of at
 //! least three native PostgreSQL connection URLs in
@@ -12,6 +16,7 @@ use ferrosa_jepsen::checker::strict_serializable::{
     check_strict_serializable, RecordedTransaction, TransactionOperation,
 };
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,6 +26,10 @@ use uuid::Uuid;
 const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 4;
 const INITIAL_BALANCE: i64 = 10_000;
+const CLIENT_NODE_COUNT_ENV: &str = "FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT";
+const FAULT_READY_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_READY_FILE";
+const FAULT_ACTIVE_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_ACTIVE_FILE";
+const FAULT_COMPLETE_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_COMPLETE_FILE";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[cfg(feature = "postgres-jepsen")]
@@ -40,6 +49,12 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         );
     }
 
+    let actor_client_count = actor_client_count(
+        urls.len(),
+        std::env::var(CLIENT_NODE_COUNT_ENV).ok().as_deref(),
+    )?;
+    let fault_schedule = FaultSchedule::from_env()?;
+
     let (clients, connections) = connect_all(&urls).await?;
     let table = format!("pg_ssi_{}", Uuid::new_v4().simple());
     clients[0]
@@ -51,13 +66,18 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         .context("create and initialize strict-serializability workload table")?;
     wait_for_table_on_all_nodes(&clients, &table).await?;
 
+    if let Some(schedule) = &fault_schedule {
+        schedule.announce_ready().await?;
+        schedule.wait_until_injected().await?;
+    }
+
     let event_clock = Arc::new(AtomicU64::new(1));
     let history = Arc::new(Mutex::new(Vec::with_capacity(
         ACTORS * TRANSACTIONS_PER_ACTOR,
     )));
     let mut actors = Vec::with_capacity(ACTORS);
     for actor in 0..ACTORS {
-        let client = Arc::clone(&clients[actor % clients.len()]);
+        let client = Arc::clone(&clients[actor % actor_client_count]);
         let event_clock = Arc::clone(&event_clock);
         let history = Arc::clone(&history);
         let table = table.clone();
@@ -73,8 +93,23 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
             Result::<()>::Ok(())
         }));
     }
+    let mut actor_error = None;
     for actor in actors {
-        actor.await.context("join PostgreSQL workload actor")??;
+        match actor.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if actor_error.is_none() => actor_error = Some(error),
+            Err(error) if actor_error.is_none() => {
+                actor_error =
+                    Some(anyhow::Error::new(error).context("join PostgreSQL workload actor"))
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+    if let Some(schedule) = &fault_schedule {
+        schedule.announce_complete().await?;
+    }
+    if let Some(error) = actor_error {
+        return Err(error);
     }
 
     let (final_a, final_b) = read_balances(&clients[0], &table).await?;
@@ -100,14 +135,13 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     );
 
     for (node, client) in clients.iter().enumerate().skip(1) {
-        let node_state = read_balances(client, &table)
+        wait_for_balances(client, &table, (final_a, final_b))
             .await
-            .with_context(|| format!("read final balances from PostgreSQL node {node}"))?;
-        assert_eq!(
-            node_state,
-            (final_a, final_b),
-            "PostgreSQL nodes must converge on the same committed transaction state"
-        );
+            .with_context(|| {
+                format!(
+                    "PostgreSQL node {node} did not converge on the committed transaction state"
+                )
+            })?;
     }
 
     if let Ok(path) = std::env::var("FERROSA_TEST_POSTGRES_HISTORY_PATH") {
@@ -196,6 +230,26 @@ async fn read_balances(client: &Client, table: &str) -> Result<(i64, i64)> {
         )
     };
     Ok((balance("a").await?, balance("b").await?))
+}
+
+async fn wait_for_balances(client: &Client, table: &str, expected: (i64, i64)) -> Result<()> {
+    let mut last_state = None;
+    let mut last_error = None;
+    for _ in 0..120 {
+        match read_balances(client, table).await {
+            Ok(state) if state == expected => return Ok(()),
+            Ok(state) => {
+                last_state = Some(state);
+                last_error = None;
+            }
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if let Some(error) = last_error {
+        return Err(error).context("read balances while waiting for replica convergence");
+    }
+    bail!("replica state {last_state:?} did not converge to {expected:?}");
 }
 
 async fn transfer_once(
@@ -295,4 +349,142 @@ fn is_serialization_failure(error: &tokio_postgres::Error) -> bool {
     error
         .code()
         .is_some_and(|sqlstate| sqlstate.code() == "40001")
+}
+
+/// Selects the client endpoints used for transactions while still retaining
+/// every endpoint for convergence checks. The fault workflow excludes the
+/// node it pauses; normal runs use every supplied endpoint.
+fn actor_client_count(url_count: usize, configured: Option<&str>) -> Result<usize> {
+    let count = configured
+        .map(str::parse::<usize>)
+        .transpose()
+        .context("parse FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT")?
+        .unwrap_or(url_count);
+    if count < 2 || count > url_count {
+        bail!(
+            "{CLIENT_NODE_COUNT_ENV} must be between 2 and the number of PostgreSQL URLs ({url_count}), got {count}"
+        );
+    }
+    Ok(count)
+}
+
+/// Coordinates a real node failure with an external process controller. The
+/// test reports that schema setup is complete, waits until the controller has
+/// paused a replica, runs the workload, then signals that the replica can be
+/// resumed before convergence checks.
+struct FaultSchedule {
+    ready_file: PathBuf,
+    active_file: PathBuf,
+    complete_file: PathBuf,
+}
+
+impl FaultSchedule {
+    fn from_env() -> Result<Option<Self>> {
+        Self::from_paths(
+            std::env::var_os(FAULT_READY_FILE_ENV).map(PathBuf::from),
+            std::env::var_os(FAULT_ACTIVE_FILE_ENV).map(PathBuf::from),
+            std::env::var_os(FAULT_COMPLETE_FILE_ENV).map(PathBuf::from),
+        )
+    }
+
+    fn from_paths(
+        ready_file: Option<PathBuf>,
+        active_file: Option<PathBuf>,
+        complete_file: Option<PathBuf>,
+    ) -> Result<Option<Self>> {
+        let configured = [ready_file, active_file, complete_file];
+        if configured.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if configured.iter().any(Option::is_none) {
+            bail!("fault schedule requires all three PostgreSQL fault marker paths");
+        }
+        let [Some(ready_file), Some(active_file), Some(complete_file)] = configured else {
+            unreachable!("all PostgreSQL fault marker paths were checked above")
+        };
+        Ok(Some(Self {
+            ready_file,
+            active_file,
+            complete_file,
+        }))
+    }
+
+    async fn announce_ready(&self) -> Result<()> {
+        write_marker(&self.ready_file).await
+    }
+
+    async fn wait_until_injected(&self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while tokio::fs::metadata(&self.active_file).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("timed out waiting for the PostgreSQL replica pause")
+    }
+
+    async fn announce_complete(&self) -> Result<()> {
+        write_marker(&self.complete_file).await
+    }
+}
+
+async fn write_marker(path: &PathBuf) -> Result<()> {
+    tokio::fs::write(path, [])
+        .await
+        .with_context(|| format!("write PostgreSQL fault marker {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{actor_client_count, FaultSchedule};
+
+    #[test]
+    fn fault_workload_can_leave_one_of_three_nodes_unused_by_clients() {
+        assert_eq!(actor_client_count(3, Some("2")).unwrap(), 2);
+    }
+
+    #[test]
+    fn default_workload_uses_every_postgres_node() {
+        assert_eq!(actor_client_count(3, None).unwrap(), 3);
+    }
+
+    #[test]
+    fn fault_workload_rejects_fewer_than_two_client_nodes() {
+        assert!(actor_client_count(3, Some("1")).is_err());
+    }
+
+    #[test]
+    fn fault_workload_rejects_client_count_above_url_count() {
+        assert!(actor_client_count(3, Some("4")).is_err());
+    }
+
+    #[test]
+    fn fault_workload_rejects_non_numeric_client_count() {
+        assert!(actor_client_count(3, Some("two")).is_err());
+    }
+
+    #[test]
+    fn fault_schedule_requires_ready_active_and_complete_markers_together() {
+        assert!(
+            FaultSchedule::from_paths(Some("ready".into()), None, Some("complete".into())).is_err()
+        );
+    }
+
+    #[test]
+    fn fault_schedule_is_disabled_when_no_marker_paths_are_configured() {
+        assert!(FaultSchedule::from_paths(None, None, None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn fault_schedule_accepts_all_three_marker_paths() {
+        assert!(FaultSchedule::from_paths(
+            Some("ready".into()),
+            Some("active".into()),
+            Some("complete".into())
+        )
+        .unwrap()
+        .is_some());
+    }
 }
