@@ -29,8 +29,12 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
   hand-rolled kernel-UAPI struct, FMEA ST-13), the `AlignedPump` behind the
   `SegmentSink` seam with `DirectWriter` as a thin wrapper (T-032, FMEA ST-14),
   the background flusher over pre-filled crossbeam channels with `pwritev`
-  batching and an abort signal (T-033, FMEA ST-15/ST-16),
-  `Compression::compress_into` (T-036) and allocation-free size-then-write
+  batching and an abort signal (T-033, FMEA ST-15/ST-16), a `loom` model of
+  the producer/flusher protocol, the full 11-`Fault` matrix, a 10 000-schedule
+  BP4 gate test, a 64-concurrent-pump stress test, and an allocation-free
+  (of `after()`'s own allocation specifically — FMEA ST-16 residual)
+  watchdog wait (T-034), `Compression::compress_into` (T-036) and
+  allocation-free size-then-write
   row encoding over a generic `RowSink` (T-037). Still to do: `DataSink`
   (removing `Data.raw`, T-038), which replaces the `DataBuffer` that row
   encoding still writes through, then wiring flush and compaction onto it

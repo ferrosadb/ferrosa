@@ -17,6 +17,18 @@ memmap2 = "0.9"
 rayon = "1"
 tracing = "0.1"
 zstd = "0.13"
+# T-034 (L6 loom model, tests/pump_loom.rs). Optional and feature-gated
+# rather than a plain dev-dependency behind `RUSTFLAGS="--cfg loom"` (loom's
+# own usual recommendation): this crate depends on `ferrosa-common`, which
+# depends on `tokio`, and `tokio` has its own internal `#[cfg(loom)]`-gated
+# code that only compiles correctly under tokio's OWN loom test harness
+# setup. `RUSTFLAGS` is process-global, so a bare `--cfg loom` reaches every
+# crate `cargo` compiles for this build — including `tokio` — and breaks it
+# (`unresolved import crate::sync::AtomicWaker` in `tokio::task::local`,
+# confirmed by direct measurement, not assumed). A Cargo feature scopes
+# cleanly to this crate's own dependency resolution instead: enabling
+# `loom` here never touches `tokio`'s build.
+loom = { version = "0.7", optional = true }
 
 [features]
 # Live infrastructure tests are intentionally absent from the default test
@@ -34,6 +46,11 @@ live-infra-tests = []
 # `tests/pump_async_*` integration binaries and, later, sibling crates like
 # `ferrosa-storage` through a `test-support`-featured dev-dependency.
 test-support = []
+# T-034: gates `tests/pump_loom.rs` (`#![cfg(feature = "loom")]`) and pulls in
+# the optional `loom` dependency above. Run with `cargo test -p
+# ferrosa-sstable --release --features test-support,loom pump_loom_` — no
+# RUSTFLAGS needed, and none of `tokio`'s own loom-gated code is touched.
+loom = ["dep:loom"]
 
 [dev-dependencies]
 # Enables `ferrosa_common::test_generators` (shared CellValue/DecoratedKey

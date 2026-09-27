@@ -186,30 +186,80 @@ byte-comparable, statistics, reader/writer round-trips) plus integration suites:
 `tests/property_tests.rs` (proptest round-trips), and
 `tests/p0_production_disk_replay.rs` (real on-disk replay regression).
 
-### Write pump tests (`pump_sync_`, `pump_async_`)
+### Write pump tests (`pump_sync_`, `pump_async_`, `pump_loom_`, `pump_stress_`)
 
-`pump_sync_*` (depth 0, T-032) and `pump_async_*` (depth ≥ 1, T-033) live in
-`src/pump.rs` under `#[cfg(test)]`, plus `tests/pump_sync_alloc.rs` and
-`tests/pump_async_alloc.rs` (both require `--features test-support`) for the
-counting-allocator zero/near-zero-allocation regressions. The `pump_async_`
-suite covers: the full `FaultySink` matrix (hard failures and the six silent
-corruptions) at depth 1–4; mode/depth parity (0..=4 byte-identical to the same
-`RecordingSink`); bounded-in-flight-then-blocks and one-permit-at-a-time
-resume with 25 randomized gate schedules, all byte-identical (BP1/BP2/BP4);
-failure and abort while parked, both returning promptly with no leaked thread
-(BP5/BP6/CD1); the stall watchdog firing exactly once past
+`pump_sync_*` (depth 0, T-032) and `pump_async_*` (depth ≥ 1, T-033/T-034)
+live in `src/pump.rs` under `#[cfg(test)]`, plus `tests/pump_sync_alloc.rs`,
+`tests/pump_async_alloc.rs`, `tests/pump_loom.rs` and `tests/pump_stress.rs`
+(all require `--features test-support`). The `pump_async_` suite covers: the
+full 11-`Fault` `FaultySink` matrix (5 hard failures — `Eio`, `Enospc`,
+`Panic`, `FsyncFail`, `SetLenFail` — and the 6 silent corruptions) at depth
+1–4 (T-034 completed the matrix; T-033 covered a subset); mode/depth parity
+(0..=4 byte-identical to the same `RecordingSink`); bounded-in-flight-then-
+blocks and one-permit-at-a-time resume (BP1/BP2/BP4 — 25 randomized gate
+schedules by default, 10 000 under `--release`, all byte-identical; see
+below); failure and abort while parked, both returning promptly with no
+leaked thread (BP5/BP6/CD1); the stall watchdog firing exactly once past
 `STALL_THRESHOLD` (shrunk to 50 ms under `cfg(test)`) with one WARN and one
 recovery INFO (CD2/BP8); `pwritev` coalescing ≥ 3 contiguous segments into one
 call, deterministically (5 segments split any way between at most two
 flusher sweeps always leaves the larger sweep ≥ 3 — CD3); and an L6 park-count
-contention budget via a `thread_local!` counter (CD4). `pump_async_alloc.rs`
-separates a fully deterministic zero-allocation proof (writing exactly
-`depth` more never-recycled segments after a one-segment channel warm-up)
-from a real, concurrently-running sustained-streaming measurement that
-tolerates the small, scheduler-jitter-bounded allocation `crossbeam_channel`'s
-`select!`/`after()`/blocking-`recv()` internals can cost on a genuine — as
-opposed to merely checked-and-found-empty — park; see that file's module doc
-for the isolated `crossbeam_channel` measurements behind the bound.
+contention budget via a `thread_local!` counter (CD4).
+
+**Allocation (`pump_async_alloc.rs`).** Separates a fully deterministic
+zero-allocation proof (writing exactly `depth` more never-recycled segments
+after a one-segment channel warm-up) from two measurements under a real,
+concurrently-running producer/flusher handoff: an unthrottled sink (small,
+scheduler-jitter-bounded residue) and a permit-gated sink forcing a genuine
+park on almost every write. T-034 replaced the stall watchdog's
+`crossbeam_channel::after()` (ST-16: allocated a fresh one-shot timer channel
+on every genuine park) with `select!`'s own `default(duration)` arm, which
+removes that specific allocation — but **does not** make a genuine park
+allocation-free outright: isolated measurement against bare
+`crossbeam_channel` found that `select!` itself, and a plain non-`select!`
+`Receiver::recv()` alike, cost roughly one allocation of their own on every
+genuine park (most likely a fresh wait-queue node, since a parked waiter
+needs a stable heap address the wake side can find and the previous park's
+node cannot be reused). This is a property of `crossbeam_channel` itself,
+independent of `after()`, and out of scope here (decisions.md D2 already
+names the fix — a hand-rolled SPSC ring — and defers it, "gated on data, not
+done up front"). `pump_async_alloc.rs`'s module doc has the exact numbers;
+its tests assert a tight, park-count-proportional bound, not a literal zero,
+under sustained backpressure.
+
+**Concurrency model (`tests/pump_loom.rs`, `--features loom`-only).** A
+`loom` model of the producer/flusher protocol (decisions.md D2/D7): one
+producer, one flusher, `depth` ∈ {1, 2}, with a flusher error and a flusher
+panic injected at every segment index across every interleaving
+`loom::model` explores. Since loom cannot instrument `crossbeam_channel`'s
+own internals, the model runs against a small `loom::sync`-based channel
+shim (`send`/`recv`/`try_recv`/`select2`), not the real crossbeam-backed
+pump — see the file's module doc for why that is still a faithful test of
+the *protocol's* liveness and exactly-once-accounting properties. `loom` is
+an *optional* dependency gated by this crate's own `loom` Cargo feature, not
+the `RUSTFLAGS="--cfg loom"` + unconditional-dev-dependency convention loom's
+own docs usually recommend: this crate depends on `ferrosa-common`, which
+depends on `tokio`, and `tokio` has its own internal `#[cfg(loom)]`-gated
+code that only compiles correctly under tokio's OWN loom test harness setup
+— a global `RUSTFLAGS` cfg reaches `tokio` too and breaks its build
+(confirmed directly: `unresolved import crate::sync::AtomicWaker` in
+`tokio::task::local`). The Cargo feature scopes cleanly to this crate alone.
+Run with `cargo test -p ferrosa-sstable --release --features
+test-support,loom pump_loom_`.
+
+**Stress (`tests/pump_stress.rs`).** 64 concurrently open pumps, each with an
+independently randomized segment size, queue depth, byte count and (for
+about half of them) one injected `Fault`, inside a 60 s wall budget enforced
+by `Receiver::recv_timeout` against a shrinking deadline (never an unbounded
+`join()`). Asserts every pump reports an outcome, `pump::live_flusher_threads()`
+(new T-034 test-only instrumentation — a `Drop` guard around each flusher
+thread's body) returns to `0` once every pump is dropped, and a process-wide
+peak-tracking allocator's high-water mark stays within a generous multiple of
+`sum over pumps of (depth + 1) * segment`. Uses `StressSink`, a fault-capable
+sink that folds bytes into a running CRC32 instead of retaining them like
+`RecordingSink` does, so the test double's own memory doesn't dominate the
+measurement. Run with `cargo test -p ferrosa-sstable --release --features
+test-support pump_stress_`.
 
 ### Writer test oracle (T-035) and the golden SSTable corpus
 
