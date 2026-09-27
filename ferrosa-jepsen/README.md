@@ -142,24 +142,28 @@ FERROSA_TEST_POSTGRES_URLS='postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@1
   --test postgres_strict_serializable -- --nocapture
 ```
 
-The test creates a unique two-row backing table through CQL because PostgreSQL
-DDL is not part of the gateway's supported SQL surface. It then uses the native
-PostgreSQL driver for concurrent explicit `SERIALIZABLE` transfers through the
-supplied node URLs and records
-invocation/completion order and each committed transaction's reads/writes, then
-checks the full history and final balances on every node with the bounded
-strict-serializability checker. At least three reachable PostgreSQL URLs using
-the same CQL-backed role are required. The test fails loudly when the feature is
-enabled without its cluster variable. It currently checks concurrent histories
-without node-failure injection. The `postgres-jepsen-fault` job in
-`.github/workflows/ci.yml` runs the same native-driver history against the
-bundled three-node cluster while pausing node 3. It reuses the node image
-artifact built earlier in CI. It
-coordinates the pause through marker files, directs transactions through nodes
-1 and 2 while the replica is unavailable, resumes node 3 after the workload,
-then requires every node to expose the same committed state. This covers one
-replica pause during workload execution; it does not claim partition, crash
-recovery, or ambiguous-commit coverage.
+The test creates a backing table through CQL because PostgreSQL DDL is not part
+of the gateway's supported SQL surface. Native PostgreSQL sessions then run
+concurrent explicit `SERIALIZABLE` transactions for two-row transfers, a
+read/modify/write register, a predicate over two doctor rows plus one known
+absent phantom key, and a synchronized two-row write-skew invariant. This is a
+fixed workload predicate, not a general range-predicate checker. Each
+transaction records its invocation/completion interval and observed
+reads/writes. The bounded checker
+requires a serial order that reproduces those observations and preserves
+real-time order. Normal runs also wait for every supplied node to expose the
+same final state. At least three reachable PostgreSQL URLs using the same
+CQL-backed role are required. The test fails loudly when the feature is enabled
+without its cluster variables.
+
+The `postgres-jepsen-fault` job in `.github/workflows/ci.yml` runs this history
+against the bundled three-node cluster while pausing node 3. It reuses the node
+image built earlier in CI and coordinates the pause through marker files. The
+actors connect only to nodes 1 and 2 during the pause. The history checker and
+final-state convergence check cover the active quorum; the resumed node's
+Accord catch-up is a separate recovery property and is not part of this gate.
+This schedule does not claim network-partition, process-crash, ambiguous-commit,
+or cross-protocol CQL/PostgreSQL serializability coverage.
 
 Local live-infra form:
 

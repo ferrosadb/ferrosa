@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 status: developer-preview
-last_updated: 2026-06-19
+last_updated: 2026-09-27
 executive_summary: >
   The PostgreSQL v3 wire-protocol front-end for ferrosa. Implements the
   frontend/backend protocol (startup, SCRAM-SHA-256, simple + extended query),
@@ -15,10 +15,12 @@ executive_summary: >
   snapshot if any PostgreSQL data transaction committed after it; the supplied
   table set is not yet used for per-table Accord validation. Explicit isolation
   modes other than SERIALIZABLE fail with `0A000`. Accord applies PostgreSQL
-  row-version metadata to every replica. CQL/Cassandra transactions
-  remain on Accord's existing path. Native-driver cross-node coverage exists;
-  the Jepsen strict-serializability workload remains the system-wide acceptance
-  gate. `ON CONFLICT` remains unsupported.
+  row-version metadata to every replica. CQL/Cassandra transactions remain on
+  Accord's existing path. The native-driver Jepsen workload records transfer,
+  register, predicate/phantom, and write-skew histories, including a single
+  replica pause. That schedule checks the history and final-state convergence
+  on the active quorum; it does not assert catch-up of the resumed replica or
+  mixed CQL/PostgreSQL serializability. `ON CONFLICT` remains unsupported.
 ---
 
 # ferrosa-postgres — Architecture Overview

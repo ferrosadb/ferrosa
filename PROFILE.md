@@ -172,9 +172,11 @@ pruning. Choose an age that accommodates legitimate transaction duration and
 tune the sweep interval separately if reclamation latency matters.
 In cluster mode, PostgreSQL commits submit the snapshot and read/write table set
 through Accord, and replica apply carries row-version metadata to support active
-snapshots on other nodes. Native-driver cross-node coverage is present; run the
-Jepsen PostgreSQL strict-serializability workload before treating that model as
-system-wide evidence.
+snapshots on other nodes. The opt-in native-driver Jepsen workload records
+transfers, register updates, predicate reads with a phantom insert, and
+write-skew transactions. Its single-replica pause schedule checks the history
+and final state on the active quorum. It does not verify catch-up of the resumed
+replica or serializability across concurrent CQL and PostgreSQL operations.
 
 Use a lower `lg_prof_sample` value to capture more allocation events. Start with
 the default when measuring workload latency, since heavier sampling can change

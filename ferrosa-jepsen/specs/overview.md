@@ -1,12 +1,13 @@
 ---
 crate: ferrosa-jepsen
 status: implemented
-last_updated: 2026-08-09
+last_updated: 2026-09-27
 executive_summary: >
   Jepsen-style distributed correctness harness for Ferrosa. Generates
   concurrent workloads, injects faults (nemeses) over SSH, records an operation
   history, and checks it for linearizability and membership-invariant
-  violations. Docker Compose and caller-provisioned live clusters are wired
+  violations. A bounded transaction-history checker covers PostgreSQL strict
+  serializability. Docker Compose and caller-provisioned live clusters are wired
   backends; Firecracker primitives remain unwired. A
   ferrosa-sim-backed endurance run is the headline acceptance gate when Fly.io
   is unavailable. Leaf crate — nothing depends on it.
@@ -103,6 +104,18 @@ flowchart LR
 Only the native linearizability checker and the membership-invariant checks run
 in default `cargo test`/CI. Knossos requires a Clojure/`lein` project and a
 written history; Elle is type-only (`elle_result = None`).
+
+## PostgreSQL strict-serializability history
+
+The opt-in `postgres-jepsen` integration test uses native PostgreSQL sessions
+against a live cluster. It records two-row transfers, register read/modify/write
+transactions, predicate reads with a potential phantom insert, and synchronized
+write-skew transactions. `checker::strict_serializable` searches for an atomic
+serial order that matches every recorded read and final value while preserving
+real-time precedence. The CI fault schedule pauses one of three replicas and
+runs actors through the two active nodes; it verifies the history and final
+state on that active quorum. The resumed node's Accord catch-up, process-crash
+recovery, and mixed CQL/PostgreSQL histories are separate acceptance work.
 
 ## Key invariants
 

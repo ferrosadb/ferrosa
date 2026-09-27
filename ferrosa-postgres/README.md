@@ -25,8 +25,11 @@ commits submit PG-owned mutations and a snapshot through Accord. A global PG
 marker conservatively conflicts all PostgreSQL data commits; the read/write table
 set is not yet used for per-table Accord validation. Accord apply carries
 PostgreSQL row-version metadata to replicas, where each node retains history for
-its active snapshots. The distributed path has native-driver coverage; the
-Jepsen strict-serializability workload remains an acceptance gate.
+its active snapshots. The native-driver Jepsen workload covers transfer,
+register, predicate/phantom, and write-skew histories. Its single-replica pause
+schedule checks history validity and convergence on the active quorum; it does
+not establish post-resume catch-up for the paused replica or mixed
+CQL/PostgreSQL serializability.
 Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
 `= ANY($N)` / IN-lists.
 
@@ -81,8 +84,10 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   expires active snapshots past a configurable maximum age so old transactions
   cannot retain history indefinitely. Distributed row-version history is
   in-memory and scoped to active process snapshots; storage serves snapshots
-  begun after restart. The Jepsen
-  strict-serializability workload remains outstanding.
+  begun after restart. The opt-in Jepsen history checker covers transfers,
+  register updates, predicate reads/phantom insertion, and write skew. Its fault
+  mode excludes the resumed node from convergence checks; see the Jepsen crate
+  guide for the exact boundary.
 - **DML execution** — INSERT/UPDATE/DELETE build storage rows through the shared
   `ferrosa-row-bridge` encoder. **Autocommit** uses the PostgreSQL MVCC commit
   path; **inside a transaction** the write is buffered until commit (see above).
@@ -146,9 +151,11 @@ remove the materialization peak.
 build a `Mutation` → `apply_or_buffer`: **autocommit** → apply and publish MVCC
 row versions; **in a transaction** → buffer a PostgreSQL-owned `PgWrite`, later
 atomically applied by the PostgreSQL MVCC commit path. With a cluster committer,
-the PG-owned mutation batch is submitted through Accord. PostgreSQL MVCC read
-validation remains process-local and is not part of Accord's decision. CQL
-transaction writes retain their existing Accord contract.
+the PG-owned mutation batch and snapshot are submitted through Accord after
+local MVCC validation. Accord validates the cluster snapshot against the
+PostgreSQL commit marker and atomically applies the batch. The marker is
+conservative across tables, so unrelated PostgreSQL writes can cause `40001`.
+CQL transaction writes retain their existing Accord contract.
 
 See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 

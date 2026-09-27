@@ -531,7 +531,7 @@ jobs:
 
           docker pause ferrosa-jepsen-node3
           touch "$FERROSA_TEST_POSTGRES_FAULT_ACTIVE_FILE"
-          for attempt in $(seq 1 300); do
+          for attempt in $(seq 1 600); do
             if test -e "$FERROSA_TEST_POSTGRES_FAULT_COMPLETE_FILE"; then
               break
             fi

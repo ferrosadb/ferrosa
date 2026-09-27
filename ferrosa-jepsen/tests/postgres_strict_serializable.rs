@@ -1,8 +1,9 @@
 //! Native PostgreSQL driver history test for distributed MVCC transactions.
-//! Correctness: Completed committed transactions must admit a serial order that
-//! respects real-time precedence, and all nodes must converge on the final state.
-//! Last revised: 2026-09-26
-//! Last changed: Added a coordinated one-replica pause schedule for the native-driver history.
+//! Correctness: committed transactions must admit an atomic serial order that
+//! reproduces reads and respects real-time precedence. Normal runs require every
+//! node to converge; the pause schedule checks only the active quorum.
+//! Last revised: 2026-09-27
+//! Last changed: Added register, predicate/phantom, and write-skew histories.
 //!
 //! Run with `--features postgres-jepsen` and a semicolon-separated list of at
 //! least three native PostgreSQL connection URLs in
@@ -16,7 +17,7 @@ use ferrosa_jepsen::checker::strict_serializable::{
     check_strict_serializable, RecordedTransaction, TransactionOperation,
 };
 use scylla::client::session_builder::SessionBuilder;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -95,7 +96,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         )
         .await
         .context("create strict-serializability workload table through CQL")?;
-    for statement in initial_balance_statements(&table) {
+    for statement in initial_workload_statements(&table) {
         clients[0]
             .execute(&statement, &[])
             .await
@@ -116,23 +117,53 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
 
     let event_clock = Arc::new(AtomicU64::new(1));
     let history = Arc::new(Mutex::new(Vec::with_capacity(
-        ACTORS * TRANSACTIONS_PER_ACTOR,
+        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
     )));
+    let predicate_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
+    let write_skew_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
     let mut actors = Vec::with_capacity(ACTORS);
     for (actor, actor_client) in actor_clients.iter().enumerate() {
         let client = Arc::clone(actor_client);
         let event_clock = Arc::clone(&event_clock);
         let history = Arc::clone(&history);
+        let predicate_barrier = Arc::clone(&predicate_barrier);
+        let write_skew_barrier = Arc::clone(&write_skew_barrier);
         let table = table.clone();
         actors.push(tokio::spawn(async move {
             for iteration in 0..TRANSACTIONS_PER_ACTOR {
-                let id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
-                let transaction = transfer_once(&client, &table, id, &event_clock).await?;
+                let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
+                let transfer =
+                    transfer_once(&client, &table, operation_id * 2, &event_clock).await?;
                 history
                     .lock()
                     .expect("history mutex poisoned")
-                    .push(transaction);
+                    .push(transfer);
+                let register =
+                    register_once(&client, &table, operation_id * 2 + 1, &event_clock).await?;
+                history
+                    .lock()
+                    .expect("history mutex poisoned")
+                    .push(register);
             }
+
+            predicate_barrier.wait().await;
+            let predicate = if actor == 0 {
+                insert_phantom_once(&client, &table, 1_000, &event_clock).await?
+            } else {
+                observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock).await?
+            };
+            history
+                .lock()
+                .expect("history mutex poisoned")
+                .push(predicate);
+
+            write_skew_barrier.wait().await;
+            let write_skew =
+                write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?;
+            history
+                .lock()
+                .expect("history mutex poisoned")
+                .push(write_skew);
             Result::<()>::Ok(())
         }));
     }
@@ -155,17 +186,21 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         return Err(error);
     }
 
-    let (final_a, final_b) = read_balances(&clients[0], &table).await?;
-    let final_state = BTreeMap::from([("a".to_owned(), final_a), ("b".to_owned(), final_b)]);
+    let final_state = read_workload_state(&clients[0], &table).await?;
+    let final_a = final_state["a"];
+    let final_b = final_state["b"];
     let initial = BTreeMap::from([
         ("a".to_owned(), INITIAL_BALANCE),
         ("b".to_owned(), INITIAL_BALANCE),
+        ("register".to_owned(), 0),
+        ("doctor-a".to_owned(), 1),
+        ("doctor-b".to_owned(), 1),
     ]);
     let mut history = history.lock().expect("history mutex poisoned").clone();
     history.sort_by_key(|transaction| transaction.id);
     assert_eq!(
         history.len(),
-        ACTORS * TRANSACTIONS_PER_ACTOR,
+        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
         "every invoked operation must have a recorded completion"
     );
     assert!(
@@ -176,6 +211,45 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
             >= 2,
         "the workload must commit multiple transactions to exercise concurrency"
     );
+    assert!(
+        history.iter().any(|transaction| {
+            transaction.committed
+                && transaction.operations.iter().any(|operation| {
+                    matches!(operation, TransactionOperation::Write { key, .. } if key == "register")
+                })
+        }),
+        "the native register workload must commit at least one read/modify/write"
+    );
+    assert!(
+        history
+            .iter()
+            .filter(|transaction| {
+                transaction.committed
+                    && transaction.operations.iter().any(|operation| {
+                        matches!(operation, TransactionOperation::Write { key, .. } if key == "a" || key == "b")
+                    })
+            })
+            .count()
+            >= 2,
+        "the native transfer workload must commit multiple multi-row transactions"
+    );
+    assert!(
+        history.iter().any(|transaction| {
+            transaction.operations.iter().any(|operation| {
+                matches!(operation, TransactionOperation::Write { key, .. } if key == "phantom")
+            })
+        }),
+        "the predicate workload must attempt a phantom insert"
+    );
+    assert!(
+        history.iter().any(|transaction| {
+            transaction.committed
+                && transaction.operations.iter().any(|operation| {
+                    matches!(operation, TransactionOperation::Write { key, .. } if key.starts_with("doctor-"))
+                })
+        }),
+        "the native write-skew workload must commit at least one doctor update"
+    );
 
     // The fault schedule verifies transaction history and agreement on the
     // reachable quorum. Rejoining a replica's Accord catch-up is a separate
@@ -183,7 +257,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     let convergence_nodes =
         convergence_node_count(clients.len(), actor_client_count, fault_schedule.is_some());
     for (node, client) in clients.iter().enumerate().take(convergence_nodes).skip(1) {
-        wait_for_balances(client, &table, (final_a, final_b))
+        wait_for_workload_state(client, &table, &final_state)
             .await
             .with_context(|| {
                 format!(
@@ -201,6 +275,11 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         final_a + final_b,
         2 * INITIAL_BALANCE,
         "committed transfers must preserve total balance"
+    );
+    assert_eq!(
+        final_state["doctor-a"] + final_state["doctor-b"],
+        1,
+        "serializable write-skew workload must preserve one doctor on call"
     );
     check_strict_serializable(&initial, &final_state, &history)
         .map_err(anyhow::Error::from)
@@ -266,27 +345,32 @@ async fn wait_for_table_on_all_nodes(clients: &[Arc<Client>], table: &str) -> Re
     Ok(())
 }
 
-async fn read_balances(client: &Client, table: &str) -> Result<(i64, i64)> {
-    let balance = |id| async move {
-        Ok::<i64, tokio_postgres::Error>(
-            client
-                .query_one(
-                    &format!("SELECT balance FROM {table} WHERE id = $1"),
-                    &[&id],
-                )
-                .await?
-                .get(0),
-        )
-    };
-    Ok((balance("a").await?, balance("b").await?))
+async fn read_workload_state(client: &Client, table: &str) -> Result<BTreeMap<String, i64>> {
+    let mut state = BTreeMap::new();
+    for id in ["a", "b", "register", "doctor-a", "doctor-b", "phantom"] {
+        if let Some(row) = client
+            .query_opt(
+                &format!("SELECT balance FROM {table} WHERE id = $1"),
+                &[&id],
+            )
+            .await?
+        {
+            state.insert(id.to_owned(), row.get(0));
+        }
+    }
+    Ok(state)
 }
 
-async fn wait_for_balances(client: &Client, table: &str, expected: (i64, i64)) -> Result<()> {
+async fn wait_for_workload_state(
+    client: &Client,
+    table: &str,
+    expected: &BTreeMap<String, i64>,
+) -> Result<()> {
     let mut last_state = None;
     let mut last_error = None;
     for _ in 0..120 {
-        match read_balances(client, table).await {
-            Ok(state) if state == expected => return Ok(()),
+        match read_workload_state(client, table).await {
+            Ok(state) if &state == expected => return Ok(()),
             Ok(state) => {
                 last_state = Some(state);
                 last_error = None;
@@ -296,7 +380,7 @@ async fn wait_for_balances(client: &Client, table: &str, expected: (i64, i64)) -
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     if let Some(error) = last_error {
-        return Err(error).context("read balances while waiting for replica convergence");
+        return Err(error).context("read workload state while waiting for replica convergence");
     }
     bail!("replica state {last_state:?} did not converge to {expected:?}");
 }
@@ -373,7 +457,211 @@ async fn transfer_once(
     }
     .await;
 
-    let committed = match transfer {
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transfer,
+        event_clock,
+        "execute PostgreSQL transfer transaction",
+    )
+    .await
+}
+
+async fn register_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<RecordedTransaction> {
+    let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
+    let mut operations = Vec::with_capacity(2);
+    let transaction = async {
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await?;
+        let value: i64 = client
+            .query_one(
+                &format!("SELECT balance FROM {table} WHERE id = $1"),
+                &[&"register"],
+            )
+            .await?
+            .get(0);
+        operations.push(TransactionOperation::Read {
+            key: "register".to_owned(),
+            value: Some(value),
+        });
+        let next = value + 1;
+        client
+            .execute(
+                &format!("UPDATE {table} SET balance = $1 WHERE id = $2"),
+                &[&next, &"register"],
+            )
+            .await?;
+        operations.push(TransactionOperation::Write {
+            key: "register".to_owned(),
+            value: Some(next),
+        });
+        client.batch_execute("COMMIT").await?;
+        Result::<(), tokio_postgres::Error>::Ok(())
+    }
+    .await;
+
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transaction,
+        event_clock,
+        "execute PostgreSQL register transaction",
+    )
+    .await
+}
+
+async fn observe_predicate_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<RecordedTransaction> {
+    let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
+    let mut operations = Vec::with_capacity(3);
+    let transaction = async {
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await?;
+        let matching_ids = matching_predicate_ids(client, table).await?;
+        operations.extend(predicate_observations(&matching_ids));
+        client.batch_execute("COMMIT").await?;
+        Result::<(), tokio_postgres::Error>::Ok(())
+    }
+    .await;
+
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transaction,
+        event_clock,
+        "execute PostgreSQL predicate-read transaction",
+    )
+    .await
+}
+
+async fn insert_phantom_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<RecordedTransaction> {
+    let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
+    let mut operations = Vec::with_capacity(4);
+    let transaction = async {
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await?;
+        let matching_ids = matching_predicate_ids(client, table).await?;
+        operations.extend(predicate_observations(&matching_ids));
+        let phantom_value = 1_i64;
+        client
+            .execute(
+                &format!("INSERT INTO {table} (id, balance) VALUES ($1, $2)"),
+                &[&"phantom", &phantom_value],
+            )
+            .await?;
+        operations.push(TransactionOperation::Write {
+            key: "phantom".to_owned(),
+            value: Some(phantom_value),
+        });
+        client.batch_execute("COMMIT").await?;
+        Result::<(), tokio_postgres::Error>::Ok(())
+    }
+    .await;
+
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transaction,
+        event_clock,
+        "execute PostgreSQL predicate phantom insert",
+    )
+    .await
+}
+
+async fn write_skew_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<RecordedTransaction> {
+    let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
+    let mut operations = Vec::with_capacity(4);
+    let transaction = async {
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await?;
+        let matching_ids = matching_predicate_ids(client, table).await?;
+        operations.extend(predicate_observations(&matching_ids));
+        if matching_ids.contains("doctor-a") && matching_ids.contains("doctor-b") {
+            let target = if id.is_multiple_of(2) {
+                "doctor-a"
+            } else {
+                "doctor-b"
+            };
+            let off_call = 0_i64;
+            client
+                .execute(
+                    &format!("UPDATE {table} SET balance = $1 WHERE id = $2"),
+                    &[&off_call, &target],
+                )
+                .await?;
+            operations.push(TransactionOperation::Write {
+                key: target.to_owned(),
+                value: Some(off_call),
+            });
+        }
+        client.batch_execute("COMMIT").await?;
+        Result::<(), tokio_postgres::Error>::Ok(())
+    }
+    .await;
+
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transaction,
+        event_clock,
+        "execute PostgreSQL write-skew transaction",
+    )
+    .await
+}
+
+async fn matching_predicate_ids(
+    client: &Client,
+    table: &str,
+) -> Result<BTreeSet<String>, tokio_postgres::Error> {
+    let rows = client
+        .query(&format!("SELECT id FROM {table} WHERE balance = 1"), &[])
+        .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+async fn finish_recorded_transaction(
+    client: &Client,
+    id: u64,
+    invoked: u64,
+    operations: Vec<TransactionOperation>,
+    result: Result<(), tokio_postgres::Error>,
+    event_clock: &AtomicU64,
+    failure_context: &'static str,
+) -> Result<RecordedTransaction> {
+    let committed = match result {
         Ok(()) => true,
         Err(error) if is_serialization_failure(&error) => {
             client
@@ -382,7 +670,7 @@ async fn transfer_once(
                 .context("rollback PostgreSQL serialization failure")?;
             false
         }
-        Err(error) => return Err(error).context("execute PostgreSQL transfer transaction"),
+        Err(error) => return Err(error).context(failure_context),
     };
     let completed = event_clock.fetch_add(1, Ordering::SeqCst);
     Ok(RecordedTransaction {
@@ -400,11 +688,29 @@ fn is_serialization_failure(error: &tokio_postgres::Error) -> bool {
         .is_some_and(|sqlstate| sqlstate.code() == "40001")
 }
 
-fn initial_balance_statements(table: &str) -> [String; 2] {
+fn initial_workload_statements(table: &str) -> [String; 5] {
     [
         format!("INSERT INTO {table} (id, balance) VALUES ('a', {INITIAL_BALANCE})"),
         format!("INSERT INTO {table} (id, balance) VALUES ('b', {INITIAL_BALANCE})"),
+        format!("INSERT INTO {table} (id, balance) VALUES ('register', 0)"),
+        format!("INSERT INTO {table} (id, balance) VALUES ('doctor-a', 1)"),
+        format!("INSERT INTO {table} (id, balance) VALUES ('doctor-b', 1)"),
     ]
+}
+
+fn predicate_observations(matching_ids: &BTreeSet<String>) -> Vec<TransactionOperation> {
+    ["doctor-a", "doctor-b", "phantom"]
+        .into_iter()
+        .map(|key| TransactionOperation::Read {
+            key: key.to_owned(),
+            value: match (key, matching_ids.contains(key)) {
+                ("phantom", true) => Some(1),
+                ("phantom", false) => None,
+                (_, true) => Some(1),
+                (_, false) => Some(0),
+            },
+        })
+        .collect()
 }
 
 /// Selects the client endpoints used for transactions while still retaining
@@ -507,15 +813,15 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        actor_client_count, actor_client_urls, convergence_node_count, initial_balance_statements,
-        FaultSchedule,
+        actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
+        predicate_observations, FaultSchedule, TransactionOperation,
     };
 
     #[test]
-    fn balance_fixture_uses_single_row_inserts_supported_by_the_postgres_gateway() {
-        let statements = initial_balance_statements("accounts");
+    fn workload_fixture_uses_single_row_inserts_supported_by_the_postgres_gateway() {
+        let statements = initial_workload_statements("accounts");
 
-        assert_eq!(statements.len(), 2);
+        assert_eq!(statements.len(), 5);
         assert_eq!(
             statements[0],
             "INSERT INTO accounts (id, balance) VALUES ('a', 10000)"
@@ -523,6 +829,44 @@ mod tests {
         assert_eq!(
             statements[1],
             "INSERT INTO accounts (id, balance) VALUES ('b', 10000)"
+        );
+    }
+
+    #[test]
+    fn workload_fixture_includes_register_and_write_skew_rows() {
+        let statements = initial_workload_statements("accounts");
+
+        assert!(statements
+            .iter()
+            .any(|statement| statement.contains("VALUES ('register', 0)")));
+        assert!(statements
+            .iter()
+            .any(|statement| statement.contains("VALUES ('doctor-a', 1)")));
+        assert!(statements
+            .iter()
+            .any(|statement| statement.contains("VALUES ('doctor-b', 1)")));
+    }
+
+    #[test]
+    fn predicate_observation_records_matching_rows_and_absent_phantom() {
+        let matching = ["doctor-a".to_owned()].into_iter().collect();
+
+        assert_eq!(
+            predicate_observations(&matching),
+            [
+                TransactionOperation::Read {
+                    key: "doctor-a".to_owned(),
+                    value: Some(1),
+                },
+                TransactionOperation::Read {
+                    key: "doctor-b".to_owned(),
+                    value: Some(0),
+                },
+                TransactionOperation::Read {
+                    key: "phantom".to_owned(),
+                    value: None,
+                },
+            ]
         );
     }
 

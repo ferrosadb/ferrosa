@@ -265,6 +265,73 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_predicate_read_before_a_later_phantom_insert() {
+        let initial = BTreeMap::from([("doctor-a".into(), 1), ("doctor-b".into(), 1)]);
+        let final_state = BTreeMap::from([
+            ("doctor-a".into(), 1),
+            ("doctor-b".into(), 1),
+            ("phantom".into(), 1),
+        ]);
+        let history = [
+            txn(
+                1,
+                1,
+                2,
+                true,
+                vec![
+                    read("doctor-a", 1),
+                    read("doctor-b", 1),
+                    TransactionOperation::Read {
+                        key: "phantom".into(),
+                        value: None,
+                    },
+                ],
+            ),
+            txn(
+                2,
+                3,
+                4,
+                true,
+                vec![
+                    TransactionOperation::Read {
+                        key: "phantom".into(),
+                        value: None,
+                    },
+                    write("phantom", 1),
+                ],
+            ),
+        ];
+        assert!(check_strict_serializable(&initial, &final_state, &history).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_predicate_read_that_hides_a_real_time_predecessor_insert() {
+        let initial = BTreeMap::from([("doctor-a".into(), 1), ("doctor-b".into(), 1)]);
+        let final_state = BTreeMap::from([
+            ("doctor-a".into(), 1),
+            ("doctor-b".into(), 1),
+            ("phantom".into(), 1),
+        ]);
+        let history = [
+            txn(1, 1, 2, true, vec![write("phantom", 1)]),
+            txn(
+                2,
+                3,
+                4,
+                true,
+                vec![TransactionOperation::Read {
+                    key: "phantom".into(),
+                    value: None,
+                }],
+            ),
+        ];
+        assert!(matches!(
+            check_strict_serializable(&initial, &final_state, &history),
+            Err(CheckError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn rejects_write_skew_when_both_transactions_commit() {
         let initial = BTreeMap::from([("x".into(), 1), ("y".into(), 1)]);
         let final_state = BTreeMap::from([("x".into(), 0), ("y".into(), 0)]);
