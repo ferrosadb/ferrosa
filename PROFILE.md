@@ -173,8 +173,9 @@ tune the sweep interval separately if reclamation latency matters.
 In cluster mode, PostgreSQL commits submit the snapshot and read/write table set
 through Accord, and replica apply carries row-version metadata to support active
 snapshots on other nodes. The opt-in native-driver Jepsen workload records
-transfers, register updates, predicate reads with a phantom insert, and
-write-skew transactions. Its single-replica pause schedule checks the history
+transfers, register updates, exact-key reads of two doctor rows plus an absent
+phantom key, and write-skew transactions. It does not check general SQL range
+predicates. Its single-replica pause schedule checks the history
 and final state on the active quorum. It does not verify catch-up of the resumed
 replica or serializability across concurrent CQL and PostgreSQL operations.
 

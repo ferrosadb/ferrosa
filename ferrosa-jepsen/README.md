@@ -145,9 +145,9 @@ FERROSA_TEST_POSTGRES_URLS='postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@1
 The test creates a backing table through CQL because PostgreSQL DDL is not part
 of the gateway's supported SQL surface. Native PostgreSQL sessions then run
 concurrent explicit `SERIALIZABLE` transactions for two-row transfers, a
-read/modify/write register, a predicate over two doctor rows plus one known
-absent phantom key, and a synchronized two-row write-skew invariant. This is a
-fixed workload predicate, not a general range-predicate checker. Each
+read/modify/write register, exact primary-key reads of two doctor rows plus one
+known absent phantom key, and a synchronized two-row write-skew invariant. This
+fixed workload does not check general SQL range predicates. Each
 transaction records its invocation/completion interval and observed
 reads/writes. The bounded checker
 requires a serial order that reproduces those observations and preserves

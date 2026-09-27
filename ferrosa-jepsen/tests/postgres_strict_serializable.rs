@@ -17,7 +17,7 @@ use ferrosa_jepsen::checker::strict_serializable::{
     check_strict_serializable, RecordedTransaction, TransactionOperation,
 };
 use scylla::client::session_builder::SessionBuilder;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -544,8 +544,8 @@ async fn observe_predicate_once(
         client
             .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
             .await?;
-        let matching_ids = matching_predicate_ids(client, table).await?;
-        operations.extend(predicate_observations(&matching_ids));
+        let observed = read_predicate_values(client, table).await?;
+        operations.extend(predicate_observations(&observed));
         client.batch_execute("COMMIT").await?;
         Result::<(), tokio_postgres::Error>::Ok(())
     }
@@ -575,8 +575,8 @@ async fn insert_phantom_once(
         client
             .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
             .await?;
-        let matching_ids = matching_predicate_ids(client, table).await?;
-        operations.extend(predicate_observations(&matching_ids));
+        let observed = read_predicate_values(client, table).await?;
+        operations.extend(predicate_observations(&observed));
         let phantom_value = 1_i64;
         client
             .execute(
@@ -617,9 +617,10 @@ async fn write_skew_once(
         client
             .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
             .await?;
-        let matching_ids = matching_predicate_ids(client, table).await?;
-        operations.extend(predicate_observations(&matching_ids));
-        if matching_ids.contains("doctor-a") && matching_ids.contains("doctor-b") {
+        let observed = read_predicate_values(client, table).await?;
+        operations.extend(predicate_observations(&observed));
+        if observed.get("doctor-a") == Some(&Some(1)) && observed.get("doctor-b") == Some(&Some(1))
+        {
             let target = if id.is_multiple_of(2) {
                 "doctor-a"
             } else {
@@ -654,14 +655,22 @@ async fn write_skew_once(
     .await
 }
 
-async fn matching_predicate_ids(
+async fn read_predicate_values(
     client: &Client,
     table: &str,
-) -> Result<BTreeSet<String>, tokio_postgres::Error> {
-    let rows = client
-        .query(&format!("SELECT id FROM {table} WHERE balance = 1"), &[])
-        .await?;
-    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+) -> Result<BTreeMap<String, Option<i64>>, tokio_postgres::Error> {
+    let mut observed = BTreeMap::new();
+    for key in ["doctor-a", "doctor-b", "phantom"] {
+        let value = client
+            .query_opt(
+                &format!("SELECT balance FROM {table} WHERE id = $1"),
+                &[&key],
+            )
+            .await?
+            .map(|row| row.get(0));
+        observed.insert(key.to_owned(), value);
+    }
+    Ok(observed)
 }
 
 async fn finish_recorded_transaction(
@@ -730,17 +739,12 @@ fn initial_workload_statements(table: &str) -> [String; 5] {
     ]
 }
 
-fn predicate_observations(matching_ids: &BTreeSet<String>) -> Vec<TransactionOperation> {
+fn predicate_observations(observed: &BTreeMap<String, Option<i64>>) -> Vec<TransactionOperation> {
     ["doctor-a", "doctor-b", "phantom"]
         .into_iter()
         .map(|key| TransactionOperation::Read {
             key: key.to_owned(),
-            value: match (key, matching_ids.contains(key)) {
-                ("phantom", true) => Some(1),
-                ("phantom", false) => None,
-                (_, true) => Some(1),
-                (_, false) => Some(0),
-            },
+            value: observed.get(key).copied().flatten(),
         })
         .collect()
 }
@@ -880,11 +884,15 @@ mod tests {
     }
 
     #[test]
-    fn predicate_observation_records_matching_rows_and_absent_phantom() {
-        let matching = ["doctor-a".to_owned()].into_iter().collect();
+    fn predicate_observation_records_known_values_and_absent_phantom() {
+        let observed = std::collections::BTreeMap::from([
+            ("doctor-a".to_owned(), Some(1)),
+            ("doctor-b".to_owned(), Some(0)),
+            ("phantom".to_owned(), None),
+        ]);
 
         assert_eq!(
-            predicate_observations(&matching),
+            predicate_observations(&observed),
             [
                 TransactionOperation::Read {
                     key: "doctor-a".to_owned(),

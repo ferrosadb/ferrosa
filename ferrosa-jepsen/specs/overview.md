@@ -109,8 +109,8 @@ written history; Elle is type-only (`elle_result = None`).
 
 The opt-in `postgres-jepsen` integration test uses native PostgreSQL sessions
 against a live cluster. It records two-row transfers, register read/modify/write
-transactions, predicate reads with a potential phantom insert, and synchronized
-write-skew transactions. `checker::strict_serializable` searches for an atomic
+transactions, exact-key reads of two doctor rows plus a known absent phantom
+key, and synchronized write-skew transactions. `checker::strict_serializable` searches for an atomic
 serial order that matches every recorded read and final value while preserving
 real-time precedence. The CI fault schedule pauses one of three replicas and
 runs actors through the two active nodes; it verifies the history and final

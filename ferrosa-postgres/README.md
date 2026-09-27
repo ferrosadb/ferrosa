@@ -26,7 +26,7 @@ marker conservatively conflicts all PostgreSQL data commits; the read/write tabl
 set is not yet used for per-table Accord validation. Accord apply carries
 PostgreSQL row-version metadata to replicas, where each node retains history for
 its active snapshots. The native-driver Jepsen workload covers transfer,
-register, predicate/phantom, and write-skew histories. Its single-replica pause
+register, exact-key predicate/phantom, and write-skew histories. Its single-replica pause
 schedule checks history validity and convergence on the active quorum; it does
 not establish post-resume catch-up for the paused replica or mixed
 CQL/PostgreSQL serializability.
