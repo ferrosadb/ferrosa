@@ -655,6 +655,15 @@ fn agreed_row(reads: &[Vec<u8>], quorum: usize) -> Option<Vec<u8>> {
     None
 }
 
+fn snapshot_barrier_votes_sufficient(
+    votes_true: usize,
+    replica_count: usize,
+    slow_quorum: usize,
+    local_vote: bool,
+) -> bool {
+    local_vote && votes_true >= slow_quorum && votes_true <= replica_count
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExistenceVoteDecision {
     Apply,
@@ -1643,6 +1652,7 @@ impl AccordCoordinatorDriver {
 
             let mut votes_true = 0usize;
             let mut votes_false = 0usize;
+            let mut local_snapshot_vote = false;
             let mut dissenting_row: Vec<u8> = Vec::new();
             // For the generic ReadRow predicate: collect each replica's row-at-`t`
             // bytes so we can require F+1 *agreement* on the row state before the
@@ -1671,6 +1681,7 @@ impl AccordCoordinatorDriver {
                     .await
                     {
                         votes_true += 1;
+                        local_snapshot_vote = true;
                     } else {
                         tracing::error!(
                             txn_id = ?txn_id,
@@ -1806,11 +1817,19 @@ impl AccordCoordinatorDriver {
                 }
             }
 
-            // A PostgreSQL BEGIN barrier defines a snapshot for reads on every
-            // replica. A quorum is not enough when another replica could still
-            // expose an older local engine view, so require every participant to
-            // confirm that dependencies before the barrier are applied.
-            if is_snapshot_barrier && votes_true != self.replica_ids.len() {
+            // The local replica must have applied the barrier's dependencies so
+            // this PostgreSQL session cannot read a stale local view. A slow
+            // quorum then orders the barrier with every prior committed write;
+            // replicas outside that quorum cannot serve this snapshot without
+            // first establishing their own barrier.
+            if is_snapshot_barrier
+                && !snapshot_barrier_votes_sufficient(
+                    votes_true,
+                    self.replica_ids.len(),
+                    sq,
+                    local_snapshot_vote,
+                )
+            {
                 return Err(AccordDriverError::Network(format!(
                     "PostgreSQL snapshot barrier received {} of {} replica votes",
                     votes_true,
@@ -2379,6 +2398,28 @@ mod tests {
         assert_eq!(super::slow_quorum_size(5), 3);
         assert_eq!(super::slow_quorum_size(7), 4);
         assert_eq!(super::slow_quorum_size(9), 5);
+    }
+
+    #[test]
+    fn postgres_snapshot_barrier_accepts_slow_quorum_when_coordinator_applied() {
+        assert!(super::snapshot_barrier_votes_sufficient(
+            2,
+            3,
+            super::slow_quorum_size(3),
+            true,
+        ));
+        assert!(!super::snapshot_barrier_votes_sufficient(
+            1,
+            3,
+            super::slow_quorum_size(3),
+            true,
+        ));
+        assert!(!super::snapshot_barrier_votes_sufficient(
+            2,
+            3,
+            super::slow_quorum_size(3),
+            false,
+        ));
     }
 
     // -----------------------------------------------------------------------
