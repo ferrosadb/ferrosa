@@ -27,7 +27,7 @@ pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 /// Transaction status reported by `ReadyForQuery` (the `I`/`T`/`E` byte).
 ///
 /// This is the wire signal the blueprint's D11 hangs off of: entering a `T`
-/// block is the trigger to route the transaction through Accord.
+/// block is the trigger to buffer writes for the PostgreSQL MVCC commit path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransactionStatus {
     /// `I` — idle (not in a transaction block).

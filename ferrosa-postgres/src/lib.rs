@@ -2,8 +2,8 @@
 //!
 //! This crate implements the Postgres frontend/backend protocol (v3) and the
 //! connection/session state machine for a Postgres listener that shares
-//! Ferrosa's storage, schema, auth, and Accord core (via `ferrosa-session`,
-//! per decision D10). It does **not** contain the relational query engine —
+//! Ferrosa's storage, schema, and auth. CQL transaction coordination remains
+//! on Accord outside this crate. It does **not** contain the relational query engine —
 //! that lives in `ferrosa-sql`.
 //!
 //! Blueprint: `specs/proposed/postgres-frontend/`.
@@ -18,6 +18,7 @@ pub mod connection;
 pub mod extended;
 pub mod handshake;
 pub mod messages;
+mod mvcc;
 pub(crate) mod offload;
 pub mod query;
 pub mod scram;
@@ -34,5 +35,6 @@ pub use messages::{
     BackendMessage, FieldDescription, FrontendMessage, StartupFrame, StartupMessage,
     TransactionStatus,
 };
+pub use mvcc::{MvccManager, PgWrite};
 pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
 pub use server::QueryContext;

@@ -111,6 +111,10 @@ pub(crate) struct PreAcceptV2Payload {
     pub(crate) keys: Vec<Vec<u8>>,
     pub(crate) ballot: BallotNumber,
     pub(crate) epoch: u64,
+    /// PostgreSQL snapshot timestamp. When present, replicas reject a snapshot
+    /// that is older than a committed or in-flight transaction on a conflict key.
+    #[serde(default)]
+    pub(crate) snapshot_ts: Option<Timestamp>,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +130,10 @@ pub(crate) struct PreAcceptOkPayload {
     pub(crate) t: Timestamp,
     /// Dependency set detected by this replica.
     pub(crate) deps: Vec<TxnId>,
+    /// True when this replica refuses an MVCC snapshot older than a known
+    /// conflicting PostgreSQL transaction. Default false for rolling upgrades.
+    #[serde(default)]
+    pub(crate) snapshot_stale: bool,
 }
 
 /// AcceptOK response from a replica (slow path).
@@ -192,6 +200,9 @@ pub enum ReadPredicate {
         /// Target table name.
         table: String,
     },
+    /// PostgreSQL transaction-begin barrier. The replica votes only after
+    /// transactions ordered before this timestamp have applied locally.
+    SnapshotBarrier,
     /// Unconditional commit: there is no `IF` to evaluate, so the transaction
     /// always applies after commit. The coordinator SKIPS the read-vote phase
     /// entirely (no `AccordRead` fan-out). This is the path for a general
@@ -362,6 +373,7 @@ mod tests {
             from: 2,
             t,
             deps: vec![dep_a, dep_b],
+            snapshot_stale: false,
         });
         assert_bincode_roundtrip(&AcceptOkPayload {
             txn_id,

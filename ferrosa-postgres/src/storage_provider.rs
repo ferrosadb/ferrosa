@@ -81,7 +81,7 @@
 //! invent an ordering — reusing the shared bridge guarantees parity with CQL
 //! while keeping ferrosa-postgres free of any ferrosa-cql dependency (D10).
 //!
-//! ## Lossy [`CqlValue`] -> [`ferrosa_sql::Value`] conversion
+//! ## [`CqlValue`] -> [`ferrosa_sql::Value`] conversion
 //!
 //! The [`ferrosa_sql::Value`] model covers `Null | Int(i64) | Text | Bool |
 //! Float(f64) | Uuid | Bytea | Timestamp(i64 micros) | Date(i32 days) |
@@ -90,33 +90,30 @@
 //! losslessly (f32 widens to f64); `uuid`/`timeuuid` → `Value::Uuid`, `blob` →
 //! `Value::Bytea`; the temporal (`timestamp`/`date`/`time`), network (`inet`),
 //! and arbitrary-precision (`decimal`/`varint`) scalars now map through to their
-//! exact-Postgres-text engine variants. Every remaining CQL type is
-//! **known-lossy** and converts to `Value::Null` (with a code comment, never a
-//! panic). The remaining lossy types (OUT OF SCOPE — large separate efforts) are:
+//! exact-Postgres-text engine variants. Unsupported composites and durations
+//! return a conversion error; scan callers propagate it as a query error rather
+//! than showing a non-NULL stored value as SQL `NULL`.
 //!
 //! - Temporal: `Duration` (no clean Postgres-scalar mapping)
 //! - Collections / composites: `List`, `Set`, `Map`, `Tuple`, `Udt`, `Vector`
 
 use std::fmt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema, TableMetadata};
 use ferrosa_sql::{Column, ColumnType, RelSchema, Row, TableProvider, Value};
 use ferrosa_storage::{StorageEngine, TableId};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-/// Convert a single ferrosa [`CqlValue`] to the engine's [`ferrosa_sql::Value`].
-///
-/// Lossless for the integral / textual / boolean / floating-point scalars; every
-/// other variant is a documented lossy gap that maps to [`Value::Null`] (see the
-/// module docs for the full list). This is deliberately **not** a panic — widening
-/// `Value` to represent these types is follow-up work, and a query over a wider
-/// table should still run, treating the as-yet-unmodelled columns as NULL.
-pub fn cql_to_value(v: &CqlValue) -> Value {
-    match v {
+/// Convert a ferrosa [`CqlValue`] to [`ferrosa_sql::Value`]. Unsupported values
+/// return an error so callers cannot turn real data into fabricated SQL NULLs.
+pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
+    Ok(match v {
         CqlValue::Null => Value::Null,
         // Integral types widen into i64 losslessly.
         CqlValue::Int(i) => Value::Int(i64::from(*i)),
@@ -139,7 +136,10 @@ pub fn cql_to_value(v: &CqlValue) -> Value {
         // ── Temporal / network / arbitrary-precision (exact Postgres text) ──
         // `Timestamp` carries i64 MILLIS since the Unix epoch; the engine's
         // `Value::Timestamp` is MICROS, so widen by 1000.
-        CqlValue::Timestamp(ms) => Value::Timestamp(ms * 1000),
+        CqlValue::Timestamp(ms) => Value::Timestamp(
+            ms.checked_mul(1000)
+                .ok_or_else(|| "CQL timestamp is outside PostgreSQL timestamp range".to_string())?,
+        ),
         // `Date` carries u32 days centered at 2^31 (CQL epoch encoding); the
         // engine's `Value::Date` is signed days since the Unix epoch.
         CqlValue::Date(d) => Value::Date((i64::from(*d) - 2_147_483_648) as i32),
@@ -151,18 +151,18 @@ pub fn cql_to_value(v: &CqlValue) -> Value {
         // numeric with scale 0.
         CqlValue::Decimal { scale, unscaled } => Value::numeric(unscaled.clone(), *scale),
         CqlValue::Varint(b) => Value::numeric(b.clone(), 0),
-        // ── Known lossy gaps (OUT OF SCOPE — large separate efforts) ───────
-        // The engine's `Value` cannot represent these yet, so they read as NULL
-        // rather than panicking. `Duration` has no clean Postgres-scalar mapping;
-        // collections (List/Set/Map/Tuple/UDT/Vector) are a separate widening.
+        // These values have no lossless SQL scalar representation here. Fail
+        // the query instead of returning NULL for a non-NULL stored value.
         CqlValue::Duration { .. }
         | CqlValue::List(_)
         | CqlValue::Set(_)
         | CqlValue::Map(_)
         | CqlValue::Tuple(_)
         | CqlValue::Udt(_)
-        | CqlValue::Vector(_) => Value::Null,
-    }
+        | CqlValue::Vector(_) => {
+            return Err(format!("unsupported CQL value for PostgreSQL: {v:?}"))
+        }
+    })
 }
 
 /// Failure modes of [`load_table`].
@@ -344,6 +344,8 @@ struct ScanContext {
     pk_idx: Vec<usize>,
     ck_idx: Vec<usize>,
     storage_to_table: Vec<usize>,
+    /// Sparse PostgreSQL row replacements/deletions for the query snapshot.
+    overlay: Arc<std::collections::HashMap<Vec<Value>, Option<Row>>>,
 }
 
 /// Drain `range_iter` into `tx`, decoding one partition at a time.
@@ -354,6 +356,7 @@ struct ScanContext {
 /// cancelled or short-circuited query.
 async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: ScanFailure) {
     let mut stream = ctx.engine.range_iter(&ctx.table_id, None, None);
+    let mut overlay_seen = std::collections::HashSet::new();
     while let Some(item) = stream.next().await {
         let partition = match item {
             Ok(p) => p,
@@ -379,14 +382,57 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
             &ctx.ck_idx,
             &ctx.storage_to_table,
         ) {
-            let values = cql_row
+            let values: Vec<Value> = match cql_row
                 .iter()
-                .map(|cell| cell.as_ref().map_or(Value::Null, cql_to_value))
+                .map(|cell| match cell {
+                    Some(value) => cql_to_value(value),
+                    None => Ok(Value::Null),
+                })
+                .collect()
+            {
+                Ok(values) => values,
+                Err(error) => {
+                    failure.record(format!(
+                        "scan of {}.{} cannot represent a stored value: {error}",
+                        ctx.table_id.keyspace, ctx.table_id.table
+                    ));
+                    return;
+                }
+            };
+            let key: Vec<Value> = ctx
+                .pk_idx
+                .iter()
+                .chain(ctx.ck_idx.iter())
+                .map(|index| values[*index].clone())
                 .collect();
-            if tx.send(Row::new(values)).await.is_err() {
+            let row = match ctx.overlay.get(&key) {
+                Some(Some(row)) => {
+                    overlay_seen.insert(key);
+                    row.clone()
+                }
+                Some(None) => {
+                    overlay_seen.insert(key);
+                    continue;
+                }
+                None => Row::new(values),
+            };
+            if tx.send(row).await.is_err() {
                 // The consumer is gone: the executor short-circuited, errored,
                 // or the connection dropped. Not a failure — stop producing.
                 return;
+            }
+        }
+    }
+    // A snapshot can contain a row deleted from current storage, or omit a row
+    // inserted after its read timestamp. Re-add historical rows absent from the
+    // latest storage scan; the overlay remains sparse and table scans stay
+    // streamed.
+    for (key, row) in ctx.overlay.iter() {
+        if !overlay_seen.contains(key) {
+            if let Some(row) = row {
+                if tx.send(row.clone()).await.is_err() {
+                    return;
+                }
             }
         }
     }
@@ -399,6 +445,24 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
 /// closes the channel, which is what tells the producer to stop.
 struct ScanIter {
     rx: mpsc::Receiver<Row>,
+}
+
+/// Run a scan producer while converting an unexpected panic into a query
+/// failure. The synchronous `TableProvider` iterator can only observe channel
+/// closure; without this guard a panic would look exactly like a clean EOF and
+/// could silently truncate a result.
+async fn guard_scan_producer<F>(future: F, failure: ScanFailure)
+where
+    F: Future<Output = ()>,
+{
+    if let Err(payload) = AssertUnwindSafe(future).catch_unwind().await {
+        let reason = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        failure.record(format!("scan producer panicked: {reason}"));
+    }
 }
 
 impl Iterator for ScanIter {
@@ -439,8 +503,10 @@ impl TableProvider for StreamingTable {
 
     fn scan(&self) -> Box<dyn Iterator<Item = Row> + '_> {
         let (tx, rx) = mpsc::channel(SCAN_BUFFER_ROWS);
-        self.handle
-            .spawn(produce_scan(self.ctx.clone(), tx, self.failure.clone()));
+        self.handle.spawn(guard_scan_producer(
+            produce_scan(self.ctx.clone(), tx, self.failure.clone()),
+            self.failure.clone(),
+        ));
         Box::new(ScanIter { rx })
     }
 }
@@ -464,6 +530,17 @@ pub async fn load_table(
     keyspace: &str,
     table: &str,
     failure: ScanFailure,
+) -> Result<StreamingTable, LoadError> {
+    load_table_with_overlay(engine, schema, keyspace, table, failure, Default::default()).await
+}
+
+pub(crate) async fn load_table_with_overlay(
+    engine: &Arc<StorageEngine>,
+    schema: &Schema,
+    keyspace: &str,
+    table: &str,
+    failure: ScanFailure,
+    overlay: std::collections::HashMap<Vec<Value>, Option<Row>>,
 ) -> Result<StreamingTable, LoadError> {
     let snapshot = schema.snapshot();
 
@@ -503,15 +580,204 @@ pub async fn load_table(
             pk_idx,
             ck_idx,
             storage_to_table,
+            overlay: Arc::new(overlay),
         }),
         handle: Handle::current(),
         failure,
     })
 }
 
+/// Merge a transaction's uncommitted scalar row mutations into the sparse
+/// snapshot overlay so PostgreSQL transactions observe their own writes.
+pub(crate) fn apply_pending_writes(
+    engine: &StorageEngine,
+    schema: &Schema,
+    keyspace: &str,
+    table: &str,
+    overlay: &mut std::collections::HashMap<Vec<Value>, Option<Row>>,
+    writes: &[crate::mvcc::PgWrite],
+) -> Result<(), String> {
+    apply_pending_writes_with_partition_keys(engine, schema, keyspace, table, overlay, writes, None)
+}
+
+pub(crate) fn apply_pending_writes_with_partition_keys(
+    engine: &StorageEngine,
+    schema: &Schema,
+    keyspace: &str,
+    table: &str,
+    overlay: &mut std::collections::HashMap<Vec<Value>, Option<Row>>,
+    writes: &[crate::mvcc::PgWrite],
+    mut partition_keys: Option<&mut std::collections::HashMap<Vec<Value>, Vec<u8>>>,
+) -> Result<(), String> {
+    let snapshot = schema.snapshot();
+    let meta = snapshot
+        .tables
+        .get(&(keyspace.to_string(), table.to_string()))
+        .ok_or_else(|| format!("table {keyspace}.{table} is not registered"))?;
+    let names: Vec<String> = meta.columns.keys().cloned().collect();
+    let types = meta
+        .columns
+        .values()
+        .map(|column| {
+            ferrosa_row_bridge::parse_cql_type_in_keyspace(&column.column_type, keyspace, schema)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let pk = pk_indices(meta);
+    let ck = ck_indices(meta);
+    let storage_to_table = storage_to_table_indices(meta);
+
+    for write in writes {
+        let mutation = &write.0;
+        if mutation.keyspace != keyspace || mutation.table != table {
+            continue;
+        }
+        let pk_parts = ferrosa_row_bridge::decode_pk(&mutation.key, pk.len());
+        for mutation_row in &mutation.rows {
+            let ck_parts =
+                ferrosa_row_bridge::decode_clustering(&mutation_row.clustering, ck.len());
+            let mut key = Vec::with_capacity(pk.len() + ck.len());
+            let mut values = vec![Value::Null; names.len()];
+            for (index, part) in pk.iter().zip(pk_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&types[*index], part)
+                    .map_err(|error| error.to_string())?;
+                let value = cql_to_value(&cql)?;
+                key.push(value.clone());
+                values[*index] = value;
+            }
+            for (index, part) in ck.iter().zip(ck_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&types[*index], part)
+                    .map_err(|error| error.to_string())?;
+                let value = cql_to_value(&cql)?;
+                key.push(value.clone());
+                values[*index] = value;
+            }
+            if let Some(partition_keys) = partition_keys.as_deref_mut() {
+                partition_keys.insert(key.clone(), mutation.key.key.as_bytes().to_vec());
+            }
+
+            let base = if let Some(snapshot_row) = overlay.get(&key) {
+                snapshot_row.clone()
+            } else {
+                read_row_image(engine, schema, mutation, &mutation_row.clustering)?
+                    .map(|(_, row)| row)
+            };
+            if let Some(base) = base {
+                values = base.0;
+            }
+            if !mutation_row.deletion.is_live() {
+                overlay.insert(key, None);
+                continue;
+            }
+            for (storage_index, cell) in &mutation_row.cells {
+                let storage_index = usize::from(*storage_index & 0x3fff);
+                let Some(table_index) = storage_to_table.get(storage_index).copied() else {
+                    continue;
+                };
+                values[table_index] = match &cell.value {
+                    Some(bytes) => {
+                        let cql = ferrosa_row_bridge::decode_value(&types[table_index], bytes)
+                            .map_err(|error| error.to_string())?;
+                        cql_to_value(&cql)?
+                    }
+                    None => Value::Null,
+                };
+            }
+            overlay.insert(key, Some(Row::new(values)));
+        }
+    }
+    Ok(())
+}
+
+/// Read one PostgreSQL row image by its storage partition and clustering key.
+/// Returns the SQL primary-key tuple with the decoded row for MVCC history.
+pub(crate) fn read_row_image(
+    engine: &StorageEngine,
+    schema: &Schema,
+    mutation: &ferrosa_storage::Mutation,
+    clustering: &[u8],
+) -> Result<Option<(Vec<Value>, Row)>, String> {
+    let snapshot = schema.snapshot();
+    let meta = snapshot
+        .tables
+        .get(&(mutation.keyspace.clone(), mutation.table.clone()))
+        .ok_or_else(|| {
+            format!(
+                "table {}.{} is not registered",
+                mutation.keyspace, mutation.table
+            )
+        })?;
+    let names: Vec<String> = meta.columns.keys().cloned().collect();
+    let types = meta
+        .columns
+        .values()
+        .map(|column| {
+            ferrosa_row_bridge::parse_cql_type_in_keyspace(
+                &column.column_type,
+                &mutation.keyspace,
+                schema,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let pk = pk_indices(meta);
+    let ck = ck_indices(meta);
+    let storage_to_table = storage_to_table_indices(meta);
+    let Some(partition) = engine
+        .read_clustering_row(
+            &TableId::new(&mutation.keyspace, &mutation.table),
+            &mutation.key,
+            clustering,
+        )
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let rows = ferrosa_row_bridge::partition_to_rows_with_clustering(
+        &partition,
+        &names,
+        &types,
+        &pk,
+        &ck,
+        &storage_to_table,
+    );
+    let Some((_, cells)) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let values: Vec<Value> = cells
+        .iter()
+        .map(|cell| match cell {
+            Some(value) => cql_to_value(value),
+            None => Ok(Value::Null),
+        })
+        .collect::<Result<_, _>>()?;
+    let key = pk
+        .iter()
+        .chain(ck.iter())
+        .map(|index| values[*index].clone())
+        .collect();
+    Ok(Some((key, Row::new(values))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cql_to_value(value: &CqlValue) -> Value {
+        super::cql_to_value(value).expect("test value should be representable")
+    }
+
+    #[tokio::test]
+    async fn scan_producer_panic_is_reported_as_query_failure() {
+        let failure = ScanFailure::default();
+        guard_scan_producer(async { panic!("injected scan failure") }, failure.clone()).await;
+
+        assert_eq!(
+            failure.take().as_deref(),
+            Some("scan producer panicked: injected scan failure"),
+            "a producer panic must not be mistaken for a clean end of scan"
+        );
+    }
 
     use ferrosa_common::cell::CellValue;
     use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -558,22 +824,15 @@ mod tests {
     }
 
     #[test]
-    fn cql_to_value_maps_lossy_types_to_null() {
-        // The remaining out-of-scope types: Duration (no Postgres-scalar mapping)
-        // and collections. (Timestamp/Date/Time/Inet/Decimal/Varint are no longer
-        // lossy — see the dedicated test below.)
-        assert_eq!(
-            cql_to_value(&CqlValue::Duration {
-                months: 1,
-                days: 2,
-                nanos: 3
-            }),
-            Value::Null
-        );
-        assert_eq!(
-            cql_to_value(&CqlValue::List(vec![CqlValue::Int(1)])),
-            Value::Null
-        );
+    fn cql_to_value_rejects_unrepresentable_values() {
+        assert!(super::cql_to_value(&CqlValue::Duration {
+            months: 1,
+            days: 2,
+            nanos: 3
+        })
+        .is_err());
+        assert!(super::cql_to_value(&CqlValue::List(vec![CqlValue::Int(1)])).is_err());
+        assert!(super::cql_to_value(&CqlValue::Timestamp(i64::MAX)).is_err());
     }
 
     #[test]

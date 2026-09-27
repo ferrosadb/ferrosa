@@ -6,6 +6,14 @@
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
 
+/// PostgreSQL transaction isolation level requested by `BEGIN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
 /// A parsed top-level SQL statement — the unit a Postgres-wire client sends.
 ///
 /// `parse_statement` returns this; the legacy `parse` returns just the
@@ -21,8 +29,9 @@ pub enum Statement {
     /// A no-`FROM` expression query (`SELECT 1`, `SELECT version()`,
     /// `SELECT $1`) — yields exactly one row.
     SelectExprs(Vec<ScalarItem>),
-    /// `BEGIN` / `START TRANSACTION`.
-    Begin,
+    /// `BEGIN` / `START TRANSACTION`, preserving an explicitly requested
+    /// isolation level. `None` means the session default.
+    Begin { isolation: Option<IsolationLevel> },
     /// `COMMIT` / `END`.
     Commit,
     /// `ROLLBACK` / `ABORT`.

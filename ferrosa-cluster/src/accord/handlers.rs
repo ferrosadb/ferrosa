@@ -257,6 +257,7 @@ impl RpcHandler for AccordHandler {
                             from: self.local_node_id,
                             t,
                             deps,
+                            snapshot_stale: false,
                         };
                         let bytes = bincode::serialize(&ok).ok()?;
                         Some(Message::AccordPreAcceptOK(Bytes::from(bytes)))
@@ -277,14 +278,17 @@ impl RpcHandler for AccordHandler {
                 let payload: PreAcceptV2Payload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordPreAcceptV2: deserialize failed: {e}"))
                     .ok()?;
+                let snapshot_ts = payload.snapshot_ts;
+                let proposed_t = payload.t0;
                 let resp = on_state_machine(&self.state, move |sm| {
                     let key_refs: Vec<&[u8]> = payload.keys.iter().map(|k| k.as_slice()).collect();
-                    sm.handle_preaccept_multi(
+                    sm.handle_preaccept_multi_with_snapshot(
                         payload.txn_id,
                         payload.t0,
                         &key_refs,
                         payload.ballot,
                         payload.epoch,
+                        snapshot_ts,
                     )
                 })
                 .await?;
@@ -294,8 +298,19 @@ impl RpcHandler for AccordHandler {
                             from: self.local_node_id,
                             t,
                             deps,
+                            snapshot_stale: false,
                         };
                         let bytes = bincode::serialize(&ok).ok()?;
+                        Some(Message::AccordPreAcceptOK(Bytes::from(bytes)))
+                    }
+                    SmResponse::SnapshotStale => {
+                        let stale = PreAcceptOkPayload {
+                            from: self.local_node_id,
+                            t: proposed_t,
+                            deps: Vec::new(),
+                            snapshot_stale: true,
+                        };
+                        let bytes = bincode::serialize(&stale).ok()?;
                         Some(Message::AccordPreAcceptOK(Bytes::from(bytes)))
                     }
                     SmResponse::Nack { .. } => Some(Message::AccordPreAcceptOK(Bytes::new())),
@@ -465,6 +480,7 @@ impl RpcHandler for AccordHandler {
                             // holds. Defensive — the coordinator skips the read-vote
                             // for `Always`, so this arm is not normally reached.
                             ReadPredicate::Always => (true, vec![]),
+                            ReadPredicate::SnapshotBarrier => (true, vec![]),
                             // Generic IF col=val: the replica does the read-at-`t`
                             // and returns the row bytes; the coordinator (which owns
                             // the table schema) evaluates the predicate via the
@@ -637,6 +653,7 @@ mod tests {
             keys: vec![b"k1".to_vec(), b"k2".to_vec()],
             ballot: BallotNumber(0),
             epoch: 0,
+            snapshot_ts: None,
         };
         let bytes = bincode::serialize(&payload).unwrap();
         let peer: PeerId = (

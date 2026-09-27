@@ -3,9 +3,9 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ColumnRef, DeleteStmt, Expr, InsertStmt, Join, Operand, OrderItem, Projection,
-    Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement, TableRef, Term,
-    UpdateStmt,
+    AggArg, ColumnRef, DeleteStmt, Expr, InsertStmt, IsolationLevel, Join, Operand, OrderItem,
+    Projection, Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement, TableRef,
+    Term, UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -142,9 +142,9 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             }
         }
         Some(Tok::Ident(w)) => match w.to_ascii_uppercase().as_str() {
-            // Transaction control: `BEGIN [TRANSACTION|WORK]`, `START TRANSACTION`,
-            // `COMMIT|END`, `ROLLBACK|ABORT`. Trailing modifier words are ignored.
-            "BEGIN" | "START" => Ok(Statement::Begin),
+            // Transaction control: `BEGIN` / `START TRANSACTION` preserve an
+            // explicit isolation level for the session layer.
+            "BEGIN" | "START" => p.parse_begin(),
             "COMMIT" | "END" => Ok(Statement::Commit),
             "ROLLBACK" | "ABORT" => Ok(Statement::Rollback),
             "SET" => p.parse_set(),
@@ -562,6 +562,50 @@ impl Parser {
             }),
             None => Err(ParseError::UnexpectedEnd),
         }
+    }
+
+    fn parse_begin(&mut self) -> Result<Statement, ParseError> {
+        let command = self.ident()?.to_ascii_uppercase();
+        if matches!(
+            self.peek(),
+            Some(Tok::Ident(word))
+                if word.eq_ignore_ascii_case("TRANSACTION")
+                    || (command == "BEGIN" && word.eq_ignore_ascii_case("WORK"))
+        ) {
+            self.next();
+        }
+
+        let isolation = if matches!(
+            self.peek(),
+            Some(Tok::Ident(word)) if word.eq_ignore_ascii_case("ISOLATION")
+        ) {
+            self.expect_ident_kw("ISOLATION")?;
+            self.expect_ident_kw("LEVEL")?;
+            let first = self.ident()?.to_ascii_uppercase();
+            let level = match first.as_str() {
+                "SERIALIZABLE" => IsolationLevel::Serializable,
+                "READ" => {
+                    self.expect_ident_kw("COMMITTED")?;
+                    IsolationLevel::ReadCommitted
+                }
+                "REPEATABLE" => {
+                    self.expect_ident_kw("READ")?;
+                    IsolationLevel::RepeatableRead
+                }
+                _ => {
+                    return Err(ParseError::Unexpected {
+                        expected: "SERIALIZABLE, REPEATABLE READ, or READ COMMITTED",
+                        found: first,
+                    });
+                }
+            };
+            Some(level)
+        } else {
+            None
+        };
+
+        self.expect_end()?;
+        Ok(Statement::Begin { isolation })
     }
 
     /// A scalar value in a `VALUES` list: a `$N` parameter or a literal.
@@ -1607,19 +1651,45 @@ mod tests {
 
     #[test]
     fn parse_statement_transaction_control() {
-        assert_eq!(parse_statement("BEGIN").unwrap(), Statement::Begin);
+        assert_eq!(
+            parse_statement("BEGIN").unwrap(),
+            Statement::Begin { isolation: None }
+        );
         assert_eq!(
             parse_statement("begin transaction").unwrap(),
-            Statement::Begin
+            Statement::Begin { isolation: None }
         );
         assert_eq!(
             parse_statement("START TRANSACTION").unwrap(),
-            Statement::Begin
+            Statement::Begin { isolation: None }
         );
         assert_eq!(parse_statement("COMMIT").unwrap(), Statement::Commit);
         assert_eq!(parse_statement("END").unwrap(), Statement::Commit);
         assert_eq!(parse_statement("ROLLBACK").unwrap(), Statement::Rollback);
         assert_eq!(parse_statement("ABORT").unwrap(), Statement::Rollback);
+    }
+
+    #[test]
+    fn parse_statement_preserves_serializable_begin_mode() {
+        assert_eq!(
+            parse_statement("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap(),
+            Statement::Begin {
+                isolation: Some(IsolationLevel::Serializable)
+            }
+        );
+        assert_eq!(
+            parse_statement("START TRANSACTION ISOLATION LEVEL READ COMMITTED").unwrap(),
+            Statement::Begin {
+                isolation: Some(IsolationLevel::ReadCommitted)
+            }
+        );
+        assert_eq!(
+            parse_statement("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap(),
+            Statement::Begin {
+                isolation: Some(IsolationLevel::RepeatableRead)
+            }
+        );
+        assert!(parse_statement("BEGIN ISOLATION LEVEL UNKNOWN").is_err());
     }
 
     #[test]

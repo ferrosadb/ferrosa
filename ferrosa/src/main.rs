@@ -2032,17 +2032,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clone write_path and ddl_path before shared_state is moved into the CQL server.
     let cluster_write_path = shared_state.write_path.clone();
     let cluster_ddl_path = shared_state.ddl_path.clone();
-    // Capture the Accord transaction committer for the Postgres front-end before
-    // shared_state is moved into the CQL server. `None` in standalone mode — a
-    // Postgres BEGIN/COMMIT with buffered DML then fails loud (FMEA PG-1).
-    let pg_accord_committer = shared_state.core.accord_transaction_committer();
     // Clone the shared execution state for the Flight endpoint before it is
     // moved into the CQL server (feature-gated so it is not an unused clone).
     #[cfg(feature = "flight")]
     let flight_state = shared_state.clone();
-    let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state).with_task_pool(
-        ferrosa_net::task_pool::TaskPool::runtime("cql", runtimes.cql.clone()),
-    );
+    let cql_server =
+        ferrosa_cql::server::CqlServer::new(cql_config, shared_state.clone()).with_task_pool(
+            ferrosa_net::task_pool::TaskPool::runtime("cql", runtimes.cql.clone()),
+        );
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
 
@@ -2365,7 +2362,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine: storage.clone(),
             schema: schema.clone(),
             default_schema: "public".into(),
-            accord_committer: pg_accord_committer,
+            mvcc: std::sync::Arc::new(ferrosa_postgres::MvccManager::default()),
+            accord_committer: shared_state.core.accord_transaction_committer(),
         });
         let pg_status = listener_status.clone();
         runtimes.background.spawn(async move {

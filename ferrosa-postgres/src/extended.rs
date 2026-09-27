@@ -23,7 +23,7 @@
 //! subsequent message until the next `Sync`, then emits `ReadyForQuery`. The
 //! the `Session::error_pending` flag implements that skip; `Sync` clears it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ferrosa_sql::{
     parse_statement, DeleteStmt, InsertStmt, ScalarItem, ScalarValue, SelectStmt, Statement,
@@ -31,7 +31,10 @@ use ferrosa_sql::{
 };
 
 use crate::messages::{BackendMessage, TransactionStatus};
-use crate::query::{decode_param, error_response, exec_error_response, row_description_fields};
+use crate::mvcc::{MvccSnapshot, PgWrite};
+use crate::query::{
+    decode_param_checked, error_response, exec_error_response, row_description_fields,
+};
 
 /// What a prepared statement parses to: a table query, a no-`FROM` expression
 /// query (`SELECT version()`, `SELECT 1`), or parameterized DML (`INSERT` /
@@ -74,14 +77,19 @@ pub struct Session {
     /// Set when an error occurs mid-sequence; skip messages until `Sync`.
     error_pending: bool,
     /// Protocol-level transaction state, reported in every `ReadyForQuery`
-    /// (`I`/`T`/`E`). Entering a `T` block is the trigger to route the
-    /// transaction's writes through Accord once DML lands (blueprint D11).
+    /// (`I`/`T`/`E`). Entering a `T` block starts PostgreSQL MVCC transaction
+    /// state; Cassandra CQL transactions remain on Accord.
     txn: TransactionStatus,
+    /// Explicit isolation mode for the current transaction. `None` means the
+    /// session default.
+    txn_isolation: Option<ferrosa_sql::IsolationLevel>,
+    txn_snapshot: Option<MvccSnapshot>,
+    txn_read_tables: HashSet<String>,
     /// Buffered DML write-set for the open `BEGIN`/`COMMIT` block. DML inside a
     /// transaction is BUFFERED here instead of applied; `COMMIT` drives the whole
-    /// set through the Accord committer atomically; `ROLLBACK`/`end_txn` clears it
+    /// set through the PostgreSQL MVCC manager atomically; `ROLLBACK`/`end_txn` clears it
     /// so a discarded transaction never touches storage (FMEA PG-1).
-    txn_writes: Vec<ferrosa_storage::accord::TransactionWrite>,
+    txn_writes: Vec<PgWrite>,
 }
 
 /// The format code (0 text / 1 binary) for parameter `i` under the Bind fan-out
@@ -150,10 +158,17 @@ impl Session {
     /// `BEGIN`: enter a transaction block and start a fresh empty write-set. A
     /// `BEGIN` while already in one keeps the session in-transaction (PG warns
     /// but stays `T`) and clears any buffered writes.
-    pub fn begin_txn(&mut self) {
+    pub(crate) fn begin_txn(
+        &mut self,
+        isolation: Option<ferrosa_sql::IsolationLevel>,
+        snapshot: MvccSnapshot,
+    ) {
         self.txn_writes.clear();
+        self.txn_read_tables.clear();
         if matches!(self.txn, TransactionStatus::Idle) {
             self.txn = TransactionStatus::InTransaction;
+            self.txn_isolation = isolation;
+            self.txn_snapshot = Some(snapshot);
         }
     }
 
@@ -162,18 +177,41 @@ impl Session {
     /// rolled-back (or committed) transaction never re-applies on the next one.
     pub fn end_txn(&mut self) {
         self.txn = TransactionStatus::Idle;
+        self.txn_isolation = None;
+        self.txn_snapshot = None;
+        self.txn_read_tables.clear();
         self.txn_writes.clear();
     }
 
+    pub fn txn_isolation(&self) -> Option<ferrosa_sql::IsolationLevel> {
+        self.txn_isolation
+    }
+
     /// Mutable handle to the open transaction's buffered write-set, for the DML
-    /// path to push a `TransactionWrite` into while in a `T` block.
-    pub fn txn_writes_mut(&mut self) -> &mut Vec<ferrosa_storage::accord::TransactionWrite> {
+    /// path to push a PostgreSQL write into while in a `T` block.
+    pub(crate) fn txn_writes_mut(&mut self) -> &mut Vec<PgWrite> {
         &mut self.txn_writes
     }
 
+    pub(crate) fn txn_writes(&self) -> &[PgWrite] {
+        &self.txn_writes
+    }
+
+    pub(crate) fn txn_snapshot(&self) -> Option<&MvccSnapshot> {
+        self.txn_snapshot.as_ref()
+    }
+
+    pub(crate) fn txn_read_tables_mut(&mut self) -> &mut HashSet<String> {
+        &mut self.txn_read_tables
+    }
+
+    pub(crate) fn take_txn_read_tables(&mut self) -> HashSet<String> {
+        std::mem::take(&mut self.txn_read_tables)
+    }
+
     /// Drain the buffered write-set, leaving it empty. Used by `COMMIT` to hand
-    /// the whole set to the Accord committer.
-    pub fn take_txn_writes(&mut self) -> Vec<ferrosa_storage::accord::TransactionWrite> {
+    /// the whole set to the PostgreSQL MVCC commit path.
+    pub(crate) fn take_txn_writes(&mut self) -> Vec<PgWrite> {
         std::mem::take(&mut self.txn_writes)
     }
 
@@ -266,16 +304,38 @@ impl Session {
             );
         };
 
-        let params: Vec<SqlValue> = param_values
+        if param_formats.len() > 1 && param_formats.len() != param_values.len() {
+            self.error_pending = true;
+            return error_response(
+                "08P01",
+                "Bind parameter format count must be zero, one, or match the parameter count",
+            );
+        }
+        if param_formats.iter().any(|format| !matches!(format, 0 | 1))
+            || result_formats.iter().any(|format| !matches!(format, 0 | 1))
+        {
+            self.error_pending = true;
+            return error_response("08P01", "Bind format code must be 0 (text) or 1 (binary)");
+        }
+
+        let params: Result<Vec<SqlValue>, _> = param_values
             .iter()
             .enumerate()
             .map(|(i, bytes)| {
                 let format = param_format_for(param_formats, i);
                 // A declared OID is matched positionally; unspecified ⇒ 0.
                 let oid = stmt.param_oids.get(i).copied().unwrap_or(0);
-                decode_param(format, oid, bytes.as_deref())
+                decode_param_checked(format, oid, bytes.as_deref())
             })
             .collect();
+        let params = match params {
+            Ok(params) => params,
+            Err((format, message)) => {
+                self.error_pending = true;
+                let code = if format == 1 { "22P03" } else { "22P02" };
+                return error_response(code, &message);
+            }
+        };
 
         self.portals.insert(
             portal,
@@ -419,6 +479,67 @@ mod tests {
     }
 
     #[test]
+    fn bind_rejects_malformed_value_instead_of_binding_null() {
+        let mut s = Session::new();
+        s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
+
+        let response = s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[0],
+            &[Some(b"not-an-integer".to_vec())],
+            vec![],
+        );
+
+        assert!(matches!(
+            response,
+            BackendMessage::ErrorResponse { ref fields }
+                if fields[1] == (b'C', "22P02".to_string())
+        ));
+        assert!(s.is_error_pending());
+        assert!(
+            s.portal("p").is_none(),
+            "invalid values must not create a portal"
+        );
+    }
+
+    #[test]
+    fn bind_rejects_malformed_binary_value_with_binary_sqlstate() {
+        let mut s = Session::new();
+        s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
+
+        let response = s.on_bind("p".into(), "st".into(), &[1], &[Some(vec![1])], vec![]);
+
+        assert!(matches!(
+            response,
+            BackendMessage::ErrorResponse { ref fields }
+                if fields[1] == (b'C', "22P03".to_string())
+        ));
+        assert!(s.portal("p").is_none());
+    }
+
+    #[test]
+    fn bind_rejects_parameter_format_count_mismatch() {
+        let mut s = Session::new();
+        s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
+
+        let response = s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[0, 1],
+            &[Some(b"7".to_vec())],
+            vec![],
+        );
+
+        assert!(matches!(
+            response,
+            BackendMessage::ErrorResponse { ref fields }
+                if fields[1] == (b'C', "08P01".to_string())
+        ));
+        assert!(s.portal("p").is_none());
+    }
+
+    #[test]
     fn close_removes_statement_and_portal() {
         let mut s = Session::new();
         s.on_parse("st".into(), "SELECT id FROM users", vec![]);
@@ -465,7 +586,7 @@ mod tests {
         assert!(!s.in_txn() && !s.in_failed_txn());
 
         // BEGIN -> in transaction.
-        s.begin_txn();
+        s.begin_txn(None, crate::mvcc::MvccManager::default().snapshot());
         assert_eq!(s.txn_status(), TransactionStatus::InTransaction);
         assert!(s.in_txn());
 
@@ -483,8 +604,15 @@ mod tests {
         assert_eq!(s.txn_status(), TransactionStatus::Idle);
 
         // BEGIN while already in a transaction stays in-transaction.
-        s.begin_txn();
-        s.begin_txn();
+        s.begin_txn(
+            Some(ferrosa_sql::IsolationLevel::Serializable),
+            crate::mvcc::MvccManager::default().snapshot(),
+        );
+        s.begin_txn(None, crate::mvcc::MvccManager::default().snapshot());
         assert_eq!(s.txn_status(), TransactionStatus::InTransaction);
+        assert_eq!(
+            s.txn_isolation(),
+            Some(ferrosa_sql::IsolationLevel::Serializable)
+        );
     }
 }

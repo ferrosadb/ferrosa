@@ -444,6 +444,9 @@ pub enum AccordDriverError {
         /// Serialized current row from the first dissenting replica.
         current_row: Vec<u8>,
     },
+    /// A PostgreSQL transaction's Accord replicas have observed a newer
+    /// conflicting marker timestamp than its captured MVCC snapshot.
+    SnapshotStale,
     /// F+1 apply acknowledgements were not received within the timeout.
     ApplyQuorumUnavailable,
 }
@@ -455,6 +458,7 @@ impl std::fmt::Display for AccordDriverError {
             Self::Network(e) => write!(f, "Accord network error: {e}"),
             Self::Codec(e) => write!(f, "Accord codec error: {e}"),
             Self::ConditionNotMet { .. } => write!(f, "Accord LWT condition not met"),
+            Self::SnapshotStale => write!(f, "PostgreSQL MVCC snapshot is stale"),
             Self::ApplyQuorumUnavailable => write!(f, "Accord apply quorum unavailable"),
         }
     }
@@ -485,6 +489,9 @@ pub struct AccordCoordinatorDriver {
     peers: Arc<dyn AccordTransport>,
     /// IDs of the replicas for this transaction's token range.
     replica_ids: Vec<uuid::Uuid>,
+    /// Optional PostgreSQL MVCC timestamp checked by replicas during V2
+    /// PreAccept. CQL callers leave this unset.
+    snapshot_ts: Option<Timestamp>,
     /// UUID of this coordinator node (used to identify self-sends).
     ///
     /// When `PeerManager::send` is called with this ID, the send will fail
@@ -787,6 +794,7 @@ impl AccordCoordinatorDriver {
             coordinator,
             peers,
             replica_ids,
+            snapshot_ts: None,
             self_id,
             mutation,
             write_set,
@@ -863,6 +871,13 @@ impl AccordCoordinatorDriver {
     /// `keyspace`/`table` so replicas read the row at `t` and return its bytes.
     pub fn with_read_predicate(mut self, predicate: crate::accord::wire::ReadPredicate) -> Self {
         self.read_predicate = predicate;
+        self
+    }
+
+    /// Attach a PostgreSQL snapshot timestamp for replica-side stale-snapshot
+    /// validation. This is specific to PostgreSQL; CQL transactions leave it unset.
+    pub fn with_postgres_snapshot(mut self, snapshot_ts: Timestamp) -> Self {
+        self.snapshot_ts = Some(snapshot_ts);
         self
     }
 
@@ -1162,7 +1177,7 @@ impl AccordCoordinatorDriver {
         // sends `AccordPreAcceptV2` carrying every key, so each replica registers
         // the txn under all of them and returns the UNION of dependencies across
         // keys — serializing transactions that overlap on a non-first key (t_276e12).
-        let pa_msg = if self.write_set.len() == 1 {
+        let pa_msg = if self.write_set.len() == 1 && self.snapshot_ts.is_none() {
             let pa_payload = PreAcceptPayload {
                 txn_id,
                 t0,
@@ -1181,6 +1196,7 @@ impl AccordCoordinatorDriver {
                 keys,
                 ballot: BallotNumber(0),
                 epoch: 0,
+                snapshot_ts: self.snapshot_ts,
             };
             let pa_bytes = bincode::serialize(&pa_payload)
                 .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
@@ -1223,23 +1239,51 @@ impl AccordCoordinatorDriver {
         // self-vote can never reach quorum alone and the fan-out always runs.
         let self_vote_cannot_short_circuit =
             !has_remote_replica || fast_quorum_size(self.coordinator.rf) > 1;
-        if self_is_replica && !self.coordinator.is_leaseholder && self_vote_cannot_short_circuit {
+        let postgres_snapshot_transaction = self.snapshot_ts.is_some()
+            || matches!(
+                self.read_predicate,
+                crate::accord::wire::ReadPredicate::SnapshotBarrier
+            );
+        if self_is_replica
+            && !self.coordinator.is_leaseholder
+            && (self_vote_cannot_short_circuit || postgres_snapshot_transaction)
+        {
             if let Some(local_sm) = &self.local_accord_state {
                 let keys: Vec<Vec<u8>> = self.write_set.iter().map(|w| w.key.clone()).collect();
+                let snapshot_ts = self.snapshot_ts;
                 let resp = crate::accord::handlers::on_state_machine(local_sm, move |sm| {
                     let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-                    sm.handle_preaccept_multi(txn_id, t0, &keys, BallotNumber(0), 0)
+                    sm.handle_preaccept_multi_with_snapshot(
+                        txn_id,
+                        t0,
+                        &keys,
+                        BallotNumber(0),
+                        0,
+                        snapshot_ts,
+                    )
                 })
                 .await;
+                if matches!(
+                    resp.as_ref(),
+                    Some(crate::accord::state_machine::SmResponse::SnapshotStale)
+                ) {
+                    return Err(AccordDriverError::SnapshotStale);
+                }
                 if let Some(crate::accord::state_machine::SmResponse::PreAcceptOK {
                     t, deps, ..
                 }) = resp
                 {
-                    decision = self.coordinator.handle_preaccept_ok(PreAcceptResponse {
-                        from: self.coordinator.node_id,
-                        t,
-                        deps,
-                    });
+                    // At RF=2 the local vote would reach the fast quorum alone and
+                    // suppress the remote PreAccept. PostgreSQL still registers the
+                    // local conflict entry so COMMIT can validate the same snapshot
+                    // marker on every replica, but it counts only the remote vote.
+                    if self_vote_cannot_short_circuit {
+                        decision = self.coordinator.handle_preaccept_ok(PreAcceptResponse {
+                            from: self.coordinator.node_id,
+                            t,
+                            deps,
+                        });
+                    }
                 } else {
                     // The local replica did not vote. Dropping this silently
                     // costs the round a vote it was counting on and makes the
@@ -1290,6 +1334,9 @@ impl AccordCoordinatorDriver {
                     Ok((_peer_id, Message::AccordPreAcceptOK(b))) if !b.is_empty() => {
                         let ok: PreAcceptOkPayload = bincode::deserialize(b)
                             .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                        if ok.snapshot_stale {
+                            return Err(AccordDriverError::SnapshotStale);
+                        }
                         votes += 1;
                         let resp = PreAcceptResponse {
                             from: ok.from,
@@ -1606,13 +1653,32 @@ impl AccordCoordinatorDriver {
                 self.read_predicate,
                 crate::accord::wire::ReadPredicate::ReadRow { .. }
             );
+            let is_snapshot_barrier = matches!(
+                self.read_predicate,
+                crate::accord::wire::ReadPredicate::SnapshotBarrier
+            );
 
             // The coordinator's own replica is not reachable over the network
             // (self-send fails). For the generic path it must contribute its local
             // read-at-`t` so that, with RF=2 (sq=2), F+1 agreement is achievable and
             // the result is deterministic across all replicas. The applier already
             // persisted earlier conflicting txns locally before this read (dep-wait).
-            if is_generic {
+            if is_snapshot_barrier {
+                if let Some(local_sm) = &self.local_accord_state {
+                    if crate::accord::handlers::await_conflicting_deps_applied(
+                        local_sm, &key, commit_t,
+                    )
+                    .await
+                    {
+                        votes_true += 1;
+                    } else {
+                        tracing::error!(
+                            txn_id = ?txn_id,
+                            "accord: coordinator local snapshot barrier timed out — abstaining"
+                        );
+                    }
+                }
+            } else if is_generic {
                 if let crate::accord::wire::ReadPredicate::ReadRow { keyspace, table } =
                     &self.read_predicate
                 {
@@ -1738,6 +1804,18 @@ impl AccordCoordinatorDriver {
                         }
                     }
                 }
+            }
+
+            // A PostgreSQL BEGIN barrier defines a snapshot for reads on every
+            // replica. A quorum is not enough when another replica could still
+            // expose an older local engine view, so require every participant to
+            // confirm that dependencies before the barrier are applied.
+            if is_snapshot_barrier && votes_true != self.replica_ids.len() {
+                return Err(AccordDriverError::Network(format!(
+                    "PostgreSQL snapshot barrier received {} of {} replica votes",
+                    votes_true,
+                    self.replica_ids.len()
+                )));
             }
 
             if is_generic {
@@ -1882,7 +1960,35 @@ impl AccordCoordinatorDriver {
                 })
                 .await;
                 if !crate::accord::handlers::await_txn_applied(local_sm, txn_id).await {
-                    return Err(AccordDriverError::ApplyQuorumUnavailable);
+                    let state = crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                        sm.get_state(&txn_id).map(|txn| {
+                            let dependencies = txn
+                                .deps
+                                .iter()
+                                .map(|dependency| {
+                                    (
+                                        *dependency,
+                                        sm.get_state(dependency).map(|state| state.phase),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            (
+                                txn.phase,
+                                dependencies,
+                                txn.result.as_ref().map_or(0, Vec::len),
+                            )
+                        })
+                    })
+                    .await;
+                    tracing::error!(
+                        txn_id = ?txn_id,
+                        ?state,
+                        owned_write_count = self.write_set.iter().filter(|entry| self.replica_owns_key(self_id, &entry.key)).count(),
+                        "accord: coordinator local Apply did not reach Applied before the bounded wait"
+                    );
+                    return Err(AccordDriverError::Network(format!(
+                        "coordinator local Apply did not reach Applied (state={state:?})"
+                    )));
                 }
             } else if !owned_writes.is_empty() {
                 if let Some(applier) = &self.local_applier {
@@ -3342,6 +3448,7 @@ mod tests {
                         from: node_id_of(host_id),
                         t: request.t0,
                         deps: Vec::new(),
+                        snapshot_stale: false,
                     };
                     Ok(Message::AccordPreAcceptOK(Bytes::from(
                         bincode::serialize(&response).unwrap(),
@@ -3492,6 +3599,7 @@ mod tests {
                         from: node_id_of(host_id),
                         t,
                         deps,
+                        snapshot_stale: false,
                     };
                     Ok(Message::AccordPreAcceptOK(Bytes::from(
                         bincode::serialize(&payload).unwrap(),
@@ -3643,6 +3751,7 @@ mod tests {
                         from: node_id_of(host_id),
                         t: pa.t0,
                         deps: vec![],
+                        snapshot_stale: false,
                     };
                     Ok(Message::AccordPreAcceptOK(Bytes::from(
                         bincode::serialize(&payload).unwrap(),
