@@ -9,7 +9,9 @@
 //! front-ends already share, so neither front-end has to depend on the cluster
 //! layer — mirroring how `StorageApplier` is injected.
 
+use super::postgres_mvcc::PostgresMvccApplyObserver;
 use async_trait::async_trait;
+use ferrosa_common::accord::Timestamp;
 
 /// One buffered write in a transaction: the partition key, its encoded
 /// commit-log mutation, and the keyspace whose replication settings determine
@@ -80,6 +82,58 @@ impl std::error::Error for CommitError {}
 pub trait TransactionCommitter: Send + Sync {
     /// Commit `writes` as one atomic multi-key transaction.
     async fn commit(&self, writes: Vec<TransactionWrite>) -> Result<CommitOutcome, CommitError>;
+
+    /// Register the PostgreSQL MVCC observer on this node's local Accord apply
+    /// path. Cluster implementations delegate to their storage applier.
+    fn register_postgres_mvcc_observer(
+        &self,
+        _observer: std::sync::Arc<dyn PostgresMvccApplyObserver>,
+    ) -> Result<(), CommitError> {
+        Ok(())
+    }
+
+    /// Establish an Accord-ordered snapshot boundary for a PostgreSQL
+    /// transaction. This is deliberately separate from `commit`: CQL callers
+    /// keep their existing protocol and do not acquire PostgreSQL snapshot
+    /// barriers.
+    async fn begin_postgres_snapshot(&self, keyspace: &str) -> Result<Timestamp, CommitError> {
+        Err(CommitError {
+            reason: format!(
+                "committer does not implement PostgreSQL snapshot barriers for keyspace '{keyspace}'"
+            ),
+        })
+    }
+
+    /// Check that a PostgreSQL snapshot is still current before exposing rows
+    /// from a distributed read. Implementations return `false` when a committed
+    /// write is newer than the snapshot. The default fails closed.
+    async fn validate_postgres_snapshot(
+        &self,
+        keyspace: &str,
+        _snapshot: Timestamp,
+    ) -> Result<bool, CommitError> {
+        Err(CommitError {
+            reason: format!(
+                "committer does not implement PostgreSQL snapshot validation for keyspace '{keyspace}'"
+            ),
+        })
+    }
+
+    /// Commit PostgreSQL writes after checking the captured snapshot against
+    /// every table the transaction read or wrote. Implementations must order
+    /// this validation with the writes in Accord. The default fails closed.
+    async fn commit_postgres(
+        &self,
+        _keyspace: &str,
+        _writes: Vec<TransactionWrite>,
+        _tables: Vec<String>,
+        _snapshot: Timestamp,
+    ) -> Result<CommitOutcome, CommitError> {
+        Err(CommitError {
+            reason: "committer does not implement Accord-ordered PostgreSQL snapshot validation"
+                .to_string(),
+        })
+    }
 
     /// Commit `writes` and evaluate `reads` at the transaction's agreed commit
     /// timestamp, returning the row bytes observed for each read (positional).
@@ -179,6 +233,33 @@ impl TransactionCommitter for MockTransactionCommitter {
     async fn commit(&self, writes: Vec<TransactionWrite>) -> Result<CommitOutcome, CommitError> {
         self.committed.lock().expect("committer mutex").push(writes);
         self.result.clone()
+    }
+
+    async fn begin_postgres_snapshot(&self, _keyspace: &str) -> Result<Timestamp, CommitError> {
+        Ok(Timestamp {
+            epoch: 0,
+            time: 1,
+            seq: 0,
+            node: 0,
+        })
+    }
+
+    async fn validate_postgres_snapshot(
+        &self,
+        _keyspace: &str,
+        _snapshot: Timestamp,
+    ) -> Result<bool, CommitError> {
+        Ok(true)
+    }
+
+    async fn commit_postgres(
+        &self,
+        _keyspace: &str,
+        writes: Vec<TransactionWrite>,
+        _tables: Vec<String>,
+        _snapshot: Timestamp,
+    ) -> Result<CommitOutcome, CommitError> {
+        self.commit(writes).await
     }
 
     async fn commit_with_reads(

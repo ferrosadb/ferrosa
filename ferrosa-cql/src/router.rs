@@ -3191,6 +3191,9 @@ async fn finish_lwt_via_accord(
         Err(AccordDriverError::Codec(msg)) => {
             Err(CqlError::ServerError(format!("Accord codec error: {msg}")))
         }
+        Err(AccordDriverError::SnapshotStale) => Err(CqlError::ServerError(
+            "Accord snapshot stale before LWT commit".into(),
+        )),
     }
 }
 

@@ -8,11 +8,14 @@ executive_summary: >
   and lowers SQL onto the bespoke ferrosa-sql relational engine over live
   ferrosa storage. SELECT (incl. one JOIN) and single-row INSERT/UPDATE/DELETE
   are supported; it shares the storage row codec with CQL via ferrosa-row-bridge
-  (D10) and is differential-tested against real PostgreSQL 16. DML in a
-  BEGIN/COMMIT block buffers and commits atomically through Accord (FMEA PG-1);
-  ROLLBACK discards the buffer. Developer preview: $N params in DML, RETURNING,
-  and ON CONFLICT are still in progress, as is read-your-writes inside an open
-  transaction.
+  (D10) and is differential-tested against real PostgreSQL 16. Explicit
+  PostgreSQL SERIALIZABLE transactions use MVCC snapshots with read-your-writes
+  and conservative table-level conflict validation. In cluster mode, Accord
+  carries the snapshot and read/write table set into commit validation and applies
+  PostgreSQL row-version metadata to every replica. CQL/Cassandra transactions
+  remain on Accord's existing path. Native-driver cross-node coverage exists;
+  the Jepsen strict-serializability workload remains the system-wide acceptance
+  gate. `ON CONFLICT` remains unsupported.
 ---
 
 # ferrosa-postgres — Architecture Overview
@@ -42,7 +45,7 @@ Postgres drivers speak to ferrosa. Its boundary is deliberately narrow:
 | `connection` (`src/connection.rs`) | ~337 | Sans-IO `Connection`: startup/SSL/SASL → `Ready`; `take_inbuf` for pipelined first query |
 | `extended` (`src/extended.rs`) | ~453 | Per-connection `Session`: Parse/Bind/Close/Sync, prepared statements + portals, txn `I`/`T`/`E` |
 | `query` (`src/query.rs`) | ~1927 | `execute_query`, DML (INSERT/UPDATE/DELETE), value codecs (text+binary), SQLSTATE mapping, `load_catalog` |
-| `storage_provider` (`src/storage_provider.rs`) | ~758 | `load_table`: async-materialize a storage scan into a sync `InMemoryTable`; `cql_to_value`; R15 guard |
+| `storage_provider` (`src/storage_provider.rs`) | ~758 | `load_table`: bounded async-to-sync streaming provider; `cql_to_value`; R15 guard |
 | `catalog` (`src/catalog.rs`) | ~537 | `pg_catalog` projection (`pg_namespace`/`pg_class`/`pg_attribute`/`pg_type`) with deterministic OIDs |
 | `server` (`src/server.rs`) | ~540 | tokio TCP front-end: `serve`, `QueryContext`, `handle_connection`, the post-auth query loop |
 | `lib` (`src/lib.rs`) | ~37 | Module wiring + public re-exports |
@@ -90,10 +93,11 @@ form and (for most) the binary form, with OIDs/sizes advertised in
 `RowDescription`: `Int→int4(23)`, `Text→text(25)`, `Bool→bool(16)`,
 `Float→float8(701)`, `Uuid→uuid(2950)`, `Bytea→bytea(17)`,
 `Timestamp→timestamp(1114)`, `Date→date(1082)`, `Time→time(1083)`,
-`Inet→inet(869)`, `Numeric→numeric(1700)`. Binary `numeric` is out of scope (it
-falls back to text bytes — documented). The storage value bridge
-(`cql_to_value`) maps CQL scalars onto this model; `Duration` and collections
-(`List`/`Set`/`Map`/`Tuple`/`Udt`/`Vector`) are known-lossy and read as NULL.
+`Inet→inet(869)`, `Numeric→numeric(1700)`. Binary `numeric` and unsupported
+composites are rejected explicitly: the server does not send text bytes under a
+binary numeric OID or turn stored collection/duration values into SQL NULL.
+The storage value bridge (`cql_to_value`) maps supported CQL scalars onto this
+model and reports a scan error for values without a representation.
 
 ## Key invariants
 
@@ -107,9 +111,9 @@ falls back to text bytes — documented). The storage value bridge
    `ferrosa-row-bridge`, so Postgres-written rows are byte-identical to CQL.
 4. **No `ferrosa-cql` dependency (D10).** Structural — enforced by the crate
    graph.
-5. **Async storage, sync engine.** The scan is materialized up front
-   (`load_table` awaits the stream); the sync operators never `block_on` the
-   runtime.
+5. **Async storage, sync engine.** The provider bridges the async storage scan
+   to the sync executor through a bounded channel and blocking iterator. The
+   executor still materializes scan/result rows; see the data-flow notes.
 
 ## Position in the dependency graph
 

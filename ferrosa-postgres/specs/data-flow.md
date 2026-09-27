@@ -13,8 +13,9 @@ byte-identical to CQL.
 
 ## SELECT (read path)
 
-A simple `Q` query for `SELECT ... FROM t [JOIN ...] WHERE ...`. Tables are
-materialized from the async storage scan up front, then the sync engine runs.
+A simple `Q` query for `SELECT ... FROM t [JOIN ...] WHERE ...`. Storage rows
+flow through a bounded provider into the synchronous executor, which currently
+materializes its input and result rows before wire encoding.
 
 ```mermaid
 sequenceDiagram
@@ -35,20 +36,22 @@ sequenceDiagram
     SP->>Eng: range_iter(table_id) (async stream of Partition)
     Eng-->>SP: Partition*
     SP->>RB: partition_to_rows_with_storage_mapping
-    RB-->>SP: Vec&lt;Vec&lt;Option&lt;CqlValue&gt;&gt;&gt;
-    SP->>SP: cql_to_value per cell =&gt; InMemoryTable
-    SP-->>Q: MapCatalog (sync-scannable snapshot)
+    RB-->>SP: one partition's decoded rows
+    SP->>SP: bounded channel (64 rows) + sparse MVCC overlay
+    SP-->>Q: MapCatalog (re-scannable streaming provider)
     Q->>SQL: execute(select, catalog, params)
     SQL-->>Q: QueryResult (columns + rows)
-    Q->>Q: render_result =&gt; RowDescription + DataRow* + CommandComplete "SELECT n"
+    Q->>Q: render_result (encodes all rows into a Vec)
     Q-->>Srv: Vec&lt;BackendMessage&gt;
     Srv->>Drv: RowDescription, DataRow*, CommandComplete, ReadyForQuery
 ```
 
 Notes:
 
-- The async `range_iter` stream is fully drained **before** the sync operators
-  run — the engine is synchronous and must never `block_on` the runtime.
+- The storage provider reads one partition at a time and applies backpressure
+  through the bounded channel. The executor then collects its base scan and
+  `QueryResult`; the renderer collects encoded wire messages. End-to-end result
+  streaming is not implemented.
 - Column order follows the table's declared (DDL) order via the shared bridge,
   matching the CQL `route_select` read path exactly.
 - On any failure exactly one `ErrorResponse` is emitted (`42601` parse, `42P01`
@@ -91,10 +94,12 @@ Notes:
   `WHERE` identifies the row; `UPDATE` writes regular/static cells (blind
   upsert), `DELETE` writes a row-level tombstone (`build_delete_row`). Both
   report `1` because the Cassandra-style write has no match count.
-- Autocommit (no open transaction) applies immediately via `write_atomic_batch`,
-  as drawn above. Inside a `BEGIN`/`COMMIT` block the write is instead BUFFERED
-  as a `TransactionWrite` (`apply_or_buffer`) and the whole write-set is applied
-  atomically through the Accord `TransactionCommitter` on `COMMIT` (`commit_txn`);
-  `ROLLBACK` discards the buffer (never applied). See [fmea.md](fmea.md) PG-1.
+- Autocommit commits through PostgreSQL MVCC, which records before/after row
+  images around `write_atomic_batch`. Inside a `BEGIN`/`COMMIT` block, the write
+  is buffered as a PostgreSQL-owned `PgWrite`; `COMMIT` submits the PG mutation
+  batch, snapshot, and read/write table set through Accord when configured;
+  replica apply stages and publishes row-version metadata for active snapshots.
+  `ROLLBACK` discards buffered writes. Jepsen and fault/atomic-visibility
+  verification remain outstanding; see [fmea.md](fmea.md) PG-11.
 - The encoder is the single canonical `ferrosa-row-bridge` codec, so the row is
   byte-identical whether written via Postgres or CQL (no second encoder, D10).

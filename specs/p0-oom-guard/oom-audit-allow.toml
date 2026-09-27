@@ -1073,6 +1073,22 @@ owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
+path = "ferrosa-postgres/src/mvcc.rs"
+rule = "clone-on-row-data"
+symbol = "row"
+reason = "t_110dd8a5: one clone per changed key transfers a sparse MVCC snapshot overlay out of the manager lock; not a table scan copy. Revisit when the SQL row API supports shared row ownership."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-postgres/src/storage_provider.rs"
+rule = "clone-on-row-data"
+symbol = "row"
+reason = "t_110dd8a5: sparse historical rows must be owned by each re-scannable provider scan (self-joins open independent scans); bounded by MVCC-changed keys, not table size. Revisit with shared SQL row ownership."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
 path = "ferrosa-schema/src/system/aggregate_tables.rs"
 rule = "returns-vec-partition-or-row"
 reason = "t_a49d88c3 TRIAGED: BOUNDED: per-aggregate/per-table system rows = schema (registry pattern; not individually opened)."

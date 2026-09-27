@@ -75,6 +75,15 @@ pub struct ApplyMutation {
 /// 2. Be idempotent — re-applying the same `txn_id` at the same `t` is safe.
 /// 3. Not block the calling thread on I/O indefinitely (async or fast sync).
 pub trait StorageApplier: Send + Sync + 'static {
+    /// Install the PostgreSQL MVCC version sink used by the PostgreSQL front
+    /// end on this replica. Non-PostgreSQL appliers may leave the default no-op.
+    fn register_postgres_mvcc_observer(
+        &self,
+        _observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Apply a committed mutation to local storage.
     ///
     /// Called after all dependency transactions have already been applied.
@@ -392,6 +401,8 @@ pub struct EngineStorageApplier {
     /// `(txn_id, t)` alone would dedup writes 2..N of a transaction as spurious
     /// re-applies and silently drop them (DATA-LOSS).
     applied: Mutex<HashSet<(TxnId, Vec<u8>, u64)>>,
+    postgres_mvcc_observers:
+        parking_lot::RwLock<Vec<Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>>>,
 }
 
 impl EngineStorageApplier {
@@ -400,6 +411,7 @@ impl EngineStorageApplier {
         Self {
             engine,
             applied: Mutex::new(HashSet::new()),
+            postgres_mvcc_observers: parking_lot::RwLock::new(Vec::new()),
         }
     }
 
@@ -410,6 +422,20 @@ impl EngineStorageApplier {
 }
 
 impl StorageApplier for EngineStorageApplier {
+    fn register_postgres_mvcc_observer(
+        &self,
+        observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
+    ) -> Result<(), String> {
+        let mut observers = self.postgres_mvcc_observers.write();
+        if !observers
+            .iter()
+            .any(|registered| Arc::ptr_eq(registered, &observer))
+        {
+            observers.push(observer);
+        }
+        Ok(())
+    }
+
     fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
         // The single-key apply is the degenerate one-entry writeset, so it
         // shares the exact persistence + idempotency path (atomic batch of one).
@@ -430,6 +456,7 @@ impl StorageApplier for EngineStorageApplier {
         // The (txn,key,t) triples this call will newly persist — recorded only
         // AFTER the batch is durable, so a failed apply leaves them re-appliable.
         let mut newly_applied: Vec<(TxnId, Vec<u8>, u64)> = Vec::new();
+        let mut postgres_mvcc_metadata = Vec::new();
 
         {
             // Snapshot the idempotency set under the lock to decide what to skip.
@@ -440,8 +467,14 @@ impl StorageApplier for EngineStorageApplier {
                 // coordinator-local wall clock to the agreed execution timestamp
                 // `mutation.t` (t_68f226b5) so concurrent appends serialize in the
                 // Accord order. Non-list cells are untouched. Fail loud on garbage.
+                let (storage_data, metadata) =
+                    ferrosa_storage::accord::decode_postgres_mvcc_mutation(&mutation.data)
+                        .map_err(|reason| ApplyError { txn_id, reason })?;
+                if let Some(metadata) = metadata.filter(|metadata| !metadata.is_empty()) {
+                    postgres_mvcc_metadata.push(metadata.to_vec());
+                }
                 let mut decoded =
-                    Mutation::deserialize_from_rebinding_list_paths(&mutation.data, mutation.t)
+                    Mutation::deserialize_from_rebinding_list_paths(storage_data, mutation.t)
                         .map_err(|e| ApplyError {
                             txn_id,
                             reason: format!("failed to decode apply mutation: {e}"),
@@ -491,6 +524,30 @@ impl StorageApplier for EngineStorageApplier {
             return Ok(());
         }
 
+        if !postgres_mvcc_metadata.is_empty() {
+            let observers = self.postgres_mvcc_observers.read();
+            if observers.is_empty() {
+                return Err(ApplyError {
+                    txn_id,
+                    reason: "PostgreSQL MVCC metadata has no registered apply observer".into(),
+                });
+            }
+            if mutations
+                .iter()
+                .any(|mutation| mutation.t != mutations[0].t)
+            {
+                return Err(ApplyError {
+                    txn_id,
+                    reason: "PostgreSQL MVCC writeset contains multiple Accord timestamps".into(),
+                });
+            }
+            for observer in observers.iter() {
+                observer
+                    .prepare_postgres_apply(txn_id, mutations[0].t, &postgres_mvcc_metadata)
+                    .map_err(|reason| ApplyError { txn_id, reason })?;
+            }
+        }
+
         // Atomic commit of all surviving partitions. On any preflight/append
         // failure NONE of the ops are applied; propagated as `ApplyError`
         // (never fake success).
@@ -498,6 +555,14 @@ impl StorageApplier for EngineStorageApplier {
             txn_id,
             reason: format!("storage apply_batch failed for writeset: {e}"),
         })?;
+
+        if !postgres_mvcc_metadata.is_empty() {
+            for observer in self.postgres_mvcc_observers.read().iter() {
+                observer
+                    .on_postgres_apply(txn_id, mutations[0].t, &postgres_mvcc_metadata)
+                    .map_err(|reason| ApplyError { txn_id, reason })?;
+            }
+        }
 
         // Record only after the batch is durable, so a mid-apply failure leaves
         // the txn re-appliable rather than falsely marked applied.
@@ -728,38 +793,53 @@ impl CdcPublishingApplier {
 }
 
 impl CdcPublishingApplier {
-    /// Build the `CommittedToCluster` CDC event for `mutation`, or `None` if no
-    /// subscriber is listening (or the payload fails to decode).
-    fn committed_event(&self, mutation: &ApplyMutation) -> Option<ferrosa_cdc::CdcEvent> {
+    /// Build the `CommittedToCluster` CDC event, or `None` when no subscriber is
+    /// listening. Decode failures are returned so a committed write is never
+    /// silently omitted from a requested CDC stream.
+    fn committed_event(
+        &self,
+        mutation: &ApplyMutation,
+    ) -> Result<Option<ferrosa_cdc::CdcEvent>, String> {
         if !self
             .cdc
             .has_subscribers(ferrosa_cdc::CdcStream::CommittedToCluster)
         {
-            return None;
+            return Ok(None);
         }
         // Rebind list paths to the agreed `t` so the CDC event mirrors the
         // durably-applied rows (not the coordinator-clock paths), matching
         // `EngineStorageApplier::apply_writeset`.
-        Mutation::deserialize_from_rebinding_list_paths(&mutation.data, mutation.t)
-            .ok()
-            .map(|m| ferrosa_cdc::CdcEvent {
-                stream: ferrosa_cdc::CdcStream::CommittedToCluster,
-                keyspace: m.keyspace.clone(),
-                table: m.table.clone(),
-                key: m.key.clone(),
-                rows: m.rows.clone(),
-                timestamp: m.timestamp,
-                accord_ts: Some(mutation.t),
-                mutation_id: m.mutation_id,
-            })
+        let (storage_data, _) =
+            ferrosa_storage::accord::decode_postgres_mvcc_mutation(&mutation.data)?;
+        let m = Mutation::deserialize_from_rebinding_list_paths(storage_data, mutation.t)
+            .map_err(|error| format!("decode applied mutation for CDC: {error}"))?;
+        Ok(Some(ferrosa_cdc::CdcEvent {
+            stream: ferrosa_cdc::CdcStream::CommittedToCluster,
+            keyspace: m.keyspace.clone(),
+            table: m.table.clone(),
+            key: m.key.clone(),
+            rows: m.rows.clone(),
+            timestamp: m.timestamp,
+            accord_ts: Some(mutation.t),
+            mutation_id: m.mutation_id,
+        }))
     }
 }
 
 impl StorageApplier for CdcPublishingApplier {
+    fn register_postgres_mvcc_observer(
+        &self,
+        observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
+    ) -> Result<(), String> {
+        self.inner.register_postgres_mvcc_observer(observer)
+    }
+
     fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
         // Build the CDC event before `mutation` is consumed, and only if a
         // committed-stream subscriber is actually listening.
-        let event = self.committed_event(&mutation);
+        let event = self
+            .committed_event(&mutation)
+            .map_err(|reason| ApplyError { txn_id, reason })?;
         self.inner.apply(txn_id, mutation)?;
         if let Some(ev) = event {
             self.cdc.publish(ev);
@@ -778,8 +858,12 @@ impl StorageApplier for CdcPublishingApplier {
         // apply returns Ok, preserving the inner fail-loud contract.
         let events: Vec<ferrosa_cdc::CdcEvent> = mutations
             .iter()
-            .filter_map(|m| self.committed_event(m))
-            .collect();
+            .map(|mutation| {
+                self.committed_event(mutation)
+                    .map_err(|reason| ApplyError { txn_id, reason })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|events| events.into_iter().flatten().collect())?;
         self.inner.apply_writeset(txn_id, mutations)?;
         for ev in events {
             self.cdc.publish(ev);

@@ -311,6 +311,7 @@ async fn m1_join_returns_rows_to_a_real_driver() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
     });
 
@@ -396,6 +397,7 @@ async fn extended_query_error_recovers_after_sync() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
     });
 
@@ -438,6 +440,7 @@ async fn extended_parameterized_join_over_a_real_driver() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
     });
 
@@ -488,6 +491,7 @@ async fn group_by_order_by_limit_over_a_real_driver() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
     });
 
@@ -548,6 +552,7 @@ async fn where_having_distinct_over_a_real_driver() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
     });
 
@@ -618,7 +623,8 @@ async fn where_having_distinct_over_a_real_driver() {
 /// Accord committer — autocommit DML applies immediately; a COMMIT carrying
 /// buffered DML would fail loud (cluster mode required).
 async fn dml_client() -> (tokio_postgres::Client, tempfile::TempDir) {
-    dml_client_with_committer(false).await
+    let (client, _, dir, _) = dml_client_with_committer(false).await;
+    (client, dir)
 }
 
 /// As [`dml_client`], but `with_committer` installs a
@@ -627,27 +633,248 @@ async fn dml_client() -> (tokio_postgres::Client, tempfile::TempDir) {
 /// `Committed`) instead of failing loud for missing cluster mode.
 async fn dml_client_with_committer(
     with_committer: bool,
-) -> (tokio_postgres::Client, tempfile::TempDir) {
+) -> (
+    tokio_postgres::Client,
+    tokio_postgres::Client,
+    tempfile::TempDir,
+    Option<Arc<ferrosa_storage::accord::MockTransactionCommitter>>,
+) {
     use ferrosa_storage::accord::MockTransactionCommitter;
     let dir = tempfile::tempdir().unwrap();
     let engine = seed_engine(dir.path());
     let schema = create_schema();
-    let accord_committer: Option<Arc<dyn ferrosa_storage::accord::TransactionCommitter>> =
-        if with_committer {
-            Some(Arc::new(MockTransactionCommitter::new()))
-        } else {
-            None
-        };
+    let accord_committer = if with_committer {
+        Some(Arc::new(MockTransactionCommitter::new()))
+    } else {
+        None
+    };
+    let query_committer: Option<Arc<dyn ferrosa_storage::accord::TransactionCommitter>> =
+        accord_committer.as_ref().map(|committer| {
+            committer.clone() as Arc<dyn ferrosa_storage::accord::TransactionCommitter>
+        });
     let ctx = Arc::new(QueryContext {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
-        accord_committer,
+        mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
+        accord_committer: query_committer,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(server::serve(listener, dev_store(), ctx));
-    (connect(port).await, dir)
+    (
+        connect(port).await,
+        connect(port).await,
+        dir,
+        accord_committer,
+    )
+}
+
+/// Native PostgreSQL client wired to a real single-replica Accord committer.
+/// The in-process replica runs the production Accord state machine and storage
+/// applier; only peer transport is unused for this RF=1 fixture.
+async fn dml_client_with_local_accord() -> (
+    tokio_postgres::Client,
+    tokio_postgres::Client,
+    tempfile::TempDir,
+) {
+    use ferrosa_cluster::accord::{
+        AccordStateMachine, AccordTransactionCommitter, EngineStorageApplier, ReplicaResolver,
+    };
+    use ferrosa_common::accord::HybridLogicalClock;
+    use ferrosa_net::{
+        codec::Lane,
+        error::{NetError, Result as NetResult},
+        message::Message,
+    };
+    use ferrosa_storage::accord::{sync_writer::MockSyncWriter, TransactionCommitter};
+
+    struct NoPeerTransport;
+    #[async_trait::async_trait]
+    impl ferrosa_cluster::accord::transport::AccordTransport for NoPeerTransport {
+        async fn send(&self, _host: Uuid, _msg: Message, _lane: Lane) -> NetResult<Message> {
+            Err(NetError::Timeout(
+                "RF=1 fixture must not send to peers".into(),
+            ))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(seed_engine(dir.path()));
+    let schema = Arc::new(create_schema());
+    let host = Uuid::from_u128(0xA11CE);
+    let node_id = u64::from_be_bytes(host.as_bytes()[..8].try_into().unwrap());
+    let clock = Arc::new(HybridLogicalClock::new(node_id, 0));
+    let applier = Arc::new(EngineStorageApplier::new(engine.clone()));
+    let state = Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
+        node_id,
+        Arc::new(MockSyncWriter::new()),
+        applier.clone(),
+    )));
+    let resolve: ReplicaResolver = Arc::new(move |_keyspace: &str, _key: &[u8]| Some(vec![host]));
+    let committer = Arc::new(
+        AccordTransactionCommitter::new(
+            node_id,
+            clock,
+            Arc::new(NoPeerTransport),
+            applier,
+            resolve,
+        )
+        .with_local_accord_state(state),
+    );
+    let query_committer: Arc<dyn TransactionCommitter> = committer;
+    let ctx = Arc::new(QueryContext {
+        engine,
+        schema,
+        default_schema: "public".into(),
+        mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
+        accord_committer: Some(query_committer),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    (connect(port).await, connect(port).await, dir)
+}
+
+/// In-process network used by the two-node PostgreSQL/Accord test. Messages go
+/// through each node's real AccordHandler and state machine.
+struct AccordTestTransport {
+    handlers: HashMap<Uuid, Arc<ferrosa_cluster::accord::AccordHandler>>,
+}
+
+#[async_trait::async_trait]
+impl ferrosa_cluster::accord::transport::AccordTransport for AccordTestTransport {
+    async fn send(
+        &self,
+        host: Uuid,
+        msg: ferrosa_net::message::Message,
+        _lane: ferrosa_net::codec::Lane,
+    ) -> ferrosa_net::error::Result<ferrosa_net::message::Message> {
+        use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+        let handler = self
+            .handlers
+            .get(&host)
+            .ok_or_else(|| ferrosa_net::error::NetError::Timeout("unknown test peer".into()))?;
+        let peer: PeerId = (host, "127.0.0.1:0".parse().unwrap());
+        handler
+            .handle(peer, msg)
+            .await
+            .ok_or_else(|| ferrosa_net::error::NetError::Timeout("no test-peer response".into()))
+    }
+}
+
+async fn dml_clients_on_two_accord_nodes() -> (
+    tokio_postgres::Client,
+    tokio_postgres::Client,
+    [tempfile::TempDir; 2],
+) {
+    use ferrosa_cluster::accord::{AccordHandler, AccordStateMachine, EngineStorageApplier};
+    use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+    fn new_node(
+        host: Uuid,
+        engine: Arc<StorageEngine>,
+    ) -> (
+        Arc<ferrosa_cluster::accord::AccordHandler>,
+        Arc<EngineStorageApplier>,
+        Arc<parking_lot::Mutex<AccordStateMachine>>,
+    ) {
+        let node_id = u64::from_be_bytes(host.as_bytes()[..8].try_into().unwrap());
+        let applier = Arc::new(EngineStorageApplier::new(engine));
+        let state = Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
+            node_id,
+            Arc::new(MockSyncWriter::new()),
+            applier.clone(),
+        )));
+        (
+            Arc::new(AccordHandler::new(state.clone(), node_id)),
+            applier,
+            state,
+        )
+    }
+
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let engines = [
+        Arc::new(seed_engine(dirs[0].path())),
+        Arc::new(seed_engine(dirs[1].path())),
+    ];
+    let schema = Arc::new(create_schema());
+    // Accord derives the numeric node id from each UUID's first eight bytes.
+    // Put the distinguishing value there; low-only UUIDs would both derive id 0
+    // and make the two real replicas impersonate the same host in the driver.
+    let hosts = [
+        Uuid::from_u128(0xA000_0000_0000_0000_0000_0000_0000_0001),
+        Uuid::from_u128(0xB000_0000_0000_0000_0000_0000_0000_0002),
+    ];
+    let nodes = [
+        new_node(hosts[0], engines[0].clone()),
+        new_node(hosts[1], engines[1].clone()),
+    ];
+    let transport: Arc<dyn ferrosa_cluster::accord::transport::AccordTransport> =
+        Arc::new(AccordTestTransport {
+            handlers: HashMap::from([
+                (hosts[0], nodes[0].0.clone()),
+                (hosts[1], nodes[1].0.clone()),
+            ]),
+        });
+
+    async fn start_server(
+        host: Uuid,
+        engine: Arc<StorageEngine>,
+        schema: Arc<Schema>,
+        applier: Arc<ferrosa_cluster::accord::EngineStorageApplier>,
+        transport: Arc<dyn ferrosa_cluster::accord::transport::AccordTransport>,
+        hosts: [Uuid; 2],
+        local_state: Arc<parking_lot::Mutex<ferrosa_cluster::accord::AccordStateMachine>>,
+    ) -> tokio_postgres::Client {
+        use ferrosa_cluster::accord::{AccordTransactionCommitter, ReplicaResolver};
+        use ferrosa_common::accord::HybridLogicalClock;
+        use ferrosa_storage::accord::TransactionCommitter;
+
+        let node_id = u64::from_be_bytes(host.as_bytes()[..8].try_into().unwrap());
+        let clock = Arc::new(HybridLogicalClock::new(node_id, 0));
+        let replicas = hosts.to_vec();
+        let resolve: ReplicaResolver =
+            Arc::new(move |_keyspace: &str, _key: &[u8]| Some(replicas.clone()));
+        let committer = Arc::new(
+            AccordTransactionCommitter::new(node_id, clock, transport, applier, resolve)
+                .with_local_accord_state(local_state),
+        );
+        let query_committer: Arc<dyn TransactionCommitter> = committer;
+        let ctx = Arc::new(QueryContext {
+            engine,
+            schema,
+            default_schema: "public".into(),
+            mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
+            accord_committer: Some(query_committer),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(server::serve(listener, dev_store(), ctx));
+        connect(port).await
+    }
+
+    let client_a = start_server(
+        hosts[0],
+        engines[0].clone(),
+        schema.clone(),
+        nodes[0].1.clone(),
+        transport.clone(),
+        hosts,
+        nodes[0].2.clone(),
+    )
+    .await;
+    let client_b = start_server(
+        hosts[1],
+        engines[1].clone(),
+        schema,
+        nodes[1].1.clone(),
+        transport,
+        hosts,
+        nodes[1].2.clone(),
+    )
+    .await;
+    (client_a, client_b, dirs)
 }
 
 #[tokio::test]
@@ -792,7 +1019,7 @@ async fn extended_dml_in_transaction_rollback_discards_buffered_write() {
     // RETURNING still returns its row (built from the in-memory values) while
     // the write would only commit at COMMIT. A committer is installed so the
     // write buffers cleanly rather than tripping the standalone fail-loud path.
-    let (client, _dir) = dml_client_with_committer(true).await;
+    let (client, _, _dir, _) = dml_client_with_committer(true).await;
 
     client.batch_execute("BEGIN").await.expect("BEGIN");
 
@@ -828,7 +1055,7 @@ async fn extended_dml_in_transaction_commit_drives_the_committer() {
     // COMMIT succeeds cleanly (not the standalone `0A000`). The atomic-apply
     // semantics themselves are unit-tested in `server::txn_atomicity_tests`
     // against a real engine; here we prove the extended path reaches COMMIT.
-    let (client, _dir) = dml_client_with_committer(true).await;
+    let (client, _, _dir, _) = dml_client_with_committer(true).await;
 
     client.batch_execute("BEGIN").await.expect("BEGIN");
     let n = client
@@ -848,11 +1075,239 @@ async fn extended_dml_in_transaction_commit_drives_the_committer() {
 }
 
 #[tokio::test]
-async fn extended_dml_in_transaction_without_committer_fails_loud_at_commit() {
-    // Standalone mode (no committer): an extended-protocol DML buffers, but
-    // COMMIT of a non-empty buffer fails loud (`0A000`, cluster mode required)
-    // rather than faking atomicity or applying outside the committer. The buffer
-    // is discarded, so nothing is applied.
+async fn native_drivers_commit_serializable_transactions_through_accord() {
+    let (client_a, client_b, _dir) = dml_client_with_local_accord().await;
+
+    client_a
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin first serializable transaction");
+    client_b
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin second serializable transaction");
+    client_a
+        .query("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .expect("first transaction reads");
+    client_b
+        .query("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .expect("second transaction reads");
+    client_a
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"ivan", &1i32],
+        )
+        .await
+        .expect("first transaction buffers an update");
+    client_b
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"jane", &2i32],
+        )
+        .await
+        .expect("second transaction buffers a disjoint update");
+    client_a
+        .batch_execute("COMMIT")
+        .await
+        .expect("first serializable transaction commits");
+    let conflict = client_b
+        .batch_execute("COMMIT")
+        .await
+        .expect_err("stale serializable transaction must abort");
+    assert_eq!(conflict.code().map(|code| code.code()), Some("40001"));
+
+    let final_row = client_b
+        .query_one("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .expect("read the committed row through the second native client");
+    assert_eq!(final_row.get::<_, &str>(0), "ivan");
+}
+
+#[tokio::test]
+async fn native_driver_transaction_applies_through_real_accord_state_machine() {
+    let (writer, reader, _dir) = dml_client_with_local_accord().await;
+
+    writer
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin serializable transaction");
+    let changed = writer
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"accord-applied", &1i32],
+        )
+        .await
+        .expect("buffer update before commit");
+    assert_eq!(changed, 1);
+    writer
+        .batch_execute("COMMIT")
+        .await
+        .expect("real Accord transaction commits and applies the mutation");
+
+    let rows = reader
+        .query("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .expect("committed row is visible through another native client");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>(0), "accord-applied");
+}
+
+#[tokio::test]
+async fn cross_node_serializable_predicate_conflict_aborts_one_native_transaction() {
+    let (client_a, client_b, _dirs) = dml_clients_on_two_accord_nodes().await;
+    client_a
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin node A transaction");
+    client_b
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin node B transaction");
+
+    let rows_a = client_a
+        .query("SELECT id, name FROM users", &[])
+        .await
+        .expect("node A reads predicate");
+    let rows_b = client_b
+        .query("SELECT id, name FROM users", &[])
+        .await
+        .expect("node B reads predicate");
+    assert_eq!(rows_a.len(), 2);
+    assert_eq!(rows_b.len(), 2);
+
+    client_a
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"alice-a", &1i32],
+        )
+        .await
+        .expect("node A buffers update");
+    client_b
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"bob-b", &2i32],
+        )
+        .await
+        .expect("node B buffers disjoint update");
+
+    client_a
+        .batch_execute("COMMIT")
+        .await
+        .expect("first transaction commits");
+    let conflict = client_b
+        .batch_execute("COMMIT")
+        .await
+        .expect_err("cross-node stale predicate must cause a serialization failure");
+    assert_eq!(conflict.code().map(|code| code.code()), Some("40001"));
+
+    let final_a = client_a
+        .query("SELECT id, name FROM users ORDER BY id", &[])
+        .await
+        .expect("read final rows through native PostgreSQL driver");
+    assert_eq!(final_a[0].get::<_, &str>(1), "alice-a");
+    assert_eq!(final_a[1].get::<_, &str>(1), "bob");
+}
+
+#[tokio::test]
+async fn cross_node_serializable_transaction_keeps_its_snapshot_after_peer_commit() {
+    let (client_a, client_b, _dirs) = dml_clients_on_two_accord_nodes().await;
+    client_b
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin reader transaction on node B");
+
+    let initial = client_b
+        .query_one("SELECT name FROM users WHERE id = 1", &[])
+        .await
+        .expect("read initial snapshot on node B");
+    assert_eq!(initial.get::<_, &str>(0), "alice");
+
+    client_a
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin writer transaction on node A");
+    client_a
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"alice-updated", &1i32],
+        )
+        .await
+        .expect("buffer update on node A");
+    client_a
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit update on node A");
+
+    let retained_snapshot = client_b
+        .query_one("SELECT name FROM users WHERE id = 1", &[])
+        .await
+        .expect("repeat read must use the transaction's retained snapshot");
+    assert_eq!(retained_snapshot.get::<_, &str>(0), "alice");
+
+    client_b
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("discard the read-only transaction after observing its stable snapshot");
+}
+
+#[tokio::test]
+async fn cluster_autocommit_reads_do_not_advance_the_postgres_commit_marker() {
+    let (client_a, client_b, _dirs) = dml_clients_on_two_accord_nodes().await;
+    client_b
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin snapshot transaction on node B");
+
+    client_a
+        .batch_execute("SELECT id FROM users")
+        .await
+        .expect("run read-only autocommit query on node A");
+
+    let row = client_b
+        .query_one("SELECT name FROM users WHERE id = 1", &[])
+        .await
+        .expect("read-only autocommit must not stale node B snapshot");
+    assert_eq!(row.get::<_, &str>(0), "alice");
+    client_b
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("end snapshot transaction");
+}
+
+#[tokio::test]
+async fn cluster_autocommit_simple_and_extended_dml_commit_through_accord() {
+    let (client_a, client_b, _dirs) = dml_clients_on_two_accord_nodes().await;
+
+    client_a
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"alice-extended", &1i32],
+        )
+        .await
+        .expect("commit extended-protocol autocommit through Accord");
+    let row = client_b
+        .query_one("SELECT name FROM users WHERE id = 1", &[])
+        .await
+        .expect("observe extended-protocol autocommit on peer");
+    assert_eq!(row.get::<_, &str>(0), "alice-extended");
+
+    client_b
+        .batch_execute("UPDATE users SET name = 'bob-simple' WHERE id = 2")
+        .await
+        .expect("commit simple-protocol autocommit through Accord");
+    let row = client_a
+        .query_one("SELECT name FROM users WHERE id = 2", &[])
+        .await
+        .expect("observe simple-protocol autocommit on peer");
+    assert_eq!(row.get::<_, &str>(0), "bob-simple");
+}
+
+#[tokio::test]
+async fn standalone_transaction_commit_uses_local_mvcc() {
+    // Standalone has no Accord peers, so its transaction is ordered and applied
+    // by the process-local MVCC manager. Cluster mode takes the Accord path.
     let (client, _dir) = dml_client().await; // no committer
 
     client.batch_execute("BEGIN").await.expect("BEGIN");
@@ -865,24 +1320,18 @@ async fn extended_dml_in_transaction_without_committer_fails_loud_at_commit() {
         .expect("buffered INSERT acks inside the txn");
     assert_eq!(n, 1, "the write buffers (acks) inside the txn");
 
-    // COMMIT fails loud: no committer to apply the buffered write-set.
-    let err = client
+    client
         .batch_execute("COMMIT")
         .await
-        .expect_err("COMMIT without a committer must fail loud");
-    assert_eq!(
-        err.code().map(|c| c.code()),
-        Some("0A000"),
-        "standalone COMMIT of buffered DML is feature_not_supported, got: {err}"
-    );
+        .expect("standalone MVCC transaction commit");
 
-    // Nothing was applied: the buffered write was dropped, not written.
+    // The local MVCC commit is visible to subsequent statements.
     let after = client
         .query("SELECT name FROM users WHERE id = $1", &[&102i32])
         .await
         .expect("read after failed commit should succeed");
     assert!(
-        after.is_empty(),
-        "the buffered write was never applied outside the committer"
+        after.len() == 1 && after[0].get::<_, &str>(0) == "heidi",
+        "the committed standalone MVCC write is visible"
     );
 }

@@ -1044,6 +1044,7 @@ async fn start_ferrosa() -> (tokio_postgres::Client, tempfile::TempDir) {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
     });
 
