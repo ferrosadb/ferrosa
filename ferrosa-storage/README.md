@@ -668,3 +668,5 @@ hook. See [Roadmap](specs/roadmap.md).
 ### Pump wiring acceptance (T-045)
 
 File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.
+
+Shard workers collect moved component manifests directly into the fallible output vector; there is no intermediate vector of per-shard results.
