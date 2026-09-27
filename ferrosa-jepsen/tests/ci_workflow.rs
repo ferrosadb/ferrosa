@@ -133,6 +133,30 @@ fn postgres_fault_workflow_waits_for_all_nodes_to_form_before_creating_role() {
 }
 
 #[test]
+fn postgres_fault_workflow_replicates_system_auth_before_role_creation() {
+    let path = ci_yaml_path();
+    let yaml =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let auth_setup = step_body(&yaml, "Replicate PostgreSQL roles to all nodes");
+    let auth_position = yaml
+        .find("- name: Replicate PostgreSQL roles to all nodes")
+        .expect("system_auth replication setup step exists");
+    let role_position = yaml
+        .find("- name: Create the test CQL role")
+        .expect("test CQL role setup step exists");
+
+    assert!(
+        auth_setup.contains("ALTER KEYSPACE system_auth")
+            && auth_setup.contains("'replication_factor': 3"),
+        "PostgreSQL role lookup must find the test user on every node; step was:\n{auth_setup}"
+    );
+    assert!(
+        auth_position < role_position,
+        "system_auth replication must be configured before creating the test role"
+    );
+}
+
+#[test]
 fn multi_dc_nightly_workload_invokes_current_run_subcommand() {
     let path = multi_dc_nightly_yaml_path();
     let yaml =
