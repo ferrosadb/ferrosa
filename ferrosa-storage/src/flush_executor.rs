@@ -17,13 +17,14 @@
 //! changes no durability ordering. Callers still barrier (join) their submitted
 //! work before advancing any checkpoint — see `flush::fsync_components`.
 //!
-//! Last revised: 2026-07-23
-//! Last changed: Introduced the bounded rayon flush pool (replaces per-flush
-//! scoped threads) so flush parallelism is configurable and bounded.
+//! Last revised: 2026-09-27
+//! Last changed: Flush-pool width now has a documented practical ceiling;
+//!   failed pool creation retries serially and then returns an initialization
+//!   error instead of panicking.
 
 use std::sync::OnceLock;
 
-static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static POOL: OnceLock<std::result::Result<rayon::ThreadPool, String>> = OnceLock::new();
 
 /// Resolve the flush pool width from an already-read env value, falling back to
 /// host parallelism. Pure (takes the env value as an argument) so it is unit
@@ -62,39 +63,77 @@ pub(crate) fn default_parallelism() -> usize {
     )
 }
 
-fn build_pool(width: usize) -> rayon::ThreadPool {
+fn build_pool(width: usize) -> std::result::Result<rayon::ThreadPool, String> {
     let cap = crate::runtime_tuning::storage_runtime_tuning().max_flush_parallelism;
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(width.clamp(1, cap))
+    let width = width.clamp(1, cap);
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(width)
         .thread_name(|i| format!("ferrosa-flush-{i}"))
         .build()
-        .expect("build flush fsync pool")
+    {
+        Ok(pool) => Ok(pool),
+        Err(error) if width > 1 => {
+            tracing::error!(
+                width,
+                %error,
+                "failed to create configured flush pool; retrying with one worker"
+            );
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .thread_name(|i| format!("ferrosa-flush-{i}"))
+                .build()
+                .map_err(|fallback| {
+                    tracing::error!(
+                        %fallback,
+                        "failed to create serial flush fallback pool"
+                    );
+                    format!("configured pool failed ({error}); serial fallback failed ({fallback})")
+                })
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to create serial flush pool");
+            Err(error.to_string())
+        }
+    }
+}
+
+fn pool_for(width: usize) -> ferrosa_common::Result<&'static rayon::ThreadPool> {
+    pool_result(POOL.get_or_init(|| build_pool(width)))
+}
+
+fn pool_result(
+    result: &'static std::result::Result<rayon::ThreadPool, String>,
+) -> ferrosa_common::Result<&'static rayon::ThreadPool> {
+    match result {
+        Ok(pool) => Ok(pool),
+        Err(error) => Err(ferrosa_common::Error::InvalidFormat(format!(
+            "flush worker pool initialization failed: {error}"
+        ))),
+    }
 }
 
 /// Initialize the shared flush pool at `width`. Idempotent: the first call
 /// (typically `StorageEngine::new`, before any flush) wins; later calls are
 /// ignored so the width stays stable for the process lifetime. Safe to call
 /// before or after the first lazy [`pool`] access.
-pub(crate) fn configure(width: usize) {
-    if POOL.get().is_some() {
-        return;
-    }
-    // A concurrent lazy `pool()` may win the race; then `set` returns Err and
-    // the pool we just built is dropped (its threads join). Benign.
-    let _ = POOL.set(build_pool(width));
+pub(crate) fn configure(width: usize) -> ferrosa_common::Result<()> {
+    pool_for(width).map(|_| ())
 }
 
 /// The shared flush pool, lazily initialized to [`default_parallelism`] if
 /// [`configure`] was never called (e.g. in unit tests).
-pub(crate) fn pool() -> &'static rayon::ThreadPool {
-    POOL.get_or_init(|| build_pool(default_parallelism()))
+pub(crate) fn pool() -> ferrosa_common::Result<&'static rayon::ThreadPool> {
+    match POOL.get() {
+        Some(result) => pool_result(result),
+        None => pool_for(default_parallelism()),
+    }
 }
 
 /// Current flush pool width (thread count). Used to bound how many SSTable
 /// shards a single flush produces — no point making more shards than the pool
 /// can encode concurrently.
 pub(crate) fn width() -> usize {
-    pool().current_num_threads().max(1)
+    pool().map_or(1, |pool| pool.current_num_threads().max(1))
 }
 
 #[cfg(test)]
@@ -111,18 +150,35 @@ mod tests {
 
     #[test]
     fn parse_parallelism_uses_configured_ceiling() {
+        const CONFIGURED_CEILING: usize = 256;
         assert_eq!(
             crate::runtime_tuning::parse_usize_env(
                 "FERROSA_MAX_FLUSH_PARALLELISM",
-                Ok("128".to_string()),
+                Ok("256".to_string()),
                 64,
                 1,
-                usize::MAX,
+                CONFIGURED_CEILING,
             ),
-            128
+            CONFIGURED_CEILING
         );
-        assert_eq!(parse_parallelism_with(Some("100".to_string()), 4, 128), 100);
-        assert_eq!(parse_parallelism_with(Some("1000".to_string()), 4, 128), 4);
+        assert_eq!(
+            crate::runtime_tuning::parse_usize_env(
+                "FERROSA_MAX_FLUSH_PARALLELISM",
+                Ok("257".to_string()),
+                64,
+                1,
+                CONFIGURED_CEILING,
+            ),
+            64
+        );
+        assert_eq!(
+            parse_parallelism_with(Some("100".to_string()), 4, CONFIGURED_CEILING),
+            100
+        );
+        assert_eq!(
+            parse_parallelism_with(Some("1000".to_string()), 4, CONFIGURED_CEILING),
+            4
+        );
     }
 
     #[test]

@@ -3390,7 +3390,7 @@ impl<F: FlushTarget> TableStore<F> {
             .map(|_| self.flush_target.file_output_staging_dir().map(Staging))
             .collect::<Result<_>>()?;
         let phase_start = Instant::now();
-        let outputs: Vec<ShardOutput> = crate::flush_executor::pool().install(|| {
+        let outputs: Vec<ShardOutput> = crate::flush_executor::pool()?.install(|| {
             shards
                 .par_iter()
                 .zip(staging.par_iter())

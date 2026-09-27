@@ -20,6 +20,21 @@ const DEFAULT_DIGEST_READ_CHUNK_BYTES: usize = 1 << 20;
 const DEFAULT_TASK_QUEUE_CAPACITY_PER_WORKER: usize = 1;
 const DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER: usize = 2;
 
+// Practical upper bounds keep accepted operator overrides away from channel
+// allocation failure, pathological maintenance batches, and excessive worker
+// creation. They remain substantially above the defaults for larger hosts.
+const MAX_AUTOMATIC_FLUSHES_PER_POLL: usize = 1024;
+const MAX_COMPACTION_INPUTS_PER_TASK: usize = 256;
+const MAX_SCHEDULED_TABLES_PER_POLL: usize = 1024;
+const MAX_RESULTS_PER_MAINTENANCE_POLL: usize = 1024;
+const MAX_AGE_FLUSH_FLOOR_BYTES: u64 = 1 << 40; // 1 TiB
+const MAX_PER_COMPACTION_MEM_BUDGET_BYTES: u64 = 1 << 40; // 1 TiB
+const MAX_AUTO_COMPACTION_PARALLELISM: usize = 64;
+const MAX_FLUSH_PARALLELISM: usize = 256;
+const MAX_DIGEST_READ_CHUNK_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+const MAX_TASK_QUEUE_CAPACITY_PER_WORKER: usize = 32;
+const MAX_RESULT_QUEUE_CAPACITY_PER_WORKER: usize = 32;
+
 /// Validated knobs that affect flush/compaction throughput and bounded memory.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StorageRuntimeTuning {
@@ -46,67 +61,67 @@ impl StorageRuntimeTuning {
                 "FERROSA_MAX_AUTOMATIC_FLUSHES_PER_POLL",
                 defaults.max_automatic_flushes_per_poll,
                 1,
-                usize::MAX,
+                MAX_AUTOMATIC_FLUSHES_PER_POLL,
             ),
             max_compaction_inputs_per_task: read_usize(
                 "FERROSA_MAX_COMPACTION_INPUTS_PER_TASK",
                 defaults.max_compaction_inputs_per_task,
                 2,
-                usize::MAX,
+                MAX_COMPACTION_INPUTS_PER_TASK,
             ),
             max_scheduled_tables_per_poll: read_usize(
                 "FERROSA_MAX_SCHEDULED_TABLES_PER_POLL",
                 defaults.max_scheduled_tables_per_poll,
                 1,
-                usize::MAX,
+                MAX_SCHEDULED_TABLES_PER_POLL,
             ),
             max_results_per_maintenance_poll: read_usize(
                 "FERROSA_MAX_RESULTS_PER_MAINTENANCE_POLL",
                 defaults.max_results_per_maintenance_poll,
                 1,
-                usize::MAX,
+                MAX_RESULTS_PER_MAINTENANCE_POLL,
             ),
             max_age_flush_floor_bytes: read_u64(
                 "FERROSA_MAX_AGE_FLUSH_FLOOR_BYTES",
                 defaults.max_age_flush_floor_bytes,
                 1,
-                u64::MAX,
+                MAX_AGE_FLUSH_FLOOR_BYTES,
             ),
             per_compaction_mem_budget_bytes: read_u64(
                 "FERROSA_PER_COMPACTION_MEM_BUDGET_BYTES",
                 defaults.per_compaction_mem_budget_bytes,
                 1,
-                u64::MAX,
+                MAX_PER_COMPACTION_MEM_BUDGET_BYTES,
             ),
             max_auto_compaction_parallelism: read_usize(
                 "FERROSA_MAX_AUTO_COMPACTION_PARALLELISM",
                 defaults.max_auto_compaction_parallelism,
                 1,
-                usize::MAX,
+                MAX_AUTO_COMPACTION_PARALLELISM,
             ),
             max_flush_parallelism: read_usize(
                 "FERROSA_MAX_FLUSH_PARALLELISM",
                 defaults.max_flush_parallelism,
                 1,
-                usize::MAX,
+                MAX_FLUSH_PARALLELISM,
             ),
             digest_read_chunk_bytes: read_usize(
                 "FERROSA_DIGEST_READ_CHUNK_BYTES",
                 defaults.digest_read_chunk_bytes,
                 1,
-                usize::MAX,
+                MAX_DIGEST_READ_CHUNK_BYTES,
             ),
             task_queue_capacity_per_worker: read_usize(
                 "FERROSA_COMPACTION_TASK_QUEUE_CAPACITY_PER_WORKER",
                 defaults.task_queue_capacity_per_worker,
                 1,
-                usize::MAX,
+                MAX_TASK_QUEUE_CAPACITY_PER_WORKER,
             ),
             result_queue_capacity_per_worker: read_usize(
                 "FERROSA_COMPACTION_RESULT_QUEUE_CAPACITY_PER_WORKER",
                 defaults.result_queue_capacity_per_worker,
                 1,
-                usize::MAX,
+                MAX_RESULT_QUEUE_CAPACITY_PER_WORKER,
             ),
         }
     }
@@ -273,5 +288,41 @@ mod tests {
             tuning.result_queue_capacity_per_worker,
             DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER
         );
+    }
+
+    #[test]
+    fn usize_settings_reject_values_above_practical_limits() {
+        for (max, raw) in [
+            (MAX_AUTOMATIC_FLUSHES_PER_POLL, "1025"),
+            (MAX_COMPACTION_INPUTS_PER_TASK, "257"),
+            (MAX_SCHEDULED_TABLES_PER_POLL, "1025"),
+            (MAX_RESULTS_PER_MAINTENANCE_POLL, "1025"),
+            (MAX_AUTO_COMPACTION_PARALLELISM, "65"),
+            (MAX_FLUSH_PARALLELISM, "257"),
+            (MAX_DIGEST_READ_CHUNK_BYTES, "67108865"),
+            (MAX_TASK_QUEUE_CAPACITY_PER_WORKER, "33"),
+            (MAX_RESULT_QUEUE_CAPACITY_PER_WORKER, "33"),
+        ] {
+            assert_eq!(
+                parse_usize_env("TEST", Ok(raw.into()), 1, 1, max),
+                1,
+                "{raw} must be rejected above {max}"
+            );
+            assert_eq!(parse_usize_env("TEST", Ok(max.to_string()), 1, 1, max), max);
+        }
+    }
+
+    #[test]
+    fn u64_settings_reject_values_above_practical_limits() {
+        for max in [
+            MAX_AGE_FLUSH_FLOOR_BYTES,
+            MAX_PER_COMPACTION_MEM_BUDGET_BYTES,
+        ] {
+            assert_eq!(
+                parse_u64_env("TEST", Ok((max + 1).to_string()), 1, 1, max),
+                1
+            );
+            assert_eq!(parse_u64_env("TEST", Ok(max.to_string()), 1, 1, max), max);
+        }
     }
 }

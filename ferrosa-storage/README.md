@@ -696,26 +696,31 @@ default. Values are process-wide for the lifetime of the engine.
 
 | Setting | Default | Accepted range | Effect |
 |---|---:|---:|---|
-| `FERROSA_MAX_AUTOMATIC_FLUSHES_PER_POLL` | 8 | 1–`usize::MAX` | Maximum automatic flushes started per maintenance poll. |
-| `FERROSA_MAX_COMPACTION_INPUTS_PER_TASK` | 64 | 2–`usize::MAX` | Ceiling applied to `FERROSA_COMPACTION_MAX_THRESHOLD`; bounds fan-in independently of the input-byte limit. |
-| `FERROSA_MAX_SCHEDULED_TABLES_PER_POLL` | 8 | 1–`usize::MAX` | Maximum tables that receive a compaction task per maintenance poll. |
-| `FERROSA_MAX_RESULTS_PER_MAINTENANCE_POLL` | 8 | 1–`usize::MAX` | Maximum compaction failures and completed results drained per poll. |
-| `FERROSA_MAX_AGE_FLUSH_FLOOR_BYTES` | 16 MiB | 1–`u64::MAX` bytes | Upper bound for the minimum memtable volume required for age-triggered flushes. |
-| `FERROSA_PER_COMPACTION_MEM_BUDGET_BYTES` | 256 MiB | 1–`u64::MAX` bytes | Per-task memory estimate used to derive concurrency from the node memory limit. |
-| `FERROSA_MAX_AUTO_COMPACTION_PARALLELISM` | 8 | 1–`usize::MAX` | Caps auto-derived concurrency and workers, and bounds explicit compaction worker/concurrency settings. |
+| `FERROSA_MAX_AUTOMATIC_FLUSHES_PER_POLL` | 8 | 1–1,024 | Maximum automatic flushes started per maintenance poll. |
+| `FERROSA_MAX_COMPACTION_INPUTS_PER_TASK` | 64 | 2–256 | Ceiling applied to `FERROSA_COMPACTION_MAX_THRESHOLD`; bounds fan-in independently of the input-byte limit. |
+| `FERROSA_MAX_SCHEDULED_TABLES_PER_POLL` | 8 | 1–1,024 | Maximum tables that receive a compaction task per maintenance poll. |
+| `FERROSA_MAX_RESULTS_PER_MAINTENANCE_POLL` | 8 | 1–1,024 | Maximum compaction failures and completed results drained per poll. |
+| `FERROSA_MAX_AGE_FLUSH_FLOOR_BYTES` | 16 MiB | 1 byte–1 TiB | Upper bound for the minimum memtable volume required for age-triggered flushes. |
+| `FERROSA_PER_COMPACTION_MEM_BUDGET_BYTES` | 256 MiB | 1 byte–1 TiB | Per-task memory estimate used to derive concurrency from the node memory limit. |
+| `FERROSA_MAX_AUTO_COMPACTION_PARALLELISM` | 8 | 1–64 | Caps auto-derived concurrency and workers, and bounds explicit compaction worker/concurrency settings. |
 | `FERROSA_COMPACTION_WORKERS` | auto-derived from CPU count | 1–configured compaction ceiling | Explicit compaction worker count. |
 | `FERROSA_MAX_CONCURRENT_COMPACTIONS` | auto-derived from CPU and memory | 1–configured compaction ceiling | Explicit concurrent merge cap. |
-| `FERROSA_MAX_FLUSH_PARALLELISM` | 64 | 1–`usize::MAX` | Caps `FERROSA_FLUSH_PARALLELISM` and the shared flush pool width. |
+| `FERROSA_MAX_FLUSH_PARALLELISM` | 64 | 1–256 | Caps `FERROSA_FLUSH_PARALLELISM` and the shared flush pool width. |
 | `FERROSA_FLUSH_PARALLELISM` | host CPU count | 1–configured flush ceiling | Shared flush/fsync pool width. |
-| `FERROSA_DIGEST_READ_CHUNK_BYTES` | 1 MiB | 1–`usize::MAX` bytes | Reused buffer size for staged SSTable digest verification. |
-| `FERROSA_COMPACTION_TASK_QUEUE_CAPACITY_PER_WORKER` | 1 | 1–`usize::MAX` | Bounded queued tasks per compaction worker. |
-| `FERROSA_COMPACTION_RESULT_QUEUE_CAPACITY_PER_WORKER` | 2 | 1–`usize::MAX` | Bounded completed results and failures per compaction worker. |
+| `FERROSA_DIGEST_READ_CHUNK_BYTES` | 1 MiB | 1 byte–64 MiB | Reused buffer size for staged SSTable digest verification. |
+| `FERROSA_COMPACTION_TASK_QUEUE_CAPACITY_PER_WORKER` | 1 | 1–32 | Bounded queued tasks per compaction worker. |
+| `FERROSA_COMPACTION_RESULT_QUEUE_CAPACITY_PER_WORKER` | 2 | 1–32 | Bounded completed results and failures per compaction worker. |
 
-Each value is a positive, finite `usize` or `u64`; counts and byte budgets have
-no additional hard-coded upper clamp. The configured compaction parallelism
-ceiling caps both auto-derived and explicit worker/concurrency settings, while
-the queue capacities remain explicit bounded-channel limits per worker. Raising
-these values trades more throughput headroom for greater memory and I/O pressure.
+Values outside their documented ranges, including unreadable environment
+values, log at `ERROR` and use the corresponding default. These practical
+ceilings keep per-poll work, thread counts, queue allocation, and digest buffers
+bounded while allowing operators to tune within the supported range. The
+configured compaction parallelism ceiling caps both auto-derived and explicit
+worker/concurrency settings, while queue capacities remain bounded per worker.
+Raising values trades more throughput headroom for greater memory and I/O pressure.
+If Rayon cannot create the requested flush pool, initialization logs `ERROR` and
+retries with one worker; if that also fails, engine initialization returns an
+error instead of panicking.
 The age-flush floor trades earlier WAL retention relief for the risk of creating
 more small SSTables. Digest chunk size changes verification read granularity;
 digest calculation and staged-output verification remain mandatory.

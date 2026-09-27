@@ -1311,7 +1311,7 @@ impl FileFlushTarget {
         // failure and we return it WITHOUT reaching the directory fsync — no
         // false-durability claim. Guarded by
         // `fsync_components_fails_loud_and_skips_dir_when_a_component_is_missing`.
-        crate::flush_executor::pool().install(|| {
+        crate::flush_executor::pool()?.install(|| {
             components.par_iter().try_for_each(|component| {
                 Self::fsync_path(component).map_err(|e| {
                     ferrosa_common::Error::Io(std::io::Error::new(
@@ -1621,7 +1621,7 @@ impl FileFlushTarget {
             tmp_paths.push(tmp(&paths.crc));
         }
 
-        crate::flush_executor::pool().install(|| {
+        crate::flush_executor::pool()?.install(|| {
             tmp_paths.par_iter().try_for_each(|component| {
                 Self::fsync_path(component).map_err(|e| {
                     ferrosa_common::Error::Io(std::io::Error::new(

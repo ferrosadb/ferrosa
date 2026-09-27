@@ -152,7 +152,8 @@ volume or changing query results.
     configurable per-worker capacities, and maintenance poll batch limits are
     runtime tunable. Positive values are validated and defaults preserve the
     existing backlog and maintenance behavior. See the flush and
-    compaction runtime tuning table in `README.md`.
+    compaction runtime tuning table in `README.md`; settings reject values
+    outside their documented practical ranges and fall back to defaults.
 12. **A generation is verified before it can be discovered.** `flush_files`
     (shared by flush and compaction promotion) never promotes staged `.tmp`
     output to a live name until length checks, an fsync of the `.tmp`
