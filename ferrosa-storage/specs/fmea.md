@@ -94,4 +94,10 @@ T-025 result-delivery coverage extends ST-33: a completed worker blocked by the
 bounded result queue wakes directly on cancellation/shutdown and reclaims its
 unpromoted output. `cancel_source_result_*` covers both wake sources, channel
 disconnection and result-counter publication order. DROP/TRUNCATE coordination,
-disk-reserve selection and operator source wiring remain separate work.
+and operator source wiring remain separate work.
+
+T-025 disk-pressure coverage also extends ST-4/ST-33: the reserve check cancels
+the largest registered task by input bytes, with one outstanding pressure request
+at a time. It retains fail-closed admission until free space recovers. Tests
+`cancel_source_disk_reserve_*` cover selection, coalescing, pre-cancelled tasks,
+and the actual engine admission hook.

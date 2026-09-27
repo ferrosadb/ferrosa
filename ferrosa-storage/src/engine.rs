@@ -2306,6 +2306,9 @@ impl StorageEngine {
 
         let available = self.disk_free_bytes_cached();
         if available < reserve {
+            // Cancellation requests reclamation; it does not prove space has
+            // already been freed. Keep admission closed until the reserve recovers.
+            self.compaction_executor.cancel_largest_for_disk_reserve();
             return Err(ferrosa_common::Error::InvalidData(format!(
                 "local disk free space below write reserve: available={available} reserve={reserve} path={}",
                 self.config.data_dir.display()
@@ -22928,6 +22931,29 @@ mod tests {
              a pass. Implement the steps in this test's doc comment (T-070) \
              before removing this panic."
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_source_disk_reserve_cancels_work_and_keeps_admission_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _store, _prefix, _tid) = make_engine_with_pending_compaction(&dir).await;
+        let result = engine.compaction_executor.poll_results().pop().unwrap();
+        assert!(!result.cancel.is_cancelled());
+        engine.config.local_disk_free_reserve_bytes = u64::MAX;
+        engine.set_disk_free_cache_for_test(0);
+        assert!(engine.check_write_admission().is_err());
+        assert_eq!(
+            result.cancel.reason(),
+            Some(ferrosa_common::CancelReason::DiskReserve)
+        );
+        crate::compaction::executor::remove_staged_output_components(
+            &result.output.path,
+            &result.output.id,
+        );
+        engine.compaction_executor.release_task_inputs(&result.task);
+        engine.config.local_disk_free_reserve_bytes = 1;
+        engine.set_disk_free_cache_for_test(u64::MAX);
+        assert!(engine.check_write_admission().is_ok());
     }
 
     #[tokio::test]

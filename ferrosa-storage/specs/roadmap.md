@@ -188,4 +188,8 @@ Completed-result delivery now blocks on channel readiness, cancellation and
 shutdown without sleep polling, retaining move ownership until delivery succeeds.
 Source coordination remains open: synchronous DROP/TRUNCATE storage APIs need
 an async completion/submission-gate contract before they can safely await committed
-S3 finalization. Disk reserve and operator source wiring remain to be completed.
+S3 finalization. Operator source wiring remains to be completed.
+
+Disk-reserve cancellation is implemented: one task record supplies its token and
+total input bytes; the largest eligible task is cancelled on reserve exhaustion,
+without weakening admission or repeatedly cancelling tasks before reclamation.

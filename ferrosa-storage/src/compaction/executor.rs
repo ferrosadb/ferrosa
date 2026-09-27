@@ -1,6 +1,6 @@
 //! Correctness: A completed result is published once or its staging is reclaimed.
 //! Last revised: 2026-09-27
-//! Last changed: Wake bounded result delivery directly on cancellation and shutdown.
+//! Last changed: Track one cancellation record per task and select disk-pressure work by size.
 //! Module: Execute bounded streaming compaction work on background threads.
 //! Correctness: Correct when input claims prevent overlap, completed outputs are
 //! finalized once, and maintenance result batches remain explicitly bounded.
@@ -564,6 +564,12 @@ fn send_result_or_cancel<T>(
     }
 }
 
+/// One cancellation record per task, keyed by its first claimed input.
+struct InFlightCompaction {
+    cancel: CancelToken,
+    input_bytes: u64,
+}
+
 /// Runs compaction tasks on a background thread.
 ///
 /// `StorageEngine` submits tasks via `submit()` and polls results via
@@ -586,12 +592,12 @@ pub struct CompactionExecutor {
     /// unlike "does a file exist under compaction/", it cannot observe a
     /// half-written staging artifact as "done".
     pending_results: Arc<AtomicUsize>,
-    /// One [`CancelToken`] per currently-claimed task, keyed by the same
-    /// input keys as `in_flight_inputs` (T-021). `shutdown()` cancels every
-    /// value here before joining workers, which reaches both tasks actively
+    /// One cancellation record per currently-claimed task, keyed by its first
+    /// input key (T-025); total input bytes drive disk-reserve selection. `shutdown()` cancels every
+    /// token here before joining workers, which reaches both tasks actively
     /// merging AND completed tasks whose `CompactionResult` is still sitting
     /// in the result queue, unfinalized by `poll_compactions`.
-    in_flight_tokens: Arc<Mutex<std::collections::HashMap<String, CancelToken>>>,
+    in_flight_tokens: Arc<Mutex<std::collections::HashMap<String, InFlightCompaction>>>,
     /// Closing this (dropping the sole sender in `shutdown()`) wakes every
     /// worker blocked in `select!` on its task channel immediately — no poll
     /// interval (T-021 CD1, decisions.md D7).
@@ -820,11 +826,18 @@ impl CompactionExecutor {
         // created alongside the in-flight claim and registered under the
         // same input keys so `shutdown()` can find and cancel it.
         let cancel = CancelToken::new();
-        {
-            let mut tokens = self.in_flight_tokens.lock();
-            for input in &task.inputs {
-                tokens.insert(Self::input_key(&task, &input.id), cancel.clone());
-            }
+        if let Some(first) = task.inputs.first() {
+            let input_bytes = task
+                .inputs
+                .iter()
+                .fold(0u64, |sum, input| sum.saturating_add(input.size_bytes));
+            self.in_flight_tokens.lock().insert(
+                Self::input_key(&task, &first.id),
+                InFlightCompaction {
+                    cancel: cancel.clone(),
+                    input_bytes,
+                },
+            );
         }
         // Registers `cancel` for the harness (T-021), scoped by table id —
         // the same scope `cancel_point!` passes. A test's cancel-point hook
@@ -972,6 +985,28 @@ impl CompactionExecutor {
         }
     }
 
+    /// Request reclamation from the largest registered task. Keep only one
+    /// disk-pressure cancellation outstanding until its input claim is released,
+    /// so a burst of rejected writes cannot cancel every compaction at once.
+    /// Admission must still independently verify that free space recovered.
+    pub fn cancel_largest_for_disk_reserve(&self) -> Option<u64> {
+        let tasks = self.in_flight_tokens.lock();
+        if tasks
+            .values()
+            .any(|task| task.cancel.reason() == Some(CancelReason::DiskReserve))
+        {
+            return None;
+        }
+        let (key, task) = tasks
+            .iter()
+            .filter(|(_, task)| !task.cancel.is_cancelled())
+            .max_by_key(|(_, task)| task.input_bytes)?;
+        task.cancel.cancel(CancelReason::DiskReserve);
+        tracing::warn!(task = %key, input_bytes = task.input_bytes,
+            "compaction: cancelling largest task to reclaim disk reserve");
+        Some(task.input_bytes)
+    }
+
     /// Releases a successful task's inputs after its result has been finalized.
     ///
     /// Successful compactions must stay claimed while their result waits in the
@@ -993,8 +1028,8 @@ impl CompactionExecutor {
     /// token before promoting and discards the staged output instead.
     pub fn shutdown(&self) {
         self.stop_flag.store(true, Ordering::Release);
-        for token in self.in_flight_tokens.lock().values() {
-            token.cancel(CancelReason::Shutdown);
+        for task in self.in_flight_tokens.lock().values() {
+            task.cancel.cancel(CancelReason::Shutdown);
         }
         // Dropping the sole sender closes the channel: every worker blocked
         // in `select!` on it wakes at once (no poll interval).
@@ -1043,15 +1078,17 @@ impl CompactionExecutor {
 
     fn release_in_flight_inputs(
         in_flight_inputs: &Mutex<HashSet<String>>,
-        in_flight_tokens: &Mutex<std::collections::HashMap<String, CancelToken>>,
+        in_flight_tokens: &Mutex<std::collections::HashMap<String, InFlightCompaction>>,
         task: &CompactionTask,
     ) {
         let mut in_flight = in_flight_inputs.lock();
-        let mut tokens = in_flight_tokens.lock();
         for input in &task.inputs {
-            let key = Self::input_key(task, &input.id);
-            in_flight.remove(&key);
-            tokens.remove(&key);
+            in_flight.remove(&Self::input_key(task, &input.id));
+        }
+        if let Some(first) = task.inputs.first() {
+            in_flight_tokens
+                .lock()
+                .remove(&Self::input_key(task, &first.id));
         }
         // The task is fully finalized (failed/cancelled during merge, or
         // promoted/rolled-back by `poll_compactions`): the harness registry
@@ -1968,6 +2005,65 @@ fn validate_row_writable(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn cancel_source_disk_reserve_selects_largest_and_coalesces_until_release() {
+        let executor = CompactionExecutor::new();
+        let small = CancelToken::new();
+        let large = CancelToken::new();
+        {
+            let mut tasks = executor.in_flight_tokens.lock();
+            tasks.insert(
+                "ks.small:1".into(),
+                InFlightCompaction {
+                    cancel: small.clone(),
+                    input_bytes: 10,
+                },
+            );
+            tasks.insert(
+                "ks.large:1".into(),
+                InFlightCompaction {
+                    cancel: large.clone(),
+                    input_bytes: 100,
+                },
+            );
+        }
+        assert_eq!(executor.cancel_largest_for_disk_reserve(), Some(100));
+        assert_eq!(large.reason(), Some(CancelReason::DiskReserve));
+        assert!(!small.is_cancelled());
+        assert_eq!(executor.cancel_largest_for_disk_reserve(), None);
+        executor.in_flight_tokens.lock().remove("ks.large:1");
+        assert_eq!(executor.cancel_largest_for_disk_reserve(), Some(10));
+        assert_eq!(small.reason(), Some(CancelReason::DiskReserve));
+    }
+
+    #[test]
+    fn cancel_source_disk_reserve_skips_tasks_cancelled_by_other_sources() {
+        let executor = CompactionExecutor::new();
+        let small = CancelToken::new();
+        let large = CancelToken::new();
+        large.cancel(CancelReason::Operator);
+        {
+            let mut tasks = executor.in_flight_tokens.lock();
+            tasks.insert(
+                "ks.small:1".into(),
+                InFlightCompaction {
+                    cancel: small.clone(),
+                    input_bytes: 10,
+                },
+            );
+            tasks.insert(
+                "ks.large:1".into(),
+                InFlightCompaction {
+                    cancel: large.clone(),
+                    input_bytes: 100,
+                },
+            );
+        }
+        assert_eq!(executor.cancel_largest_for_disk_reserve(), Some(10));
+        assert_eq!(large.reason(), Some(CancelReason::Operator));
+        assert_eq!(small.reason(), Some(CancelReason::DiskReserve));
+    }
 
     #[test]
     fn cancel_source_result_full_queue_wakes_on_cancel() {

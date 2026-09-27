@@ -721,3 +721,10 @@ and shutdown channels. Cancellation while that queue is full wakes the worker
 without a sleep interval, removes its unpromoted staging components and releases
 input claims. Result accounting increments before publication so an immediate
 consumer cannot underflow the pending-result counter.
+
+When write admission observes the disk reserve exhausted, the executor cancels
+the registered task with the largest total input size. One disk-pressure
+cancellation remains outstanding until that task releases its claim, preventing
+a burst of rejected writes from cancelling all tasks. Admission stays closed
+until the existing free-space check observes recovery. The cancellation registry
+now keeps one record per task instead of duplicating its token for every input.

@@ -207,3 +207,12 @@ task cancellation channel and executor shutdown. The unsent result remains owned
 by the worker; cancellation drops direct-upload buffers, removes staged component
 files and releases input claims. The pending-result counter is incremented inside
 the selected send expression, before the receiver can observe the result.
+
+### Disk-reserve cancellation (T-025 slice)
+
+The write-admission reserve check requests cancellation of the largest registered
+compaction by total input bytes. The same registry retains one token and size per
+task; it excludes already-cancelled tasks and waits for an outstanding disk-reserve
+cancellation to release before selecting another. Cancellation never substitutes
+for the actual free-space check: the current write still fails closed while the
+reserve is exhausted, and later writes can proceed once space recovers.
