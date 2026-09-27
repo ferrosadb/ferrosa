@@ -85,15 +85,12 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         )
         .await
         .context("create strict-serializability workload table through CQL")?;
-    clients[0]
-        .execute(
-            &format!(
-                "INSERT INTO {table} (id, balance) VALUES ('a', {INITIAL_BALANCE}), ('b', {INITIAL_BALANCE})"
-            ),
-            &[],
-        )
-        .await
-        .context("initialize strict-serializability workload balances")?;
+    for statement in initial_balance_statements(&table) {
+        clients[0]
+            .execute(&statement, &[])
+            .await
+            .context("initialize strict-serializability workload balances")?;
+    }
     wait_for_table_on_all_nodes(&clients, &table).await?;
 
     if let Some(schedule) = &fault_schedule {
@@ -381,6 +378,13 @@ fn is_serialization_failure(error: &tokio_postgres::Error) -> bool {
         .is_some_and(|sqlstate| sqlstate.code() == "40001")
 }
 
+fn initial_balance_statements(table: &str) -> [String; 2] {
+    [
+        format!("INSERT INTO {table} (id, balance) VALUES ('a', {INITIAL_BALANCE})"),
+        format!("INSERT INTO {table} (id, balance) VALUES ('b', {INITIAL_BALANCE})"),
+    ]
+}
+
 /// Selects the client endpoints used for transactions while still retaining
 /// every endpoint for convergence checks. The fault workflow excludes the
 /// node it pauses; normal runs use every supplied endpoint.
@@ -466,7 +470,22 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{actor_client_count, FaultSchedule};
+    use super::{actor_client_count, initial_balance_statements, FaultSchedule};
+
+    #[test]
+    fn balance_fixture_uses_single_row_inserts_supported_by_the_postgres_gateway() {
+        let statements = initial_balance_statements("accounts");
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0],
+            "INSERT INTO accounts (id, balance) VALUES ('a', 10000)"
+        );
+        assert_eq!(
+            statements[1],
+            "INSERT INTO accounts (id, balance) VALUES ('b', 10000)"
+        );
+    }
 
     #[test]
     fn fault_workload_can_leave_one_of_three_nodes_unused_by_clients() {
