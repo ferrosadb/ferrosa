@@ -23,25 +23,6 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
 
 ## Next
 
-- **Wire the aligned write pump (sstable-write-pump plan, T-038 onward).**
-  Done so far: `pump::PumpConfig` (T-030), `dio_align::{resolve_block, probe,
-  block_for}` (T-031; gnu and musl alike via a raw `SYS_statx` syscall against a
-  hand-rolled kernel-UAPI struct, FMEA ST-13), the `AlignedPump` behind the
-  `SegmentSink` seam with `DirectWriter` as a thin wrapper (T-032, FMEA ST-14),
-  the background flusher over pre-filled crossbeam channels with `pwritev`
-  batching and an abort signal (T-033, FMEA ST-15/ST-16), a `loom` model of
-  the producer/flusher protocol, the full 11-`Fault` matrix, a 10 000-schedule
-  BP4 gate test, a 64-concurrent-pump stress test, and an allocation-free
-  (of `after()`'s own allocation specifically — FMEA ST-16 residual)
-  watchdog wait (T-034), `Compression::compress_into` (T-036) and
-  allocation-free size-then-write
-  row encoding over a generic `RowSink` (T-037). Still to do: `DataSink`
-  (removing `Data.raw`, T-038), which replaces the `DataBuffer` that row
-  encoding still writes through, then wiring flush and compaction onto it
-  (T-039/T-040). The pump's `AbortSignal` shim is swapped for
-  `ferrosa_common::CancelToken` when T-021 lands. The pump API stays
-  `pub(crate)` until T-038 needs it from `ferrosa-storage`. See
-  `ferrosa-suite/specs/sstable-write-pump/`.
 - **Complex-column support (FMEA ST-3).** Implement collections / UDT / tuple /
   frozen cell encode+decode in the Data.db codec, or surface unsupported complex
   columns as an explicit error to any consuming crate that needs them.
@@ -55,8 +36,8 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
   `compress_internal`/`HashTable` types would need to be reused, and aren't
   `pub`). `None` and `Zstd` are zero-allocation after warm-up
   (`tests/compress_into_alloc.rs`); `Lz4` is a bounded, constant one
-  allocation per call. Worth revisiting when T-038's `ChunkCompressor` lands
-  (an upgraded `lz4_flex`, or a small vendored patch exposing a reusable
+  allocation per call. Now that T-038's `ChunkCompressor` is in place, revisit
+  when upgrading `lz4_flex` or exposing a reusable
   hash table, would close the gap) — low priority since it's a bounded,
   non-scaling cost, not a leak.
 - **Bloom filter sizing.** `SSTableWriter::new` sizes the bloom filter for a
@@ -102,6 +83,12 @@ Test-support pump hooks are scoped by output directory and wrap each real sink
 once at open. Integration tests can record effective segment/depth/mode or inject
 backpressure without process environment changes; guards unregister on drop.
 Production builds do not include the hook registry or its locks.
+
+The pump also backs file-backed flush and compaction output (T-045). Storage
+recomputes `Digest.crc32` from staged `Data.db` bytes before publication; this
+check is unconditional and independent of the optional compaction row/partition
+count walk. The local `AbortSignal`/`NeverAbort` shim remains in use on this
+branch and is not yet replaced by `ferrosa_common::CancelToken` (T-021).
 
 ### Pump wiring acceptance (T-045)
 

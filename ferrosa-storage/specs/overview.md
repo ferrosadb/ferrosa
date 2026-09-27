@@ -249,3 +249,18 @@ Operator stop requests use `CancelReason::Operator` under the task registry lock
 They select all current tasks or one registered table, preserve the first recorded
 cancellation reason, and leave admission enabled. Counts describe the registry at
 request time; the caller does not wait for finalization or promise reclaimed disk.
+
+### Compaction digest-failure retry
+
+Digest or output-verification failures retry with exponential backoff (default
+1 s initial, 60 s maximum). `FERROSA_COMPACTION_RETRY_BACKOFF_INITIAL_MS` accepts
+1–60,000 ms and `FERROSA_COMPACTION_RETRY_BACKOFF_MAX_MS` accepts 1–600,000 ms;
+out-of-range values clamp with a WARN, invalid integers use the default with an
+ERROR, and a maximum below the initial delay is normalized up to the initial
+delay. Three consecutive failures pause that table by default;
+`FERROSA_COMPACTION_DIGEST_FAILURE_LIMIT` configures the threshold (1–100,
+default 3; out-of-range values clamp with a WARN, invalid integers use the
+default with an ERROR). The pause and retry streak are in memory: restart clears them, or an
+operator can call
+`StorageEngine::resume_table_compactions_after_digest_failures(table_id)` to
+resume and reset the streak.
