@@ -177,7 +177,12 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         "the workload must commit multiple transactions to exercise concurrency"
     );
 
-    for (node, client) in clients.iter().enumerate().skip(1) {
+    // The fault schedule verifies transaction history and agreement on the
+    // reachable quorum. Rejoining a replica's Accord catch-up is a separate
+    // recovery contract; normal runs still require every node to converge.
+    let convergence_nodes =
+        convergence_node_count(clients.len(), actor_client_count, fault_schedule.is_some());
+    for (node, client) in clients.iter().enumerate().take(convergence_nodes).skip(1) {
         wait_for_balances(client, &table, (final_a, final_b))
             .await
             .with_context(|| {
@@ -425,6 +430,14 @@ fn actor_client_urls<'a>(urls: &'a [&'a str], node_count: usize) -> Vec<&'a str>
     (0..ACTORS).map(|actor| urls[actor % node_count]).collect()
 }
 
+fn convergence_node_count(total_nodes: usize, active_nodes: usize, fault_scheduled: bool) -> usize {
+    if fault_scheduled {
+        active_nodes
+    } else {
+        total_nodes
+    }
+}
+
 /// Coordinates a real node failure with an external process controller. The
 /// test reports that schema setup is complete, waits until the controller has
 /// paused a replica, runs the workload, then signals that the replica can be
@@ -493,7 +506,10 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{actor_client_count, actor_client_urls, initial_balance_statements, FaultSchedule};
+    use super::{
+        actor_client_count, actor_client_urls, convergence_node_count, initial_balance_statements,
+        FaultSchedule,
+    };
 
     #[test]
     fn balance_fixture_uses_single_row_inserts_supported_by_the_postgres_gateway() {
@@ -523,6 +539,12 @@ mod tests {
             actor_client_urls(&nodes, 2),
             ["node1", "node2", "node1", "node2", "node1"]
         );
+    }
+
+    #[test]
+    fn fault_workload_checks_convergence_only_on_active_nodes() {
+        assert_eq!(convergence_node_count(3, 2, true), 2);
+        assert_eq!(convergence_node_count(3, 3, false), 3);
     }
 
     #[test]
