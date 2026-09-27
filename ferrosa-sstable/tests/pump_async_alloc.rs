@@ -474,34 +474,62 @@ fn backpressure_repeated_waits_allocate_zero_bytes_after_open() {
     pump.write_all(&chunk).unwrap();
     pump.write_all(&chunk).unwrap();
     gate.wait_for_attempts(1);
-    let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
-    let (phase_tx, phase_rx) = crossbeam_channel::bounded(1);
-    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let coordination = Arc::new((
+        Mutex::new((false, 0usize, 0usize)),
+        std::sync::Condvar::new(),
+    ));
+    let controller_coordination = Arc::clone(&coordination);
     let controller_gate = Arc::clone(&gate);
     let controller = std::thread::spawn(move || {
-        // Initialize controller-side channel wait storage before measurement.
-        let mut selection = crossbeam_channel::Select::new();
-        selection.recv(&phase_rx);
-        selection.recv(&done_rx);
-        assert!(selection.try_select().is_err());
-        drop(selection);
-        ready_tx.send(()).unwrap();
-        for _ in 0..ITERATIONS {
-            phase_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert_eq!(
-                done_rx.recv_timeout(Duration::from_millis(5)),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout)
-            );
+        {
+            let (state_lock, changed) = &*controller_coordination;
+            state_lock.lock().unwrap().0 = true;
+            changed.notify_one();
+        }
+        for phase in 1..=ITERATIONS {
+            let (state_lock, changed) = &*controller_coordination;
+            let mut state = state_lock.lock().unwrap();
+            let phase_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while state.1 < phase {
+                let remaining = phase_deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero(), "producer did not start phase {phase}");
+                let (next, result) = changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                assert!(
+                    !result.timed_out() || state.1 >= phase,
+                    "producer did not start phase {phase}"
+                );
+            }
+            let completed_before = state.2;
+            let no_completion_deadline = std::time::Instant::now() + Duration::from_millis(5);
+            while std::time::Instant::now() < no_completion_deadline {
+                let remaining =
+                    no_completion_deadline.saturating_duration_since(std::time::Instant::now());
+                let (next, _) = changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                assert_eq!(
+                    state.2, completed_before,
+                    "write completed before the gate released a permit"
+                );
+            }
+            drop(state);
             let mut finished = false;
             for _ in 0..3 {
                 controller_gate.release(1);
-                match done_rx.recv_timeout(Duration::from_millis(5)) {
-                    Ok(()) => {
-                        finished = true;
+                let mut state = state_lock.lock().unwrap();
+                let permit_deadline = std::time::Instant::now() + Duration::from_millis(5);
+                while state.2 == completed_before {
+                    let remaining =
+                        permit_deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
                         break;
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                    Err(error) => panic!("producer disconnected: {error}"),
+                    let (next, _) = changed.wait_timeout(state, remaining).unwrap();
+                    state = next;
+                }
+                if state.2 > completed_before {
+                    finished = true;
+                    break;
                 }
             }
             assert!(
@@ -510,16 +538,35 @@ fn backpressure_repeated_waits_allocate_zero_bytes_after_open() {
             );
         }
     });
-    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    {
+        let (state_lock, changed) = &*coordination;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut state = state_lock.lock().unwrap();
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "controller did not start");
+            let (next, result) = changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(!result.timed_out() || state.0, "controller did not start");
+        }
+    }
     let before_events = alloc_events();
     let before_bytes = ALLOC_BYTES.load(Ordering::Relaxed);
     let before_waits = ferrosa_sstable::pump::pump_park_count();
     for _ in 0..ITERATIONS {
-        phase_tx.send(()).unwrap();
+        {
+            let (state_lock, changed) = &*coordination;
+            state_lock.lock().unwrap().1 += 1;
+            changed.notify_one();
+        }
         // Three segments exceed the complete two-segment ring, even if a
         // previous coalesced call returned every buffer before this operation.
         pump.write_all(&[11u8; 4096 * 3]).unwrap();
-        done_tx.send(()).unwrap();
+        {
+            let (state_lock, changed) = &*coordination;
+            state_lock.lock().unwrap().2 += 1;
+            changed.notify_one();
+        }
     }
     let events = alloc_events() - before_events;
     let bytes = ALLOC_BYTES.load(Ordering::Relaxed) - before_bytes;
