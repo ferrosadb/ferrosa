@@ -1725,8 +1725,8 @@ fn component_expectations<'a>(
 
 fn verify_promoted_sstable(reader: &SSTableReader<FileReadAt>) -> Result<()> {
     let mut iter = reader.partitions_iter()?;
-    while let Some(partition) = iter.next_partition()? {
-        let _ = partition.rows.len();
+    while iter.next_partition_count()?.is_some() {
+        // Walk partition framing and count rows without decoding cell payloads.
     }
     Ok(())
 }
@@ -3590,6 +3590,113 @@ mod tests {
         }
         let output = writer.finish_to_directory(&staging_dir).unwrap();
         (target, output)
+    }
+
+    fn refresh_staged_digest(output: &mut ferrosa_sstable::writer::SSTableOutputFiles) {
+        let data = std::fs::read(&output.data).unwrap();
+        let mut hasher = ferrosa_sstable::checksum::DigestCrc32::new();
+        hasher.update(&data);
+        let digest = ferrosa_sstable::checksum::format_digest(hasher.finalize());
+        std::fs::write(&output.digest, &digest).unwrap();
+        output.digest_len = digest.len() as u64;
+    }
+
+    #[test]
+    fn promoted_sstable_count_walk_matches_full_partition_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 5001),
+        ];
+        let (_target, output) = staged_output_for_digest_tests(dir.path(), &partitions);
+        let reader = SSTableReader::open(SSTableComponents {
+            data: FileReadAt::open(&output.data).unwrap(),
+            partitions: FileReadAt::open(&output.partitions).unwrap(),
+            rows: FileReadAt::open(&output.rows).unwrap(),
+            filter: std::fs::read(&output.filter).unwrap(),
+            compression_info: output
+                .compression_info
+                .as_ref()
+                .map(std::fs::read)
+                .transpose()
+                .unwrap(),
+            statistics: std::fs::read(&output.statistics).unwrap(),
+        })
+        .unwrap();
+
+        let mut full = reader.partitions_iter().unwrap();
+        let mut expected = Vec::new();
+        while let Some(partition) = full.next_partition().unwrap() {
+            expected.push((partition.key, partition.rows.len() as u64));
+        }
+
+        let mut counts = reader.partitions_iter().unwrap();
+        let mut actual = Vec::new();
+        while let Some((key, rows)) = counts.next_partition_count().unwrap() {
+            actual.push((key, rows));
+        }
+        assert_eq!(actual, expected);
+        verify_promoted_sstable(&reader).unwrap();
+    }
+
+    #[test]
+    fn flush_files_rejects_truncated_partition_framing_after_digest_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let options = WriteOptions {
+            compression: None,
+            verify_output: false,
+            ..WriteOptions::default()
+        };
+        let (target, mut output) =
+            staged_output_for_digest_tests_with_options(dir.path(), &partitions, options);
+
+        let mut data = std::fs::read(&output.data).unwrap();
+        let terminator = data.last_mut().expect("nonempty Data.db");
+        assert_ne!(*terminator, 0, "fixture ends with a partition terminator");
+        *terminator = 0;
+        std::fs::write(&output.data, data).unwrap();
+        refresh_staged_digest(&mut output);
+
+        let error = match target.flush_files(output) {
+            Ok(_) => panic!("the readback framing check must reject a missing partition terminator"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("could not be read back"),
+            "framing refusal should come from staged SSTable readback: {error}"
+        );
+        assert!(
+            dir.path().join("quarantine").exists(),
+            "the malformed staged output must be quarantined"
+        );
+    }
+
+    #[test]
+    fn flush_files_rejects_malformed_partition_index_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let options = WriteOptions {
+            compression: None,
+            verify_output: false,
+            ..WriteOptions::default()
+        };
+        let (target, output) =
+            staged_output_for_digest_tests_with_options(dir.path(), &partitions, options);
+
+        let mut index = std::fs::read(&output.partitions).unwrap();
+        assert!(!index.is_empty(), "fixture has partition index metadata");
+        index.fill(0xff);
+        std::fs::write(&output.partitions, index).unwrap();
+
+        let error = match target.flush_files(output) {
+            Ok(_) => panic!("the reader must reject malformed partition index metadata"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("could not be read back"),
+            "metadata refusal should come from staged SSTable readback: {error}"
+        );
     }
 
     /// Enough partitions, with big enough values, that Data.db comfortably
