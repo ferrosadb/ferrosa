@@ -32,6 +32,14 @@ resolution beyond the serialization header, or cluster routing.
   `get_clustering_row`), bloom/bounds pre-checks (`may_contain_key`), and
   streaming iteration in token order (`partitions_iter` → `PartitionIter`) with
   token-seek (`seek_to_token`) and projection variants.
+- **Component output (T-040)** — every physical SSTable component write uses
+  `AlignedPump`, including metadata and buffered Data.db output from the memory
+  writer. Metadata uses depth 0: one aligned segment, exact logical-length
+  truncation and sync before completion. Direct mode follows the same runtime
+  switch as Data.db; the streaming CompressionInfo header retains its existing
+  buffered depth-0 path. `finish()` still returns owned component bytes for
+  memory callers. Trie/Rows/CRC construction remains in memory (T-081); this
+  change routes output and removes the second whole-trie copy.
 - **Source checksums (T-011)** — `Digest.crc32` (a single CRC32 over the final
   on-disk Data.db bytes) is written for every table; `CRC.db` (a per-chunk
   CRC32 table, Cassandra-compatible layout) is written for uncompressed

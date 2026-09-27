@@ -79,3 +79,11 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
 - Async / S3 I/O — lives in `ferrosa-storage` behind the `ReadAt`/`WriteAt`
   traits; this crate stays synchronous and runtime-free.
 - CQL planning, schema DDL, or cluster routing — belong to the calling crates.
+
+## Component output milestone (T-040)
+
+All component file writes now use the pump, including metadata and buffered
+output from a memory writer. Byte parity is checked for every component across
+both output modes and all supported compression codecs. T-081 remains required
+to bound the metadata builders (trie, Rows and CRC) and remove duplicate Bloom
+serialization; pump routing alone does not make those builders allocation-free.

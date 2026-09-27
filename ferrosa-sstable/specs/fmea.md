@@ -103,3 +103,12 @@ severity — a wrong byte here is silent, durable data loss.
   instrumentation), and peak process allocation stays within a generous
   multiple of the sum of each pump's own `(depth + 1) * segment` — the
   bounded-ring rule under real concurrency, not just one pump at a time.
+
+## Component output coverage (T-040)
+
+`component_pump_` tests exercise every component with direct and buffered sinks
+under None/LZ4/Zstd, and check partial-tail truncation, empty components, sync
+completion and surfaced sync errors. Metadata now receives the same pump I/O
+failure handling as Data.db. Golden oracle tests guard format identity. The
+remaining table-sized trie/Rows/CRC buffers are T-081 scope; this routing change
+does not resolve that memory bound.

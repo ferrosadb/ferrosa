@@ -34,7 +34,6 @@
 //! per-column complex `DeletionTime` on write are still deferred (Ferrosa's
 //! collection ops are element add/remove, not whole-collection clears).
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -136,85 +135,54 @@ impl AbortSignal for CancelAbortSignal {
     }
 }
 
-/// A Data.db sink that is either the cache-bypassing
-/// [`DirectWriter`](crate::direct::DirectWriter) or the original buffered
-/// [`std::fs::File`], selected by [`sstable_direct_io_enabled`]. Presents a
-/// uniform `write_all` / `position` / `finish` surface so the compressed and
-/// uncompressed build paths are written once, mode-agnostic. `position` returns
-/// the logical write offset (substituting for `Seek::stream_position`, which
-/// O_DIRECT's staging buffer cannot answer from the OS file offset).
-enum DataDbWriter {
-    // Boxed: T-033 grew `AlignedPump` (which `DirectWriter` now wraps) with
-    // the `depth >= 1` async backend's channels/join-handle/abort-signal
-    // fields, tripping clippy's `large_enum_variant` against the much
-    // smaller `Buffered` variant.
-    Direct(Box<crate::direct::DirectWriter>),
-    Buffered { file: std::fs::File, written: u64 },
+/// Synchronous aligned output for any SSTable component. Both explicit
+/// buffered mode and direct I/O use the pump's padding, trim and sync protocol.
+struct ComponentWriter {
+    pump: AlignedPump,
 }
 
-impl DataDbWriter {
-    /// Open `data_path`. `direct` (from [`sstable_direct_io_enabled`] at the call
-    /// site) is an explicit parameter — not read from the environment here — so
-    /// both modes are unit-testable without the `set_var` parallel-test race.
+impl ComponentWriter {
     fn create(path: &Path, direct: bool) -> Result<Self> {
-        if direct {
-            Ok(Self::Direct(Box::new(crate::direct::DirectWriter::create(
-                path,
-            )?)))
+        let (sink, block): (Box<dyn SegmentSink>, usize) = if direct {
+            let (sink, block) = FileSink::create(path)?;
+            (Box::new(sink), block)
         } else {
-            Ok(Self::Buffered {
-                file: std::fs::File::create(path)?,
-                written: 0,
-            })
-        }
+            (Box::new(BufferedFileSink::create(path)?), MIN_BLOCK)
+        };
+        let segment = PumpConfig::from_env().effective_segment(block);
+        Ok(Self {
+            pump: AlignedPump::open(sink, block, segment, path.to_path_buf()),
+        })
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        match self {
-            Self::Direct(writer) => writer.write_all(bytes),
-            Self::Buffered { file, written } => {
-                file.write_all(bytes)?;
-                *written += bytes.len() as u64;
-                Ok(())
-            }
-        }
+        self.pump.write_all(bytes)
     }
 
-    /// Logical offset of the next byte — substitutes for `stream_position()`.
     fn position(&self) -> u64 {
-        match self {
-            Self::Direct(writer) => writer.position(),
-            Self::Buffered { written, .. } => *written,
-        }
+        self.pump.position()
     }
 
-    /// Durably persist the Data.db content and consume the writer.
-    fn finish(self) -> Result<()> {
-        match self {
-            Self::Direct(writer) => {
-                writer.finish()?;
-                Ok(())
-            }
-            Self::Buffered { file, .. } => {
-                file.sync_data()?;
-                Ok(())
-            }
-        }
+    fn finish(self) -> Result<u64> {
+        self.pump.finish()
     }
 }
 
-fn write_component_file(path: &Path, bytes: &[u8]) -> Result<u64> {
-    std::fs::write(path, bytes)?;
-    Ok(bytes.len() as u64)
+/// Write borrowed component bytes without copying them into another component
+/// buffer. The pump owns a fixed aligned segment and returns logical length.
+fn pump_component(path: &Path, bytes: &[u8]) -> Result<u64> {
+    let mut writer = ComponentWriter::create(path, sstable_direct_io_enabled())?;
+    writer.write_all(bytes)?;
+    writer.finish()
 }
 
-/// Wraps [`DataDbWriter`] with a streaming [`DigestCrc32`] (and, for
+/// Wraps [`ComponentWriter`] with a streaming [`DigestCrc32`] (and, for
 /// uncompressed tables, a [`ChunkCrc`]) so `Digest.crc32`/`CRC.db` are
 /// computed from the exact bytes as they are written, never by re-reading
 /// Data.db from disk afterward. See `checksum` module docs for the on-disk
 /// formats (Cassandra-compatible; spec: `publication-safety.md` M1).
 struct ChecksummedDataDbWriter {
-    inner: DataDbWriter,
+    inner: ComponentWriter,
     digest: DigestCrc32,
     chunk_crc: Option<ChunkCrc>,
 }
@@ -225,7 +193,7 @@ impl ChecksummedDataDbWriter {
     /// (compressed tables, which have no `CRC.db`).
     fn create(path: &Path, direct: bool, chunk_crc_size: Option<usize>) -> Result<Self> {
         Ok(Self {
-            inner: DataDbWriter::create(path, direct)?,
+            inner: ComponentWriter::create(path, direct)?,
             digest: DigestCrc32::new(),
             chunk_crc: chunk_crc_size.map(ChunkCrc::new),
         })
@@ -1064,10 +1032,10 @@ impl SSTableWriter {
 
     /// Finalize the SSTable and produce all component files.
     pub fn finish(self) -> Result<SSTableOutput> {
-        let first_key = self.first_key.clone().unwrap_or_default();
-        let last_key = self.last_key.clone().unwrap_or_default();
-        let first_index_key = self.first_index_key.clone().unwrap_or_default();
-        let last_index_key = self.last_index_key.clone().unwrap_or_default();
+        let first_key = self.first_key.unwrap_or_default();
+        let last_key = self.last_key.unwrap_or_default();
+        let first_index_key = self.first_index_key.unwrap_or_default();
+        let last_index_key = self.last_index_key.unwrap_or_default();
         let partition_count = self.partition_count;
         let total_rows = self.total_rows;
         let total_columns_set = self.total_columns_set;
@@ -1075,7 +1043,7 @@ impl SSTableWriter {
         let has_compression = self.options.compression.is_some()
             && !matches!(self.options.compression, Some(Compression::None));
         let verify_output = self.options.verify_output;
-        let header = self.header.clone();
+        let header = self.header;
 
         // 1. Finalize trie -> Partitions.db (trie bytes + key bounds footer)
         let partitions = Self::build_partitions_db(
@@ -1090,7 +1058,7 @@ impl SSTableWriter {
 
         // 3. Build statistics -> Statistics.db
         let statistics = Self::build_statistics_db(
-            &self.header,
+            &header,
             bloom_fp_chance,
             &first_key,
             &last_key,
@@ -1195,10 +1163,10 @@ impl SSTableWriter {
         let staging_dir = staging_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&staging_dir)?;
 
-        let first_key = self.first_key.clone().unwrap_or_default();
-        let last_key = self.last_key.clone().unwrap_or_default();
-        let first_index_key = self.first_index_key.clone().unwrap_or_default();
-        let last_index_key = self.last_index_key.clone().unwrap_or_default();
+        let first_key = self.first_key.unwrap_or_default();
+        let last_key = self.last_key.unwrap_or_default();
+        let first_index_key = self.first_index_key.unwrap_or_default();
+        let last_index_key = self.last_index_key.unwrap_or_default();
         let partition_count = self.partition_count;
         let total_rows = self.total_rows;
         let total_columns_set = self.total_columns_set;
@@ -1206,7 +1174,7 @@ impl SSTableWriter {
         let has_compression = self.options.compression.is_some()
             && !matches!(self.options.compression, Some(Compression::None));
         let verify_output = self.options.verify_output;
-        let header = self.header.clone();
+        let header = self.header;
 
         let data_path = staging_dir.join("Data.db");
         let partitions_path = staging_dir.join("Partitions.db");
@@ -1224,13 +1192,13 @@ impl SSTableWriter {
             &last_index_key,
             partition_count,
         )?;
-        let partitions_len = write_component_file(&partitions_path, &partitions)?;
+        let partitions_len = pump_component(&partitions_path, &partitions)?;
 
         let filter = self.bloom.write();
-        let filter_len = write_component_file(&filter_path, &filter)?;
+        let filter_len = pump_component(&filter_path, &filter)?;
 
         let statistics = Self::build_statistics_db(
-            &self.header,
+            &header,
             bloom_fp_chance,
             &first_key,
             &last_key,
@@ -1238,7 +1206,7 @@ impl SSTableWriter {
             total_rows,
             total_columns_set,
         );
-        let statistics_len = write_component_file(&statistics_path, &statistics)?;
+        let statistics_len = pump_component(&statistics_path, &statistics)?;
 
         // T-038: `DataSink::Stream` already streamed Data.db (and
         // CompressionInfo.db, if compressed) to `data_path`/
@@ -1252,7 +1220,7 @@ impl SSTableWriter {
             DataSink::Memory(data_buf) => {
                 let artifacts = Self::build_data_db_to_file(data_buf, &self.options, &data_path)?;
                 let compression_info_len = if let Some(info) = artifacts.compression_info.as_ref() {
-                    write_component_file(&compression_info_path, info)?
+                    pump_component(&compression_info_path, info)?
                 } else {
                     0
                 };
@@ -1293,17 +1261,17 @@ impl SSTableWriter {
         // Source checksums (T-011, D6): `Digest.crc32` for every table;
         // `CRC.db` only for uncompressed tables.
         let digest_bytes = checksum::format_digest(digest);
-        let digest_len = write_component_file(&digest_path, &digest_bytes)?;
+        let digest_len = pump_component(&digest_path, &digest_bytes)?;
         let crc_len = if let Some(crc_db) = crc_db.as_ref() {
-            write_component_file(&crc_path, crc_db)?
+            pump_component(&crc_path, crc_db)?
         } else {
             0
         };
 
-        let rows_len = write_component_file(&rows_path, &self.rows_buf)?;
+        let rows_len = pump_component(&rows_path, &self.rows_buf)?;
 
         let toc = Self::build_toc(has_compression);
-        let toc_len = write_component_file(&toc_path, &toc)?;
+        let toc_len = pump_component(&toc_path, &toc)?;
 
         let output = SSTableOutputFiles {
             data: data_path,
@@ -1946,12 +1914,9 @@ impl SSTableWriter {
         last_index_key: &[u8],
         partition_count: u64,
     ) -> Result<Vec<u8>> {
-        let (trie_data, root_pos) = trie_builder.finish()?;
-
-        let mut buf = Vec::new();
-
-        // Trie data
-        buf.extend_from_slice(&trie_data);
+        // Reuse the builder's allocation; appending the footer does not require
+        // a second full copy of the encoded trie.
+        let (mut buf, root_pos) = trie_builder.finish()?;
 
         // Key bounds section
         let key_bounds_offset = buf.len() as i64;
@@ -2480,6 +2445,92 @@ mod tests {
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
     use proptest::prelude::*;
 
+    #[test]
+    fn component_pump_all_components_mode_parity() {
+        for compression in [
+            None,
+            Some(Compression::Lz4),
+            Some(Compression::Zstd { level: 1 }),
+        ] {
+            let mut writer = SSTableWriter::new(
+                WriteOptions {
+                    compression,
+                    ..WriteOptions::default()
+                },
+                test_header(),
+            );
+            writer
+                .add_partition(&make_wide_partition(b"component-parity", 400))
+                .unwrap();
+            let output = writer.finish().unwrap();
+            let components = [
+                ("Data.db", Some(output.data.as_slice())),
+                ("Partitions.db", Some(output.partitions.as_slice())),
+                ("Rows.db", Some(output.rows.as_slice())),
+                ("Filter.db", Some(output.filter.as_slice())),
+                ("Statistics.db", Some(output.statistics.as_slice())),
+                ("CompressionInfo.db", output.compression_info.as_deref()),
+                ("Digest.crc32", Some(output.digest.as_slice())),
+                ("CRC.db", output.crc.as_deref()),
+                ("TOC.txt", Some(output.toc.as_slice())),
+            ];
+            for direct in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                for (name, bytes) in components {
+                    if let Some(bytes) = bytes {
+                        let path = dir.path().join(name);
+                        let mut sink = ComponentWriter::create(&path, direct).unwrap();
+                        for chunk in bytes.chunks(37) {
+                            sink.write_all(chunk).unwrap();
+                        }
+                        assert_eq!(sink.position(), bytes.len() as u64);
+                        assert_eq!(sink.finish().unwrap(), bytes.len() as u64);
+                        assert_eq!(
+                            std::fs::read(path).unwrap(),
+                            bytes,
+                            "{name}, direct={direct}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn component_pump_pads_trims_and_syncs() {
+        use crate::direct::DirectMode;
+        use crate::pump::test_support::RecordingSink;
+        let (sink, recording) = RecordingSink::new(DirectMode::Buffered);
+        let pump = AlignedPump::open(Box::new(sink), 4096, 4096, "Rows.db".into());
+        let mut component = ComponentWriter { pump };
+        let bytes = vec![0xa5; 8193];
+        component.write_all(&bytes).unwrap();
+        assert_eq!(component.finish().unwrap(), bytes.len() as u64);
+        assert_eq!(recording.bytes(), bytes);
+        assert_eq!(recording.writes().len(), 3);
+        assert_eq!(recording.set_len_calls(), vec![8193]);
+        assert!(recording.sync_data_calls() > 0);
+    }
+
+    #[test]
+    fn component_pump_empty_component_and_sync_error() {
+        use crate::direct::DirectMode;
+        use crate::pump::test_support::{Fault, FaultySink, RecordingSink};
+        let (sink, recording) = RecordingSink::new(DirectMode::Buffered);
+        let pump = AlignedPump::open(Box::new(sink), 4096, 4096, "Rows.db".into());
+        assert_eq!(ComponentWriter { pump }.finish().unwrap(), 0);
+        assert!(recording.bytes().is_empty());
+        assert!(recording.sync_data_calls() > 0);
+
+        let (sink, _) = FaultySink::new(DirectMode::Buffered);
+        // The padded tail is call 0; its first sync is call 1.
+        let sink = sink.at(1, Fault::FsyncFail);
+        let pump = AlignedPump::open(Box::new(sink), 4096, 4096, "Filter.db".into());
+        let mut component = ComponentWriter { pump };
+        component.write_all(b"filter").unwrap();
+        assert!(component.finish().is_err());
+    }
+
     /// The load-bearing wiring invariant: writing the same byte stream through a
     /// direct (O_DIRECT/F_NOCACHE) Data.db writer and the buffered writer yields
     /// byte-for-byte identical files AND identical recorded chunk offsets —
@@ -2502,7 +2553,7 @@ mod tests {
         let mut offsets: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
         let paths = [dir.path().join("buffered.db"), dir.path().join("direct.db")];
         for (idx, direct) in [false, true].into_iter().enumerate() {
-            let mut w = DataDbWriter::create(&paths[idx], direct).expect("create");
+            let mut w = ComponentWriter::create(&paths[idx], direct).expect("create");
             for chunk in &writes {
                 offsets[idx].push(w.position());
                 w.write_all(chunk).expect("write_all");
@@ -3213,7 +3264,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `ChecksummedDataDbWriter` is the exact wiring point named in the T-011
-    /// packet (`DataDbWriter::write_all`). Exercise it directly across sizes
+    /// packet (`ComponentWriter::write_all`). Exercise it directly across sizes
     /// that land on either side of a chunk boundary — the classic
     /// off-by-one zone for chunked checksums — feeding bytes through
     /// irregular `write_all` calls (never one call per chunk) so a bug that

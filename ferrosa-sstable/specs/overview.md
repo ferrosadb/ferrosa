@@ -219,3 +219,18 @@ widely-depended-on crates in the workspace — `ferrosa-cdc`, `ferrosa-cluster`,
 `ferrosa-sparql`, `ferrosa-storage`, and `ferrosa-worker` all consume its
 reader/writer or `types`. See the [root crate index](../../specs/crates.md) for
 the full graph.
+
+## Component output through the aligned pump (T-040)
+
+`finish_to_directory` sends every metadata component through a synchronous
+`ComponentWriter` wrapping `AlignedPump`. Both direct and explicitly buffered
+output follow the pump's write, sync and tail-truncate protocol, including the
+Data.db path used when a memory writer is finalized to files. Component lengths
+come from the pump's logical byte counter. The existing streaming Data.db pump
+keeps its configurable depth; streaming CompressionInfo keeps its patched-header
+depth-0 pump. The owned-byte `finish()` API remains available without file I/O.
+
+Consumed key bounds and headers move into finalization. The partition footer is
+appended to the trie builder's returned buffer instead of copying the entire
+trie into a second buffer. T-081 still owns bounded trie, Rows and CRC building;
+T-040 does not claim allocation-free metadata construction.
