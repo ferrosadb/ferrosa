@@ -23,10 +23,6 @@
 
 use std::sync::OnceLock;
 
-/// Hard sanity cap on flush parallelism. A capacity-aware default never
-/// approaches this; it only guards against an absurd operator override.
-const MAX_FLUSH_PARALLELISM: usize = 64;
-
 static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
 /// Resolve the flush pool width from an already-read env value, falling back to
@@ -34,33 +30,42 @@ static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 /// testable without mutating the process environment — `std::env::set_var` in
 /// one test races every other test that reads the same var (see the rust skill).
 ///
-/// A value `>= 1` wins (clamped to [`MAX_FLUSH_PARALLELISM`]); `0`, a negative /
-/// non-numeric value, or an absent var falls back to `available_parallelism()`.
-pub(crate) fn parse_parallelism(env_val: Option<String>) -> usize {
-    if let Some(v) = env_val {
-        // Named `requested` (not `n`): this is an operator-set thread-count
-        // config, not a query result bound — the OOM-audit `.min(.., CAP)`
-        // result-cap heuristic keys off a receiver literally named `n`.
-        if let Ok(requested) = v.trim().parse::<usize>() {
-            if requested >= 1 {
-                return requested.min(MAX_FLUSH_PARALLELISM);
-            }
-        }
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, MAX_FLUSH_PARALLELISM)
+/// A valid value in the configured range wins. Invalid values log an error and
+/// fall back to the capacity-aware host width.
+#[cfg(test)]
+fn parse_parallelism_with(env_val: Option<String>, host_default: usize, cap: usize) -> usize {
+    let value = env_val
+        .map(Ok)
+        .unwrap_or(Err(std::env::VarError::NotPresent));
+    parse_parallelism_value(value, host_default, cap)
+}
+
+fn parse_parallelism_value(
+    value: Result<String, std::env::VarError>,
+    host_default: usize,
+    cap: usize,
+) -> usize {
+    crate::runtime_tuning::parse_usize_env("FERROSA_FLUSH_PARALLELISM", value, host_default, 1, cap)
 }
 
 /// The capacity-aware default width, reading `FERROSA_FLUSH_PARALLELISM`.
 pub(crate) fn default_parallelism() -> usize {
-    parse_parallelism(std::env::var("FERROSA_FLUSH_PARALLELISM").ok())
+    let cap = crate::runtime_tuning::storage_runtime_tuning().max_flush_parallelism;
+    let host_default = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, cap);
+    parse_parallelism_value(
+        std::env::var("FERROSA_FLUSH_PARALLELISM"),
+        host_default,
+        cap,
+    )
 }
 
 fn build_pool(width: usize) -> rayon::ThreadPool {
+    let cap = crate::runtime_tuning::storage_runtime_tuning().max_flush_parallelism;
     rayon::ThreadPoolBuilder::new()
-        .num_threads(width.clamp(1, MAX_FLUSH_PARALLELISM))
+        .num_threads(width.clamp(1, cap))
         .thread_name(|i| format!("ferrosa-flush-{i}"))
         .build()
         .expect("build flush fsync pool")
@@ -100,25 +105,39 @@ mod tests {
 
     #[test]
     fn parse_parallelism_honors_valid_override() {
-        assert_eq!(parse_parallelism(Some("4".to_string())), 4);
-        assert_eq!(parse_parallelism(Some("  8 ".to_string())), 8);
+        assert_eq!(parse_parallelism_with(Some("4".to_string()), 2, 64), 4);
+        assert_eq!(parse_parallelism_with(Some("  8 ".to_string()), 2, 64), 8);
     }
 
     #[test]
-    fn parse_parallelism_caps_absurd_values() {
+    fn parse_parallelism_uses_configured_ceiling() {
         assert_eq!(
-            parse_parallelism(Some("100000".to_string())),
-            MAX_FLUSH_PARALLELISM
+            crate::runtime_tuning::parse_usize_env(
+                "FERROSA_MAX_FLUSH_PARALLELISM",
+                Ok("128".to_string()),
+                64,
+                1,
+                usize::MAX,
+            ),
+            128
         );
+        assert_eq!(parse_parallelism_with(Some("100".to_string()), 4, 128), 100);
+        assert_eq!(parse_parallelism_with(Some("1000".to_string()), 4, 128), 4);
+    }
+
+    #[test]
+    fn unreadable_flush_parallelism_falls_back_to_host_default() {
+        let error = std::env::VarError::NotUnicode(std::ffi::OsString::from("unreadable"));
+        assert_eq!(parse_parallelism_value(Err(error), 4, 64), 4);
     }
 
     #[test]
     fn parse_parallelism_falls_back_on_invalid_or_absent() {
-        // None, non-numeric, and sub-1 all fall back to host parallelism (>= 1).
+        // Missing, malformed, and sub-1 values fall back to host parallelism.
         for v in [None, Some("garbage".to_string()), Some("0".to_string())] {
-            let w = parse_parallelism(v);
+            let w = parse_parallelism_with(v, 4, 64);
             assert!(w >= 1, "fallback parallelism must be >= 1, got {w}");
-            assert!(w <= MAX_FLUSH_PARALLELISM);
+            assert!(w <= 64);
         }
     }
 

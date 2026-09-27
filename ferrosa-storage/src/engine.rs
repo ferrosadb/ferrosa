@@ -61,19 +61,6 @@ use crate::timeseries::{
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
 
-/// Maximum minimum size for an age-triggered automatic flush.
-///
-/// With the production 64 MiB flush threshold, data must accumulate to 16 MiB
-/// before age may admit a flush. Smaller configured thresholds retain their
-/// own threshold as the floor, preserving deterministic small-threshold tests.
-const MAX_AGE_FLUSH_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Bound synchronous automatic-flush work per maintenance tick. A later tick
-/// resumes from the still-dirty tables, so this caps allocation/I/O without
-/// sacrificing eventual progress.
-const MAX_AUTOMATIC_FLUSHES_PER_POLL: usize = 8;
-const MAX_COMPACTION_INPUTS_PER_TASK: usize = 64;
-
 // T-023 crash injection belongs to the poll future that explicitly opts in.
 // Task-local scope follows Tokio task migration and resets on unwind/drop;
 // unrelated tasks and synchronous startup reconciliation never inherit it.
@@ -82,8 +69,12 @@ tokio::task_local! {
     static TEST_CRASH_AFTER_N_INPUT_RETIREMENTS: usize;
 }
 
-fn effective_compaction_input_bounds(min_threshold: usize, max_threshold: usize) -> (usize, usize) {
-    let max_threshold = max_threshold.clamp(2, MAX_COMPACTION_INPUTS_PER_TASK);
+fn effective_compaction_input_bounds(
+    min_threshold: usize,
+    max_threshold: usize,
+    configured_max_inputs: usize,
+) -> (usize, usize) {
+    let max_threshold = max_threshold.clamp(2, configured_max_inputs.max(2));
     let min_threshold = min_threshold.clamp(2, max_threshold);
     (min_threshold, max_threshold)
 }
@@ -1101,6 +1092,7 @@ impl Drop for DigestFailurePause {
 
 pub struct StorageEngine {
     config: StorageEngineConfig,
+    runtime_tuning: crate::runtime_tuning::StorageRuntimeTuning,
     write_admission: WriteAdmissionSettings,
     /// Shared with the index scheduler's sidecar installer (t_7ac6b0e3).
     tables: Arc<RwLock<HashMap<TableId, TableState>>>,
@@ -2632,6 +2624,7 @@ impl StorageEngine {
 
         let engine = Self {
             config,
+            runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
             write_admission: WriteAdmissionSettings::from_env(),
             pump_rate_sample_at_ns: AtomicU64::new(reference_instant().elapsed().as_nanos() as u64),
             pump_rate_sample_total_ns: AtomicU64::new(
@@ -2849,6 +2842,7 @@ impl StorageEngine {
 
         Ok(Self {
             config,
+            runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
             write_admission: WriteAdmissionSettings::from_env(),
             pump_rate_sample_at_ns: AtomicU64::new(reference_instant().elapsed().as_nanos() as u64),
             pump_rate_sample_total_ns: AtomicU64::new(
@@ -3012,6 +3006,7 @@ impl StorageEngine {
 
         let engine = Self {
             config,
+            runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
             write_admission: WriteAdmissionSettings::from_env(),
             pump_rate_sample_at_ns: AtomicU64::new(reference_instant().elapsed().as_nanos() as u64),
             pump_rate_sample_total_ns: AtomicU64::new(
@@ -9781,7 +9776,7 @@ impl StorageEngine {
         let age_flush_floor = self
             .config
             .flush_threshold_bytes
-            .clamp(1, MAX_AGE_FLUSH_FLOOR_BYTES);
+            .clamp(1, self.runtime_tuning.max_age_flush_floor_bytes);
         let tables = self.tables.read();
         let to_flush: Vec<TableId> = tables
             .iter()
@@ -9797,7 +9792,7 @@ impl StorageEngine {
                 let pins_retained_wal = self.commit_log.table_pins_retained_wal_pressure(table_id);
                 memtable_size > 0 && (size_exceeded || age_and_volume_exceeded || pins_retained_wal)
             })
-            .take(MAX_AUTOMATIC_FLUSHES_PER_POLL)
+            .take(self.runtime_tuning.max_automatic_flushes_per_poll)
             .map(|(id, _)| id.clone())
             .collect();
         drop(tables);
@@ -9833,14 +9828,14 @@ impl StorageEngine {
     /// Crash-safe: pending-log → upload → S3 confirm → manifest update →
     /// enqueue input deletions → evict local input directories.
     pub async fn poll_compactions(&self) {
-        const MAX_RESULTS_PER_MAINTENANCE_POLL: usize = 8;
+        let max_results_per_poll = self.runtime_tuning.max_results_per_maintenance_poll;
         let failures = self
             .compaction_executor
-            .poll_failures_bounded(MAX_RESULTS_PER_MAINTENANCE_POLL);
+            .poll_failures_bounded(max_results_per_poll);
         self.handle_compaction_failures(failures);
         let results = self
             .compaction_executor
-            .poll_results_bounded(MAX_RESULTS_PER_MAINTENANCE_POLL);
+            .poll_results_bounded(max_results_per_poll);
         self.finalize_compactions(results).await;
         self.schedule_compaction_backlog_round();
     }
@@ -11127,6 +11122,7 @@ impl StorageEngine {
         let (min_inputs, max_inputs) = effective_compaction_input_bounds(
             self.config.compaction.min_threshold,
             self.config.compaction.max_threshold,
+            self.runtime_tuning.max_compaction_inputs_per_task,
         );
         let thresholds_were_normalized = min_inputs != self.config.compaction.min_threshold
             || max_inputs != self.config.compaction.max_threshold;
@@ -11234,10 +11230,11 @@ impl StorageEngine {
     /// Schedule at most eight compaction tasks per maintenance pass, scanning
     /// the table map in place without collecting IDs or task lists.
     fn schedule_compaction_backlog_round(&self) {
-        const MAX_SCHEDULED_TABLES_PER_POLL: usize = 8;
+        let max_scheduled_tables_per_poll = self.runtime_tuning.max_scheduled_tables_per_poll;
         let (min_inputs, _) = effective_compaction_input_bounds(
             self.config.compaction.min_threshold,
             self.config.compaction.max_threshold,
+            self.runtime_tuning.max_compaction_inputs_per_task,
         );
         let tables = self.tables.read();
         let mut accepted = 0_usize;
@@ -11247,7 +11244,7 @@ impl StorageEngine {
             }
             if self.maybe_compact(table_id, state) {
                 accepted += 1;
-                if accepted >= MAX_SCHEDULED_TABLES_PER_POLL {
+                if accepted >= max_scheduled_tables_per_poll {
                     break;
                 }
             }
@@ -13065,6 +13062,7 @@ impl StorageEngine {
 
         Ok(Self {
             config,
+            runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
             write_admission: WriteAdmissionSettings::from_env(),
             tables,
             pending_index_uploads,
@@ -13413,9 +13411,14 @@ mod tests {
 
     #[test]
     fn effective_compaction_bounds_reject_unbounded_operator_thresholds() {
-        assert_eq!(effective_compaction_input_bounds(4, 1_000), (4, 64));
-        assert_eq!(effective_compaction_input_bounds(1_000, 1_000), (64, 64));
-        assert_eq!(effective_compaction_input_bounds(0, 0), (2, 2));
+        assert_eq!(effective_compaction_input_bounds(4, 1_000, 64), (4, 64));
+        assert_eq!(
+            effective_compaction_input_bounds(1_000, 1_000, 64),
+            (64, 64)
+        );
+        assert_eq!(effective_compaction_input_bounds(0, 0, 64), (2, 2));
+        assert_eq!(effective_compaction_input_bounds(4, 1_000, 12), (4, 12));
+        assert_eq!(effective_compaction_input_bounds(0, 0, 1), (2, 2));
     }
 
     #[test]

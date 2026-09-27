@@ -45,29 +45,10 @@ use crate::upload::manager::SstableComponentBytes;
 use super::control::{SubmissionTicket, TableCompactionPause, TaskTracker};
 use super::metadata::{CompactionTask, SSTableMetadata};
 
-/// One queued task per worker is sufficient to keep every worker busy while
-/// preventing a large SSTable backlog from becoming an in-memory task backlog.
-const TASK_QUEUE_CAPACITY_PER_WORKER: usize = 1;
-
-/// Completed outputs waiting for the maintenance thread are bounded to two per
-/// worker. Workers apply backpressure here instead of growing a result vector.
-const RESULT_QUEUE_CAPACITY_PER_WORKER: usize = 2;
-
 /// Reader pool used to obtain compaction input SSTable readers so they count
 /// against the engine-wide resident-reader bound (FMEA #11). Keyed identically
 /// to the live read path: `(table_id, gen_num)` over `FileReadAt` readers.
 type CompactionReaderPool = SharedReaderPool<ferrosa_sstable::io::FileReadAt>;
-
-/// Conservative peak-memory budget charged to ONE concurrent streaming
-/// compaction. Since compaction merges a partition-group at a time (widest
-/// partition × inputs + reader/writer buffers), not the whole SSTable set, a
-/// few hundred MB is a safe worst case per task. Used to auto-tune the
-/// concurrency cap from the configured memory limit.
-const PER_COMPACTION_MEM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Hard ceiling on auto-derived worker threads / concurrency, so a very large
-/// host does not spawn an unreasonable number of compaction threads.
-const MAX_AUTO_COMPACTION_PARALLELISM: usize = 8;
 
 /// Fraction (as a divisor) of the configured memory limit that compaction may
 /// budget across all concurrent tasks. `2` = at most half of RAM is charged to
@@ -119,12 +100,18 @@ fn detected_memory_limit_bytes() -> Option<u64> {
 /// than `cpus` (so each concurrent merge can own a worker) and never more than
 /// `memory/2 / per-task-budget` (so peak compaction memory stays under half the
 /// node's limit). Always at least 1. `None` memory → CPU-scaled default of 2.
-fn auto_tuned_max_concurrent(cpus: usize, mem_limit_bytes: Option<u64>) -> usize {
-    let cpu_cap = cpus.clamp(1, MAX_AUTO_COMPACTION_PARALLELISM);
+fn auto_tuned_max_concurrent(
+    cpus: usize,
+    mem_limit_bytes: Option<u64>,
+    parallelism_cap: usize,
+    per_task_budget_bytes: u64,
+) -> usize {
+    let parallelism_cap = parallelism_cap.max(1);
+    let cpu_cap = cpus.clamp(1, parallelism_cap);
     let mem_cap = match mem_limit_bytes {
         Some(mem) => {
-            let budgeted = mem / COMPACTION_MEM_DIVISOR / PER_COMPACTION_MEM_BUDGET_BYTES;
-            (budgeted as usize).clamp(1, MAX_AUTO_COMPACTION_PARALLELISM)
+            let budgeted = mem / COMPACTION_MEM_DIVISOR / per_task_budget_bytes.max(1);
+            (budgeted as usize).clamp(1, parallelism_cap)
         }
         // No memory signal: keep the historical conservative default.
         None => 2,
@@ -135,8 +122,8 @@ fn auto_tuned_max_concurrent(cpus: usize, mem_limit_bytes: Option<u64>) -> usize
 /// Pure auto-tune for worker threads: one per CPU, bounded. Extra idle workers
 /// are cheap (they block on `recv`), and having at least as many workers as the
 /// concurrency cap lets every permitted merge run without head-of-line blocking.
-fn auto_tuned_workers(cpus: usize) -> usize {
-    cpus.clamp(1, MAX_AUTO_COMPACTION_PARALLELISM)
+fn auto_tuned_workers(cpus: usize, parallelism_cap: usize) -> usize {
+    cpus.clamp(1, parallelism_cap.max(1))
 }
 
 fn available_cpus() -> usize {
@@ -148,27 +135,32 @@ fn available_cpus() -> usize {
 /// Resolve the concurrent-compaction cap: explicit env override, else auto-tuned
 /// from CPU + configured memory (never zero).
 fn configured_max_concurrent_compactions() -> usize {
-    if let Some(n) = std::env::var("FERROSA_MAX_CONCURRENT_COMPACTIONS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-    {
-        return n;
-    }
-    auto_tuned_max_concurrent(available_cpus(), detected_memory_limit_bytes())
+    let tuning = crate::runtime_tuning::storage_runtime_tuning();
+    let default = auto_tuned_max_concurrent(
+        available_cpus(),
+        detected_memory_limit_bytes(),
+        tuning.max_auto_compaction_parallelism,
+        tuning.per_compaction_mem_budget_bytes,
+    );
+    crate::runtime_tuning::read_usize(
+        "FERROSA_MAX_CONCURRENT_COMPACTIONS",
+        default,
+        1,
+        tuning.max_auto_compaction_parallelism,
+    )
 }
 
 /// Resolve the compaction worker-thread count: explicit env override, else
 /// auto-tuned from CPU count (never zero).
 fn configured_compaction_workers() -> usize {
-    if let Some(n) = std::env::var("FERROSA_COMPACTION_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-    {
-        return n;
-    }
-    auto_tuned_workers(available_cpus())
+    let tuning = crate::runtime_tuning::storage_runtime_tuning();
+    let default = auto_tuned_workers(available_cpus(), tuning.max_auto_compaction_parallelism);
+    crate::runtime_tuning::read_usize(
+        "FERROSA_COMPACTION_WORKERS",
+        default,
+        1,
+        tuning.max_auto_compaction_parallelism,
+    )
 }
 
 /// A counting semaphore that caps the number of compaction merges running at
@@ -650,6 +642,7 @@ impl CompactionExecutor {
     }
 
     fn build(reader_pool: Option<CompactionReaderPool>) -> Self {
+        let tuning = *crate::runtime_tuning::storage_runtime_tuning();
         let worker_count = configured_compaction_workers();
         let max_concurrent = configured_max_concurrent_compactions();
         tracing::info!(
@@ -661,10 +654,10 @@ impl CompactionExecutor {
              FERROSA_COMPACTION_WORKERS / FERROSA_MAX_CONCURRENT_COMPACTIONS)"
         );
         let (result_tx, result_rx) = crossbeam_channel::bounded::<CompactionResult>(
-            worker_count.saturating_mul(RESULT_QUEUE_CAPACITY_PER_WORKER),
+            worker_count.saturating_mul(tuning.result_queue_capacity_per_worker),
         );
         let (failure_tx, failure_rx) = crossbeam_channel::bounded::<CompactionFailure>(
-            worker_count.saturating_mul(RESULT_QUEUE_CAPACITY_PER_WORKER),
+            worker_count.saturating_mul(tuning.result_queue_capacity_per_worker),
         );
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let tracker = TaskTracker::default();
@@ -680,8 +673,9 @@ impl CompactionExecutor {
         let mut handles = Vec::with_capacity(worker_count);
 
         for worker_idx in 0..worker_count {
-            let (task_tx, task_rx) =
-                crossbeam_channel::bounded::<QueuedCompactionTask>(TASK_QUEUE_CAPACITY_PER_WORKER);
+            let (task_tx, task_rx) = crossbeam_channel::bounded::<QueuedCompactionTask>(
+                tuning.task_queue_capacity_per_worker,
+            );
             task_txs.push(task_tx);
             let result_tx = result_tx.clone();
             let failure_tx = failure_tx.clone();
@@ -3656,34 +3650,46 @@ mod tests {
     /// Auto-tune is bounded by BOTH cpu and memory, and never zero.
     #[test]
     fn auto_tuned_concurrency_is_bounded_by_cpu_and_memory() {
-        // 2 GB (the dev forcing function): half of RAM / 256 MB = 4 tasks,
-        // capped by cpus. With ample cpus the memory bound (4) wins.
+        // 2 GB: half of RAM / 256 MB = 4 tasks, capped by CPUs.
         assert_eq!(
-            auto_tuned_max_concurrent(16, Some(2 * 1024 * 1024 * 1024)),
+            auto_tuned_max_concurrent(16, Some(2 * 1024 * 1024 * 1024), 8, 256 * 1024 * 1024),
             4
         );
         // Few cpus cap below the memory allowance.
         assert_eq!(
-            auto_tuned_max_concurrent(2, Some(2 * 1024 * 1024 * 1024)),
+            auto_tuned_max_concurrent(2, Some(2 * 1024 * 1024 * 1024), 8, 256 * 1024 * 1024),
             2
         );
         // Tiny memory floors at 1, never zero.
-        assert_eq!(auto_tuned_max_concurrent(8, Some(64 * 1024 * 1024)), 1);
+        assert_eq!(
+            auto_tuned_max_concurrent(8, Some(64 * 1024 * 1024), 8, 256 * 1024 * 1024),
+            1
+        );
         // Huge memory is still capped by the parallelism ceiling and cpus.
         assert_eq!(
-            auto_tuned_max_concurrent(64, Some(256u64 * 1024 * 1024 * 1024)),
-            MAX_AUTO_COMPACTION_PARALLELISM
+            auto_tuned_max_concurrent(64, Some(256u64 * 1024 * 1024 * 1024), 8, 256 * 1024 * 1024),
+            8
+        );
+        // The operator-set parallelism ceiling is honored when raised.
+        assert_eq!(
+            auto_tuned_max_concurrent(64, Some(256u64 * 1024 * 1024 * 1024), 32, 256 * 1024 * 1024),
+            32
         );
         // No memory signal → historical conservative default of 2 (cpu-capped).
-        assert_eq!(auto_tuned_max_concurrent(8, None), 2);
-        assert_eq!(auto_tuned_max_concurrent(1, None), 1);
+        assert_eq!(auto_tuned_max_concurrent(8, None, 8, 256 * 1024 * 1024), 2);
+        assert_eq!(auto_tuned_max_concurrent(1, None, 8, 256 * 1024 * 1024), 1);
+        assert_eq!(
+            auto_tuned_max_concurrent(64, None, 32, 256 * 1024 * 1024),
+            2
+        );
     }
 
     #[test]
     fn auto_tuned_workers_track_cpus_within_bounds() {
-        assert_eq!(auto_tuned_workers(1), 1);
-        assert_eq!(auto_tuned_workers(4), 4);
-        assert_eq!(auto_tuned_workers(64), MAX_AUTO_COMPACTION_PARALLELISM);
+        assert_eq!(auto_tuned_workers(1, 8), 1);
+        assert_eq!(auto_tuned_workers(4, 8), 4);
+        assert_eq!(auto_tuned_workers(64, 8), 8);
+        assert_eq!(auto_tuned_workers(64, 32), 32);
     }
 
     #[test]

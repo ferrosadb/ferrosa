@@ -1478,9 +1478,10 @@ impl FileFlushTarget {
         })?;
 
         use std::io::Read;
-        const DIGEST_READ_CHUNK: usize = 1 << 20; // 1 MiB, reused across the read.
+        let digest_read_chunk_bytes =
+            crate::runtime_tuning::storage_runtime_tuning().digest_read_chunk_bytes;
         let mut hasher = ferrosa_sstable::checksum::DigestCrc32::new();
-        let mut buf = vec![0u8; DIGEST_READ_CHUNK];
+        let mut buf = vec![0u8; digest_read_chunk_bytes];
         #[cfg(test)]
         let readback_hook = readback_test_support::for_path(&data_path);
         loop {

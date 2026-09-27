@@ -148,10 +148,11 @@ volume or changing query results.
     closed segment; restart replay remains the durability path for smaller
     memtables.
 11. **Backlog work is bounded and self-rescheduling.** Planning uses cached
-    descriptor scalars with a 64-input hard cap, task/result queues are
-    fixed-capacity, and every poll admits a fixed number of compactions until
-    the strategy threshold is met. Automatic flush ticks handle at most eight
-    tables before yielding to later maintenance.
+    descriptor scalars with a configurable input cap, task/result queues have
+    configurable per-worker capacities, and maintenance poll batch limits are
+    runtime tunable. Positive values are validated and defaults preserve the
+    existing backlog and maintenance behavior. See the flush and
+    compaction runtime tuning table in `README.md`.
 12. **A generation is verified before it can be discovered.** `flush_files`
     (shared by flush and compaction promotion) never promotes staged `.tmp`
     output to a live name until length checks, an fsync of the `.tmp`
