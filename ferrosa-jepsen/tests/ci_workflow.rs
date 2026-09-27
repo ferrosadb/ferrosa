@@ -108,6 +108,31 @@ fn postgres_jepsen_compose_advertises_host_reachable_cql_ports() {
 }
 
 #[test]
+fn postgres_fault_workflow_waits_for_all_nodes_to_form_before_creating_role() {
+    let path = ci_yaml_path();
+    let yaml =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let readiness = step_body(&yaml, "Wait for PostgreSQL cluster formation");
+    let readiness_position = yaml
+        .find("- name: Wait for PostgreSQL cluster formation")
+        .expect("PostgreSQL cluster readiness step exists");
+    let role_position = yaml
+        .find("- name: Create the test CQL role")
+        .expect("test CQL role setup step exists");
+
+    assert!(
+        readiness.contains("/api/cluster/ring")
+            && readiness.contains("Normal")
+            && readiness.contains("SECONDS + 120"),
+        "PostgreSQL fault setup must wait for the three-node ring to form; step was:\n{readiness}"
+    );
+    assert!(
+        readiness_position < role_position,
+        "the test role must be created only after cluster formation is verified"
+    );
+}
+
+#[test]
 fn multi_dc_nightly_workload_invokes_current_run_subcommand() {
     let path = multi_dc_nightly_yaml_path();
     let yaml =
