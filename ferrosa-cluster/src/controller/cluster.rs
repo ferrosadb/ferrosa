@@ -1485,7 +1485,13 @@ impl ModeController {
             // instance (same Arc the handler serves) — the last mile that makes
             // live BEGIN…COMMIT reach quorum instead of "Accord quorum
             // unavailable" (a node is never in its own peer map).
-            let accord_state = publish_accord_state(&self.accord_state_slot, built);
+            let accord_state = match publish_accord_state(&self.accord_state_slot, built) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::error!(%error, "failed to register PostgreSQL MVCC observer on Accord state");
+                    return;
+                }
+            };
             accord_state_for_maintenance = accord_state.clone();
 
             let accord_handler = Arc::new(AccordHandler::new(

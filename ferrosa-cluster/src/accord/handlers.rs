@@ -34,6 +34,8 @@ pub type AccordState = Arc<parking_lot::Mutex<AccordStateMachine>>;
 /// the cluster controller (which creates it during formation) to the session
 /// layer (whose transaction committer needs it to cast the coordinator's own
 /// PreAccept vote locally — a node is never in its own peer map).
+/// PostgreSQL MVCC observers registered before formation are retained here and
+/// installed before the replica state becomes visible to message handlers.
 ///
 /// The session's `SessionCore` is built *before* the controller forms the
 /// cluster and creates the state, so the two cannot share a plain `AccordState`
@@ -42,12 +44,65 @@ pub type AccordState = Arc<parking_lot::Mutex<AccordStateMachine>>;
 /// demand. Empty until formation (and in standalone/tests), in which case the
 /// committer falls back to remote-only votes (correct when peers are the
 /// replicas).
-pub type AccordStateSlot = Arc<arc_swap::ArcSwapOption<parking_lot::Mutex<AccordStateMachine>>>;
+#[derive(Clone)]
+pub struct AccordStateSlot {
+    inner: Arc<AccordStateSlotInner>,
+}
+
+struct AccordStateSlotInner {
+    state: arc_swap::ArcSwapOption<parking_lot::Mutex<AccordStateMachine>>,
+    postgres_mvcc_observers:
+        parking_lot::Mutex<Vec<Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>>>,
+}
+
+impl AccordStateSlot {
+    pub fn load_full(&self) -> Option<AccordState> {
+        self.inner.state.load_full()
+    }
+
+    /// Register an MVCC observer on the published state, or retain it until
+    /// cluster formation publishes the local replica state.
+    pub fn register_postgres_mvcc_observer(
+        &self,
+        observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
+    ) -> Result<(), String> {
+        let mut observers = self.inner.postgres_mvcc_observers.lock();
+        if observers
+            .iter()
+            .any(|registered| Arc::ptr_eq(registered, &observer))
+        {
+            return Ok(());
+        }
+        if let Some(state) = self.load_full() {
+            state
+                .lock()
+                .register_postgres_mvcc_observer(observer.clone())?;
+        }
+        observers.push(observer);
+        Ok(())
+    }
+
+    fn publish(&self, state: AccordState) -> Result<(), String> {
+        let observers = self.inner.postgres_mvcc_observers.lock();
+        for observer in observers.iter() {
+            state
+                .lock()
+                .register_postgres_mvcc_observer(observer.clone())?;
+        }
+        self.inner.state.store(Some(state));
+        Ok(())
+    }
+}
 
 /// An empty [`AccordStateSlot`] — the initial state before the controller
 /// publishes this node's live `AccordState`.
 pub fn empty_accord_state_slot() -> AccordStateSlot {
-    Arc::new(arc_swap::ArcSwapOption::empty())
+    AccordStateSlot {
+        inner: Arc::new(AccordStateSlotInner {
+            state: arc_swap::ArcSwapOption::empty(),
+            postgres_mvcc_observers: parking_lot::Mutex::new(Vec::new()),
+        }),
+    }
 }
 
 /// Publish `state` into `slot` and return it, so the node's [`AccordHandler`]
@@ -55,9 +110,12 @@ pub fn empty_accord_state_slot() -> AccordStateSlot {
 /// instance. The controller calls this once during cluster formation, then
 /// serves the returned state from its handler — guaranteeing the coordinator's
 /// local self-vote uses exactly the state its remote peers see.
-pub fn publish_accord_state(slot: &AccordStateSlot, state: AccordState) -> AccordState {
-    slot.store(Some(state.clone()));
-    state
+pub fn publish_accord_state(
+    slot: &AccordStateSlot,
+    state: AccordState,
+) -> Result<AccordState, String> {
+    slot.publish(state.clone())?;
+    Ok(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -556,7 +614,7 @@ mod tests {
 
         let sm = AccordStateMachine::new(7, std::sync::Arc::new(MockSyncWriter::new()));
         let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
-        let served = publish_accord_state(&slot, state.clone());
+        let served = publish_accord_state(&slot, state.clone()).expect("publish state");
 
         // The handler is constructed from the returned/served state.
         let _handler = AccordHandler::new(served.clone(), 7);

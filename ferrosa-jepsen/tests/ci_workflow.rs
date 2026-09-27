@@ -22,6 +22,10 @@ fn multi_dc_nightly_yaml_path() -> PathBuf {
     repo_root().join(".github/workflows/jepsen-multi-dc-nightly.yml")
 }
 
+fn postgres_jepsen_compose_path() -> PathBuf {
+    repo_root().join("ferrosa-jepsen/tests/docker/jepsen-cluster.yml")
+}
+
 fn step_body<'a>(yaml: &'a str, step_name: &str) -> &'a str {
     let marker = format!("- name: {step_name}");
     let start = yaml
@@ -68,6 +72,63 @@ fn legacy_test_job_still_excludes_ferrosa_jepsen() {
         yaml.contains("--exclude ferrosa-jepsen"),
         "the general-purpose `test` job must keep `--exclude ferrosa-jepsen` so it \
          doesn't try to spin Docker. The new jepsen-smoke job runs the suite separately."
+    );
+}
+
+#[test]
+fn postgres_jepsen_compose_advertises_host_reachable_cql_ports() {
+    let path = postgres_jepsen_compose_path();
+    let compose =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(&compose).expect("parse PostgreSQL Jepsen compose YAML");
+    let services = parsed
+        .get("services")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("services mapping");
+
+    for (node, port) in [("node1", 49042), ("node2", 49043), ("node3", 49044)] {
+        let service = services
+            .get(serde_yaml::Value::String(node.into()))
+            .unwrap_or_else(|| panic!("service {node} missing"));
+        let environment = service
+            .get("environment")
+            .and_then(serde_yaml::Value::as_mapping)
+            .unwrap_or_else(|| panic!("{node} missing environment"));
+        let actual = environment
+            .get(serde_yaml::Value::String("FERROSA_CQL_BROADCAST".into()))
+            .and_then(serde_yaml::Value::as_str);
+
+        assert_eq!(
+            actual,
+            Some(format!("127.0.0.1:{port}").as_str()),
+            "{node} must advertise the CQL endpoint reachable by the host workload driver"
+        );
+    }
+}
+
+#[test]
+fn postgres_fault_workflow_waits_for_all_nodes_to_form_before_creating_role() {
+    let path = ci_yaml_path();
+    let yaml =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let readiness = step_body(&yaml, "Wait for PostgreSQL cluster formation");
+    let readiness_position = yaml
+        .find("- name: Wait for PostgreSQL cluster formation")
+        .expect("PostgreSQL cluster readiness step exists");
+    let role_position = yaml
+        .find("- name: Create the test CQL role")
+        .expect("test CQL role setup step exists");
+
+    assert!(
+        readiness.contains("/api/cluster/ring")
+            && readiness.contains("Normal")
+            && readiness.contains("SECONDS + 120"),
+        "PostgreSQL fault setup must wait for the three-node ring to form; step was:\n{readiness}"
+    );
+    assert!(
+        readiness_position < role_position,
+        "the test role must be created only after cluster formation is verified"
     );
 }
 

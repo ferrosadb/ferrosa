@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 doc: roadmap
-last_updated: 2026-06-25
+last_updated: 2026-09-27
 ---
 
 # ferrosa-postgres — Roadmap
@@ -23,6 +23,10 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   abort or return the committed value as appropriate; versions are reclaimed
   after the oldest active snapshot advances. Explicit isolation levels other
   than SERIALIZABLE fail loud. CQL transactions remain on Accord.
+- **PostgreSQL strict-serializability workload.** The native-driver Jepsen test
+  checks transfers, register updates, predicate/phantom histories, and
+  write-skew histories. Its fault schedule pauses one replica and verifies the
+  history and final state on the active quorum.
 - **Parameterized DML** (was FMEA PG-2, `feat/pg-extended-crud`).
   `INSERT`/`UPDATE`/`DELETE` accept bound `$N` parameters over the extended
   protocol: prepared as `PreparedKind::{Insert,Update,Delete}`, substituted at
@@ -36,12 +40,11 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Now (highest value)
 
-- **Jepsen PostgreSQL strict-serializability workload** (FMEA PG-11). PostgreSQL
-  mutation batches carry their snapshot into Accord; replica apply transports
-  row-version metadata for active snapshots. Cluster validation currently uses
-  a global marker instead of the supplied read/write table set. Exercise
-  multi-client register, transfer, write-skew, predicate, and real-time-order
-  histories with node failures before claiming the Jepsen model across nodes.
+- **Replica catch-up and mixed-protocol correctness** (FMEA PG-11). The fault
+  schedule checks PostgreSQL transaction histories while one replica is
+  paused, then checks final-state convergence on the active quorum. Verify
+  post-resume Accord catch-up and histories that mix PostgreSQL transactions
+  with CQL writes before making those broader claims.
 - **End-to-end SELECT streaming.** The storage provider is bounded, but
   `ferrosa_sql` collects base scans/results and PostgreSQL rendering buffers all
   wire messages. Stream through the executor and socket writer to bound memory.

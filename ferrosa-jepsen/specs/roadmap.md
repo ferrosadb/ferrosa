@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 doc: roadmap
-last_updated: 2026-07-16
+last_updated: 2026-09-27
 ---
 
 # ferrosa-jepsen — Roadmap
@@ -23,6 +23,11 @@ external checkers.
 - **Implement the `report` CLI subcommands.** `report list`/`compare`/`render`
   log "not yet implemented" (`main.rs`) despite `report/{comparison,timeline,
   anomaly}` modules existing. Finish wiring them to the archive.
+
+- **PostgreSQL recovery and protocol-boundary histories.** The strict
+  serializability checker and active-quorum pause workload are wired. Verify
+  post-resume replica catch-up and histories that mix CQL writes with PostgreSQL
+  transactions before claiming those guarantees.
 
 ## Next
 

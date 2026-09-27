@@ -133,6 +133,16 @@ pub struct AccordStateMachine {
 }
 
 impl AccordStateMachine {
+    /// Register the PostgreSQL MVCC observer on this replica's apply engine.
+    /// The transaction coordinator also has a local applier, but local replica
+    /// votes are applied through `apply_engine`, so observers must reach it.
+    pub fn register_postgres_mvcc_observer(
+        &self,
+        observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
+    ) -> Result<(), String> {
+        self.apply_engine.register_postgres_mvcc_observer(observer)
+    }
+
     /// Create a new state machine for the given node.
     ///
     /// Uses a [`NoopStorageApplier`]: the apply seam records `(txn_id, t)` but

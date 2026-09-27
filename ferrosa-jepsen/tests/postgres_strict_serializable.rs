@@ -1,4 +1,9 @@
 //! Native PostgreSQL driver history test for distributed MVCC transactions.
+//! Correctness: committed transactions must admit an atomic serial order that
+//! reproduces reads and respects real-time precedence. Normal runs require every
+//! node to converge; the pause schedule checks only the active quorum.
+//! Last revised: 2026-09-27
+//! Last changed: Added register, predicate/phantom, and write-skew histories.
 //!
 //! Run with `--features postgres-jepsen` and a semicolon-separated list of at
 //! least three native PostgreSQL connection URLs in
@@ -11,7 +16,9 @@ use anyhow::{bail, Context, Result};
 use ferrosa_jepsen::checker::strict_serializable::{
     check_strict_serializable, RecordedTransaction, TransactionOperation,
 };
+use scylla::client::session_builder::SessionBuilder;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,8 +26,14 @@ use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
 const ACTORS: usize = 5;
-const TRANSACTIONS_PER_ACTOR: usize = 4;
+const TRANSACTIONS_PER_ACTOR: usize = 2;
 const INITIAL_BALANCE: i64 = 10_000;
+const POSTGRES_DEFAULT_SCHEMA: &str = "public";
+const CLIENT_NODE_COUNT_ENV: &str = "FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT";
+const CQL_URLS_ENV: &str = "FERROSA_TEST_CQL_URLS";
+const FAULT_READY_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_READY_FILE";
+const FAULT_ACTIVE_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_ACTIVE_FILE";
+const FAULT_COMPLETE_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_COMPLETE_FILE";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[cfg(feature = "postgres-jepsen")]
@@ -40,54 +53,166 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         );
     }
 
+    let actor_client_count = actor_client_count(
+        urls.len(),
+        std::env::var(CLIENT_NODE_COUNT_ENV).ok().as_deref(),
+    )?;
+    let cql_urls = std::env::var(CQL_URLS_ENV)
+        .context("set FERROSA_TEST_CQL_URLS to semicolon-separated CQL node addresses")?;
+    let cql_urls: Vec<_> = cql_urls
+        .split(';')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if cql_urls.is_empty() {
+        bail!("FERROSA_TEST_CQL_URLS must contain at least one CQL node address");
+    }
+    let fault_schedule = FaultSchedule::from_env()?;
+
     let (clients, connections) = connect_all(&urls).await?;
     let table = format!("pg_ssi_{}", Uuid::new_v4().simple());
-    clients[0]
-        .batch_execute(&format!(
-            "CREATE TABLE {table} (id TEXT PRIMARY KEY, balance BIGINT NOT NULL);\
-             INSERT INTO {table} (id, balance) VALUES ('a', {INITIAL_BALANCE}), ('b', {INITIAL_BALANCE});"
-        ))
+    // PostgreSQL DDL is not part of this gateway's supported SQL surface. Create
+    // the backing CQL table through CQL, then exercise only SQL DML/transactions
+    // through the native PostgreSQL driver below.
+    let cql_session = SessionBuilder::new()
+        .known_nodes(&cql_urls)
+        .build()
         .await
-        .context("create and initialize strict-serializability workload table")?;
+        .context("connect to CQL cluster for strict-serializability table setup")?;
+    cql_session
+        .query_unpaged(
+            "CREATE KEYSPACE IF NOT EXISTS public WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}",
+            &[],
+        )
+        .await
+        .context("create PostgreSQL default schema keyspace through CQL")?;
+    cql_session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE {POSTGRES_DEFAULT_SCHEMA}.{table} (id text PRIMARY KEY, balance bigint)"
+            ),
+            &[],
+        )
+        .await
+        .context("create strict-serializability workload table through CQL")?;
+    for statement in initial_workload_statements(&table) {
+        clients[0]
+            .execute(&statement, &[])
+            .await
+            .context("initialize strict-serializability workload balances")?;
+    }
     wait_for_table_on_all_nodes(&clients, &table).await?;
+
+    // Each Jepsen actor needs a distinct PostgreSQL session. Sharing one
+    // Client per node lets concurrent actors interleave BEGIN/COMMIT on the
+    // same server-side transaction state.
+    let actor_urls = actor_client_urls(&urls, actor_client_count);
+    let (actor_clients, actor_connections) = connect_all(&actor_urls).await?;
+
+    if let Some(schedule) = &fault_schedule {
+        schedule.announce_ready().await?;
+        schedule.wait_until_injected().await?;
+    }
 
     let event_clock = Arc::new(AtomicU64::new(1));
     let history = Arc::new(Mutex::new(Vec::with_capacity(
-        ACTORS * TRANSACTIONS_PER_ACTOR,
+        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
     )));
+    let predicate_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
+    let write_skew_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
+    let (actor_failure_tx, actor_failure_rx) = tokio::sync::watch::channel(false);
     let mut actors = Vec::with_capacity(ACTORS);
-    for actor in 0..ACTORS {
-        let client = Arc::clone(&clients[actor % clients.len()]);
+    for (actor, actor_client) in actor_clients.iter().enumerate() {
+        let client = Arc::clone(actor_client);
         let event_clock = Arc::clone(&event_clock);
         let history = Arc::clone(&history);
+        let predicate_barrier = Arc::clone(&predicate_barrier);
+        let write_skew_barrier = Arc::clone(&write_skew_barrier);
+        let actor_failure_tx = actor_failure_tx.clone();
+        let mut actor_failure_rx = actor_failure_rx.clone();
         let table = table.clone();
         actors.push(tokio::spawn(async move {
-            for iteration in 0..TRANSACTIONS_PER_ACTOR {
-                let id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
-                let transaction = transfer_once(&client, &table, id, &event_clock).await?;
+            let result = async {
+                for iteration in 0..TRANSACTIONS_PER_ACTOR {
+                    let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
+                    let transfer =
+                        transfer_once(&client, &table, operation_id * 2, &event_clock).await?;
+                    history
+                        .lock()
+                        .expect("history mutex poisoned")
+                        .push(transfer);
+                    let register =
+                        register_once(&client, &table, operation_id * 2 + 1, &event_clock).await?;
+                    history
+                        .lock()
+                        .expect("history mutex poisoned")
+                        .push(register);
+                }
+
+                wait_for_phase(&predicate_barrier, &mut actor_failure_rx).await?;
+                let predicate = if actor == 0 {
+                    insert_phantom_once(&client, &table, 1_000, &event_clock).await?
+                } else {
+                    observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock)
+                        .await?
+                };
                 history
                     .lock()
                     .expect("history mutex poisoned")
-                    .push(transaction);
+                    .push(predicate);
+
+                wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
+                let write_skew =
+                    write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?;
+                history
+                    .lock()
+                    .expect("history mutex poisoned")
+                    .push(write_skew);
+                Ok(())
             }
-            Result::<()>::Ok(())
+            .await;
+
+            if result.is_err() {
+                actor_failure_tx.send_replace(true);
+            }
+            result
         }));
     }
+    let mut actor_error = None;
     for actor in actors {
-        actor.await.context("join PostgreSQL workload actor")??;
+        match actor.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if actor_error.is_none() => actor_error = Some(error),
+            Err(error) if actor_error.is_none() => {
+                actor_error =
+                    Some(anyhow::Error::new(error).context("join PostgreSQL workload actor"))
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+    if let Some(schedule) = &fault_schedule {
+        schedule.announce_complete().await?;
+    }
+    if let Some(error) = actor_error {
+        return Err(error);
     }
 
-    let (final_a, final_b) = read_balances(&clients[0], &table).await?;
-    let final_state = BTreeMap::from([("a".to_owned(), final_a), ("b".to_owned(), final_b)]);
+    let final_state = read_workload_state(&clients[0], &table).await?;
+    let final_a = final_state["a"];
+    let final_b = final_state["b"];
     let initial = BTreeMap::from([
         ("a".to_owned(), INITIAL_BALANCE),
         ("b".to_owned(), INITIAL_BALANCE),
+        ("register".to_owned(), 0),
+        ("doctor-a".to_owned(), 1),
+        ("doctor-b".to_owned(), 1),
     ]);
     let mut history = history.lock().expect("history mutex poisoned").clone();
     history.sort_by_key(|transaction| transaction.id);
     assert_eq!(
         history.len(),
-        ACTORS * TRANSACTIONS_PER_ACTOR,
+        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
         "every invoked operation must have a recorded completion"
     );
     assert!(
@@ -98,16 +223,59 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
             >= 2,
         "the workload must commit multiple transactions to exercise concurrency"
     );
+    assert!(
+        history.iter().any(|transaction| {
+            transaction.committed
+                && transaction.operations.iter().any(|operation| {
+                    matches!(operation, TransactionOperation::Write { key, .. } if key == "register")
+                })
+        }),
+        "the native register workload must commit at least one read/modify/write"
+    );
+    assert!(
+        history
+            .iter()
+            .filter(|transaction| {
+                transaction.committed
+                    && transaction.operations.iter().any(|operation| {
+                        matches!(operation, TransactionOperation::Write { key, .. } if key == "a" || key == "b")
+                    })
+            })
+            .count()
+            >= 2,
+        "the native transfer workload must commit multiple multi-row transactions"
+    );
+    assert!(
+        history.iter().any(|transaction| {
+            transaction.operations.iter().any(|operation| {
+                matches!(operation, TransactionOperation::Write { key, .. } if key == "phantom")
+            })
+        }),
+        "the predicate workload must attempt a phantom insert"
+    );
+    assert!(
+        history.iter().any(|transaction| {
+            transaction.committed
+                && transaction.operations.iter().any(|operation| {
+                    matches!(operation, TransactionOperation::Write { key, .. } if key.starts_with("doctor-"))
+                })
+        }),
+        "the native write-skew workload must commit at least one doctor update"
+    );
 
-    for (node, client) in clients.iter().enumerate().skip(1) {
-        let node_state = read_balances(client, &table)
+    // The fault schedule verifies transaction history and agreement on the
+    // reachable quorum. Rejoining a replica's Accord catch-up is a separate
+    // recovery contract; normal runs still require every node to converge.
+    let convergence_nodes =
+        convergence_node_count(clients.len(), actor_client_count, fault_schedule.is_some());
+    for (node, client) in clients.iter().enumerate().take(convergence_nodes).skip(1) {
+        wait_for_workload_state(client, &table, &final_state)
             .await
-            .with_context(|| format!("read final balances from PostgreSQL node {node}"))?;
-        assert_eq!(
-            node_state,
-            (final_a, final_b),
-            "PostgreSQL nodes must converge on the same committed transaction state"
-        );
+            .with_context(|| {
+                format!(
+                    "PostgreSQL node {node} did not converge on the committed transaction state"
+                )
+            })?;
     }
 
     if let Ok(path) = std::env::var("FERROSA_TEST_POSTGRES_HISTORY_PATH") {
@@ -120,16 +288,22 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         2 * INITIAL_BALANCE,
         "committed transfers must preserve total balance"
     );
+    assert_eq!(
+        final_state["doctor-a"] + final_state["doctor-b"],
+        1,
+        "serializable write-skew workload must preserve one doctor on call"
+    );
     check_strict_serializable(&initial, &final_state, &history)
         .map_err(anyhow::Error::from)
         .context("PostgreSQL transaction history violated strict serializability")?;
 
-    clients[0]
-        .batch_execute(&format!("DROP TABLE {table}"))
+    cql_session
+        .query_unpaged(format!("DROP TABLE {POSTGRES_DEFAULT_SCHEMA}.{table}"), &[])
         .await
-        .context("drop strict-serializability workload table")?;
+        .context("drop strict-serializability workload table through CQL")?;
     drop(clients);
-    for connection in connections {
+    drop(actor_clients);
+    for connection in connections.into_iter().chain(actor_connections) {
         connection
             .await
             .context("join PostgreSQL connection task")?
@@ -183,19 +357,44 @@ async fn wait_for_table_on_all_nodes(clients: &[Arc<Client>], table: &str) -> Re
     Ok(())
 }
 
-async fn read_balances(client: &Client, table: &str) -> Result<(i64, i64)> {
-    let balance = |id| async move {
-        Ok::<i64, tokio_postgres::Error>(
-            client
-                .query_one(
-                    &format!("SELECT balance FROM {table} WHERE id = $1"),
-                    &[&id],
-                )
-                .await?
-                .get(0),
-        )
-    };
-    Ok((balance("a").await?, balance("b").await?))
+async fn read_workload_state(client: &Client, table: &str) -> Result<BTreeMap<String, i64>> {
+    let mut state = BTreeMap::new();
+    for id in ["a", "b", "register", "doctor-a", "doctor-b", "phantom"] {
+        if let Some(row) = client
+            .query_opt(
+                &format!("SELECT balance FROM {table} WHERE id = $1"),
+                &[&id],
+            )
+            .await?
+        {
+            state.insert(id.to_owned(), row.get(0));
+        }
+    }
+    Ok(state)
+}
+
+async fn wait_for_workload_state(
+    client: &Client,
+    table: &str,
+    expected: &BTreeMap<String, i64>,
+) -> Result<()> {
+    let mut last_state = None;
+    let mut last_error = None;
+    for _ in 0..120 {
+        match read_workload_state(client, table).await {
+            Ok(state) if &state == expected => return Ok(()),
+            Ok(state) => {
+                last_state = Some(state);
+                last_error = None;
+            }
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if let Some(error) = last_error {
+        return Err(error).context("read workload state while waiting for replica convergence");
+    }
+    bail!("replica state {last_state:?} did not converge to {expected:?}");
 }
 
 async fn transfer_once(
@@ -270,7 +469,220 @@ async fn transfer_once(
     }
     .await;
 
-    let committed = match transfer {
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transfer,
+        event_clock,
+        "execute PostgreSQL transfer transaction",
+    )
+    .await
+}
+
+async fn register_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<RecordedTransaction> {
+    let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
+    let mut operations = Vec::with_capacity(2);
+    let transaction = async {
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await?;
+        let value: i64 = client
+            .query_one(
+                &format!("SELECT balance FROM {table} WHERE id = $1"),
+                &[&"register"],
+            )
+            .await?
+            .get(0);
+        operations.push(TransactionOperation::Read {
+            key: "register".to_owned(),
+            value: Some(value),
+        });
+        let next = value + 1;
+        client
+            .execute(
+                &format!("UPDATE {table} SET balance = $1 WHERE id = $2"),
+                &[&next, &"register"],
+            )
+            .await?;
+        operations.push(TransactionOperation::Write {
+            key: "register".to_owned(),
+            value: Some(next),
+        });
+        client.batch_execute("COMMIT").await?;
+        Result::<(), tokio_postgres::Error>::Ok(())
+    }
+    .await;
+
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transaction,
+        event_clock,
+        "execute PostgreSQL register transaction",
+    )
+    .await
+}
+
+async fn observe_predicate_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<RecordedTransaction> {
+    let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
+    let mut operations = Vec::with_capacity(3);
+    let transaction = async {
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await?;
+        let observed = read_predicate_values(client, table).await?;
+        operations.extend(predicate_observations(&observed));
+        client.batch_execute("COMMIT").await?;
+        Result::<(), tokio_postgres::Error>::Ok(())
+    }
+    .await;
+
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transaction,
+        event_clock,
+        "execute PostgreSQL predicate-read transaction",
+    )
+    .await
+}
+
+async fn insert_phantom_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<RecordedTransaction> {
+    let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
+    let mut operations = Vec::with_capacity(4);
+    let transaction = async {
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await?;
+        let observed = read_predicate_values(client, table).await?;
+        operations.extend(predicate_observations(&observed));
+        let phantom_value = 1_i64;
+        client
+            .execute(
+                &format!("INSERT INTO {table} (id, balance) VALUES ($1, $2)"),
+                &[&"phantom", &phantom_value],
+            )
+            .await?;
+        operations.push(TransactionOperation::Write {
+            key: "phantom".to_owned(),
+            value: Some(phantom_value),
+        });
+        client.batch_execute("COMMIT").await?;
+        Result::<(), tokio_postgres::Error>::Ok(())
+    }
+    .await;
+
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transaction,
+        event_clock,
+        "execute PostgreSQL predicate phantom insert",
+    )
+    .await
+}
+
+async fn write_skew_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<RecordedTransaction> {
+    let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
+    let mut operations = Vec::with_capacity(4);
+    let transaction = async {
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .await?;
+        let observed = read_predicate_values(client, table).await?;
+        operations.extend(predicate_observations(&observed));
+        if observed.get("doctor-a") == Some(&Some(1)) && observed.get("doctor-b") == Some(&Some(1))
+        {
+            let target = if id.is_multiple_of(2) {
+                "doctor-a"
+            } else {
+                "doctor-b"
+            };
+            let off_call = 0_i64;
+            client
+                .execute(
+                    &format!("UPDATE {table} SET balance = $1 WHERE id = $2"),
+                    &[&off_call, &target],
+                )
+                .await?;
+            operations.push(TransactionOperation::Write {
+                key: target.to_owned(),
+                value: Some(off_call),
+            });
+        }
+        client.batch_execute("COMMIT").await?;
+        Result::<(), tokio_postgres::Error>::Ok(())
+    }
+    .await;
+
+    finish_recorded_transaction(
+        client,
+        id,
+        invoked,
+        operations,
+        transaction,
+        event_clock,
+        "execute PostgreSQL write-skew transaction",
+    )
+    .await
+}
+
+async fn read_predicate_values(
+    client: &Client,
+    table: &str,
+) -> Result<BTreeMap<String, Option<i64>>, tokio_postgres::Error> {
+    let mut observed = BTreeMap::new();
+    for key in ["doctor-a", "doctor-b", "phantom"] {
+        let value = client
+            .query_opt(
+                &format!("SELECT balance FROM {table} WHERE id = $1"),
+                &[&key],
+            )
+            .await?
+            .map(|row| row.get(0));
+        observed.insert(key.to_owned(), value);
+    }
+    Ok(observed)
+}
+
+async fn finish_recorded_transaction(
+    client: &Client,
+    id: u64,
+    invoked: u64,
+    operations: Vec<TransactionOperation>,
+    result: Result<(), tokio_postgres::Error>,
+    event_clock: &AtomicU64,
+    failure_context: &'static str,
+) -> Result<RecordedTransaction> {
+    let committed = match result {
         Ok(()) => true,
         Err(error) if is_serialization_failure(&error) => {
             client
@@ -279,7 +691,7 @@ async fn transfer_once(
                 .context("rollback PostgreSQL serialization failure")?;
             false
         }
-        Err(error) => return Err(error).context("execute PostgreSQL transfer transaction"),
+        Err(error) => return Err(error).context(failure_context),
     };
     let completed = event_clock.fetch_add(1, Ordering::SeqCst);
     Ok(RecordedTransaction {
@@ -291,8 +703,292 @@ async fn transfer_once(
     })
 }
 
+async fn wait_for_phase(
+    barrier: &tokio::sync::Barrier,
+    actor_failure_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        if *actor_failure_rx.borrow() {
+            bail!("another PostgreSQL workload actor failed before the phase barrier");
+        }
+
+        tokio::select! {
+            _ = barrier.wait() => return Ok(()),
+            changed = actor_failure_rx.changed() => {
+                if changed.is_err() || *actor_failure_rx.borrow() {
+                    bail!("another PostgreSQL workload actor failed at the phase barrier");
+                }
+            }
+        }
+    }
+}
+
 fn is_serialization_failure(error: &tokio_postgres::Error) -> bool {
     error
         .code()
         .is_some_and(|sqlstate| sqlstate.code() == "40001")
+}
+
+fn initial_workload_statements(table: &str) -> [String; 5] {
+    [
+        format!("INSERT INTO {table} (id, balance) VALUES ('a', {INITIAL_BALANCE})"),
+        format!("INSERT INTO {table} (id, balance) VALUES ('b', {INITIAL_BALANCE})"),
+        format!("INSERT INTO {table} (id, balance) VALUES ('register', 0)"),
+        format!("INSERT INTO {table} (id, balance) VALUES ('doctor-a', 1)"),
+        format!("INSERT INTO {table} (id, balance) VALUES ('doctor-b', 1)"),
+    ]
+}
+
+fn predicate_observations(observed: &BTreeMap<String, Option<i64>>) -> Vec<TransactionOperation> {
+    ["doctor-a", "doctor-b", "phantom"]
+        .into_iter()
+        .map(|key| TransactionOperation::Read {
+            key: key.to_owned(),
+            value: observed.get(key).copied().flatten(),
+        })
+        .collect()
+}
+
+/// Selects the client endpoints used for transactions while still retaining
+/// every endpoint for convergence checks. The fault workflow excludes the
+/// node it pauses; normal runs use every supplied endpoint.
+fn actor_client_count(url_count: usize, configured: Option<&str>) -> Result<usize> {
+    let count = configured
+        .map(str::parse::<usize>)
+        .transpose()
+        .context("parse FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT")?
+        .unwrap_or(url_count);
+    if count < 2 || count > url_count {
+        bail!(
+            "{CLIENT_NODE_COUNT_ENV} must be between 2 and the number of PostgreSQL URLs ({url_count}), got {count}"
+        );
+    }
+    Ok(count)
+}
+
+/// Assign one session endpoint per actor, spreading sessions across the
+/// selected nodes without sharing a PostgreSQL transaction state machine.
+fn actor_client_urls<'a>(urls: &'a [&'a str], node_count: usize) -> Vec<&'a str> {
+    (0..ACTORS).map(|actor| urls[actor % node_count]).collect()
+}
+
+fn convergence_node_count(total_nodes: usize, active_nodes: usize, fault_scheduled: bool) -> usize {
+    if fault_scheduled {
+        active_nodes
+    } else {
+        total_nodes
+    }
+}
+
+/// Coordinates a real node failure with an external process controller. The
+/// test reports that schema setup is complete, waits until the controller has
+/// paused a replica, runs the workload, then signals that the replica can be
+/// resumed before convergence checks.
+struct FaultSchedule {
+    ready_file: PathBuf,
+    active_file: PathBuf,
+    complete_file: PathBuf,
+}
+
+impl FaultSchedule {
+    fn from_env() -> Result<Option<Self>> {
+        Self::from_paths(
+            std::env::var_os(FAULT_READY_FILE_ENV).map(PathBuf::from),
+            std::env::var_os(FAULT_ACTIVE_FILE_ENV).map(PathBuf::from),
+            std::env::var_os(FAULT_COMPLETE_FILE_ENV).map(PathBuf::from),
+        )
+    }
+
+    fn from_paths(
+        ready_file: Option<PathBuf>,
+        active_file: Option<PathBuf>,
+        complete_file: Option<PathBuf>,
+    ) -> Result<Option<Self>> {
+        let configured = [ready_file, active_file, complete_file];
+        if configured.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if configured.iter().any(Option::is_none) {
+            bail!("fault schedule requires all three PostgreSQL fault marker paths");
+        }
+        let [Some(ready_file), Some(active_file), Some(complete_file)] = configured else {
+            unreachable!("all PostgreSQL fault marker paths were checked above")
+        };
+        Ok(Some(Self {
+            ready_file,
+            active_file,
+            complete_file,
+        }))
+    }
+
+    async fn announce_ready(&self) -> Result<()> {
+        write_marker(&self.ready_file).await
+    }
+
+    async fn wait_until_injected(&self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while tokio::fs::metadata(&self.active_file).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("timed out waiting for the PostgreSQL replica pause")
+    }
+
+    async fn announce_complete(&self) -> Result<()> {
+        write_marker(&self.complete_file).await
+    }
+}
+
+async fn write_marker(path: &PathBuf) -> Result<()> {
+    tokio::fs::write(path, [])
+        .await
+        .with_context(|| format!("write PostgreSQL fault marker {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
+        predicate_observations, wait_for_phase, FaultSchedule, TransactionOperation,
+    };
+
+    #[test]
+    fn workload_fixture_uses_single_row_inserts_supported_by_the_postgres_gateway() {
+        let statements = initial_workload_statements("accounts");
+
+        assert_eq!(statements.len(), 5);
+        assert_eq!(
+            statements[0],
+            "INSERT INTO accounts (id, balance) VALUES ('a', 10000)"
+        );
+        assert_eq!(
+            statements[1],
+            "INSERT INTO accounts (id, balance) VALUES ('b', 10000)"
+        );
+    }
+
+    #[test]
+    fn workload_fixture_includes_register_and_write_skew_rows() {
+        let statements = initial_workload_statements("accounts");
+
+        assert!(statements
+            .iter()
+            .any(|statement| statement.contains("VALUES ('register', 0)")));
+        assert!(statements
+            .iter()
+            .any(|statement| statement.contains("VALUES ('doctor-a', 1)")));
+        assert!(statements
+            .iter()
+            .any(|statement| statement.contains("VALUES ('doctor-b', 1)")));
+    }
+
+    #[test]
+    fn predicate_observation_records_known_values_and_absent_phantom() {
+        let observed = std::collections::BTreeMap::from([
+            ("doctor-a".to_owned(), Some(1)),
+            ("doctor-b".to_owned(), Some(0)),
+            ("phantom".to_owned(), None),
+        ]);
+
+        assert_eq!(
+            predicate_observations(&observed),
+            [
+                TransactionOperation::Read {
+                    key: "doctor-a".to_owned(),
+                    value: Some(1),
+                },
+                TransactionOperation::Read {
+                    key: "doctor-b".to_owned(),
+                    value: Some(0),
+                },
+                TransactionOperation::Read {
+                    key: "phantom".to_owned(),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_failure_releases_peers_waiting_at_a_workload_phase() {
+        let barrier = tokio::sync::Barrier::new(2);
+        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(false);
+        let waiting_actor =
+            tokio::spawn(async move { wait_for_phase(&barrier, &mut failure_rx).await });
+
+        failure_tx.send_replace(true);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiting_actor)
+            .await
+            .expect("failed actor should release its peers from the barrier")
+            .expect("waiting actor task should not panic");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fault_workload_can_leave_one_of_three_nodes_unused_by_clients() {
+        assert_eq!(actor_client_count(3, Some("2")).unwrap(), 2);
+    }
+
+    #[test]
+    fn fault_workload_gives_each_actor_a_separate_session_on_active_nodes() {
+        let nodes = ["node1", "node2", "paused-node"];
+
+        assert_eq!(
+            actor_client_urls(&nodes, 2),
+            ["node1", "node2", "node1", "node2", "node1"]
+        );
+    }
+
+    #[test]
+    fn fault_workload_checks_convergence_only_on_active_nodes() {
+        assert_eq!(convergence_node_count(3, 2, true), 2);
+        assert_eq!(convergence_node_count(3, 3, false), 3);
+    }
+
+    #[test]
+    fn default_workload_uses_every_postgres_node() {
+        assert_eq!(actor_client_count(3, None).unwrap(), 3);
+    }
+
+    #[test]
+    fn fault_workload_rejects_fewer_than_two_client_nodes() {
+        assert!(actor_client_count(3, Some("1")).is_err());
+    }
+
+    #[test]
+    fn fault_workload_rejects_client_count_above_url_count() {
+        assert!(actor_client_count(3, Some("4")).is_err());
+    }
+
+    #[test]
+    fn fault_workload_rejects_non_numeric_client_count() {
+        assert!(actor_client_count(3, Some("two")).is_err());
+    }
+
+    #[test]
+    fn fault_schedule_requires_ready_active_and_complete_markers_together() {
+        assert!(
+            FaultSchedule::from_paths(Some("ready".into()), None, Some("complete".into())).is_err()
+        );
+    }
+
+    #[test]
+    fn fault_schedule_is_disabled_when_no_marker_paths_are_configured() {
+        assert!(FaultSchedule::from_paths(None, None, None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn fault_schedule_accepts_all_three_marker_paths() {
+        assert!(FaultSchedule::from_paths(
+            Some("ready".into()),
+            Some("active".into()),
+            Some("complete".into())
+        )
+        .unwrap()
+        .is_some());
+    }
 }

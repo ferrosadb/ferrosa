@@ -114,7 +114,11 @@ transactions before applying to storage at the agreed HLC timestamp. On the
 slow path, each AcceptOK reports the replica's effective dependencies, including
 conflicts observed locally after PreAccept; the coordinator carries the accepted
 quorum's dependency union into Commit so Accept cannot erase a newly observed
-ordering edge. See [data-flow.md](data-flow.md).
+ordering edge. LWT read-votes return as soon as F+1 matching votes decide, so an
+unavailable minority does not hold a completed quorum open. PostgreSQL snapshot
+barriers rely on their committed slow quorum and the serving replica's local
+dependency/apply check, without remote read-vote fanout. See
+[data-flow.md](data-flow.md).
 
 ## Key invariants
 

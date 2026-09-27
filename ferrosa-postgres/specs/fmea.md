@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 doc: fmea
-last_updated: 2026-06-25
+last_updated: 2026-09-27
 ---
 
 # ferrosa-postgres — FMEA / Known Issues
@@ -35,10 +35,11 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 - `ON CONFLICT` (upsert) → parse error; multi-row `INSERT … VALUES (…),(…)`.
 - `= ANY($N)` / IN-list parameter expansion.
 - `UPDATE`/`DELETE` with a non-key or range `WHERE` (only full-PK equality).
-- **Cluster-wide PostgreSQL strict serializability is not yet verified** — PG
-  snapshot and read/write table validation now enter Accord, and replica apply
-  distributes row-version metadata. Do not claim Jepsen strong serializability
-  until the workload and fault/atomic-visibility gates pass.
+- **Full PostgreSQL strict-serializability scope is not yet verified** — the
+  supported native-driver workload and one-paused-replica active-quorum schedule
+  passed CI on PR #456 head `9ba735e72d1e117d7b64e574402ef7ab60fafad6` (run
+  36329758452). General range predicates, resumed-replica catch-up, process
+  crashes, and mixed CQL/PostgreSQL histories remain outside that evidence.
 - `SET`/`RESET` session GUCs (simple-query path returns `0A000`).
 - Function calls in DML `VALUES`; most scalar functions beyond
   `version()`/`current_database()`/`current_schema()`.
@@ -52,8 +53,8 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
-| PG-1 | **PostgreSQL transaction atomicity and snapshot isolation** — PG-owned MVCC commit path; CQL remains on Accord | A serializable driver sees its begin snapshot plus its own writes; commits are atomic or abort with `40001` | 9 | 3 | 4 | 108 | **Distributed wiring implemented; guarantee evidence pending.** Snapshot, read-your-writes, write-skew, phantom, lost-update, real-time-order, rollback, protocol-parity, stable cross-node snapshot, and cross-node predicate-conflict tests cover current behavior. Cluster validation uses a global PostgreSQL commit marker, so unrelated PG commits can cause false conflicts. Jepsen and multi-row failure/visibility tests remain. |
-| PG-11 | **PostgreSQL strict-serializability evidence is incomplete** | A concurrency or failure history may violate the Jepsen model despite the current deterministic tests | 10 | 3 | 8 | 240 | **Open, blocks cluster-level strict-serializability claims.** Accord validates against a global PostgreSQL commit marker and replica apply publishes row versions to active snapshots; the supplied read/write table set is not yet used for per-table validation. Add and run the PostgreSQL Jepsen workload with node-failure schedules; cover multi-row atomic visibility and restart boundaries. |
+| PG-1 | **PostgreSQL transaction atomicity and snapshot isolation** — PG-owned MVCC commit path; CQL remains on Accord | A serializable driver sees its begin snapshot plus its own writes; commits are atomic or abort with `40001` | 9 | 3 | 4 | 108 | **Distributed wiring and targeted evidence implemented.** Snapshot, read-your-writes, write-skew, phantom, lost-update, real-time-order, rollback, protocol-parity, stable cross-node snapshot, cross-node predicate-conflict, restart, and atomic-visibility tests cover current behavior. The native-driver Jepsen gate passed transfer/register/fixed-point predicate/phantom/write-skew histories plus one paused-replica schedule on `9ba735e72d1e117d7b64e574402ef7ab60fafad6` (run 36329758452). Cluster validation uses a global PostgreSQL commit marker, so unrelated PG commits can cause false conflicts. Resumed-node catch-up and CQL/PostgreSQL interleavings are not covered. |
+| PG-11 | **PostgreSQL strict-serializability recovery scope is incomplete** | A recovering replica or a mixed CQL/PostgreSQL history may diverge despite a valid PostgreSQL-only history on the active quorum | 10 | 3 | 8 | 240 | **Open boundary.** CI passed the PostgreSQL Jepsen checker with a single replica paused and checks history plus convergence only across the active quorum. The supplied read/write table set is not used for per-table Accord validation, so unrelated PostgreSQL writes can cause false conflicts. Add separate recovery/catch-up and mixed-protocol histories before making those broader claims. |
 | PG-2 | **(resolved) `$N` params in DML** — parameterized `INSERT`/`UPDATE`/`DELETE` are now bound at `Bind` and substituted at `Execute` | — | 2 | 1 | 1 | 2 | **Done.** `substitute_param` fails loud `08P01` if a `$N` has no bound value; param OIDs inferred from each placeholder's target column. Covered by the `extended_parameterized_*` live tests. |
 | PG-3 | **`INSERT … RETURNING` only; `UPDATE`/`DELETE … RETURNING` + `ON CONFLICT` unsupported** | `UPDATE`/`DELETE … RETURNING` and upsert ORM patterns fail | 5 | 5 | 2 | 50 | `INSERT … RETURNING` done (in-memory row, no read-back). `UPDATE`/`DELETE … RETURNING` fail loud `0A000`; `ON CONFLICT` fails at parse. Never a wrong row. Roadmap Next. |
 | PG-4 | **(mitigated) CQL `Duration`/collections have no SQL value representation** | A scan cannot represent a non-NULL duration/list/map column | 6 | 4 | 2 | 48 | `cql_to_value` returns an error and scan failure is propagated as a query error; no fabricated NULL. Widen `Value` to add support (roadmap Later). |
@@ -68,9 +69,9 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 
 1. **PG-10 (RPN 100)** — UPDATE/DELETE report `1` row unconditionally (Cassandra
    blind upsert/tombstone); differs from PG's real match count.
-2. **PG-11 (RPN 240)** — strict-serializability evidence is incomplete. The
-   Accord wiring and native-driver scenarios pass, but the Jepsen workload and
-   fault schedules remain outstanding.
+2. **PG-11 (RPN 240)** — paused-replica catch-up and mixed-protocol serializability
+   remain unverified. The current Jepsen fault gate proves only the recorded
+   PostgreSQL history and final convergence on the active quorum.
 
 ## Detection assets
 

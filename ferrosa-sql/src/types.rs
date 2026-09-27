@@ -173,6 +173,7 @@ fn scale_up(n: &BigInt, power: i32) -> BigInt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     Int,
+    BigInt,
     Text,
     Bool,
     Float,

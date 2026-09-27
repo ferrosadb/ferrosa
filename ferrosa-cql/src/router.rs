@@ -10963,6 +10963,28 @@ fn persist_role_row_direct(state: &SharedState, name: &str) -> Result<(), CqlErr
         .map_err(|e| CqlError::ServerError(format!("persist role {name}: {e}")))
 }
 
+/// Adds the credential forms needed by the distributed role write path.
+/// Passwords stay on the coordinator: the serialized role carries only the
+/// CQL password hash and the PostgreSQL SCRAM verifier derived from plaintext.
+fn role_with_cluster_password(
+    schema: &Schema,
+    mut role: RoleMetadata,
+    password: Option<&str>,
+    hashed_password: Option<&str>,
+) -> Result<RoleMetadata, CqlError> {
+    if let Some(hash) = hashed_password {
+        schema.validate_password_hash(hash)?;
+        role.salted_hash = Some(hash.to_owned());
+    } else if let Some(password) = password {
+        schema.password_policy().validate(password, &role.name)?;
+        role.salted_hash = Some(schema.password_hasher().hash_password(password)?);
+        role.scram = Some(ferrosa_schema::auth::scram::derive_with_random_salt(
+            password,
+        ));
+    }
+    Ok(role)
+}
+
 async fn route_create_role(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -11018,15 +11040,12 @@ async fn route_create_role(
             //
             // Hashing on the coordinator also keeps the cleartext
             // password off the wire and out of the Raft log.
-            let mut role = base_role;
-            if let Some(ref h) = s.hashed_password {
-                // HASHED PASSWORD: validate on the coordinator, ship verbatim.
-                state.schema.validate_password_hash(h)?;
-                role.salted_hash = Some(h.clone());
-            } else if let Some(ref pw) = s.password {
-                state.schema.password_policy().validate(pw, &s.name)?;
-                role.salted_hash = Some(state.schema.password_hasher().hash_password(pw)?);
-            }
+            let role = role_with_cluster_password(
+                &state.schema,
+                base_role,
+                s.password.as_deref(),
+                s.hashed_password.as_deref(),
+            )?;
             match ddl {
                 DdlPath::Pair(coordinator) => {
                     coordinator
@@ -26747,6 +26766,31 @@ mod tests {
 
     // ── CREATE ROLE / ALTER ROLE / DROP ROLE routing tests ────────────
 
+    #[test]
+    fn distributed_role_password_includes_postgres_scram_verifier() {
+        let (state, _dir) = setup();
+        let role = RoleMetadata {
+            name: "distributed_pg_user".into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+            scram: None,
+        };
+
+        let role = role_with_cluster_password(&state.schema, role, Some("test-password-123"), None)
+            .expect("cluster role credentials should be constructed");
+
+        assert!(
+            role.salted_hash.is_some(),
+            "CQL login hash must be retained"
+        );
+        assert!(
+            role.scram.is_some(),
+            "PostgreSQL verifier must travel with the distributed role"
+        );
+    }
+
     #[tokio::test]
     async fn create_role_stores_in_schema() {
         let (state, _dir) = setup();
@@ -29049,7 +29093,8 @@ mod tests {
                 Arc::new(ferrosa_storage::accord::sync_writer::MockSyncWriter::new()),
             ),
         ));
-        ferrosa_cluster::accord::publish_accord_state(&state.accord_state, local_state.clone());
+        ferrosa_cluster::accord::publish_accord_state(&state.accord_state, local_state.clone())
+            .expect("publish local Accord state");
 
         let loaded = require_local_accord_state_for_lwt(&state)
             .expect("published local Accord state must be available to LWT");

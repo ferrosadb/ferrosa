@@ -53,6 +53,9 @@ pub struct AccordTransactionCommitter {
     /// its own peer map, so that self-send fails "unknown peer"). `None` falls
     /// back to remote votes only (used by tests with an external coordinator).
     local_accord_state: Option<crate::accord::handlers::AccordState>,
+    /// Production creates the committer before cluster formation publishes the
+    /// local state, so retain the slot and load it when each transaction runs.
+    local_accord_state_slot: Option<crate::accord::handlers::AccordStateSlot>,
 }
 
 impl AccordTransactionCommitter {
@@ -70,6 +73,7 @@ impl AccordTransactionCommitter {
             applier,
             resolve,
             local_accord_state: None,
+            local_accord_state_slot: None,
         }
     }
 
@@ -84,19 +88,17 @@ impl AccordTransactionCommitter {
     }
 
     /// Wire the coordinator node's own Accord state from a shared
-    /// [`AccordStateSlot`](crate::accord::handlers::AccordStateSlot) if it is
-    /// populated. The controller fills the slot with this node's live
-    /// `AccordState` during cluster formation; the session layer, which builds
-    /// the committer, holds only the slot (it is constructed before formation).
-    /// An empty slot leaves the committer on remote-only votes — correct when
-    /// the node is not itself a replica, and the pre-fix behavior otherwise.
+    /// [`AccordStateSlot`](crate::accord::handlers::AccordStateSlot). The
+    /// controller fills the slot with this node's live `AccordState` during
+    /// cluster formation; because the session layer constructs the committer
+    /// before formation, the slot is loaded when each transaction runs. An
+    /// empty slot leaves the committer on remote-only votes — correct when the
+    /// node is not itself a replica.
     pub fn with_local_accord_state_slot(
         mut self,
         slot: &crate::accord::handlers::AccordStateSlot,
     ) -> Self {
-        if let Some(state) = slot.load_full() {
-            self.local_accord_state = Some(state);
-        }
+        self.local_accord_state_slot = Some(slot.clone());
         self
     }
 }
@@ -108,8 +110,18 @@ impl TransactionCommitter for AccordTransactionCommitter {
         observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
     ) -> Result<(), CommitError> {
         self.applier
-            .register_postgres_mvcc_observer(observer)
-            .map_err(|reason| CommitError { reason })
+            .register_postgres_mvcc_observer(observer.clone())
+            .map_err(|reason| CommitError { reason })?;
+        if let Some(slot) = &self.local_accord_state_slot {
+            slot.register_postgres_mvcc_observer(observer.clone())
+                .map_err(|reason| CommitError { reason })?;
+        } else if let Some(state) = &self.local_accord_state {
+            state
+                .lock()
+                .register_postgres_mvcc_observer(observer)
+                .map_err(|reason| CommitError { reason })?;
+        }
+        Ok(())
     }
 
     async fn commit(&self, writes: Vec<TransactionWrite>) -> Result<CommitOutcome, CommitError> {
@@ -277,8 +289,14 @@ async fn drive_accord(
     // When the coordinator is itself a replica, let it vote on its own
     // PreAccept locally rather than dial itself (unreachable in its own peer
     // map). Without this a sole-replica transaction never reaches quorum.
-    if let Some(state) = &committer.local_accord_state {
-        driver = driver.with_local_accord_state(state.clone());
+    let local_accord_state = committer.local_accord_state.clone().or_else(|| {
+        committer
+            .local_accord_state_slot
+            .as_ref()
+            .and_then(|slot| slot.load_full())
+    });
+    if let Some(state) = local_accord_state {
+        driver = driver.with_local_accord_state(state);
     }
 
     match driver.run_transaction().await {
@@ -304,18 +322,38 @@ mod tests {
     /// Records every applied mutation's data, so a test can assert which keys' writes landed.
     struct RecordingApplier {
         applied: Mutex<Vec<Vec<u8>>>,
+        registered_observers: Mutex<usize>,
     }
     impl RecordingApplier {
         fn new() -> Self {
             Self {
                 applied: Mutex::new(Vec::new()),
+                registered_observers: Mutex::new(0),
             }
         }
         fn applied_data(&self) -> Vec<Vec<u8>> {
             self.applied.lock().expect("applier mutex").clone()
         }
+
+        fn registered_observer_count(&self) -> usize {
+            *self
+                .registered_observers
+                .lock()
+                .expect("observer count mutex")
+        }
     }
     impl StorageApplier for RecordingApplier {
+        fn register_postgres_mvcc_observer(
+            &self,
+            _observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
+        ) -> Result<(), String> {
+            *self
+                .registered_observers
+                .lock()
+                .expect("observer count mutex") += 1;
+            Ok(())
+        }
+
         fn apply(
             &self,
             _txn_id: ferrosa_common::accord::TxnId,
@@ -325,6 +363,28 @@ mod tests {
                 .lock()
                 .expect("applier mutex")
                 .push(mutation.data);
+            Ok(())
+        }
+    }
+
+    struct TestPostgresObserver;
+
+    impl ferrosa_storage::accord::PostgresMvccApplyObserver for TestPostgresObserver {
+        fn prepare_postgres_apply(
+            &self,
+            _txn_id: ferrosa_common::accord::TxnId,
+            _t: ferrosa_common::accord::Timestamp,
+            _metadata: &[Vec<u8>],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn on_postgres_apply(
+            &self,
+            _txn_id: ferrosa_common::accord::TxnId,
+            _t: ferrosa_common::accord::Timestamp,
+            _metadata: &[Vec<u8>],
+        ) -> Result<(), String> {
             Ok(())
         }
     }
@@ -670,7 +730,7 @@ mod tests {
         // controller fills at formation. A populated slot must enable the
         // coordinator's local self-vote exactly as with_local_accord_state does,
         // so an RF=1 (sole-replica) transaction commits.
-        use crate::accord::handlers::{empty_accord_state_slot, AccordState};
+        use crate::accord::handlers::{empty_accord_state_slot, publish_accord_state, AccordState};
         use crate::accord::state_machine::AccordStateMachine;
         use ferrosa_storage::accord::sync_writer::MockSyncWriter;
 
@@ -688,7 +748,6 @@ mod tests {
                 Arc::new(MockSyncWriter::new()),
                 applier.clone(),
             )));
-        slot.store(Some(state));
         let resolve: ReplicaResolver = Arc::new(move |_ks: &str, _key: &[u8]| Some(vec![host]));
         let committer = AccordTransactionCommitter::new(
             node_id,
@@ -698,6 +757,9 @@ mod tests {
             resolve,
         )
         .with_local_accord_state_slot(&slot);
+        // Cluster formation publishes this state after the session has already
+        // constructed its long-lived committer.
+        publish_accord_state(&slot, state).expect("publish local state");
 
         let outcome = committer
             .commit(vec![write("ks", b"k", b"v")])
@@ -709,6 +771,56 @@ mod tests {
             applier.applied_data(),
             vec![b"v".to_vec()],
             "the coordinator must apply its own write when the slot is populated"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_mvcc_observer_reaches_state_published_after_committer_setup() {
+        use crate::accord::handlers::{empty_accord_state_slot, publish_accord_state, AccordState};
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let host = Uuid::from_u128(0xC3);
+        let node_id = node_id_of(host);
+        let coordinator_applier = Arc::new(RecordingApplier::new());
+        let replica_applier = Arc::new(RecordingApplier::new());
+        let slot = empty_accord_state_slot();
+        let resolve: ReplicaResolver = Arc::new(move |_ks: &str, _key: &[u8]| Some(vec![host]));
+        let committer = AccordTransactionCommitter::new(
+            node_id,
+            Arc::new(HybridLogicalClock::new(node_id, 0)),
+            Arc::new(NoPeersTransport),
+            coordinator_applier,
+            resolve,
+        )
+        .with_local_accord_state_slot(&slot);
+        committer
+            .register_postgres_mvcc_observer(Arc::new(TestPostgresObserver))
+            .expect("register PostgreSQL MVCC observer before formation");
+
+        let state: AccordState =
+            Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
+                node_id,
+                Arc::new(MockSyncWriter::new()),
+                replica_applier.clone(),
+            )));
+        publish_accord_state(&slot, state).expect("publish state with registered observer");
+
+        assert_eq!(
+            replica_applier.registered_observer_count(),
+            1,
+            "publishing replica state must install observers before it handles remote Apply"
+        );
+
+        committer
+            .commit(vec![write("ks", b"k", b"v")])
+            .await
+            .expect("commit after the local Accord state is published");
+
+        assert_eq!(
+            replica_applier.registered_observer_count(),
+            1,
+            "the published replica's storage applier must receive the PostgreSQL observer"
         );
     }
 

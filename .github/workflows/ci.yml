@@ -400,6 +400,169 @@ jobs:
           # Workflow shape assertions live in the integration tests.
           cargo test -p ferrosa-jepsen --all-features --test ci_workflow
 
+  # Reuses the node image artifact from build-node-image so this live
+  # PostgreSQL fault schedule does not compile a second server binary.
+  postgres-jepsen-fault:
+    name: PostgreSQL Jepsen fault schedule
+    needs: build-node-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: postgres-jepsen-fault
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Download and load the node image built earlier in CI
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ferrosa-node-image
+          path: /tmp/ferrosa-node-image
+      - name: Load node image and start the PostgreSQL cluster
+        env:
+          FERROSA_NIGHTLY_IMAGE: ferrosa-test-node:latest
+        run: |
+          docker load --input /tmp/ferrosa-node-image/ferrosa-node-image.tar.gz
+          docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster.yml up -d --no-build
+      - name: Wait for PostgreSQL cluster formation
+        run: |
+          set -euo pipefail
+          expected_nodes='["11111111-1111-1111-1111-111111111111","22222222-2222-2222-2222-222222222222","33333333-3333-3333-3333-333333333333"]'
+          node_specs=(
+            "49090|11111111-1111-1111-1111-111111111111"
+            "49091|22222222-2222-2222-2222-222222222222"
+            "49092|33333333-3333-3333-3333-333333333333"
+          )
+          deadline=$((SECONDS + 120))
+          ready=0
+          last_problem='cluster endpoints have not responded yet'
+          while (( SECONDS < deadline )); do
+            all_ready=1
+            for node_spec in "${node_specs[@]}"; do
+              IFS='|' read -r web_port expected_host_id <<< "$node_spec"
+              base_url="http://127.0.0.1:${web_port}"
+              status=$(curl --connect-timeout 2 --max-time 5 -sf \
+                "${base_url}/api/cluster/status") || status=''
+              if ! printf '%s' "$status" | jq -e --arg id "$expected_host_id" \
+                '.host_id == $id and .mode == "cluster"' >/dev/null; then
+                all_ready=0
+                last_problem="node $expected_host_id has not entered cluster mode"
+                break
+              fi
+              ring=$(curl --connect-timeout 2 --max-time 5 -sf \
+                "${base_url}/api/cluster/ring") || ring=''
+              if ! printf '%s' "$ring" | jq -e --argjson expected "$expected_nodes" \
+                '([.nodes[] | select(.state == "Normal") | .host_id] | sort) == ($expected | sort)' >/dev/null; then
+                all_ready=0
+                last_problem="node $expected_host_id does not see all three Normal ring members"
+                break
+              fi
+            done
+            if [ "$all_ready" -eq 1 ]; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::PostgreSQL Jepsen cluster did not form within 120s: $last_problem"
+            docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster.yml ps
+            exit 1
+          fi
+          echo "PostgreSQL Jepsen cluster formed: all three nodes report the expected Normal ring"
+      - name: Create the test CQL role
+        run: |
+          docker pull cassandra:5.0
+          for attempt in $(seq 1 60); do
+            if docker run --rm --network host cassandra:5.0 cqlsh 127.0.0.1 49042 \
+              -e "CREATE ROLE ferrosa_pg_jepsen WITH PASSWORD = 'ferrosa-jepsen-test' AND LOGIN = true AND SUPERUSER = true;"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "CQL role creation did not succeed after $attempt attempts" >&2
+          exit 1
+      - name: Run native PostgreSQL history while node 3 is paused
+        env:
+          FERROSA_NIGHTLY_IMAGE: ferrosa-test-node:latest
+          FERROSA_TEST_CQL_URLS: 127.0.0.1:49042;127.0.0.1:49043;127.0.0.1:49044
+          FERROSA_TEST_POSTGRES_URLS: postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:49052/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:49053/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:49054/postgres
+          FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT: "2"
+          FERROSA_TEST_POSTGRES_FAULT_READY_FILE: /tmp/pg-fault-ready
+          FERROSA_TEST_POSTGRES_FAULT_ACTIVE_FILE: /tmp/pg-fault-active
+          FERROSA_TEST_POSTGRES_FAULT_COMPLETE_FILE: /tmp/pg-fault-complete
+          FERROSA_TEST_POSTGRES_HISTORY_PATH: /tmp/postgres-jepsen-history.json
+        run: |
+          set -euo pipefail
+          compose="docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster.yml"
+          cleanup() {
+            $compose logs --no-color > /tmp/postgres-jepsen-cluster.log 2>&1 || true
+            docker unpause ferrosa-jepsen-node3 >/dev/null 2>&1 || true
+            $compose down -v || true
+          }
+          trap cleanup EXIT
+
+          rm -f "$FERROSA_TEST_POSTGRES_FAULT_READY_FILE" \
+            "$FERROSA_TEST_POSTGRES_FAULT_ACTIVE_FILE" \
+            "$FERROSA_TEST_POSTGRES_FAULT_COMPLETE_FILE"
+          cargo test -p ferrosa-jepsen --all-features \
+            --test postgres_strict_serializable -- --nocapture \
+            > /tmp/postgres-jepsen.log 2>&1 &
+          test_pid=$!
+
+          for attempt in $(seq 1 180); do
+            if test -e "$FERROSA_TEST_POSTGRES_FAULT_READY_FILE"; then
+              break
+            fi
+            if ! kill -0 "$test_pid" 2>/dev/null; then
+              cat /tmp/postgres-jepsen.log
+              wait "$test_pid"
+            fi
+            sleep 1
+          done
+          if ! test -e "$FERROSA_TEST_POSTGRES_FAULT_READY_FILE"; then
+            echo "PostgreSQL test did not finish setup within $attempt seconds" >&2
+            cat /tmp/postgres-jepsen.log
+            exit 1
+          fi
+
+          docker pause ferrosa-jepsen-node3
+          touch "$FERROSA_TEST_POSTGRES_FAULT_ACTIVE_FILE"
+          for attempt in $(seq 1 600); do
+            if test -e "$FERROSA_TEST_POSTGRES_FAULT_COMPLETE_FILE"; then
+              break
+            fi
+            if ! kill -0 "$test_pid" 2>/dev/null; then
+              cat /tmp/postgres-jepsen.log
+              wait "$test_pid"
+            fi
+            sleep 1
+          done
+          if ! test -e "$FERROSA_TEST_POSTGRES_FAULT_COMPLETE_FILE"; then
+            echo "PostgreSQL workload did not complete within $attempt seconds of the replica pause" >&2
+            cat /tmp/postgres-jepsen.log
+            exit 1
+          fi
+
+          docker unpause ferrosa-jepsen-node3
+          if ! wait "$test_pid"; then
+            cat /tmp/postgres-jepsen.log
+            exit 1
+          fi
+          cat /tmp/postgres-jepsen.log
+      - name: Upload history and cluster logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: postgres-jepsen-fault
+          path: |
+            /tmp/postgres-jepsen.log
+            /tmp/postgres-jepsen-history.json
+            /tmp/postgres-jepsen-cluster.log
+
   # ── Stage 2c: Example CQL tests (reuses musl binary) ───────────────
   examples:
     name: Example CQL Scripts
