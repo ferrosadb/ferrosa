@@ -19,14 +19,20 @@
 //!
 //! [bti]: https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod backpressure_test_support;
+
 pub mod bloom;
 pub mod byte_comparable;
+pub mod checksum;
 pub mod compression;
 pub mod data;
+pub mod dio_align;
 pub mod direct;
 pub mod io;
 pub mod marshal;
 pub mod partition_index;
+pub mod pump;
 pub mod reader;
 pub mod row_index;
 pub mod scan;

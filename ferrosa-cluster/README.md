@@ -375,6 +375,14 @@ bounding aggregate raft-worker oversubscription. Leader-dependent setup uses
 `require_leader(timeout)`, which fails loud at the real precondition rather than
 panicking later in `leader_node()`.
 
+### Write admission
+
+`WritePath::write` and logged `write_batch` await the local storage engine's
+per-table pressure gate before dispatching direct, pair, or cluster writes.
+The gate uses async notification/deadline waiting only in the soft-pressure
+zone; the storage write keeps its synchronous hard-limit check as the final
+guard. Batch admission is preflighted before any logged mutation is applied.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — subsystem map, invariants, position

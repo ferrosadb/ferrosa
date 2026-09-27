@@ -40,32 +40,59 @@ fn simple_class_name(type_name: &str) -> &str {
     head.rsplit('.').next().unwrap_or(head).trim()
 }
 
-/// The top-level type arguments of a parametric Cassandra type, e.g.
-/// `MapType(A,B)` -> `["A", "B"]` where `A`/`B` keep their own nesting.
-/// Returns `None` if the type has no parenthesized arguments.
-fn top_level_args(type_name: &str) -> Option<Vec<&str>> {
+/// Iterates the top-level type arguments of a parametric Cassandra type,
+/// e.g. `MapType(A,B)` yields `"A"`, then `"B"` (each keeping its own
+/// nesting), without collecting them into a `Vec`. `collection_value_type`
+/// is on the row-body encoding hot path (`writer.rs` calls it once per
+/// complex-column run, per row) and only ever needs the first or second
+/// argument, so allocating a `Vec` of all of them — as a naive top-level
+/// split would — is wasted work on every row of every complex column.
+struct TopLevelArgs<'a> {
+    inner: &'a str,
+    pos: usize,
+    done: bool,
+}
+
+impl<'a> Iterator for TopLevelArgs<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.done {
+            return None;
+        }
+        let bytes = self.inner.as_bytes();
+        let start = self.pos;
+        let mut depth = 0usize;
+        let mut i = self.pos;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    self.pos = i + 1;
+                    return Some(self.inner[start..i].trim());
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        self.done = true;
+        Some(self.inner[start..].trim())
+    }
+}
+
+/// Returns `None` if `type_name` has no parenthesized arguments.
+fn top_level_args(type_name: &str) -> Option<TopLevelArgs<'_>> {
     let open = type_name.find('(')?;
     let close = type_name.rfind(')')?;
     if close <= open {
         return None;
     }
-    let inner = &type_name[open + 1..close];
-    let mut args = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for (i, ch) in inner.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                args.push(inner[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    args.push(inner[start..].trim());
-    Some(args)
+    Some(TopLevelArgs {
+        inner: &type_name[open + 1..close],
+        pos: 0,
+        done: false,
+    })
 }
 
 /// True if `type_name` is a **non-frozen (multicell) collection** — the columns
@@ -101,10 +128,10 @@ pub fn is_multicell(type_name: &str) -> bool {
 ///
 /// Returns `None` for a non-collection type.
 pub fn collection_value_type(type_name: &str) -> Option<&str> {
-    let args = top_level_args(type_name)?;
+    let mut args = top_level_args(type_name)?;
     match simple_class_name(type_name) {
-        "ListType" | "SetType" => args.first().copied(),
-        "MapType" => args.get(1).copied(),
+        "ListType" | "SetType" => args.next(),
+        "MapType" => args.nth(1),
         _ => None,
     }
 }

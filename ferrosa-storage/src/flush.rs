@@ -1,4 +1,7 @@
 //! FlushTarget abstraction and serialization header construction.
+//! Correctness: staged output is verified before publication; abandoned scratch is swept.
+//! Last revised: 2026-09-26
+//! Last changed: Removed legacy Data.raw scratch at startup and targeted Data.db in writer callers.
 //!
 //! This module provides the [`FlushTarget`] trait, which decouples memtable
 //! flush logic from the destination: in-memory buffers ([`InMemoryFlushTarget`])
@@ -346,6 +349,22 @@ pub trait FlushTarget {
     /// the staged files into memory, then calls [`FlushTarget::flush`].
     fn flush_files(&self, output: SSTableOutputFiles) -> Result<SSTableReader<Self::Reader>> {
         self.flush(output.read_to_memory()?)
+    }
+
+    /// Publish files produced by `finish_to_directory_deferred_sync`.
+    /// Implementations that stage files must sync them before promotion and
+    /// may apply their buffered page-cache policy after verification. The
+    /// default fails loudly so a deferred file output is never materialized
+    /// through [`FlushTarget::flush_files`].
+    fn flush_deferred_files(
+        &self,
+        _output: SSTableOutputFiles,
+    ) -> Result<SSTableReader<Self::Reader>> {
+        Err(ferrosa_common::Error::InvalidFormat(
+            "FlushTarget::flush_deferred_files is not implemented; deferred writer output must be \
+             explicitly handed to a target that owns its durability barrier"
+                .into(),
+        ))
     }
 
     /// Returns the generation number of the most recently flushed SSTable.
@@ -739,15 +758,53 @@ pub(crate) mod fsync_probe {
     static SYNCED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static SYNCED_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static RENAMED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+
+    /// A single durability-relevant event, in the order it happened.
+    ///
+    /// The per-kind vectors above (`SYNCED_FILES` etc.) lose relative order
+    /// between different kinds of events. `EVENTS` is the ordered timeline
+    /// used to prove sequencing invariants such as "rename happens before the
+    /// directory fsync, which happens before any input is unlinked"
+    /// (T-001 / compaction-cancel-safety.md window E').
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Event {
+        Rename(PathBuf),
+        FileFsync(PathBuf),
+        ReadbackVerified(PathBuf),
+        Fadvise(PathBuf),
+        DirFsync(PathBuf),
+        Unlink(PathBuf),
+    }
+
+    impl Event {
+        fn path(&self) -> &Path {
+            match self {
+                Self::Rename(path)
+                | Self::FileFsync(path)
+                | Self::ReadbackVerified(path)
+                | Self::Fadvise(path)
+                | Self::DirFsync(path)
+                | Self::Unlink(path) => path,
+            }
+        }
+    }
 
     pub(crate) struct ExclusiveGuard {
         _guard: MutexGuard<'static, ()>,
     }
 
+    /// A prior test that panicked while holding one of these locks poisons
+    /// it for every later probe test — the probe's job is to observe
+    /// durability ordering across *deliberately panicking* test bodies (see
+    /// `compaction_promotion_fail_after_first_component_is_atomic_and_recoverable`-
+    /// style tests elsewhere), so poisoning here is expected, not a sign of
+    /// corrupted data. Recovering the inner value and immediately `reset()`ing
+    /// it is what makes probe state a per-test fixture again instead of a
+    /// permanently poisoned global (T-091: 5 cascading failures traced to
+    /// exactly this).
     pub(crate) fn exclusive() -> ExclusiveGuard {
-        let guard = EXCLUSIVE
-            .lock()
-            .expect("fsync probe exclusive lock poisoned");
+        let guard = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         ExclusiveGuard { _guard: guard }
     }
@@ -759,52 +816,235 @@ pub(crate) mod fsync_probe {
     }
 
     fn reset() {
-        SYNCED_FILES.lock().expect("fsync probe poisoned").clear();
-        SYNCED_DIRS.lock().expect("fsync probe poisoned").clear();
-        RENAMED_FILES.lock().expect("fsync probe poisoned").clear();
+        SYNCED_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        SYNCED_DIRS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        RENAMED_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     pub(crate) fn note_file(path: &Path) {
         SYNCED_FILES
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(path.to_path_buf());
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Event::FileFsync(path.to_path_buf()));
     }
 
     pub(crate) fn note_dir(path: &Path) {
         SYNCED_DIRS
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(path.to_path_buf());
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Event::DirFsync(path.to_path_buf()));
     }
 
     pub(crate) fn note_rename(path: &Path) {
         RENAMED_FILES
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(path.to_path_buf());
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Event::Rename(path.to_path_buf()));
+    }
+
+    pub(crate) fn note_readback_verified(path: &Path) {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Event::ReadbackVerified(path.to_path_buf()));
+    }
+
+    pub(crate) fn note_fadvise(path: &Path) {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Event::Fadvise(path.to_path_buf()));
+    }
+
+    /// Record an attempted unlink (e.g. of a retired compaction input
+    /// component). Recorded regardless of whether the unlink succeeded, since
+    /// what matters for ordering proofs is when the attempt happened.
+    pub(crate) fn note_unlink(path: &Path) {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Event::Unlink(path.to_path_buf()));
     }
 
     pub(crate) fn synced_files() -> HashSet<PathBuf> {
         SYNCED_FILES
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .cloned()
+            .collect()
+    }
+
+    pub(crate) fn synced_files_under(base: &Path) -> HashSet<PathBuf> {
+        synced_files()
+            .into_iter()
+            .filter(|path| path.starts_with(base))
             .collect()
     }
 
     pub(crate) fn synced_dirs() -> HashSet<PathBuf> {
         SYNCED_DIRS
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .cloned()
             .collect()
     }
 
+    pub(crate) fn synced_dirs_under(base: &Path) -> HashSet<PathBuf> {
+        synced_dirs()
+            .into_iter()
+            .filter(|path| path.starts_with(base))
+            .collect()
+    }
+
     pub(crate) fn renamed_files() -> Vec<PathBuf> {
-        RENAMED_FILES.lock().expect("fsync probe poisoned").clone()
+        RENAMED_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The full chronological timeline of rename/fsync/unlink events.
+    pub(crate) fn events() -> Vec<Event> {
+        EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn events_under(base: &Path) -> Vec<Event> {
+        events()
+            .into_iter()
+            .filter(|event| event.path().starts_with(base))
+            .collect()
+    }
+}
+
+/// Sweep leftover flush/compaction-output staging debris from a component
+/// directory (`publication-safety.md` M2).
+///
+/// A `.tmp` component is left behind only when the process died between
+/// renaming staged output to `.tmp` (`FileFlushTarget::flush_files`) and
+/// either quarantining it (verification failure) or promoting it to a live
+/// name (success) — every other path removes it. `{gen}-Data.db.tmp` never
+/// matches the `{gen}-Data.db` suffix generation discovery scans for, so it
+/// is not a data-loss risk by itself, but leaving it as unlabeled debris hides
+/// exactly the kind of interrupted publish M2 asks to make visible. It is
+/// moved into `quarantine/`, the same destination a failed `flush_files` call
+/// uses, so an operator finds both kinds of refusal in one place.
+///
+/// `.sstable-staging/` and `.merge-spill/` hold pre-rename bytes under their
+/// original component names — nothing in them has been renamed to a `.tmp` or
+/// live name yet. Like the compaction output directory
+/// (`StorageEngine::cleanup_stale_compaction_staging`), they are only ever
+/// live while a flush or merge-read is running in this process; there is
+/// nothing at startup to resume one, so they are pure debris and are removed
+/// outright rather than quarantined. Legacy `Data.raw` scratch files directly
+/// in the component directory are also removed; they are never live components.
+///
+/// Called from `StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode`
+/// before generation discovery, and again from `FileFlushTarget::new`/
+/// `new_starting_at` as a safety net for callers that construct a flush
+/// target without going through table startup (tests, the compaction output
+/// directory, the merge-spill ephemeral path).
+pub(crate) fn sweep_stale_flush_staging(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                %e,
+                dir = %dir.display(),
+                "flush: could not scan dir for stale staging"
+            );
+            return;
+        }
+    };
+
+    let quarantine_dir = dir.join("quarantine");
+    let mut quarantine_ready = false;
+    let mut quarantined = 0usize;
+    let mut removed_staging_dirs = 0usize;
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+
+        if is_dir && (name_str == ".sstable-staging" || name_str == ".merge-spill") {
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => removed_staging_dirs += 1,
+                Err(e) => tracing::error!(
+                    %e,
+                    dir = %entry.path().display(),
+                    "flush: could not remove stale flush staging dir"
+                ),
+            }
+            continue;
+        }
+
+        // The streaming writer never produces Data.raw. An exact legacy
+        // basename is uncommitted scratch; generation-prefixed Data.db stays live.
+        if !is_dir && name_str == "Data.raw" {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                tracing::error!(%e, path = %entry.path().display(),
+                    "flush: could not remove stale legacy raw data");
+            }
+            continue;
+        }
+
+        if is_dir || !name_str.ends_with(".tmp") {
+            continue;
+        }
+
+        if !quarantine_ready {
+            if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
+                tracing::error!(
+                    %e,
+                    dir = %quarantine_dir.display(),
+                    "flush: could not create quarantine dir for stale staged components"
+                );
+                break;
+            }
+            quarantine_ready = true;
+        }
+        let dest = quarantine_dir.join(&name);
+        match std::fs::rename(entry.path(), &dest) {
+            Ok(()) => quarantined += 1,
+            Err(e) => tracing::error!(
+                %e,
+                path = %entry.path().display(),
+                "flush: could not quarantine stale staged component"
+            ),
+        }
+    }
+
+    if quarantined > 0 || removed_staging_dirs > 0 {
+        tracing::warn!(
+            quarantined,
+            removed_staging_dirs,
+            dir = %dir.display(),
+            "flush: swept stale staged output left by an earlier crash"
+        );
     }
 }
 
@@ -815,23 +1055,11 @@ impl FileFlushTarget {
     /// counter starts at 0; the first flush produces generation 1.
     pub fn new(base_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&base_dir)?;
-        Self::cleanup_stale_tmp_files(&base_dir);
+        sweep_stale_flush_staging(&base_dir);
         Ok(Self {
             base_dir,
             generation: AtomicU64::new(0),
         })
-    }
-
-    /// Remove any stale `.tmp` files left behind by a crash during flush.
-    fn cleanup_stale_tmp_files(dir: &Path) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "tmp") {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
     }
 
     /// Returns the current generation counter value (the last generation written).
@@ -848,7 +1076,7 @@ impl FileFlushTarget {
     /// gen=1 and their SSTables collide in the S3 manifest.
     pub fn new_starting_at(base_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&base_dir)?;
-        Self::cleanup_stale_tmp_files(&base_dir);
+        sweep_stale_flush_staging(&base_dir);
         let max_gen = Self::scan_max_generation(&base_dir);
         let node_offset = Self::node_generation_offset();
         Ok(Self {
@@ -952,6 +1180,8 @@ impl FileFlushTarget {
             statistics: base.join(format!("{gen}-Statistics.db")),
             toc: base.join(format!("{gen}-TOC.txt")),
             compression_info: base.join(format!("{gen}-CompressionInfo.db")),
+            digest: base.join(format!("{gen}-Digest.crc32")),
+            crc: base.join(format!("{gen}-CRC.db")),
         }
     }
 
@@ -983,8 +1213,11 @@ impl FileFlushTarget {
         Self::rename_path(tmp(&paths.filter), &paths.filter)?;
         Self::rename_path(tmp(&paths.statistics), &paths.statistics)?;
         Self::rename_path(tmp(&paths.toc), &paths.toc)?;
+        Self::rename_path(tmp(&paths.digest), &paths.digest)?;
         if has_compression_info {
             Self::rename_path(tmp(&paths.compression_info), &paths.compression_info)?;
+        } else {
+            Self::rename_path(tmp(&paths.crc), &paths.crc)?;
         }
         Self::rename_path(tmp(&paths.data), &paths.data)?;
         Ok(())
@@ -1007,6 +1240,11 @@ impl FileFlushTarget {
 
     /// fsync the directory `dir` so that rename directory entries are durable.
     ///
+    /// `pub(crate)` so `StorageEngine::promote_compaction_output` (engine.rs,
+    /// T-001) can reuse this exact barrier for `sstables/<table>/` after
+    /// promoting a compaction output, instead of duplicating the open+sync_all
+    /// dance with its own durability semantics.
+    ///
     /// On POSIX a `rename(2)` updates the directory; that update lives in the
     /// page cache until the directory inode is fsynced. Without this, a crash
     /// after rename but before writeback can lose the final-named entry (or,
@@ -1014,7 +1252,7 @@ impl FileFlushTarget {
     /// flushed). Opening the directory and calling `sync_all()` flushes those
     /// entries. This is the single barrier that makes the temp→rename→final
     /// sequence crash-atomic.
-    fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
         let f = std::fs::File::open(dir)?;
         f.sync_all()?;
         #[cfg(test)]
@@ -1044,9 +1282,12 @@ impl FileFlushTarget {
             &paths.filter,
             &paths.statistics,
             &paths.toc,
+            &paths.digest,
         ];
         if has_compression_info {
             components.push(&paths.compression_info);
+        } else {
+            components.push(&paths.crc);
         }
 
         // Issue every component fsync CONCURRENTLY so their device flushes fill
@@ -1070,7 +1311,7 @@ impl FileFlushTarget {
         // failure and we return it WITHOUT reaching the directory fsync — no
         // false-durability claim. Guarded by
         // `fsync_components_fails_loud_and_skips_dir_when_a_component_is_missing`.
-        crate::flush_executor::pool().install(|| {
+        crate::flush_executor::pool()?.install(|| {
             components.par_iter().try_for_each(|component| {
                 Self::fsync_path(component).map_err(|e| {
                     ferrosa_common::Error::Io(std::io::Error::new(
@@ -1117,14 +1358,344 @@ impl FileFlushTarget {
             None
         };
 
-        SSTableReader::open(SSTableComponents {
+        let mut reader = SSTableReader::open(SSTableComponents {
             data,
             partitions,
             rows,
             filter,
             compression_info,
             statistics,
+        })?;
+
+        // This helper only ever opens a generation this process just
+        // promoted (see call sites), so Digest.crc32 (and CRC.db for
+        // uncompressed tables) are always present here -- `?`, not `.ok()`.
+        let digest = std::fs::read(&paths.digest)?;
+        reader.load_digest(&digest)?;
+        if !has_compression_info {
+            let crc = std::fs::read(&paths.crc)?;
+            reader.load_crc_table(&crc)?;
+        }
+
+        Ok(reader)
+    }
+
+    /// Validate that every staged `.tmp` component landed at its expected
+    /// length. `SSTableOutputFiles` records a length per component; checking
+    /// only `data_len` let five of six components promote unchecked. What a
+    /// length check cannot catch is covered by the readback walk that follows
+    /// it in `flush_files`.
+    ///
+    /// `Rows.db` is legitimately zero-length for small SSTables (see
+    /// `StorageEngine::smoke_test_generation`, which excludes it from its
+    /// zero-byte rule), so the comparison is against the recorded length,
+    /// never against zero.
+    fn check_staged_component_lengths(
+        gen: u64,
+        paths: &FileComponentPaths,
+        output: &SSTableOutputFiles,
+    ) -> std::result::Result<(), String> {
+        let tmp = Self::tmp_component_path;
+        let mut checks: Vec<(&str, &Path, u64)> = vec![
+            ("Data.db", &paths.data, output.data_len),
+            ("Partitions.db", &paths.partitions, output.partitions_len),
+            ("Rows.db", &paths.rows, output.rows_len),
+            ("Filter.db", &paths.filter, output.filter_len),
+            ("Statistics.db", &paths.statistics, output.statistics_len),
+            ("TOC.txt", &paths.toc, output.toc_len),
+            ("Digest.crc32", &paths.digest, output.digest_len),
+        ];
+        if output.compression_info.is_some() {
+            checks.push((
+                "CompressionInfo.db",
+                &paths.compression_info,
+                output.compression_info_len,
+            ));
+        }
+        if output.crc.is_some() {
+            checks.push(("CRC.db", &paths.crc, output.crc_len));
+        }
+
+        for (name, path, expected) in checks {
+            let actual = std::fs::metadata(tmp(path)).map(|m| m.len()).unwrap_or(0);
+            if actual != expected {
+                return Err(format!(
+                    "FLUSH CORRUPTION: staged {name} gen={gen} expected {expected} bytes, \
+                     got {actual}."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Recompute `Digest.crc32` from the staged `.tmp` Data.db bytes **read
+    /// back from disk** and compare it with the producer's value
+    /// (`publication-safety.md` M2 step 4 / M3, T-012). Runs unconditionally
+    /// -- there is no environment variable that can turn this off, unlike
+    /// compaction's row/partition count walk -- and runs for compaction too,
+    /// since compaction publishes through this same `flush_files`.
+    ///
+    /// This closes G3/G4: the structural readback walk that follows only
+    /// proves the file decodes, not that it holds the bytes the producer
+    /// actually computed a checksum over. A length-preserving corruption
+    /// (bit flip, swapped block, stale bytes from a recycled buffer) changes
+    /// the CRC32 essentially certainly, so this check catches every case in
+    /// the fault matrix a length comparison and a decode walk both miss.
+    ///
+    /// Reads in bounded chunks through one reused buffer -- never a
+    /// whole-file `Vec` -- and on Linux advises the kernel to drop the pages
+    /// this verification read just forced into cache, so checking the digest
+    /// does not itself refill the cache the write pump bypasses. An advise
+    /// failure is logged, never silent, and never fails the check: the
+    /// digest comparison is the correctness gate, the fadvise call is only a
+    /// cache hint.
+    fn verify_staged_data_digest(
+        gen: u64,
+        paths: &FileComponentPaths,
+    ) -> std::result::Result<(), String> {
+        let tmp = Self::tmp_component_path;
+        let digest_path = tmp(&paths.digest);
+        let data_path = tmp(&paths.data);
+
+        let digest_bytes = std::fs::read(&digest_path).map_err(|e| {
+            format!(
+                "staged Digest.crc32 gen={gen} at {} could not be read: {e}",
+                digest_path.display()
+            )
+        })?;
+        let expected = ferrosa_sstable::checksum::parse_digest(&digest_bytes).map_err(|e| {
+            format!(
+                "staged Digest.crc32 gen={gen} at {} is unreadable: {e}",
+                digest_path.display()
+            )
+        })?;
+
+        let file = std::fs::File::open(&data_path).map_err(|e| {
+            format!(
+                "staged Data.db gen={gen} at {} could not be opened for digest verification: {e}",
+                data_path.display()
+            )
+        })?;
+
+        use std::io::Read;
+        let digest_read_chunk_bytes =
+            crate::runtime_tuning::storage_runtime_tuning().digest_read_chunk_bytes;
+        let mut hasher = ferrosa_sstable::checksum::DigestCrc32::new();
+        let mut buf = vec![0u8; digest_read_chunk_bytes];
+        #[cfg(test)]
+        let readback_hook = readback_test_support::for_path(&data_path);
+        loop {
+            #[cfg(test)]
+            if let Some(hook) = &readback_hook {
+                hook().map_err(|e| format!("gated digest readback failed: {e}"))?;
+            }
+            let n = (&file).read(&mut buf).map_err(|e| {
+                format!("read failed verifying staged Data.db digest gen={gen}: {e}")
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Self::fadvise_dontneed_after_verification(&file, &data_path);
+
+        let actual = hasher.finalize();
+        if actual != expected {
+            return Err(format!(
+                "staged Data.db gen={gen} at {} Digest.crc32 mismatch: producer computed \
+                 {expected:#010x}, re-reading the staged bytes from disk computed {actual:#010x}.",
+                data_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Advise the kernel to drop this file's pages from the page cache
+    /// (Linux only). Called after verification reads so they do not leave the
+    /// just-checked bytes resident in cache. A no-op on other platforms: there
+    /// is no portable equivalent, and this is a cache hint, not a correctness
+    /// requirement.
+    #[cfg(target_os = "linux")]
+    fn fadvise_dontneed_after_verification(file: &std::fs::File, path: &Path) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` is a valid, open fd for the duration of this call;
+        // offset/len 0 means "the whole file", and `posix_fadvise` is
+        // advisory -- it cannot fault or invalidate the fd.
+        let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        if rc != 0 {
+            tracing::warn!(
+                path = %path.display(),
+                errno = rc,
+                "posix_fadvise(DONTNEED) failed after staged verification; the \
+                 verification bytes may remain in the page cache"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn fadvise_dontneed_after_verification(_file: &std::fs::File, _path: &Path) {}
+
+    /// Build the `.tmp`-named counterpart of every path in `paths`, for
+    /// opening a throwaway reader over staged (not-yet-promoted) bytes.
+    fn tmp_component_paths(paths: &FileComponentPaths) -> FileComponentPaths {
+        let tmp = Self::tmp_component_path;
+        FileComponentPaths {
+            data: tmp(&paths.data),
+            partitions: tmp(&paths.partitions),
+            rows: tmp(&paths.rows),
+            filter: tmp(&paths.filter),
+            statistics: tmp(&paths.statistics),
+            toc: tmp(&paths.toc),
+            compression_info: tmp(&paths.compression_info),
+            digest: tmp(&paths.digest),
+            crc: tmp(&paths.crc),
+        }
+    }
+
+    /// For deferred writer output, discard component pages only after the
+    /// publication transaction has synced and verified every staged file.
+    /// This preserves the buffered pump's cache policy without asking DONTNEED
+    /// to discard dirty, not-yet-durable pages.
+    fn fadvise_deferred_components(
+        paths: &FileComponentPaths,
+        has_compression_info: bool,
+        has_crc: bool,
+    ) {
+        let advise = |path: &Path| {
+            #[cfg(test)]
+            fsync_probe::note_fadvise(path);
+            match std::fs::File::open(path) {
+                Ok(file) => Self::fadvise_dontneed_after_verification(&file, path),
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to open verified staged component for page-cache advice"
+                ),
+            }
+        };
+        for path in [
+            &paths.data,
+            &paths.partitions,
+            &paths.rows,
+            &paths.filter,
+            &paths.statistics,
+            &paths.toc,
+            &paths.digest,
+        ] {
+            advise(path);
+        }
+        if has_compression_info {
+            advise(&paths.compression_info);
+        }
+        if has_crc {
+            advise(&paths.crc);
+        }
+    }
+
+    /// fsync every staged `.tmp` component (concurrently, on the shared flush
+    /// pool, mirroring `fsync_components`'s ordering rationale) WITHOUT
+    /// touching the containing directory -- the `.tmp` names are not renamed
+    /// yet, so there is no new directory entry to make durable here. Called
+    /// before the pre-promote readback walk so a crash right after a
+    /// successful flush_files still has fsynced bytes to read back.
+    fn fsync_tmp_components(
+        &self,
+        paths: &FileComponentPaths,
+        has_compression_info: bool,
+        has_crc: bool,
+    ) -> Result<()> {
+        let tmp = Self::tmp_component_path;
+        let mut tmp_paths: Vec<PathBuf> = vec![
+            tmp(&paths.data),
+            tmp(&paths.partitions),
+            tmp(&paths.rows),
+            tmp(&paths.filter),
+            tmp(&paths.statistics),
+            tmp(&paths.toc),
+            tmp(&paths.digest),
+        ];
+        if has_compression_info {
+            tmp_paths.push(tmp(&paths.compression_info));
+        }
+        if has_crc {
+            tmp_paths.push(tmp(&paths.crc));
+        }
+
+        crate::flush_executor::pool()?.install(|| {
+            tmp_paths.par_iter().try_for_each(|component| {
+                Self::fsync_path(component).map_err(|e| {
+                    ferrosa_common::Error::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "fsync of staged component {} failed: {e}",
+                            component.display()
+                        ),
+                    ))
+                })
+            })
         })
+    }
+
+    /// Move a refused generation's `.tmp` component set into `quarantine/`,
+    /// WARN with the reason, count the refusal
+    /// (`sstable_publication_refused_total{reason}`), and return the `Err`
+    /// the caller should propagate.
+    ///
+    /// Scans for the `{gen}-*.tmp` prefix rather than the fixed component list
+    /// so an unexpected leftover (a partial write outside the six/seven named
+    /// components) is still swept, matching the prefix-scan convention
+    /// `StorageEngine::quarantine_generation` already uses for live names.
+    fn quarantine_staged_components(
+        &self,
+        gen: u64,
+        reason: crate::metrics::PublicationRefusedReason,
+        detail: &str,
+    ) -> ferrosa_common::Error {
+        let quarantine_dir = self.base_dir.join("quarantine");
+        let mut moved = 0usize;
+        match std::fs::create_dir_all(&quarantine_dir) {
+            Ok(()) => {
+                let prefix = format!("{gen}-");
+                for entry in std::fs::read_dir(&self.base_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if !name_str.starts_with(&prefix) || !name_str.ends_with(".tmp") {
+                        continue;
+                    }
+                    let dest = quarantine_dir.join(&name);
+                    match std::fs::rename(entry.path(), &dest) {
+                        Ok(()) => moved += 1,
+                        Err(e) => tracing::error!(
+                            gen, %e, path = %entry.path().display(),
+                            "flush: could not move refused staged component to quarantine"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::error!(
+                gen, %e, dir = %quarantine_dir.display(),
+                "flush: could not create quarantine dir; refused staged output left under .tmp names"
+            ),
+        }
+
+        crate::metrics::inc_sstable_publication_refused(reason);
+        tracing::warn!(
+            gen,
+            reason = reason.label(),
+            detail,
+            moved,
+            dir = %quarantine_dir.display(),
+            "flush: refusing to publish staged SSTable output; quarantined"
+        );
+
+        ferrosa_common::Error::InvalidFormat(format!(
+            "{detail} Refusing to publish it; {moved} staged component(s) quarantined under {}.",
+            quarantine_dir.display()
+        ))
     }
 }
 
@@ -1136,6 +1707,10 @@ struct FileComponentPaths {
     statistics: PathBuf,
     toc: PathBuf,
     compression_info: PathBuf,
+    /// `Digest.crc32` — written for every table (T-011).
+    digest: PathBuf,
+    /// `CRC.db` — written for uncompressed tables only (T-011).
+    crc: PathBuf,
 }
 
 /// Open a file-backed SSTable reader from component files for generation `gen`
@@ -1180,15 +1755,27 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
     let filter = std::fs::read(required(filter_component)?)?;
     let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap_or_default();
     let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+    let is_compressed = compression_info.is_some();
 
-    SSTableReader::open(SSTableComponents {
+    let mut reader = SSTableReader::open(SSTableComponents {
         data,
         partitions,
         rows,
         filter,
         compression_info,
         statistics,
-    })
+    })?;
+
+    // Digest.crc32 (all tables) and CRC.db (uncompressed tables only) are
+    // genuinely optional, same as CompressionInfo.db above: a generation
+    // written before T-011 has neither, and `SSTableReader` treats an
+    // unloaded digest/CRC table as "not checked" rather than an error
+    // (logged once per generation — see `checksum` module docs in
+    // ferrosa-sstable). Centralised (T-012) so every other file-backed open
+    // path gets the same automatic loading instead of opting in ad hoc.
+    ferrosa_sstable::reader::load_checksums_for_generation(&mut reader, dir, gen, is_compressed);
+
+    Ok(reader)
 }
 
 /// Process-wide SSTable generation allocator.
@@ -1227,6 +1814,7 @@ fn component_expectations<'a>(
             output.statistics.len() as u64,
         ),
         ("TOC.txt", &paths.toc, output.toc.len() as u64),
+        ("Digest.crc32", &paths.digest, output.digest.len() as u64),
     ];
     if let Some(ci) = output.compression_info.as_ref() {
         v.push((
@@ -1235,15 +1823,181 @@ fn component_expectations<'a>(
             ci.len() as u64,
         ));
     }
+    if let Some(crc) = output.crc.as_ref() {
+        v.push(("CRC.db", &paths.crc, crc.len() as u64));
+    }
     v
 }
 
 fn verify_promoted_sstable(reader: &SSTableReader<FileReadAt>) -> Result<()> {
     let mut iter = reader.partitions_iter()?;
-    while let Some(partition) = iter.next_partition()? {
-        let _ = partition.rows.len();
+    while iter.next_partition_count()?.is_some() {
+        // Walk partition framing and count rows without decoding cell payloads.
     }
     Ok(())
+}
+
+fn write_legacy_component(path: impl AsRef<Path>, bytes: &[u8]) -> std::io::Result<()> {
+    ferrosa_sstable::pump::note_component_write_outside_pump(path.as_ref());
+    std::fs::write(path, bytes)
+}
+
+impl FileFlushTarget {
+    fn flush_files_inner(
+        &self,
+        output: SSTableOutputFiles,
+        drop_cache_after_verify: bool,
+    ) -> Result<SSTableReader<FileReadAt>> {
+        let gen = self.next_generation();
+        let paths = self.component_paths(gen);
+        let has_compression_info = output.compression_info.is_some();
+        tracing::info!(
+            gen,
+            data_size = output.data_len,
+            partitions_size = output.partitions_len,
+            dir = %self.base_dir.display(),
+            "flush: staging SSTable for verify-before-promote"
+        );
+
+        let tmp = Self::tmp_component_path;
+
+        std::fs::rename(&output.data, tmp(&paths.data))?;
+        std::fs::rename(&output.partitions, tmp(&paths.partitions))?;
+        std::fs::rename(&output.rows, tmp(&paths.rows))?;
+        std::fs::rename(&output.filter, tmp(&paths.filter))?;
+        std::fs::rename(&output.statistics, tmp(&paths.statistics))?;
+        std::fs::rename(&output.toc, tmp(&paths.toc))?;
+        std::fs::rename(&output.digest, tmp(&paths.digest))?;
+        if let Some(compression_info) = output.compression_info.as_ref() {
+            std::fs::rename(compression_info, tmp(&paths.compression_info))?;
+        }
+        if let Some(crc) = output.crc.as_ref() {
+            std::fs::rename(crc, tmp(&paths.crc))?;
+        }
+
+        // The staging dir is empty now regardless of what happens below, so
+        // clean it up eagerly rather than leaving a failure path to forget it.
+        let staging_parent = output.staging_dir.parent().map(Path::to_path_buf);
+        if let Err(e) = std::fs::remove_dir(&output.staging_dir) {
+            tracing::debug!(
+                gen, %e, dir = %output.staging_dir.display(),
+                "flush: could not remove empty staging dir"
+            );
+        }
+        if let Some(parent) = staging_parent {
+            if let Err(e) = std::fs::remove_dir(&parent) {
+                tracing::debug!(
+                    gen, %e, dir = %parent.display(),
+                    "flush: staging parent not empty or already removed"
+                );
+            }
+        }
+
+        // Verify-before-promote (`publication-safety.md` M2): every check
+        // below runs against the `.tmp` names, BEFORE `promote_tmp_components`
+        // makes anything live. A refusal at any point quarantines the `.tmp`
+        // set instead of returning with output under a name the startup scan
+        // will load. This closes G1: the previous order promoted to live
+        // names first and verified after, so a readback failure left a
+        // corrupt SSTable at a live name next to the WAL replay of the same
+        // rows.
+        if let Err(detail) = Self::check_staged_component_lengths(gen, &paths, &output) {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::LengthMismatch,
+                &detail,
+            ));
+        }
+
+        // Durability barrier on the STAGED bytes: fsync every `.tmp` component
+        // before the readback walk trusts what it reads, and before promote
+        // can rename them into place. `fsync_dir` after promote below then
+        // only needs to make the rename entries durable -- the component
+        // bytes underneath are already synced.
+        if let Err(e) =
+            self.fsync_tmp_components(&paths, has_compression_info, output.crc.is_some())
+        {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::Fsync,
+                &format!(
+                    "FLUSH CORRUPTION: staged components gen={gen} could not be fsynced: {e}."
+                ),
+            ));
+        }
+
+        // Recompute Digest.crc32 from the now-durable staged bytes and compare
+        // it with the producer's value (`publication-safety.md` M2 step 4 / M3,
+        // T-012). Unconditional -- flush and compaction (which calls this same
+        // function) both get it, and there is no environment variable that can
+        // disable it, unlike the row/partition count walk compaction runs
+        // separately. This runs BEFORE the structural readback walk below: a
+        // length-preserving content corruption changes the CRC32, so this is
+        // the check that actually catches it, not the decode walk.
+        if let Err(detail) = Self::verify_staged_data_digest(gen, &paths) {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::DigestMismatch,
+                &format!("FLUSH CORRUPTION: {detail}"),
+            ));
+        }
+
+        // Read back the STAGED file, not a promised promotion of it.
+        //
+        // On 2026-08-20 node2's compaction of agent_memory.session_task_focus_stack
+        // verified its output in the compaction staging directory -- "output
+        // verified (streaming readback matches merge) partitions=13 rows=17" --
+        // and nine seconds later the swap published it into the table directory
+        // under a different generation. That published file was corrupt:
+        //
+        //     read_exact_at: wanted 17063 bytes, got 818
+        //
+        // Nothing checked the published file itself. Verifying staged bytes
+        // and then promoting something else was not verification -- this now
+        // walks the exact `.tmp` bytes that promote will rename into place, on
+        // a THROWAWAY reader (the engine keeps the reader this function
+        // returns; verifying through it would leave cached state that a later
+        // corruption could hide behind).
+        let tmp_paths = Self::tmp_component_paths(&paths);
+        let readback =
+            Self::open_reader_from_paths(&tmp_paths, has_compression_info).and_then(|probe| {
+                let result = verify_promoted_sstable(&probe);
+                drop(probe);
+                result
+            });
+        if let Err(e) = readback {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::ReadbackFailed,
+                &format!("FLUSH CORRUPTION: staged SSTable gen={gen} could not be read back: {e}."),
+            ));
+        }
+
+        #[cfg(test)]
+        fsync_probe::note_readback_verified(&tmp_paths.data);
+        if drop_cache_after_verify {
+            Self::fadvise_deferred_components(
+                &tmp_paths,
+                has_compression_info,
+                output.crc.is_some(),
+            );
+        }
+
+        Self::promote_tmp_components(&paths, has_compression_info)?;
+
+        // The component bytes are already fsynced (above); only the rename
+        // entries need to become durable now.
+        Self::fsync_dir(&self.base_dir)?;
+
+        tracing::info!(
+            gen,
+            data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
+            path = %paths.data.display(),
+            "flush: staged SSTable verified, promoted, and fsynced"
+        );
+
+        Self::open_reader_from_paths(&paths, has_compression_info)
+    }
 }
 
 impl FlushTarget for FileFlushTarget {
@@ -1301,17 +2055,23 @@ impl FlushTarget for FileFlushTarget {
             statistics: run_dir.join("0-Statistics.db"),
             toc: run_dir.join("0-TOC.txt"),
             compression_info: run_dir.join("0-CompressionInfo.db"),
+            digest: run_dir.join("0-Digest.crc32"),
+            crc: run_dir.join("0-CRC.db"),
         };
         // Write components; on any failure remove the run dir so we never leak.
         let write_all = || -> Result<()> {
-            std::fs::write(&paths.data, &output.data)?;
-            std::fs::write(&paths.partitions, &output.partitions)?;
-            std::fs::write(&paths.rows, &output.rows)?;
-            std::fs::write(&paths.filter, &output.filter)?;
-            std::fs::write(&paths.statistics, &output.statistics)?;
-            std::fs::write(&paths.toc, &output.toc)?;
+            write_legacy_component(&paths.data, &output.data)?;
+            write_legacy_component(&paths.partitions, &output.partitions)?;
+            write_legacy_component(&paths.rows, &output.rows)?;
+            write_legacy_component(&paths.filter, &output.filter)?;
+            write_legacy_component(&paths.statistics, &output.statistics)?;
+            write_legacy_component(&paths.toc, &output.toc)?;
+            write_legacy_component(&paths.digest, &output.digest)?;
             if let Some(ref ci) = output.compression_info {
-                std::fs::write(&paths.compression_info, ci)?;
+                write_legacy_component(&paths.compression_info, ci)?;
+            }
+            if let Some(ref crc) = output.crc {
+                write_legacy_component(&paths.crc, crc)?;
             }
             Ok(())
         };
@@ -1379,17 +2139,21 @@ impl FlushTarget for FileFlushTarget {
         let toc_tmp = tmp(&paths.toc);
 
         if let Some(ref ci) = output.compression_info {
-            std::fs::write(tmp(&paths.compression_info), ci)?;
+            write_legacy_component(tmp(&paths.compression_info), ci)?;
+        }
+        if let Some(ref crc) = output.crc {
+            write_legacy_component(tmp(&paths.crc), crc)?;
         }
 
         std::thread::scope(|s| {
             let handles: Vec<_> = [
-                s.spawn(|| std::fs::write(tmp(&paths.data), &output.data)),
-                s.spawn(|| std::fs::write(tmp(&paths.partitions), &output.partitions)),
-                s.spawn(|| std::fs::write(tmp(&paths.rows), &output.rows)),
-                s.spawn(|| std::fs::write(tmp(&paths.filter), &output.filter)),
-                s.spawn(|| std::fs::write(tmp(&paths.statistics), &output.statistics)),
-                s.spawn(|| std::fs::write(&toc_tmp, &output.toc)),
+                s.spawn(|| write_legacy_component(tmp(&paths.data), &output.data)),
+                s.spawn(|| write_legacy_component(tmp(&paths.partitions), &output.partitions)),
+                s.spawn(|| write_legacy_component(tmp(&paths.rows), &output.rows)),
+                s.spawn(|| write_legacy_component(tmp(&paths.filter), &output.filter)),
+                s.spawn(|| write_legacy_component(tmp(&paths.statistics), &output.statistics)),
+                s.spawn(|| write_legacy_component(&toc_tmp, &output.toc)),
+                s.spawn(|| write_legacy_component(tmp(&paths.digest), &output.digest)),
             ]
             .into_iter()
             .collect();
@@ -1465,130 +2229,14 @@ impl FlushTarget for FileFlushTarget {
     }
 
     fn flush_files(&self, output: SSTableOutputFiles) -> Result<SSTableReader<FileReadAt>> {
-        let gen = self.next_generation();
-        let paths = self.component_paths(gen);
-        let has_compression_info = output.compression_info.is_some();
-        tracing::info!(
-            gen,
-            data_size = output.data_len,
-            partitions_size = output.partitions_len,
-            dir = %self.base_dir.display(),
-            "flush: promoting staged SSTable"
-        );
+        self.flush_files_inner(output, false)
+    }
 
-        let tmp = Self::tmp_component_path;
-
-        std::fs::rename(&output.data, tmp(&paths.data))?;
-        std::fs::rename(&output.partitions, tmp(&paths.partitions))?;
-        std::fs::rename(&output.rows, tmp(&paths.rows))?;
-        std::fs::rename(&output.filter, tmp(&paths.filter))?;
-        std::fs::rename(&output.statistics, tmp(&paths.statistics))?;
-        std::fs::rename(&output.toc, tmp(&paths.toc))?;
-        if let Some(compression_info) = output.compression_info.as_ref() {
-            std::fs::rename(compression_info, tmp(&paths.compression_info))?;
-        }
-
-        // Verify EVERY component's length, not just Data.db's.
-        //
-        // `SSTableOutputFiles` records a length for each component and this
-        // gate compared only `data_len`, so five of six were promoted
-        // unchecked. Cheap hardening -- one `metadata` call each -- but note
-        // what a length check cannot do: see the readback below. A file can be
-        // exactly the length the writer intended and still be unreadable.
-        //
-        // Rows.db is legitimately zero-length for small SSTables (see
-        // `StorageEngine::smoke_test_generation`, which deliberately excludes
-        // it from the zero-byte rule), so the comparison is against the
-        // recorded length rather than against zero.
-        let mut checks: Vec<(&str, &Path, u64)> = vec![
-            ("Data.db", &paths.data, output.data_len),
-            ("Partitions.db", &paths.partitions, output.partitions_len),
-            ("Rows.db", &paths.rows, output.rows_len),
-            ("Filter.db", &paths.filter, output.filter_len),
-            ("Statistics.db", &paths.statistics, output.statistics_len),
-            ("TOC.txt", &paths.toc, output.toc_len),
-        ];
-        if has_compression_info {
-            checks.push((
-                "CompressionInfo.db",
-                &paths.compression_info,
-                output.compression_info_len,
-            ));
-        }
-
-        for (name, path, expected) in checks {
-            let actual = std::fs::metadata(tmp(path)).map(|m| m.len()).unwrap_or(0);
-            if actual != expected {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "FLUSH CORRUPTION: staged {name} gen={gen} expected {expected} bytes, \
-                     got {actual}. Refusing to promote a partially written SSTable; the \
-                     staged files are left in place for inspection."
-                )));
-            }
-        }
-
-        Self::promote_tmp_components(&paths, has_compression_info)?;
-
-        // Durability barrier: fsync every promoted component, then fsync the
-        // directory once, BEFORE cleaning up staging or returning. This path is
-        // shared by compaction output promotion (compaction/executor.rs), so
-        // compaction inherits the same crash-atomic guarantee: the local output
-        // SSTable is durable before any caller deletes inputs or swaps the
-        // manifest.
-        self.fsync_components(&paths, has_compression_info)?;
-
-        let staging_parent = output.staging_dir.parent().map(Path::to_path_buf);
-        let _ = std::fs::remove_dir(&output.staging_dir);
-        if let Some(parent) = staging_parent {
-            let _ = std::fs::remove_dir(parent);
-        }
-
-        tracing::info!(
-            gen,
-            data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
-            path = %paths.data.display(),
-            "flush: staged Data.db promoted and fsynced"
-        );
-
-        // Verify on a THROWAWAY reader, then hand back a clean one.
-        //
-        // Walking the partitions warms reader state, and the engine keeps the
-        // reader this function returns. Verifying through it would leave that
-        // cached state in place, so a file corrupted after the flush could be
-        // served from memory instead of being detected -- the verification
-        // would mask exactly the failures it exists to catch.
-        let probe = Self::open_reader_from_paths(&paths, has_compression_info)?;
-
-        // Read back the file that was PUBLISHED, not the one that was staged.
-        //
-        // On 2026-08-20 node2's compaction of agent_memory.session_task_focus_stack
-        // verified its output in the compaction staging directory -- "output
-        // verified (streaming readback matches merge) partitions=13 rows=17" --
-        // and nine seconds later the swap published it into the table directory
-        // under a different generation. That published file was corrupt:
-        //
-        //     read_exact_at: wanted 17063 bytes, got 818
-        //
-        // Nothing checked it. Opening a reader succeeds on a file whose
-        // partition index is wrong, and the length comparison above cannot see
-        // damage that does not change a length. So the SSTable entered the live
-        // view as healthy and was found thirty seconds later by the periodic
-        // self-heal scan -- at which point quarantining it broke every read of
-        // that table on that node.
-        //
-        // Verifying in staging and publishing something else is not
-        // verification. This walks the promoted partitions once, the same work
-        // the compaction path already pays, moved to the file that matters.
-        if let Err(e) = verify_promoted_sstable(&probe) {
-            return Err(ferrosa_common::Error::InvalidFormat(format!(
-                "FLUSH CORRUPTION: promoted SSTable gen={gen} could not be read back: {e}. \
-                 Refusing to publish it; components are left in place at {} for salvage.",
-                paths.data.display()
-            )));
-        }
-        drop(probe);
-
-        Self::open_reader_from_paths(&paths, has_compression_info)
+    fn flush_deferred_files(
+        &self,
+        output: SSTableOutputFiles,
+    ) -> Result<SSTableReader<FileReadAt>> {
+        self.flush_files_inner(output, true)
     }
 
     fn last_generation(&self) -> u64 {
@@ -1997,7 +2645,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &partitions {
@@ -2044,7 +2692,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &partitions {
@@ -2157,7 +2805,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &partitions {
@@ -2221,13 +2869,15 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
-        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let output = writer
+            .finish_to_directory_deferred_sync(&staging_dir)
+            .unwrap();
 
         // Damage the CONTENT while keeping the length exactly as recorded --
         // the shape a length comparison cannot see, and the shape that
@@ -2245,7 +2895,7 @@ mod tests {
         );
         std::fs::write(&output.data, &damaged).unwrap();
 
-        let msg = match target.flush_files(output) {
+        let msg = match target.flush_deferred_files(output) {
             Ok(_) => panic!(
                 "an SSTable whose contents cannot be read back must not be \
                  promoted into the live view"
@@ -2260,7 +2910,32 @@ mod tests {
     }
 
     #[test]
-    fn file_flush_target_promotes_staged_sstable_files() {
+    fn writer_callers_restart_removes_legacy_raw_without_touching_live_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join(".sstable-staging").join("old-writer");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("Data.raw"), b"abandoned staging").unwrap();
+        std::fs::write(dir.path().join("Data.raw"), b"abandoned raw output").unwrap();
+        std::fs::write(dir.path().join("1-Data.db"), b"live component").unwrap();
+
+        FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+
+        assert!(!staging.exists());
+        assert!(!dir.path().join("Data.raw").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("1-Data.db")).unwrap(),
+            b"live component"
+        );
+    }
+
+    #[test]
+    fn writer_callers_flush_promotes_staged_sstable_files() {
+        for compression in [None, Some(ferrosa_sstable::Compression::Lz4)] {
+            assert_writer_caller_flush(compression);
+        }
+    }
+
+    fn assert_writer_caller_flush(compression: Option<ferrosa_sstable::Compression>) {
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut partitions = vec![
@@ -2275,9 +2950,13 @@ mod tests {
             .unwrap()
             .expect("file target staging dir");
         let header = build_serialization_header(&schema, &partitions);
-        let options = WriteOptions::default();
+        let compressed = compression.is_some();
+        let options = WriteOptions {
+            compression,
+            ..WriteOptions::default()
+        };
         let mut writer =
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db")).unwrap();
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
@@ -2294,10 +2973,12 @@ mod tests {
             std::fs::metadata(&data_path).unwrap().len(),
             staged_data_len
         );
-        assert!(dir
-            .path()
-            .join(format!("{gen}-CompressionInfo.db"))
-            .exists());
+        assert_eq!(
+            dir.path()
+                .join(format!("{gen}-CompressionInfo.db"))
+                .exists(),
+            compressed
+        );
 
         for p in &partitions {
             let got = reader.get_partition(&p.key).unwrap().expect("partition");
@@ -2559,7 +3240,7 @@ mod tests {
         let header = build_serialization_header(&schema, &partitions);
         let options = WriteOptions::default();
         let mut writer =
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db")).unwrap();
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
@@ -2597,7 +3278,7 @@ mod tests {
         let _reader = target.flush(output).unwrap();
         let gen = target.generation();
 
-        let synced = fsync_probe::synced_files();
+        let synced = fsync_probe::synced_files_under(dir.path());
         for suffix in [
             "Data.db",
             "Partitions.db",
@@ -2764,6 +3445,8 @@ mod tests {
             statistics: base.join("9-Statistics.db"), // intentionally NOT created
             toc: touch("9-TOC.txt"),
             compression_info: base.join("9-CompressionInfo.db"),
+            digest: touch("9-Digest.crc32"),
+            crc: touch("9-CRC.db"),
         };
 
         let result = target.fsync_components(&paths, /* has_compression_info */ false);
@@ -2781,7 +3464,10 @@ mod tests {
     #[test]
     fn flush_files_fsyncs_every_component_and_directory() {
         // The staged-promotion path (used by compaction) must apply the same
-        // durability barrier as flush().
+        // durability barrier as flush() -- but verify-before-promote
+        // (`publication-safety.md` M2) fsyncs the STAGED `.tmp` bytes before
+        // the readback walk trusts them, and promote's rename needs only the
+        // directory fsync afterward (the bytes underneath did not change).
         let _fsync_probe = fsync_probe::exclusive();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2800,39 +3486,638 @@ mod tests {
         let header = build_serialization_header(&schema, &partitions);
         let options = WriteOptions::default();
         let mut writer =
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db")).unwrap();
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
-        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let output = writer
+            .finish_to_directory_deferred_sync(&staging_dir)
+            .unwrap();
         let has_ci = output.compression_info.is_some();
 
-        let _reader = target.flush_files(output).unwrap();
+        let _reader = target.flush_deferred_files(output).unwrap();
         let gen = target.generation();
 
         let synced = fsync_probe::synced_files();
         let mut expected = vec![
-            "Data.db",
-            "Partitions.db",
-            "Rows.db",
-            "Filter.db",
-            "Statistics.db",
-            "TOC.txt",
+            "Data.db.tmp",
+            "Partitions.db.tmp",
+            "Rows.db.tmp",
+            "Filter.db.tmp",
+            "Statistics.db.tmp",
+            "TOC.txt.tmp",
         ];
         if has_ci {
-            expected.push("CompressionInfo.db");
+            expected.push("CompressionInfo.db.tmp");
         }
         for suffix in expected {
             let path = dir.path().join(format!("{gen}-{suffix}"));
             assert!(
                 synced.contains(&path),
-                "component {suffix} was not fsynced; synced={synced:?}"
+                "staged component {suffix} was not fsynced before verify; synced={synced:?}"
             );
         }
+
+        let events = fsync_probe::events_under(dir.path());
+        let last_component_fsync = events
+            .iter()
+            .rposition(|event| matches!(event, fsync_probe::Event::FileFsync(_)))
+            .expect("component fsync events");
+        let readback_verified = events
+            .iter()
+            .position(|event| matches!(event, fsync_probe::Event::ReadbackVerified(_)))
+            .expect("readback completion event");
+        let first_fadvise = events
+            .iter()
+            .position(|event| matches!(event, fsync_probe::Event::Fadvise(_)))
+            .expect("deferred output cache advice");
+        let first_promotion = events
+            .iter()
+            .position(|event| matches!(event, fsync_probe::Event::Rename(_)))
+            .expect("promotion rename event");
+        let directory_fsync = events
+            .iter()
+            .position(|event| matches!(event, fsync_probe::Event::DirFsync(_)))
+            .expect("final directory fsync event");
+        assert!(last_component_fsync < readback_verified);
+        assert!(readback_verified < first_fadvise);
+        assert!(first_fadvise < first_promotion);
+        assert!(first_promotion < directory_fsync);
         assert!(
-            fsync_probe::synced_dirs().contains(&dir.path().to_path_buf()),
-            "containing directory was not fsynced"
+            events.iter().enumerate().all(|(index, event)| {
+                !matches!(event, fsync_probe::Event::Fadvise(_))
+                    || (readback_verified < index && index < first_promotion)
+            }),
+            "all deferred cache advice must follow verification and precede promotion: {events:?}"
         );
+        assert!(
+            fsync_probe::synced_dirs_under(dir.path()).contains(&dir.path().to_path_buf()),
+            "containing directory was not fsynced after promote"
+        );
+    }
+
+    /// G1 regression (`publication-safety.md` M2, FMEA F13/ST-31): a refused
+    /// flush must never leave `*-Data.db` under a LIVE name.
+    ///
+    /// Before this fix, `flush_files` promoted staged `.tmp` components to
+    /// live names, fsynced them, and only THEN ran the readback walk. A
+    /// content-only corruption (right length, wrong bytes -- exactly what a
+    /// length check cannot see) failed the walk, but by then `{gen}-Data.db`
+    /// was already a live name the next startup's generation-discovery scan
+    /// (`*-Data.db`) would load next to the WAL replay of the same rows. This
+    /// test reproduces that corruption and asserts the live name never
+    /// existed and the staged output is quarantined instead.
+    ///
+    /// Since T-012, this exact corruption shape is caught by the digest
+    /// check (`DigestMismatch`), which runs before the structural readback
+    /// walk (`ReadbackFailed`) ever gets a chance to fail on it -- any
+    /// length-preserving content change almost certainly changes the CRC32.
+    /// The readback walk remains a second, independent line of defense for
+    /// whatever the digest does not cover.
+    #[test]
+    fn publication_verify_refused_flush_is_quarantined_not_left_live() {
+        let _fsync_probe = fsync_probe::exclusive();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 3000),
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.db"),
+        )
+        .unwrap();
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer
+            .finish_to_directory_deferred_sync(&staging_dir)
+            .unwrap();
+
+        // Damage the CONTENT while keeping the length exactly as recorded --
+        // the shape a length comparison cannot see.
+        let good = std::fs::read(&output.data).unwrap();
+        assert_eq!(good.len() as u64, output.data_len);
+        let mut damaged = good.clone();
+        for b in damaged.iter_mut().skip(good.len() / 4) {
+            *b = 0xff;
+        }
+        std::fs::write(&output.data, &damaged).unwrap();
+
+        let metric_before = crate::metrics::sstable_publication_refused_total(
+            crate::metrics::PublicationRefusedReason::DigestMismatch,
+        );
+
+        let msg = match target.flush_deferred_files(output) {
+            Ok(_) => panic!("an SSTable whose contents cannot be read back must not be promoted"),
+            Err(e) => e.to_string(),
+        };
+        let gen = target.generation();
+
+        assert!(
+            msg.contains("FLUSH CORRUPTION"),
+            "the refusal must be reported as flush corruption: {msg}"
+        );
+
+        let live_data = dir.path().join(format!("{gen}-Data.db"));
+        assert!(
+            !live_data.exists(),
+            "a refused flush must never leave *-Data.db under a live name: {live_data:?}"
+        );
+
+        let quarantined_data = dir
+            .path()
+            .join("quarantine")
+            .join(format!("{gen}-Data.db.tmp"));
+        assert!(
+            quarantined_data.exists(),
+            "the refused staged Data.db must be quarantined for salvage: {quarantined_data:?}"
+        );
+        let events = fsync_probe::events_under(dir.path());
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                fsync_probe::Event::ReadbackVerified(_) | fsync_probe::Event::Fadvise(_)
+            )),
+            "a digest-refused deferred output must not reach cache eviction: {events:?}"
+        );
+
+        assert!(
+            crate::metrics::sstable_publication_refused_total(
+                crate::metrics::PublicationRefusedReason::DigestMismatch
+            ) > metric_before,
+            "the publication-refused metric must count the digest mismatch"
+        );
+    }
+
+    /// A refused flush must not block progress: the next flush against the
+    /// same target succeeds and lands under a NEW generation, never reusing
+    /// or resurrecting the quarantined one.
+    #[test]
+    fn publication_verify_refused_flush_then_next_flush_succeeds_with_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+
+        // First flush: corrupt content, so it is refused and quarantined.
+        let bad_partitions = vec![make_partition("k1", b"v1", 5000)];
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &bad_partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.db"),
+        )
+        .unwrap();
+        for p in &bad_partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let good = std::fs::read(&output.data).unwrap();
+        let mut damaged = good.clone();
+        for b in damaged.iter_mut().skip(good.len() / 4) {
+            *b = 0xff;
+        }
+        std::fs::write(&output.data, &damaged).unwrap();
+        if target.flush_files(output).is_ok() {
+            panic!("first flush must be refused");
+        }
+        let refused_gen = target.generation();
+
+        // Second flush: clean output must succeed under a new generation.
+        let good_partitions = vec![make_partition("k2", b"v2", 6000)];
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &good_partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.db"),
+        )
+        .unwrap();
+        for p in &good_partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let reader = target
+            .flush_files(output)
+            .expect("a clean flush after a refusal must still succeed");
+        let new_gen = target.generation();
+
+        assert_ne!(
+            new_gen, refused_gen,
+            "the retried flush must land on a new generation, not reuse the refused one"
+        );
+        let got = reader
+            .get_partition(&good_partitions[0].key)
+            .unwrap()
+            .expect("partition");
+        assert_eq!(got.rows.len(), 1);
+
+        assert!(
+            !dir.path().join(format!("{refused_gen}-Data.db")).exists(),
+            "the refused generation must still never be live after a later successful flush"
+        );
+    }
+
+    /// Build a real staged flush output (not yet promoted) from `partitions`,
+    /// returning the `FileFlushTarget`, the base dir, and the `SSTableOutputFiles`
+    /// ready to hand to `flush_files`. Shared setup for the `digest_verify_`
+    /// tests below, which each damage `output.data` differently before calling
+    /// `flush_files`.
+    fn staged_output_for_digest_tests(
+        dir: &Path,
+        partitions: &[Partition],
+    ) -> (FileFlushTarget, ferrosa_sstable::writer::SSTableOutputFiles) {
+        staged_output_for_digest_tests_with_options(dir, partitions, WriteOptions::default())
+    }
+
+    /// Same as [`staged_output_for_digest_tests`], with the writer's
+    /// `WriteOptions` under the caller's control -- needed by the
+    /// swapped-block test below, which must disable compression to keep a
+    /// guaranteed on-disk size regardless of how compressible its fixture
+    /// values are.
+    fn staged_output_for_digest_tests_with_options(
+        dir: &Path,
+        partitions: &[Partition],
+        options: WriteOptions,
+    ) -> (FileFlushTarget, ferrosa_sstable::writer::SSTableOutputFiles) {
+        let schema = test_schema();
+        let target = FileFlushTarget::new(dir.to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, partitions);
+        let mut writer =
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db")).unwrap();
+        for p in partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        (target, output)
+    }
+
+    fn refresh_staged_digest(output: &mut ferrosa_sstable::writer::SSTableOutputFiles) {
+        let data = std::fs::read(&output.data).unwrap();
+        let mut hasher = ferrosa_sstable::checksum::DigestCrc32::new();
+        hasher.update(&data);
+        let digest = ferrosa_sstable::checksum::format_digest(hasher.finalize());
+        std::fs::write(&output.digest, &digest).unwrap();
+        output.digest_len = digest.len() as u64;
+    }
+
+    #[test]
+    fn promoted_sstable_count_walk_matches_full_partition_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 5001),
+        ];
+        let (_target, output) = staged_output_for_digest_tests(dir.path(), &partitions);
+        let reader = SSTableReader::open(SSTableComponents {
+            data: FileReadAt::open(&output.data).unwrap(),
+            partitions: FileReadAt::open(&output.partitions).unwrap(),
+            rows: FileReadAt::open(&output.rows).unwrap(),
+            filter: std::fs::read(&output.filter).unwrap(),
+            compression_info: output
+                .compression_info
+                .as_ref()
+                .map(std::fs::read)
+                .transpose()
+                .unwrap(),
+            statistics: std::fs::read(&output.statistics).unwrap(),
+        })
+        .unwrap();
+
+        let mut full = reader.partitions_iter().unwrap();
+        let mut expected = Vec::new();
+        while let Some(partition) = full.next_partition().unwrap() {
+            expected.push((partition.key, partition.rows.len() as u64));
+        }
+
+        let mut counts = reader.partitions_iter().unwrap();
+        let mut actual = Vec::new();
+        while let Some((key, rows)) = counts.next_partition_count().unwrap() {
+            actual.push((key, rows));
+        }
+        assert_eq!(actual, expected);
+        verify_promoted_sstable(&reader).unwrap();
+    }
+
+    #[test]
+    fn flush_files_rejects_truncated_partition_framing_after_digest_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let options = WriteOptions {
+            compression: None,
+            verify_output: false,
+            ..WriteOptions::default()
+        };
+        let (target, mut output) =
+            staged_output_for_digest_tests_with_options(dir.path(), &partitions, options);
+
+        let mut data = std::fs::read(&output.data).unwrap();
+        let terminator = data.last_mut().expect("nonempty Data.db");
+        assert_ne!(*terminator, 0, "fixture ends with a partition terminator");
+        *terminator = 0;
+        std::fs::write(&output.data, data).unwrap();
+        refresh_staged_digest(&mut output);
+
+        let error = match target.flush_files(output) {
+            Ok(_) => {
+                panic!("the readback framing check must reject a missing partition terminator")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("could not be read back"),
+            "framing refusal should come from staged SSTable readback: {error}"
+        );
+        assert!(
+            dir.path().join("quarantine").exists(),
+            "the malformed staged output must be quarantined"
+        );
+    }
+
+    #[test]
+    fn flush_files_rejects_malformed_partition_index_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let options = WriteOptions {
+            compression: None,
+            verify_output: false,
+            ..WriteOptions::default()
+        };
+        let (target, output) =
+            staged_output_for_digest_tests_with_options(dir.path(), &partitions, options);
+
+        let mut index = std::fs::read(&output.partitions).unwrap();
+        assert!(!index.is_empty(), "fixture has partition index metadata");
+        index.fill(0xff);
+        std::fs::write(&output.partitions, index).unwrap();
+
+        let error = match target.flush_files(output) {
+            Ok(_) => panic!("the reader must reject malformed partition index metadata"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("could not be read back"),
+            "metadata refusal should come from staged SSTable readback: {error}"
+        );
+    }
+
+    /// Enough partitions, with big enough values, that Data.db comfortably
+    /// exceeds two 4 KiB blocks -- needed by the swapped-block test below.
+    /// Each partition's value bytes vary (not a constant fill), so LZ4
+    /// cannot shrink the fixture out from under the size assumption even if
+    /// a caller forgets to disable compression. `SSTableWriter` requires
+    /// partitions in token order, so this sorts by key (matching
+    /// `DecoratedKey`'s `Ord`) before returning, the same way every other
+    /// multi-partition test in this module does.
+    fn partitions_spanning_multiple_blocks() -> Vec<Partition> {
+        let mut partitions: Vec<Partition> = (0..64)
+            .map(|i| {
+                let value: Vec<u8> = (0..512u32).map(|b| (b ^ (i * 37)) as u8).collect();
+                make_partition(&format!("k{i:04}"), &value, 1000 + i as i64)
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        partitions
+    }
+
+    /// L4 fault row: a single bit flip in the staged Data.db, at a length
+    /// that keeps every length check green (`publication-safety.md` M2 step
+    /// 4 / M3, T-012). Must be refused, quarantined, and counted under
+    /// `DigestMismatch` -- never left under a live name.
+    #[test]
+    fn digest_verify_bit_flip_is_refused_and_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let (target, output) = staged_output_for_digest_tests(dir.path(), &partitions);
+
+        let mut damaged = std::fs::read(&output.data).unwrap();
+        let mid = damaged.len() / 2;
+        damaged[mid] ^= 0x01; // single bit flip, length unchanged
+        std::fs::write(&output.data, &damaged).unwrap();
+
+        let metric_before = crate::metrics::sstable_publication_refused_total(
+            crate::metrics::PublicationRefusedReason::DigestMismatch,
+        );
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!("a bit-flipped Data.db must fail digest verification"),
+            Err(e) => e.to_string(),
+        };
+        let gen = target.generation();
+
+        assert!(
+            msg.contains("FLUSH CORRUPTION") && msg.contains("Digest.crc32 mismatch"),
+            "refusal must name the digest mismatch: {msg}"
+        );
+        assert!(
+            !dir.path().join(format!("{gen}-Data.db")).exists(),
+            "a bit-flipped flush must never be promoted to a live name"
+        );
+        assert!(
+            dir.path()
+                .join("quarantine")
+                .join(format!("{gen}-Data.db.tmp"))
+                .exists(),
+            "the refused staged Data.db must be quarantined for salvage"
+        );
+        assert!(
+            crate::metrics::sstable_publication_refused_total(
+                crate::metrics::PublicationRefusedReason::DigestMismatch
+            ) > metric_before,
+            "the publication-refused metric must count the digest mismatch"
+        );
+    }
+
+    /// L4 fault row: two 4 KiB blocks of the staged Data.db swapped in place
+    /// (same length, same bytes overall, wrong order). A structural decode
+    /// can plausibly still succeed on shuffled bytes for some encodings; the
+    /// digest must not.
+    #[test]
+    fn digest_verify_swapped_block_is_refused_and_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = partitions_spanning_multiple_blocks();
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let (target, output) =
+            staged_output_for_digest_tests_with_options(dir.path(), &partitions, options);
+
+        let mut damaged = std::fs::read(&output.data).unwrap();
+        assert!(
+            damaged.len() >= 2 * 4096,
+            "fixture must be big enough to hold two distinct 4 KiB blocks: {}",
+            damaged.len()
+        );
+        let (block_a, rest) = damaged.split_at_mut(4096);
+        let block_b = &mut rest[..4096];
+        block_a.swap_with_slice(block_b);
+        std::fs::write(&output.data, &damaged).unwrap();
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!("a Data.db with swapped 4 KiB blocks must fail digest verification"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("Digest.crc32 mismatch"),
+            "refusal must name the digest mismatch: {msg}"
+        );
+    }
+
+    /// L4 fault row: "segment recycled before its write completed" -- stale
+    /// bytes from an unrelated, previously-written Data.db land at the right
+    /// offset with the right length. Simulated by splicing in bytes from a
+    /// second, differently-sized real SSTable's Data.db, truncated/padded to
+    /// match. The length check cannot see this; the digest must.
+    #[test]
+    fn digest_verify_stale_bytes_is_refused_and_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A second, unrelated SSTable purely as a source of "stale" bytes.
+        let stale_dir = tempfile::tempdir().unwrap();
+        let stale_partitions = vec![make_partition("stale", b"stale-value-bytes", 9999)];
+        let (_stale_target, stale_output) =
+            staged_output_for_digest_tests(stale_dir.path(), &stale_partitions);
+        let stale_bytes = std::fs::read(&stale_output.data).unwrap();
+
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let (target, output) = staged_output_for_digest_tests(dir.path(), &partitions);
+
+        let good = std::fs::read(&output.data).unwrap();
+        let mut damaged = good.clone();
+        // Overwrite a middle span with stale bytes (cycled if shorter),
+        // keeping the overall length exactly as recorded.
+        let start = good.len() / 3;
+        let span = (good.len() / 3).max(1);
+        for (i, b) in damaged.iter_mut().skip(start).take(span).enumerate() {
+            *b = stale_bytes[i % stale_bytes.len()];
+        }
+        assert_ne!(damaged, good, "the splice must actually change the bytes");
+        std::fs::write(&output.data, &damaged).unwrap();
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!("stale spliced-in bytes must fail digest verification"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("Digest.crc32 mismatch"),
+            "refusal must name the digest mismatch: {msg}"
+        );
+    }
+
+    /// Acceptance criterion 3 (`publication-safety.md`): after a digest
+    /// refusal, a later flush against the same target still succeeds, lands
+    /// on a new generation, and the refused generation stays quarantined
+    /// (never live, never retried in place).
+    #[test]
+    fn digest_verify_refused_flush_then_next_flush_succeeds_with_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_partitions = vec![make_partition("k1", b"v1", 5000)];
+        let (target, output) = staged_output_for_digest_tests(dir.path(), &bad_partitions);
+        let mut damaged = std::fs::read(&output.data).unwrap();
+        let mid = damaged.len() / 2;
+        damaged[mid] ^= 0xff;
+        std::fs::write(&output.data, &damaged).unwrap();
+        match target.flush_files(output) {
+            Ok(_) => panic!("first flush must be refused on digest mismatch"),
+            Err(e) => assert!(e.to_string().contains("Digest.crc32 mismatch")),
+        }
+        let refused_gen = target.generation();
+
+        // A clean flush against the same target must still succeed, on a new
+        // generation, after the digest-refused attempt above.
+        let good_partitions = vec![make_partition("k2", b"v2", 6000)];
+        let schema = test_schema();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &good_partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.db"),
+        )
+        .unwrap();
+        for p in &good_partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let reader = target
+            .flush_files(output)
+            .expect("a clean flush after a digest refusal must still succeed");
+        let new_gen = target.generation();
+
+        assert_ne!(
+            new_gen, refused_gen,
+            "the retried flush must land on a new generation, not reuse the refused one"
+        );
+        let got = reader
+            .get_partition(&good_partitions[0].key)
+            .unwrap()
+            .expect("partition");
+        assert_eq!(got.rows.len(), 1);
+        assert!(
+            !dir.path().join(format!("{refused_gen}-Data.db")).exists(),
+            "the digest-refused generation must still never be live"
+        );
+    }
+
+    /// An SSTable written before T-011 has neither `Digest.crc32` nor
+    /// `CRC.db`. Every file-backed open path must still open it, treating
+    /// the missing components as "not checked" rather than an error
+    /// (`publication-safety.md` M1), and must not report checksums as
+    /// loaded.
+    #[test]
+    fn digest_verify_old_sstable_without_digest_or_crc_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let (target, output) = staged_output_for_digest_tests(dir.path(), &partitions);
+        let reader = target.flush_files(output).expect("clean flush succeeds");
+        let gen = target.generation();
+        assert!(
+            reader.digest_loaded(),
+            "a fresh flush must load its own digest"
+        );
+        drop(reader);
+
+        std::fs::remove_file(dir.path().join(format!("{gen}-Digest.crc32"))).unwrap();
+        let crc_path = dir.path().join(format!("{gen}-CRC.db"));
+        let _ = std::fs::remove_file(&crc_path);
+
+        let reader = open_file_sstable(dir.path(), &gen.to_string())
+            .expect("an SSTable without Digest.crc32/CRC.db must still open");
+        assert!(
+            !reader.digest_loaded(),
+            "a generation with no Digest.crc32 file must not report a loaded digest"
+        );
+        assert!(
+            !reader.crc_table_loaded(),
+            "a generation with no CRC.db file must not report a loaded CRC table"
+        );
+        let got = reader.get_partition(&partitions[0].key).unwrap();
+        assert!(got.is_some(), "the SSTable must still read correctly");
     }
 
     /// RED TEST (known bug): Two FileFlushTarget instances on the SAME
@@ -2935,3 +4220,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "flush_readback_test_support.rs"]
+pub(crate) mod readback_test_support;

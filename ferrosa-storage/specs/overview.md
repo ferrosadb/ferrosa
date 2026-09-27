@@ -33,6 +33,18 @@ serve standalone (`LocalDataStore`) and cluster-routed deployments. Its downstre
 boundary is `ferrosa-sstable` (BTI I/O) and `object_store` (S3). It knows nothing
 about CQL/SQL protocol framing or query planning — those belong to the front-ends.
 
+File flush and compaction stream into staged `Data.db` through the SSTable
+writer. Compaction shares its task cancellation token with the pump, and a
+borrowed staging guard removes incomplete output after the writer has dropped.
+Startup removes legacy `Data.raw` scratch before generation discovery.
+
+The test-only mid-retirement crash injection uses Tokio task-local scope, so
+concurrent compaction tests and synchronous recovery cannot inherit a fault.
+The scope unwinds with the injected future, including panic and cancellation.
+Compaction resolves structural output verification once at task entry and
+passes it explicitly to the executor; tests can choose a policy per task
+without changing the process environment. Digest verification is unconditional.
+
 ## Module map
 
 | Module | Responsibility |
@@ -62,13 +74,17 @@ about CQL/SQL protocol framing or query planning — those belong to the front-e
 **Write path** (front-end → durable): build a `Mutation` → `commit_log.append`
 (CAS allocation into the active segment, durability governed by the sync
 strategy) → `ArcSwap::load` the `StoreView` → `active.put` into one memtable
-shard (cell-level merge-on-write). When the active memtable crosses
-`memtable_backpressure_bytes`, `write()` performs a synchronous in-line flush
-before returning. On flush: a per-table `Mutex` serializes; a fresh memtable is
-swapped in and the old one becomes `flushing` (writes resume immediately); the
-flushing snapshot is serialized to a BTI SSTable via `FlushTarget`; the new
-descriptor is prepended; index/FTI sidecars are built; the SSTable components are
-submitted to `UploadManager` for S3 write-behind; STCS/UCS is evaluated.
+shard (cell-level merge-on-write). The async CQL `WritePath` applies per-table
+pressure admission: in the soft zone it requests a background flush and waits
+on that table's `Notify` until active-memtable capacity is released or a
+bounded deadline expires; pressure is checked once more before dispatch. The
+hard zone returns typed `Error::Overloaded`. Synchronous storage callers keep
+the hard admission check. On flush: a per-table `Mutex` serializes; a fresh
+memtable is swapped in and the old one becomes `flushing` (writes resume
+immediately); the flushing snapshot is serialized to a BTI SSTable via
+`FlushTarget`; the new descriptor is prepended; index/FTI sidecars are built;
+the SSTable components are submitted to `UploadManager` for S3 write-behind;
+STCS/UCS is evaluated.
 
 **Read path** (durable → front-end): `ArcSwap::load` (wait-free) a `StoreView` →
 check active memtable → check flushing memtable → prune SSTable descriptors by
@@ -132,10 +148,21 @@ volume or changing query results.
     closed segment; restart replay remains the durability path for smaller
     memtables.
 11. **Backlog work is bounded and self-rescheduling.** Planning uses cached
-    descriptor scalars with a 64-input hard cap, task/result queues are
-    fixed-capacity, and every poll admits a fixed number of compactions until
-    the strategy threshold is met. Automatic flush ticks handle at most eight
-    tables before yielding to later maintenance.
+    descriptor scalars with a configurable input cap, task/result queues have
+    configurable per-worker capacities, and maintenance poll batch limits are
+    runtime tunable. Positive values are validated and defaults preserve the
+    existing backlog and maintenance behavior. See the flush and
+    compaction runtime tuning table in `README.md`; settings reject values
+    outside their documented practical ranges and fall back to defaults.
+12. **A generation is verified before it can be discovered.** `flush_files`
+    (shared by flush and compaction promotion) never promotes staged `.tmp`
+    output to a live name until length checks, an fsync of the `.tmp`
+    components, and a throwaway-reader readback walk over those same `.tmp`
+    paths all pass. Any failure moves the `.tmp` set to `quarantine/` instead
+    of leaving it under a name the next startup's `*-Data.db` generation scan
+    would load (ST-27). Startup also sweeps stale `.tmp` sets and abandoned
+    flush staging (`.sstable-staging/`, `.merge-spill/`) before that scan
+    runs.
 
 ## Position in the dependency graph
 
@@ -144,3 +171,98 @@ A heavyweight internal hub. Depends on `ferrosa-cdc`, `ferrosa-common`,
 `ferrosa-cluster`, `ferrosa-cql`, `ferrosa-ctl`, `ferrosa-graph`,
 `ferrosa-index-builder`, `ferrosa-loadgen`, `ferrosa-postgres`,
 `ferrosa-session`, `ferrosa-sparql`. See the root crate index for the full graph.
+
+### Pump wiring acceptance (T-045)
+
+File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.
+
+Shard workers collect moved component manifests directly into the fallible output vector; there is no intermediate vector of per-shard results.
+
+T-041 tests exercise actual engine flush/compaction stalls and scoped digest
+readback checkpoints. Publication, WAL discard and compaction input retirement
+wait for readback; a released flush completes with compaction still gated.
+Admission bounds the active memtable; the separately retained flushing memtable
+must be included in total memory accounting. These counters do not prove flat
+process RSS. The isolated pump benchmark reports its own heap/RSS/throughput;
+engine-level E1/E2/E3 RSS and Linux dirty-page/cgroup measurements remain live
+acceptance evidence to collect, not inferred passes.
+
+Read-ahead config: `FERROSA_COMPACTION_READAHEAD_BYTES`, default 1 MiB,
+range 1..=256 MiB, rounded up to 4096 bytes. Invalid values emit ERROR and fall back;
+valid normalization emits WARN with configured/effective sizes. Shutdown can
+cancel a parked producer, then joins once the outstanding device call returns.
+
+### Durable input retirement (T-024)
+
+After the committed replacement is visible, retirement hides each input before
+reclaiming its files. A generation directory moves to `.retired-<generation>`;
+flat layouts move Data.db first, followed by every generation-prefixed component,
+including index sidecars. Directory fsyncs precede reclamation and follow removal.
+Any failure retains the replacement intent and records a warning and counter.
+The scoped `RetireInput` fault hook exercises failure after Data.db moved; restart
+and subsequent retries finish the remaining components idempotently.
+
+### Cancellation while delivering completed results (T-025 slice)
+
+Result delivery uses crossbeam `select!` over the bounded result sender, the
+task cancellation channel and executor shutdown. The unsent result remains owned
+by the worker; cancellation drops direct-upload buffers, removes staged component
+files and releases input claims. The pending-result counter is incremented inside
+the selected send expression, before the receiver can observe the result.
+
+### Disk-reserve cancellation (T-025 slice)
+
+The write-admission reserve check requests cancellation of the largest registered
+compaction by total input bytes. The same registry retains one token and size per
+task; it excludes already-cancelled tasks and waits for an outstanding disk-reserve
+cancellation to release before selecting another. Cancellation never substitutes
+for the actual free-space check: the current write still fails closed while the
+reserve is exhausted, and later writes can proceed once space recovers.
+
+### Table DDL and compaction cancellation (T-025)
+
+DROP TABLE, DROP KEYSPACE and TRUNCATE pause compaction admission, invalidate
+submission tickets captured before input selection, cancel active tasks, and
+await claim release before removing table data. The task registry and input
+claims share one lock. Result publication and finalization notify async waiters;
+no Tokio worker blocks on compaction completion. A committed replacement still
+finishes its existing finalization before DDL proceeds. CQL, pair, cluster and
+Raft application boundaries hold the pause through schema/storage changes.
+Synchronous storage entry points return a busy error while work is active;
+async callers use `unregister_table_and_wait` or `truncate_and_wait`.
+Async APIs take `Arc<StorageEngine>` so an owned finalization job can survive a
+request disconnect. TRUNCATE retains its pause through asynchronous S3 cleanup;
+a dropped DDL waiter cannot strand a dequeued result or release its claim early.
+
+### Durable S3 compaction completion (T-026)
+
+The replacement record remains the recovery cursor after local input retirement.
+It advances through `Retired`, `S3Uploaded`, `S3Manifested`, and
+`S3DeletesEnqueued`; the pending-upload log carries replayable upload work and
+is removed only after manifest publication. Startup reconstructs missing upload
+entries from `Retired` or `S3Uploaded` records, then resumes idempotent deletes
+from manifested records. A failed S3-delete enqueue is logged and leaves the
+record for retry. Pinned and local-only compactions remove the record after
+local retirement without attempting S3 work. Mock-store crash tests interrupt
+pending-log, manifest-CAS, delete-enqueue, and pinned-retirement phases.
+### Operator compaction stop (T-025)
+
+Operator stop requests use `CancelReason::Operator` under the task registry lock.
+They select all current tasks or one registered table, preserve the first recorded
+cancellation reason, and leave admission enabled. Counts describe the registry at
+request time; the caller does not wait for finalization or promise reclaimed disk.
+
+### Compaction digest-failure retry
+
+Digest or output-verification failures retry with exponential backoff (default
+1 s initial, 60 s maximum). `FERROSA_COMPACTION_RETRY_BACKOFF_INITIAL_MS` accepts
+1–60,000 ms and `FERROSA_COMPACTION_RETRY_BACKOFF_MAX_MS` accepts 1–600,000 ms;
+out-of-range values clamp with a WARN, invalid integers use the default with an
+ERROR, and a maximum below the initial delay is normalized up to the initial
+delay. Three consecutive failures pause that table by default;
+`FERROSA_COMPACTION_DIGEST_FAILURE_LIMIT` configures the threshold (1–100,
+default 3; out-of-range values clamp with a WARN, invalid integers use the
+default with an ERROR). The pause and retry streak are in memory: restart clears them, or an
+operator can call
+`StorageEngine::resume_table_compactions_after_digest_failures(table_id)` to
+resume and reset the streak.

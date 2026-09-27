@@ -20,6 +20,9 @@ fn default_config() -> CompactionConfig {
         bucket_low: 0.5,
         bucket_high: 1.5,
         output_dir: PathBuf::from("/tmp/compaction"),
+        retry_backoff_initial: std::time::Duration::from_secs(1),
+        retry_backoff_max: std::time::Duration::from_secs(60),
+        retry_digest_failure_limit: 3,
     }
 }
 

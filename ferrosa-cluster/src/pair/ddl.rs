@@ -204,7 +204,7 @@ impl DdlCoordinator {
     pub async fn coordinate_ddl(&self, op: DdlOperation) -> Result<()> {
         match **self.role.load() {
             PairRole::Primary => {
-                self.apply_ddl_locally(&op)?;
+                self.apply_ddl_locally(&op).await?;
                 let version = Uuid::new_v4();
                 self.schema.set_schema_version(version);
                 if let Err(e) = self.replicate_ddl(&op, version).await {
@@ -217,7 +217,9 @@ impl DdlCoordinator {
     }
 
     /// Apply a DDL operation to the local schema and storage engine.
-    pub(crate) fn apply_ddl_locally(&self, op: &DdlOperation) -> Result<()> {
+    pub(crate) async fn apply_ddl_locally(&self, op: &DdlOperation) -> Result<()> {
+        let _pauses =
+            crate::ddl_path::pause_ddl_compactions(op, &self.schema, &self.engine).await?;
         match op {
             DdlOperation::CreateKeyspace(ks) => {
                 self.schema
@@ -556,7 +558,7 @@ impl RpcHandler for PairDdlForwardHandler {
                 // Replicate back to secondary in background to avoid deadlock
                 // (calling replicate_ddl inside the RPC handler would block
                 // the dispatch loop, creating a circular wait).
-                if let Err(e) = self.coordinator.apply_ddl_locally(&op) {
+                if let Err(e) = self.coordinator.apply_ddl_locally(&op).await {
                     tracing::error!("failed to apply forwarded DDL: {e}");
                     return None;
                 }
@@ -575,7 +577,7 @@ impl RpcHandler for PairDdlForwardHandler {
             }
             PairRole::Secondary => {
                 // Replicated DDL from primary: apply + set version
-                let res = self.coordinator.apply_ddl_locally(&op);
+                let res = self.coordinator.apply_ddl_locally(&op).await;
                 if res.is_ok() {
                     if let Some(v) = schema_version {
                         self.coordinator.schema.set_schema_version(v);

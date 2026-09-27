@@ -17,6 +17,10 @@ ferrosa-sstable = { path = "../ferrosa-sstable" }
 arc-swap = "1.7"
 parking_lot = "0.12"
 crc32fast = "1"
+# CancelToken's closed channel and the compaction executor's task/result
+# queues (T-021, decisions.md D7): crossbeam bounded channels + blocking
+# select!, no polling.
+crossbeam-channel = "0.5"
 # Scalar index sidecars are read through a memory map (t_7ac6b0e3); same
 # version ferrosa-sstable maps its Partitions/Rows components with.
 memmap2 = "0.9"
@@ -36,6 +40,11 @@ dashmap = "6"
 hex = "0.4"
 smallvec = "1"
 tracing = "0.1"
+# Unconditional (not just cfg(target_os = "macos")) so `posix_fadvise` is
+# available on Linux too: the flush-publication digest verification (T-012)
+# advises the kernel to drop the pages it re-reads to check Data.db's
+# Digest.crc32, on whichever OS this crate is actually built for.
+libc = "0.2"
 ureq = { version = "3", features = ["json"] }
 proptest = { version = "1", optional = true }
 # Optional normal dep so `self_heal::test_fixtures` (behind `test-support`) can
@@ -43,9 +52,6 @@ proptest = { version = "1", optional = true }
 # crates (their dev-deps don't activate our dev-deps). Also a dev-dep below for
 # this crate's own tests, mirroring how `proptest` is declared.
 tempfile = { version = "3", optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
 
 [features]
 # The production write path should avoid the sharded BTree memtable's
@@ -102,10 +108,29 @@ repair-fuzz-known-failures = ["test-generators"]
 # a Fly app per run. Run it by hand on a CPU-starved host, env-scaled via
 # RACE_KEYS / RACE_READERS / RACE_SECS / RACE_FLUSH_EVERY.
 race-stress = []
+# Removed 2026-09-26: the `known-open-window` feature used to gate
+# `cancel_crash_sweep_*` cases the code didn't yet close (windows C, D, E,
+# `compaction-cancel-safety.md`). T-022 (durable replacement record with the
+# generation choice reserved before it is written, forge t_cb6fa288) + T-023
+# (startup reconciliation) close every window that crate's crash-sweep
+# exercises, so the feature now gated nothing and was deleted rather than
+# kept as permanent dead weight. The remaining T-024 scope (per-component
+# retirement atomicity within one generation) needs a finer hook than the
+# crash-sweep's per-generation `CancelPoint` provides -- see
+# `specs/roadmap.md`. If a future packet needs a new gated case, reintroduce
+# a feature rather than resurrecting this one under the same name.
+# slow tests; run nightly by nightly-slow-tests.yml; PR CI skips `::slow::`
+slow-tests = []
 
 [dev-dependencies]
 async-trait = "0.1"
 ferrosa-common = { path = "../ferrosa-common", features = ["test-generators"] }
+# Plumbing for T-033/T-038 (sstable-write-pump): the write-pump fault-injection
+# sinks (RecordingSink, FaultySink, GateSink) are `pub(crate)` in
+# ferrosa-sstable today, so this feature does not yet expose anything this
+# crate's tests can call — it just keeps the dev-dependency wiring ready for
+# when a later packet adds the cross-crate seam.
+ferrosa-sstable = { path = "../ferrosa-sstable", features = ["test-support"] }
 # Self-reference enables the `test-generators` feature for this crate's own
 # `tests/` integration harness (`repair_fuzz.rs`) without exporting the
 # generators into the production build.

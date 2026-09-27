@@ -342,7 +342,7 @@ impl RpcHandler for TruncateForwardHandler {
                 return None;
             }
         };
-        if let Err(e) = self.storage.truncate(&table_id) {
+        if let Err(e) = self.storage.truncate_and_wait(&table_id).await {
             tracing::warn!(%e, table = %table_id, "TruncateForward failed — not sending ACK");
             return None;
         }

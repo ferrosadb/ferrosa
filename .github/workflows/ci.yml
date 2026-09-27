@@ -137,9 +137,14 @@ jobs:
           # nightly, in nightly-fuzz.yml's `perf-regression` job where the
           # machine is not competing with the rest of the PR gate. Keep the two
           # in sync: a new perf assertion added here must run there.
+          # `--skip ::slow::` excludes the tests under the `slow-tests` feature
+          # (compiled here under --all-features, but too slow for per-PR CI);
+          # they run nightly in nightly-slow-tests.yml.
+          # LazyFS crash harness is unimplemented (T-070); in-process durability
+          # probes cover ordering until the crash harness exists.
           cargo test --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -- --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
+            -- --skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                --skip dep_wait_ordering \
                --skip lwt_batch_atomicity_all \
@@ -156,6 +161,7 @@ jobs:
                --skip fly_multi_node_streaming_scan \
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
+               --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no

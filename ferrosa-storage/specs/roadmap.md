@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 doc: roadmap
-last_updated: 2026-07-03
+last_updated: 2026-09-26
 ---
 
 # ferrosa-storage — Roadmap
@@ -26,9 +26,26 @@ open work lives in specs and the items below.
 
 ## Next
 
+- **Compaction cancel safety — cancellation itself (T-021,
+  `compaction-cancel-safety.md`).** T-022 (durable replacement record, with
+  the output generation chosen and reserved before the record is written,
+  forge t_cb6fa288) and T-023 (startup reconciliation) landed and, between
+  them, close every window the T-020 crash-sweep (`cancel_harness_*`/
+  `cancel_crash_sweep_*`) exercises — including window E (input retirement
+  stopping partway through the input list) at the sweep's per-generation
+  granularity, and the `AfterPromote` sub-window of C that T-022's initial
+  landing left open (a crash between promotion and a since-removed
+  post-promotion `output_gen` correction). No `cancel_crash_sweep_*` case is
+  feature-gated any more; the `known-open-window` feature was deleted
+  2026-09-26. **Remaining scope, still open:**
+  - **T-021 itself: actual cancellation.** Nothing today can interrupt an
+    in-flight compaction early (shutdown still joins every worker and waits
+    out the merge) — the crash-sweep only proves what a *crash* leaves
+    behind, not that a *voluntary* cancel is fast or possible at all.
 - **Remove index artifacts with the generation they index (FMEA ST-24).**
-  `evict_local_input_sstable_files` and `delete_sstable_files` remove only the
-  seven SSTable components, so every compacted or evicted generation leaves its
+  T-024 now removes all sidecars during compaction. The separate
+  `delete_sstable_files` eviction path and historical debris still require
+  investigation; previously each retired generation left its
   `.sidecar`, `FTI-` and `VEC-` files behind (5,122 FTI sidecars against 11 live
   SSTables per node on one cluster). The query path no longer reads them, but
   they cost disk, and a one-time sweep is needed for tables that already
@@ -75,6 +92,26 @@ open work lives in specs and the items below.
 
 ## Recently landed
 
+- **T-012 verification test isolation.** Digest-corruption tests disable the
+  structural scan for their task only, preserving concurrent cancellation checks.
+
+- **T-023 test isolation.** The retirement crash seam is task-local and resets
+  on unwind or cancellation; unrelated compactions can run concurrently.
+
+- **Streaming writer callers (T-039).** Flush and compaction target staged
+  `Data.db`; compaction shares cancellation with the pump and cleans partial
+  output after writer teardown. Startup sweeps legacy `Data.raw` scratch.
+
+- **Compaction cancel-safety test harness (T-020, 2026-09-26).** Test
+  infrastructure only, no behavior change: `CancelPoint` names every step in
+  the compaction lifecycle table (`compaction-cancel-safety.md`), a
+  `cancel_point!` hook (compiled to nothing outside
+  `cfg(any(test, feature = "test-support"))`) is wired into the executor and
+  `poll_compactions`, and `assert_cancel_invariants` checks I1-I4 against a
+  `WriteOracle` model. First real use: a crash-twin subprocess sweep (CS2)
+  that SIGABRTs a child process at each point and asserts the invariants
+  after reopening — see `README.md` § Compaction cancel-safety harness.
+
 - **Vector CREATE INDEX live-row backfill (2026-09-17).** Dynamic HNSW and HVQ
   registration now indexes rows in the active and flushing memtables before the
   new view is published, so switching ANN execution to the new index cannot
@@ -119,3 +156,47 @@ open work lives in specs and the items below.
   `ferrosa-graph`).
 - Cluster routing/consensus — owned by `ferrosa-cluster`; this crate exposes the
   `DataStore` seam it routes through.
+
+### Pump wiring acceptance (T-045)
+
+File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.
+
+T-041 tests exercise actual engine flush/compaction stalls and scoped digest
+readback checkpoints. Publication, WAL discard and compaction input retirement
+wait for readback; a released flush completes with compaction still gated.
+Admission bounds the active memtable; the separately retained flushing memtable
+must be included in total memory accounting. These counters do not prove flat
+process RSS. The isolated pump benchmark reports its own heap/RSS/throughput;
+engine-level E1/E2/E3 RSS and Linux dirty-page/cgroup measurements remain live
+acceptance evidence to collect, not inferred passes.
+
+Read-ahead config: `FERROSA_COMPACTION_READAHEAD_BYTES`, default 1 MiB,
+range 1..=256 MiB, rounded up to 4096 bytes. Invalid values emit ERROR and fall back;
+valid normalization emits WARN with configured/effective sizes. Shutdown can
+cancel a parked producer, then joins once the outstanding device call returns.
+
+### Completed: T-024 local input retirement
+
+Generation directories and flat components, including secondary/full-text/vector
+sidecars, retire through durable hidden paths. Failures retain their intent and
+retry on startup. The remaining T-060 extension is a grace period at the single
+`remove_retired` reclamation seam; current retirement removes the files immediately.
+
+### Completed: T-025 cancellation and operator control
+
+Completed-result delivery waits on channel readiness, cancellation, and shutdown
+without sleep polling. Disk-reserve pressure cancels the largest eligible task
+while keeping admission fail-closed until space recovers. A shared tracker,
+invalidatable submission tickets, and async DROP/TRUNCATE wrappers drain
+finalization across CQL, pair, cluster, and Raft; sync storage calls return busy.
+
+The authenticated operator API and ferrosa-ctl compaction stop cancel all
+current tasks or one table scope without disabling future scheduling.
+
+### Completed: T-026 S3 compaction recovery
+
+The replacement record remains the durable cursor through upload confirmation,
+manifest publication, and S3 input-delete enqueue. Startup rebuilds absent upload
+ledger entries from replacement records, replays the uploads, and retries deletes
+after manifest publication. Enqueue failures preserve the record for another
+attempt. A mock-store crash sweep covers the S3 and pinned-local boundaries.

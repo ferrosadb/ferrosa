@@ -1,21 +1,29 @@
 name: Nightly Slow Tests
 
-# The tests that PR CI skips.
+# The tests that PR CI skips, plus the cluster-gated tests PR CI runs itself.
 #
-# A handful of tests take 60-90 seconds each — randomized external-sort spills,
-# a compaction soak over many seeds, high-volume ingest, a 2k-mutation
-# commit-log replay, wide-partition paging. They are worth having and they are
-# not worth paying for on every push, so they carry
-# `#[ignore = "slow (...); runs in the nightly --ignored job"]` and run here.
+# Two different categories land here, for two different reasons:
 #
-# This job is the other half of that bargain. Gating a slow test without a
-# nightly that runs it does not make it cheap, it deletes it: the test still
-# exists, still looks like coverage in the file, and never executes again.
-# If this workflow is removed or left red, re-run those tests some other way
-# or drop the `#[ignore]`s.
+# * SLOW tests — randomized external-sort spills, a compaction soak over many
+#   seeds, high-volume ingest, a 2k-mutation commit-log replay, wide-partition
+#   paging — each take 60-90 seconds. They are worth having and not worth
+#   paying for on every push, so they live in a `mod slow` gated behind the
+#   `slow-tests` crate feature (never `#[ignore]` — ferrosa/CLAUDE.md forbids
+#   ignoring a test for being slow). PR CI compiles them (`--all-features`)
+#   but skips running them (`--skip ::slow::`); this workflow is where they run.
+# * CLUSTER-GATED tests — genuinely need a live 3-node cluster, not merely
+#   slow. They stay `#[ignore]`d and PR CI's `integration` job already runs
+#   them against a real cluster; this workflow re-runs the same `--ignored`
+#   selection nightly for the same reason it re-runs everything else.
+#
+# This job is the other half of the slow-tests bargain. Gating a slow test
+# without a nightly that runs it does not make it cheap, it deletes it: the
+# test still exists, still looks like coverage in the file, and never executes
+# again. If this workflow is removed or left red, re-run those tests some
+# other way or drop the `slow-tests` gate.
 #
 # Run one locally with:
-#   cargo test -p ferrosa-storage -- --ignored e4_slow_pitr_commit_log_replay_1k_plus_1k
+#   cargo test -p ferrosa-storage --features slow-tests -- ::slow::e4_slow_pitr_commit_log_replay_1k_plus_1k
 
 on:
   schedule:
@@ -128,16 +136,28 @@ jobs:
           ./scripts/test-cluster-up-ci.sh > /tmp/cluster-env
           cat /tmp/cluster-env >> "$GITHUB_ENV"
 
-      # `--ignored` runs ONLY the ignored tests, which is exactly the set PR CI
-      # skipped plus the cluster-gated set. Nothing here re-runs the fast suite;
-      # that already ran on the commit that produced this tree.
-      #
-      # jepsen and loadgen are excluded exactly as PR CI excludes them; they run
-      # in their own workflows (Elle, Multi-DC Jepsen).
+      # The `slow-tests` feature tests are compiled under --all-features in PR
+      # CI too, but PR CI's "Run tests" step passes `--skip ::slow::` — this is
+      # the only place they actually run. --exclude matches PR CI's package
+      # selection so the nightly is at least as thorough, never narrower.
       #
       # --no-fail-fast: without it cargo stops at the first failing test binary
       # and the rest of the run is never reported.
-      - name: Run the ignored (slow) tests
+      - name: Run the slow tests
+        env:
+          FERROSA_TEST_CONTAINERS: "1"
+        run: |
+          cargo test --workspace --all-targets --all-features --no-fail-fast \
+            --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
+            -- ::slow::
+
+      # `--ignored` runs ONLY the cluster-gated tests, the same set PR CI's
+      # `integration` job runs against its own cluster. Nothing here re-runs
+      # the fast suite; that already ran on the commit that produced this tree.
+      #
+      # jepsen and loadgen are excluded exactly as PR CI excludes them; they run
+      # in their own workflows (Elle, Multi-DC Jepsen).
+      - name: Run the ignored (cluster-gated) tests
         env:
           FERROSA_TEST_CONTAINERS: "1"
         run: |
@@ -157,20 +177,34 @@ jobs:
         run: ./scripts/test-cluster-down.sh --ci
 
       # A nightly that silently stops selecting anything is the failure mode
-      # this whole arrangement is exposed to: rename a test, drop an
-      # `#[ignore]`, and the job goes green having run nothing at all.
-      - name: Fail if no ignored tests were selected
+      # this whole arrangement is exposed to: rename a test, drop the
+      # `slow-tests` gate or an `#[ignore]`, and the job goes green having run
+      # nothing at all. Each selection is checked separately with the same
+      # flags its run used, so either going quiet is caught on its own.
+      - name: Fail if no slow or ignored tests were selected
         if: always()
         run: |
           set -euo pipefail
-          count=$(cargo test --workspace --all-targets --all-features \
+          slow_count=$(cargo test --workspace --all-targets --all-features \
+                    --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
+                    -- ::slow:: --list 2>/dev/null \
+                  | grep -c ': test$' || true)
+          echo "slow tests selected: $slow_count"
+          if [ "$slow_count" -eq 0 ]; then
+            echo "::error::No slow-tests were found. Either the slow-tests feature gate was"
+            echo "::error::removed (so PR CI is paying for them again) or this job is"
+            echo "::error::selecting nothing and reporting success for doing no work."
+            exit 1
+          fi
+
+          ignored_count=$(cargo test --workspace --all-targets --all-features \
                     --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
                     -- --ignored --list 2>/dev/null \
                   | grep -c ': test$' || true)
-          echo "ignored tests selected: $count"
-          if [ "$count" -eq 0 ]; then
-            echo "::error::No ignored tests were found. Either the #[ignore] gates were"
-            echo "::error::removed (so PR CI is paying for them again) or this job is"
-            echo "::error::selecting nothing and reporting success for doing no work."
+          echo "ignored tests selected: $ignored_count"
+          if [ "$ignored_count" -eq 0 ]; then
+            echo "::error::No ignored (cluster-gated) tests were found. Either the #[ignore]"
+            echo "::error::gates were removed (so PR CI is paying for them again) or this job"
+            echo "::error::is selecting nothing and reporting success for doing no work."
             exit 1
           fi

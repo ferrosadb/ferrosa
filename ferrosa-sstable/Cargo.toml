@@ -8,15 +8,57 @@ repository.workspace = true
 
 [dependencies]
 crc32fast = "1"
+crossbeam-channel = "0.5"
 ferrosa-common = { path = "../ferrosa-common" }
 libc = "0.2"
 lru = "0.12"
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 memmap2 = "0.9"
 rayon = "1"
 tracing = "0.1"
 zstd = "0.13"
+# T-034 (L6 loom model, tests/pump_loom.rs). Optional and feature-gated
+# rather than a plain dev-dependency behind `RUSTFLAGS="--cfg loom"` (loom's
+# own usual recommendation): this crate depends on `ferrosa-common`, which
+# depends on `tokio`, and `tokio` has its own internal `#[cfg(loom)]`-gated
+# code that only compiles correctly under tokio's OWN loom test harness
+# setup. `RUSTFLAGS` is process-global, so a bare `--cfg loom` reaches every
+# crate `cargo` compiles for this build — including `tokio` — and breaks it
+# (`unresolved import crate::sync::AtomicWaker` in `tokio::task::local`,
+# confirmed by direct measurement, not assumed). A Cargo feature scopes
+# cleanly to this crate's own dependency resolution instead: enabling
+# `loom` here never touches `tokio`'s build.
+loom = { version = "0.7", optional = true }
+
+[features]
+# Live infrastructure tests are intentionally absent from the default test
+# target. Opt in with `--features live-infra-tests` on a Linux host so a
+# missing environment prerequisite (e.g. STATX_DIOALIGN support) cannot be
+# reported as a passing test body.
+live-infra-tests = []
+# Compiles `pump::test_support` (RecordingSink, FaultySink, GateSink — T-032)
+# outside `cfg(test)`, so it is part of the crate's compiled dev-support
+# surface rather than only its unit-test binary. Always available to this
+# crate's own tests regardless of this feature. T-033 bumps `AlignedPump`,
+# `SegmentSink`, `FileSink`, `AbortSignal`/`NeverAbort` and this module to
+# `pub` (still gated by this feature outside `cfg(test)`), the "pub seam"
+# this comment used to say T-033/T-038 would add — used by this crate's own
+# `tests/pump_async_*` integration binaries and, later, sibling crates like
+# `ferrosa-storage` through a `test-support`-featured dev-dependency.
+test-support = []
+# T-034: gates `tests/pump_loom.rs` (`#![cfg(feature = "loom")]`) and pulls in
+# the optional `loom` dependency above. Run with `cargo test -p
+# ferrosa-sstable --release --features test-support,loom pump_loom_` — no
+# RUSTFLAGS needed, and none of `tokio`'s own loom-gated code is touched.
+loom = ["dep:loom"]
+# Exposes the compressed-chunk reader seam only to the cargo-fuzz target.
+fuzzing = []
 
 [dev-dependencies]
+# Enables `ferrosa_common::test_generators` (shared CellValue/DecoratedKey
+# proptest strategies) for the T-035 writer oracle's Partition/Row
+# generators (ferrosa-sstable/tests/support/generators.rs).
+ferrosa-common = { path = "../ferrosa-common", features = ["test-generators"] }
 proptest = "1"
+sha2 = "0.10"
 tempfile = "3"

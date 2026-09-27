@@ -143,6 +143,7 @@ See [specs/reference/release-process.md](specs/reference/release-process.md). Ke
 Non-negotiable rules for all agents:
 
 - **No `#[ignore]`** — Zero legitimately ignored tests in this codebase.
+- **Slow tests** — behind the crate feature `slow-tests` inside a `mod slow`; PR CI skips `::slow::`; `nightly-slow-tests.yml` runs them. Never `#[ignore]` a test for being slow.
 - **No silent returns** — Never `if condition { return; }` in a test body.
 - **Live-infra opt-in target** — Tests requiring Firecracker/Docker/cluster must be behind the crate feature `live-infra-tests`, so default verifier commands do not report missing-infra test bodies as passed.
 - **Panic on missing infrastructure** — Once `live-infra-tests` is enabled, tests requiring Firecracker/Docker/cluster must `panic!` with setup instructions when the matching environment prerequisite is absent.

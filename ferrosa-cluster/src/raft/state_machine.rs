@@ -1875,6 +1875,44 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                     responses.push(RaftResponse::Ok);
                 }
                 EntryPayload::Normal(cmd) => {
+                    let mut pauses = Vec::new();
+                    if let Some(engine) = &self.engine {
+                        match &cmd.op {
+                            RaftOp::DropTable { keyspace, table } => {
+                                pauses.push(
+                                    engine
+                                        .pause_table_compactions(
+                                            &TableId::new(keyspace, table),
+                                            ferrosa_common::CancelReason::TableDropped,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            StorageIOError::write_state_machine(to_any_error(error))
+                                        })?,
+                                );
+                            }
+                            RaftOp::DropKeyspace(name) => {
+                                for (keyspace, table) in
+                                    self.state.tables.keys().filter(|(ks, _)| ks == name)
+                                {
+                                    pauses.push(
+                                        engine
+                                            .pause_table_compactions(
+                                                &TableId::new(keyspace, table),
+                                                ferrosa_common::CancelReason::TableDropped,
+                                            )
+                                            .await
+                                            .map_err(|error| {
+                                                StorageIOError::write_state_machine(to_any_error(
+                                                    error,
+                                                ))
+                                            })?,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     let (resp, pending) = self.apply_command(cmd);
                     // Drain the collected system-table writes off the raft
                     // worker. Awaiting here (before the next entry) preserves

@@ -49,6 +49,23 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Debug, Subcommand)]
+enum CompactionAction {
+    /// Request cancellation; committed replacements still finish normally.
+    Stop {
+        #[arg(long, requires = "table")]
+        keyspace: Option<String>,
+        #[arg(long, requires = "keyspace")]
+        table: Option<String>,
+        /// Admin/operator username. Prompts for its password unless --password-stdin is set.
+        #[arg(long)]
+        username: Option<String>,
+        /// Read the password from one line of standard input.
+        #[arg(long, requires = "username")]
+        password_stdin: bool,
+    },
+}
+
 /// Available subcommands.
 #[derive(Debug, Subcommand)]
 enum Commands {
@@ -67,6 +84,12 @@ enum Commands {
         /// Show only the longest-running queries (sorted by elapsed time).
         #[arg(long)]
         long_running: bool,
+    },
+
+    /// Cancel current compactions on this node (future scheduling stays enabled).
+    Compaction {
+        #[command(subcommand)]
+        action: CompactionAction,
     },
 
     /// Show storage engine statistics.
@@ -553,6 +576,25 @@ async fn main() {
         Commands::Queries { long_running } => commands::run_queries(addr, long_running)
             .await
             .map_err(Into::into),
+        Commands::Compaction {
+            action:
+                CompactionAction::Stop {
+                    keyspace,
+                    table,
+                    username,
+                    password_stdin,
+                },
+        } => {
+            commands::compaction::stop(
+                addr,
+                web_port,
+                keyspace.as_deref(),
+                table.as_deref(),
+                username.as_deref(),
+                password_stdin,
+            )
+            .await
+        }
         Commands::Storage => commands::run_storage(addr).await.map_err(Into::into),
         Commands::Topology => commands::run_topology(addr).await.map_err(Into::into),
         Commands::Peers => commands::run_peers(addr).await.map_err(Into::into),
@@ -776,6 +818,59 @@ mod tests {
             cli.command,
             Commands::Queries { long_running: true }
         ));
+    }
+
+    #[test]
+    fn compaction_stop_cli_parses_node_and_table_scope() {
+        let cli = Cli::try_parse_from(["ferrosa-ctl", "compaction", "stop"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Compaction {
+                action: CompactionAction::Stop {
+                    keyspace: None,
+                    table: None,
+                    username: None,
+                    password_stdin: false
+                }
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "compaction",
+            "stop",
+            "--keyspace",
+            "ks",
+            "--table",
+            "t",
+            "--username",
+            "operator",
+            "--password-stdin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Compaction {
+                action: CompactionAction::Stop {
+                    keyspace: Some(_),
+                    table: Some(_),
+                    username: Some(_),
+                    password_stdin: true
+                }
+            }
+        ));
+        for suffix in [["--keyspace", "ks"], ["--table", "t"]] {
+            assert!(Cli::try_parse_from([
+                "ferrosa-ctl",
+                "compaction",
+                "stop",
+                suffix[0],
+                suffix[1]
+            ])
+            .is_err());
+        }
+        assert!(
+            Cli::try_parse_from(["ferrosa-ctl", "compaction", "stop", "--password-stdin"]).is_err()
+        );
     }
 
     #[test]

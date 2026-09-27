@@ -18,7 +18,7 @@ every crate above it — severities are correspondingly high.
 | FC-4 | `parse_wkb` rejects valid-but-unsupported geometry as an error (only Point + single-ring Polygon; antimeridian deferred to P2-d) | Callers needing MultiPolygon / holes / antimeridian get `InvalidData`, not a result | 4 | 4 | 2 | 32 | **Designed fail-loud** (clear error messages, not silent NULL). Tracked as a feature gap, not a bug. |
 | FC-5 | `TaskPool::current()` silently falls back to ambient `tokio::spawn` | Subsystem work lands on the default runtime instead of its tunable pool → contention (cf. the Raft-starvation class of bug) without a hard signal | 6 | 4 | 6 | 144 | **Documented but quiet.** Doc comment warns hot paths should prefer `runtime()`, but `current()` does not log/meter when it spawns on the ambient runtime — a degradation with no observable line. |
 | FC-6 | New `#[non_exhaustive]` `Error`/`DataType` variant breaks downstream matches | Compile break (or worse, a wildcard arm silently swallows a new error) | 5 | 2 | 3 | 30 | `#[non_exhaustive]` is deliberate; downstream wildcard arms must be audited when variants are added. |
-| FC-7 | `Error::is_backpressure()` classifies overload by **substring** match on `InvalidData` messages | A reworded backpressure message stops being treated as backpressure → request fails as a hard error instead of shedding load | 6 | 3 | 7 | 126 | **String-matching anti-pattern.** Checks `contains("local disk free space below write reserve")` / `starts_with("overloaded:")`. Contrast with the typed `CorruptSstable` path; backpressure should be a typed variant too. |
+| FC-7 | Legacy `Error::is_backpressure()` still classifies older overloads by substring match | A reworded legacy error can lose overload classification | 6 | 3 | 7 | 126 → 36 | **Mitigated:** new storage hard-pressure errors use `Error::Overloaded { reason, table }`; consumers match the variant. `is_backpressure()` retains old strings for rolling upgrades and cross-crate errors, and CQL logs when this fallback is used. |
 | FC-8 | `test-generators` proptest strategies cover only `CellValue`/keys, not `CqlValue`/`CqlType` | Downstream property tests can't exercise the full value space from the shared generators | 3 | 5 | 4 | 60 | Generators exist for cells + keys; a `CqlValue` strategy would let every consumer property-test round-trips. Roadmap Next. |
 
 ## Top risks to act on
@@ -28,9 +28,9 @@ every crate above it — severities are correspondingly high.
    runtime-contention bugs (Raft heartbeat starvation), an un-instrumented
    fallback onto the wrong runtime is exactly the kind of "looks fine, runs hot"
    failure the fail-loud rule warns against. Add a one-shot `warn!` + a counter.
-2. **FC-7 (RPN 126)** — backpressure is detected by substring-matching error
-   messages. Promote it to a typed `Error::Overloaded`/`Backpressure` variant so
-   classification can't silently break when a message is reworded.
+2. **FC-7 (RPN 36 residual)** — legacy string matching remains for older
+   storage/cluster errors; new storage admission errors use the typed overload
+   variant and CQL logs when this fallback matches.
 3. **FC-3 (RPN 108)** — `CqlValue` total order underpins index/sort correctness;
    add a property test over the full cross-type matrix as a regression net.
 

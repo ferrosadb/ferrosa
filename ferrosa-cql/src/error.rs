@@ -298,7 +298,14 @@ impl From<ferrosa_schema::SchemaError> for CqlError {
 
 impl From<ferrosa_common::Error> for CqlError {
     fn from(err: ferrosa_common::Error) -> Self {
+        let err = match err {
+            ferrosa_common::Error::Overloaded { reason, table } => {
+                return Self::Overloaded(format!("table={table} reason={reason}"));
+            }
+            other => other,
+        };
         if err.is_backpressure() {
+            tracing::warn!(error = %err, "legacy string-matched storage backpressure error");
             Self::Overloaded(format!("storage backpressure: {err}"))
         } else {
             Self::ServerError(format!("storage error: {err}"))
@@ -357,7 +364,11 @@ impl From<ferrosa_cluster::ClusterError> for CqlError {
                 data_present,
             },
             ClusterError::Overloaded(msg) => Self::Overloaded(msg),
+            ClusterError::Storage(ferrosa_common::Error::Overloaded { reason, table }) => {
+                Self::Overloaded(format!("table={table} reason={reason}"))
+            }
             ClusterError::Storage(e) if e.is_backpressure() => {
+                tracing::warn!(error = %e, "legacy string-matched cluster storage backpressure error");
                 Self::Overloaded(format!("storage backpressure: {e}"))
             }
             other => Self::ServerError(format!("cluster error: {other}")),
@@ -546,6 +557,17 @@ mod tests {
         };
         let cql_err: CqlError = schema_err.into();
         assert_eq!(cql_err.error_code(), 0x2100);
+    }
+
+    #[test]
+    fn typed_storage_overload_maps_to_cql_overloaded() {
+        let error = ferrosa_common::Error::Overloaded {
+            reason: "hard memtable pressure".into(),
+            table: "ks.tbl".into(),
+        };
+        let cql_error: CqlError = error.into();
+        assert_eq!(cql_error.error_code(), 0x1001);
+        assert!(matches!(cql_error, CqlError::Overloaded(message) if message.contains("ks.tbl")));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Module: Compose lock-free memtable, flush, SSTable read, and metadata views.
 //! Correctness: Correct when every ArcSwap view is internally aligned and read
 //! and compaction planning preserve key bounds without resident-reader fanout.
-//! Last revised: 2026-09-01
-//! Last changed: Added bounded high-SSTable-fanout read diagnostics.
+//! Last revised: 2026-09-26
+//! Last changed: Opened staged Data.db directly for streaming flush output.
 //!
 //! Lock-free composition of memtable, flush, and SSTable reads.
 //!
@@ -41,7 +41,7 @@ use ferrosa_index::{FilterPredicate, IndexKey, IndexType, RowPosition};
 use ferrosa_sstable::io::ReadAt;
 use ferrosa_sstable::reader::SSTableReader;
 use ferrosa_sstable::types::{Partition, Row};
-use ferrosa_sstable::writer::{SSTableOutput, SSTableWriter};
+use ferrosa_sstable::writer::{SSTableOutput, SSTableOutputFiles, SSTableWriter};
 use ferrosa_sstable::WriteOptions;
 use rayon::prelude::*;
 
@@ -2679,6 +2679,17 @@ impl<F: FlushTarget> TableStore<F> {
     /// 5. Build the SSTable via [`SSTableWriter`] and [`FlushTarget::flush`].
     /// 6. Prepend the new reader to the SSTable list and clear `flushing`.
     pub fn flush(&self) -> Result<()> {
+        self.flush_with_swap_callback(|| {})
+    }
+
+    /// Flushes while notifying the owner immediately after the active
+    /// memtable has been swapped for a fresh one. The completion result still
+    /// carries the durability outcome; this callback only releases
+    /// backpressure waiters that depend on active-memtable capacity.
+    pub(crate) fn flush_with_swap_callback(
+        &self,
+        on_memtable_release: impl FnOnce(),
+    ) -> Result<()> {
         let total_start = Instant::now();
         let phase_start = Instant::now();
         let _guard = self.flush_guard.lock();
@@ -2735,6 +2746,7 @@ impl<F: FlushTarget> TableStore<F> {
             crate::metrics::FlushPhase::SwapMemtable,
             phase_start.elapsed(),
         );
+        on_memtable_release();
 
         // Step 2: Snapshot the flushing memtable.
         // Also capture any late writes from the PREVIOUS flushing memtable
@@ -2928,7 +2940,7 @@ impl<F: FlushTarget> TableStore<F> {
         let header = flush::build_serialization_header(&schema, &partitions);
         let staged_output = self.flush_target.file_output_staging_dir()?;
         let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw"))?
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db"))?
         } else {
             SSTableWriter::new(options, header)
         };
@@ -2937,14 +2949,14 @@ impl<F: FlushTarget> TableStore<F> {
             writer.add_partition(p)?;
         }
         let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
-            let output = writer.finish_to_directory(staging_dir)?;
+            let output = writer.finish_to_directory_deferred_sync(staging_dir)?;
             let output_bytes = output.total_size_bytes();
             crate::metrics::observe_flush_phase(
                 crate::metrics::FlushPhase::EncodeSstable,
                 phase_start.elapsed(),
             );
             let phase_start = Instant::now();
-            let reader = self.flush_target.flush_files(output)?;
+            let reader = self.flush_target.flush_deferred_files(output)?;
             crate::metrics::observe_flush_phase(
                 crate::metrics::FlushPhase::LocalWriteSstable,
                 phase_start.elapsed(),
@@ -3354,51 +3366,86 @@ impl<F: FlushTarget> TableStore<F> {
         let schema = self.schema.load_full();
         let shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
 
-        // Parallel ENCODE — the ~98% cost. Each shard is independent (disjoint
-        // token range, its own writer). In-memory `finish()` keeps shards
-        // independent; each holds <= 1/N of the memtable, so transient encoded
-        // bytes stay bounded.
+        // Stage directories before entering Rayon: the target need not be Sync.
+        // Guards outlive all parallel writers and remove incomplete or unpublished
+        // files on every error. Each worker retains bounded pump buffers plus a
+        // component manifest, never a complete encoded SSTable byte image.
+        struct Staging(Option<std::path::PathBuf>);
+        impl Drop for Staging {
+            fn drop(&mut self) {
+                if let Some(path) = &self.0 {
+                    if let Err(error) = std::fs::remove_dir_all(path) {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            tracing::error!(?path, %error, "sharded flush staging cleanup failed");
+                        }
+                    }
+                }
+            }
+        }
+        enum ShardOutput {
+            Files(SSTableOutputFiles),
+            Memory(SSTableOutput),
+        }
+        let staging: Vec<Staging> = (0..shards.len())
+            .map(|_| self.flush_target.file_output_staging_dir().map(Staging))
+            .collect::<Result<_>>()?;
         let phase_start = Instant::now();
-        let encoded: Vec<Result<SSTableOutput>> = crate::flush_executor::pool().install(|| {
+        let outputs: Vec<ShardOutput> = crate::flush_executor::pool()?.install(|| {
             shards
                 .par_iter()
-                .map(|shard| {
+                .zip(staging.par_iter())
+                .map(|(shard, stage)| {
                     let header = flush::build_serialization_header(&schema, shard);
-                    let mut writer = SSTableWriter::new(options.clone(), header);
-                    for p in shard {
-                        writer.add_partition(p)?;
+                    let mut writer = match &stage.0 {
+                        Some(dir) => SSTableWriter::new_file_backed(
+                            options.clone(),
+                            header,
+                            dir.join("Data.db"),
+                        )?,
+                        None => SSTableWriter::new(options.clone(), header),
+                    };
+                    for partition in shard {
+                        writer.add_partition(partition)?;
                     }
-                    writer.finish()
+                    match &stage.0 {
+                        Some(dir) => writer
+                            .finish_to_directory_deferred_sync(dir)
+                            .map(ShardOutput::Files),
+                        None => writer.finish().map(ShardOutput::Memory),
+                    }
                 })
-                .collect()
-        });
-        let outputs: Vec<SSTableOutput> = encoded.into_iter().collect::<Result<_>>()?;
+                .collect::<Result<_>>()
+        })?;
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::EncodeSstable,
             phase_start.elapsed(),
         );
 
-        // Sequential PUBLISH-TO-DISK — the flush target's generation counter is
-        // shared/serial, so write each encoded shard with its own fresh gen.
-        // This is the cheap (~0.3%) part.
+        // Publish each finished shard under its own generation; install all
+        // readers together only after every shard has been published.
         let phase_start = Instant::now();
         let flush_dir = self.flush_target.base_dir().to_path_buf();
         let mut published: Vec<(u64, Arc<SSTableReader<F::Reader>>)> =
             Vec::with_capacity(outputs.len());
         let mut total_output_bytes = 0u64;
         for output in outputs {
-            total_output_bytes += (output.data.len()
-                + output.partitions.len()
-                + output.rows.len()
-                + output.filter.len()
-                + output.statistics.len()
-                + output.toc.len()
-                + output
-                    .compression_info
-                    .as_ref()
-                    .map(|ci| ci.len())
-                    .unwrap_or(0)) as u64;
-            let reader = self.flush_target.flush(output)?;
+            let reader = match output {
+                ShardOutput::Files(output) => {
+                    total_output_bytes += output.total_size_bytes();
+                    self.flush_target.flush_deferred_files(output)?
+                }
+                ShardOutput::Memory(output) => {
+                    total_output_bytes += (output.data.len()
+                        + output.partitions.len()
+                        + output.rows.len()
+                        + output.filter.len()
+                        + output.statistics.len()
+                        + output.toc.len()
+                        + output.compression_info.as_ref().map_or(0, Vec::len))
+                        as u64;
+                    self.flush_target.flush(output)?
+                }
+            };
             let gen = self.flush_target.last_generation();
             self.next_gen
                 .fetch_max(gen + 1, std::sync::atomic::Ordering::SeqCst);
@@ -7259,6 +7306,12 @@ fn sstable_compaction_component_size(table_dir: &std::path::Path, id: &str) -> O
     if let Ok(meta) = std::fs::metadata(compression_info) {
         total = total.saturating_add(meta.len());
     }
+    for suffix in ["Digest.crc32", "CRC.db"] {
+        let path = table_dir.join(format!("{id}-{suffix}"));
+        if let Ok(meta) = std::fs::metadata(path) {
+            total = total.saturating_add(meta.len());
+        }
+    }
     Some(total)
 }
 
@@ -10913,9 +10966,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn startup_smoke_test_rejects_out_of_order_data_stream() {
-        let tmp = tempfile::tempdir().unwrap();
+    /// Corrupt a flushed Data.db into an out-of-order token stream, as both
+    /// `startup_smoke_test_rejects_out_of_order_data_stream` and
+    /// `startup_smoke_test_rejects_out_of_order_data_stream_even_with_stale_checksums`
+    /// need to start from: write two partitions, flush, then rewrite Data.db
+    /// with their headers swapped so the on-disk stream violates token order.
+    /// Returns the table dir, the flushed generation, and the corrupted bytes
+    /// (so callers can choose whether to rebuild Digest.crc32/CRC.db to match).
+    fn corrupt_flushed_generation_into_out_of_order_stream(
+        tmp: &tempfile::TempDir,
+    ) -> (TableStore<crate::flush::FileFlushTarget>, u64, Vec<u8>) {
         let store = file_backed_test_store(tmp.path());
         let schema = test_schema();
 
@@ -10940,13 +11000,58 @@ mod tests {
             &header_partitions,
             &second,
         ));
-        std::fs::write(&data_path, unsorted_data).unwrap();
+        std::fs::write(&data_path, &unsorted_data).unwrap();
+
+        (store, gen, unsorted_data)
+    }
+
+    #[test]
+    fn startup_smoke_test_rejects_out_of_order_data_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_store, gen, unsorted_data) =
+            corrupt_flushed_generation_into_out_of_order_stream(&tmp);
+
+        // Checksums (T-011, commit b4d16012) were computed over the ORIGINAL,
+        // correctly-ordered Data.db at flush time. Left stale, the CRC.db
+        // chunk covering the rewritten bytes no longer matches them, and that
+        // checksum layer fires before the token-order check ever runs — the
+        // very next test asserts exactly that. This test exists to exercise
+        // the token-order check specifically, so it rebuilds Digest.crc32 and
+        // CRC.db to match the corrupted bytes: same corruption, checksums
+        // that pass, so the failure is unambiguously the order check.
+        let digest = ferrosa_sstable::checksum::format_digest(
+            ferrosa_sstable::checksum::digest_bytes(&unsorted_data),
+        );
+        std::fs::write(tmp.path().join(format!("{gen}-Digest.crc32")), digest).unwrap();
+        let crc = ferrosa_sstable::checksum::compute_chunk_crc(&unsorted_data, 65536);
+        std::fs::write(tmp.path().join(format!("{gen}-CRC.db")), crc).unwrap();
 
         let err = crate::engine::StorageEngine::smoke_test_generation(tmp.path(), gen)
             .expect_err("startup/self-heal smoke test must detect Data.db token-order corruption");
         assert!(
             err.to_string().contains("partition order violation"),
             "error must name the token-order corruption, got: {err}"
+        );
+    }
+
+    #[test]
+    fn startup_smoke_test_rejects_out_of_order_data_stream_even_with_stale_checksums() {
+        // Companion to the test above: the SAME corruption, but WITHOUT
+        // rebuilding Digest.crc32/CRC.db, so the flush-time checksums are
+        // stale against the rewritten Data.db. This must still be rejected —
+        // by the CRC.db layer this time — so both detection layers (checksum
+        // and token-order) are covered by a test that actually exercises them,
+        // rather than one layer silently masking the other forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let (_store, gen, _unsorted_data) =
+            corrupt_flushed_generation_into_out_of_order_stream(&tmp);
+
+        let err = crate::engine::StorageEngine::smoke_test_generation(tmp.path(), gen)
+            .expect_err("startup/self-heal smoke test must detect stale-checksum corruption");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CRC") || msg.contains("crc") || msg.contains("checksum"),
+            "error must name the checksum-layer corruption when checksums are left stale, got: {err}"
         );
     }
 
@@ -11181,6 +11286,122 @@ mod tests {
             "results must remain top-k sorted: {:?}",
             results
         );
+    }
+
+    #[test]
+    fn wiring_sharded_flush_failure_removes_all_staging() {
+        use ferrosa_sstable::pump::test_support::{
+            install_sink_hook, Fault, FaultySink, PumpOverrides,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let _hook = install_sink_hook(
+            dir.path().to_path_buf(),
+            PumpOverrides::default(),
+            Arc::new(|opened, sink| {
+                if opened.path.ends_with("Data.db") {
+                    let (faulty, _) = FaultySink::new(opened.mode);
+                    Box::new(faulty.at(0, Fault::Enospc))
+                } else {
+                    sink
+                }
+            }),
+        );
+        let store = TableStore::new(
+            test_schema(),
+            crate::flush::FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        let mut partitions: Vec<_> = (0..4)
+            .map(|i| Partition {
+                key: make_key(&format!("key{i}")),
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![make_row(b"value", 1000)],
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        let error = store
+            .flush_sharded(partitions, 2, 4, Instant::now(), &new_memtable())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("No space") || error.to_string().contains("ENOSPC"),
+            "{error}"
+        );
+        assert_eq!(store.sstable_count(), 0);
+        // The shared staging root is infrastructure; only its owned per-shard
+        // children must disappear. No generation or staged component may remain.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            assert_eq!(path, dir.path().join(".sstable-staging"));
+            assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn wiring_sharded_flush_uses_pump_and_reads_back() {
+        use ferrosa_sstable::pump::test_support::{PumpOverrides, PumpTrace};
+        let dir = tempfile::tempdir().unwrap();
+        let trace = PumpTrace::install(
+            dir.path().to_path_buf(),
+            PumpOverrides {
+                segment_bytes: Some(262_144),
+                queue_depth: Some(1),
+            },
+        );
+        let store = TableStore::new(
+            test_schema(),
+            crate::flush::FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        let mut partitions: Vec<_> = (0..20)
+            .map(|i| {
+                let mut p = Partition {
+                    key: make_key(&format!("key{i:05}")),
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    static_row: None,
+                    rows: Vec::new(),
+                };
+                p.rows
+                    .push(make_row(format!("val{i:05}").as_bytes(), 1000 + i));
+                p
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        // Call the actual shard path with two shards even on a one-core runner.
+        store
+            .flush_sharded(partitions, 2, 20, Instant::now(), &new_memtable())
+            .unwrap();
+        assert_eq!(store.sstable_count(), 2);
+        assert!(
+            trace.bypasses().is_empty(),
+            "component writes bypassed pump: {:?}",
+            trace.bypasses()
+        );
+        trace.assert_complete_sstables_with_deferred_sync(2);
+        let files = trace.files();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|f| f.opened.path.ends_with("Data.db"))
+                .count(),
+            2
+        );
+        assert!(files.iter().all(|f| !f.opened.path.ends_with("Data.raw")));
+        let got = store.read_range(None, None, 40).unwrap();
+        assert_eq!(got.len(), 20);
+        for p in got {
+            let key = std::str::from_utf8(p.key.key.as_bytes()).unwrap();
+            assert_eq!(
+                p.rows[0].cells[0].1.value.as_deref(),
+                Some(format!("val{}", &key[3..]).as_bytes())
+            );
+        }
     }
 
     #[test]

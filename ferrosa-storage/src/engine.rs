@@ -1,8 +1,8 @@
 //! Module: Compose commit log, memtable, flush, compaction, object storage, and cache.
 //! Correctness: Correct when admitted writes are durable before visibility and reads,
 //! replay, flush, and maintenance preserve table and cursor invariants.
-//! Last revised: 2026-09-01
-//! Last changed: Made automatic flush admission volume- and WAL-pressure-bounded.
+//! Last revised: 2026-09-27
+//! Last changed: Retry output digest failures with backoff and latch table pauses for operator resume.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -41,7 +41,12 @@ use crate::commitlog::cdc::{CdcPageLimit, CdcReader, CdcReplayError, DurableCdcP
 use crate::commitlog::config::{CommitLogConfig, CommitLogPosition, TableId};
 use crate::commitlog::mutation::Mutation;
 use crate::commitlog::CommitLog;
-use crate::compaction::executor::CompactionExecutor;
+#[cfg(any(test, feature = "test-support"))]
+use crate::compaction::cancel_harness::CancelPoint;
+use crate::compaction::cancel_point;
+use crate::compaction::control::TableCompactionPause;
+use crate::compaction::executor::{CompactionExecutor, CompactionFailure};
+use crate::compaction::retry::CompactionRetryPolicy;
 use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
 use crate::flush::{FileFlushTarget, REQUIRED_SSTABLE_COMPONENTS};
@@ -56,21 +61,20 @@ use crate::timeseries::{
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
 
-/// Maximum minimum size for an age-triggered automatic flush.
-///
-/// With the production 64 MiB flush threshold, data must accumulate to 16 MiB
-/// before age may admit a flush. Smaller configured thresholds retain their
-/// own threshold as the floor, preserving deterministic small-threshold tests.
-const MAX_AGE_FLUSH_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
+// T-023 crash injection belongs to the poll future that explicitly opts in.
+// Task-local scope follows Tokio task migration and resets on unwind/drop;
+// unrelated tasks and synchronous startup reconciliation never inherit it.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_CRASH_AFTER_N_INPUT_RETIREMENTS: usize;
+}
 
-/// Bound synchronous automatic-flush work per maintenance tick. A later tick
-/// resumes from the still-dirty tables, so this caps allocation/I/O without
-/// sacrificing eventual progress.
-const MAX_AUTOMATIC_FLUSHES_PER_POLL: usize = 8;
-const MAX_COMPACTION_INPUTS_PER_TASK: usize = 64;
-
-fn effective_compaction_input_bounds(min_threshold: usize, max_threshold: usize) -> (usize, usize) {
-    let max_threshold = max_threshold.clamp(2, MAX_COMPACTION_INPUTS_PER_TASK);
+fn effective_compaction_input_bounds(
+    min_threshold: usize,
+    max_threshold: usize,
+    configured_max_inputs: usize,
+) -> (usize, usize) {
+    let max_threshold = max_threshold.clamp(2, configured_max_inputs.max(2));
     let min_threshold = min_threshold.clamp(2, max_threshold);
     (min_threshold, max_threshold)
 }
@@ -222,7 +226,7 @@ pub(crate) fn write_options_for_schema(
         .and_then(|v| v.parse::<usize>().ok())
         .map(|kb| kb.saturating_mul(1024))
         .filter(|bytes| *bytes > 0)
-        .unwrap_or(ferrosa_sstable::Compression::DEFAULT_CHUNK_SIZE);
+        .unwrap_or_else(|| ferrosa_sstable::WriteOptions::default().chunk_size);
 
     Ok(ferrosa_sstable::WriteOptions {
         compression,
@@ -235,6 +239,18 @@ pub(crate) fn write_options_for_schema(
 fn compression_from_schema(
     schema: &TableSchema,
 ) -> ferrosa_common::Result<Option<ferrosa_sstable::Compression>> {
+    if let Some(enabled) = schema.extensions.get("compression.enabled") {
+        let enabled = enabled.trim();
+        if enabled.eq_ignore_ascii_case("false") || enabled == "0" {
+            return Ok(None);
+        } else if !enabled.eq_ignore_ascii_case("true") && enabled != "1" {
+            tracing::error!(
+                value = enabled,
+                "invalid compression.enabled schema value; treating compression as enabled"
+            );
+        }
+    }
+
     let Some(class) = schema
         .extensions
         .get("compression.class")
@@ -1057,8 +1073,27 @@ fn incremental_compaction_disk_reservation(input_bytes: u64, disk_reserve_bytes:
 ///
 /// One instance per node. Manages multiple tables, each with its own
 /// `TableStore`. The commit log is shared across all tables.
+struct DigestFailurePause {
+    _pause: TableCompactionPause,
+}
+
+impl DigestFailurePause {
+    fn new(pause: TableCompactionPause) -> Self {
+        crate::metrics::inc_compaction_paused_tables();
+        Self { _pause: pause }
+    }
+}
+
+impl Drop for DigestFailurePause {
+    fn drop(&mut self) {
+        crate::metrics::dec_compaction_paused_tables();
+    }
+}
+
 pub struct StorageEngine {
     config: StorageEngineConfig,
+    runtime_tuning: crate::runtime_tuning::StorageRuntimeTuning,
+    write_admission: WriteAdmissionSettings,
     /// Shared with the index scheduler's sidecar installer (t_7ac6b0e3).
     tables: Arc<RwLock<HashMap<TableId, TableState>>>,
     /// Sidecars the scheduler built and installed, whose generation may
@@ -1079,6 +1114,12 @@ pub struct StorageEngine {
     /// long as the node stays up.
     deferred_index_builds: parking_lot::Mutex<HashMap<TableId, Vec<DeferredIndexBuild>>>,
     compaction_executor: CompactionExecutor,
+    /// Retry history is one entry per table with a retryable verification failure.
+    compaction_retry: parking_lot::Mutex<CompactionRetryPolicy>,
+    /// Retaining these RAII guards latches operator-visible digest pauses until resume/drop.
+    compaction_paused: parking_lot::Mutex<HashMap<TableId, DigestFailurePause>>,
+    /// Wakes the maintenance task when a retry backoff expires.
+    compaction_retry_notify: Arc<tokio::sync::Notify>,
     upload_manager: Option<UploadManager>,
     compaction_upload_manager: Option<UploadManager>,
     local_cache: LocalCache,
@@ -1127,6 +1168,12 @@ pub struct StorageEngine {
     /// The process maintenance loop consumes this flag to run an urgent flush
     /// outside request handling.
     flush_requested: AtomicBool,
+    /// Cached rate of write-pump resource blocking, sampled at a bounded
+    /// cadence so requests do not contend on a process-wide lock.
+    pump_rate_sample_at_ns: AtomicU64,
+    pump_rate_sample_total_ns: AtomicU64,
+    pump_blocked_rate_micros: AtomicU64,
+    soft_pressure_table_count: AtomicU64,
     /// Last observed live manifest object/byte totals per table. Updated by
     /// S3 sync/restore paths and used by sync-only metrics surfaces.
     s3_manifest_stats: RwLock<HashMap<String, (i32, i64)>>,
@@ -1165,6 +1212,106 @@ struct TableState {
     /// plus an atomic pointer swap, with no mutex contention even when
     /// many threads write to the same table concurrently.
     last_commit_log_position: ArcSwap<Option<CommitLogPosition>>,
+    /// Per-table waiters are woken after a successful flush. This is only
+    /// consulted in the soft-pressure zone; ordinary writes do not touch it.
+    write_pressure_notify: Arc<tokio::sync::Notify>,
+    /// Pressure gauge in percentage points (0..=100), updated atomically.
+    write_pressure_percent: Arc<AtomicU64>,
+    /// Tracks soft-zone edges so logs are emitted once per transition.
+    in_write_soft_zone: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct WriteAdmissionSettings {
+    soft_pressure: f64,
+    max_soft_delay: std::time::Duration,
+}
+
+impl WriteAdmissionSettings {
+    const DEFAULT_SOFT_PRESSURE: f64 = 0.7;
+    const DEFAULT_MAX_DELAY_MS: u64 = 50;
+
+    fn from_env() -> Self {
+        let soft_pressure = read_bounded_env_f64(
+            "FERROSA_WRITE_SOFT_PRESSURE_THRESHOLD",
+            Self::DEFAULT_SOFT_PRESSURE,
+            0.05,
+            0.95,
+        );
+        let max_delay_ms = read_bounded_env_u64(
+            "FERROSA_WRITE_SOFT_DELAY_MAX_MS",
+            Self::DEFAULT_MAX_DELAY_MS,
+            1,
+            1_000,
+        );
+        Self {
+            soft_pressure,
+            max_soft_delay: std::time::Duration::from_millis(max_delay_ms),
+        }
+    }
+}
+
+fn read_bounded_env_f64(name: &str, default: f64, min: f64, max: f64) -> f64 {
+    match std::env::var(name) {
+        Ok(raw) => match parse_bounded_f64(&raw, min, max) {
+            Some(value) => value,
+            None => {
+                tracing::error!(variable = name, value = %raw, default, "invalid runtime tuning value; using safe default");
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(err) => {
+            tracing::error!(variable = name, %err, default, "cannot read runtime tuning value; using safe default");
+            default
+        }
+    }
+}
+
+fn read_bounded_env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => match parse_bounded_u64(&raw, min, max) {
+            Some(value) => value,
+            None => {
+                tracing::error!(variable = name, value = %raw, default, "invalid runtime tuning value; using safe default");
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(err) => {
+            tracing::error!(variable = name, %err, default, "cannot read runtime tuning value; using safe default");
+            default
+        }
+    }
+}
+
+fn parse_bounded_f64(raw: &str, min: f64, max: f64) -> Option<f64> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && (min..=max).contains(value))
+}
+
+fn parse_bounded_u64(raw: &str, min: u64, max: u64) -> Option<u64> {
+    raw.parse::<u64>()
+        .ok()
+        .filter(|value| (min..=max).contains(value))
+}
+
+#[cfg(test)]
+mod write_admission_config_tests {
+    use super::*;
+
+    #[test]
+    fn admission_settings_have_bounded_rational_defaults() {
+        assert_eq!(WriteAdmissionSettings::DEFAULT_SOFT_PRESSURE, 0.7);
+        assert_eq!(WriteAdmissionSettings::DEFAULT_MAX_DELAY_MS, 50);
+        assert_eq!(parse_bounded_f64("0.75", 0.05, 0.95), Some(0.75));
+        assert_eq!(parse_bounded_f64("NaN", 0.05, 0.95), None);
+        assert_eq!(parse_bounded_f64("1.0", 0.05, 0.95), None);
+        assert_eq!(parse_bounded_u64("50", 1, 1_000), Some(50));
+        assert_eq!(parse_bounded_u64("0", 1, 1_000), None);
+        assert_eq!(parse_bounded_u64("1001", 1, 1_000), None);
+    }
 }
 
 struct StorageSchemaView<'a>(&'a HashMap<TableId, TableState>);
@@ -1738,6 +1885,8 @@ impl StorageEngine {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ];
 
         let rehydration_locks: Arc<DashMap<String, Arc<std::sync::Mutex<()>>>> =
@@ -2174,6 +2323,9 @@ impl StorageEngine {
 
         let available = self.disk_free_bytes_cached();
         if available < reserve {
+            // Cancellation requests reclamation; it does not prove space has
+            // already been freed. Keep admission closed until the reserve recovers.
+            self.compaction_executor.cancel_largest_for_disk_reserve();
             return Err(ferrosa_common::Error::InvalidData(format!(
                 "local disk free space below write reserve: available={available} reserve={reserve} path={}",
                 self.config.data_dir.display()
@@ -2215,14 +2367,179 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<()> {
         let memtable_size = state.store.memtable_size() as u64;
         crate::metrics::observe_memtable_size(memtable_size);
+        let pressure = ((memtable_size as f64
+            / self.config.memtable_backpressure_bytes.max(1) as f64)
+            .max(self.sample_write_pump_blocked_rate()))
+        .clamp(0.0, 1.0);
+        self.update_write_pressure(state, table_id, pressure);
         if memtable_size >= self.config.memtable_backpressure_bytes {
             self.request_flush();
-            return Err(ferrosa_common::Error::InvalidData(format!(
-                "overloaded: memtable backpressure threshold exceeded: table={table_id} size={memtable_size} threshold={}",
-                self.config.memtable_backpressure_bytes
-            )));
+            crate::metrics::inc_write_admission_rejected("hard_memtable");
+            return Err(ferrosa_common::Error::Overloaded {
+                reason: format!(
+                    "memtable backpressure threshold exceeded: size={memtable_size} threshold={}",
+                    self.config.memtable_backpressure_bytes
+                ),
+                table: table_id.to_string(),
+            });
         }
         Ok(())
+    }
+
+    /// Waits briefly for a table's flush to release pressure before allowing a
+    /// CQL write. This is called by the async write-path adapter; synchronous
+    /// storage callers retain the hard admission check in `write()`.
+    pub async fn await_write_admission(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        // The overwhelmingly common path avoids even the table-map read lock.
+        // The storage write that follows samples pressure and publishes the
+        // first soft-zone edge for the next request.
+        if self.soft_pressure_table_count.load(Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
+        let notifier = {
+            let tables = self.tables.read();
+            let state = tables.get(table_id).ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+            })?;
+            Arc::clone(&state.write_pressure_notify)
+        };
+        let mut notified = std::pin::pin!(notifier.notified_owned());
+        // Register before sampling pressure so a successful flush between the
+        // sample and the await cannot be missed.
+        notified.as_mut().enable();
+
+        let hard_limit = self.config.memtable_backpressure_bytes.max(1);
+        let (pressure, memtable_pressure, memtable_size) = {
+            let tables = self.tables.read();
+            let state = tables.get(table_id).ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+            })?;
+            let memtable_size = state.store.memtable_size() as u64;
+            let memtable_pressure = (memtable_size as f64 / hard_limit as f64).min(1.0);
+            let pressure = memtable_pressure
+                .max(self.sample_write_pump_blocked_rate())
+                .clamp(0.0, 1.0);
+            self.update_write_pressure(state, table_id, pressure);
+            (pressure, memtable_pressure, memtable_size)
+        };
+
+        if pressure >= 1.0 {
+            self.request_flush();
+            crate::metrics::inc_write_admission_rejected(if memtable_pressure >= 1.0 {
+                "hard_memtable"
+            } else {
+                "hard_flush_lag"
+            });
+            return Err(ferrosa_common::Error::Overloaded {
+                reason: if memtable_pressure >= 1.0 {
+                    format!("memtable pressure reached hard limit ({memtable_size} bytes)")
+                } else {
+                    "write-pump blocked rate reached hard limit".to_owned()
+                },
+                table: table_id.to_string(),
+            });
+        }
+
+        if pressure < self.write_admission.soft_pressure {
+            return Ok(());
+        }
+        self.request_flush();
+        let scale = ((pressure - self.write_admission.soft_pressure)
+            / (1.0 - self.write_admission.soft_pressure))
+            .clamp(0.0, 1.0);
+        let delay = self.write_admission.max_soft_delay.mul_f64(scale.max(0.02));
+        let started = Instant::now();
+        let _ = tokio::time::timeout(delay, notified.as_mut()).await;
+        let elapsed = started.elapsed();
+        crate::metrics::observe_write_admission_delay(elapsed);
+        crate::metrics::inc_write_admission_delayed();
+
+        // One bounded re-check after the wake/deadline. Do not sleep or poll;
+        // continued soft pressure is admitted after this single grace period.
+        let (pressure, memtable_pressure, memtable_size) = {
+            let tables = self.tables.read();
+            let state = tables.get(table_id).ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+            })?;
+            let memtable_size = state.store.memtable_size() as u64;
+            let memtable_pressure = (memtable_size as f64 / hard_limit as f64).min(1.0);
+            let pressure = memtable_pressure
+                .max(self.sample_write_pump_blocked_rate())
+                .clamp(0.0, 1.0);
+            self.update_write_pressure(state, table_id, pressure);
+            (pressure, memtable_pressure, memtable_size)
+        };
+        if pressure >= 1.0 {
+            self.request_flush();
+            crate::metrics::inc_write_admission_rejected(if memtable_pressure >= 1.0 {
+                "hard_memtable"
+            } else {
+                "hard_flush_lag"
+            });
+            return Err(ferrosa_common::Error::Overloaded {
+                reason: if memtable_pressure >= 1.0 {
+                    format!("memtable pressure reached hard limit ({memtable_size} bytes)")
+                } else {
+                    "write-pump blocked rate reached hard limit".to_owned()
+                },
+                table: table_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn update_write_pressure(&self, state: &TableState, table_id: &TableId, pressure: f64) {
+        let gauge_percent = (pressure.clamp(0.0, 1.0) * 100.0).round() as u64;
+        if state.write_pressure_percent.load(Ordering::Relaxed) != gauge_percent {
+            state
+                .write_pressure_percent
+                .store(gauge_percent, Ordering::Relaxed);
+        }
+        if pressure >= self.write_admission.soft_pressure && pressure < 1.0 {
+            if state
+                .in_write_soft_zone
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.soft_pressure_table_count
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(table = %table_id, pressure, "write admission entered soft pressure zone");
+            }
+        } else if pressure < self.write_admission.soft_pressure
+            && state
+                .in_write_soft_zone
+                .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.soft_pressure_table_count
+                .fetch_sub(1, Ordering::Relaxed);
+            tracing::info!(table = %table_id, pressure, "write admission recovered below soft pressure");
+        }
+    }
+
+    fn sample_write_pump_blocked_rate(&self) -> f64 {
+        const SAMPLE_INTERVAL_NS: u64 = 100_000_000;
+        let now_ns = reference_instant().elapsed().as_nanos() as u64;
+        let sampled_at = self.pump_rate_sample_at_ns.load(Ordering::Relaxed);
+        if now_ns.saturating_sub(sampled_at) >= SAMPLE_INTERVAL_NS
+            && self
+                .pump_rate_sample_at_ns
+                .compare_exchange(sampled_at, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let total_ns = (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free()
+                * 1_000_000_000.0) as u64;
+            let previous_total = self
+                .pump_rate_sample_total_ns
+                .swap(total_ns, Ordering::Relaxed);
+            let rate = total_ns.saturating_sub(previous_total) as f64
+                / now_ns.saturating_sub(sampled_at).max(1) as f64;
+            self.pump_blocked_rate_micros.store(
+                (rate.clamp(0.0, 1.0) * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        self.pump_blocked_rate_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
 
     fn request_flush_if_needed(&self, state: &TableState) {
@@ -2252,7 +2569,7 @@ impl StorageEngine {
         // Pin the process-wide flush-pool width (FERROSA_FLUSH_PARALLELISM,
         // default = host parallelism). Bounds fsync/flush concurrency across all
         // flushes; the first engine to start wins for the process lifetime.
-        crate::flush_executor::configure(crate::flush_executor::default_parallelism());
+        crate::flush_executor::configure(crate::flush_executor::default_parallelism())?;
 
         // Ensure data directories exist.
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
@@ -2307,12 +2624,24 @@ impl StorageEngine {
 
         let engine = Self {
             config,
+            runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
+            write_admission: WriteAdmissionSettings::from_env(),
+            pump_rate_sample_at_ns: AtomicU64::new(reference_instant().elapsed().as_nanos() as u64),
+            pump_rate_sample_total_ns: AtomicU64::new(
+                (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free() * 1_000_000_000.0)
+                    as u64,
+            ),
+            pump_blocked_rate_micros: AtomicU64::new(0),
+            soft_pressure_table_count: AtomicU64::new(0),
             tables,
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
+            compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
+            compaction_paused: parking_lot::Mutex::new(HashMap::new()),
+            compaction_retry_notify: Arc::new(tokio::sync::Notify::new()),
             upload_manager,
             compaction_upload_manager,
             local_cache,
@@ -2513,12 +2842,24 @@ impl StorageEngine {
 
         Ok(Self {
             config,
+            runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
+            write_admission: WriteAdmissionSettings::from_env(),
+            pump_rate_sample_at_ns: AtomicU64::new(reference_instant().elapsed().as_nanos() as u64),
+            pump_rate_sample_total_ns: AtomicU64::new(
+                (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free() * 1_000_000_000.0)
+                    as u64,
+            ),
+            pump_blocked_rate_micros: AtomicU64::new(0),
+            soft_pressure_table_count: AtomicU64::new(0),
             tables,
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
+            compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
+            compaction_paused: parking_lot::Mutex::new(HashMap::new()),
+            compaction_retry_notify: Arc::new(tokio::sync::Notify::new()),
             upload_manager,
             compaction_upload_manager,
             local_cache,
@@ -2665,12 +3006,24 @@ impl StorageEngine {
 
         let engine = Self {
             config,
+            runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
+            write_admission: WriteAdmissionSettings::from_env(),
+            pump_rate_sample_at_ns: AtomicU64::new(reference_instant().elapsed().as_nanos() as u64),
+            pump_rate_sample_total_ns: AtomicU64::new(
+                (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free() * 1_000_000_000.0)
+                    as u64,
+            ),
+            pump_blocked_rate_micros: AtomicU64::new(0),
+            soft_pressure_table_count: AtomicU64::new(0),
             tables,
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations,
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
+            compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
+            compaction_paused: parking_lot::Mutex::new(HashMap::new()),
+            compaction_retry_notify: Arc::new(tokio::sync::Notify::new()),
             upload_manager,
             compaction_upload_manager,
             local_cache,
@@ -2706,6 +3059,161 @@ impl StorageEngine {
         Ok((engine, pending_mutations))
     }
 
+    /// Rebuild S3 upload work from replacement records before replaying the
+    /// upload ledger. The intent is the authoritative cursor; the ledger is a
+    /// compact queue payload and may be missing if the process died before it
+    /// was appended.
+    fn prepare_compaction_s3_replay(&self, pending_log: &crate::upload::PendingUploadsLog) {
+        if self.upload_manager.is_none() && self.compaction_upload_manager.is_none() {
+            return;
+        }
+        let mut existing = match pending_log.pending_records() {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| (record.table_id, record.sstable_id))
+                .collect::<std::collections::HashSet<_>>(),
+            Err(e) => {
+                tracing::error!(%e, "compaction recovery could not read the upload ledger");
+                return;
+            }
+        };
+
+        let pending_phase = |phase: crate::compaction::intent::CompactionIntentPhase| {
+            matches!(
+                phase,
+                crate::compaction::intent::CompactionIntentPhase::Retired
+                    | crate::compaction::intent::CompactionIntentPhase::S3Uploaded
+            )
+        };
+        let tables = self.tables.read();
+        for (table_id, state) in tables.iter() {
+            if state.pin_config.is_some() {
+                continue;
+            }
+            let table_dir = self.table_sstable_dir(table_id);
+            let entries = match std::fs::read_dir(&table_dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, path = %table_dir.display(), "compaction recovery could not scan replacement records");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !crate::compaction::intent::CompactionIntentRecord::is_record_name(&name) {
+                    continue;
+                }
+                let intent = match crate::compaction::intent::CompactionIntentRecord::read_at(
+                    &entry.path(),
+                ) {
+                    Ok(Some(intent)) if pending_phase(intent.phase) => intent,
+                    Ok(Some(_)) | Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!(%e, %table_id, path = %entry.path().display(), "compaction recovery could not read replacement record");
+                        continue;
+                    }
+                };
+                let table_key = table_id.to_string();
+                let key = (table_key.clone(), intent.output_gen.clone());
+                if existing.contains(&key) {
+                    continue;
+                }
+                let Some(output) = state
+                    .store
+                    .sstable_metadata(&table_dir)
+                    .into_iter()
+                    .find(|metadata| metadata.id == intent.output_gen)
+                else {
+                    tracing::error!(%table_id, output = %intent.output_gen, "compaction replacement record points to a missing output during S3 recovery");
+                    continue;
+                };
+                let size = intent
+                    .output_gen
+                    .parse::<u64>()
+                    .map(|generation| Self::collect_sstable_files(&table_dir, generation))
+                    .map(|files| files.iter().map(|file| file.size_bytes).sum())
+                    .unwrap_or(output.size_bytes);
+                let compaction = crate::upload::pending_log::PendingCompactionUpload {
+                    intent_task_id: Some(intent.task_id.clone()),
+                    remove_input_ids: intent.inputs.clone(),
+                    output: crate::manifest::ManifestEntry {
+                        id: intent.output_gen.clone(),
+                        size,
+                        min_token: output.min_token,
+                        max_token: output.max_token,
+                        min_timestamp: output.min_timestamp,
+                        max_timestamp: output.max_timestamp,
+                    },
+                };
+                match pending_log.add_compaction_entry(&table_key, &intent.output_gen, compaction) {
+                    Ok(()) => {
+                        existing.insert(key);
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, %table_id, output = %intent.output_gen, "compaction recovery could not rebuild the pending upload entry")
+                    }
+                }
+            }
+        }
+        drop(tables);
+    }
+
+    /// Remove replacement records that only protect local pinned or
+    /// non-S3 compactions. Their local retirement is complete, so there is no
+    /// remote phase for startup to resume.
+    fn prune_local_only_compaction_intents(&self) {
+        let no_object_store = self.object_store.is_none();
+        let tables = self
+            .tables
+            .read()
+            .iter()
+            .map(|(table_id, state)| {
+                (
+                    table_id.clone(),
+                    no_object_store || state.pin_config.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (table_id, local_only) in tables {
+            if !local_only {
+                continue;
+            }
+            let table_dir = self.table_sstable_dir(&table_id);
+            let entries = match std::fs::read_dir(&table_dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, path = %table_dir.display(), "local compaction recovery could not scan replacement records");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !crate::compaction::intent::CompactionIntentRecord::is_record_name(&name) {
+                    continue;
+                }
+                match crate::compaction::intent::CompactionIntentRecord::read_at(&entry.path()) {
+                    Ok(Some(intent))
+                        if intent.phase
+                            == crate::compaction::intent::CompactionIntentPhase::Retired =>
+                    {
+                        if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                            &table_dir,
+                            &intent.task_id,
+                        ) {
+                            tracing::warn!(%e, %table_id, task_id = %intent.task_id, "could not delete local-only replacement record after retirement");
+                        }
+                    }
+                    Ok(Some(_)) | Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(%e, %table_id, path = %entry.path().display(), "could not read local-only replacement record")
+                    }
+                }
+            }
+        }
+    }
+
     /// Replays pending S3 uploads that were interrupted by a crash.
     ///
     /// Reads the pending-uploads.log and re-submits upload tasks for each
@@ -2715,11 +3223,19 @@ impl StorageEngine {
         let pending_log_path = self.config.data_dir.join("pending-uploads.log");
         let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
             Ok(log) => log,
-            Err(_) => return, // No log file — nothing to replay
+            Err(e) => {
+                tracing::error!(%e, path = %pending_log_path.display(), "could not open pending upload ledger during compaction recovery");
+                return;
+            }
         };
+        self.prune_local_only_compaction_intents();
+        self.prepare_compaction_s3_replay(&pending_log);
 
         let records = match pending_log.pending_records() {
-            Ok(e) if e.is_empty() => return,
+            Ok(e) if e.is_empty() => {
+                self.resume_compaction_s3_deletions().await;
+                return;
+            }
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("failed to read pending-uploads.log: {e}");
@@ -2727,14 +3243,14 @@ impl StorageEngine {
             }
         };
 
-        let Some(upload_mgr) = self.upload_manager.as_ref() else {
+        if self.upload_manager.is_none() && self.compaction_upload_manager.is_none() {
             tracing::warn!(
                 "pending-uploads.log has {} entries but no upload manager configured — \
                  these SSTables may not be in S3",
                 records.len()
             );
             return;
-        };
+        }
 
         tracing::info!(
             count = records.len(),
@@ -2753,6 +3269,18 @@ impl StorageEngine {
         let mut finalize_handles = Vec::new();
 
         for (idx, record) in records.iter().enumerate() {
+            let upload_mgr = if record.compaction.is_some() {
+                self.compaction_upload_manager
+                    .as_ref()
+                    .or(self.upload_manager.as_ref())
+            } else {
+                self.upload_manager
+                    .as_ref()
+                    .or(self.compaction_upload_manager.as_ref())
+            };
+            let Some(upload_mgr) = upload_mgr else {
+                continue;
+            };
             let Some(files) = crate::upload::replay::find_pending_upload_files(
                 &self.config.data_dir,
                 &self.config.compaction.output_dir,
@@ -2818,6 +3346,109 @@ impl StorageEngine {
             };
             let _ = tokio::time::timeout(std::time::Duration::from_millis(100), drain).await;
         }
+        self.resume_compaction_s3_deletions().await;
+    }
+
+    /// Retry S3 input deletion for records whose upload and manifest phases
+    /// are durable. Duplicate deletes are safe and close crashes between queue
+    /// submission and replacement-record removal.
+    async fn resume_compaction_s3_deletions(&self) {
+        let Some(upload_mgr) = self
+            .compaction_upload_manager
+            .as_ref()
+            .or(self.upload_manager.as_ref())
+        else {
+            return;
+        };
+        let tables = self
+            .tables
+            .read()
+            .iter()
+            .map(|(table_id, state)| (table_id.clone(), state.pin_config.is_some()))
+            .collect::<Vec<_>>();
+        for (table_id, pinned) in tables {
+            if pinned {
+                continue;
+            }
+            let table_dir = self.table_sstable_dir(&table_id);
+            let entries = match std::fs::read_dir(&table_dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, path = %table_dir.display(), "compaction recovery could not scan for S3 delete work");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !crate::compaction::intent::CompactionIntentRecord::is_record_name(&name) {
+                    continue;
+                }
+                let mut intent = match crate::compaction::intent::CompactionIntentRecord::read_at(
+                    &entry.path(),
+                ) {
+                    Ok(Some(intent)) => intent,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!(%e, %table_id, path = %entry.path().display(), "compaction recovery could not read replacement record before S3 deletion");
+                        continue;
+                    }
+                };
+                if !matches!(
+                    intent.phase,
+                    crate::compaction::intent::CompactionIntentPhase::S3Manifested
+                        | crate::compaction::intent::CompactionIntentPhase::S3DeletesEnqueued
+                ) {
+                    continue;
+                }
+                let stubs = intent
+                    .inputs
+                    .iter()
+                    .map(|generation| {
+                        Self::compaction_input_retirement_stub(&table_dir, generation)
+                    })
+                    .collect::<Vec<_>>();
+                let deletion_plan = crate::compaction::finalize::plan_input_deletions(
+                    &table_id.to_string(),
+                    &stubs,
+                    std::time::Duration::from_secs(3600),
+                );
+                let mut submitted = true;
+                for task in deletion_plan.tasks {
+                    let (on_complete, completion) = tokio::sync::oneshot::channel();
+                    match upload_mgr
+                        .submit(crate::upload::UploadTask::DeleteSSTable {
+                            table_id: task.table_id,
+                            sstable_id: task.sstable_id,
+                            grace_period: task.grace_period,
+                            on_complete: Some(on_complete),
+                        })
+                        .await
+                    {
+                        Ok(()) => drop(completion),
+                        Err(e) => {
+                            tracing::error!(%e, %table_id, task_id = %intent.task_id, "compaction recovery failed to enqueue an S3 input delete");
+                            submitted = false;
+                            break;
+                        }
+                    }
+                }
+                if !submitted {
+                    continue;
+                }
+                intent.phase = crate::compaction::intent::CompactionIntentPhase::S3DeletesEnqueued;
+                if let Err(e) = intent.write(&table_dir) {
+                    tracing::error!(%e, %table_id, task_id = %intent.task_id, "compaction recovery enqueued S3 deletes but could not persist that phase");
+                    continue;
+                }
+                if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                    &table_dir,
+                    &intent.task_id,
+                ) {
+                    tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction recovery completed S3 enqueue but could not delete replacement record");
+                }
+            }
+        }
     }
 
     async fn finalize_replayed_pending_upload(
@@ -2859,10 +3490,10 @@ impl StorageEngine {
             }
         };
 
-        let removals_for_cas_retry = if let Some(compaction) = ctx.compaction {
+        let removals_for_cas_retry = if let Some(compaction) = ctx.compaction.as_ref() {
             manifest.remove_sstables(&ctx.table_id, &compaction.remove_input_ids);
-            manifest.add_sstable(&ctx.table_id, compaction.output);
-            vec![(ctx.table_id.clone(), compaction.remove_input_ids)]
+            manifest.add_sstable(&ctx.table_id, compaction.output.clone());
+            vec![(ctx.table_id.clone(), compaction.remove_input_ids.clone())]
         } else {
             tracing::warn!(
                 table = ctx.table_id,
@@ -2908,6 +3539,45 @@ impl StorageEngine {
                 "pending upload replay uploaded SSTable but could not save manifest; leaving entry for later retry"
             );
             return;
+        }
+
+        if let Some(task_id) = ctx
+            .compaction
+            .as_ref()
+            .and_then(|compaction| compaction.intent_task_id.as_deref())
+        {
+            let table_dir = ctx
+                .pending_log_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("sstables")
+                .join(&ctx.table_id);
+            match crate::compaction::intent::CompactionIntentRecord::read_at(
+                &crate::compaction::intent::CompactionIntentRecord::path(&table_dir, task_id),
+            ) {
+                Ok(Some(mut intent)) if intent.output_gen == ctx.sstable_id => {
+                    intent.phase = crate::compaction::intent::CompactionIntentPhase::S3Manifested;
+                    if let Err(e) = intent.write(&table_dir) {
+                        tracing::warn!(
+                            %e,
+                            table = ctx.table_id,
+                            sstable = ctx.sstable_id,
+                            "pending upload replay saved the manifest but could not advance the replacement record; leaving the upload durable for retry"
+                        );
+                        return;
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        table = ctx.table_id,
+                        sstable = ctx.sstable_id,
+                        "pending upload replay saved the manifest but could not read its replacement record"
+                    );
+                    return;
+                }
+            }
         }
 
         match crate::upload::PendingUploadsLog::open(&ctx.pending_log_path)
@@ -3166,6 +3836,8 @@ impl StorageEngine {
             state.pin_config = Some(pin_config);
             self.pin_metrics.inc_pinned_tables();
         }
+        drop(tables);
+        self.prune_local_only_compaction_intents();
         Ok(())
     }
 
@@ -3321,6 +3993,9 @@ impl StorageEngine {
             pinned_sstables: Vec::new(),
             first_unflushed_write_at_nanos: std::sync::atomic::AtomicI64::new(0),
             last_commit_log_position: ArcSwap::from_pointee(None),
+            write_pressure_notify: Arc::new(tokio::sync::Notify::new()),
+            write_pressure_percent: Arc::new(AtomicU64::new(0)),
+            in_write_soft_zone: AtomicBool::new(false),
         })
     }
 
@@ -3387,6 +4062,7 @@ impl StorageEngine {
         // An index whose CREATE INDEX outran this CREATE TABLE is built now,
         // not at the next restart.
         self.drain_deferred_index_builds(&table_id);
+        self.prune_local_only_compaction_intents();
 
         Ok(())
     }
@@ -3405,7 +4081,11 @@ impl StorageEngine {
         match tables.entry(table_id) {
             Entry::Occupied(_) => false,
             Entry::Vacant(slot) => {
+                let metric_label = slot.key().to_string();
+                let metric_gauge = Arc::clone(&state.write_pressure_percent);
                 slot.insert(state);
+                drop(tables);
+                crate::metrics::register_write_admission_pressure(metric_label, &metric_gauge);
                 true
             }
         }
@@ -3497,7 +4177,19 @@ impl StorageEngine {
             // guard, or name-keyed cells.
             let cl_position = **state.last_commit_log_position.load();
             if state.store.memtable_size() > 0 {
-                state.store.flush()?;
+                let pressure_notify = Arc::clone(&state.write_pressure_notify);
+                state
+                    .store
+                    .flush_with_swap_callback(|| pressure_notify.notify_waiters())?;
+                let active_size = state.store.memtable_size() as u64;
+                let pressure = ((active_size as f64
+                    / self.config.memtable_backpressure_bytes.max(1) as f64)
+                    .max(self.sample_write_pump_blocked_rate()))
+                .clamp(0.0, 1.0);
+                self.update_write_pressure(state, table_id, pressure);
+                // Schema changes can flush the active memtable too; notify at
+                // both release and completion, in case a waiter re-checks early.
+                state.write_pressure_notify.notify_waiters();
                 state
                     .first_unflushed_write_at_nanos
                     .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -3532,7 +4224,36 @@ impl StorageEngine {
     /// from this path). Local deletion is sufficient to prevent stale data
     /// from being loaded on re-creation.
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
-        self.tables.write().remove(table_id);
+        let pause = self
+            .compaction_executor
+            .pause_table(table_id, ferrosa_common::CancelReason::TableDropped);
+        if !pause.is_drained() {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "table {table_id} has active compaction; use unregister_table_and_wait"
+            )));
+        }
+        self.unregister_table_quiesced(table_id)
+    }
+
+    /// Cancel compactions, await their complete finalization, then change table storage.
+    pub async fn unregister_table_and_wait(
+        self: &Arc<Self>,
+        table_id: &TableId,
+    ) -> ferrosa_common::Result<()> {
+        let _pause = self
+            .pause_table_compactions(table_id, ferrosa_common::CancelReason::TableDropped)
+            .await?;
+        self.unregister_table_quiesced(table_id)
+    }
+
+    fn unregister_table_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        self.clear_compaction_retry_state(table_id);
+        if let Some(state) = self.tables.write().remove(table_id) {
+            if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
+                self.soft_pressure_table_count
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         self.remove_time_series_consolidator(table_id);
 
         // Drop live in-memory index state for the table. The per-index maps
@@ -5073,6 +5794,26 @@ impl StorageEngine {
         }
     }
 
+    /// T-001 fault-injection marker: a file with this name inside a
+    /// compaction output's directory makes the post-rename directory fsync in
+    /// [`Self::promote_compaction_output`] fail, so tests can prove no input
+    /// is ever unlinked when that durability barrier cannot be established.
+    #[cfg(test)]
+    const TEST_FAIL_PROMOTION_DIR_FSYNC: &str = ".test-promotion-fail-dir-fsync";
+
+    fn should_fail_promotion_dir_fsync(_output_dir: &std::path::Path) -> bool {
+        #[cfg(test)]
+        {
+            _output_dir
+                .join(Self::TEST_FAIL_PROMOTION_DIR_FSYNC)
+                .exists()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     fn temp_promotion_directory(
         target_dir: &std::path::Path,
         promoted_gen: u64,
@@ -5168,6 +5909,8 @@ impl StorageEngine {
                 "Statistics.db",
                 "TOC.txt",
                 "CompressionInfo.db",
+                "Digest.crc32",
+                "CRC.db",
             ] {
                 let path = dir.join(format!("{}-{component}", gen));
                 if path.exists() {
@@ -5282,6 +6025,268 @@ impl StorageEngine {
         )
     }
 
+    /// T-023: reconcile every compaction replacement record found directly
+    /// under `table_dir`, and sweep leftover `.promote-*` staging debris
+    /// (window B) and `.compaction-*.intent.tmp` write-staging debris while
+    /// already scanning the directory. See
+    /// `compaction-cancel-safety.md` C3 and [`crate::compaction::intent`].
+    fn reconcile_compaction_intents(table_dir: &std::path::Path) {
+        let entries = match std::fs::read_dir(table_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::error!(
+                    %e, dir = %table_dir.display(),
+                    "storage-engine: could not scan table dir for compaction replacement \
+                     records; any crash-interrupted compaction here will not be reconciled \
+                     this startup"
+                );
+                return;
+            }
+        };
+
+        let mut record_paths = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".promote-") {
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            %e, path = %entry.path().display(),
+                            "storage-engine: failed to remove stale compaction promote-staging debris"
+                        );
+                    }
+                }
+                continue;
+            }
+            if name.ends_with(".intent.tmp") {
+                if let Err(e) = std::fs::remove_file(entry.path()) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            %e, path = %entry.path().display(),
+                            "storage-engine: failed to remove stale compaction intent write-staging file"
+                        );
+                    }
+                }
+                continue;
+            }
+            if crate::compaction::intent::CompactionIntentRecord::is_record_name(&name) {
+                record_paths.push(entry.path());
+            }
+        }
+
+        for path in record_paths {
+            Self::reconcile_one_compaction_intent(table_dir, &path);
+        }
+    }
+
+    /// Recovers the [`TableId`] a `table_dir` was built for, inverting the
+    /// `data_dir/sstables/<table_id.to_string()>` convention every caller of
+    /// `load_existing_sstables_and_sidecars*` already relies on (e.g.
+    /// `build_table_state`: `config.data_dir.join("sstables").join(table_id.to_string())`).
+    /// Startup reconciliation only has the directory, not the id itself, and
+    /// needs one to key the test-only `cancel_point!` hook the same way
+    /// production compaction does; `TableId`'s `Display` is `"{keyspace}.{table}"`
+    /// with no other `.` expected in either part (CQL identifiers), so
+    /// splitting on the first `.` round-trips it. Production builds never
+    /// read the id `cancel_point!` is keyed by (it compiles to nothing
+    /// outside `cfg(any(test, feature = "test-support"))`), so an
+    /// unparseable name here is harmless, not a correctness risk.
+    fn table_id_from_table_dir(table_dir: &std::path::Path) -> TableId {
+        let dir_name = table_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        match dir_name.split_once('.') {
+            Some((keyspace, table)) => TableId::new(keyspace, table),
+            None => TableId::new(dir_name, ""),
+        }
+    }
+
+    /// Reconcile a single `.compaction-*.intent` record. See the module doc
+    /// on [`crate::compaction::intent`] and `compaction-cancel-safety.md` C3
+    /// for the decision table this implements.
+    fn reconcile_one_compaction_intent(table_dir: &std::path::Path, record_path: &std::path::Path) {
+        let record = match crate::compaction::intent::CompactionIntentRecord::read_at(record_path) {
+            Ok(Some(record)) => record,
+            // Vanished between the directory listing and this read -- another
+            // path (or a previous run of this same function) already handled
+            // it. Nothing to do.
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(
+                    %e, path = %record_path.display(),
+                    "storage-engine: unreadable compaction replacement record; leaving it in \
+                     place for operator inspection rather than guessing at its intent"
+                );
+                crate::metrics::inc_compaction_reconcile_unreadable_record();
+                return;
+            }
+        };
+
+        let output_present =
+            Self::generation_component_path(table_dir, &record.output_gen, "Data.db").is_some();
+
+        if !output_present {
+            // The output was never promoted (phase Promoting), or is missing
+            // at a later phase, which should never happen because promotion
+            // fsyncs the directory (T-001) before any later phase is ever
+            // written. Either way the only safe action left is to delete the
+            // record and leave whatever inputs remain exactly as they are --
+            // there is nothing here to roll forward onto.
+            if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                table_dir,
+                &record.task_id,
+            ) {
+                tracing::error!(
+                    %e, task_id = %record.task_id,
+                    "storage-engine: failed to delete a rolled-back compaction replacement record"
+                );
+            }
+            crate::metrics::inc_compaction_reconcile_rolled_back();
+            tracing::warn!(
+                task_id = %record.task_id,
+                output_gen = %record.output_gen,
+                phase = ?record.phase,
+                dir = %table_dir.display(),
+                "storage-engine: rolled back an incomplete compaction found at startup \
+                 (its output does not exist); inputs are untouched"
+            );
+            return;
+        }
+
+        let digest_matches = match Self::read_generation_digest(table_dir, &record.output_gen) {
+            Ok(digest) => digest == record.output_digest,
+            Err(e) => {
+                tracing::error!(
+                    %e, task_id = %record.task_id, output_gen = %record.output_gen,
+                    "storage-engine: could not read the promoted compaction output's \
+                     Digest.crc32 during startup reconciliation; treating it as a digest \
+                     mismatch rather than trusting an unverifiable generation"
+                );
+                false
+            }
+        };
+
+        if !digest_matches {
+            let quarantine_dir = table_dir.join("quarantine");
+            if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
+                tracing::error!(
+                    %e, dir = %quarantine_dir.display(), task_id = %record.task_id,
+                    "storage-engine: could not create the quarantine dir for a \
+                     digest-mismatched compaction output; leaving the output and the record \
+                     in place for the next startup to retry"
+                );
+                return;
+            }
+            let quarantined = record
+                .output_gen
+                .parse::<u64>()
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "compaction replacement record output_gen {:?} is not a u64: {e}",
+                        record.output_gen
+                    ))
+                })
+                .and_then(|gen| Self::quarantine_generation(table_dir, gen, &quarantine_dir));
+            if let Err(e) = quarantined {
+                tracing::error!(
+                    %e, task_id = %record.task_id, output_gen = %record.output_gen,
+                    "storage-engine: failed to quarantine a digest-mismatched compaction \
+                     output; leaving it live is not an option, leaving the record in place \
+                     for the next startup to retry"
+                );
+                return;
+            }
+            if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                table_dir,
+                &record.task_id,
+            ) {
+                tracing::error!(
+                    %e, task_id = %record.task_id,
+                    "storage-engine: quarantined a digest-mismatched compaction output but \
+                     failed to delete its replacement record"
+                );
+            }
+            crate::metrics::inc_compaction_reconcile_digest_mismatch();
+            tracing::error!(
+                task_id = %record.task_id,
+                output_gen = %record.output_gen,
+                dir = %table_dir.display(),
+                "storage-engine: quarantined a compaction output whose Digest.crc32 did not \
+                 match its replacement record; its inputs were kept live"
+            );
+            return;
+        }
+
+        // Output present and its digest matches the record: roll forward.
+        // Retire every input the record lists that is still on disk --
+        // `evict_local_input_sstable_files` already treats a missing
+        // component as a no-op, so this is correct and idempotent whether
+        // zero, some, or all of them survived a crash (including the
+        // already-fully-retired case, i.e. a `Retired`-phase record that
+        // never reached its own deletion). THIS is the fix for the
+        // resurrection window: without it, an input left live after a crash
+        // could still hold a row that the output's tombstone purge already
+        // dropped, and nothing would ever finish retiring it.
+        let stubs: Vec<crate::compaction::metadata::SSTableMetadata> = record
+            .inputs
+            .iter()
+            .map(|gen| Self::compaction_input_retirement_stub(table_dir, gen))
+            .collect();
+        let table_id_for_retire = Self::table_id_from_table_dir(table_dir);
+        if !Self::evict_local_input_sstable_files(&table_id_for_retire, &stubs) {
+            return;
+        }
+
+        if matches!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Promoting
+                | crate::compaction::intent::CompactionIntentPhase::Swapped
+        ) {
+            let mut retired = record.clone();
+            retired.phase = crate::compaction::intent::CompactionIntentPhase::Retired;
+            if let Err(e) = retired.write(table_dir) {
+                tracing::error!(
+                    %e, task_id = %record.task_id,
+                    "storage-engine: inputs were retired but replacement record could not advance to Retired; startup will retry idempotently"
+                );
+                return;
+            }
+        }
+        crate::metrics::inc_compaction_reconcile_rolled_forward();
+        tracing::warn!(
+            task_id = %record.task_id,
+            output_gen = %record.output_gen,
+            inputs = ?record.inputs,
+            dir = %table_dir.display(),
+            "storage-engine: rolled a compaction forward at startup, finishing retirement of \
+             inputs a crash left live; replacement record retained for S3 convergence (forge t_fca66994)"
+        );
+    }
+
+    /// A minimal [`crate::compaction::metadata::SSTableMetadata`] sufficient
+    /// for [`Self::evict_local_input_sstable_files`], which reads only `.id`
+    /// and `.path`. Startup reconciliation has an input's generation id from
+    /// the replacement record but not its token/timestamp bounds, which
+    /// retirement never inspects.
+    fn compaction_input_retirement_stub(
+        table_dir: &std::path::Path,
+        gen: &str,
+    ) -> crate::compaction::metadata::SSTableMetadata {
+        crate::compaction::metadata::SSTableMetadata {
+            id: gen.to_string(),
+            path: table_dir.to_path_buf(),
+            size_bytes: 0,
+            min_token: 0,
+            max_token: 0,
+            min_timestamp: 0,
+            max_timestamp: 0,
+            partition_count: 0,
+            legacy_format: false,
+        }
+    }
+
     fn load_existing_sstables_and_sidecars_with_repair_mode(
         table_dir: &std::path::Path,
         reader_pool: &crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
@@ -5292,6 +6297,24 @@ impl StorageEngine {
         Vec<SSTableSidecarMap>,
         Vec<(String, std::path::PathBuf)>,
     ) {
+        // Sweep stale `.tmp` component sets and abandoned flush staging
+        // BEFORE generation discovery (`publication-safety.md` M2). A `.tmp`
+        // name never matches the `-Data.db` suffix the scan below looks for,
+        // so this is not a correctness fix for the scan itself -- it is what
+        // makes a crash mid-flush visible (quarantined) instead of silent
+        // disk debris, and it runs here rather than only in
+        // `FileFlushTarget::new_starting_at` because that constructor runs
+        // AFTER this scan today (`StorageEngine::build_table_state`).
+        crate::flush::sweep_stale_flush_staging(table_dir);
+
+        // T-023 (compaction-cancel-safety.md C3, forge t_fca66994): reconcile
+        // every compaction replacement record BEFORE generation discovery, so
+        // a crash that left a purged tombstone's shadowed row live in an
+        // un-retired input can never be read back. Must run after the flush
+        // staging sweep (debris there is unrelated) and before the scan below
+        // (which does not know how to interpret a `.compaction-*.intent` file).
+        Self::reconcile_compaction_intents(table_dir);
+
         // Collect all generation numbers by looking for Data.db files.
         let mut generations: Vec<u64> = {
             let mut values = std::collections::HashSet::new();
@@ -7998,6 +9021,46 @@ impl StorageEngine {
     /// Subsequent reads for this table will return empty results. Existing
     /// readers holding `Arc` references to old data will complete normally.
     pub fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        let pause = self
+            .compaction_executor
+            .pause_table(table_id, ferrosa_common::CancelReason::Truncated);
+        if !pause.is_drained() {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "table {table_id} has active compaction; use truncate_and_wait"
+            )));
+        }
+        self.truncate_quiesced(table_id)
+    }
+
+    /// Cancel compactions, await their complete finalization, then change table storage.
+    pub async fn truncate_and_wait(
+        self: &Arc<Self>,
+        table_id: &TableId,
+    ) -> ferrosa_common::Result<()> {
+        let engine = Arc::clone(self);
+        let table_id = table_id.clone();
+        TaskPool::current("storage-truncate")
+            .spawn(async move {
+                let _pause = engine
+                    .pause_table_compactions(&table_id, ferrosa_common::CancelReason::Truncated)
+                    .await?;
+                engine.truncate_local(&table_id)?;
+                engine.truncate_s3_async(&table_id).await;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                ferrosa_common::Error::InvalidFormat(format!("TRUNCATE task failed: {error}"))
+            })?
+    }
+
+    fn truncate_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        self.truncate_local(table_id)?;
+        self.truncate_s3(table_id);
+        Ok(())
+    }
+
+    fn truncate_local(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         let tables = self.tables.read();
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
@@ -8024,10 +9087,6 @@ impl StorageEngine {
             let _ = std::fs::create_dir_all(&table_dir);
         }
 
-        // Delete S3 objects + manifest entry for this table synchronously
-        // so stale data doesn't reappear on bootstrap from S3.
-        self.truncate_s3(table_id);
-
         Ok(())
     }
 
@@ -8038,6 +9097,24 @@ impl StorageEngine {
     /// S3 deletions complete — this ensures stale data doesn't reappear
     /// when other nodes bootstrap from S3 after a TRUNCATE.
     fn truncate_s3(&self, table_id: &TableId) {
+        if self.resolve_store_and_prefix().is_none() {
+            return;
+        }
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("truncate S3 runtime");
+                rt.block_on(self.truncate_s3_async(table_id));
+            });
+            if let Err(error) = handle.join() {
+                tracing::warn!(?error, "TRUNCATE: S3 cleanup thread panicked");
+            }
+        });
+    }
+
+    async fn truncate_s3_async(&self, table_id: &TableId) {
         let Some((store, prefix)) = self.resolve_store_and_prefix() else {
             return;
         };
@@ -8048,80 +9125,67 @@ impl StorageEngine {
             .as_ref()
             .map(|c| format!("{}/manifest.json", c.prefix));
 
-        // Run S3 operations on a blocking thread with its own runtime.
-        let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("truncate S3 runtime");
-            rt.block_on(async {
-                // 1. Delete all SSTable objects for this table (recursive).
-                // S3 objects are stored under: {prefix}/{table_id}/{sstable_id}/...
-                // We also need to check subdirectories, so use list_with_delimiter
-                // at the table level to find SSTable dirs, then delete each.
-                let table_path = object_store::path::Path::from(format!("{prefix}/{table_id_str}"));
-                match store.list_with_delimiter(Some(&table_path)).await {
-                    Ok(result) => {
-                        let mut deleted = 0u64;
-                        // Delete objects at the table level
-                        for obj in &result.objects {
+        // 1. Delete all SSTable objects for this table (recursive).
+        // S3 objects are stored under: {prefix}/{table_id}/{sstable_id}/...
+        // We also need to check subdirectories, so use list_with_delimiter
+        // at the table level to find SSTable dirs, then delete each.
+        let table_path = object_store::path::Path::from(format!("{prefix}/{table_id_str}"));
+        match store.list_with_delimiter(Some(&table_path)).await {
+            Ok(result) => {
+                let mut deleted = 0u64;
+                // Delete objects at the table level
+                for obj in &result.objects {
+                    let _ = store.delete(&obj.location).await;
+                    deleted += 1;
+                }
+                // Delete objects in SSTable subdirectories
+                for subdir in &result.common_prefixes {
+                    if let Ok(sub_result) = store.list_with_delimiter(Some(subdir)).await {
+                        for obj in &sub_result.objects {
                             let _ = store.delete(&obj.location).await;
                             deleted += 1;
                         }
-                        // Delete objects in SSTable subdirectories
-                        for subdir in &result.common_prefixes {
-                            if let Ok(sub_result) = store.list_with_delimiter(Some(subdir)).await {
-                                for obj in &sub_result.objects {
-                                    let _ = store.delete(&obj.location).await;
-                                    deleted += 1;
-                                }
-                            }
-                        }
-                        if deleted > 0 {
-                            tracing::info!(
-                                table = %table_id_str,
-                                deleted,
-                                "TRUNCATE: deleted S3 objects"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            table = %table_id_str,
-                            %e,
-                            "TRUNCATE: S3 list failed"
-                        );
                     }
                 }
+                if deleted > 0 {
+                    tracing::info!(
+                        table = %table_id_str,
+                        deleted,
+                        "TRUNCATE: deleted S3 objects"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_id_str,
+                    %e,
+                    "TRUNCATE: S3 list failed"
+                );
+            }
+        }
 
-                // 2. Remove this table from the S3 manifest.
-                if let Some(mpath) = manifest_path {
-                    let path = object_store::path::Path::from(mpath);
-                    if let Ok(data) = store.get(&path).await {
-                        if let Ok(bytes) = data.bytes().await {
-                            if let Ok(mut manifest) =
-                                serde_json::from_slice::<crate::manifest::Manifest>(&bytes)
-                            {
-                                if manifest.sstables.remove(&table_id_str).is_some() {
-                                    if let Ok(updated) = serde_json::to_vec_pretty(&manifest) {
-                                        let _ = store
-                                            .put(&path, object_store::PutPayload::from(updated))
-                                            .await;
-                                        tracing::info!(
-                                            table = %table_id_str,
-                                            "TRUNCATE: removed table from S3 manifest"
-                                        );
-                                    }
-                                }
+        // 2. Remove this table from the S3 manifest.
+        if let Some(mpath) = manifest_path {
+            let path = object_store::path::Path::from(mpath);
+            if let Ok(data) = store.get(&path).await {
+                if let Ok(bytes) = data.bytes().await {
+                    if let Ok(mut manifest) =
+                        serde_json::from_slice::<crate::manifest::Manifest>(&bytes)
+                    {
+                        if manifest.sstables.remove(&table_id_str).is_some() {
+                            if let Ok(updated) = serde_json::to_vec_pretty(&manifest) {
+                                let _ = store
+                                    .put(&path, object_store::PutPayload::from(updated))
+                                    .await;
+                                tracing::info!(
+                                    table = %table_id_str,
+                                    "TRUNCATE: removed table from S3 manifest"
+                                );
                             }
                         }
                     }
                 }
-            });
-        });
-        // Wait for S3 cleanup to complete before returning.
-        if let Err(e) = handle.join() {
-            tracing::warn!("TRUNCATE: S3 cleanup thread panicked: {:?}", e);
+            }
         }
     }
 
@@ -8466,7 +9530,19 @@ impl StorageEngine {
             // can rebuild the memtable. Removing the fsync from flush(), or
             // moving discard_completed before this line, reintroduces the P0
             // "kill mid-flush loses both the torn SSTable and the WAL copy" bug.
-            state.store.flush()?;
+            let pressure_notify = Arc::clone(&state.write_pressure_notify);
+            state
+                .store
+                .flush_with_swap_callback(|| pressure_notify.notify_waiters())?;
+            let active_size = state.store.memtable_size() as u64;
+            let pressure = ((active_size as f64
+                / self.config.memtable_backpressure_bytes.max(1) as f64)
+                .max(self.sample_write_pump_blocked_rate()))
+            .clamp(0.0, 1.0);
+            self.update_write_pressure(state, table_id, pressure);
+            // Completion is a second useful edge: the active memtable was
+            // already released at swap, while durability is now established.
+            state.write_pressure_notify.notify_waiters();
 
             // Reset the unflushed-write timestamp so the next write starts a
             // fresh age window. This must happen after flush() succeeds.
@@ -8636,6 +9712,16 @@ impl StorageEngine {
         self.tables.read().contains_key(table_id)
     }
 
+    /// Test accessor for the engine's own [`CompactionExecutor`] (T-021 CS4):
+    /// lets a cancellation test call `shutdown()` directly, without going
+    /// through the heavier `StorageEngine::shutdown()` (which also flushes
+    /// every table and drains the index scheduler first), so the timing
+    /// assertion measures only what T-021 changed.
+    #[cfg(test)]
+    pub(crate) fn compaction_executor_for_test(&self) -> &CompactionExecutor {
+        &self.compaction_executor
+    }
+
     #[cfg(test)]
     pub(crate) fn deferred_replay_mutation_count_for_test(&self) -> usize {
         self.deferred_replay_mutations.lock().len()
@@ -8690,7 +9776,7 @@ impl StorageEngine {
         let age_flush_floor = self
             .config
             .flush_threshold_bytes
-            .clamp(1, MAX_AGE_FLUSH_FLOOR_BYTES);
+            .clamp(1, self.runtime_tuning.max_age_flush_floor_bytes);
         let tables = self.tables.read();
         let to_flush: Vec<TableId> = tables
             .iter()
@@ -8706,7 +9792,7 @@ impl StorageEngine {
                 let pins_retained_wal = self.commit_log.table_pins_retained_wal_pressure(table_id);
                 memtable_size > 0 && (size_exceeded || age_and_volume_exceeded || pins_retained_wal)
             })
-            .take(MAX_AUTOMATIC_FLUSHES_PER_POLL)
+            .take(self.runtime_tuning.max_automatic_flushes_per_poll)
             .map(|(id, _)| id.clone())
             .collect();
         drop(tables);
@@ -8742,10 +9828,169 @@ impl StorageEngine {
     /// Crash-safe: pending-log → upload → S3 confirm → manifest update →
     /// enqueue input deletions → evict local input directories.
     pub async fn poll_compactions(&self) {
-        const MAX_RESULTS_PER_MAINTENANCE_POLL: usize = 8;
+        let max_results_per_poll = self.runtime_tuning.max_results_per_maintenance_poll;
+        let failures = self
+            .compaction_executor
+            .poll_failures_bounded(max_results_per_poll);
+        self.handle_compaction_failures(failures);
         let results = self
             .compaction_executor
-            .poll_results_bounded(MAX_RESULTS_PER_MAINTENANCE_POLL);
+            .poll_results_bounded(max_results_per_poll);
+        self.finalize_compactions(results).await;
+        self.schedule_compaction_backlog_round();
+    }
+
+    /// Request cancellation of current compactions on this node. Future admission
+    /// stays enabled; committed replacements finish their normal finalization.
+    pub fn request_compaction_stop(
+        &self,
+        table_id: Option<&TableId>,
+    ) -> ferrosa_common::Result<crate::compaction::CompactionStopReport> {
+        if let Some(table_id) = table_id {
+            let tables = self.tables.read();
+            if !tables.contains_key(table_id) {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "table not registered: {table_id}"
+                )));
+            }
+            Ok(self
+                .compaction_executor
+                .request_operator_stop(Some(table_id)))
+        } else {
+            Ok(self.compaction_executor.request_operator_stop(None))
+        }
+    }
+
+    fn handle_compaction_failures(&self, failures: Vec<CompactionFailure>) {
+        for failure in failures {
+            if !self.tables.read().contains_key(&failure.table_id) {
+                continue;
+            }
+            if self
+                .compaction_paused
+                .lock()
+                .contains_key(&failure.table_id)
+            {
+                continue;
+            }
+            let (streak, delay) = self.compaction_retry.lock().record_failure(
+                failure.table_id.clone(),
+                Instant::now(),
+                self.config.compaction.retry_backoff_initial,
+                self.config.compaction.retry_backoff_max,
+            );
+            if streak >= self.config.compaction.retry_digest_failure_limit {
+                let mut paused = self.compaction_paused.lock();
+                if !paused.contains_key(&failure.table_id) {
+                    let pause = self
+                        .compaction_executor
+                        .pause_table(&failure.table_id, ferrosa_common::CancelReason::Operator);
+                    paused.insert(failure.table_id.clone(), DigestFailurePause::new(pause));
+                    tracing::error!(
+                        table_id = %failure.table_id,
+                        consecutive_digest_failures = streak,
+                        failure = %failure.message,
+                        "compaction: pausing table after repeated output digest/verification failures; operator resume or restart required"
+                    );
+                    self.compaction_retry.lock().remove(&failure.table_id);
+                }
+            } else {
+                tracing::warn!(
+                    table_id = %failure.table_id,
+                    consecutive_digest_failures = streak,
+                    retry_delay_ms = delay.as_millis() as u64,
+                    failure = %failure.message,
+                    "compaction: output digest/verification failed; retry scheduled with backoff"
+                );
+            }
+            self.compaction_retry_notify.notify_one();
+        }
+    }
+
+    /// Wait for an earliest retry deadline or a retry-state change.
+    pub async fn wait_for_compaction_retry_wakeup(&self) {
+        let notified = self.compaction_retry_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let deadline = self
+            .compaction_retry
+            .lock()
+            .next_deadline(Instant::now())
+            .map(tokio::time::Instant::from_std);
+        if let Some(deadline) = deadline {
+            tokio::select! {
+                _ = notified => {},
+                _ = self.compaction_executor.wait_for_failure_notification() => {},
+                _ = tokio::time::sleep_until(deadline) => {},
+            }
+        } else {
+            tokio::select! {
+                _ = notified => {},
+                _ = self.compaction_executor.wait_for_failure_notification() => {},
+            }
+        }
+    }
+
+    /// Resume automatic compaction for a table paused after repeated digest failures.
+    /// The retry streak is cleared so the next failure starts at the initial delay.
+    pub fn resume_table_compactions_after_digest_failures(&self, table_id: &TableId) -> bool {
+        let resumed = self.compaction_paused.lock().remove(table_id).is_some();
+        self.compaction_retry.lock().remove(table_id);
+        if resumed {
+            self.compaction_retry_notify.notify_one();
+            tracing::info!(%table_id, "compaction: digest-failure pause cleared by operator");
+        }
+        resumed
+    }
+
+    fn clear_compaction_retry_state(&self, table_id: &TableId) {
+        let retry_removed = self.compaction_retry.lock().remove(table_id);
+        self.compaction_paused.lock().remove(table_id);
+        if retry_removed {
+            self.compaction_retry_notify.notify_one();
+        }
+    }
+
+    /// Pause admission before cancellation. Enable the notification before checking
+    /// claims/results so a result publication or release cannot be missed.
+    pub async fn pause_table_compactions(
+        self: &Arc<Self>,
+        table_id: &TableId,
+        reason: ferrosa_common::CancelReason,
+    ) -> ferrosa_common::Result<crate::compaction::TableCompactionPause> {
+        let pause = self.compaction_executor.pause_table(table_id, reason);
+        loop {
+            let changed = self.compaction_executor.changed().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if pause.is_drained() {
+                return Ok(pause);
+            }
+            let results = self.compaction_executor.poll_results_bounded(8);
+            if results.is_empty() {
+                changed.await;
+            } else {
+                let engine = Arc::clone(self);
+                // Dropping a DDL waiter detaches this job; committed finalization
+                // and claim release must survive a request disconnect.
+                TaskPool::current("storage-compaction-finalize")
+                    .spawn(async move {
+                        engine.finalize_compactions(results).await;
+                    })
+                    .await
+                    .map_err(|error| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "compaction finalizer failed while draining {table_id}: {error}"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    async fn finalize_compactions(
+        &self,
+        results: Vec<crate::compaction::executor::CompactionResult>,
+    ) {
         for result in results {
             let _input_claim = CompactionResultInputClaim {
                 executor: &self.compaction_executor,
@@ -8759,8 +10004,100 @@ impl StorageEngine {
                 .collect();
             let table_id = &result.task.table_id;
 
+            cancel_point!(&table_id.to_string(), CancelPoint::BeforePromote);
+            // T-021, compaction-cancel-safety.md C2: this is the last free
+            // cancel point. Cancelling here costs nothing — the output has
+            // been verified but never promoted, opened, or observed by
+            // anything else — so roll back by discarding the staged output.
+            // Inputs are untouched and the claim is released as usual (the
+            // `_input_claim` guard above, on scope exit via `continue`).
+            // AFTER promotion, cancellation is recorded but not honoured;
+            // T-022 owns that commit point.
+            if let Err(c) = result.cancel.check() {
+                crate::compaction::executor::remove_staged_output_components(
+                    &result.output.path,
+                    &result.output.id,
+                );
+                crate::metrics::inc_compaction_cancelled();
+                if let Some(cancelled_at) = result.cancel.cancelled_at() {
+                    crate::metrics::observe_compaction_cancel_latency(cancelled_at.elapsed());
+                }
+                tracing::info!(
+                    %table_id, reason = %c.0,
+                    "compaction: cancelled before promote; output discarded, inputs untouched"
+                );
+                continue;
+            }
+            // ── T-022 (forge t_cb6fa288): durable replacement record, written
+            // and fsynced BEFORE promotion, with the REAL output generation id
+            // already decided. This is the commit point
+            // (compaction-cancel-safety.md C2): once it lands, startup
+            // reconciliation (T-023) can always finish the job, so every step
+            // from here on rolls forward on success or rolls back explicitly
+            // on failure -- it never leaves an orphan the way the old bare
+            // `continue`s did (window C). The generation choice happens
+            // BEFORE this write (not after promotion, as a previous version
+            // of this code did) so there is never a durable record pointing
+            // at a placeholder id promotion is free to abandon.
+            let task_id = result.output.id.clone();
+            let output_digest = match Self::read_generation_digest(
+                &result.output.path,
+                &result.output.id,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    let message = format!("failed to read staged output Digest.crc32: {e}");
+                    crate::compaction::executor::remove_staged_output_components(
+                        &result.output.path,
+                        &result.output.id,
+                    );
+                    tracing::error!(failure = %message, %table_id, %task_id, "compaction: staged output digest verification failed; preserving inputs");
+                    self.handle_compaction_failures(vec![CompactionFailure {
+                        table_id: table_id.clone(),
+                        message,
+                    }]);
+                    continue;
+                }
+            };
+            let table_paused = self
+                .compaction_paused
+                .lock()
+                .contains_key(&result.task.table_id);
+            let retry_removed = self
+                .compaction_retry
+                .lock()
+                .succeeded(&result.task.table_id, table_paused);
+            if retry_removed {
+                self.compaction_retry_notify.notify_one();
+            }
+            let (promoted_gen, table_dir, final_target) = match self
+                .reserve_compaction_promotion_target(table_id, &result.output)
+            {
+                Ok(reserved) => reserved,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, %task_id, "compaction: failed to reserve a promotion target; preserving inputs");
+                    continue;
+                }
+            };
+            let mut intent = crate::compaction::intent::CompactionIntentRecord {
+                task_id: task_id.clone(),
+                output_gen: promoted_gen.to_string(),
+                output_digest,
+                inputs: result.task.inputs.iter().map(|m| m.id.clone()).collect(),
+                phase: crate::compaction::intent::CompactionIntentPhase::Promoting,
+            };
+            if let Err(e) = intent.write(&table_dir) {
+                tracing::error!(%e, %table_id, %task_id, "compaction: failed to write replacement record; preserving inputs");
+                continue;
+            }
+
             let promote_start = Instant::now();
-            let output = match self.promote_compaction_output(table_id, &result.output) {
+            let output = match self.promote_compaction_output(
+                &result.output,
+                promoted_gen,
+                &table_dir,
+                &final_target,
+            ) {
                 Ok(output) => {
                     crate::metrics::observe_compaction_phase(
                         crate::metrics::CompactionPhase::PromoteOutput,
@@ -8774,9 +10111,23 @@ impl StorageEngine {
                         promote_start.elapsed(),
                     );
                     tracing::error!(%e, %table_id, "compaction: failed to promote output SSTable");
+                    Self::rollback_compaction_intent(
+                        table_id,
+                        &table_dir,
+                        &task_id,
+                        None,
+                        "promote failed",
+                    );
                     continue;
                 }
             };
+
+            cancel_point!(&table_id.to_string(), CancelPoint::AfterPromote);
+            // output_gen was decided and durably recorded BEFORE promotion ran
+            // (above), so unlike the previous design there is nothing to
+            // correct here: a crash at this exact point already finds a
+            // record whose output_gen names the generation promotion just
+            // produced (forge t_cb6fa288).
 
             // Open the promoted compacted output SSTable.
             let gen = &output.id;
@@ -8785,10 +10136,18 @@ impl StorageEngine {
                 Ok(r) => Arc::new(r),
                 Err(e) => {
                     tracing::error!(%e, "compaction: failed to open output SSTable");
+                    Self::rollback_compaction_intent(
+                        table_id,
+                        &table_dir,
+                        &task_id,
+                        Some(&output.path),
+                        "output reader open failed",
+                    );
                     continue;
                 }
             };
 
+            cancel_point!(&table_id.to_string(), CancelPoint::SidecarBuild);
             // Full-text sidecars for the output, built BEFORE the swap and with
             // the table lock released. Compaction used to write none, so every
             // compacted SSTable was re-tokenized in full by every fts_match
@@ -8842,9 +10201,18 @@ impl StorageEngine {
                         Ok(sidecars) => sidecars,
                         Err(e) => {
                             tracing::error!(%e, %table_id, "compaction: output sidecars could not be built; keeping the inputs");
+                            drop(tables);
+                            Self::rollback_compaction_intent(
+                                table_id,
+                                &table_dir,
+                                &task_id,
+                                Some(&output.path),
+                                "output sidecar merge failed",
+                            );
                             continue;
                         }
                     };
+                    cancel_point!(&table_id.to_string(), CancelPoint::BeforeSwap);
                     if let Err(e) = state.store.swap_compacted_sstables(
                         &input_id_paths,
                         output_id,
@@ -8853,8 +10221,17 @@ impl StorageEngine {
                         output_sidecars,
                     ) {
                         tracing::error!(%e, "compaction: swap failed");
+                        drop(tables);
+                        Self::rollback_compaction_intent(
+                            table_id,
+                            &table_dir,
+                            &task_id,
+                            Some(&output.path),
+                            "swap failed",
+                        );
                         continue;
                     }
+                    cancel_point!(&table_id.to_string(), CancelPoint::AfterSwap);
                     let post_swap_count = state.store.sstable_count();
                     tracing::info!(
                         %table_id,
@@ -8863,6 +10240,10 @@ impl StorageEngine {
                         removed = input_id_paths.len(),
                         "compaction: swap complete"
                     );
+                    intent.phase = crate::compaction::intent::CompactionIntentPhase::Swapped;
+                    if let Err(e) = intent.write(&table_dir) {
+                        tracing::error!(%e, %table_id, %task_id, "compaction: failed to advance replacement record to Swapped; startup reconciliation will still roll it forward from Promoting");
+                    }
 
                     // Eager index build: submit high-priority rebuild for compacted output.
                     // Same as flush — keeps MemtableIndex bounded in steady state.
@@ -8953,14 +10334,28 @@ impl StorageEngine {
             // Register in local cache.
             self.local_cache
                 .register(&output.id, output.path.clone(), output.size_bytes);
-            let cleanup_inputs = || {
-                let cleanup_start = Instant::now();
-                Self::evict_local_input_sstable_files(&result.task.inputs);
-                crate::metrics::observe_compaction_phase(
-                    crate::metrics::CompactionPhase::InputCleanup,
-                    cleanup_start.elapsed(),
-                );
-            };
+            // Retire every input and persist the phase. For S3-backed tables,
+            // the record remains the recovery cursor through manifest save and
+            // input-delete enqueue. The pending-upload log carries the upload
+            // payload; it does not replace this record's phase.
+            let cleanup_inputs =
+                |record: &mut crate::compaction::intent::CompactionIntentRecord| -> bool {
+                    let cleanup_start = Instant::now();
+                    if !Self::evict_local_input_sstable_files(table_id, &result.task.inputs) {
+                        return false;
+                    }
+                    crate::metrics::observe_compaction_phase(
+                        crate::metrics::CompactionPhase::InputCleanup,
+                        cleanup_start.elapsed(),
+                    );
+                    record.phase = crate::compaction::intent::CompactionIntentPhase::Retired;
+                    if let Err(e) = record.write(&table_dir) {
+                        tracing::error!(%e, %table_id, task_id = %record.task_id, "compaction: failed to advance replacement record to Retired; startup reconciliation will retry retirement (idempotent)");
+                        false
+                    } else {
+                        true
+                    }
+                };
 
             // ── Skip S3 upload for pinned tables ────────────────────────────
             //
@@ -8987,18 +10382,27 @@ impl StorageEngine {
                 }
                 self.pin_metrics.add_pinned_bytes(size as i64);
                 self.enforce_pin_max_bytes(table_id);
-                cleanup_inputs();
+                if !cleanup_inputs(&mut intent) {
+                    continue;
+                }
+                if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                    &table_dir,
+                    &intent.task_id,
+                ) {
+                    tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to delete pinned replacement record after retirement");
+                }
                 continue;
             }
 
             // ── Crash-safe S3 upload + manifest update ─────────────────────
             //
-            // 5-step pattern (mirrors sync_sstables_to_s3):
+            // S3 steps are checkpoints in the replacement record:
             //   1. Write pending-log entry (fsynced)
             //   2. Submit UploadTask with on_complete channel
             //   3. Await S3 confirmation
-            //   4. Remove pending-log entry
-            //   5. Update manifest (remove inputs, add output)
+            //   4. Update manifest (remove inputs, add output)
+            //   5. Remove pending-log entry
+            //   6. Enqueue input deletes, then retire the replacement record
             //
             // If upload_manager is None (no S3 configured) we skip silently.
             let upload_mgr = self
@@ -9006,11 +10410,25 @@ impl StorageEngine {
                 .as_ref()
                 .or(self.upload_manager.as_ref());
             let Some(upload_mgr) = upload_mgr else {
-                cleanup_inputs();
+                if cleanup_inputs(&mut intent) {
+                    if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                        &table_dir,
+                        &intent.task_id,
+                    ) {
+                        tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to delete replacement record for a table without S3");
+                    }
+                }
                 continue;
             };
             let Some((store, prefix)) = self.resolve_store_and_prefix() else {
-                cleanup_inputs();
+                if cleanup_inputs(&mut intent) {
+                    if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                        &table_dir,
+                        &intent.task_id,
+                    ) {
+                        tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to delete replacement record without an object store");
+                    }
+                }
                 continue;
             };
 
@@ -9050,13 +10468,16 @@ impl StorageEngine {
                 total_size,
             );
 
+            cancel_point!(&table_id_str, CancelPoint::S3PendingLog);
             // Step 1: record the pending upload before deleting any input.
-            // Without this fsynced marker, a crash can strand the local-only
-            // output after its inputs are reclaimed (#235).
+            // This is paired with the replacement record: if a crash happens
+            // after input retirement, startup can replay the upload and resume
+            // from the record's phase.
             let pending_log_path = self.config.data_dir.join("pending-uploads.log");
             let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
                 Ok(pending_log) => {
                     let compaction = crate::upload::pending_log::PendingCompactionUpload {
+                        intent_task_id: Some(intent.task_id.clone()),
                         remove_input_ids: manifest_plan.remove_input_ids.clone(),
                         output: manifest_plan.add_output.clone(),
                     };
@@ -9082,9 +10503,11 @@ impl StorageEngine {
                 }
             };
 
-            // The output is now recoverable after a crash, so reclaiming the
-            // superseded inputs cannot leave the manifest without a readable copy.
-            cleanup_inputs();
+            // Inputs are now recoverable through the durable upload entry, so
+            // their local components can be retired before uploading.
+            if !cleanup_inputs(&mut intent) {
+                continue;
+            }
 
             // Step 2: create completion channel and submit the upload.
             //
@@ -9120,6 +10543,7 @@ impl StorageEngine {
                     on_complete: Some(tx),
                 }
             };
+            cancel_point!(&table_id_str, CancelPoint::S3Upload);
             if let Err(e) = upload_mgr.try_submit(task) {
                 tracing::warn!(
                     %e,
@@ -9179,6 +10603,12 @@ impl StorageEngine {
                 continue;
             }
 
+            intent.phase = crate::compaction::intent::CompactionIntentPhase::S3Uploaded;
+            if let Err(e) = intent.write(&table_dir) {
+                tracing::error!(%e, %table_id, task_id = %intent.task_id, "compaction: S3 upload succeeded but replacement record could not advance to S3Uploaded; pending upload remains retryable");
+                continue;
+            }
+
             // Step 4: update manifest — load fresh copy, remove inputs, add output, save.
             // Keep full input metadata for local eviction after manifest update.
             let input_ids = manifest_plan.remove_input_ids.clone();
@@ -9202,6 +10632,8 @@ impl StorageEngine {
                         "Statistics.db",
                         "TOC.txt",
                         "CompressionInfo.db",
+                        "Digest.crc32",
+                        "CRC.db",
                     ];
                     result
                         .task
@@ -9229,6 +10661,7 @@ impl StorageEngine {
                     // Pass removals explicitly so CAS retry re-applies them
                     // after merging with the latest manifest. Without this,
                     // merge_into re-introduces the entries we removed.
+                    cancel_point!(&table_id_str, CancelPoint::S3ManifestCas);
                     let save_result = if self.cas_supported() {
                         manifest
                             .save_with_retry_and_removals(
@@ -9249,11 +10682,19 @@ impl StorageEngine {
                     if let Err(e) = save_result {
                         tracing::error!(%e, %sstable_id, "compaction: manifest save failed");
                     } else {
-                        manifest_saved = true;
-                        tracing::info!(%sstable_id, removed = input_ids.len(), "compaction: manifest updated");
-                        // Record bytes freed by this compaction in the metrics gauge.
-                        self.compaction_metrics
-                            .add_bytes_reclaimed(input_bytes_total);
+                        intent.phase =
+                            crate::compaction::intent::CompactionIntentPhase::S3Manifested;
+                        match intent.write(&table_dir) {
+                            Ok(()) => {
+                                manifest_saved = true;
+                                tracing::info!(%sstable_id, removed = input_ids.len(), "compaction: manifest updated");
+                                self.compaction_metrics
+                                    .add_bytes_reclaimed(input_bytes_total);
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, %sstable_id, task_id = %intent.task_id, "compaction: manifest saved but replacement record could not advance to S3Manifested; retaining pending upload for replay")
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -9291,16 +10732,23 @@ impl StorageEngine {
                 &result.task.inputs,
                 std::time::Duration::from_secs(3600),
             );
+            let mut deletes_enqueued = true;
             for task_plan in deletion_plan.tasks {
+                cancel_point!(&table_id_str, CancelPoint::S3Delete);
                 let (del_tx, del_rx) = tokio::sync::oneshot::channel();
-                let _ = upload_mgr
+                if let Err(e) = upload_mgr
                     .submit(crate::upload::UploadTask::DeleteSSTable {
                         table_id: task_plan.table_id,
                         sstable_id: task_plan.sstable_id,
                         grace_period: task_plan.grace_period,
                         on_complete: Some(del_tx),
                     })
-                    .await;
+                    .await
+                {
+                    tracing::error!(%e, %table_id_str, %sstable_id, "compaction: failed to enqueue S3 input deletion; replacement record retained for retry");
+                    deletes_enqueued = false;
+                    break;
+                }
                 // Increment the S3 delete counter for each enqueued deletion.
                 self.compaction_metrics.inc_s3_deletes();
                 if deletion_plan.fire_and_forget {
@@ -9308,12 +10756,21 @@ impl StorageEngine {
                     drop(del_rx);
                 }
             }
+            if !deletes_enqueued {
+                continue;
+            }
+            intent.phase = crate::compaction::intent::CompactionIntentPhase::S3DeletesEnqueued;
+            if let Err(e) = intent.write(&table_dir) {
+                tracing::error!(%e, %table_id_str, task_id = %intent.task_id, "compaction: S3 input deletes were enqueued but replacement record could not advance; duplicate deletes may be retried");
+                continue;
+            }
+            if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                &table_dir,
+                &intent.task_id,
+            ) {
+                tracing::warn!(%e, %table_id_str, task_id = %intent.task_id, "compaction: all S3 steps completed but replacement record could not be deleted");
+            }
         }
-
-        // A restarted node may already own thousands of SSTables but receive no
-        // new writes. Schedule another bounded round after every maintenance
-        // poll so backlog reduction cannot depend on a future flush event.
-        self.schedule_compaction_backlog_round();
     }
 
     /// Opens an SSTable from component files in a directory.
@@ -9361,15 +10818,42 @@ impl StorageEngine {
 
         let compression_info = Self::generation_component_path(dir, gen, "CompressionInfo.db")
             .and_then(|p| std::fs::read(p).ok());
+        let is_compressed = compression_info.is_some();
 
-        ferrosa_sstable::reader::SSTableReader::open(SSTableComponents {
+        let mut reader = ferrosa_sstable::reader::SSTableReader::open(SSTableComponents {
             data,
             partitions,
             rows,
             filter,
             compression_info,
             statistics,
-        })
+        })?;
+
+        // Digest.crc32 (all tables) and CRC.db (uncompressed tables only) are
+        // genuinely optional here, same as CompressionInfo.db above: a
+        // generation written before T-011 has neither, and `SSTableReader`
+        // treats an unloaded digest/CRC table as "not checked" rather than
+        // an error (logged once per generation — see `checksum` module docs
+        // in ferrosa-sstable). This is what makes
+        // "verify CRC.db on every uncompressed chunk read" apply to reads
+        // that go through this open path. Centralised (T-012): this table
+        // dir supports a nested per-generation layout that a plain
+        // `dir.join(...)` join can't resolve, so paths are resolved here via
+        // `generation_component_path` and handed to the shared loader.
+        let digest_path = Self::generation_component_path(dir, gen, "Digest.crc32");
+        let crc_path = if is_compressed {
+            None
+        } else {
+            Self::generation_component_path(dir, gen, "CRC.db")
+        };
+        ferrosa_sstable::reader::load_checksums_if_present(
+            &mut reader,
+            gen,
+            digest_path.as_deref(),
+            crc_path.as_deref(),
+        );
+
+        Ok(reader)
     }
 
     /// Returns the number of SSTables for a table.
@@ -9487,10 +10971,19 @@ impl StorageEngine {
     ///
     /// Useful for testing and debugging compaction issues. Submits a compaction
     /// task for every table that has at least 2 SSTables, regardless of size
+    /// Wait for a compaction result without consuming it (acceptance harness).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn await_compaction_result(&self, timeout: std::time::Duration) -> bool {
+        self.compaction_executor.await_result_available(timeout)
+    }
+
     /// bucketing or min_threshold.
     pub fn force_compact_all(&self) {
         let tables = self.tables.read();
         for (table_id, state) in tables.iter() {
+            let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
+                continue;
+            };
             let metadata = self.collect_sstable_metadata(table_id, state);
             tracing::info!(%table_id, count = metadata.len(), "force-compact: table SSTables");
             if metadata.len() >= 2 {
@@ -9502,7 +10995,10 @@ impl StorageEngine {
                     table_id: table_id.clone(),
                     purge,
                 };
-                if let Err(e) = self.compaction_executor.submit(task) {
+                if let Err(e) = self
+                    .compaction_executor
+                    .try_submit_with_ticket(task, &ticket)
+                {
                     tracing::error!(%e, %table_id, "force-compact: submit failed");
                 }
             }
@@ -9528,6 +11024,12 @@ impl StorageEngine {
             });
         }
 
+        let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
+            return Ok(IncrementalCompactionSchedule::InFlight {
+                input_sstables: 0,
+                input_bytes: 0,
+            });
+        };
         let (available_sstables, inputs, schema, purge) = {
             let tables = self.tables.read();
             let Some(state) = tables.get(table_id) else {
@@ -9580,7 +11082,10 @@ impl StorageEngine {
             purge,
         };
         let input_sstables = task.inputs.len();
-        match self.compaction_executor.try_submit(task)? {
+        match self
+            .compaction_executor
+            .try_submit_with_ticket(task, &ticket)?
+        {
             true => {
                 tracing::info!(
                     %table_id,
@@ -9603,10 +11108,21 @@ impl StorageEngine {
     }
 
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) -> bool {
+        if !self
+            .compaction_retry
+            .lock()
+            .eligible(table_id, Instant::now())
+        {
+            return false;
+        }
+        let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
+            return false;
+        };
         let sstable_count = state.store.sstable_count();
         let (min_inputs, max_inputs) = effective_compaction_input_bounds(
             self.config.compaction.min_threshold,
             self.config.compaction.max_threshold,
+            self.runtime_tuning.max_compaction_inputs_per_task,
         );
         let thresholds_were_normalized = min_inputs != self.config.compaction.min_threshold
             || max_inputs != self.config.compaction.max_threshold;
@@ -9633,7 +11149,10 @@ impl StorageEngine {
                 table_id: table_id.clone(),
                 purge,
             };
-            return match self.compaction_executor.try_submit(task) {
+            return match self
+                .compaction_executor
+                .try_submit_with_ticket(task, &ticket)
+            {
                 Ok(accepted) => {
                     if accepted {
                         tracing::info!(
@@ -9695,7 +11214,10 @@ impl StorageEngine {
         let mut accepted_any = false;
         for mut task in tasks {
             task.purge = self.purge_policy_for(table_id, state, &task.inputs);
-            match self.compaction_executor.try_submit(task) {
+            match self
+                .compaction_executor
+                .try_submit_with_ticket(task, &ticket)
+            {
                 Ok(accepted) => accepted_any |= accepted,
                 Err(error) => {
                     tracing::error!(%error, %table_id, "storage-engine: compaction submit failed");
@@ -9708,10 +11230,11 @@ impl StorageEngine {
     /// Schedule at most eight compaction tasks per maintenance pass, scanning
     /// the table map in place without collecting IDs or task lists.
     fn schedule_compaction_backlog_round(&self) {
-        const MAX_SCHEDULED_TABLES_PER_POLL: usize = 8;
+        let max_scheduled_tables_per_poll = self.runtime_tuning.max_scheduled_tables_per_poll;
         let (min_inputs, _) = effective_compaction_input_bounds(
             self.config.compaction.min_threshold,
             self.config.compaction.max_threshold,
+            self.runtime_tuning.max_compaction_inputs_per_task,
         );
         let tables = self.tables.read();
         let mut accepted = 0_usize;
@@ -9721,7 +11244,7 @@ impl StorageEngine {
             }
             if self.maybe_compact(table_id, state) {
                 accepted += 1;
-                if accepted >= MAX_SCHEDULED_TABLES_PER_POLL {
+                if accepted >= max_scheduled_tables_per_poll {
                     break;
                 }
             }
@@ -9843,6 +11366,8 @@ impl StorageEngine {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ];
         suffixes
             .iter()
@@ -9863,6 +11388,8 @@ impl StorageEngine {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ];
         let mut reclaimed = 0u64;
 
@@ -10618,6 +12145,8 @@ impl StorageEngine {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ];
 
         'entry_loop: for entry in entries {
@@ -10974,12 +12503,41 @@ impl StorageEngine {
         generations
     }
 
-    fn promote_compaction_output(
+    /// Chooses and reserves the generation id + directory a compaction
+    /// output will be promoted into, WITHOUT moving any data.
+    /// `compaction-cancel-safety.md` C2 / forge t_cb6fa288: the durable
+    /// replacement record must be written with the real `output_gen` before
+    /// promotion runs, not with a placeholder corrected afterward -- the
+    /// previous design wrote the record with the compaction's pre-promotion
+    /// staged id, called `promote_compaction_output` (which was free to pick
+    /// a different id to dodge a collision), and only then rewrote the
+    /// record with the real id. A crash between those two writes left a
+    /// durable, fsynced record pointing at a generation that had already
+    /// been renamed away, so startup reconciliation found "output missing"
+    /// and rolled back -- while the real output sat live on disk, orphaned,
+    /// under its true id. Splitting the choice out and reserving it here
+    /// closes that window: by the time the intent record is written, the
+    /// id it names is the one promotion will actually use.
+    ///
+    /// The reservation itself is [`crate::store::TableStore::advance_gen_past`]
+    /// on this table's store, called BEFORE returning -- the same mechanism
+    /// `poll_compactions` already relies on post-swap to keep a later flush
+    /// from reusing a compaction's output generation, just invoked earlier
+    /// so the choice is binding before it is committed to disk. It narrows,
+    /// rather than eliminates, the underlying race between two independently
+    /// seeded generation counters described in `flush.rs`'s
+    /// `two_flush_targets_never_issue_the_same_generation` (a live
+    /// theoretical collision between this table's flush target and the
+    /// compaction executor's own staging flush target, unrelated to this
+    /// packet) -- that race is guarded today by the `final_target.exists()`
+    /// check in [`Self::promote_compaction_output`], which fails the
+    /// promotion loudly (rolled back via the intent record) rather than
+    /// silently overwriting anything.
+    fn reserve_compaction_promotion_target(
         &self,
         table_id: &TableId,
         output: &crate::compaction::metadata::SSTableMetadata,
-    ) -> ferrosa_common::Result<crate::compaction::metadata::SSTableMetadata> {
-        let source_dir = &output.path;
+    ) -> ferrosa_common::Result<(u64, std::path::PathBuf, std::path::PathBuf)> {
         let target_dir = self
             .config
             .data_dir
@@ -11001,10 +12559,7 @@ impl StorageEngine {
             .max()
             .unwrap_or(0);
         let promoted_gen = table_max_gen.max(output_gen).saturating_add(1);
-        let promoted_id = promoted_gen.to_string();
-        let old_prefix = format!("{}-", output.id);
-        let final_target = target_dir.join(&promoted_id);
-        let fail_after_first = Self::should_fail_promotion_after_first_component(&output.path);
+        let final_target = target_dir.join(promoted_gen.to_string());
 
         if final_target.exists() {
             return Err(ferrosa_common::Error::InvalidFormat(format!(
@@ -11013,7 +12568,33 @@ impl StorageEngine {
             )));
         }
 
-        let staging_dir = Self::temp_promotion_directory(&target_dir, promoted_gen);
+        // Binding from here: a flush of this table that starts after this
+        // point is guaranteed a generation past `promoted_gen`.
+        if let Some(state) = self.tables.read().get(table_id) {
+            state.store.advance_gen_past(promoted_gen);
+        }
+
+        Ok((promoted_gen, target_dir, final_target))
+    }
+
+    /// Promotes a compaction output into `final_target`, which
+    /// [`Self::reserve_compaction_promotion_target`] has already chosen and
+    /// reserved -- this function only moves data, it never decides the
+    /// generation id. See that function's doc comment for why the choice and
+    /// the move are separate calls.
+    fn promote_compaction_output(
+        &self,
+        output: &crate::compaction::metadata::SSTableMetadata,
+        promoted_gen: u64,
+        target_dir: &std::path::Path,
+        final_target: &std::path::Path,
+    ) -> ferrosa_common::Result<crate::compaction::metadata::SSTableMetadata> {
+        let source_dir = &output.path;
+        let promoted_id = promoted_gen.to_string();
+        let old_prefix = format!("{}-", output.id);
+        let fail_after_first = Self::should_fail_promotion_after_first_component(&output.path);
+
+        let staging_dir = Self::temp_promotion_directory(target_dir, promoted_gen);
         let mut moves = Vec::new();
         for entry in std::fs::read_dir(source_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
@@ -11114,7 +12695,7 @@ impl StorageEngine {
             )));
         }
 
-        std::fs::rename(&staging_dir, &final_target).map_err(|e| {
+        std::fs::rename(&staging_dir, final_target).map_err(|e| {
             rollback_moved(&moved);
             ferrosa_common::Error::InvalidFormat(format!(
                 "failed to atomically promote compaction output to {}: {e}",
@@ -11122,18 +12703,104 @@ impl StorageEngine {
             ))
         })?;
 
+        #[cfg(test)]
+        crate::flush::fsync_probe::note_rename(final_target);
+
+        // Window E' (compaction-cancel-safety.md): the rename above only
+        // updates the directory through the page cache. Without fsyncing
+        // `target_dir`, a crash can persist a later input unlink while losing
+        // this rename -- both copies of the data gone. Every remaining step
+        // (opening the reader, building sidecars, evicting inputs) must not
+        // run until this directory entry is durable, so a failure here is
+        // fatal to the whole promotion.
+        Self::fsync_promoted_directory(target_dir, final_target, &staging_dir, &moved, source_dir)?;
+
         Self::cleanup_promoted_compaction_output(source_dir, &old_prefix);
 
-        let size_bytes = Self::generation_component_paths(&final_target, promoted_gen)
+        let size_bytes = Self::generation_component_paths(final_target, promoted_gen)
             .iter()
             .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum();
 
         let mut promoted = output.clone();
         promoted.id = promoted_id;
-        promoted.path = final_target;
+        promoted.path = final_target.to_path_buf();
         promoted.size_bytes = size_bytes;
         Ok(promoted)
+    }
+
+    /// After the atomic rename into `final_target`, fsync `target_dir` so the
+    /// rename's directory entry is durable before any caller treats the
+    /// promotion as complete (compaction-cancel-safety.md window E' — T-001).
+    /// Reuses [`crate::flush::FileFlushTarget::fsync_dir`], the same barrier
+    /// `flush.rs` uses after its own promoting renames.
+    ///
+    /// On fsync failure, undo the rename so the promotion leaves no visible
+    /// trace when that is possible. If even the rollback rename fails, the
+    /// output stays visible without a durable directory entry -- a disk leak
+    /// (window B / `.promote-*` debris, already swept at startup, T-023),
+    /// never data loss, because this function still returns `Err` either way
+    /// and the only caller (`poll_compactions`) evicts inputs solely on `Ok`.
+    fn fsync_promoted_directory(
+        target_dir: &std::path::Path,
+        final_target: &std::path::Path,
+        staging_dir: &std::path::Path,
+        moved: &[(std::path::PathBuf, std::path::PathBuf)],
+        fail_injection_source: &std::path::Path,
+    ) -> ferrosa_common::Result<()> {
+        let fsync_result = if Self::should_fail_promotion_dir_fsync(fail_injection_source) {
+            Err(std::io::Error::other(
+                "simulated compaction promote directory fsync failure (test marker present)",
+            ))
+        } else {
+            crate::flush::FileFlushTarget::fsync_dir(target_dir)
+        };
+
+        let Err(e) = fsync_result else {
+            return Ok(());
+        };
+
+        match std::fs::rename(final_target, staging_dir) {
+            Ok(()) => {
+                for (source, target) in moved.iter().rev() {
+                    if !target.exists() {
+                        continue;
+                    }
+                    if let Err(restore_err) = std::fs::rename(target, source) {
+                        tracing::error!(
+                            %restore_err,
+                            from = %target.display(),
+                            to = %source.display(),
+                            "compaction: promote rollback could not restore a staged component; \
+                             it is left in the staging dir for startup cleanup"
+                        );
+                    }
+                }
+                if let Err(cleanup_err) = std::fs::remove_dir_all(staging_dir) {
+                    tracing::warn!(
+                        %cleanup_err,
+                        dir = %staging_dir.display(),
+                        "compaction: promote rollback left its staging dir behind (disk leak, swept at startup)"
+                    );
+                }
+            }
+            Err(rollback_err) => {
+                tracing::error!(
+                    %e,
+                    %rollback_err,
+                    dir = %target_dir.display(),
+                    target = %final_target.display(),
+                    "compaction: promote directory fsync failed and the rename could not be \
+                     undone; output remains visible without a durable directory entry -- \
+                     inputs must not be evicted"
+                );
+            }
+        }
+
+        Err(ferrosa_common::Error::InvalidFormat(format!(
+            "failed to fsync promoted compaction directory {}: {e}",
+            target_dir.display()
+        )))
     }
 
     fn cleanup_promoted_compaction_output(source_dir: &std::path::Path, promoted_prefix: &str) {
@@ -11163,23 +12830,108 @@ impl StorageEngine {
         }
     }
 
-    fn evict_local_input_sstable_files(inputs: &[crate::compaction::metadata::SSTableMetadata]) {
-        let standard_components = [
-            "Data.db",
-            "Partitions.db",
-            "Rows.db",
-            "Filter.db",
-            "Statistics.db",
-            "TOC.txt",
-            "CompressionInfo.db",
-        ];
-        for input in inputs {
-            for component in &standard_components {
-                let file_path = Self::generation_component_path(&input.path, &input.id, component)
-                    .unwrap_or_else(|| input.path.join(format!("{}-{component}", input.id)));
-                let _ = std::fs::remove_file(&file_path);
+    // T-024 (compaction-cancel-safety.md C4) replaces this with an atomic,
+    // fsynced retirement of the whole generation. Until then this only
+    // reaches a superseded input once `promote_compaction_output` has
+    // returned `Ok` (i.e. the output's directory entry is durable, T-001), so
+    // a crash here can still leak files but never loses both copies.
+    fn evict_local_input_sstable_files(
+        _table_id: &TableId,
+        inputs: &[crate::compaction::metadata::SSTableMetadata],
+    ) -> bool {
+        let mut complete = true;
+        // `idx` feeds `CancelPoint::RetireInput` (test/test-support only:
+        // `cancel_point!` compiles to nothing otherwise). In a production
+        // build that makes the index genuinely unused; a manual counter
+        // would then trip clippy's `explicit_counter_loop` in the test
+        // build (since `idx` *is* read there), so this narrowly silences
+        // the resulting unused-index/unused-variable lints only for the
+        // build where discarding `idx` is correct.
+        #[cfg_attr(
+            not(any(test, feature = "test-support")),
+            allow(unused_variables, clippy::unused_enumerate_index)
+        )]
+        for (idx, input) in inputs.iter().enumerate() {
+            cancel_point!(&_table_id.to_string(), CancelPoint::RetireInput(idx));
+            complete &= crate::compaction::retire::retire(&input.path, &input.id);
+            // T-023 regression seam: simulate a process crash after exactly N
+            // inputs have been retired, so tests can prove startup
+            // reconciliation finishes retiring the rest instead of
+            // resurrecting whatever the survivors were shadowing (forge
+            // t_fca66994). Outside an explicit task-local scope it is disabled.
+            // A panic (not a plain `return`) is deliberate: a real crash lets
+            // no further code run -- no phase advance, no record deletion --
+            // and only a panic reproduces that when the caller is run inside
+            // `tokio::spawn` and its `JoinError` is discarded by the test.
+            #[cfg(test)]
+            if TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+                .try_with(|count| idx + 1 == *count)
+                .unwrap_or(false)
+            {
+                panic!(
+                    "T-023 test seam: simulated crash after retiring {} of {} compaction inputs",
+                    idx + 1,
+                    inputs.len()
+                );
             }
         }
+        complete
+    }
+
+    /// Read and parse a generation's `Digest.crc32` component (T-011 format).
+    /// Used both when committing a compaction's replacement record (read from
+    /// the staged output, before promotion) and during startup reconciliation
+    /// (read from the promoted output, to verify it against the record).
+    fn read_generation_digest(dir: &std::path::Path, gen: &str) -> std::io::Result<u32> {
+        let path = Self::generation_component_path(dir, gen, "Digest.crc32")
+            .unwrap_or_else(|| dir.join(format!("{gen}-Digest.crc32")));
+        let bytes = std::fs::read(&path)?;
+        ferrosa_sstable::checksum::parse_digest(&bytes)
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))
+    }
+
+    /// Roll back a compaction after its replacement record committed but
+    /// before input retirement started (T-022, compaction-cancel-safety.md
+    /// C2): remove the promoted output directory when one exists, fsync
+    /// `table_dir` so the removal is durable, and delete the record. The
+    /// inputs are never touched by this function, so it is safe to call from
+    /// any failure point between the commit and the start of retirement.
+    fn rollback_compaction_intent(
+        table_id: &TableId,
+        table_dir: &std::path::Path,
+        task_id: &str,
+        promoted_output_dir: Option<&std::path::Path>,
+        reason: &str,
+    ) {
+        if let Some(output_dir) = promoted_output_dir {
+            match std::fs::remove_dir_all(output_dir) {
+                Ok(()) => {
+                    if let Err(e) = crate::flush::FileFlushTarget::fsync_dir(table_dir) {
+                        tracing::error!(
+                            %e, %table_id, task_id, dir = %table_dir.display(),
+                            "compaction: rollback removed the promoted output but could not \
+                             fsync the table dir; left for startup reconciliation"
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::error!(
+                        %e, %table_id, task_id, dir = %output_dir.display(),
+                        "compaction: rollback could not remove the promoted output directory; \
+                         left for startup reconciliation (an orphan, not data loss -- inputs \
+                         are untouched)"
+                    );
+                }
+            }
+        }
+        if let Err(e) =
+            crate::compaction::intent::CompactionIntentRecord::delete(table_dir, task_id)
+        {
+            tracing::error!(%e, %table_id, task_id, "compaction: rollback could not delete the replacement record; startup reconciliation will retry");
+        }
+        crate::metrics::inc_compaction_intent_rollback();
+        tracing::warn!(%table_id, task_id, reason, "compaction: rolled back after the replacement record committed; inputs are untouched");
     }
 
     /// Collect local component file paths for an SSTable generation.
@@ -11304,15 +13056,23 @@ impl StorageEngine {
         let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
+        let pump_sample_at_ns = reference_instant().elapsed().as_nanos() as u64;
+        let pump_sample_total_ns = (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free()
+            * 1_000_000_000.0) as u64;
 
         Ok(Self {
             config,
+            runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
+            write_admission: WriteAdmissionSettings::from_env(),
             tables,
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
+            compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
+            compaction_paused: parking_lot::Mutex::new(HashMap::new()),
+            compaction_retry_notify: Arc::new(tokio::sync::Notify::new()),
             upload_manager,
             compaction_upload_manager,
             local_cache,
@@ -11339,6 +13099,10 @@ impl StorageEngine {
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
+            pump_rate_sample_at_ns: AtomicU64::new(pump_sample_at_ns),
+            pump_rate_sample_total_ns: AtomicU64::new(pump_sample_total_ns),
+            pump_blocked_rate_micros: AtomicU64::new(0),
+            soft_pressure_table_count: AtomicU64::new(0),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             reader_pool,
             upload_store_override: Some((store, prefix)),
@@ -11424,6 +13188,8 @@ impl StorageEngine {
                     "Statistics.db",
                     "TOC.txt",
                     "CompressionInfo.db",
+                    "Digest.crc32",
+                    "CRC.db",
                 ];
                 for component in &components {
                     let local_path = table_dir.join(format!("{gen}-{component}"));
@@ -11583,6 +13349,8 @@ impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
 
 #[cfg(test)]
 mod tests {
+    include!("engine_wiring_tests.rs");
+
     use super::*;
 
     use ferrosa_common::cell::CellValue;
@@ -11643,9 +13411,14 @@ mod tests {
 
     #[test]
     fn effective_compaction_bounds_reject_unbounded_operator_thresholds() {
-        assert_eq!(effective_compaction_input_bounds(4, 1_000), (4, 64));
-        assert_eq!(effective_compaction_input_bounds(1_000, 1_000), (64, 64));
-        assert_eq!(effective_compaction_input_bounds(0, 0), (2, 2));
+        assert_eq!(effective_compaction_input_bounds(4, 1_000, 64), (4, 64));
+        assert_eq!(
+            effective_compaction_input_bounds(1_000, 1_000, 64),
+            (64, 64)
+        );
+        assert_eq!(effective_compaction_input_bounds(0, 0, 64), (2, 2));
+        assert_eq!(effective_compaction_input_bounds(4, 1_000, 12), (4, 12));
+        assert_eq!(effective_compaction_input_bounds(0, 0, 1), (2, 2));
     }
 
     #[test]
@@ -12536,6 +14309,35 @@ mod tests {
             Some(ferrosa_sstable::Compression::Lz4)
         ));
         assert!(options.verify_output);
+        assert_eq!(
+            options.chunk_size,
+            ferrosa_sstable::WriteOptions::default().chunk_size
+        );
+    }
+
+    #[test]
+    fn write_options_honor_disabled_compression_schema_extension() {
+        for enabled in ["false", "0"] {
+            let mut schema = test_schema();
+            schema
+                .extensions
+                .insert("compression.enabled".to_string(), enabled.to_string());
+            let options = write_options_for_schema(&schema, true).unwrap();
+            assert_eq!(options.compression, None, "enabled={enabled}");
+        }
+    }
+
+    #[test]
+    fn invalid_compression_enabled_uses_enabled_default() {
+        let mut schema = test_schema();
+        schema
+            .extensions
+            .insert("compression.enabled".to_string(), "perhaps".to_string());
+        let options = write_options_for_schema(&schema, true).unwrap();
+        assert!(matches!(
+            options.compression,
+            Some(ferrosa_sstable::Compression::Lz4)
+        ));
     }
 
     #[test]
@@ -13967,124 +15769,6 @@ mod tests {
         );
     }
 
-    /// CI-sized regression for production high-volume ingest: many rows to the
-    /// same partition key with flush_if_needed triggering automatically based on
-    /// size. Keep this below the bounded-read/materialization cap; full
-    /// production-volume verification belongs on streaming/paged paths.
-    #[test]
-    #[ignore = "slow (high-volume ingest driving repeated auto-flush); runs in the nightly --ignored job"]
-    fn high_volume_ingest_with_auto_flush_preserves_all_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = StorageEngineConfig {
-            flush_threshold_bytes: 4096, // 4KB — will trigger every ~50-100 rows
-            flush_max_age_secs: 1,
-            ..StorageEngineConfig::test_config(dir.path())
-        };
-        let engine = StorageEngine::new(config, None).unwrap();
-        let tid = table_id();
-        engine.register_table(test_schema()).unwrap();
-
-        let pk = make_key("tenant_session"); // same partition for all rows
-        let total = 2_000;
-
-        for i in 0..total {
-            let row = Row {
-                clustering: (i as i32).to_be_bytes().to_vec(),
-                cells: vec![(
-                    0,
-                    CellValue::live(format!("entity_{i}").into_bytes(), (i + 1) as i64),
-                )],
-                deletion: DeletionTime::LIVE,
-                primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
-            };
-            engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
-
-            // Simulate the background flush loop calling flush_if_needed
-            // every 100 writes (production runs on a timer)
-            if (i + 1) % 100 == 0 {
-                engine.flush_if_needed().unwrap();
-            }
-        }
-
-        // Final flush
-        engine.flush(&tid).unwrap();
-
-        // ALL 11,000 rows MUST be present
-        let result = engine.read(&tid, &pk).unwrap();
-        assert!(result.is_some(), "partition must exist");
-        let actual = result.unwrap().rows.len();
-        assert_eq!(
-            actual,
-            total,
-            "DATA LOSS: expected {total} rows after high-volume ingest, got {actual}. \
-             {} rows lost during flush_if_needed cycles.",
-            total - actual
-        );
-    }
-
-    /// Concurrent writes + flush from separate thread.
-    #[test]
-    #[ignore = "slow (many threads writing while flushes run); runs in the nightly --ignored job"]
-    fn concurrent_write_and_flush_threads_preserve_all_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = StorageEngineConfig {
-            flush_threshold_bytes: 2048,
-            flush_max_age_secs: 1,
-            ..StorageEngineConfig::test_config(dir.path())
-        };
-        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
-        let tid = table_id();
-        engine.register_table(test_schema()).unwrap();
-
-        let pk = make_key("concurrent_pk");
-        let total = 5_000usize;
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Background flush thread
-        let flush_engine = Arc::clone(&engine);
-        let flush_tid = tid.clone();
-        let flush_stop = Arc::clone(&stop);
-        let flush_handle = std::thread::spawn(move || {
-            let mut count = 0u64;
-            while !flush_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = flush_engine.flush_if_needed();
-                count += 1;
-                std::thread::sleep(std::time::Duration::from_micros(100));
-            }
-            let _ = flush_engine.flush(&flush_tid);
-            count
-        });
-
-        // Writer
-        for i in 0..total {
-            let row = Row {
-                clustering: (i as i32).to_be_bytes().to_vec(),
-                cells: vec![(
-                    0,
-                    CellValue::live(format!("r{i}").into_bytes(), (i + 1) as i64),
-                )],
-                deletion: DeletionTime::LIVE,
-                primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
-            };
-            engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
-        }
-
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let flush_count = flush_handle.join().unwrap();
-        engine.flush(&tid).unwrap();
-
-        let result = engine.read(&tid, &pk).unwrap();
-        assert!(result.is_some(), "partition must exist");
-        let actual = result.unwrap().rows.len();
-        assert_eq!(
-            actual,
-            total,
-            "DATA LOSS: {total} rows written with {flush_count} concurrent flushes, \
-             got {actual}. {} lost.",
-            total - actual
-        );
-    }
-
     /// SSTable roundtrip: 1000 rows with varying value sizes, flush, read
     /// back, verify every row and value is intact (no corruption).
     #[test]
@@ -14346,6 +16030,57 @@ mod tests {
                 "data must survive restart after zero-byte Rows.db"
             );
         }
+    }
+
+    /// `publication-safety.md` M2: a stale `.tmp` component set and leftover
+    /// flush staging left by a crashed process must be swept into
+    /// `quarantine/` BEFORE generation discovery runs, not silently deleted
+    /// and not left as unlabeled debris. `-Data.db.tmp` never matches the
+    /// `-Data.db` suffix discovery looks for either way, so this asserts the
+    /// sweep itself, not a change in which generations get discovered.
+    #[test]
+    fn publication_verify_stale_tmp_and_staging_swept_before_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("test_ks.swept_table");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        // A `.tmp` set left by a process that died between rename-to-.tmp and
+        // either quarantine or promote.
+        std::fs::write(table_dir.join("7-Data.db.tmp"), b"stale staged data").unwrap();
+        std::fs::write(table_dir.join("7-Partitions.db.tmp"), b"stale partitions").unwrap();
+
+        // Leftover pre-rename staging from a crashed flush.
+        let staging = table_dir.join(".sstable-staging").join("12345-1-0");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("Data.raw"), b"never renamed").unwrap();
+
+        let pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> =
+            Arc::new(crate::reader_pool::ReaderPool::new(8));
+        let (descriptors, _sidecars, ids) = StorageEngine::load_existing_sstables_and_sidecars(
+            &table_dir,
+            &pool,
+            "publication-verify-sweep",
+        );
+        assert!(
+            descriptors.is_empty() && ids.is_empty(),
+            "a swept .tmp set must never be discovered as a live generation"
+        );
+
+        assert!(
+            table_dir.join("quarantine").join("7-Data.db.tmp").exists(),
+            "the stale .tmp component set must be quarantined for salvage, not deleted"
+        );
+        assert!(
+            table_dir
+                .join("quarantine")
+                .join("7-Partitions.db.tmp")
+                .exists(),
+            "every component of the stale .tmp set must be quarantined, not only Data.db"
+        );
+        assert!(
+            !table_dir.join(".sstable-staging").exists(),
+            "abandoned pre-rename staging must be removed at startup"
+        );
     }
 
     /// Regression: the default startup smoke test must not quarantine
@@ -15762,6 +17497,7 @@ mod tests {
             err.to_string().contains("memtable backpressure"),
             "write past memtable_backpressure_bytes must fail closed; got {err}"
         );
+        assert!(matches!(err, ferrosa_common::Error::Overloaded { .. }));
         assert_eq!(
             engine.sstable_count(&tid),
             0,
@@ -15774,6 +17510,64 @@ mod tests {
 
         engine.flush_if_needed().unwrap();
         assert_eq!(engine.sstable_count(&tid), 1);
+    }
+
+    #[tokio::test]
+    async fn write_admission_soft_zone_wakes_after_successful_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let mut engine = StorageEngine::new(config, None).unwrap();
+        engine.write_admission = WriteAdmissionSettings {
+            soft_pressure: 0.4,
+            max_soft_delay: std::time::Duration::from_secs(1),
+        };
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("soft"), make_row(b"data", 1000), 1000)
+            .unwrap();
+        let current_size = engine.tables.read()[&tid].store.memtable_size() as u64;
+        engine.config.memtable_backpressure_bytes = current_size.saturating_mul(2).max(2);
+        engine.tables.read()[&tid]
+            .in_write_soft_zone
+            .store(true, Ordering::Relaxed);
+        engine.soft_pressure_table_count.store(1, Ordering::Relaxed);
+        let engine = Arc::new(engine);
+
+        let waiter_engine = Arc::clone(&engine);
+        let waiter_table = tid.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_engine.await_write_admission(&waiter_table).await });
+        tokio::task::yield_now().await;
+        assert!(engine.take_flush_request());
+        engine.flush(&tid).unwrap();
+        waiter.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_admission_soft_zone_times_out_once_then_rechecks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let mut engine = StorageEngine::new(config, None).unwrap();
+        engine.write_admission = WriteAdmissionSettings {
+            soft_pressure: 0.4,
+            max_soft_delay: std::time::Duration::from_millis(5),
+        };
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("soft"), make_row(b"data", 1000), 1000)
+            .unwrap();
+        let current_size = engine.tables.read()[&tid].store.memtable_size() as u64;
+        engine.config.memtable_backpressure_bytes = current_size.saturating_mul(2).max(2);
+        engine.tables.read()[&tid]
+            .in_write_soft_zone
+            .store(true, Ordering::Relaxed);
+        engine.soft_pressure_table_count.store(1, Ordering::Relaxed);
+        let started = Instant::now();
+        engine.await_write_admission(&tid).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        assert!(engine.take_flush_request());
     }
 
     #[test]
@@ -17583,6 +19377,8 @@ mod tests {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ] {
             let p = gen2_dir.join(format!("{gen2}-{comp}"));
             if let Ok(bytes) = std::fs::read(&p) {
@@ -18681,7 +20477,8 @@ mod tests {
     /// without the runtime overhead of the full 1 000+1 000 spec requirement.
     ///
     /// For the spec-mandated 1 000+1 000 test see
-    /// [`e4_slow_pitr_commit_log_replay_1k_plus_1k`].
+    /// `slow::e4_slow_pitr_commit_log_replay_1k_plus_1k` (behind the
+    /// `slow-tests` feature).
     #[test]
     fn e4_pitr_commit_log_replay_to_point_in_time() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -18884,29 +20681,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(restore_via_intent_e2e());
-    }
-
-    /// E4 (slow): Commit-log replay PITR — spec acceptance criterion #2
-    /// mandates exactly 1 000 pre-snapshot rows and 1 000 post-snapshot rows.
-    ///
-    /// Gated with `#[ignore]` because the archiver poll loop and 2 000
-    /// individual commit-log writes with a 256-byte segment size take ~60–90 s
-    /// on a typical CI runner.  Run explicitly with:
-    ///
-    /// ```sh
-    /// cargo test -p ferrosa-storage -- --ignored e4_slow_pitr_commit_log_replay_1k_plus_1k
-    /// ```
-    ///
-    /// Uses the identical code path as the fast 100-row variant; only the row
-    /// count differs.
-    #[test]
-    #[ignore = "slow (2k-mutation commit-log replay with a 256-byte segment size); runs in the nightly --ignored job"]
-    fn e4_slow_pitr_commit_log_replay_1k_plus_1k() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(run_pitr_replay_e2e(1_000));
     }
 
     /// FM1/FM8: Archiver SHA-256 verification — archived segment data in S3
@@ -20882,18 +22656,34 @@ mod tests {
         String,
         TableId,
     ) {
+        make_engine_with_pending_compaction_for_table(dir, "test_table").await
+    }
+
+    /// Use a dedicated table name for cancel-hook tests so the process-wide
+    /// test hook registry cannot collide with the many engine tests that use
+    /// `test_ks.test_table` concurrently.
+    async fn make_engine_with_pending_compaction_for_table(
+        dir: &tempfile::TempDir,
+        table_name: &str,
+    ) -> (
+        StorageEngine,
+        Arc<dyn object_store::ObjectStore>,
+        String,
+        TableId,
+    ) {
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let prefix = "test-node".to_string();
+        let mut schema = test_schema();
+        schema.table = table_name.to_string();
+        let tid = TableId::new(&schema.keyspace, &schema.table);
 
         let config = StorageEngineConfig::test_config(dir.path());
         let rt = tokio::runtime::Handle::current();
         let engine =
             StorageEngine::new_with_upload_store(config, Arc::clone(&store), prefix.clone(), &rt)
                 .unwrap();
-        engine.register_table(test_schema()).unwrap();
-
-        let tid = table_id();
+        engine.register_table(schema.clone()).unwrap();
 
         // Flush 1: write k1 → SSTable #1.
         engine
@@ -20918,17 +22708,29 @@ mod tests {
             let task = crate::compaction::metadata::CompactionTask {
                 inputs: metadata,
                 output_dir: compaction_output_dir,
-                schema: test_schema(),
+                schema,
                 table_id: tid.clone(),
                 purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }
 
-        // Block until the compaction worker has posted its result. This used to poll
-        // the output directory every 50 ms for three seconds, which raced the worker
-        // on a loaded host.
-        wait_for_compaction_result(&engine);
+        // Wait for the compaction executor (background thread) to finish, on
+        // the deterministic signal (a completed result waiting in the result
+        // queue) rather than racing the filesystem: a file can appear under
+        // compaction/ while the executor is still mid-write, which let
+        // dependent tests observe a staging artifact as "done" and run
+        // before finalize under load (T-091).
+        let completed = engine
+            .compaction_executor
+            .wait_for_result(std::time::Duration::from_secs(120))
+            .await;
+        assert!(
+            completed,
+            "compaction task did not complete within 120s; executor state: \
+             pending_result_count={}",
+            engine.compaction_executor.pending_result_count()
+        );
 
         (engine, store, prefix, tid)
     }
@@ -20989,6 +22791,151 @@ mod tests {
         assert!(
             store.get(&data_path).await.is_ok(),
             "compacted SSTable Data.db must be present in S3 at {data_path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_s3_crash_sweep_replays_from_replacement_record() {
+        use futures::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        for point in [
+            crate::compaction::cancel_harness::CancelPoint::S3PendingLog,
+            crate::compaction::cancel_harness::CancelPoint::S3ManifestCas,
+            crate::compaction::cancel_harness::CancelPoint::S3Delete,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let table_name = "test_t026_s3_crash_sweep";
+            let (engine, store, prefix, tid) =
+                make_engine_with_pending_compaction_for_table(&dir, table_name).await;
+            wait_for_compaction_result(&engine);
+            let crash_point = point;
+            let guard = crate::compaction::cancel_harness::CancelHookGuard::install(
+                tid.to_string(),
+                Arc::new(move |observed| {
+                    if observed == crash_point {
+                        panic!("simulated crash at {crash_point}");
+                    }
+                }),
+            );
+            assert!(
+                AssertUnwindSafe(engine.poll_compactions())
+                    .catch_unwind()
+                    .await
+                    .is_err(),
+                "the test hook must interrupt compaction at {point}"
+            );
+            drop(guard);
+            drop(engine);
+
+            let runtime = tokio::runtime::Handle::current();
+            let reopened = StorageEngine::new_with_upload_store(
+                StorageEngineConfig::test_config(dir.path()),
+                Arc::clone(&store),
+                prefix.clone(),
+                &runtime,
+            )
+            .unwrap();
+            let mut schema = test_schema();
+            schema.table = table_name.to_string();
+            reopened.register_table(schema).unwrap();
+            reopened.replay_pending_uploads().await;
+            for _ in 0..20 {
+                if leftover_intent_records(&reopened.table_sstable_dir(&tid)).is_empty() {
+                    break;
+                }
+                reopened.replay_pending_uploads().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+                .await
+                .unwrap();
+            let entries = manifest
+                .sstables
+                .get(&tid.to_string())
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                entries.len(),
+                1,
+                "replay from {point} must publish only the compacted output"
+            );
+            assert!(
+                crate::upload::PendingUploadsLog::open(&dir.path().join("pending-uploads.log"))
+                    .unwrap()
+                    .pending_records()
+                    .unwrap()
+                    .is_empty(),
+                "replay from {point} must remove the upload entry after the manifest save"
+            );
+            assert!(
+                leftover_intent_records(&reopened.table_sstable_dir(&tid)).is_empty(),
+                "replay from {point} must remove the record after re-enqueuing input deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_s3_pinned_crash_finishes_local_retirement_without_upload() {
+        use futures::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_name = "test_t026_pinned_crash";
+        let (engine, store, prefix, tid) =
+            make_engine_with_pending_compaction_for_table(&dir, table_name).await;
+        engine
+            .update_table_pin_config(&tid, Some(PinConfig { max_bytes: None }))
+            .await
+            .unwrap();
+        wait_for_compaction_result(&engine);
+        let guard = crate::compaction::cancel_harness::CancelHookGuard::install(
+            tid.to_string(),
+            Arc::new(|point| {
+                if point == crate::compaction::cancel_harness::CancelPoint::RetireInput(0) {
+                    panic!("simulated crash during pinned input retirement");
+                }
+            }),
+        );
+        assert!(
+            AssertUnwindSafe(engine.poll_compactions())
+                .catch_unwind()
+                .await
+                .is_err(),
+            "the test hook must interrupt pinned input retirement"
+        );
+        drop(guard);
+        drop(engine);
+
+        let runtime = tokio::runtime::Handle::current();
+        let reopened = StorageEngine::new_with_upload_store(
+            StorageEngineConfig::test_config(dir.path()),
+            Arc::clone(&store),
+            prefix.clone(),
+            &runtime,
+        )
+        .unwrap();
+        let mut schema = test_schema();
+        schema.table = table_name.to_string();
+        reopened
+            .register_table_pinned(schema, PinConfig { max_bytes: None })
+            .unwrap();
+        reopened.replay_pending_uploads().await;
+
+        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        assert!(
+            manifest
+                .sstables
+                .get(&tid.to_string())
+                .is_none_or(Vec::is_empty),
+            "pinned compaction must not publish an S3 manifest entry"
+        );
+        assert!(
+            leftover_intent_records(&reopened.table_sstable_dir(&tid)).is_empty(),
+            "startup reconciliation finishes local pinned retirement and prunes its record"
         );
     }
 
@@ -21127,6 +23074,7 @@ mod tests {
                 &tid_str,
                 &output_id,
                 crate::upload::pending_log::PendingCompactionUpload {
+                    intent_task_id: None,
                     remove_input_ids: manifest_plan.remove_input_ids.clone(),
                     output: manifest_plan.add_output.clone(),
                 },
@@ -21215,19 +23163,19 @@ mod tests {
             .write(&tid, &make_key("k3"), make_row(b"v3", 3000), 3000)
             .unwrap();
 
-        // Wait for compaction to finish (up to 15s under heavy CI load).
-        let compaction_dir = dir.path().join("compaction");
-        for _ in 0..300 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists()
-                && std::fs::read_dir(&compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false)
-            {
-                break;
-            }
-        }
+        // Wait for compaction to finish, on the deterministic completion
+        // signal rather than racing the filesystem (T-091): a file can
+        // appear under compaction/ while the executor is still mid-write.
+        let compaction_completed = engine
+            .compaction_executor
+            .wait_for_result(std::time::Duration::from_secs(120))
+            .await;
+        assert!(
+            compaction_completed,
+            "compaction task did not complete within 120s; executor state: \
+             pending_result_count={}",
+            engine.compaction_executor.pending_result_count()
+        );
 
         // Flush on a separate task while poll_compactions runs.
         let eng_clone = std::sync::Arc::clone(&engine);
@@ -21554,6 +23502,21 @@ mod tests {
         );
     }
 
+    /// Drives the split reserve-then-promote sequence
+    /// (`reserve_compaction_promotion_target` then `promote_compaction_output`)
+    /// exactly as `poll_compactions` does since t_cb6fa288's fix, so these
+    /// unit tests exercise the same two-call sequence production code uses
+    /// rather than a single-call API that no longer exists.
+    fn promote_via_reserve(
+        engine: &StorageEngine,
+        tid: &TableId,
+        output: &crate::compaction::metadata::SSTableMetadata,
+    ) -> ferrosa_common::Result<crate::compaction::metadata::SSTableMetadata> {
+        let (promoted_gen, target_dir, final_target) =
+            engine.reserve_compaction_promotion_target(tid, output)?;
+        engine.promote_compaction_output(output, promoted_gen, &target_dir, &final_target)
+    }
+
     #[tokio::test]
     async fn compaction_promotion_fail_after_first_component_is_atomic_and_recoverable() {
         let dir = tempfile::tempdir().unwrap();
@@ -21587,7 +23550,7 @@ mod tests {
             .join(StorageEngine::TEST_FAIL_PROMOTION_AFTER_FIRST_COMPONENT);
         std::fs::write(&marker_path, b"1").unwrap();
 
-        let failed = engine.promote_compaction_output(&tid, &result);
+        let failed = promote_via_reserve(&engine, &tid, &result);
         assert!(
             failed.is_err(),
             "promotion should fail with test marker present"
@@ -21613,7 +23576,7 @@ mod tests {
         );
 
         std::fs::remove_file(&marker_path).unwrap();
-        let recovered = engine.promote_compaction_output(&tid, &result);
+        let recovered = promote_via_reserve(&engine, &tid, &result);
         assert!(
             recovered.is_ok(),
             "promotion should recover from marker-cleared output: {:?}",
@@ -21637,6 +23600,980 @@ mod tests {
         );
     }
 
+    // ── T-001: fsync sstables/<table>/ before any input is unlinked ────────
+    //
+    // compaction-cancel-safety.md window E': nothing fsynced the table
+    // directory between the promote rename and the input unlinks, so a crash
+    // could persist the unlinks while losing the rename -- both copies gone.
+    // Both tests below drive the real `poll_compactions` path end to end
+    // (not just `promote_compaction_output` in isolation), so they prove the
+    // durability barrier actually gates eviction rather than merely that the
+    // two functions behave correctly on their own.
+
+    #[tokio::test]
+    async fn promote_dir_fsync_order_is_rename_then_dir_fsync_then_unlink() {
+        use crate::flush::fsync_probe::Event;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+
+        let _probe = crate::flush::fsync_probe::exclusive();
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            if StorageEngine::scan_generations(&sstable_dir).len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let events = crate::flush::fsync_probe::events();
+        let relevant: Vec<(usize, &Event)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| match event {
+                Event::Rename(p) | Event::Unlink(p) => p.starts_with(&sstable_dir),
+                Event::DirFsync(p) => *p == sstable_dir,
+                Event::FileFsync(_) | Event::ReadbackVerified(_) | Event::Fadvise(_) => false,
+            })
+            .collect();
+
+        let rename_idx = relevant
+            .iter()
+            .find_map(|(i, e)| matches!(e, Event::Rename(_)).then_some(*i))
+            .expect("promote should rename the staged output into sstables/<table>/");
+        let dir_fsync_idx = relevant
+            .iter()
+            .find_map(|(i, e)| matches!(e, Event::DirFsync(_)).then_some(*i))
+            .expect("promote should fsync sstables/<table>/ after the rename");
+        let unlink_idx = relevant
+            .iter()
+            .find_map(|(i, e)| matches!(e, Event::Unlink(_)).then_some(*i))
+            .expect("a successful promote should be followed by input eviction");
+
+        assert!(
+            rename_idx < dir_fsync_idx,
+            "the promote rename must be recorded before the directory fsync: {relevant:?}"
+        );
+        assert!(
+            dir_fsync_idx < unlink_idx,
+            "the directory fsync must be recorded before any input is unlinked: {relevant:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_dir_fsync_failure_prevents_input_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+        let pre_generations = StorageEngine::scan_generations(&sstable_dir);
+
+        let input_component_paths: Vec<std::path::PathBuf> = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let inputs = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            inputs
+                .iter()
+                .flat_map(|input| {
+                    let path = input.path.clone();
+                    let id = input.id.clone();
+                    [
+                        "Data.db",
+                        "Partitions.db",
+                        "Rows.db",
+                        "Filter.db",
+                        "Statistics.db",
+                    ]
+                    .into_iter()
+                    .map(move |component| {
+                        StorageEngine::generation_component_path(&path, &id, component)
+                            .unwrap_or_else(|| path.join(format!("{id}-{component}")))
+                    })
+                })
+                .collect()
+        };
+        assert!(
+            !input_component_paths.is_empty(),
+            "setup should have produced at least one input component"
+        );
+        for p in &input_component_paths {
+            assert!(
+                p.exists(),
+                "input component {p:?} should exist before compaction"
+            );
+        }
+
+        // Inject the dir-fsync failure marker into the shared compaction
+        // output directory before polling. `output.path` for a real
+        // compaction result is exactly this directory -- it is what
+        // `make_engine_with_pending_compaction` sets as
+        // `CompactionTask::output_dir`, and the sibling
+        // `compaction_promotion_fail_after_first_component_is_atomic_and_recoverable`
+        // test above confirms it by injecting its own marker into
+        // `result.path` the same way.
+        let compaction_output_dir = dir.path().join("compaction").join(tid.to_string());
+        std::fs::write(
+            compaction_output_dir.join(StorageEngine::TEST_FAIL_PROMOTION_DIR_FSYNC),
+            b"1",
+        )
+        .unwrap();
+
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let post_generations = StorageEngine::scan_generations(&sstable_dir);
+        assert_eq!(
+            pre_generations, post_generations,
+            "a failed directory fsync must never leave a promoted generation visible"
+        );
+        for p in &input_component_paths {
+            assert!(
+                p.exists(),
+                "input component {p:?} must survive a promote whose directory fsync failed"
+            );
+        }
+    }
+
+    /// CS13-style crash test (T-001): after promoting a compaction output,
+    /// drop un-fsynced directory-entry writes for `sstables/<table>/` (as if
+    /// the filesystem crashed before the promote rename's directory entry
+    /// reached disk), then restart. The invariant this proves: with the fix
+    /// in this packet, either the promoted output's directory entry survived
+    /// the simulated crash, or the inputs were never unlinked -- never
+    /// neither.
+    ///
+    /// LazyFS setup (this harness is not implemented yet -- see below):
+    ///   1. Build/install LazyFS: <https://github.com/dsrhaslab/lazyfs>.
+    ///   2. Mount a LazyFS-backed directory with a fault config that can drop
+    ///      un-fsynced writes on trigger (LazyFS's crash-simulation fault).
+    ///   3. Point a `StorageEngine`'s `data_dir` at that mountpoint.
+    ///   4. Run a flush + compact cycle, trigger the LazyFS crash fault right
+    ///      after the directory fsync in `fsync_promoted_directory` but
+    ///      before `evict_local_input_sstable_files`, then remount clean and
+    ///      reopen the engine.
+    ///   5. Assert exactly one of {inputs, promoted output} is discoverable.
+    ///
+    /// Set `FERROSA_TEST_LAZYFS=1` to opt in once that harness exists. It
+    /// does not exist yet: this packet proves the ordering and failure-path
+    /// invariants with the in-process `fsync_probe` seam instead (the two
+    /// tests above). A real crash-consistency proof under LazyFS needs a
+    /// Linux host, which the project plan does not provision until T-070
+    /// (`specs/sstable-write-pump/compiled-project-plan.md`).
+    #[cfg(feature = "live-infra-tests")]
+    #[test]
+    fn promote_dir_fsync_lazyfs_crash_loses_neither_copy() {
+        if std::env::var("FERROSA_TEST_LAZYFS").is_err() {
+            panic!(
+                "FERROSA_TEST_LAZYFS not set -- install LazyFS \
+                 (https://github.com/dsrhaslab/lazyfs), mount a LazyFS-backed \
+                 directory with a fault config that can drop un-fsynced \
+                 writes, point a StorageEngine's data_dir at it, and re-run \
+                 with FERROSA_TEST_LAZYFS=1. See this test's doc comment for \
+                 the mount + fault-injection steps this harness still needs \
+                 (tracked for T-070, the first point with a Linux host)."
+            );
+        }
+        panic!(
+            "FERROSA_TEST_LAZYFS is set but the LazyFS mount / fault-injection \
+             harness is not implemented in this crate yet -- refusing to fake \
+             a pass. Implement the steps in this test's doc comment (T-070) \
+             before removing this panic."
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_source_ddl_abandoned_waiter_does_not_abandon_owned_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        let mut drain = Box::pin(
+            engine.pause_table_compactions(&tid, ferrosa_common::CancelReason::TableDropped),
+        );
+        // This poll dequeues the result and spawns its finalizer. The spawned
+        // job cannot run yet on this single-thread runtime.
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        assert_eq!(engine.compaction_executor.pending_result_count(), 0);
+        drop(drain);
+        let pause = tokio::time::timeout(
+            COMPACTION_HANG_GUARD,
+            engine.pause_table_compactions(&tid, ferrosa_common::CancelReason::TableDropped),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(pause.is_drained());
+        assert_eq!(
+            engine.sstable_count(&tid),
+            2,
+            "abandoned DROP does not remove table data"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_source_ddl_truncate_drains_result_and_rejects_stale_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        let ticket = engine.compaction_executor.submission_ticket(&tid).unwrap();
+        let stale = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            crate::compaction::metadata::CompactionTask {
+                inputs: engine.collect_sstable_metadata(&tid, state),
+                output_dir: dir.path().join("compaction").join(tid.to_string()),
+                schema: test_schema(),
+                table_id: tid.clone(),
+                purge: None,
+            }
+        };
+        // The synchronous boundary fails before altering table contents.
+        assert!(engine
+            .truncate(&tid)
+            .unwrap_err()
+            .to_string()
+            .contains("active compaction"));
+        assert_eq!(engine.sstable_count(&tid), 2);
+        // Exercise the held-result slot as well as the normal result queue.
+        assert!(engine
+            .compaction_executor
+            .await_result_available(COMPACTION_HANG_GUARD));
+        tokio::time::timeout(COMPACTION_HANG_GUARD, engine.truncate_and_wait(&tid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.compaction_executor.pending_result_count(), 0);
+        assert_eq!(engine.sstable_count(&tid), 0);
+        assert!(engine.read(&tid, &make_key("k1")).unwrap().is_none());
+        assert!(!engine
+            .compaction_executor
+            .try_submit_with_ticket(stale, &ticket)
+            .unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_source_ddl_drop_drains_before_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        assert!(engine
+            .unregister_table(&tid)
+            .unwrap_err()
+            .to_string()
+            .contains("active compaction"));
+        assert_eq!(engine.sstable_count(&tid), 2);
+        tokio::time::timeout(
+            COMPACTION_HANG_GUARD,
+            engine.unregister_table_and_wait(&tid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(engine.compaction_executor.pending_result_count(), 0);
+        assert!(!dir.path().join("sstables").join(tid.to_string()).exists());
+        engine.register_table(test_schema()).unwrap();
+        assert!(engine.read(&tid, &make_key("k1")).unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_source_ddl_wait_yields_until_finalizer_releases_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        // Model a maintenance finalizer that already owns the completed result.
+        let result = engine.compaction_executor.poll_results().pop().unwrap();
+        let ddl = engine.truncate_and_wait(&tid);
+        let release = async {
+            let cancelled = result.cancel.clone();
+            tokio::task::spawn_blocking(move || cancelled.closed().recv())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(result.cancel.is_cancelled());
+            assert_eq!(engine.sstable_count(&tid), 2);
+            crate::compaction::executor::remove_staged_output_components(
+                &result.output.path,
+                &result.output.id,
+            );
+            engine.compaction_executor.release_task_inputs(&result.task);
+        };
+        tokio::time::timeout(COMPACTION_HANG_GUARD, async {
+            let (outcome, ()) = tokio::join!(ddl, release);
+            outcome.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(engine.sstable_count(&tid), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_source_disk_reserve_cancels_work_and_keeps_admission_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, _store, _prefix, _tid) = make_engine_with_pending_compaction(&dir).await;
+        let result = engine.compaction_executor.poll_results().pop().unwrap();
+        assert!(!result.cancel.is_cancelled());
+        engine.config.local_disk_free_reserve_bytes = u64::MAX;
+        engine.set_disk_free_cache_for_test(0);
+        assert!(engine.check_write_admission().is_err());
+        assert_eq!(
+            result.cancel.reason(),
+            Some(ferrosa_common::CancelReason::DiskReserve)
+        );
+        crate::compaction::executor::remove_staged_output_components(
+            &result.output.path,
+            &result.output.id,
+        );
+        engine.compaction_executor.release_task_inputs(&result.task);
+        engine.config.local_disk_free_reserve_bytes = 1;
+        engine.set_disk_free_cache_for_test(u64::MAX);
+        assert!(engine.check_write_admission().is_ok());
+    }
+
+    #[tokio::test]
+    async fn compaction_retire_failure_retains_intent_until_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        assert!(engine
+            .compaction_executor
+            .await_result_available(std::time::Duration::from_secs(10)));
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let generation = StorageEngine::scan_generations(&table_dir)[0].to_string();
+        let obstruction = table_dir.join(format!(".retired-{generation}"));
+        std::fs::write(&obstruction, b"inject retirement failure").unwrap();
+        engine.poll_compactions().await;
+        let records = leftover_intent_records(&table_dir);
+        assert_eq!(records.len(), 1);
+        let record = crate::compaction::intent::CompactionIntentRecord::read_at(&records[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Swapped
+        );
+        std::fs::remove_file(obstruction).unwrap();
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+        let records = leftover_intent_records(&table_dir);
+        assert_eq!(
+            records.len(),
+            1,
+            "S3 recovery still owns the retired record"
+        );
+        let record = crate::compaction::intent::CompactionIntentRecord::read_at(&records[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Retired
+        );
+        assert!(!StorageEngine::scan_generations(&table_dir).contains(&generation.parse().unwrap()));
+    }
+
+    #[test]
+    fn compaction_retire_includes_sidecars_and_generation_directories() {
+        for nested in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let live = if nested {
+                dir.path().join("7")
+            } else {
+                dir.path().to_path_buf()
+            };
+            std::fs::create_dir_all(&live).unwrap();
+            for name in [
+                "7-Data.db",
+                "7-TOC.txt",
+                "7-title.sidecar",
+                "7-FTI-title.db",
+                "7-VEC-embedding.db",
+            ] {
+                std::fs::write(live.join(name), b"component").unwrap();
+            }
+            std::fs::write(dir.path().join("70-Data.db"), b"neighbor").unwrap();
+            let input = StorageEngine::compaction_input_retirement_stub(dir.path(), "7");
+            StorageEngine::evict_local_input_sstable_files(&table_id(), &[input]);
+            assert!(!live.join("7-title.sidecar").exists());
+            assert!(!live.join("7-FTI-title.db").exists());
+            assert!(!live.join("7-VEC-embedding.db").exists());
+            assert!(!dir.path().join(".retired-7").exists());
+            assert!(dir.path().join("70-Data.db").exists());
+            if nested {
+                assert!(!live.exists());
+            }
+        }
+    }
+
+    // ── T-022 / T-023: durable replacement record, commit/rollback, and
+    // startup reconciliation (compaction-cancel-safety.md C2/C3, forge
+    // t_fca66994) ──────────────────────────────────────────────────────
+
+    fn leftover_intent_records(table_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(table_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(crate::compaction::intent::CompactionIntentRecord::is_record_name)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_record_written_and_fsynced_before_promote() {
+        use crate::flush::fsync_probe::Event;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+
+        let _probe = crate::flush::fsync_probe::exclusive();
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            if StorageEngine::scan_generations(&sstable_dir).len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let events = crate::flush::fsync_probe::events();
+        let is_intent = |p: &std::path::PathBuf| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::compaction::intent::CompactionIntentRecord::is_record_name)
+        };
+        let intent_rename_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::Rename(p) if is_intent(p)))
+            .expect("the replacement record must be renamed into place before anything else");
+        let intent_dir_fsync_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::DirFsync(p) if *p == sstable_dir))
+            .expect("writing the replacement record must fsync the table dir");
+        let output_rename_idx = events
+            .iter()
+            .position(
+                |e| matches!(e, Event::Rename(p) if p.starts_with(&sstable_dir) && !is_intent(p)),
+            )
+            .expect("promote must rename the output into sstables/<table>/");
+
+        assert!(
+            intent_rename_idx < output_rename_idx,
+            "the replacement record must be committed (renamed + fsynced) before promotion: {events:?}"
+        );
+        assert!(
+            intent_dir_fsync_idx < output_rename_idx,
+            "the record's directory fsync must also precede promotion: {events:?}"
+        );
+
+        assert!(
+            leftover_intent_records(&sstable_dir).is_empty(),
+            "the replacement record must be deleted once the compaction fully completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_promote_failure_rolls_back_and_preserves_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+        let pre_generations = StorageEngine::scan_generations(&sstable_dir);
+
+        let input_component_paths: Vec<std::path::PathBuf> = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let inputs = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            inputs
+                .iter()
+                .flat_map(|input| {
+                    let path = input.path.clone();
+                    let id = input.id.clone();
+                    ["Data.db", "Partitions.db", "Rows.db"]
+                        .into_iter()
+                        .map(move |component| {
+                            StorageEngine::generation_component_path(&path, &id, component)
+                                .unwrap_or_else(|| path.join(format!("{id}-{component}")))
+                        })
+                })
+                .collect()
+        };
+        assert!(!input_component_paths.is_empty());
+
+        // Same fault-injection marker T-001's own tests use: makes the
+        // post-rename directory fsync inside `promote_compaction_output` fail,
+        // so promotion itself never completes.
+        let compaction_output_dir = dir.path().join("compaction").join(tid.to_string());
+        std::fs::write(
+            compaction_output_dir.join(StorageEngine::TEST_FAIL_PROMOTION_DIR_FSYNC),
+            b"1",
+        )
+        .unwrap();
+
+        let rollback_before = crate::metrics::compaction_intent_rollback_total();
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let post_generations = StorageEngine::scan_generations(&sstable_dir);
+        assert_eq!(
+            pre_generations, post_generations,
+            "a failed promote must never leave a new generation visible"
+        );
+        for p in &input_component_paths {
+            assert!(p.exists(), "inputs must survive a promote failure: {p:?}");
+        }
+        assert!(
+            leftover_intent_records(&sstable_dir).is_empty(),
+            "the replacement record must be deleted after a rolled-back promote failure"
+        );
+        assert!(
+            crate::metrics::compaction_intent_rollback_total() > rollback_before,
+            "the rollback must be observable via the intent-rollback counter"
+        );
+    }
+
+    #[test]
+    fn compaction_commit_rollback_removes_promoted_output_dir_and_deletes_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let output_dir = table_dir.join("9");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("9-Data.db"), b"promoted").unwrap();
+
+        let record = crate::compaction::intent::CompactionIntentRecord {
+            task_id: "9".to_string(),
+            output_gen: "9".to_string(),
+            output_digest: 1,
+            inputs: vec!["1".to_string(), "2".to_string()],
+            phase: crate::compaction::intent::CompactionIntentPhase::Promoting,
+        };
+        record.write(&table_dir).unwrap();
+
+        let before = crate::metrics::compaction_intent_rollback_total();
+        StorageEngine::rollback_compaction_intent(
+            &table_id(),
+            &table_dir,
+            "9",
+            Some(&output_dir),
+            "test rollback",
+        );
+
+        assert!(
+            !output_dir.exists(),
+            "the promoted output directory must be removed on rollback"
+        );
+        assert!(
+            leftover_intent_records(&table_dir).is_empty(),
+            "the record must be deleted on rollback"
+        );
+        assert!(crate::metrics::compaction_intent_rollback_total() > before);
+    }
+
+    #[tokio::test]
+    async fn compaction_retirement_crash_does_not_leak_to_unrelated_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = StorageEngine::compaction_input_retirement_stub(dir.path(), "1");
+        let unrelated = TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+            .scope(1, async move {
+                tokio::spawn(async move {
+                    StorageEngine::evict_local_input_sstable_files(&table_id(), &[input]);
+                })
+                .await
+            })
+            .await;
+        assert!(
+            unrelated.is_ok(),
+            "another task must not inherit crash injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_retirement_crash_scope_resets_after_panic_and_drop() {
+        use futures::FutureExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = StorageEngine::compaction_input_retirement_stub(dir.path(), "1");
+        let crash = TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.scope(1, async {
+            StorageEngine::evict_local_input_sstable_files(
+                &table_id(),
+                std::slice::from_ref(&input),
+            );
+        });
+        assert!(std::panic::AssertUnwindSafe(crash)
+            .catch_unwind()
+            .await
+            .is_err());
+        assert!(TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+            .try_with(|_| ())
+            .is_err());
+
+        // Poll and then drop a pending injected future on this same task.
+        let mut abandoned = Box::pin(TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.scope(1, async {
+            assert_eq!(TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.get(), 1);
+            std::future::pending::<()>().await;
+        }));
+        assert!(futures::poll!(abandoned.as_mut()).is_pending());
+        drop(abandoned);
+        assert!(TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+            .try_with(|_| ())
+            .is_err());
+        StorageEngine::evict_local_input_sstable_files(&table_id(), &[input]);
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_phase_reaches_swapped_before_retirement_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+
+        // The compaction executor runs on a background thread and may not
+        // have pushed its result onto the channel yet (the same race
+        // `compaction_output_uploaded_to_s3` documents), so a no-op poll must
+        // not be mistaken for the seam failing to fire.
+        let mut crashed = false;
+        for _ in 0..40 {
+            let poll_engine = Arc::clone(&engine);
+            let joined = tokio::spawn(
+                TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+                    .scope(1, async move { poll_engine.poll_compactions().await }),
+            )
+            .await;
+            if joined.is_err() {
+                crashed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            crashed,
+            "the T-023 crash seam must panic inside poll_compactions once the compaction \
+             result is available, to simulate a crash"
+        );
+
+        let mut records = leftover_intent_records(&sstable_dir);
+        assert_eq!(
+            records.len(),
+            1,
+            "the interrupted compaction must leave exactly one replacement record"
+        );
+        let record = crate::compaction::intent::CompactionIntentRecord::read_at(&records.remove(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Swapped,
+            "the record must have advanced Promoting -> Swapped before retirement -- and \
+             therefore Retired -- ever started"
+        );
+    }
+
+    /// `test_schema()` plus `gc_grace_seconds = 0`, so a tombstone with an
+    /// ancient `local_deletion_time` (see `LONG_AGO_LDT` further below, used
+    /// by the pre-existing purge tests) is genuinely purgeable under
+    /// purge.rs's real rules rather than test-rigged.
+    fn dead_partition_schema() -> TableSchema {
+        let mut schema = test_schema();
+        schema.extensions.insert(
+            ferrosa_common::schema::GC_GRACE_EXTENSION.to_string(),
+            "0".to_string(),
+        );
+        schema
+    }
+
+    /// THE resurrection regression (forge `t_fca66994`): two inputs, A with a
+    /// live row and B with a tombstone that purges it, compacted together and
+    /// then crashed after retiring only B. Without T-023, restart discovers
+    /// the purged-tombstone output alongside the still-live A and the row
+    /// comes back. With it, startup finishes retiring A and the row stays
+    /// dead.
+    #[tokio::test]
+    async fn compaction_reconcile_resurrection_regression_row_stays_dead_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let rt = tokio::runtime::Handle::current();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let engine = Arc::new(
+            StorageEngine::new_with_upload_store(
+                config,
+                Arc::clone(&store),
+                "test-node".to_string(),
+                &rt,
+            )
+            .unwrap(),
+        );
+        let tid = table_id();
+        engine.register_table(dead_partition_schema()).unwrap();
+
+        // Input A (flush 1): "dead" holds a live row, plus an unrelated live
+        // partition so the compaction's output is not entirely purged away
+        // (which would make the executor keep one unpurged partition instead
+        // -- `compaction_purge_held_back_total`).
+        engine
+            .write(&tid, &make_key("live"), make_row(b"v", 1000), 1000)
+            .unwrap();
+        engine
+            .write(&tid, &make_key("dead"), make_row(b"v", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Input B (flush 2): a partition tombstone for "dead", using purge.rs's
+        // real rules via `gc_grace_seconds = 0` and an ancient local deletion
+        // time, so it is genuinely purgeable rather than test-rigged.
+        engine
+            .write(
+                &tid,
+                &make_key("dead"),
+                partition_delete_row(2000, LONG_AGO_LDT),
+                2000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let (input_a, input_b) = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let mut metadata = engine.collect_sstable_metadata(&tid, state);
+            metadata.sort_by_key(|m| m.id.parse::<u64>().unwrap());
+            (metadata[0].clone(), metadata[1].clone())
+        };
+
+        // B first: the crash seam below retires whichever input is first.
+        let inputs = vec![input_b.clone(), input_a.clone()];
+        let purge = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            engine.purge_policy_for(&tid, state, &inputs)
+        };
+        assert!(purge.is_some(), "gc_grace_seconds=0 must enable purging");
+
+        let compaction_output_dir = dir.path().join("compaction").join(tid.to_string());
+        let task = crate::compaction::metadata::CompactionTask {
+            inputs,
+            output_dir: compaction_output_dir,
+            schema: dead_partition_schema(),
+            table_id: tid.clone(),
+            purge,
+        };
+        engine.compaction_executor.submit(task).unwrap();
+
+        let compaction_dir = dir.path().join("compaction");
+        for _ in 0..80 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if compaction_dir.exists()
+                && std::fs::read_dir(&compaction_dir)
+                    .ok()
+                    .map(|mut rd| rd.any(|_| true))
+                    .unwrap_or(false)
+            {
+                break;
+            }
+        }
+
+        // Simulate a crash after retiring only B (the tombstone holder): the
+        // real `poll_compactions` runs inside a spawned task, so the panic the
+        // seam raises is caught by `tokio::spawn` as a `JoinError` instead of
+        // failing this test -- exactly what a process crash looks like, since
+        // no code past the panic point ever runs (no phase=Retired write, no
+        // record deletion).
+        let mut crashed = false;
+        for _ in 0..40 {
+            let poll_engine = Arc::clone(&engine);
+            let joined = tokio::spawn(
+                TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+                    .scope(1, async move { poll_engine.poll_compactions().await }),
+            )
+            .await;
+            if joined.is_err() {
+                crashed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            crashed,
+            "the crash seam must panic once the compaction result is available, to simulate a crash"
+        );
+
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+        assert!(
+            StorageEngine::generation_component_path(&sstable_dir, &input_b.id, "Data.db")
+                .is_none(),
+            "B (the tombstone holder) must be retired before the simulated crash"
+        );
+        assert!(
+            StorageEngine::generation_component_path(&sstable_dir, &input_a.id, "Data.db")
+                .is_some(),
+            "A (the row holder) must survive the simulated crash"
+        );
+
+        // Restart: drop the crashed engine first so a fresh instance can open
+        // the same data dir, then rediscover from disk exactly as a real
+        // restart would.
+        drop(engine);
+        let rt2 = tokio::runtime::Handle::current();
+        let config2 = StorageEngineConfig::test_config(dir.path());
+        let engine2 =
+            StorageEngine::new_with_upload_store(config2, store, "test-node".to_string(), &rt2)
+                .unwrap();
+        engine2.register_table(dead_partition_schema()).unwrap();
+
+        let partition = engine2.read(&tid, &make_key("dead")).unwrap();
+        let resurrected = partition
+            .map(|p| !p.rows.is_empty() || p.static_row.is_some())
+            .unwrap_or(false);
+        assert!(
+            !resurrected,
+            "dead's row must NOT resurrect after the crash and restart (forge t_fca66994)"
+        );
+
+        let live_partition = engine2.read(&tid, &make_key("live")).unwrap();
+        assert!(
+            live_partition.is_some_and(|p| !p.rows.is_empty()),
+            "unrelated live data must survive reconciliation"
+        );
+
+        assert!(
+            StorageEngine::generation_component_path(&sstable_dir, &input_a.id, "Data.db")
+                .is_none(),
+            "startup reconciliation must finish retiring A"
+        );
+        let records = leftover_intent_records(&sstable_dir);
+        assert_eq!(records.len(), 1, "S3 convergence still owns the record");
+        let record = crate::compaction::intent::CompactionIntentRecord::read_at(&records[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Retired
+        );
+    }
+
+    #[test]
+    fn compaction_reconcile_rolls_back_when_output_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        // An input that is still live -- rollback must leave it exactly alone.
+        std::fs::write(table_dir.join("3-Data.db"), b"still here").unwrap();
+
+        let record = crate::compaction::intent::CompactionIntentRecord {
+            task_id: "50".to_string(),
+            output_gen: "51".to_string(), // never promoted; no such generation exists
+            output_digest: 123,
+            inputs: vec!["3".to_string(), "4".to_string()],
+            phase: crate::compaction::intent::CompactionIntentPhase::Promoting,
+        };
+        record.write(&table_dir).unwrap();
+
+        let before = crate::metrics::compaction_reconcile_rolled_back_total();
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+
+        assert!(
+            leftover_intent_records(&table_dir).is_empty(),
+            "a record whose output was never promoted must be deleted"
+        );
+        assert!(
+            table_dir.join("3-Data.db").exists(),
+            "rollback must leave a still-live input untouched"
+        );
+        assert!(crate::metrics::compaction_reconcile_rolled_back_total() > before);
+    }
+
+    #[test]
+    fn compaction_reconcile_quarantines_digest_mismatch_and_keeps_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        let gen_dir = table_dir.join("5");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(gen_dir.join("5-Data.db"), b"promoted but corrupted").unwrap();
+        std::fs::write(
+            gen_dir.join("5-Digest.crc32"),
+            ferrosa_sstable::checksum::format_digest(12345),
+        )
+        .unwrap();
+        std::fs::write(table_dir.join("3-Data.db"), b"an input").unwrap();
+
+        let record = crate::compaction::intent::CompactionIntentRecord {
+            task_id: "99".to_string(),
+            output_gen: "5".to_string(),
+            output_digest: 999, // does not match the 12345 written above
+            inputs: vec!["3".to_string(), "4".to_string()],
+            phase: crate::compaction::intent::CompactionIntentPhase::Swapped,
+        };
+        record.write(&table_dir).unwrap();
+
+        let before = crate::metrics::compaction_reconcile_digest_mismatch_total();
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+
+        assert!(
+            !gen_dir.exists(),
+            "a digest-mismatched output must never be left live"
+        );
+        assert!(
+            table_dir.join("quarantine").join("5-Data.db").exists(),
+            "the quarantined component must land in quarantine/"
+        );
+        assert!(
+            leftover_intent_records(&table_dir).is_empty(),
+            "the record must be deleted after quarantining its output"
+        );
+        assert!(
+            table_dir.join("3-Data.db").exists(),
+            "inputs must be kept live on a digest mismatch"
+        );
+        assert!(crate::metrics::compaction_reconcile_digest_mismatch_total() > before);
+    }
+
+    #[test]
+    fn compaction_reconcile_sweeps_promote_star_debris_and_stale_intent_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        let promote_debris = table_dir.join(".promote-1234-abcd");
+        std::fs::create_dir_all(&promote_debris).unwrap();
+        std::fs::write(promote_debris.join("1234-Data.db"), b"partial").unwrap();
+
+        let tmp_intent = table_dir.join(".compaction-77.intent.tmp");
+        std::fs::write(&tmp_intent, b"{}").unwrap();
+
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+
+        assert!(
+            !promote_debris.exists(),
+            "leftover .promote-* staging must be swept at startup (window B)"
+        );
+        assert!(
+            !tmp_intent.exists(),
+            "a stale .intent.tmp left by an interrupted record write must be swept too"
+        );
+    }
+
+    #[test]
+    fn compaction_reconcile_no_records_is_a_noop_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("7-Data.db"), b"an ordinary live generation").unwrap();
+
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+
+        assert!(
+            table_dir.join("7-Data.db").exists(),
+            "a table dir with no replacement records must be left untouched"
+        );
+    }
+
     #[test]
     fn compaction_promotion_preserves_other_pending_outputs_in_shared_staging_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -21650,8 +24587,7 @@ mod tests {
         let output_a = write_fake_compaction_output(&compaction_dir, "101");
         let output_b = write_fake_compaction_output(&compaction_dir, "202");
 
-        let promoted_a = engine
-            .promote_compaction_output(&tid, &output_a)
+        let promoted_a = promote_via_reserve(&engine, &tid, &output_a)
             .expect("first compaction output should promote");
         assert!(
             promoted_a
@@ -21677,8 +24613,7 @@ mod tests {
             );
         }
 
-        let promoted_b = engine
-            .promote_compaction_output(&tid, &output_b)
+        let promoted_b = promote_via_reserve(&engine, &tid, &output_b)
             .expect("second output should still promote after the first output");
         assert!(
             promoted_b
@@ -21953,20 +24888,22 @@ mod tests {
             engine.compaction_executor.submit(task).unwrap();
         }
 
-        // Wait for executor to finish writing output files.
-        let compaction_dir = dir.path().join("compaction");
-        for _ in 0..60 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists() {
-                let has_output = std::fs::read_dir(&compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false);
-                if has_output {
-                    break;
-                }
-            }
-        }
+        // Wait for the executor to finish, on the deterministic completion
+        // signal rather than racing the filesystem (T-091): a file can
+        // appear under compaction/ while the executor is still mid-write,
+        // and this call site polls compactions exactly once afterward with
+        // no retry, so an early wakeup here would fail the upload assertion
+        // below outright rather than merely racing it.
+        let compaction_completed = engine
+            .compaction_executor
+            .wait_for_result(std::time::Duration::from_secs(120))
+            .await;
+        assert!(
+            compaction_completed,
+            "compaction task did not complete within 120s; executor state: \
+             pending_result_count={}",
+            engine.compaction_executor.pending_result_count()
+        );
         engine.poll_compactions().await;
 
         // Verify the output is in S3.
@@ -22269,20 +25206,20 @@ mod tests {
             );
         }
 
-        // Wait for the compaction executor background thread to finish.
-        let compaction_dir = dir.path().join("compaction");
-        for _ in 0..60 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists() {
-                let has_output = std::fs::read_dir(&compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false);
-                if has_output {
-                    break;
-                }
-            }
-        }
+        // Wait for the compaction executor background thread to finish, on
+        // the deterministic completion signal rather than racing the
+        // filesystem (T-091): a file can appear under compaction/ while the
+        // executor is still mid-write.
+        let compaction_completed = engine
+            .compaction_executor
+            .wait_for_result(std::time::Duration::from_secs(120))
+            .await;
+        assert!(
+            compaction_completed,
+            "compaction task did not complete within 120s; executor state: \
+             pending_result_count={}",
+            engine.compaction_executor.pending_result_count()
+        );
 
         // ── poll_compactions: upload, manifest update, local eviction ──
         //
@@ -26572,4 +29509,151 @@ mod tests {
              inputs)"
         );
     }
+
+    /// Slow tests: excluded from PR CI (`--skip ::slow::`), compiled under
+    /// `--all-features` but only run by `nightly-slow-tests.yml`. See the
+    /// `slow-tests` feature in Cargo.toml.
+    #[cfg(feature = "slow-tests")]
+    mod slow {
+        use super::*;
+
+        /// CI-sized regression for production high-volume ingest: many rows to the
+        /// same partition key with flush_if_needed triggering automatically based on
+        /// size. Keep this below the bounded-read/materialization cap; full
+        /// production-volume verification belongs on streaming/paged paths.
+        #[test]
+        fn high_volume_ingest_with_auto_flush_preserves_all_rows() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = StorageEngineConfig {
+                flush_threshold_bytes: 4096, // 4KB — will trigger every ~50-100 rows
+                flush_max_age_secs: 1,
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+            let engine = StorageEngine::new(config, None).unwrap();
+            let tid = table_id();
+            engine.register_table(test_schema()).unwrap();
+
+            let pk = make_key("tenant_session"); // same partition for all rows
+            let total = 2_000;
+
+            for i in 0..total {
+                let row = Row {
+                    clustering: (i as i32).to_be_bytes().to_vec(),
+                    cells: vec![(
+                        0,
+                        CellValue::live(format!("entity_{i}").into_bytes(), (i + 1) as i64),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+                };
+                engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+
+                // Simulate the background flush loop calling flush_if_needed
+                // every 100 writes (production runs on a timer)
+                if (i + 1) % 100 == 0 {
+                    engine.flush_if_needed().unwrap();
+                }
+            }
+
+            // Final flush
+            engine.flush(&tid).unwrap();
+
+            // ALL 11,000 rows MUST be present
+            let result = engine.read(&tid, &pk).unwrap();
+            assert!(result.is_some(), "partition must exist");
+            let actual = result.unwrap().rows.len();
+            assert_eq!(
+                actual,
+                total,
+                "DATA LOSS: expected {total} rows after high-volume ingest, got {actual}. \
+                 {} rows lost during flush_if_needed cycles.",
+                total - actual
+            );
+        }
+
+        /// Concurrent writes + flush from separate thread.
+        #[test]
+        fn concurrent_write_and_flush_threads_preserve_all_rows() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = StorageEngineConfig {
+                flush_threshold_bytes: 2048,
+                flush_max_age_secs: 1,
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+            let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+            let tid = table_id();
+            engine.register_table(test_schema()).unwrap();
+
+            let pk = make_key("concurrent_pk");
+            let total = 5_000usize;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Background flush thread
+            let flush_engine = Arc::clone(&engine);
+            let flush_tid = tid.clone();
+            let flush_stop = Arc::clone(&stop);
+            let flush_handle = std::thread::spawn(move || {
+                let mut count = 0u64;
+                while !flush_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = flush_engine.flush_if_needed();
+                    count += 1;
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                let _ = flush_engine.flush(&flush_tid);
+                count
+            });
+
+            // Writer
+            for i in 0..total {
+                let row = Row {
+                    clustering: (i as i32).to_be_bytes().to_vec(),
+                    cells: vec![(
+                        0,
+                        CellValue::live(format!("r{i}").into_bytes(), (i + 1) as i64),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+                };
+                engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+            }
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let flush_count = flush_handle.join().unwrap();
+            engine.flush(&tid).unwrap();
+
+            let result = engine.read(&tid, &pk).unwrap();
+            assert!(result.is_some(), "partition must exist");
+            let actual = result.unwrap().rows.len();
+            assert_eq!(
+                actual,
+                total,
+                "DATA LOSS: {total} rows written with {flush_count} concurrent flushes, \
+                 got {actual}. {} lost.",
+                total - actual
+            );
+        }
+
+        /// E4 (slow): Commit-log replay PITR — spec acceptance criterion #2
+        /// mandates exactly 1 000 pre-snapshot rows and 1 000 post-snapshot rows.
+        ///
+        /// Behind the `slow-tests` feature because the archiver poll loop and
+        /// 2 000 individual commit-log writes with a 256-byte segment size take
+        /// ~60-90s on a typical CI runner. Run explicitly with:
+        ///
+        /// ```sh
+        /// cargo test -p ferrosa-storage --features slow-tests -- ::slow::e4_slow_pitr_commit_log_replay_1k_plus_1k
+        /// ```
+        ///
+        /// Uses the identical code path as the fast 100-row variant; only the row
+        /// count differs.
+        #[test]
+        fn e4_slow_pitr_commit_log_replay_1k_plus_1k() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(run_pitr_replay_e2e(1_000));
+        }
+    }
+    include!("engine_backpressure_tests.rs");
 }

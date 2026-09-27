@@ -2338,6 +2338,7 @@ dependencies = [
 name = "ferrosa-common"
 version = "0.22.0"
 dependencies = [
+ "crossbeam-channel",
  "num-bigint",
  "proptest",
  "serde",
@@ -2373,7 +2374,7 @@ dependencies = [
  "hmac 0.12.1",
  "indexmap 2.14.0",
  "libc",
- "lz4_flex",
+ "lz4_flex 0.11.6",
  "md-5 0.11.0",
  "memchr",
  "moka",
@@ -2590,7 +2591,7 @@ dependencies = [
  "ferrosa-common",
  "futures",
  "hmac 0.12.1",
- "lz4_flex",
+ "lz4_flex 0.11.6",
  "parking_lot 0.12.5",
  "proptest",
  "rand 0.10.1",
@@ -2757,13 +2758,16 @@ name = "ferrosa-sstable"
 version = "0.22.0"
 dependencies = [
  "crc32fast",
+ "crossbeam-channel",
  "ferrosa-common",
  "libc",
+ "loom",
  "lru",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "memmap2",
  "proptest",
  "rayon",
+ "sha2 0.10.9",
  "tempfile",
  "tracing",
  "zstd",
@@ -2777,6 +2781,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "crc32fast",
+ "crossbeam-channel",
  "crossbeam-skiplist",
  "dashmap",
  "ferrosa-cdc",
@@ -3061,6 +3066,21 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+]
+
+[[package]]
+name = "generator"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54ade96dc9003043bce7c035c85a9df5a858bfb2039c5a2e6fdf00f324f6c551"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "log",
+ "rustversion",
+ "windows-link",
+ "windows-result",
 ]
 
 [[package]]
@@ -4035,6 +4055,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "loom"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
+dependencies = [
+ "cfg-if",
+ "generator",
+ "scoped-tls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lru"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4054,6 +4087,15 @@ name = "lz4_flex"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
 ]
@@ -6418,6 +6460,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6470,7 +6518,7 @@ dependencies = [
  "bytes",
  "chrono",
  "itertools 0.14.0",
- "lz4_flex",
+ "lz4_flex 0.11.6",
  "scylla-macros",
  "snap",
  "stable_deref_trait",

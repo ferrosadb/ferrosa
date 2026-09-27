@@ -1115,7 +1115,8 @@ fn open_reader(dir: &Path, gen: u64) -> Result<SSTableReader<FileReadAt>, CtlErr
     let filter = std::fs::read(comp("Filter.db")).unwrap_or_default();
     let statistics = std::fs::read(comp("Statistics.db")).unwrap_or_default();
     let compression_info = std::fs::read(comp("CompressionInfo.db")).ok();
-    let reader = SSTableReader::open(SSTableComponents {
+    let is_compressed = compression_info.is_some();
+    let mut reader = SSTableReader::open(SSTableComponents {
         data,
         partitions,
         rows,
@@ -1123,6 +1124,21 @@ fn open_reader(dir: &Path, gen: u64) -> Result<SSTableReader<FileReadAt>, CtlErr
         compression_info,
         statistics,
     })?;
+
+    // Digest.crc32/CRC.db, when present, so `ferrosa-ctl sstable verify` and
+    // friends can actually check them instead of opening a reader that never
+    // had them loaded (T-012; `publication-safety.md` M1/M5). Tolerant of
+    // either being absent -- an SSTable written before T-011 has neither, and
+    // must keep opening.
+    let digest_path = comp("Digest.crc32");
+    let crc_path = comp("CRC.db");
+    ferrosa_sstable::reader::load_checksums_if_present(
+        &mut reader,
+        &gen.to_string(),
+        Some(&digest_path),
+        if is_compressed { None } else { Some(&crc_path) },
+    );
+
     Ok(reader)
 }
 
@@ -1262,6 +1278,39 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "Data.db" && c.present),
             "Data.db component reported present"
+        );
+    }
+
+    /// `open_reader` must load `Digest.crc32`/`CRC.db` automatically when
+    /// they exist, so `ferrosa-ctl sstable verify` can actually check them
+    /// (T-012; this call site previously never loaded them).
+    #[test]
+    fn digest_verify_open_reader_loads_digest_when_present() {
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(1);
+        let gen = StorageEngine::list_generations_in_dir(&table_dir)[0];
+        let reader = open_reader(&table_dir, gen).unwrap();
+        assert!(
+            reader.digest_loaded(),
+            "open_reader must load Digest.crc32 when the file exists"
+        );
+    }
+
+    /// An SSTable written before T-011 has no `Digest.crc32`/`CRC.db`.
+    /// `open_reader` must still open it (`publication-safety.md` M1), just
+    /// without reporting checksums as loaded.
+    #[test]
+    fn digest_verify_open_reader_tolerates_missing_digest() {
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(1);
+        let gen = StorageEngine::list_generations_in_dir(&table_dir)[0];
+        let gdir = resolve_gen_dir(&table_dir, gen).unwrap();
+        std::fs::remove_file(gdir.join(format!("{gen}-Digest.crc32"))).unwrap();
+        let _ = std::fs::remove_file(gdir.join(format!("{gen}-CRC.db")));
+
+        let reader = open_reader(&table_dir, gen)
+            .expect("an old SSTable without Digest.crc32 must still open");
+        assert!(
+            !reader.digest_loaded(),
+            "a generation with no Digest.crc32 file must not report a loaded digest"
         );
     }
 

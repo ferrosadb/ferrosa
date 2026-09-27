@@ -1,10 +1,12 @@
 //! Module: Record and render bounded process-wide storage telemetry.
 //! Correctness: Correct when counters are monotonic, gauges reflect complete
 //! operations, and observation never allocates in storage hot paths.
-//! Last revised: 2026-09-01
-//! Last changed: Added maximum and high-threshold SSTable read-fanout signals.
+//! Last revised: 2026-09-26
+//! Last changed: Export a bounded gauge for tables paused after digest failures.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 #[derive(Clone, Copy)]
@@ -266,6 +268,53 @@ const WRITE_FAILURE_REASONS: [WriteFailureReason; 5] = [
     WriteFailureReason::MemtableWrite,
 ];
 
+/// Why `FileFlushTarget::flush_files` refused to publish a staged SSTable
+/// generation (`publication-safety.md` M2). Every reason ends the same way:
+/// the `.tmp` component set is moved to `quarantine/` instead of being
+/// promoted to a live name, so a startup scan never has to reason about it.
+#[derive(Clone, Copy)]
+pub enum PublicationRefusedReason {
+    /// A staged `.tmp` component's on-disk length disagreed with the length
+    /// the writer recorded for it.
+    LengthMismatch,
+    /// A staged `.tmp` component could not be fsynced durable before verify.
+    Fsync,
+    /// The recomputed `Digest.crc32` over the staged `.tmp` Data.db (read back
+    /// from disk) disagreed with the producer's value (`publication-safety.md`
+    /// M2 step 4 / M3, T-012). Runs unconditionally in flush and compaction —
+    /// there is no environment variable that disables it.
+    DigestMismatch,
+    /// The pre-promote readback walk over the `.tmp` component set failed.
+    ReadbackFailed,
+}
+
+impl PublicationRefusedReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LengthMismatch => "length_mismatch",
+            Self::Fsync => "fsync",
+            Self::DigestMismatch => "digest_mismatch",
+            Self::ReadbackFailed => "readback_failed",
+        }
+    }
+
+    fn idx(self) -> usize {
+        match self {
+            Self::LengthMismatch => 0,
+            Self::Fsync => 1,
+            Self::DigestMismatch => 2,
+            Self::ReadbackFailed => 3,
+        }
+    }
+}
+
+const PUBLICATION_REFUSED_REASONS: [PublicationRefusedReason; 4] = [
+    PublicationRefusedReason::LengthMismatch,
+    PublicationRefusedReason::Fsync,
+    PublicationRefusedReason::DigestMismatch,
+    PublicationRefusedReason::ReadbackFailed,
+];
+
 static FLUSH_PHASE_MICROS_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static FLUSH_PHASE_COUNT_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -275,6 +324,55 @@ static FLUSH_PARTITIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLUSH_LAST_BYTES: AtomicU64 = AtomicU64::new(0);
 static FLUSH_LAST_ROWS: AtomicU64 = AtomicU64::new(0);
 static FLUSH_LAST_PARTITIONS: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_DELAYED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_DELAY_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_DELAY_COUNT: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_DELAY_BUCKETS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static WRITE_ADMISSION_REJECTED_HARD_MEMTABLE: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_REJECTED_HARD_FLUSH_LAG: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_PRESSURE_BY_TABLE: OnceLock<Mutex<HashMap<String, Vec<Weak<AtomicU64>>>>> =
+    OnceLock::new();
+const WRITE_ADMISSION_DELAY_BUCKET_MS: [u64; 6] = [1, 5, 10, 25, 50, 1_000];
+
+/// Registers a table's pressure gauge. Registration happens once per table,
+/// while per-write updates use only the gauge's atomic value.
+pub fn register_write_admission_pressure(label: String, gauge: &Arc<AtomicU64>) {
+    let registry = WRITE_ADMISSION_PRESSURE_BY_TABLE.get_or_init(Default::default);
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(label)
+        .or_default()
+        .push(Arc::downgrade(gauge));
+}
+
+pub fn inc_write_admission_delayed() {
+    WRITE_ADMISSION_DELAYED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn observe_write_admission_delay(duration: Duration) {
+    let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+    WRITE_ADMISSION_DELAY_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    WRITE_ADMISSION_DELAY_COUNT.fetch_add(1, Ordering::Relaxed);
+    let millis = duration.as_millis().min(u64::MAX as u128) as u64;
+    for (index, bound) in WRITE_ADMISSION_DELAY_BUCKET_MS.iter().enumerate() {
+        if millis <= *bound {
+            WRITE_ADMISSION_DELAY_BUCKETS[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn inc_write_admission_rejected(reason: &'static str) {
+    match reason {
+        "hard_memtable" => {
+            WRITE_ADMISSION_REJECTED_HARD_MEMTABLE.fetch_add(1, Ordering::Relaxed);
+        }
+        "hard_flush_lag" => {
+            WRITE_ADMISSION_REJECTED_HARD_FLUSH_LAG.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
 
 static UPLOAD_PHASE_MICROS_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static UPLOAD_PHASE_COUNT_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
@@ -292,6 +390,17 @@ static COMPACTION_SKIPPED_OVERLAP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_PAUSED_TABLES: AtomicU64 = AtomicU64::new(0);
+/// Compaction tasks that returned `Err` because their `CancelToken` was
+/// cancelled (T-021), as distinct from an ordinary failure.
+static COMPACTION_RETIRE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_CANCELLED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Sum, count and max of the latency from `CancelToken::cancel()` to the
+/// checkpoint that observed it and returned `Err` (T-021,
+/// `compaction_cancel_latency_seconds`).
+static COMPACTION_CANCEL_LATENCY_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_CANCEL_LATENCY_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_CANCEL_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_RUNNING: AtomicU64 = AtomicU64::new(0);
@@ -318,6 +427,22 @@ static COMPACTION_PURGE_HELD_BACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Compactions that ran without purging because the table's `gc_grace_seconds`
 /// could not be read. Non-zero means a table option is corrupt; alert on it.
 static COMPACTION_PURGE_POLICY_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Compactions rolled back after their replacement record committed but before
+/// retirement (reader-open, sidecar-merge, or swap failure) -- T-022.
+static COMPACTION_INTENT_ROLLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Startup reconciliations that rolled a `Promoting` record back because its
+/// output was never promoted -- T-023.
+static COMPACTION_RECONCILE_ROLLED_BACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Startup reconciliations that rolled a record forward, retiring whichever of
+/// its listed inputs a crash had left live -- T-023 (the resurrection fix).
+static COMPACTION_RECONCILE_ROLLED_FORWARD_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Startup reconciliations that found a promoted output whose `Digest.crc32`
+/// did not match the record and quarantined it. Non-zero means promoted bytes
+/// were corrupted after the fact; alert on it.
+static COMPACTION_RECONCILE_DIGEST_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Startup reconciliations that found a `.compaction-*.intent` file present
+/// but unparseable. Left in place for operator inspection; alert on it.
+static COMPACTION_RECONCILE_UNREADABLE_RECORD_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static WRITE_PHASE_MICROS_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static WRITE_PHASE_MICROS_MAX: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
@@ -325,6 +450,7 @@ static WRITE_PHASE_COUNT_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7
 static WRITE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURE_REASON_TOTAL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static SSTABLE_PUBLICATION_REFUSED_TOTAL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static WRITE_INLINE_FLUSH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_SIZE_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_FLUSH_THRESHOLD_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -457,9 +583,50 @@ pub fn inc_compaction_failed() {
     COMPACTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Set the process-wide count of tables paused after digest verification failures.
+pub fn inc_compaction_paused_tables() {
+    COMPACTION_PAUSED_TABLES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Decrement the process-wide count when a digest pause guard is released.
+pub fn dec_compaction_paused_tables() {
+    let _ = COMPACTION_PAUSED_TABLES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        Some(count.saturating_sub(1))
+    });
+}
+
 /// Record a compaction input reader obtained through the engine-wide reader
 /// pool (FMEA #11). Called once per input SSTable per task when the executor is
 /// pool-routed.
+/// Records a compaction task cancelled rather than failed (T-021).
+pub fn inc_compaction_cancelled() {
+    COMPACTION_CANCELLED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one failed retirement operation; its intent remains available for replay.
+pub fn inc_compaction_retire_failures() {
+    COMPACTION_RETIRE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records the latency from `CancelToken::cancel()` to the checkpoint that
+/// observed it (`compaction_cancel_latency_seconds`).
+pub fn observe_compaction_cancel_latency(duration: Duration) {
+    let micros = duration_micros(duration);
+    COMPACTION_CANCEL_LATENCY_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    COMPACTION_CANCEL_LATENCY_COUNT.fetch_add(1, Ordering::Relaxed);
+    update_max_u64(&COMPACTION_CANCEL_LATENCY_MICROS_MAX, micros);
+}
+
+#[cfg(test)]
+pub fn compaction_cancelled_total() -> u64 {
+    COMPACTION_CANCELLED_TOTAL.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn compaction_cancel_latency_count() -> u64 {
+    COMPACTION_CANCEL_LATENCY_COUNT.load(Ordering::Relaxed)
+}
+
 pub fn inc_compaction_pool_input_opens() {
     COMPACTION_POOL_INPUT_OPENS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -494,6 +661,63 @@ pub fn inc_compaction_purge_held_back() {
 /// Times a compaction wrote a fully-purged partition because nothing else survived.
 pub fn compaction_purge_held_back_total() -> u64 {
     COMPACTION_PURGE_HELD_BACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a compaction rolled back after its replacement record committed
+/// (T-022): the promoted directory was removed, the record deleted, and the
+/// inputs left untouched.
+pub fn inc_compaction_intent_rollback() {
+    COMPACTION_INTENT_ROLLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total post-commit compaction rollbacks since startup.
+pub fn compaction_intent_rollback_total() -> u64 {
+    COMPACTION_INTENT_ROLLBACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a startup reconciliation that rolled a `Promoting` record back
+/// (T-023): its output was never promoted, so the record was deleted and its
+/// inputs left live.
+pub fn inc_compaction_reconcile_rolled_back() {
+    COMPACTION_RECONCILE_ROLLED_BACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total startup roll-backs since startup.
+pub fn compaction_reconcile_rolled_back_total() -> u64 {
+    COMPACTION_RECONCILE_ROLLED_BACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a startup reconciliation that rolled a record forward: the output
+/// matched its digest, so every input still on disk was retired.
+pub fn inc_compaction_reconcile_rolled_forward() {
+    COMPACTION_RECONCILE_ROLLED_FORWARD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total startup roll-forwards since startup -- the resurrection fix firing.
+pub fn compaction_reconcile_rolled_forward_total() -> u64 {
+    COMPACTION_RECONCILE_ROLLED_FORWARD_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a startup reconciliation that quarantined a promoted output whose
+/// `Digest.crc32` did not match its record.
+pub fn inc_compaction_reconcile_digest_mismatch() {
+    COMPACTION_RECONCILE_DIGEST_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total digest-mismatch quarantines found by startup reconciliation.
+pub fn compaction_reconcile_digest_mismatch_total() -> u64 {
+    COMPACTION_RECONCILE_DIGEST_MISMATCH_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a startup reconciliation that found an unparseable
+/// `.compaction-*.intent` file and left it in place for operator inspection.
+pub fn inc_compaction_reconcile_unreadable_record() {
+    COMPACTION_RECONCILE_UNREADABLE_RECORD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total unreadable compaction intent records found by startup reconciliation.
+pub fn compaction_reconcile_unreadable_record_total() -> u64 {
+    COMPACTION_RECONCILE_UNREADABLE_RECORD_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Total compaction input readers obtained via the reader pool since startup.
@@ -606,6 +830,17 @@ pub fn inc_write_inline_flush() {
     WRITE_INLINE_FLUSH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+/// A staged SSTable generation was refused publication and quarantined
+/// instead of promoted (`publication-safety.md` M2, FMEA F13/ST-27).
+pub fn inc_sstable_publication_refused(reason: PublicationRefusedReason) {
+    SSTABLE_PUBLICATION_REFUSED_TOTAL[reason.idx()].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn sstable_publication_refused_total(reason: PublicationRefusedReason) -> u64 {
+    SSTABLE_PUBLICATION_REFUSED_TOTAL[reason.idx()].load(Ordering::Relaxed)
+}
+
 pub fn set_memtable_thresholds(flush_threshold_bytes: u64, backpressure_bytes: u64) {
     MEMTABLE_FLUSH_THRESHOLD_BYTES.store(flush_threshold_bytes, Ordering::Relaxed);
     MEMTABLE_BACKPRESSURE_BYTES.store(backpressure_bytes, Ordering::Relaxed);
@@ -708,6 +943,15 @@ pub fn render_prometheus() -> String {
             WRITE_FAILURE_REASON_TOTAL[reason.idx()].load(Ordering::Relaxed)
         ));
     }
+    out.push_str("# HELP ferrosa_storage_sstable_publication_refused_total Staged SSTable generations refused publication and quarantined instead of promoted.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_publication_refused_total counter\n");
+    for reason in PUBLICATION_REFUSED_REASONS {
+        out.push_str(&format!(
+            "ferrosa_storage_sstable_publication_refused_total{{reason=\"{}\"}} {}\n",
+            reason.label(),
+            SSTABLE_PUBLICATION_REFUSED_TOTAL[reason.idx()].load(Ordering::Relaxed)
+        ));
+    }
     out.push_str("# HELP ferrosa_storage_write_inline_flush_total StorageEngine::write calls that synchronously ran a memtable flush.\n");
     out.push_str("# TYPE ferrosa_storage_write_inline_flush_total counter\n");
     out.push_str(&format!(
@@ -732,6 +976,66 @@ pub fn render_prometheus() -> String {
         "ferrosa_storage_memtable_backpressure_bytes {}\n",
         MEMTABLE_BACKPRESSURE_BYTES.load(Ordering::Relaxed)
     ));
+    out.push_str("# HELP ferrosa_storage_write_admission_delayed_total CQL writes delayed in the soft-pressure zone.\n");
+    out.push_str("# TYPE ferrosa_storage_write_admission_delayed_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_write_admission_delayed_total {}\n",
+        WRITE_ADMISSION_DELAYED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_write_admission_delay_seconds Soft-pressure wait duration.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_write_admission_delay_seconds histogram\n");
+    for (index, bound) in WRITE_ADMISSION_DELAY_BUCKET_MS.iter().enumerate() {
+        out.push_str(&format!(
+            "ferrosa_storage_write_admission_delay_seconds_bucket{{le=\"{}\"}} {}\n",
+            *bound as f64 / 1_000.0,
+            WRITE_ADMISSION_DELAY_BUCKETS[index].load(Ordering::Relaxed)
+        ));
+    }
+    out.push_str(&format!(
+        "ferrosa_storage_write_admission_delay_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        WRITE_ADMISSION_DELAY_COUNT.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "ferrosa_storage_write_admission_delay_seconds_sum {:.6}\nferrosa_storage_write_admission_delay_seconds_count {}\n",
+        WRITE_ADMISSION_DELAY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        WRITE_ADMISSION_DELAY_COUNT.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_write_admission_rejected_total Writes rejected at hard pressure by reason.\n");
+    out.push_str("# TYPE ferrosa_storage_write_admission_rejected_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_write_admission_rejected_total{{reason=\"hard_memtable\"}} {}\nferrosa_storage_write_admission_rejected_total{{reason=\"hard_flush_lag\"}} {}\n",
+        WRITE_ADMISSION_REJECTED_HARD_MEMTABLE.load(Ordering::Relaxed),
+        WRITE_ADMISSION_REJECTED_HARD_FLUSH_LAG.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_write_pressure_ratio Per-table maximum of memtable and write-pump pressure, quantized to percentage points.\n");
+    out.push_str("# TYPE ferrosa_storage_write_pressure_ratio gauge\n");
+    if let Some(registry) = WRITE_ADMISSION_PRESSURE_BY_TABLE.get() {
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.retain(|label, gauges| {
+            gauges.retain(|gauge| gauge.strong_count() > 0);
+            if !gauges.is_empty() {
+                let value = gauges
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .map(|gauge| gauge.load(Ordering::Relaxed))
+                    .max()
+                    .unwrap_or(0);
+                let escaped = label
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                out.push_str(&format!(
+                    "ferrosa_storage_write_pressure_ratio{{table=\"{escaped}\"}} {:.2}\n",
+                    value as f64 / 100.0
+                ));
+            }
+            !gauges.is_empty()
+        });
+    }
     out.push_str("# HELP ferrosa_storage_write_phase_seconds_total Total wall time spent in StorageEngine::write phases.\n");
     out.push_str("# TYPE ferrosa_storage_write_phase_seconds_total counter\n");
     out.push_str("# HELP ferrosa_storage_write_phase_seconds_max Maximum observed wall time for a StorageEngine::write phase.\n");
@@ -900,6 +1204,42 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_compaction_failed_total {}\n",
         COMPACTION_FAILED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_paused_tables Tables paused after repeated output digest or verification failures.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_paused_tables gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_paused_tables {}\n",
+        COMPACTION_PAUSED_TABLES.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_retire_failures_total Input retirement failures retained for reconciliation.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_retire_failures_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_retire_failures_total {}\n",
+        COMPACTION_RETIRE_FAILURES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_cancelled_total Compaction tasks that returned Err because their CancelToken was cancelled.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_cancelled_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_cancelled_total {}\n",
+        COMPACTION_CANCELLED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_cancel_latency_seconds_sum Total latency from CancelToken::cancel() to the checkpoint that observed it.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_cancel_latency_seconds_sum counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_cancel_latency_seconds_sum {}\n",
+        COMPACTION_CANCEL_LATENCY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_cancel_latency_seconds_count Observations of compaction cancel latency.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_cancel_latency_seconds_count counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_cancel_latency_seconds_count {}\n",
+        COMPACTION_CANCEL_LATENCY_COUNT.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_cancel_latency_seconds_max Maximum observed compaction cancel latency.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_cancel_latency_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_cancel_latency_seconds_max {}\n",
+        COMPACTION_CANCEL_LATENCY_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
     ));
     out.push_str(
         "# HELP ferrosa_storage_compaction_queue_depth Compaction tasks waiting in executor queues.\n",
@@ -1481,6 +1821,24 @@ mod tests {
         // The counter is exported in the Prometheus text rendering.
         let text = render_prometheus();
         assert!(text.contains("ferrosa_storage_range_read_truncated_total"));
+    }
+
+    #[test]
+    fn write_admission_metrics_render_table_pressure_and_histogram() {
+        let gauge = Arc::new(AtomicU64::new(73));
+        register_write_admission_pressure("admission_test.unique".into(), &gauge);
+        observe_write_admission_delay(Duration::from_millis(7));
+        inc_write_admission_delayed();
+        inc_write_admission_rejected("hard_memtable");
+
+        let text = render_prometheus();
+        assert!(text.contains(
+            "ferrosa_storage_write_pressure_ratio{table=\"admission_test.unique\"} 0.73"
+        ));
+        assert!(text.contains("ferrosa_storage_write_admission_delay_seconds_bucket"));
+        assert!(text.contains("ferrosa_storage_write_admission_delayed_total"));
+        assert!(text
+            .contains("ferrosa_storage_write_admission_rejected_total{reason=\"hard_memtable\"}"));
     }
 
     #[test]

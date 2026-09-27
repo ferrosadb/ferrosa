@@ -20,7 +20,8 @@ impl ClusterCoordinator {
     pub async fn coordinate_truncate(&self, table_id: &TableId) -> crate::error::Result<()> {
         // 1. Truncate local storage first.
         self.storage
-            .truncate(table_id)
+            .truncate_and_wait(table_id)
+            .await
             .map_err(crate::error::ClusterError::Storage)?;
 
         // 2. Fan out to all remote nodes in the ring.

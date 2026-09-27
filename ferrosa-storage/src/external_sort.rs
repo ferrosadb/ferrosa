@@ -484,13 +484,6 @@ impl<T: SpillRow, C: SpillOrder<T>> KWayMerge<T, C> {
     }
 }
 
-/// Sort `rows` fully in memory (used by the fast path and as the reference).
-#[cfg(test)]
-pub(crate) fn sort_in_memory(mut rows: Vec<Row>, order: &RowOrder) -> Vec<Row> {
-    rows.sort_by(|a, b| order.compare(a, b));
-    rows
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,23 +542,6 @@ mod tests {
         assert_eq!(out, vec![9, 6, 5, 4, 3, 2, 1, 1]);
     }
 
-    /// Tiny deterministic LCG so this unit test needs no `rand` dependency.
-    /// (The full property test with `rand`/`proptest` lives in `ferrosa-cql`.)
-    struct Lcg(u64);
-    impl Lcg {
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            self.0
-        }
-        fn range(&mut self, lo: i64, hi: i64) -> i64 {
-            let span = (hi - lo) as u64;
-            lo + (self.next_u64() % span) as i64
-        }
-    }
-
     /// The point of the generic-ification (t_4ce82a3e): a FOREIGN row type with
     /// its OWN comparator reuses the spill/merge machinery and gets that
     /// comparator's ordering — not `CqlValue`'s. Models the graph executor's
@@ -616,65 +592,6 @@ mod tests {
             got,
             vec![1, 2, 3, 4, 5],
             "foreign comparator must order the merge"
-        );
-    }
-
-    #[test]
-    #[ignore = "slow (randomized spill/merge over many runs); runs in the nightly --ignored job"]
-    fn spilled_result_equals_in_memory_reference_randomized() {
-        let mut rng = Lcg(0xF355_0A5A);
-        let order = RowOrder::new(vec![(0, true)]);
-        for trial in 0..20 {
-            let n = rng.range(0, 2_000) as usize;
-            let rows: Vec<Row> = (0..n).map(|_| irow(rng.range(-1_000, 1_000))).collect();
-
-            let reference = sort_in_memory(rows.clone(), &order);
-
-            let dir = tempfile::tempdir().unwrap();
-            let mut s = ExternalSorter::new(dir.path(), order.clone(), 64);
-            for r in rows {
-                s.push(r).unwrap();
-            }
-            let got: Vec<Row> = s.finish().unwrap().map(|r| r.unwrap()).collect();
-
-            assert_eq!(
-                got.len(),
-                reference.len(),
-                "trial {trial}: length differs (n={n})"
-            );
-            let got_vals: Vec<i64> = got.iter().map(ival).collect();
-            let ref_vals: Vec<i64> = reference.iter().map(ival).collect();
-            assert_eq!(
-                got_vals, ref_vals,
-                "trial {trial}: spilled order != in-memory reference (n={n})"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "slow (cascading merge over many spilled runs); runs in the nightly --ignored job"]
-    fn cascade_merge_over_many_runs_stays_correct() {
-        // Force FAR more than MERGE_FANIN runs (threshold=1 → ~1 run per row) so
-        // finish() must cascade-merge across multiple passes. The result must
-        // still be a total, correct order with no loss/dup.
-        let dir = tempfile::tempdir().unwrap();
-        let order = RowOrder::new(vec![(0, true)]);
-        let mut s = ExternalSorter::new(dir.path(), order.clone(), 1);
-        let mut rng = Lcg(0xABCD_1234);
-        let n = 5_000; // >> MERGE_FANIN (64) → guaranteed multi-pass cascade
-        let mut expected: Vec<i64> = Vec::with_capacity(n);
-        for _ in 0..n {
-            let v = rng.range(-50_000, 50_000);
-            expected.push(v);
-            s.push(irow(v)).unwrap();
-        }
-        assert!(s.run_count() > MERGE_FANIN, "must exceed the merge fan-in");
-        expected.sort_unstable();
-        let got: Vec<i64> = s.finish().unwrap().map(|r| ival(&r.unwrap())).collect();
-        assert_eq!(got.len(), expected.len(), "no rows lost or duplicated");
-        assert_eq!(
-            got, expected,
-            "cascade merge must be totally correctly ordered"
         );
     }
 
@@ -751,5 +668,94 @@ mod tests {
             format!("{err}").contains("truncated"),
             "expected truncated-run error, got {err}"
         );
+    }
+
+    /// Slow tests: excluded from PR CI (`--skip ::slow::`), compiled under
+    /// `--all-features` but only run by `nightly-slow-tests.yml`. See the
+    /// `slow-tests` feature in Cargo.toml.
+    #[cfg(feature = "slow-tests")]
+    mod slow {
+        use super::*;
+
+        /// Sort `rows` fully in memory (used as the reference for the
+        /// randomized spill/merge comparison below).
+        fn sort_in_memory(mut rows: Vec<Row>, order: &RowOrder) -> Vec<Row> {
+            rows.sort_by(|a, b| order.compare(a, b));
+            rows
+        }
+
+        /// Tiny deterministic LCG so this unit test needs no `rand` dependency.
+        /// (The full property test with `rand`/`proptest` lives in `ferrosa-cql`.)
+        struct Lcg(u64);
+        impl Lcg {
+            fn next_u64(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn range(&mut self, lo: i64, hi: i64) -> i64 {
+                let span = (hi - lo) as u64;
+                lo + (self.next_u64() % span) as i64
+            }
+        }
+
+        #[test]
+        fn spilled_result_equals_in_memory_reference_randomized() {
+            let mut rng = Lcg(0xF355_0A5A);
+            let order = RowOrder::new(vec![(0, true)]);
+            for trial in 0..20 {
+                let n = rng.range(0, 2_000) as usize;
+                let rows: Vec<Row> = (0..n).map(|_| irow(rng.range(-1_000, 1_000))).collect();
+
+                let reference = sort_in_memory(rows.clone(), &order);
+
+                let dir = tempfile::tempdir().unwrap();
+                let mut s = ExternalSorter::new(dir.path(), order.clone(), 64);
+                for r in rows {
+                    s.push(r).unwrap();
+                }
+                let got: Vec<Row> = s.finish().unwrap().map(|r| r.unwrap()).collect();
+
+                assert_eq!(
+                    got.len(),
+                    reference.len(),
+                    "trial {trial}: length differs (n={n})"
+                );
+                let got_vals: Vec<i64> = got.iter().map(ival).collect();
+                let ref_vals: Vec<i64> = reference.iter().map(ival).collect();
+                assert_eq!(
+                    got_vals, ref_vals,
+                    "trial {trial}: spilled order != in-memory reference (n={n})"
+                );
+            }
+        }
+
+        #[test]
+        fn cascade_merge_over_many_runs_stays_correct() {
+            // Force FAR more than MERGE_FANIN runs (threshold=1 → ~1 run per row) so
+            // finish() must cascade-merge across multiple passes. The result must
+            // still be a total, correct order with no loss/dup.
+            let dir = tempfile::tempdir().unwrap();
+            let order = RowOrder::new(vec![(0, true)]);
+            let mut s = ExternalSorter::new(dir.path(), order.clone(), 1);
+            let mut rng = Lcg(0xABCD_1234);
+            let n = 5_000; // >> MERGE_FANIN (64) → guaranteed multi-pass cascade
+            let mut expected: Vec<i64> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let v = rng.range(-50_000, 50_000);
+                expected.push(v);
+                s.push(irow(v)).unwrap();
+            }
+            assert!(s.run_count() > MERGE_FANIN, "must exceed the merge fan-in");
+            expected.sort_unstable();
+            let got: Vec<i64> = s.finish().unwrap().map(|r| ival(&r.unwrap())).collect();
+            assert_eq!(got.len(), expected.len(), "no rows lost or duplicated");
+            assert_eq!(
+                got, expected,
+                "cascade merge must be totally correctly ordered"
+            );
+        }
     }
 }

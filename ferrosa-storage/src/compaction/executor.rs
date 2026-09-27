@@ -1,51 +1,54 @@
+//! Correctness: A completed result is published once or its staging is reclaimed.
+//! Last revised: 2026-09-27
+//! Last changed: Publish retryable digest and readback failures through a bounded channel.
 //! Module: Execute bounded streaming compaction work on background threads.
 //! Correctness: Correct when input claims prevent overlap, completed outputs are
 //! finalized once, and maintenance result batches remain explicitly bounded.
-//! Last revised: 2026-09-01
-//! Last changed: Added count-bounded result polling for backlog maintenance.
+//! Last revised: 2026-09-26
+//! Last changed: Made per-task output verification explicit so tests do not mutate process policy.
 //!
 //! Background compaction executor.
 //!
 //! Receives [`CompactionTask`]s via a channel, merges input SSTables on a
 //! background thread using the existing `merge_partitions` logic, and sends
 //! back [`CompactionResult`]s.
+//!
+//! **Cancellation (T-021, `compaction-cancel-safety.md` C1).** `try_submit`
+//! creates one [`CancelToken`] per task, alongside the in-flight input claim.
+//! It is checked (unconditionally, in every build) at every input open, the
+//! top of each merge-loop partition, before `finish_to_directory`, before
+//! `flush_files`, and once per readback-verify partition; a cancelled
+//! checkpoint removes whatever this task has staged so far (loudly — no
+//! `let _`) and returns `Err`. `poll_compactions` (`engine.rs`) checks the
+//! same token once more, immediately before promoting the output — the last
+//! point at which cancelling is free (`compaction-cancel-safety.md` C2);
+//! after promotion the task rolls forward and T-022 owns the commit point.
+//! [`CompactionExecutor::shutdown`] cancels every live token *before* joining
+//! workers, so shutdown waits out one checkpoint interval rather than a
+//! whole merge.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use parking_lot::{Condvar, Mutex};
+use crossbeam_channel::{Receiver, Sender};
+use ferrosa_common::{CancelReason, CancelToken};
+use parking_lot::Mutex;
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::compaction::cancel_harness::CancelPoint;
+use crate::compaction::cancel_point;
 use crate::store::SharedReaderPool;
 use crate::upload::manager::SstableComponentBytes;
 
+use super::control::{SubmissionTicket, TableCompactionPause, TaskTracker};
 use super::metadata::{CompactionTask, SSTableMetadata};
-
-/// One queued task per worker is sufficient to keep every worker busy while
-/// preventing a large SSTable backlog from becoming an in-memory task backlog.
-const TASK_QUEUE_CAPACITY_PER_WORKER: usize = 1;
-
-/// Completed outputs waiting for the maintenance thread are bounded to two per
-/// worker. Workers apply backpressure here instead of growing a result vector.
-const RESULT_QUEUE_CAPACITY_PER_WORKER: usize = 2;
 
 /// Reader pool used to obtain compaction input SSTable readers so they count
 /// against the engine-wide resident-reader bound (FMEA #11). Keyed identically
 /// to the live read path: `(table_id, gen_num)` over `FileReadAt` readers.
 type CompactionReaderPool = SharedReaderPool<ferrosa_sstable::io::FileReadAt>;
-
-/// Conservative peak-memory budget charged to ONE concurrent streaming
-/// compaction. Since compaction merges a partition-group at a time (widest
-/// partition × inputs + reader/writer buffers), not the whole SSTable set, a
-/// few hundred MB is a safe worst case per task. Used to auto-tune the
-/// concurrency cap from the configured memory limit.
-const PER_COMPACTION_MEM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Hard ceiling on auto-derived worker threads / concurrency, so a very large
-/// host does not spawn an unreasonable number of compaction threads.
-const MAX_AUTO_COMPACTION_PARALLELISM: usize = 8;
 
 /// Fraction (as a divisor) of the configured memory limit that compaction may
 /// budget across all concurrent tasks. `2` = at most half of RAM is charged to
@@ -97,12 +100,18 @@ fn detected_memory_limit_bytes() -> Option<u64> {
 /// than `cpus` (so each concurrent merge can own a worker) and never more than
 /// `memory/2 / per-task-budget` (so peak compaction memory stays under half the
 /// node's limit). Always at least 1. `None` memory → CPU-scaled default of 2.
-fn auto_tuned_max_concurrent(cpus: usize, mem_limit_bytes: Option<u64>) -> usize {
-    let cpu_cap = cpus.clamp(1, MAX_AUTO_COMPACTION_PARALLELISM);
+fn auto_tuned_max_concurrent(
+    cpus: usize,
+    mem_limit_bytes: Option<u64>,
+    parallelism_cap: usize,
+    per_task_budget_bytes: u64,
+) -> usize {
+    let parallelism_cap = parallelism_cap.max(1);
+    let cpu_cap = cpus.clamp(1, parallelism_cap);
     let mem_cap = match mem_limit_bytes {
         Some(mem) => {
-            let budgeted = mem / COMPACTION_MEM_DIVISOR / PER_COMPACTION_MEM_BUDGET_BYTES;
-            (budgeted as usize).clamp(1, MAX_AUTO_COMPACTION_PARALLELISM)
+            let budgeted = mem / COMPACTION_MEM_DIVISOR / per_task_budget_bytes.max(1);
+            (budgeted as usize).clamp(1, parallelism_cap)
         }
         // No memory signal: keep the historical conservative default.
         None => 2,
@@ -113,8 +122,8 @@ fn auto_tuned_max_concurrent(cpus: usize, mem_limit_bytes: Option<u64>) -> usize
 /// Pure auto-tune for worker threads: one per CPU, bounded. Extra idle workers
 /// are cheap (they block on `recv`), and having at least as many workers as the
 /// concurrency cap lets every permitted merge run without head-of-line blocking.
-fn auto_tuned_workers(cpus: usize) -> usize {
-    cpus.clamp(1, MAX_AUTO_COMPACTION_PARALLELISM)
+fn auto_tuned_workers(cpus: usize, parallelism_cap: usize) -> usize {
+    cpus.clamp(1, parallelism_cap.max(1))
 }
 
 fn available_cpus() -> usize {
@@ -126,27 +135,32 @@ fn available_cpus() -> usize {
 /// Resolve the concurrent-compaction cap: explicit env override, else auto-tuned
 /// from CPU + configured memory (never zero).
 fn configured_max_concurrent_compactions() -> usize {
-    if let Some(n) = std::env::var("FERROSA_MAX_CONCURRENT_COMPACTIONS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-    {
-        return n;
-    }
-    auto_tuned_max_concurrent(available_cpus(), detected_memory_limit_bytes())
+    let tuning = crate::runtime_tuning::storage_runtime_tuning();
+    let default = auto_tuned_max_concurrent(
+        available_cpus(),
+        detected_memory_limit_bytes(),
+        tuning.max_auto_compaction_parallelism,
+        tuning.per_compaction_mem_budget_bytes,
+    );
+    crate::runtime_tuning::read_usize(
+        "FERROSA_MAX_CONCURRENT_COMPACTIONS",
+        default,
+        1,
+        tuning.max_auto_compaction_parallelism,
+    )
 }
 
 /// Resolve the compaction worker-thread count: explicit env override, else
 /// auto-tuned from CPU count (never zero).
 fn configured_compaction_workers() -> usize {
-    if let Some(n) = std::env::var("FERROSA_COMPACTION_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-    {
-        return n;
-    }
-    auto_tuned_workers(available_cpus())
+    let tuning = crate::runtime_tuning::storage_runtime_tuning();
+    let default = auto_tuned_workers(available_cpus(), tuning.max_auto_compaction_parallelism);
+    crate::runtime_tuning::read_usize(
+        "FERROSA_COMPACTION_WORKERS",
+        default,
+        1,
+        tuning.max_auto_compaction_parallelism,
+    )
 }
 
 /// A counting semaphore that caps the number of compaction merges running at
@@ -155,56 +169,54 @@ fn configured_compaction_workers() -> usize {
 /// task finishes, so at most `cap` tasks ever execute concurrently regardless
 /// of how many worker threads exist.
 struct CompactionGate {
-    cap: usize,
-    available: Mutex<usize>,
-    cv: Condvar,
+    permits: Receiver<()>,
+    returned: Sender<()>,
 }
 
 impl CompactionGate {
     fn new(cap: usize) -> Self {
-        let cap = cap.max(1);
-        Self {
-            cap,
-            available: Mutex::new(cap),
-            cv: Condvar::new(),
+        let (returned, permits) = crossbeam_channel::bounded(cap.max(1));
+        for _ in 0..cap.max(1) {
+            returned.send(()).expect("new permit channel");
         }
+        Self { permits, returned }
     }
 
-    /// Block until a permit is available, then take it. Returns a guard that
-    /// returns the permit on drop. `stop` is polled so a shutting-down executor
-    /// does not deadlock waiting on a permit that never frees.
-    fn acquire<'a>(&'a self, stop: &AtomicBool) -> Option<CompactionPermit<'a>> {
-        let mut available = self.available.lock();
-        while *available == 0 {
-            if stop.load(Ordering::Acquire) {
-                return None;
-            }
-            // Bounded wait so shutdown is observed promptly even if no permit
-            // frees up (Rule 2: no unbounded blocking).
-            self.cv
-                .wait_for(&mut available, std::time::Duration::from_millis(100));
+    fn acquire<'a>(
+        &'a self,
+        cancel: &CancelToken,
+        shutdown: &Receiver<()>,
+    ) -> Option<CompactionPermit<'a>> {
+        if cancel.is_cancelled() {
+            return None;
         }
-        *available -= 1;
-        Some(CompactionPermit { gate: self })
+        crossbeam_channel::select! {
+            recv(self.permits) -> _ => Some(CompactionPermit { gate: self }),
+            recv(cancel.closed()) -> _ => None,
+            recv(shutdown) -> _ => None,
+        }
     }
 }
 
-/// RAII permit: returns its slot to the [`CompactionGate`] on drop.
 struct CompactionPermit<'a> {
     gate: &'a CompactionGate,
 }
 
 impl Drop for CompactionPermit<'_> {
     fn drop(&mut self) {
-        let mut available = self.gate.available.lock();
-        *available = (*available + 1).min(self.gate.cap);
-        self.gate.cv.notify_one();
+        self.gate
+            .returned
+            .try_send(())
+            .expect("permit returned exactly once");
     }
 }
 
 struct QueuedCompactionTask {
     task: CompactionTask,
     queued_at: Instant,
+    /// This task's cancellation token (T-021), created in `try_submit`
+    /// alongside the in-flight input claim.
+    cancel: CancelToken,
 }
 
 fn env_flag_enabled(name: &str, default: bool) -> bool {
@@ -228,20 +240,33 @@ enum InputReadMode {
 ///
 /// `enabled` comes from the run-time switch (`FERROSA_COMPACTION_DIRECT_READ`,
 /// then `FERROSA_DIRECT_IO`): ON by default, `=0` turns it off. `window_env` is
-/// `FERROSA_COMPACTION_READAHEAD_BYTES`; an invalid value is WARN-logged and the
+/// `FERROSA_COMPACTION_READAHEAD_BYTES`; an invalid value is ERROR-logged and the
 /// default window is used, so a typo cannot silently change memory use.
 fn input_read_mode(enabled: bool, window_env: Option<&str>) -> InputReadMode {
     if !enabled {
         return InputReadMode::Cached;
     }
     let window = ferrosa_sstable::scan::parse_scan_window(window_env).unwrap_or_else(|why| {
-        tracing::warn!(
+        tracing::error!(
             error = %why,
             default = ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW,
             "compaction: invalid FERROSA_COMPACTION_READAHEAD_BYTES, using the default window"
         );
         ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW
     });
+    if let Some(raw) = window_env {
+        if raw.trim().parse::<usize>().is_ok_and(|requested| {
+            requested != window
+                && requested > 0
+                && requested <= ferrosa_sstable::scan::MAX_SCAN_WINDOW
+        }) {
+            tracing::warn!(
+                configured = raw,
+                effective = window,
+                "compaction read-ahead window rounded up to a block multiple"
+            );
+        }
+    }
     InputReadMode::DirectScan { window }
 }
 
@@ -274,6 +299,42 @@ fn open_input_data(
 
 fn compaction_verify_output_enabled() -> bool {
     env_flag_enabled("FERROSA_COMPACTION_VERIFY_OUTPUT", true)
+}
+
+// Test-only fault-injection hook for the staged compaction output, called
+// right after `finish_to_directory` returns and before `flush_files`
+// renames/digest-verifies it. See the call site in
+// `execute_task_with_policy` and `digest_verify_compaction_output_*`
+// tests (T-012).
+//
+// `execute_task_with_policy` runs synchronously on the caller's thread
+// (no internal thread handoff between `finish_to_directory` and the hook
+// call below), so a `thread_local` -- rather than a process-wide `static
+// Mutex` -- confines a test's injected corruption to its own call. `cargo
+// test` runs test functions concurrently across threads; a shared `static`
+// hook was visible to every OTHER compaction test running on a different
+// thread at the same time and corrupted their outputs too.
+// (A `///` doc comment here is a clippy error: rustdoc cannot attach
+// documentation to a macro invocation like `thread_local!`.)
+#[cfg(test)]
+type CompactionOutputHook = dyn Fn(&ferrosa_sstable::writer::SSTableOutputFiles);
+
+#[cfg(test)]
+thread_local! {
+    static COMPACTION_OUTPUT_HOOK: std::cell::RefCell<Option<Box<CompactionOutputHook>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_compaction_output_hook(
+    hook: impl Fn(&ferrosa_sstable::writer::SSTableOutputFiles) + 'static,
+) {
+    COMPACTION_OUTPUT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn clear_compaction_output_hook() {
+    COMPACTION_OUTPUT_HOOK.with(|h| *h.borrow_mut() = None);
 }
 
 fn ensure_compaction_component(
@@ -353,6 +414,79 @@ fn read_compaction_component(
     }
 }
 
+/// Removes a task's merge-time staging directory after cancellation.
+///
+/// `compaction-cancel-safety.md` C1: "On cancel, remove staging with loud
+/// errors." Every failure is logged (never `let _`) rather than discarded —
+/// a leaked staging directory is otherwise invisible until the next process
+/// restart wipes `compaction/` wholesale. A missing directory is not an
+/// error (nothing was staged yet, e.g. cancellation at `InputOpen`).
+fn remove_staging_dir(staging_dir: &std::path::Path) {
+    if let Err(e) = std::fs::remove_dir_all(staging_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::error!(
+                %e,
+                dir = %staging_dir.display(),
+                "compaction cancel: failed to remove merge staging directory"
+            );
+        }
+    }
+}
+
+/// Declared before the writer so its pumps join before scratch is removed.
+/// Borrowing the path adds no allocation and also covers I/O errors between
+/// explicit cancellation checkpoints.
+struct StagingCleanup<'a>(&'a std::path::Path);
+
+impl Drop for StagingCleanup<'_> {
+    fn drop(&mut self) {
+        remove_staging_dir(self.0);
+    }
+}
+
+/// Removes every `{gen}-*` compaction-output component file under `dir`
+/// after cancellation, once the output has already been flushed into `dir`
+/// (post `flush_files`, pre-promote) but the task is rolling back rather than
+/// completing. Used by the `VerifyPartition` checkpoint and by
+/// `poll_compactions`'s `BeforePromote` check (`engine.rs`) — the two points
+/// where the output lives at a real path but has not yet been promoted or
+/// observed elsewhere. Every removal failure is logged loudly (no `let _`).
+pub(crate) fn remove_staged_output_components(dir: &std::path::Path, gen: &str) {
+    let prefix = format!("{gen}-");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::error!(
+                %e,
+                dir = %dir.display(),
+                "compaction cancel: failed to list staged output directory for cleanup"
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::error!(%error, dir = %dir.display(),
+                    "compaction cancel: failed to inspect staged output entry");
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(&prefix) {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                tracing::error!(
+                    %e,
+                    path = %entry.path().display(),
+                    "compaction cancel: failed to remove staged output component"
+                );
+            }
+        }
+    }
+}
+
 /// Result of a completed compaction.
 #[derive(Debug)]
 pub struct CompactionResult {
@@ -368,6 +502,19 @@ pub struct CompactionResult {
     /// compactions and contributed to OOMs, so compaction now uploads from the
     /// flushed files instead.
     pub direct_upload: Option<CompactionDirectUpload>,
+    /// This task's cancellation token (T-021). The merge already ran to
+    /// completion by the time a `CompactionResult` exists, but the token can
+    /// still be cancelled between here and `poll_compactions` promoting the
+    /// output — the last free cancel point (`compaction-cancel-safety.md`
+    /// C2) — so `poll_compactions` checks it once more before promoting.
+    pub cancel: CancelToken,
+}
+
+/// Bounded notification that an output digest or readback verification failed.
+#[derive(Debug)]
+pub(crate) struct CompactionFailure {
+    pub table_id: crate::TableId,
+    pub message: String,
 }
 
 /// In-memory SSTable components produced by compaction.
@@ -385,20 +532,89 @@ impl CompactionDirectUpload {
     }
 }
 
+/// Move a completed result into the bounded queue, or return ownership when
+/// cancellation/shutdown wins. Count it before publishing so a fast receiver
+/// cannot decrement an as-yet-unincremented counter. No retry loop or cloning.
+fn send_result_or_cancel<T>(
+    sender: &Sender<T>,
+    result: T,
+    pending: &AtomicUsize,
+    cancel: &CancelToken,
+    shutdown: &Receiver<()>,
+) -> Option<T> {
+    crossbeam_channel::select! {
+        send(sender, {
+            pending.fetch_add(1, Ordering::Release);
+            result
+        }) -> sent => match sent {
+            Ok(()) => None,
+            Err(error) => {
+                pending.fetch_sub(1, Ordering::Release);
+                Some(error.0)
+            }
+        },
+        recv(cancel.closed()) -> _ => Some(result),
+        recv(shutdown) -> _ => Some(result),
+    }
+}
+
+fn send_failure_or_shutdown(
+    sender: &Sender<CompactionFailure>,
+    failure: CompactionFailure,
+    pending: &AtomicUsize,
+    shutdown: &Receiver<()>,
+) -> bool {
+    crossbeam_channel::select! {
+        send(sender, {
+            pending.fetch_add(1, Ordering::Release);
+            failure
+        }) -> sent => match sent {
+            Ok(()) => true,
+            Err(error) => {
+                pending.fetch_sub(1, Ordering::Release);
+                tracing::warn!(table_id = %error.0.table_id, "compaction: retry notification receiver stopped");
+                false
+            }
+        },
+        recv(shutdown) -> _ => false,
+    }
+}
+
+fn is_digest_verification_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("digest")
+        || message.contains("corruption: output")
+        || message.contains("output sstable is corrupt")
+}
+
 /// Runs compaction tasks on a background thread.
 ///
 /// `StorageEngine` submits tasks via `submit()` and polls results via
 /// `poll_results()`. The executor is stopped on `shutdown()`.
 pub struct CompactionExecutor {
-    task_txs: Vec<std::sync::mpsc::SyncSender<QueuedCompactionTask>>,
+    task_txs: Vec<Sender<QueuedCompactionTask>>,
     next_worker: AtomicUsize,
-    result_rx: Mutex<std::sync::mpsc::Receiver<CompactionResult>>,
+    result_rx: Mutex<Receiver<CompactionResult>>,
+    failure_rx: Mutex<Receiver<CompactionFailure>>,
+    failure_notify: Arc<tokio::sync::Notify>,
     /// At most one result received by [`Self::await_result_available`] and not yet
     /// handed to a poll. Lock order: this slot, then `result_rx`.
     held_result: Mutex<Option<CompactionResult>>,
     handles: Mutex<Vec<thread::JoinHandle<()>>>,
-    stop_flag: Arc<AtomicBool>,
-    in_flight_inputs: Arc<Mutex<HashSet<String>>>,
+    tracker: TaskTracker,
+    /// Count of completed results sitting in `result_rx`, waiting to be
+    /// drained by `poll_results`/`poll_results_bounded`. Incremented by a
+    /// worker thread the instant it enqueues a finished result, decremented
+    /// as each result is popped. This is the deterministic completion signal
+    /// tests use instead of racing the filesystem for compaction output —
+    /// unlike "does a file exist under compaction/", it cannot observe a
+    /// half-written staging artifact as "done".
+    pending_results: Arc<AtomicUsize>,
+    pending_failures: Arc<AtomicUsize>,
+    /// Closing this (dropping the sole sender in `shutdown()`) wakes every
+    /// worker blocked in `select!` on its task channel immediately — no poll
+    /// interval (T-021 CD1, decisions.md D7).
+    shutdown_tx: Mutex<Option<Sender<()>>>,
 }
 
 impl Default for CompactionExecutor {
@@ -426,6 +642,7 @@ impl CompactionExecutor {
     }
 
     fn build(reader_pool: Option<CompactionReaderPool>) -> Self {
+        let tuning = *crate::runtime_tuning::storage_runtime_tuning();
         let worker_count = configured_compaction_workers();
         let max_concurrent = configured_max_concurrent_compactions();
         tracing::info!(
@@ -436,123 +653,169 @@ impl CompactionExecutor {
             "compaction executor: auto-tuned parallelism (override with \
              FERROSA_COMPACTION_WORKERS / FERROSA_MAX_CONCURRENT_COMPACTIONS)"
         );
-        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<CompactionResult>(
-            worker_count.saturating_mul(RESULT_QUEUE_CAPACITY_PER_WORKER),
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<CompactionResult>(
+            worker_count.saturating_mul(tuning.result_queue_capacity_per_worker),
         );
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let in_flight_inputs = Arc::new(Mutex::new(HashSet::new()));
+        let (failure_tx, failure_rx) = crossbeam_channel::bounded::<CompactionFailure>(
+            worker_count.saturating_mul(tuning.result_queue_capacity_per_worker),
+        );
+        let failure_notify = Arc::new(tokio::sync::Notify::new());
+        let tracker = TaskTracker::default();
+        let pending_results = Arc::new(AtomicUsize::new(0));
+        let pending_failures = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(CompactionGate::new(max_concurrent));
+        // The sole sender lives on `Self`; dropping it in `shutdown()` closes
+        // this channel and wakes every worker's `select!` at once — no poll
+        // interval (T-021 CD1, decisions.md D7).
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(0);
         // `reader_pool` is already an `Arc`, so each worker gets a cheap clone.
         let mut task_txs = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
 
         for worker_idx in 0..worker_count {
-            let (task_tx, task_rx) = std::sync::mpsc::sync_channel::<QueuedCompactionTask>(
-                TASK_QUEUE_CAPACITY_PER_WORKER,
+            let (task_tx, task_rx) = crossbeam_channel::bounded::<QueuedCompactionTask>(
+                tuning.task_queue_capacity_per_worker,
             );
             task_txs.push(task_tx);
             let result_tx = result_tx.clone();
-            let stop = Arc::clone(&stop_flag);
-            let in_flight_inputs = Arc::clone(&in_flight_inputs);
+            let failure_tx = failure_tx.clone();
+            let failure_notify = Arc::clone(&failure_notify);
+            let tracker = tracker.clone();
+            let pending_results = Arc::clone(&pending_results);
+            let pending_failures = Arc::clone(&pending_failures);
             let gate = Arc::clone(&gate);
             let reader_pool = reader_pool.clone();
+            let shutdown_rx = shutdown_rx.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("compaction-executor-{worker_idx}"))
                 .spawn(move || {
-                    while !stop.load(Ordering::Acquire) {
-                        match task_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                            Ok(queued) => {
-                                crate::metrics::dec_compaction_queue_depth();
-                                crate::metrics::observe_compaction_phase(
-                                    crate::metrics::CompactionPhase::QueueWait,
-                                    queued.queued_at.elapsed(),
+                    loop {
+                        // Blocking select, not a stop-flag check-then-recv
+                        // poll (T-021 CD1, decisions.md D7): a worker parked
+                        // here with no queued task wakes immediately when
+                        // `shutdown()` drops `shutdown_tx`, not on the next
+                        // poll slice.
+                        let queued = crossbeam_channel::select! {
+                            recv(task_rx) -> msg => match msg {
+                                Ok(queued) => queued,
+                                Err(_) => break,
+                            },
+                            recv(shutdown_rx) -> _ => break,
+                        };
+                        crate::metrics::dec_compaction_queue_depth();
+                        crate::metrics::observe_compaction_phase(
+                            crate::metrics::CompactionPhase::QueueWait,
+                            queued.queued_at.elapsed(),
+                        );
+                        let task = queued.task;
+                        let cancel = queued.cancel;
+                        // Cap concurrent merges across all workers
+                        // (FMEA #11): hold a permit for the duration of
+                        // the merge. The running gauge is bumped only
+                        // *after* the permit is taken, so
+                        // `compaction_running_max` reflects tasks
+                        // actually executing, never those blocked at the
+                        // gate.
+                        let permit = match gate.acquire(&cancel, &shutdown_rx) {
+                            Some(permit) => permit,
+                            None => {
+                                // Cancelled before a permit freed:
+                                // requeued inputs are released so a
+                                // restart can reschedule them.
+                                Self::release_in_flight_inputs(
+                                    &tracker,
+                                    &task,
                                 );
-                                let task = queued.task;
-                                // Cap concurrent merges across all workers
-                                // (FMEA #11): hold a permit for the duration of
-                                // the merge. The running gauge is bumped only
-                                // *after* the permit is taken, so
-                                // `compaction_running_max` reflects tasks
-                                // actually executing, never those blocked at the
-                                // gate.
-                                let permit = match gate.acquire(&stop) {
-                                    Some(permit) => permit,
-                                    None => {
-                                        // Shutting down before a permit freed:
-                                        // requeued inputs are released so a
-                                        // restart can reschedule them.
-                                        Self::release_in_flight_inputs(&in_flight_inputs, &task);
-                                        break;
-                                    }
+                                continue;
+                            }
+                        };
+                        crate::metrics::inc_compaction_running();
+                        let task_start = Instant::now();
+                        let result =
+                            Self::execute_task_routed(&task, reader_pool.as_ref(), &cancel);
+                        crate::metrics::dec_compaction_running();
+                        drop(permit);
+                        match result {
+                            Ok(output) => {
+                                tracing::debug!(
+                                    inputs = task.inputs.len(),
+                                    pool_input_opens = output.pool_input_opens,
+                                    elapsed_ms = task_start.elapsed().as_millis() as u64,
+                                    "compaction: task finished"
+                                );
+                                let completed = CompactionResult {
+                                    task,
+                                    output: output.metadata,
+                                    direct_upload: output.direct_upload,
+                                    cancel: cancel.clone(),
                                 };
-                                crate::metrics::inc_compaction_running();
-                                let task_start = Instant::now();
-                                let result = Self::execute_task_routed(&task, reader_pool.as_ref());
-                                crate::metrics::dec_compaction_running();
-                                drop(permit);
-                                match result {
-                                    Ok(output) => {
-                                        tracing::debug!(
-                                            inputs = task.inputs.len(),
-                                            pool_input_opens = output.pool_input_opens,
-                                            elapsed_ms = task_start.elapsed().as_millis() as u64,
-                                            "compaction: task finished"
-                                        );
-                                        let mut completed = CompactionResult {
-                                            task,
-                                            output: output.metadata,
-                                            direct_upload: output.direct_upload,
-                                        };
-                                        loop {
-                                            match result_tx.try_send(completed) {
-                                                Ok(()) => break,
-                                                Err(std::sync::mpsc::TrySendError::Full(result)) => {
-                                                    completed = result;
-                                                    if stop.load(Ordering::Acquire) {
-                                                        Self::release_in_flight_inputs(
-                                                            &in_flight_inputs,
-                                                            &completed.task,
-                                                        );
-                                                        tracing::error!(
-                                                            table_id = %completed.task.table_id,
-                                                            "compaction: shutdown while bounded result queue was full; inputs remain live and task will be retried after restart"
-                                                        );
-                                                        break;
-                                                    }
-                                                    std::thread::sleep(
-                                                        std::time::Duration::from_millis(10),
-                                                    );
-                                                }
-                                                Err(std::sync::mpsc::TrySendError::Disconnected(
-                                                    result,
-                                                )) => {
-                                                    Self::release_in_flight_inputs(
-                                                        &in_flight_inputs,
-                                                        &result.task,
-                                                    );
-                                                    tracing::error!(
-                                                        table_id = %result.task.table_id,
-                                                        "compaction: result receiver closed; inputs remain live"
-                                                    );
-                                                    break;
-                                                }
-                                            }
+                                if let Some(unsent) = send_result_or_cancel(
+                                    &result_tx, completed, &pending_results, &cancel, &shutdown_rx,
+                                ) {
+                                    remove_staged_output_components(&unsent.output.path, &unsent.output.id);
+                                    Self::release_in_flight_inputs(
+                                        &tracker, &unsent.task,
+                                    );
+                                    if let Some(reason) = cancel.reason() {
+                                        crate::metrics::inc_compaction_cancelled();
+                                        if let Some(started) = cancel.cancelled_at() {
+                                            crate::metrics::observe_compaction_cancel_latency(started.elapsed());
                                         }
+                                        tracing::info!(table_id = %unsent.task.table_id, %reason,
+                                            "compaction: cancelled while delivering result; staged output removed");
+                                    } else {
+                                        tracing::warn!(table_id = %unsent.task.table_id,
+                                            "compaction: result delivery stopped; staged output removed, inputs remain live");
                                     }
-                                    Err(e) => {
-                                        Self::release_in_flight_inputs(&in_flight_inputs, &task);
-                                        crate::metrics::observe_compaction_phase(
-                                            crate::metrics::CompactionPhase::Total,
-                                            task_start.elapsed(),
+                                }
+                                tracker.changed.notify_waiters();
+                            }
+                            Err(e) => {
+                                Self::release_in_flight_inputs(
+                                    &tracker,
+                                    &task,
+                                );
+                                crate::metrics::observe_compaction_phase(
+                                    crate::metrics::CompactionPhase::Total,
+                                    task_start.elapsed(),
+                                );
+                                // A cancelled checkpoint's error is
+                                // distinguished by the token's own state, not
+                                // by matching the error string: only a task
+                                // whose token was actually cancelled can have
+                                // `reason()` set.
+                                if let Some(reason) = cancel.reason() {
+                                    crate::metrics::inc_compaction_cancelled();
+                                    if let Some(cancelled_at) = cancel.cancelled_at() {
+                                        crate::metrics::observe_compaction_cancel_latency(
+                                            cancelled_at.elapsed(),
                                         );
-                                        crate::metrics::inc_compaction_failed();
-                                        tracing::error!(%e, "compaction: task failed");
+                                    }
+                                    tracing::info!(
+                                        %e, reason = %reason, table_id = %task.table_id,
+                                        "compaction: task cancelled"
+                                    );
+                                } else {
+                                    crate::metrics::inc_compaction_failed();
+                                    tracing::error!(%e, table_id = %task.table_id, "compaction: task failed");
+                                    if is_digest_verification_failure(&e) {
+                                        let failure = CompactionFailure {
+                                            table_id: task.table_id,
+                                            message: e,
+                                        };
+                                        let sent = send_failure_or_shutdown(
+                                            &failure_tx,
+                                            failure,
+                                            &pending_failures,
+                                            &shutdown_rx,
+                                        );
+                                        if sent {
+                                            failure_notify.notify_one();
+                                        }
                                     }
                                 }
                             }
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         }
                     }
                 })
@@ -564,10 +827,14 @@ impl CompactionExecutor {
             task_txs,
             next_worker: AtomicUsize::new(0),
             result_rx: Mutex::new(result_rx),
+            failure_rx: Mutex::new(failure_rx),
+            failure_notify,
             held_result: Mutex::new(None),
             handles: Mutex::new(handles),
-            stop_flag,
-            in_flight_inputs,
+            tracker,
+            pending_results,
+            pending_failures,
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
         }
     }
 
@@ -578,28 +845,64 @@ impl CompactionExecutor {
     /// a bounded maintenance batch was actually accepted can use this result
     /// instead of treating overlap suppression as a successful submission.
     pub fn try_submit(&self, task: CompactionTask) -> ferrosa_common::Result<bool> {
-        crate::metrics::inc_compaction_submitted();
-        if !Self::try_claim_in_flight_inputs(&self.in_flight_inputs, &task) {
-            crate::metrics::inc_compaction_skipped_overlap();
-            tracing::debug!(
-                table_id = %task.table_id,
-                inputs = task.inputs.len(),
-                "compaction: skipping overlapping task already in flight"
-            );
+        let Some(ticket) = self.submission_ticket(&task.table_id) else {
             return Ok(false);
-        }
+        };
+        self.try_submit_with_ticket(task, &ticket)
+    }
+
+    pub(crate) fn submission_ticket(&self, table: &crate::TableId) -> Option<SubmissionTicket> {
+        self.tracker.submission_ticket(table)
+    }
+
+    pub(crate) fn pause_table(
+        &self,
+        table: &crate::TableId,
+        reason: CancelReason,
+    ) -> TableCompactionPause {
+        self.tracker.pause_table(table, reason)
+    }
+
+    pub(crate) fn changed(&self) -> &tokio::sync::Notify {
+        &self.tracker.changed
+    }
+
+    pub(crate) fn try_submit_with_ticket(
+        &self,
+        task: CompactionTask,
+        ticket: &SubmissionTicket,
+    ) -> ferrosa_common::Result<bool> {
+        crate::metrics::inc_compaction_submitted();
+        let Some(cancel) = self.tracker.try_register(&task, ticket) else {
+            crate::metrics::inc_compaction_skipped_overlap();
+            return Ok(false);
+        };
+        // Registers `cancel` for the harness (T-021), scoped by table id —
+        // the same scope `cancel_point!` passes. A test's cancel-point hook
+        // can look this exact token up (`cancel_harness::cancel_now`) and
+        // cancel it, not merely record having reached the point. Stays
+        // registered for this task's whole lifetime, through
+        // `poll_compactions`'s `BeforePromote` check, and is removed in
+        // `release_in_flight_inputs` once the task is fully finalized.
+        // No-op outside test/test-support builds.
+        #[cfg(any(test, feature = "test-support"))]
+        crate::compaction::cancel_harness::register_cancel_token(
+            task.table_id.to_string(),
+            cancel.clone(),
+        );
 
         let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.task_txs.len();
         crate::metrics::inc_compaction_queue_depth();
         let queued = QueuedCompactionTask {
             task,
             queued_at: Instant::now(),
+            cancel,
         };
         match self.task_txs[worker_idx].try_send(queued) {
             Ok(()) => Ok(true),
-            Err(std::sync::mpsc::TrySendError::Full(queued)) => {
+            Err(crossbeam_channel::TrySendError::Full(queued)) => {
                 crate::metrics::dec_compaction_queue_depth();
-                Self::release_in_flight_inputs(&self.in_flight_inputs, &queued.task);
+                Self::release_in_flight_inputs(&self.tracker, &queued.task);
                 tracing::debug!(
                     table_id = %queued.task.table_id,
                     inputs = queued.task.inputs.len(),
@@ -607,9 +910,9 @@ impl CompactionExecutor {
                 );
                 Ok(false)
             }
-            Err(std::sync::mpsc::TrySendError::Disconnected(queued)) => {
+            Err(crossbeam_channel::TrySendError::Disconnected(queued)) => {
                 crate::metrics::dec_compaction_queue_depth();
-                Self::release_in_flight_inputs(&self.in_flight_inputs, &queued.task);
+                Self::release_in_flight_inputs(&self.tracker, &queued.task);
                 Err(ferrosa_common::Error::InvalidFormat(
                     "compaction channel closed".into(),
                 ))
@@ -638,15 +941,37 @@ impl CompactionExecutor {
         let rx = self.result_rx.lock();
         let mut results = Vec::with_capacity(max_results.min(8));
         if max_results > 0 {
-            results.extend(held.take());
+            if let Some(result) = held.take() {
+                self.pending_results.fetch_sub(1, Ordering::Release);
+                results.push(result);
+            }
         }
         while results.len() < max_results {
             let Ok(result) = rx.try_recv() else {
                 break;
             };
+            self.pending_results.fetch_sub(1, Ordering::Release);
             results.push(result);
         }
         results
+    }
+
+    /// Drains a bounded batch of retryable output digest failures.
+    pub(crate) fn poll_failures_bounded(&self, max_failures: usize) -> Vec<CompactionFailure> {
+        let rx = self.failure_rx.lock();
+        let mut failures = Vec::with_capacity(max_failures.min(8));
+        while failures.len() < max_failures {
+            let Ok(failure) = rx.try_recv() else {
+                break;
+            };
+            self.pending_failures.fetch_sub(1, Ordering::Release);
+            failures.push(failure);
+        }
+        failures
+    }
+
+    pub(crate) async fn wait_for_failure_notification(&self) {
+        self.failure_notify.notified().await;
     }
 
     /// Block until a completed compaction result is available to
@@ -674,6 +999,58 @@ impl CompactionExecutor {
         }
     }
 
+    /// Number of completed compaction results currently sitting in the
+    /// result queue, waiting to be drained by `poll_results`/
+    /// `poll_results_bounded`.
+    ///
+    /// This is the deterministic signal for "the background compaction
+    /// thread is done": incremented the instant a worker enqueues a
+    /// finished result, decremented as each result is popped. Tests that
+    /// need to wait for a submitted task to finish (without consuming the
+    /// result themselves) should poll this rather than probing the
+    /// filesystem for output files, which can observe an in-progress
+    /// staging write as "done".
+    pub fn pending_result_count(&self) -> usize {
+        self.pending_results.load(Ordering::Acquire)
+    }
+
+    /// Blocks (via short polling sleeps) until at least one completed
+    /// compaction result is waiting in the result queue, or `timeout`
+    /// elapses.
+    ///
+    /// Returns `true` once a result is observed, `false` on timeout. Callers
+    /// that require completion should treat a `false` return as fatal (panic
+    /// with context) rather than silently proceeding — see
+    /// `make_engine_with_pending_compaction` in `engine.rs` for the pattern.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_result(&self, timeout: std::time::Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.pending_result_count() > 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    pub(crate) fn request_operator_stop(
+        &self,
+        table_id: Option<&crate::TableId>,
+    ) -> super::CompactionStopReport {
+        self.tracker.request_operator_stop(table_id)
+    }
+
+    /// Request reclamation from the largest registered task. Keep only one
+    /// disk-pressure cancellation outstanding until its input claim is released,
+    /// so a burst of rejected writes cannot cancel every compaction at once.
+    /// Admission must still independently verify that free space recovered.
+    pub fn cancel_largest_for_disk_reserve(&self) -> Option<u64> {
+        self.tracker.cancel_largest_for_disk_reserve()
+    }
+
     /// Releases a successful task's inputs after its result has been finalized.
     ///
     /// Successful compactions must stay claimed while their result waits in the
@@ -681,43 +1058,52 @@ impl CompactionExecutor {
     /// and the first finalized result can delete files the duplicate task still
     /// expects to read.
     pub fn release_task_inputs(&self, task: &CompactionTask) {
-        Self::release_in_flight_inputs(&self.in_flight_inputs, task);
+        Self::release_in_flight_inputs(&self.tracker, task);
     }
 
     /// Shuts down the compaction executor, waiting for the background thread.
+    ///
+    /// Cancels every live task's [`CancelToken`] and closes the worker
+    /// shutdown channel *before* joining, so shutdown waits out one
+    /// checkpoint interval per in-flight task instead of a whole merge
+    /// (`compaction-cancel-safety.md` C1). This also reaches completed tasks
+    /// whose `CompactionResult` is still sitting in the result queue,
+    /// unfinalized by `poll_compactions`: `poll_compactions` checks the same
+    /// token before promoting and discards the staged output instead.
     pub fn shutdown(&self) {
-        self.stop_flag.store(true, Ordering::Release);
+        self.tracker.cancel_all(CancelReason::Shutdown);
+        // Dropping the sole sender closes the channel: every worker blocked
+        // in `select!` on it wakes at once (no poll interval).
+        self.shutdown_tx.lock().take();
         for handle in self.handles.lock().drain(..) {
-            let _ = handle.join();
+            if let Err(panic) = handle.join() {
+                // A worker thread panicking mid-compaction is not a "quiet"
+                // shutdown outcome: something crashed rather than returning
+                // `Err`, and swallowing that (`let _ = handle.join()`) would
+                // hide it entirely (standing order: no silently discarded
+                // errors). `Box<dyn Any + Send>` isn't `Debug`, so pull out
+                // the message the common panic payload shapes carry.
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                tracing::error!(
+                    panic = %message,
+                    "compaction executor: worker thread panicked during shutdown"
+                );
+            }
         }
     }
 
-    fn input_key(task: &CompactionTask, input_id: &str) -> String {
-        format!("{}:{input_id}", task.table_id)
-    }
-
-    fn try_claim_in_flight_inputs(
-        in_flight_inputs: &Mutex<HashSet<String>>,
-        task: &CompactionTask,
-    ) -> bool {
-        let keys: Vec<String> = task
-            .inputs
-            .iter()
-            .map(|input| Self::input_key(task, &input.id))
-            .collect();
-        let mut in_flight = in_flight_inputs.lock();
-        if keys.iter().any(|key| in_flight.contains(key)) {
-            return false;
-        }
-        in_flight.extend(keys);
-        true
-    }
-
-    fn release_in_flight_inputs(in_flight_inputs: &Mutex<HashSet<String>>, task: &CompactionTask) {
-        let mut in_flight = in_flight_inputs.lock();
-        for input in &task.inputs {
-            in_flight.remove(&Self::input_key(task, &input.id));
-        }
+    fn release_in_flight_inputs(tracker: &TaskTracker, task: &CompactionTask) {
+        tracker.release(task);
+        // The task is fully finalized (failed/cancelled during merge, or
+        // promoted/rolled-back by `poll_compactions`): the harness registry
+        // entry for this table (`try_submit` registered it) has no further
+        // use. No-op outside test/test-support builds.
+        #[cfg(any(test, feature = "test-support"))]
+        crate::compaction::cancel_harness::unregister_cancel_token(&task.table_id.to_string());
     }
 }
 
@@ -736,16 +1122,26 @@ impl CompactionExecutor {
     where
         F: FnMut(usize),
     {
-        Self::execute_task_inner(task, None, observe_group_width)
+        // No external cancellation source for this test-only entry point: a
+        // fresh, never-cancelled token. A test that wants to exercise
+        // cancellation installs a `CancelHookGuard` + calls
+        // `cancel_harness::cancel_now` — `execute_task_with_policy`
+        // registers whatever token it is given (including this fresh one)
+        // under the task's table-id scope for the duration of the call.
+        let cancel = CancelToken::new();
+        Self::execute_task_inner(task, None, &cancel, observe_group_width)
     }
 
     /// Execute a task with input opens routed through the engine-wide reader
-    /// pool when one is configured (FMEA #11). Used by the worker threads.
+    /// pool when one is configured (FMEA #11), checking `cancel` at every
+    /// checkpoint (T-021). Used by the worker threads with each task's own
+    /// real token.
     fn execute_task_routed(
         task: &CompactionTask,
         reader_pool: Option<&CompactionReaderPool>,
+        cancel: &CancelToken,
     ) -> std::result::Result<ExecutedCompaction, String> {
-        Self::execute_task_inner(task, reader_pool, |_| {})
+        Self::execute_task_inner(task, reader_pool, cancel, |_| {})
     }
 
     /// Execute a single compaction task by merging input SSTables into one output.
@@ -768,29 +1164,38 @@ impl CompactionExecutor {
     pub(crate) fn execute_task(
         task: &CompactionTask,
     ) -> std::result::Result<ExecutedCompaction, String> {
-        Self::execute_task_inner(task, None, |_| {})
+        // Fresh, never-cancelled token: this entry point has no submitter to
+        // hand it a real one. See `execute_task_observing`'s doc comment for
+        // how a test still exercises real cancellation through it.
+        let cancel = CancelToken::new();
+        Self::execute_task_inner(task, None, &cancel, |_| {})
     }
 
     fn execute_task_inner<F>(
         task: &CompactionTask,
         reader_pool: Option<&CompactionReaderPool>,
+        cancel: &CancelToken,
         observe_group_width: F,
     ) -> std::result::Result<ExecutedCompaction, String>
     where
         F: FnMut(usize),
     {
-        Self::execute_task_with_read_mode(
+        Self::execute_task_with_policy(
             task,
             reader_pool,
             configured_input_read_mode(),
+            compaction_verify_output_enabled(),
+            cancel,
             observe_group_width,
         )
     }
 
-    fn execute_task_with_read_mode<F>(
+    fn execute_task_with_policy<F>(
         task: &CompactionTask,
         reader_pool: Option<&CompactionReaderPool>,
         read_mode: InputReadMode,
+        verify_output: bool,
+        cancel: &CancelToken,
         mut observe_group_width: F,
     ) -> std::result::Result<ExecutedCompaction, String>
     where
@@ -834,6 +1239,8 @@ impl CompactionExecutor {
         let mut pool_input_opens = 0usize;
         let pool_table_key = task.table_id.to_string();
         for input in &task.inputs {
+            cancel_point!(&pool_table_key, CancelPoint::InputOpen);
+            cancel.check().map_err(|c| c.to_string())?;
             let gen = &input.id;
             let dir = &input.path;
 
@@ -883,9 +1290,11 @@ impl CompactionExecutor {
                     .unwrap_or(0),
             );
 
+            let is_compressed = compression_info.is_some();
+
             // Strict open: validates and aborts on corruption regardless of
             // whether the pool already has this generation cached.
-            let reader = SSTableReader::open(SSTableComponents {
+            let mut reader = SSTableReader::open(SSTableComponents {
                 data,
                 partitions: partitions_file,
                 rows,
@@ -894,6 +1303,18 @@ impl CompactionExecutor {
                 statistics,
             })
             .map_err(|e| format!("aborting compaction: SSTable {gen} corrupt: {e}"))?;
+
+            // Digest.crc32/CRC.db, when present, so per-chunk CRC.db
+            // verification on uncompressed reads (already wired into the read
+            // path) actually runs against merge inputs instead of silently
+            // opting out -- this call site previously never loaded them
+            // (T-012; `publication-safety.md` M1).
+            ferrosa_sstable::reader::load_checksums_for_generation(
+                &mut reader,
+                dir,
+                gen,
+                is_compressed,
+            );
 
             // A DirectScan reader is private to this task: parked in the shared pool
             // it would be handed to the live read path, which does point reads that
@@ -967,10 +1388,12 @@ impl CompactionExecutor {
             .file_output_staging_dir()
             .map_err(|e| format!("flush staging dir: {e}"))?
             .ok_or_else(|| "file flush target did not provide staging directory".to_string())?;
-        let mut writer = SSTableWriter::new_file_backed(
+        let _staging_cleanup = StagingCleanup(&staging_dir);
+        let mut writer = SSTableWriter::new_file_backed_with_cancel(
             options,
             output_header.clone(),
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
+            cancel.clone(),
         )
         .map_err(|e| format!("writer staging: {e}"))?;
 
@@ -1055,8 +1478,27 @@ impl CompactionExecutor {
         // every partition does: an empty output cannot be swapped in.
         let mut held_back: Option<ferrosa_sstable::types::Partition> = None;
         let mut purged_markers: u64 = 0;
+        // Test-only: which merge-loop iteration this is, so the cancel harness
+        // can distinguish the first partition from every later one.
+        #[cfg(any(test, feature = "test-support"))]
+        let mut merge_loop_iteration: u64 = 0;
 
         while let Some(top) = heap.pop() {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                cancel_point!(
+                    &pool_table_key,
+                    if merge_loop_iteration == 0 {
+                        CancelPoint::MergePartitionFirst
+                    } else {
+                        CancelPoint::MergePartitionMiddle
+                    }
+                );
+                merge_loop_iteration += 1;
+            }
+            if let Err(c) = cancel.check() {
+                return Err(c.to_string());
+            }
             // Drain all heap entries that share this key (multiple inputs
             // wrote the same partition).
             let HeapEntry {
@@ -1180,6 +1622,10 @@ impl CompactionExecutor {
         let merged_partition_count = tally.partitions;
         let merged_row_count = tally.rows;
         let (min_token, max_token) = (tally.min_token, tally.max_token);
+        cancel_point!(&pool_table_key, CancelPoint::MergePartitionLast);
+        if let Err(c) = cancel.check() {
+            return Err(c.to_string());
+        }
 
         tracing::info!(
             partitions = merged_partition_count,
@@ -1209,27 +1655,48 @@ impl CompactionExecutor {
             );
         }
 
+        cancel_point!(&pool_table_key, CancelPoint::BeforeFinish);
+        if let Err(c) = cancel.check() {
+            return Err(c.to_string());
+        }
         let finish_start = Instant::now();
         let output = writer
-            .finish_to_directory(staging_dir)
+            .finish_to_directory_deferred_sync(&staging_dir)
             .map_err(|e| format!("finish: {e}"))?;
         crate::metrics::observe_compaction_phase(
             crate::metrics::CompactionPhase::WriterFinish,
             finish_start.elapsed(),
         );
+
+        // Test-only fault injection point: lets a test corrupt the staged
+        // output (still under `staging_dir`, before `flush_files` renames,
+        // fsyncs and digest-verifies it) to prove the digest check in
+        // `flush_files` below is unconditional -- including for compaction,
+        // regardless of `FERROSA_COMPACTION_VERIFY_OUTPUT` (T-012).
+        #[cfg(test)]
+        COMPACTION_OUTPUT_HOOK.with(|h| {
+            if let Some(hook) = h.borrow().as_ref() {
+                hook(&output);
+            }
+        });
+
         let direct_upload = None;
 
         // 4. Promote staged output files via FileFlushTarget.
+        cancel_point!(&pool_table_key, CancelPoint::BeforeFlushFiles);
+        if let Err(c) = cancel.check() {
+            return Err(c.to_string());
+        }
         let local_write_start = Instant::now();
         let reader = flush_target
-            .flush_files(output)
+            .flush_deferred_files(output)
             .map_err(|e| format!("flush output: {e}"))?;
         crate::metrics::observe_compaction_phase(
             crate::metrics::CompactionPhase::LocalWriteSstable,
             local_write_start.elapsed(),
         );
 
-        if compaction_verify_output_enabled() {
+        if verify_output {
             // 5. Streaming readback verification — count partitions and rows
             //    without materializing the output back into a Vec.  Catches
             //    Data.db / Partitions.db inconsistencies that would corrupt
@@ -1245,6 +1712,14 @@ impl CompactionExecutor {
                     .next_partition()
                     .map_err(|e| format!("CORRUPTION: output read failed: {e}"))?
                 {
+                    cancel_point!(&pool_table_key, CancelPoint::VerifyPartition);
+                    if let Err(c) = cancel.check() {
+                        remove_staged_output_components(
+                            &task.output_dir,
+                            &flush_target.generation().to_string(),
+                        );
+                        return Err(c.to_string());
+                    }
                     readback_partitions += 1;
                     readback_rows += p.rows.len();
                 }
@@ -1539,6 +2014,135 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn register_pressure_task(
+        executor: &CompactionExecutor,
+        id: &str,
+        bytes: u64,
+    ) -> (CompactionTask, CancelToken) {
+        let task = CompactionTask {
+            inputs: vec![make_metadata(id, bytes)],
+            output_dir: PathBuf::from("unused"),
+            schema: test_table_schema(),
+            table_id: test_table_id(),
+            purge: None,
+        };
+        let ticket = executor.submission_ticket(&task.table_id).unwrap();
+        let token = executor.tracker.try_register(&task, &ticket).unwrap();
+        (task, token)
+    }
+
+    #[test]
+    fn cancel_source_disk_reserve_selects_largest_and_coalesces_until_release() {
+        let executor = CompactionExecutor::new();
+        let (small_task, small) = register_pressure_task(&executor, "small", 10);
+        let (large_task, large) = register_pressure_task(&executor, "large", 100);
+        assert_eq!(executor.cancel_largest_for_disk_reserve(), Some(100));
+        assert_eq!(large.reason(), Some(CancelReason::DiskReserve));
+        assert!(!small.is_cancelled());
+        assert_eq!(executor.cancel_largest_for_disk_reserve(), None);
+        executor.release_task_inputs(&large_task);
+        assert_eq!(executor.cancel_largest_for_disk_reserve(), Some(10));
+        assert_eq!(small.reason(), Some(CancelReason::DiskReserve));
+        executor.release_task_inputs(&small_task);
+    }
+
+    #[test]
+    fn cancel_source_disk_reserve_skips_tasks_cancelled_by_other_sources() {
+        let executor = CompactionExecutor::new();
+        let (small_task, small) = register_pressure_task(&executor, "small", 10);
+        let (large_task, large) = register_pressure_task(&executor, "large", 100);
+        large.cancel(CancelReason::Operator);
+        assert_eq!(executor.cancel_largest_for_disk_reserve(), Some(10));
+        assert_eq!(large.reason(), Some(CancelReason::Operator));
+        assert_eq!(small.reason(), Some(CancelReason::DiskReserve));
+        executor.release_task_inputs(&small_task);
+        executor.release_task_inputs(&large_task);
+    }
+
+    #[test]
+    fn cancel_source_result_full_queue_wakes_on_cancel() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(11).unwrap();
+        let pending = AtomicUsize::new(1);
+        let (_shutdown, shutdown_rx) = crossbeam_channel::bounded(0);
+        let cancel = CancelToken::new();
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(0);
+            let (done_tx, done_rx) = crossbeam_channel::bounded(0);
+            let (tx, pending, cancel, shutdown_rx) = (&tx, &pending, &cancel, &shutdown_rx);
+            scope.spawn(move || {
+                entered_tx.send(()).unwrap();
+                done_tx
+                    .send(send_result_or_cancel(tx, 22, pending, cancel, shutdown_rx))
+                    .unwrap();
+            });
+            entered_rx.recv().unwrap();
+            cancel.cancel(CancelReason::Operator);
+            assert_eq!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                Some(22)
+            );
+        });
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert_eq!(rx.recv().unwrap(), 11);
+    }
+
+    #[test]
+    fn cancel_source_result_full_queue_wakes_on_shutdown() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(11).unwrap();
+        let pending = AtomicUsize::new(1);
+        let (shutdown, shutdown_rx) = crossbeam_channel::bounded(0);
+        let cancel = CancelToken::new();
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(0);
+            let (done_tx, done_rx) = crossbeam_channel::bounded(0);
+            let (tx, pending, cancel, shutdown_rx) = (&tx, &pending, &cancel, &shutdown_rx);
+            scope.spawn(move || {
+                entered_tx.send(()).unwrap();
+                done_tx
+                    .send(send_result_or_cancel(tx, 22, pending, cancel, shutdown_rx))
+                    .unwrap();
+            });
+            entered_rx.recv().unwrap();
+            drop(shutdown);
+            assert_eq!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap(),
+                Some(22)
+            );
+        });
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert_eq!(rx.recv().unwrap(), 11);
+    }
+
+    #[test]
+    fn cancel_source_result_counter_precedes_delivery_and_disconnect_reverses_it() {
+        let (tx, rx) = crossbeam_channel::bounded(0);
+        let pending = AtomicUsize::new(0);
+        let (_shutdown, shutdown_rx) = crossbeam_channel::bounded(0);
+        let cancel = CancelToken::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert_eq!(
+                    send_result_or_cancel(&tx, 22, &pending, &cancel, &shutdown_rx),
+                    None
+                );
+            });
+            assert_eq!(rx.recv().unwrap(), 22);
+            assert_eq!(pending.fetch_sub(1, Ordering::AcqRel), 1);
+        });
+        drop(rx);
+        assert_eq!(
+            send_result_or_cancel(&tx, 33, &pending, &cancel, &shutdown_rx),
+            Some(33)
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
     fn make_metadata(id: &str, size: u64) -> SSTableMetadata {
         SSTableMetadata {
             id: id.to_string(),
@@ -1744,6 +2348,64 @@ mod tests {
     }
 
     #[test]
+    fn writer_callers_compaction_publishes_without_raw_scratch() {
+        for compression in ["lz4", "none"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut task = real_compaction_task(tmp.path());
+            task.schema
+                .extensions
+                .insert("compression.class".into(), compression.into());
+            let output = CompactionExecutor::execute_task(&task).unwrap();
+            assert_eq!(output.metadata.partition_count, 30);
+            assert_no_raw_scratch(&task.output_dir);
+            let staged = task.output_dir.join(".sstable-staging");
+            assert!(!staged.exists(), "successful publication removes staging");
+        }
+    }
+
+    fn assert_no_raw_scratch(dir: &std::path::Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            assert_ne!(entry.file_name(), "Data.raw");
+            if entry.file_type().unwrap().is_dir() {
+                assert_no_raw_scratch(&entry.path());
+            }
+        }
+    }
+
+    #[test]
+    fn writer_callers_compaction_cancellation_reaches_writer_and_cleans_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = real_compaction_task(tmp.path());
+        // Uncompressed writes reach the pump immediately, so this test isolates
+        // token propagation from the compressor's bounded batch buffering.
+        task.schema
+            .extensions
+            .insert("compression.class".into(), "none".into());
+        let cancel = CancelToken::new();
+        let err = match CompactionExecutor::execute_task_inner(&task, None, &cancel, |_| {
+            // This callback runs after the partition checkpoint and immediately
+            // before emission. Only the writer sees cancellation for this row.
+            cancel.cancel(CancelReason::Operator);
+        }) {
+            Ok(_) => panic!("cancellation must stop the writer"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("write partition"),
+            "cancel must reach the pump: {err}"
+        );
+        let staging_root = task.output_dir.join(".sstable-staging");
+        assert_eq!(std::fs::read_dir(staging_root).unwrap().count(), 0);
+        for input in &task.inputs {
+            assert!(
+                input.path.join(format!("{}-Data.db", input.id)).exists(),
+                "cancel must preserve input files"
+            );
+        }
+    }
+
+    #[test]
     fn await_result_available_reports_false_when_nothing_is_running() {
         let executor = CompactionExecutor::new();
         assert!(!executor.await_result_available(std::time::Duration::from_millis(20)));
@@ -1768,20 +2430,14 @@ mod tests {
             purge: None,
         };
 
-        assert!(CompactionExecutor::try_claim_in_flight_inputs(
-            &executor.in_flight_inputs,
-            &task
-        ));
+        let ticket = executor.submission_ticket(&task.table_id).unwrap();
+        assert!(executor.tracker.try_register(&task, &ticket).is_some());
         assert!(
-            !CompactionExecutor::try_claim_in_flight_inputs(&executor.in_flight_inputs, &task),
-            "overlapping compaction must stay blocked while a completed result waits to be finalized"
+            executor.tracker.try_register(&task, &ticket).is_none(),
+            "inputs remain claimed until finalization"
         );
-
         executor.release_task_inputs(&task);
-        assert!(
-            CompactionExecutor::try_claim_in_flight_inputs(&executor.in_flight_inputs, &task),
-            "poll_compactions finalization should release inputs for future compaction"
-        );
+        assert!(executor.tracker.try_register(&task, &ticket).is_some());
         executor.release_task_inputs(&task);
         executor.shutdown();
     }
@@ -2039,6 +2695,62 @@ mod tests {
     }
 
     #[test]
+    fn backpressure_read_ahead_config_logs_error_defaults_and_normalization() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Capture(std::sync::Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for bad in ["junk", "0", "-1", "268435457"] {
+                assert_eq!(
+                    input_read_mode(true, Some(bad)),
+                    InputReadMode::DirectScan {
+                        window: ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW
+                    }
+                );
+            }
+            assert_eq!(
+                input_read_mode(true, Some("4097")),
+                InputReadMode::DirectScan { window: 8192 }
+            );
+            assert_eq!(
+                input_read_mode(true, None),
+                InputReadMode::DirectScan {
+                    window: ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW
+                }
+            );
+            assert_eq!(
+                input_read_mode(true, Some("268435456")),
+                InputReadMode::DirectScan {
+                    window: ferrosa_sstable::scan::MAX_SCAN_WINDOW
+                }
+            );
+        });
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("ERROR").count(), 4, "{logs}");
+        assert_eq!(logs.matches("WARN").count(), 1, "{logs}");
+        assert!(logs.contains("effective=8192"), "{logs}");
+        assert!(
+            logs.contains("configured=\"4097\"") || logs.contains("configured=4097"),
+            "{logs}"
+        );
+    }
+
+    #[test]
     fn input_read_mode_selection() {
         use ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW;
         assert_eq!(input_read_mode(false, None), InputReadMode::Cached);
@@ -2053,7 +2765,7 @@ mod tests {
             input_read_mode(true, Some("8192")),
             InputReadMode::DirectScan { window: 8192 }
         );
-        // A bad window is reported (WARN) and the default is used — never silent.
+        // A bad window is reported (ERROR) and the default is used — never silent.
         assert_eq!(
             input_read_mode(true, Some("junk")),
             InputReadMode::DirectScan {
@@ -2103,8 +2815,16 @@ mod tests {
                 table_id: test_table_id(),
                 purge: None,
             };
-            let done = CompactionExecutor::execute_task_with_read_mode(&task, None, mode, |_| {})
-                .expect("compaction");
+            let cancel = ferrosa_common::CancelToken::new();
+            let done = CompactionExecutor::execute_task_with_policy(
+                &task,
+                None,
+                mode,
+                true,
+                &cancel,
+                |_| {},
+            )
+            .expect("compaction");
             read_output_partitions(&output_dir, &done.metadata.id)
         };
 
@@ -2151,10 +2871,13 @@ mod tests {
             purge: None,
         };
         let pool: CompactionReaderPool = Arc::new(crate::reader_pool::ReaderPool::new(256));
-        let result = CompactionExecutor::execute_task_with_read_mode(
+        let cancel = ferrosa_common::CancelToken::new();
+        let result = CompactionExecutor::execute_task_with_policy(
             &task,
             Some(&pool),
             InputReadMode::DirectScan { window: 4096 },
+            true,
+            &cancel,
             |_| {},
         )
         .expect("compaction");
@@ -2363,6 +3086,92 @@ mod tests {
         );
     }
 
+    /// `publication-safety.md` M3 / T-012: the digest check in `flush_files`
+    /// runs unconditionally for compaction output, regardless of
+    /// `FERROSA_COMPACTION_VERIFY_OUTPUT` -- that variable controls only the
+    /// separate row/partition count walk. A corrupted output must be
+    /// refused, and its inputs must remain live and untouched (F15): nothing
+    /// retires them, because `execute_task` returns `Err` before its caller
+    /// ever gets a chance to swap.
+    #[test]
+    fn digest_verify_compaction_output_corruption_refused_even_with_verify_output_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema_with_columns();
+
+        let dir_a = tmp.path().join("sstable_a");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        let partitions_a: Vec<_> = (0..5)
+            .map(|i| make_test_partition(&format!("key_{i:04}"), "value_a", 1000))
+            .collect();
+        let meta_a = write_sstable_to_dir(&dir_a, &partitions_a, &schema);
+
+        let dir_b = tmp.path().join("sstable_b");
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let partitions_b: Vec<_> = (5..10)
+            .map(|i| make_test_partition(&format!("key_{i:04}"), "value_b", 2000))
+            .collect();
+        let meta_b = write_sstable_to_dir(&dir_b, &partitions_b, &schema);
+
+        let input_a_data = std::fs::read(dir_a.join(format!("{}-Data.db", meta_a.id))).unwrap();
+        let input_b_data = std::fs::read(dir_b.join(format!("{}-Data.db", meta_b.id))).unwrap();
+
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let task = CompactionTask {
+            inputs: vec![meta_a.clone(), meta_b.clone()],
+            output_dir: output_dir.clone(),
+            schema: schema.clone(),
+            table_id: test_table_id(),
+            purge: None,
+        };
+
+        set_compaction_output_hook(|output| {
+            let good = std::fs::read(&output.data).unwrap();
+            let mut damaged = good.clone();
+            for b in damaged.iter_mut().skip(good.len() / 4) {
+                *b = 0xff;
+            }
+            std::fs::write(&output.data, &damaged).unwrap();
+        });
+
+        // Disable only this task's structural scan. Digest verification remains
+        // unconditional, and parallel cancellation tests retain their scan.
+        let result = CompactionExecutor::execute_task_with_policy(
+            &task,
+            None,
+            configured_input_read_mode(),
+            false,
+            &CancelToken::new(),
+            |_| {},
+        );
+
+        clear_compaction_output_hook();
+
+        let msg = match result {
+            Ok(_) => panic!(
+                "a compaction whose output digest does not match must be refused even with \
+                 FERROSA_COMPACTION_VERIFY_OUTPUT=0"
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            msg.contains("Digest.crc32 mismatch"),
+            "refusal must be reported as a digest mismatch: {msg}"
+        );
+
+        assert_eq!(
+            std::fs::read(dir_a.join(format!("{}-Data.db", meta_a.id))).unwrap(),
+            input_a_data,
+            "input A must remain untouched after a refused compaction"
+        );
+        assert_eq!(
+            std::fs::read(dir_b.join(format!("{}-Data.db", meta_b.id))).unwrap(),
+            input_b_data,
+            "input B must remain untouched after a refused compaction"
+        );
+    }
+
     #[test]
     fn compaction_streaming_merge_only_holds_one_partition_per_input() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2438,6 +3247,16 @@ mod tests {
             &second,
         ));
         std::fs::write(data_path, unsorted_data).unwrap();
+        // The hand-crafted Data.db above no longer matches the Digest.crc32
+        // / CRC.db that `write_sstable_to_dir` computed for the ORIGINAL
+        // (sorted) bytes. Since T-012 loads them automatically on every
+        // compaction input open, a stale CRC.db would fail chunk
+        // verification on the very first read and mask the token-order
+        // error this test actually exercises. Removing them makes this
+        // generation "not checked" (T-011's old-SSTable tolerance) instead
+        // of "checked against the wrong bytes".
+        let _ = std::fs::remove_file(dir.join(format!("{}-Digest.crc32", meta.id)));
+        let _ = std::fs::remove_file(dir.join(format!("{}-CRC.db", meta.id)));
 
         let output_dir = tmp.path().join("output");
         std::fs::create_dir_all(&output_dir).unwrap();
@@ -2624,19 +3443,23 @@ mod tests {
         const ITERS: usize = 50;
 
         let gate = Arc::new(CompactionGate::new(CAP));
-        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
+        let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(0);
         let live = Arc::new(AtomicUsize::new(0));
         let max_live = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::new();
         for _ in 0..WORKERS {
             let gate = Arc::clone(&gate);
-            let stop = Arc::clone(&stop);
+            let cancel = cancel.clone();
+            let shutdown_rx = shutdown_rx.clone();
             let live = Arc::clone(&live);
             let max_live = Arc::clone(&max_live);
             handles.push(std::thread::spawn(move || {
                 for _ in 0..ITERS {
-                    let permit = gate.acquire(&stop).expect("permit while not stopped");
+                    let permit = gate
+                        .acquire(&cancel, &shutdown_rx)
+                        .expect("permit while not stopped");
                     let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                     max_live.fetch_max(now, Ordering::SeqCst);
                     // Hold the permit briefly so contention is real.
@@ -2658,28 +3481,52 @@ mod tests {
     }
 
     /// A shutting-down executor must not deadlock a worker blocked on the gate:
-    /// `acquire` returns `None` once `stop` is set.
+    /// `acquire` returns `None` once the shutdown sender closes.
     #[test]
     fn compaction_gate_unblocks_on_shutdown() {
         let gate = Arc::new(CompactionGate::new(1));
-        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
+        let (_shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(0);
 
         // Exhaust the single permit and hold it.
-        let held = gate.acquire(&stop).expect("first permit");
+        let held = gate.acquire(&cancel, &shutdown_rx).expect("first permit");
 
         let waiter = {
             let gate = Arc::clone(&gate);
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || gate.acquire(&stop).is_none())
+            let cancel = cancel.clone();
+            let shutdown_rx = shutdown_rx.clone();
+            std::thread::spawn(move || gate.acquire(&cancel, &shutdown_rx).is_none())
         };
-        // Give the waiter time to block on the unavailable permit.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        stop.store(true, Ordering::Release);
+        drop(_shutdown_tx);
         let returned_none = waiter.join().unwrap();
         assert!(
             returned_none,
             "waiter must observe shutdown and stop blocking, not wait forever"
         );
+        drop(held);
+    }
+
+    #[test]
+    fn compaction_gate_unblocks_on_table_cancellation() {
+        let gate = CompactionGate::new(1);
+        let cancel = CancelToken::new();
+        let (_shutdown, shutdown_rx) = crossbeam_channel::bounded(0);
+        let held = gate.acquire(&cancel, &shutdown_rx).unwrap();
+        std::thread::scope(|scope| {
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            let gate_ref = &gate;
+            let cancel_ref = &cancel;
+            let shutdown_ref = &shutdown_rx;
+            scope.spawn(move || {
+                done_tx
+                    .send(gate_ref.acquire(cancel_ref, shutdown_ref).is_none())
+                    .unwrap();
+            });
+            cancel.cancel(CancelReason::TableDropped);
+            assert!(done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap());
+        });
         drop(held);
     }
 
@@ -2746,10 +3593,13 @@ mod tests {
 
         // The cached (pool-routed) mode is what this pins, so ask for it. It used
         // to be inherited from the default, which is now the direct scan.
-        let result = CompactionExecutor::execute_task_with_read_mode(
+        let cancel = ferrosa_common::CancelToken::new();
+        let result = CompactionExecutor::execute_task_with_policy(
             &task,
             Some(&pool),
             InputReadMode::Cached,
+            true,
+            &cancel,
             |_| {},
         )
         .expect("compaction");
@@ -2800,33 +3650,59 @@ mod tests {
     /// Auto-tune is bounded by BOTH cpu and memory, and never zero.
     #[test]
     fn auto_tuned_concurrency_is_bounded_by_cpu_and_memory() {
-        // 2 GB (the dev forcing function): half of RAM / 256 MB = 4 tasks,
-        // capped by cpus. With ample cpus the memory bound (4) wins.
+        // 2 GB: half of RAM / 256 MB = 4 tasks, capped by CPUs.
         assert_eq!(
-            auto_tuned_max_concurrent(16, Some(2 * 1024 * 1024 * 1024)),
+            auto_tuned_max_concurrent(16, Some(2 * 1024 * 1024 * 1024), 8, 256 * 1024 * 1024),
             4
         );
         // Few cpus cap below the memory allowance.
         assert_eq!(
-            auto_tuned_max_concurrent(2, Some(2 * 1024 * 1024 * 1024)),
+            auto_tuned_max_concurrent(2, Some(2 * 1024 * 1024 * 1024), 8, 256 * 1024 * 1024),
             2
         );
         // Tiny memory floors at 1, never zero.
-        assert_eq!(auto_tuned_max_concurrent(8, Some(64 * 1024 * 1024)), 1);
+        assert_eq!(
+            auto_tuned_max_concurrent(8, Some(64 * 1024 * 1024), 8, 256 * 1024 * 1024),
+            1
+        );
         // Huge memory is still capped by the parallelism ceiling and cpus.
         assert_eq!(
-            auto_tuned_max_concurrent(64, Some(256u64 * 1024 * 1024 * 1024)),
-            MAX_AUTO_COMPACTION_PARALLELISM
+            auto_tuned_max_concurrent(64, Some(256u64 * 1024 * 1024 * 1024), 8, 256 * 1024 * 1024),
+            8
+        );
+        // The operator-set parallelism ceiling is honored when raised.
+        assert_eq!(
+            auto_tuned_max_concurrent(64, Some(256u64 * 1024 * 1024 * 1024), 32, 256 * 1024 * 1024),
+            32
         );
         // No memory signal → historical conservative default of 2 (cpu-capped).
-        assert_eq!(auto_tuned_max_concurrent(8, None), 2);
-        assert_eq!(auto_tuned_max_concurrent(1, None), 1);
+        assert_eq!(auto_tuned_max_concurrent(8, None, 8, 256 * 1024 * 1024), 2);
+        assert_eq!(auto_tuned_max_concurrent(1, None, 8, 256 * 1024 * 1024), 1);
+        assert_eq!(
+            auto_tuned_max_concurrent(64, None, 32, 256 * 1024 * 1024),
+            2
+        );
     }
 
     #[test]
     fn auto_tuned_workers_track_cpus_within_bounds() {
-        assert_eq!(auto_tuned_workers(1), 1);
-        assert_eq!(auto_tuned_workers(4), 4);
-        assert_eq!(auto_tuned_workers(64), MAX_AUTO_COMPACTION_PARALLELISM);
+        assert_eq!(auto_tuned_workers(1, 8), 1);
+        assert_eq!(auto_tuned_workers(4, 8), 4);
+        assert_eq!(auto_tuned_workers(64, 8), 8);
+        assert_eq!(auto_tuned_workers(64, 32), 32);
+    }
+
+    #[test]
+    fn compaction_backoff_classifies_digest_and_readback_failures() {
+        assert!(is_digest_verification_failure(
+            "flush output: Digest mismatch for Data.db"
+        ));
+        assert!(is_digest_verification_failure(
+            "CORRUPTION: output partitions_iter failed"
+        ));
+        assert!(is_digest_verification_failure(
+            "compaction output SSTable is corrupt"
+        ));
+        assert!(!is_digest_verification_failure("finish: disk full"));
     }
 }

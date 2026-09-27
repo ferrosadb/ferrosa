@@ -21,6 +21,9 @@ pub enum Error {
     Io(std::io::Error),
     /// Data does not conform to expected format.
     InvalidData(String),
+    /// A table rejected a write because local storage pressure is above its
+    /// configured hard limit.
+    Overloaded { reason: String, table: String },
     /// File or structure format not recognized.
     InvalidFormat(String),
     /// Checksum verification failed.
@@ -54,6 +57,7 @@ impl Error {
     /// backpressure rather than a malformed request or unexpected failure.
     pub fn is_backpressure(&self) -> bool {
         match self {
+            Error::Overloaded { .. } => true,
             Error::InvalidData(msg) => {
                 msg.contains("local disk free space below write reserve")
                     || msg.starts_with("overloaded:")
@@ -94,6 +98,9 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::InvalidData(msg) => write!(f, "invalid data: {msg}"),
+            Error::Overloaded { reason, table } => {
+                write!(f, "overloaded: table={table} reason={reason}")
+            }
             Error::InvalidFormat(msg) => write!(f, "invalid format: {msg}"),
             Error::ChecksumMismatch { expected, actual } => {
                 write!(
@@ -164,5 +171,15 @@ mod tests {
         fn assert_sync<T: Sync>() {}
         assert_send::<Error>();
         assert_sync::<Error>();
+    }
+
+    #[test]
+    fn overloaded_is_typed_backpressure() {
+        let err = Error::Overloaded {
+            reason: "hard memtable pressure".to_owned(),
+            table: "ks.tbl".to_owned(),
+        };
+        assert!(err.is_backpressure());
+        assert!(err.to_string().contains("table=ks.tbl"));
     }
 }

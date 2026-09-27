@@ -140,14 +140,20 @@ impl BloomFilter {
         Ok(BloomFilter { hash_count, bits })
     }
 
+    /// Emit the existing bitset without allocating a second serialized copy.
+    pub fn write_to<S: crate::io::AppendSink>(&self, sink: &mut S) -> Result<()> {
+        sink.append(&self.hash_count.to_be_bytes())?;
+        sink.append(&(self.bits.len() as i32).to_be_bytes())?;
+        for word in &self.bits {
+            sink.append(&word.to_ne_bytes())?;
+        }
+        Ok(())
+    }
+
     /// Serialize the Bloom filter (new format).
     pub fn write(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(8 + self.bits.len() * 8);
-        buf.extend_from_slice(&self.hash_count.to_be_bytes());
-        buf.extend_from_slice(&(self.bits.len() as i32).to_be_bytes());
-        for &word in &self.bits {
-            buf.extend_from_slice(&word.to_ne_bytes());
-        }
+        self.write_to(&mut buf).expect("memory sink cannot fail");
         buf
     }
 }

@@ -93,14 +93,23 @@ pub fn run(work_dir: &Path, seed_start: u64, iterations: usize) -> Result<SoakRe
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // No non-slow tests remain in this module, so `use super::*;` would be
+    // unused when `slow-tests` is off. `mod slow` imports directly from the
+    // grandparent (this file's top level) instead.
 
-    #[test]
-    #[ignore = "slow (compaction soak across many seeds); runs in the nightly --ignored job"]
-    fn soak_stays_clean_across_many_seeds() {
-        let tmp = tempfile::tempdir().unwrap();
-        let report = run(tmp.path(), 1, 48).expect("soak must stay clean");
-        assert_eq!(report.iterations, 48);
-        assert!(report.cells_checked > 0, "soak must actually check cells");
+    /// Slow tests: excluded from PR CI (`--skip ::slow::`), compiled under
+    /// `--all-features` but only run by `nightly-slow-tests.yml`. See the
+    /// `slow-tests` feature in Cargo.toml.
+    #[cfg(feature = "slow-tests")]
+    mod slow {
+        use super::super::*;
+
+        #[test]
+        fn soak_stays_clean_across_many_seeds() {
+            let tmp = tempfile::tempdir().unwrap();
+            let report = run(tmp.path(), 1, 48).expect("soak must stay clean");
+            assert_eq!(report.iterations, 48);
+            assert!(report.cells_checked > 0, "soak must actually check cells");
+        }
     }
 }

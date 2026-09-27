@@ -116,3 +116,18 @@ drains cluster tasks → internode → memtables → schema in a 30 s timeout wi
 `ferrosa-sparql`, `ferrosa-storage`, `ferrosa-udf`. Depended on by nothing — it
 is the binary. See the [root crate index](../../specs/crates.md) for the full
 graph.
+
+### Pump wiring acceptance (T-045)
+
+The CQL wiring acceptance test writes compressed and plain tables through a real client/server, includes a row larger than a pump segment, flushes and compacts, tears down the first runtime, and verifies all rows through a reopened engine and fresh server.
+
+### Compaction operator API
+
+`POST /api/compaction/stop` uses the existing authenticated admin/operator routes.
+JSON `{}` selects current tasks on this node; `{"keyspace":"ks","table":"t"}`
+selects one registered table. Partial/empty scope, unknown fields, malformed JSON
+and query parameters return 400; unknown tables return 404; bodies above 4 KiB
+return 413. HTTP 202 returns `status: cancellation_requested`, `node_id`, echoed
+`keyspace`/`table`, `matched_tasks` and `already_cancelled_tasks`. This is a request
+acknowledgement: committed replacements continue, and future scheduling remains
+active. `ferrosa-ctl compaction stop` calls this endpoint.

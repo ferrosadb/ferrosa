@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sstable
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-09-26
 ---
 
 # ferrosa-sstable — Roadmap
@@ -29,6 +29,17 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
 - **Snappy / Deflate compression.** Currently only None / LZ4 / Zstd are
   supported. Add the remaining Cassandra algorithms behind the `Compression`
   enum for broader fixture compatibility.
+- **`Lz4` chunk compression cannot reach zero allocations (T-036 finding).**
+  `compress_into`'s `Lz4` arm calls `lz4_flex::block::compress_into`, which
+  allocates a fresh boxed match-finding hash table every call — the pinned
+  `lz4_flex = "0.11"` exposes no reusable-state entry point (the private
+  `compress_internal`/`HashTable` types would need to be reused, and aren't
+  `pub`). `None` and `Zstd` are zero-allocation after warm-up
+  (`tests/compress_into_alloc.rs`); `Lz4` is a bounded, constant one
+  allocation per call. Now that T-038's `ChunkCompressor` is in place, revisit
+  when upgrading `lz4_flex` or exposing a reusable
+  hash table, would close the gap) — low priority since it's a bounded,
+  non-scaling cost, not a leak.
 - **Bloom filter sizing.** `SSTableWriter::new` sizes the bloom filter for a
   fixed 10 000-key default with a "production would resize" note. Make the size
   derive from the actual partition count (builder pattern or post-hoc resize) so
@@ -49,3 +60,59 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
 - Async / S3 I/O — lives in `ferrosa-storage` behind the `ReadAt`/`WriteAt`
   traits; this crate stays synchronous and runtime-free.
 - CQL planning, schema DDL, or cluster routing — belong to the calling crates.
+
+## Component output milestone (T-040)
+
+All component file writes now use the pump, including metadata and buffered
+output from a memory writer. Byte parity is checked for every component across
+both output modes and all supported compression codecs. T-081 now streams
+partition/row trie nodes and CRC words, reuses row-trie scratch and emits Bloom
+words without a duplicate serialized bitset. Remaining strict allocation work:
+Rayon external-job injection. T-081 initializes cached Crossbeam wait storage
+at open and uses one-slot abort channels solely for disconnection; unchanged
+RE5 and pump allocation gates pass. No allocation allowances were added.
+
+T-081 allocator attribution: the unchanged LZ4 and Zstd strict gates each
+observe one 1,520-byte allocation across 1,000 measured partitions after 64
+warm-up partitions. The allocation stack is `crossbeam_deque::Injector<JobRef>`
+through `rayon_core::ThreadPool::install` from `ChunkCompressor::flush_batch`.
+It belongs to external job injection, not component serialization. Scheduling
+is a separate follow-up; neither strict gate is relaxed in T-081.
+
+Test-support pump hooks are scoped by output directory and wrap each real sink
+once at open. Integration tests can record effective segment/depth/mode or inject
+backpressure without process environment changes; guards unregister on drop.
+Production builds do not include the hook registry or its locks.
+
+The pump also backs file-backed flush and compaction output (T-045). Storage
+recomputes `Digest.crc32` from staged `Data.db` bytes before publication; this
+check is unconditional and independent of the optional compaction row/partition
+count walk. The local `AbortSignal`/`NeverAbort` shim remains in use on this
+branch and is not yet replaced by `ferrosa_common::CancelToken` (T-021).
+
+### Pump wiring acceptance (T-045)
+
+Fixed component labels count pump opens by I/O mode, successful physical bytes (including padding), and sink write requests. The counters use atomics and resolve labels once per file; no per-write allocation or registry lock is added. Scoped test traces preserve real file I/O and detect known legacy component-write routes.
+
+T-041 backpressure tests cover component byte parity, codec/sink independence,
+ring bounds, real read-ahead pull bounds, fault propagation and a minute stall.
+Reproduce physical-write memory/throughput observations with the
+`backpressure_memory` integration target in package `ferrosa-sstable`, feature
+`test-support`, and harness flag `--nocapture`.
+The `BACKPRESSURE_MEASUREMENT` record reports four 15-second live-heap/RSS samples,
+then identical 64 MiB ungated/resumed workloads (first three segments excluded
+from throughput timing). This is a measured local comparison, not an engine
+throughput SLA or Linux cache/cgroup acceptance claim. Linux `dm-delay` E1–E3
+still requires the live infrastructure run with dirty-page and cgroup evidence.
+
+
+Local macOS arm64 debug observation, 2026-09-27, T-041 worktree based on
+`6a8c6a69` plus the scoped-hook prerequisite: after a 60-second closed gate,
+live allocated bytes were `[3161094, 3161094, 3161094, 3161094]`; RSS KiB was
+`[9216, 9248, 9248, 9248]`. The same pump/file workload measured 1321.409 MiB/s
+ungated and 1538.203 MiB/s after release (ratio 1.164). The report can be saved
+with `FERROSA_BACKPRESSURE_REPORT`; otherwise it goes to the platform temp dir.
+This is **not** an old-writer versus new-writer benchmark. It demonstrates this
+local pump's bounded stall and recovery; it does not establish a historical
+speedup or production throughput SLA. Keep identical fixtures, codec, build
+profile, segment/depth settings and filesystem for a historical comparison.

@@ -11,8 +11,8 @@
 //! Correctness: compound clustering restrictions validate declared key order,
 //! and bounded single-column clustering resumes stop before materializing a
 //! wide partition tail.
-//! Last revised: 2026-09-16.
-//! Last changed: persist standalone role mutations to system_auth before reply.
+//! Last revised: 2026-09-27
+//! Last changed: Coordinate table DDL with compaction cancellation and completion.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -9567,9 +9567,18 @@ async fn route_drop_keyspace(
                 .filter(|(ks, _)| ks == &s.name)
                 .map(|(ks, tbl)| ferrosa_storage::TableId::new(ks, tbl))
                 .collect();
+            let mut pauses = Vec::with_capacity(table_ids.len());
+            for tid in &table_ids {
+                pauses.push(
+                    state
+                        .engine
+                        .pause_table_compactions(tid, ferrosa_common::CancelReason::TableDropped)
+                        .await?,
+                );
+            }
             state.schema.drop_keyspace(&s.name, ctx.auth)?;
             for tid in &table_ids {
-                let _ = state.engine.unregister_table(tid);
+                state.engine.unregister_table(tid)?;
             }
         }
         DdlPath::Pair(coordinator) => {
@@ -10066,9 +10075,13 @@ async fn route_drop_table(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.drop_table(ks, &s.table, ctx.auth)?;
             let tid = ferrosa_storage::TableId::new(ks, &s.table);
-            let _ = state.engine.unregister_table(&tid);
+            let _pause = state
+                .engine
+                .pause_table_compactions(&tid, ferrosa_common::CancelReason::TableDropped)
+                .await?;
+            state.schema.drop_table(ks, &s.table, ctx.auth)?;
+            state.engine.unregister_table(&tid)?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropTable {
@@ -21062,29 +21075,6 @@ mod tests {
         );
     }
 
-    /// A user `LIMIT N` greater than `DEFAULT_RANGE_READ_LIMIT` must return N
-    /// rows — the query's own LIMIT is the ONLY bound. Previously
-    /// `range_read_limited_rows` clamped the scan to 10_000, silently capping a
-    /// large user LIMIT below what the client asked for.
-    #[tokio::test]
-    #[ignore = "slow (materializes more than 10k rows); runs in the nightly --ignored job"]
-    async fn user_limit_above_10k_returns_all_requested_rows() {
-        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
-        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
-
-        let cql = format!("SELECT * FROM pageks.t LIMIT {n}");
-        let (rows, _pages) = collect_all_pages(&state, &auth, &ks, &cql, None).await;
-        let mut ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
-        ids.sort();
-        ids.dedup();
-        assert_eq!(
-            ids.len(),
-            n as usize,
-            "LIMIT {n} must return {n} distinct rows, not a server-capped {} window",
-            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
-        );
-    }
-
     /// (b) A streaming scalar aggregate (`SUM`) over more than
     /// `DEFAULT_RANGE_READ_LIMIT` rows must be EXACT — computed over the whole
     /// table, not over a clipped 10_000-row window (and not fail-loud).
@@ -30019,88 +30009,6 @@ mod tests {
         );
     }
 
-    /// t_a0f922a3 mode 1 (CYCLE): a single partition WIDER than one page must
-    /// page to completion through the real paging_state round-trip. The live
-    /// 3-node cluster looped forever over ~10% of `typed_edges` because the
-    /// cursor re-entered a wide partition at partition granularity. One
-    /// partition of 15k clustering rows at page_size 5000 must yield exactly
-    /// 3 strictly-advancing pages whose union is the exact row set, and
-    /// has_more must go false.
-    #[tokio::test]
-    #[ignore = "slow (wide partition paged to exhaustion); runs in the nightly --ignored job"]
-    async fn wide_partition_spanning_pages_terminates_exactly() {
-        let rows_per: i64 = 15_000;
-        let page_size: i32 = 5_000;
-        let (state, _dir, auth, ks) = setup_clustered_scan_table("widepg", &[1], rows_per).await;
-
-        let expected: std::collections::BTreeSet<(i32, i32)> =
-            (0..rows_per as i32).map(|ck| (1, ck)).collect();
-
-        // Star projection → range_read_stream_all_from.
-        let pages = walk_pages(
-            &state,
-            &auth,
-            &ks,
-            "SELECT * FROM widepg.wide",
-            page_size,
-            10,
-        )
-        .await;
-        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
-
-        // Column-subset projection → range_read_projected_stream_all_from —
-        // the exact live `SELECT src_id, edge_type, dst_id FROM typed_edges`
-        // shape. pk/ck are columns 0/1 of the projection.
-        let pages = walk_pages(
-            &state,
-            &auth,
-            &ks,
-            "SELECT pk, ck FROM widepg.wide",
-            page_size,
-            10,
-        )
-        .await;
-        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
-
-        // t_a0f922a3 "also verify": the same scan must be exact when the rows
-        // are SSTABLE-backed, not memtable-backed. A live node returned an
-        // instant EMPTY page for a COUNT-verified 15k-row table right after a
-        // restart, and the live cycle was observed on flushed data. An empty
-        // or short union here means the paged path silently loses
-        // SSTable-backed rows.
-        state
-            .engine
-            .flush(&ferrosa_storage::TableId::new("widepg", "wide"))
-            .expect("flush widepg.wide to SSTable");
-
-        let pages = walk_pages(
-            &state,
-            &auth,
-            &ks,
-            "SELECT * FROM widepg.wide",
-            page_size,
-            10,
-        )
-        .await;
-        assert!(
-            !pages.is_empty(),
-            "SSTable-backed paged scan returned an instant EMPTY result for a \
-             populated table (t_a0f922a3 restart evidence)"
-        );
-        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
-
-        let pages = walk_pages(
-            &state,
-            &auth,
-            &ks,
-            "SELECT pk, ck FROM widepg.wide",
-            page_size,
-            10,
-        )
-        .await;
-        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
-    }
-
     /// t_a0f922a3 LIVE (the bug 3 prior in-process-green fixes missed): the
     /// EXACT live shape and transport. `SELECT pk, ck FROM vcyc.edges`
     /// (3 partitions × 5000 clustering rows), driven with the python driver's
@@ -30166,148 +30074,6 @@ mod tests {
             "SSTable-backed wire-paged scan returned an instant EMPTY result"
         );
         assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
-    }
-
-    /// t_a0f922a3 mode 1, live shape: MULTI-COMPONENT TEXT clustering
-    /// (`typed_edges` is `((tenant, session), edge_type, dst_id)` — text
-    /// components of VARYING lengths, u16-length-prefixed in the encoded
-    /// clustering bytes). The paging cursor compares raw encoded clustering
-    /// bytes, and the SSTable layer decodes/re-encodes the components on
-    /// flush/read — any byte-order or round-trip divergence between the
-    /// memtable and SSTable forms makes the cursor skip or re-emit rows and
-    /// can cycle forever. Walk a wide partition spanning pages, memtable-
-    /// backed then SSTable-backed then MIXED (flushed base + memtable
-    /// updates), asserting the exact union each time.
-    #[tokio::test]
-    #[ignore = "slow (wide partition paged to exhaustion after a flush); runs in the nightly --ignored job"]
-    async fn wide_partition_multi_text_clustering_pages_exactly_after_flush() {
-        let (state, _dir) = setup();
-        let auth = dev_auth();
-        let ks = Some("mck".to_string());
-        let ctx = paging_ctx(&auth, &ks, None, None);
-        run_ddl(
-            &state,
-            &ctx,
-            "CREATE KEYSPACE mck WITH replication = \
-             {'class': 'SimpleStrategy', 'replication_factor': 1}",
-        )
-        .await;
-        run_ddl(
-            &state,
-            &ctx,
-            "CREATE TABLE mck.edges (pk int, e text, d text, v int, PRIMARY KEY (pk, e, d))",
-        )
-        .await;
-
-        // Varying-length components so length-prefixed byte order and
-        // component-wise order DIVERGE (e.g. 'b' vs 'aa').
-        let edge_types = ["a", "bb", "c", "dddd", "ee", "supports", "x"];
-        let mut expected: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
-        let n: usize = 4_200;
-        let page_size: i32 = 1_000;
-        for i in 0..n {
-            let e = edge_types[i % edge_types.len()];
-            // Varying-length dst ids: "n-5", "n-55", "n-555", ...
-            let d = format!("n-{}", "5".repeat(1 + i % 5)) + &format!("-{i}");
-            run_ddl(
-                &state,
-                &ctx,
-                &format!("INSERT INTO mck.edges (pk, e, d, v) VALUES (7, '{e}', '{d}', 1)"),
-            )
-            .await;
-            expected.insert((e.to_string(), d));
-        }
-        assert_eq!(expected.len(), n, "seed rows must be distinct");
-
-        let collect_pairs = |pages: &[Vec<Vec<Option<CqlValue>>>]| {
-            let mut seen: Vec<(String, String)> = pages
-                .iter()
-                .flatten()
-                .map(|row| {
-                    let text_at = |i: usize| match &row[i] {
-                        Some(CqlValue::Text(s)) => s.clone(),
-                        other => panic!("expected text at column {i}, got {other:?}"),
-                    };
-                    (text_at(0), text_at(1))
-                })
-                .collect();
-            let delivered = seen.len();
-            seen.sort();
-            seen.dedup();
-            assert_eq!(
-                seen.len(),
-                delivered,
-                "paged traversal emitted duplicate rows"
-            );
-            seen.into_iter().collect::<std::collections::BTreeSet<_>>()
-        };
-        let max_pages = n.div_ceil(page_size as usize) + 2;
-
-        // Memtable-backed.
-        let pages = walk_pages(
-            &state,
-            &auth,
-            &ks,
-            "SELECT e, d FROM mck.edges",
-            page_size,
-            max_pages,
-        )
-        .await;
-        assert_eq!(
-            collect_pairs(&pages),
-            expected,
-            "memtable-backed multi-text-ck paged union must be exact"
-        );
-
-        // SSTable-backed.
-        state
-            .engine
-            .flush(&ferrosa_storage::TableId::new("mck", "edges"))
-            .expect("flush mck.edges to SSTable");
-        let pages = walk_pages(
-            &state,
-            &auth,
-            &ks,
-            "SELECT e, d FROM mck.edges",
-            page_size,
-            max_pages,
-        )
-        .await;
-        assert_eq!(
-            collect_pairs(&pages),
-            expected,
-            "SSTable-backed multi-text-ck paged union must be exact — a \
-             clustering round-trip divergence cycles the cursor (t_a0f922a3)"
-        );
-
-        // Mixed: overwrite a slice of rows so the scan merges SSTable base
-        // rows with newer memtable rows sharing the same clustering.
-        for i in 0..500 {
-            let e = edge_types[i % edge_types.len()];
-            let d = format!("n-{}", "5".repeat(1 + i % 5)) + &format!("-{i}");
-            run_ddl(
-                &state,
-                &ctx,
-                &format!("INSERT INTO mck.edges (pk, e, d, v) VALUES (7, '{e}', '{d}', 2)"),
-            )
-            .await;
-        }
-        let pages = walk_pages(
-            &state,
-            &auth,
-            &ks,
-            "SELECT e, d FROM mck.edges",
-            page_size,
-            max_pages,
-        )
-        .await;
-        assert_eq!(
-            collect_pairs(&pages),
-            expected,
-            "mixed memtable+SSTable multi-text-ck paged union must be exact \
-             (same-clustering rows must fold, not duplicate)"
-        );
     }
 
     /// t_a0f922a3 mode 2 (STALL): many SMALL partitions, pk-only projection,
@@ -32126,5 +31892,258 @@ mod tests {
             "an index naming a column the table does not have cannot be built, so it \
              must be refused rather than silently chosen and read as empty"
         );
+    }
+
+    /// Slow tests: excluded from PR CI (`--skip ::slow::`), compiled under
+    /// `--all-features` but only run by `nightly-slow-tests.yml`. See the
+    /// `slow-tests` feature in Cargo.toml.
+    #[cfg(feature = "slow-tests")]
+    mod slow {
+        use super::*;
+
+        /// A user `LIMIT N` greater than `DEFAULT_RANGE_READ_LIMIT` must return N
+        /// rows — the query's own LIMIT is the ONLY bound. Previously
+        /// `range_read_limited_rows` clamped the scan to 10_000, silently capping a
+        /// large user LIMIT below what the client asked for.
+        #[tokio::test]
+        async fn user_limit_above_10k_returns_all_requested_rows() {
+            let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+            let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+            let cql = format!("SELECT * FROM pageks.t LIMIT {n}");
+            let (rows, _pages) = collect_all_pages(&state, &auth, &ks, &cql, None).await;
+            let mut ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+            ids.sort();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                n as usize,
+                "LIMIT {n} must return {n} distinct rows, not a server-capped {} window",
+                ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+            );
+        }
+
+        /// t_a0f922a3 mode 1 (CYCLE): a single partition WIDER than one page must
+        /// page to completion through the real paging_state round-trip. The live
+        /// 3-node cluster looped forever over ~10% of `typed_edges` because the
+        /// cursor re-entered a wide partition at partition granularity. One
+        /// partition of 15k clustering rows at page_size 5000 must yield exactly
+        /// 3 strictly-advancing pages whose union is the exact row set, and
+        /// has_more must go false.
+        #[tokio::test]
+        async fn wide_partition_spanning_pages_terminates_exactly() {
+            let rows_per: i64 = 15_000;
+            let page_size: i32 = 5_000;
+            let (state, _dir, auth, ks) =
+                setup_clustered_scan_table("widepg", &[1], rows_per).await;
+
+            let expected: std::collections::BTreeSet<(i32, i32)> =
+                (0..rows_per as i32).map(|ck| (1, ck)).collect();
+
+            // Star projection → range_read_stream_all_from.
+            let pages = walk_pages(
+                &state,
+                &auth,
+                &ks,
+                "SELECT * FROM widepg.wide",
+                page_size,
+                10,
+            )
+            .await;
+            assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+
+            // Column-subset projection → range_read_projected_stream_all_from —
+            // the exact live `SELECT src_id, edge_type, dst_id FROM typed_edges`
+            // shape. pk/ck are columns 0/1 of the projection.
+            let pages = walk_pages(
+                &state,
+                &auth,
+                &ks,
+                "SELECT pk, ck FROM widepg.wide",
+                page_size,
+                10,
+            )
+            .await;
+            assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+
+            // t_a0f922a3 "also verify": the same scan must be exact when the rows
+            // are SSTABLE-backed, not memtable-backed. A live node returned an
+            // instant EMPTY page for a COUNT-verified 15k-row table right after a
+            // restart, and the live cycle was observed on flushed data. An empty
+            // or short union here means the paged path silently loses
+            // SSTable-backed rows.
+            state
+                .engine
+                .flush(&ferrosa_storage::TableId::new("widepg", "wide"))
+                .expect("flush widepg.wide to SSTable");
+
+            let pages = walk_pages(
+                &state,
+                &auth,
+                &ks,
+                "SELECT * FROM widepg.wide",
+                page_size,
+                10,
+            )
+            .await;
+            assert!(
+                !pages.is_empty(),
+                "SSTable-backed paged scan returned an instant EMPTY result for a \
+                 populated table (t_a0f922a3 restart evidence)"
+            );
+            assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+
+            let pages = walk_pages(
+                &state,
+                &auth,
+                &ks,
+                "SELECT pk, ck FROM widepg.wide",
+                page_size,
+                10,
+            )
+            .await;
+            assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+        }
+
+        /// t_a0f922a3 mode 1, live shape: MULTI-COMPONENT TEXT clustering
+        /// (`typed_edges` is `((tenant, session), edge_type, dst_id)` — text
+        /// components of VARYING lengths, u16-length-prefixed in the encoded
+        /// clustering bytes). The paging cursor compares raw encoded clustering
+        /// bytes, and the SSTable layer decodes/re-encodes the components on
+        /// flush/read — any byte-order or round-trip divergence between the
+        /// memtable and SSTable forms makes the cursor skip or re-emit rows and
+        /// can cycle forever. Walk a wide partition spanning pages, memtable-
+        /// backed then SSTable-backed then MIXED (flushed base + memtable
+        /// updates), asserting the exact union each time.
+        #[tokio::test]
+        async fn wide_partition_multi_text_clustering_pages_exactly_after_flush() {
+            let (state, _dir) = setup();
+            let auth = dev_auth();
+            let ks = Some("mck".to_string());
+            let ctx = paging_ctx(&auth, &ks, None, None);
+            run_ddl(
+                &state,
+                &ctx,
+                "CREATE KEYSPACE mck WITH replication = \
+                 {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            )
+            .await;
+            run_ddl(
+                &state,
+                &ctx,
+                "CREATE TABLE mck.edges (pk int, e text, d text, v int, PRIMARY KEY (pk, e, d))",
+            )
+            .await;
+
+            // Varying-length components so length-prefixed byte order and
+            // component-wise order DIVERGE (e.g. 'b' vs 'aa').
+            let edge_types = ["a", "bb", "c", "dddd", "ee", "supports", "x"];
+            let mut expected: std::collections::BTreeSet<(String, String)> =
+                std::collections::BTreeSet::new();
+            let n: usize = 4_200;
+            let page_size: i32 = 1_000;
+            for i in 0..n {
+                let e = edge_types[i % edge_types.len()];
+                // Varying-length dst ids: "n-5", "n-55", "n-555", ...
+                let d = format!("n-{}", "5".repeat(1 + i % 5)) + &format!("-{i}");
+                run_ddl(
+                    &state,
+                    &ctx,
+                    &format!("INSERT INTO mck.edges (pk, e, d, v) VALUES (7, '{e}', '{d}', 1)"),
+                )
+                .await;
+                expected.insert((e.to_string(), d));
+            }
+            assert_eq!(expected.len(), n, "seed rows must be distinct");
+
+            let collect_pairs = |pages: &[Vec<Vec<Option<CqlValue>>>]| {
+                let mut seen: Vec<(String, String)> = pages
+                    .iter()
+                    .flatten()
+                    .map(|row| {
+                        let text_at = |i: usize| match &row[i] {
+                            Some(CqlValue::Text(s)) => s.clone(),
+                            other => panic!("expected text at column {i}, got {other:?}"),
+                        };
+                        (text_at(0), text_at(1))
+                    })
+                    .collect();
+                let delivered = seen.len();
+                seen.sort();
+                seen.dedup();
+                assert_eq!(
+                    seen.len(),
+                    delivered,
+                    "paged traversal emitted duplicate rows"
+                );
+                seen.into_iter().collect::<std::collections::BTreeSet<_>>()
+            };
+            let max_pages = n.div_ceil(page_size as usize) + 2;
+
+            // Memtable-backed.
+            let pages = walk_pages(
+                &state,
+                &auth,
+                &ks,
+                "SELECT e, d FROM mck.edges",
+                page_size,
+                max_pages,
+            )
+            .await;
+            assert_eq!(
+                collect_pairs(&pages),
+                expected,
+                "memtable-backed multi-text-ck paged union must be exact"
+            );
+
+            // SSTable-backed.
+            state
+                .engine
+                .flush(&ferrosa_storage::TableId::new("mck", "edges"))
+                .expect("flush mck.edges to SSTable");
+            let pages = walk_pages(
+                &state,
+                &auth,
+                &ks,
+                "SELECT e, d FROM mck.edges",
+                page_size,
+                max_pages,
+            )
+            .await;
+            assert_eq!(
+                collect_pairs(&pages),
+                expected,
+                "SSTable-backed multi-text-ck paged union must be exact — a \
+                 clustering round-trip divergence cycles the cursor (t_a0f922a3)"
+            );
+
+            // Mixed: overwrite a slice of rows so the scan merges SSTable base
+            // rows with newer memtable rows sharing the same clustering.
+            for i in 0..500 {
+                let e = edge_types[i % edge_types.len()];
+                let d = format!("n-{}", "5".repeat(1 + i % 5)) + &format!("-{i}");
+                run_ddl(
+                    &state,
+                    &ctx,
+                    &format!("INSERT INTO mck.edges (pk, e, d, v) VALUES (7, '{e}', '{d}', 2)"),
+                )
+                .await;
+            }
+            let pages = walk_pages(
+                &state,
+                &auth,
+                &ks,
+                "SELECT e, d FROM mck.edges",
+                page_size,
+                max_pages,
+            )
+            .await;
+            assert_eq!(
+                collect_pairs(&pages),
+                expected,
+                "mixed memtable+SSTable multi-text-ck paged union must be exact \
+                 (same-clustering rows must fold, not duplicate)"
+            );
+        }
     }
 }

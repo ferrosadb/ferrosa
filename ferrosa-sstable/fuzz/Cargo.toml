@@ -1,0 +1,29 @@
+[package]
+name = "ferrosa-sstable-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ferrosa-common = { path = "../../ferrosa-common" }
+ferrosa-sstable = { path = "..", features = ["fuzzing"] }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "sstable_offsets"
+path = "fuzz_targets/sstable_offsets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checksum_parsing"
+path = "fuzz_targets/checksum_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

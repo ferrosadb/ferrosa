@@ -888,6 +888,186 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn compaction_stop_api_validates_scope_before_cancellation() {
+        let app = crate::web::build_router(make_state());
+        for body in [
+            r#"{"keyspace":"ks"}"#,
+            r#"{"table":"t"}"#,
+            r#"{"keyspace":" ","table":"t"}"#,
+            r#"{"unknown":true}"#,
+            r#"{"table":42}"#,
+            "not-json",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/compaction/stop")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/compaction/stop?table=oops")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/compaction/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"keyspace":"absent","table":"missing"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = app
+            .oneshot(
+                Request::post("/api/compaction/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(" ".repeat(4097)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn compaction_stop_api_cancels_real_work_on_only_the_selected_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state();
+        state.storage = Arc::new(
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap(),
+        );
+        for table in ["first", "other"] {
+            let schema = ferrosa_common::schema::TableSchema {
+                keyspace: "ops".into(),
+                table: table.into(),
+                key_type: "UTF8Type".into(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![],
+                extensions: Default::default(),
+            };
+            state.storage.register_table(schema).unwrap();
+            let tid = ferrosa_storage::TableId::new("ops", table);
+            for value in 0u8..2 {
+                let key =
+                    ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(vec![
+                        value,
+                    ]));
+                let row = ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        1000,
+                    ),
+                };
+                state.storage.write(&tid, &key, row, 1000).unwrap();
+                state.storage.flush(&tid).unwrap();
+            }
+        }
+        state.storage.force_compact_all();
+        let response = crate::web::build_router(state.clone())
+            .oneshot(
+                Request::post("/api/compaction/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"keyspace":"ops","table":"first"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["matched_tasks"], 1);
+        assert_eq!(body["already_cancelled_tasks"], 0);
+        let other = ferrosa_storage::TableId::new("ops", "other");
+        let other_report = state.storage.request_compaction_stop(Some(&other)).unwrap();
+        assert_eq!(other_report.matched_tasks, 1);
+        assert_eq!(other_report.already_cancelled_tasks, 0);
+        for table in ["first", "other"] {
+            let tid = ferrosa_storage::TableId::new("ops", table);
+            let _pause = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                state
+                    .storage
+                    .pause_table_compactions(&tid, ferrosa_common::CancelReason::Operator),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                state.storage.sstable_count(&tid),
+                2,
+                "cancellation preserves live inputs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_stop_api_is_authenticated_post_and_acknowledges_request_only() {
+        let state = make_state();
+        let node = state.host_id.to_string();
+        let app = crate::web::build_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/compaction/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let response = app
+            .oneshot(
+                Request::post("/api/compaction/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "cancellation_requested");
+        assert_eq!(body["node_id"], node);
+        assert_eq!(body["matched_tasks"], 0);
+        assert_eq!(body["already_cancelled_tasks"], 0);
+        let mut protected = state;
+        protected.auth_disabled = false;
+        let response = crate::web::build_router(protected)
+            .oneshot(
+                Request::post("/api/compaction/stop")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     struct StubTable {
         cols: Vec<VirtualColumnDef>,
         rows: Vec<VirtualRow>,

@@ -35,6 +35,7 @@ here so storage and schema share it without a cycle through `ferrosa-sstable`.
 | Module | LoC | Responsibility |
 |--------|-----|----------------|
 | `accord` (`src/accord.rs`) | 1177 | Accord `Timestamp`, `TxnId`, ballot newtypes, `HybridLogicalClock` (lock-free, drift-checked `merge`), `BallotGenerator`, `TxnPhase`/`TxnState` |
+| `cancel` (`src/cancel.rs`) | ~260 | `CancelToken`/`CancelReason`/`Cancelled` (T-021): a `Relaxed`-atomic flag plus a crossbeam `closed()` channel a `select!` blocks on without polling |
 | `schema` (`src/schema.rs`) | 637 | `TableSchema`, `ColumnDefinition`, `PinConfig`; fail-loud `fixed_width_for_marshal_type` / `validate_cell_bytes` / `validate_clustering_shape`; legacy column-order detector |
 | `geometry` (`src/geometry.rs`) | 436 | `Geometry` (Point + single-ring Polygon), WKB `marshal_wkb` / `parse_wkb` |
 | `cql_type` (`src/cql_type.rs`) | 334 | `CqlType` (full type tree + `type_id`), `CqlValue` (runtime value, IEEE-754-total `Ord`), bigint serde |
@@ -101,6 +102,11 @@ flowchart TD
 ## Position in the dependency graph
 
 The bottom. Depends on no Ferrosa crate (external only: `num-bigint`, `serde`,
-`uuid`, `tokio`, optional `proptest`). Depended on by essentially every other
+`uuid`, `tokio`, `crossbeam-channel` (T-021), optional `proptest`). Depended on by essentially every other
 crate in the workspace — see the [README dependency list](../README.md#dependencies)
 and the [root crate index](../../specs/crates.md) for the full graph.
+
+Cancellation uses a one-slot Crossbeam channel solely for disconnection. No
+payload is sent or consumed; every cloned receiver observes closure, including
+clones created after cancellation. Fixed capacity avoids zero-channel select
+packet allocations in storage pump waits (T-081).

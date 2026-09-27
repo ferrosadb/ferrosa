@@ -45,6 +45,55 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   concurrency across *all* concurrent flushes, so flush parallelism is a
   capacity-aware knob rather than a per-flush thread count.
 
+  **Publication safety — verify before promote (`publication-safety.md` M2):**
+  `FileFlushTarget::flush_files` (used by both flush and compaction promotion)
+  renames staged output to `.tmp`, checks every component's length, fsyncs the
+  `.tmp` components, then opens a THROWAWAY reader over the `.tmp` paths and
+  walks every partition — only after that succeeds does it promote to live
+  names and fsync the directory. A refusal at any of those steps moves the
+  whole `.tmp` set into `quarantine/` (WARN, `sstable_publication_refused_total{reason}`)
+  instead of returning with output under a name generation discovery would
+  load. Before this ordering, a readback failure was detected only AFTER
+  promoting to a live name, so a corrupt SSTable could enter the live view
+  next to the WAL replay of the same rows (FMEA ST-31). Startup sweeps stale
+  `.tmp` sets and abandoned `.sstable-staging`/`.merge-spill` staging into
+  `quarantine/`/removed, before generation discovery runs
+  (`StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode` calls
+  `flush::sweep_stale_flush_staging`; `FileFlushTarget::new`/`new_starting_at`
+  call it too, as a safety net for callers outside table startup).
+
+  **Digest verification on published bytes, unconditional (`publication-safety.md`
+  M2 step 4 / M3, T-012, FMEA ST-32):** between the `.tmp` fsync and the
+  structural readback walk above, `flush_files` recomputes `Digest.crc32` by
+  reading the `.tmp` Data.db back from disk (a reused 1 MiB buffer, never a
+  whole-file `Vec`; `POSIX_FADV_DONTNEED` on Linux afterward so the check does
+  not refill the page cache the write pump bypasses) and compares it with the
+  producer's value. A mismatch quarantines under
+  `PublicationRefusedReason::DigestMismatch` and refuses publication, same as
+  every other verify-before-promote failure. This closes the gap the readback
+  walk alone left open: that walk proves the file *decodes*, not that it holds
+  the bytes the producer actually wrote, so a length-preserving corruption (bit
+  flip, swapped block, stale bytes from a segment recycled before its write
+  completed) could pass it. Because compaction promotes through this same
+  `flush_files`, the digest check is unconditional for compaction too —
+  `FERROSA_COMPACTION_VERIFY_OUTPUT` continues to control only compaction's
+  separate row/partition count walk, never this check. Checksum loading
+  (`Digest.crc32`/`CRC.db`) is centralised in
+  `ferrosa_sstable::reader::{load_checksums_if_present, load_checksums_for_generation}`
+  and every production file-backed open path calls it: this crate's flush-open
+  helpers (already did, since T-011), the compaction executor's input open, the
+  local index-build backend, and `ferrosa-ctl`'s `sstable` reader (both
+  previously opened readers with checksums never loaded at all). An SSTable
+  predating T-011 still opens everywhere, treated as "not checked" and logged
+  once per generation, never as an error.
+
+  **Streaming writer callers (T-039):** file flush and compaction open staged
+  `Data.db` directly. Compaction passes its task cancellation token into the
+  writer so backpressure wakes on cancellation; a borrowed staging guard joins
+  writer teardown before deleting abandoned output. Startup removes legacy
+  `Data.raw` scratch along with abandoned staging directories, preserving live
+  generation files.
+
   **Automatic-flush admission (t_889b0d9a):** maintenance cadence alone never
   creates a tiny SSTable. The age trigger requires at least 16 MiB (or the
   configured flush threshold when smaller), while the size/backpressure
@@ -131,6 +180,73 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `is_sorted` check for the already-sorted common case), so even a 1-input legacy
   rewrite re-sorts each partition — permanently fixing the on-disk order the
   streaming read path assumes.
+  **Promote directory fsync before input eviction (T-001, FMEA ST-30):**
+  `promote_compaction_output` renames the staged output into
+  `sstables/<table>/<gen>` and then fsyncs `sstables/<table>/` itself, reusing
+  the same barrier `flush.rs` uses for its own promoting renames
+  (`FileFlushTarget::fsync_dir`, now `pub(crate)`). `poll_compactions` only
+  calls `evict_local_input_sstable_files` when promotion returns `Ok`, so a
+  directory-fsync failure structurally prevents input eviction — without this,
+  a crash between the rename and the unlinks could persist the unlinks while
+  losing the rename, destroying both the inputs and the output. On failure the
+  rename is undone when the filesystem allows it; if even that fails, the
+  output is left as a visible orphan (a disk leak, not data loss — swept by a
+  future startup reconciliation, T-023) and the caller still sees `Err`.
+  `evict_local_input_sstable_files` no longer silently discards unlink errors:
+  unexpected failures are WARN-logged (a missing file is not an error). Full
+  atomic, fsynced retirement of the whole input generation is T-024.
+  **Cancellable compaction (T-021, `compaction-cancel-safety.md` C1):**
+  `try_submit` creates one `ferrosa_common::CancelToken` per task, checked
+  (unconditionally — in every build, not only tests) at every input open, the
+  top of each merge-loop partition, before `finish_to_directory`, before
+  `flush_files`, once per readback-verify partition, and once more in
+  `poll_compactions` immediately before promoting — the last point at which
+  cancelling is free (nothing has been promoted, opened, or observed yet); a
+  cancelled checkpoint removes whatever this task staged so far (loud errors,
+  never `let _`) and releases the input claim through the existing paths.
+  **After promotion, cancellation is recorded but not honoured** — T-022 owns
+  that commit point. `CompactionExecutor::shutdown` cancels every live token
+  *before* joining workers (reaching both actively-merging tasks and
+  completed-but-not-yet-promoted results still sitting in the result queue),
+  so shutdown waits out one checkpoint interval rather than a whole merge.
+  The executor's task and result queues, and the worker loop's own wait, are
+  `crossbeam_channel::bounded` with a blocking `select!` against a shutdown
+  channel — no `recv_timeout` poll interval, so an idle worker exits shutdown
+  immediately. Metric: `compaction_cancel_latency_seconds` (cancel-call to
+  observed-`Err`). The T-020 cancel-point harness
+  (`compaction/cancel_harness.rs`) now also registers each task's live token
+  by table-id scope, so a test's cancel-point hook can call
+  `cancel_harness::cancel_now` to actually cancel — not merely record having
+  reached — a `CancelPoint`.
+  **Durable replacement record + startup reconciliation (T-022/T-023, FMEA ST-34):**
+  `compaction::intent::CompactionIntentRecord` is a JSON file at
+  `sstables/<table>/.compaction-<id>.intent` — `{task_id, output_gen,
+  output_digest, inputs, phase}`, `phase` one of `Promoting → Swapped →
+  Retired`. `poll_compactions` writes it (fsynced file + fsynced table dir)
+  **before** promoting the staged output; that write is the commit point. A
+  failure after commit but before retirement (reader-open, sidecar-merge, or
+  swap) rolls back under the record — removes the promoted output directory,
+  fsyncs, deletes the record — via `StorageEngine::rollback_compaction_intent`,
+  leaving the inputs untouched (`compaction_intent_rollback_total`). This
+  closes the gap ST-27's tombstone purge opened: retiring inputs one at a time
+  with no cross-input atomicity meant a crash between two retirements could
+  delete the input holding a purged tombstone while the input holding the row
+  it shadowed survived, resurrecting that row. Startup reconciliation
+  (`StorageEngine::reconcile_compaction_intents`, run per table before
+  generation discovery, alongside the existing `.promote-*` staging sweep)
+  rolls an incomplete record back if its output was never promoted,
+  quarantines the output on a `Digest.crc32` mismatch (T-011 format) while
+  keeping the inputs live, and otherwise rolls forward: retires every listed
+  input still on disk — idempotent, since a missing component is a no-op — so
+  a crash mid-retirement always finishes. This does not replace
+  `upload::PendingUploadsLog`: that log still separately drives S3
+  upload/manifest/delete recovery on the same path as before; the replacement
+  record is the source of truth only for the local promote/swap/retire
+  sequence. Metrics: `compaction_intent_rollback_total`,
+  `compaction_reconcile_rolled_back_total`,
+  `compaction_reconcile_rolled_forward_total`,
+  `compaction_reconcile_digest_mismatch_total`,
+  `compaction_reconcile_unreadable_record_total`.
 - **S3 write-behind** (`upload/`) — `UploadManager` tokio task + bounded mpsc;
   SHA-256 integrity metadata; pending-upload log + replay for crash safety;
   separate flush vs. compaction upload managers. Pending-upload replay recognizes
@@ -421,7 +537,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   BTI format I/O.
 
 External: `object_store` (aws), `tokio`, `arc-swap`, `parking_lot`,
-`crossbeam-skiplist`, `crc32fast`, `sha2`, `dashmap`, `serde`, `bytes`, `fs2`.
+`crossbeam-skiplist`, `crossbeam-channel` (T-021: `CancelToken`'s channel, the
+compaction executor's task/result queues), `crc32fast`, `sha2`, `dashmap`,
+`serde`, `bytes`, `fs2`.
 
 **Called by** (crates that depend on this):
 
@@ -432,12 +550,22 @@ External: `object_store` (aws), `tokio`, `arc-swap`, `parking_lot`,
 
 ## Tests
 
-~1010 test functions across in-module `#[test]`/`#[tokio::test]` and 17
+~1024 test functions across in-module `#[test]`/`#[tokio::test]` and 17
 integration files (`tests/`), including proptest property suites
 (`engine_property`, `compaction_property`, `commitlog_property`,
 `property_tests`) and the repair fuzz harness (`repair_fuzz.rs`, gated behind
 `test-generators`/`fuzz-fileio`). Live-infra tests are behind the
 `live-infra-tests` feature + `FERROSA_TEST_*` env vars. No `#[ignore]`.
+
+Slow tests (compaction soak across many seeds, high-volume ingest, concurrent
+write+flush, the 2k-mutation commit-log replay PITR case) live in a `mod slow`
+gated behind the `slow-tests` feature instead of `#[ignore]`. PR CI compiles
+them (`--all-features`) but skips running them (`--skip ::slow::`);
+`nightly-slow-tests.yml` is where they run. Run one locally with:
+
+```bash
+cargo test -p ferrosa-storage --features slow-tests -- ::slow::e4_slow_pitr_commit_log_replay_1k_plus_1k
+```
 
 The read-vs-compaction race stress (`race-stress` feature,
 `read_compaction_race_stress`) has **no CI job**. It ran nightly on a throwaway
@@ -452,9 +580,238 @@ cargo test -p ferrosa-storage --features race-stress --release \
 
 Scale with `RACE_KEYS` / `RACE_READERS` / `RACE_SECS` / `RACE_FLUSH_EVERY`.
 
+### Compaction cancel-safety and crash recovery (T-020–T-026)
+
+The T-023 retirement crash seam is scoped to the explicitly injected Tokio
+poll task. Concurrent tests and startup reconciliation do not inherit the
+fault; unwinding or dropping the scoped future removes the injection.
+The digest-corruption test passes a per-task structural verification policy;
+it never disables the verification checkpoint for concurrent cancellation tests.
+
+`src/compaction/cancel_harness.rs` names every step in the compaction
+lifecycle (`CancelPoint`) and gives production code a `cancel_point!(...)`
+hook to call at each one, behind `cfg(any(test, feature = "test-support"))`
+(a no-op, compiled to nothing, otherwise). `src/compaction/cancel_oracle.rs`
+is a plain model of every acknowledged write (`WriteOracle`) plus
+`assert_cancel_invariants`, which checks I1 (content matches the oracle), I2
+(exactly one of {inputs, output} discoverable after startup reconciliation
+runs), I3 (every discoverable generation opens and walks), and I4 (no
+`.promote-*`/`.retired-*`/stale-`.tmp`/staging leaks). See
+`specs/sstable-write-pump/compaction-cancel-safety.md`.
+
+**T-021 makes cancellation real**, unconditionally (in every build, not only
+tests): `try_submit` creates a `CancelToken`, and every merge-time
+`cancel_point!` call site is now paired with a real `token.check()` that
+returns `Err` and rolls back whatever this task staged so far; `engine.rs`'s
+`poll_compactions` adds one more real check immediately before promoting (the
+last free cancel point). The harness now also registers each task's live
+token by table-id scope (`cancel_harness::register_cancel_token` /
+`cancel_now`), so a test's cancel-point hook can genuinely cancel — not
+merely record having reached — a `CancelPoint`:
+
+- `cancel_harness_*` (`cancel_harness_integration.rs`): the hook fires at
+  every point during a real, uncancelled compaction, and the oracle +
+  invariant checker agree on a clean flushed table.
+- `cancel_token_*` (`cancel_token_tests.rs`, T-021): CS1 — cancelling at
+  every honoured checkpoint (`InputOpen` through `BeforePromote`) rolls
+  back with no restart needed, and I1-I4 still hold after one; CS3 — the
+  cancel-to-`Err` latency is small and `compaction_cancel_latency_seconds`
+  records it; CS4 — `CompactionExecutor::shutdown()` cancels a task stuck
+  mid-merge promptly instead of waiting for it to finish; CS14 (folded into
+  each CS1 case) — the same inputs compact again afterward with identical
+  content; CD1 — a worker parked on an empty task channel exits shutdown
+  immediately (crossbeam `select!`, no `recv_timeout` poll interval).
+- `cancel_crash_sweep_*` (`cancel_crash_sweep_tests.rs`, CS2 in
+  `test-specification.md` L10): a crash-twin subprocess harness, unrelated to
+  T-021's live-process cancellation. Each test re-execs the same test binary
+  filtered to itself, the child installs a hook that `std::process::abort()`s
+  (SIGABRT) at one `CancelPoint`, drives a real compaction into it
+  (compressed and uncompressed), and the parent asserts the child died by
+  signal, reopens a fresh engine on the same data dir, and checks I1-I4.
+
+Points strictly before the C2 commit point (input open through
+`BeforePromote`) roll back cleanly, because `compaction/<table>/` staging is
+unconditionally wiped at every engine open. Every point at or after the
+commit (`AfterPromote` through input retirement) rolls forward cleanly onto
+the promoted output: T-022 writes the durable replacement record with the
+real, already-reserved output generation id before promotion runs (forge
+t_cb6fa288 — `StorageEngine::reserve_compaction_promotion_target`), and
+T-023's startup reconciliation retires every input the record lists,
+unconditionally and idempotently, regardless of how far retirement got
+before the crash. T-026 keeps the replacement record authoritative through
+S3 upload, manifest publication, and input-delete enqueue. Startup rebuilds
+missing upload work from the record, replays the pending-upload ledger, and
+retries deletion for manifested records. Pinned and local-only compactions
+finish local retirement without publishing an S3 manifest. The mock-store
+crash sweep covers pending-log, manifest-CAS, delete-enqueue, and pinned
+retirement interruption. All `cancel_crash_sweep_*` cases therefore run
+unconditionally today; there is no `known-open-window`-gated case (the
+feature that used to exist under that name was deleted 2026-09-26 once
+nothing gated on it):
+
+```bash
+cargo test -p ferrosa-storage cancel_harness_
+cargo test -p ferrosa-storage cancel_token_
+cargo test -p ferrosa-storage cancel_crash_sweep_
+cargo test -p ferrosa-common cancel
+```
+
+
+Unix-only (signal-based crash detection). The `RetireInput` `CancelPoint`
+fires once per whole input generation, not per component file, so it cannot
+exercise "one generation half-deleted mid-component-loop" (some of a single
+generation's own component files gone, some not) — the remaining scope of
+T-024 (C4: atomic per-generation retirement) needs a finer, per-component
+hook. See [Roadmap](specs/roadmap.md).
+
+### CQL write pressure admission
+
+Async CQL writes use per-table pressure `max(active memtable / hard limit,
+write-pump blocked-time rate)`. At pressure 0.7 they request a background flush
+and wait on that table's `Notify` for a pressure-scaled deadline; they re-check
+once and reject at pressure 1.0. Synchronous storage callers keep the hard
+admission check. Table pressure is updated atomically; metrics registration and
+scraping use a registry lock only off the write path.
+
+Runtime settings are read when the storage engine starts:
+
+| Variable | Default | Accepted range | Invalid value |
+|---|---:|---:|---|
+| `FERROSA_WRITE_SOFT_PRESSURE_THRESHOLD` | `0.7` | `0.05..=0.95` | ERROR log, use `0.7` |
+| `FERROSA_WRITE_SOFT_DELAY_MAX_MS` | `50` | `1..=1000` | ERROR log, use `50` |
+
+The pressure threshold is a ratio; the maximum delay caps the grace period.
+The pump blocked-time rate is clamped to `[0, 1]`. Invalid values never prevent
+startup. Prometheus exports `ferrosa_storage_write_admission_delayed_total`,
+`ferrosa_storage_write_admission_delay_seconds`,
+`ferrosa_storage_write_admission_rejected_total{reason}`, and the per-table
+`ferrosa_storage_write_pressure_ratio` gauge.
+
+### Flush and compaction runtime tuning
+
+The storage engine reads these bounded `FERROSA_*` settings once, on first
+flush/compaction runtime configuration. Missing values keep the defaults shown
+below. Malformed, unreadable, or out-of-range values log at `ERROR` and use the
+default. Values are process-wide for the lifetime of the engine.
+
+| Setting | Default | Accepted range | Effect |
+|---|---:|---:|---|
+| `FERROSA_MAX_AUTOMATIC_FLUSHES_PER_POLL` | 8 | 1–1,024 | Maximum automatic flushes started per maintenance poll. |
+| `FERROSA_MAX_COMPACTION_INPUTS_PER_TASK` | 64 | 2–256 | Ceiling applied to `FERROSA_COMPACTION_MAX_THRESHOLD`; bounds fan-in independently of the input-byte limit. |
+| `FERROSA_MAX_SCHEDULED_TABLES_PER_POLL` | 8 | 1–1,024 | Maximum tables that receive a compaction task per maintenance poll. |
+| `FERROSA_MAX_RESULTS_PER_MAINTENANCE_POLL` | 8 | 1–1,024 | Maximum compaction failures and completed results drained per poll. |
+| `FERROSA_MAX_AGE_FLUSH_FLOOR_BYTES` | 16 MiB | 1 byte–1 TiB | Upper bound for the minimum memtable volume required for age-triggered flushes. |
+| `FERROSA_PER_COMPACTION_MEM_BUDGET_BYTES` | 256 MiB | 1 byte–1 TiB | Per-task memory estimate used to derive concurrency from the node memory limit. |
+| `FERROSA_MAX_AUTO_COMPACTION_PARALLELISM` | 8 | 1–64 | Caps auto-derived concurrency and workers, and bounds explicit compaction worker/concurrency settings. |
+| `FERROSA_COMPACTION_WORKERS` | auto-derived from CPU count | 1–configured compaction ceiling | Explicit compaction worker count. |
+| `FERROSA_MAX_CONCURRENT_COMPACTIONS` | auto-derived from CPU and memory | 1–configured compaction ceiling | Explicit concurrent merge cap. |
+| `FERROSA_MAX_FLUSH_PARALLELISM` | 64 | 1–256 | Caps `FERROSA_FLUSH_PARALLELISM` and the shared flush pool width. |
+| `FERROSA_FLUSH_PARALLELISM` | host CPU count | 1–configured flush ceiling | Shared flush/fsync pool width. |
+| `FERROSA_DIGEST_READ_CHUNK_BYTES` | 1 MiB | 1 byte–64 MiB | Reused buffer size for staged SSTable digest verification. |
+| `FERROSA_COMPACTION_TASK_QUEUE_CAPACITY_PER_WORKER` | 1 | 1–32 | Bounded queued tasks per compaction worker. |
+| `FERROSA_COMPACTION_RESULT_QUEUE_CAPACITY_PER_WORKER` | 2 | 1–32 | Bounded completed results and failures per compaction worker. |
+
+Values outside their documented ranges, including unreadable environment
+values, log at `ERROR` and use the corresponding default. These practical
+ceilings keep per-poll work, thread counts, queue allocation, and digest buffers
+bounded while allowing operators to tune within the supported range. The
+configured compaction parallelism ceiling caps both auto-derived and explicit
+worker/concurrency settings, while queue capacities remain bounded per worker.
+Raising values trades more throughput headroom for greater memory and I/O pressure.
+If Rayon cannot create the requested flush pool, initialization logs `ERROR` and
+retries with one worker; if that also fails, engine initialization returns an
+error instead of panicking.
+The age-flush floor trades earlier WAL retention relief for the risk of creating
+more small SSTables. Digest chunk size changes verification read granularity;
+digest calculation and staged-output verification remain mandatory.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position
 - [Data flow](specs/data-flow.md) — write path and read path (mermaid)
 - [FMEA / known issues](specs/fmea.md) — failure modes ranked by RPN
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+### Pump wiring acceptance (T-045)
+
+File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.
+
+Internal flush and compaction writers defer component sync to the
+`FileFlushTarget` staged handoff. The target syncs every staged component,
+verifies digests and structure, applies the buffered cache hint after readback,
+then promotes files and syncs the directory. Standalone SSTable callers keep
+the normal durable finish path.
+
+Shard workers collect moved component manifests directly into the fallible output vector; there is no intermediate vector of per-shard results.
+
+### Backpressure verification (T-041)
+
+Real engine tests gate flush/compaction output and digest readback by unique
+temporary directory. They assert active-memtable admission reaches a plateau,
+rejections do not grow it, accepted rows remain readable, a released flush can
+complete while compaction stays gated, and WAL/input retirement waits for digest
+verification. Shutdown cancellation is observed before releasing the controlled
+device call; no cancelled output replaces the live inputs. This explicitly
+accounts for the fact that cancellation cannot interrupt an arbitrary syscall.
+
+`FERROSA_COMPACTION_READAHEAD_BYTES` defaults to 1 MiB, accepts 1 byte through
+256 MiB, and rounds to a 4096-byte block. Invalid values log ERROR and use the
+default; changed alignment logs configured/effective values at WARN. No startup
+failure is introduced for a malformed value.
+
+Compaction retires local inputs through durable `.retired-<generation>` renames.
+Flat layouts hide Data.db first and include secondary, full-text and vector
+sidecars; generation directories move atomically. Failures emit WARN, increment
+`ferrosa_storage_compaction_retire_failures_total`, and retain the replacement
+intent so startup reconciliation can retry. Component names stream from the
+directory without collecting file contents or a component inventory.
+
+Completed compactions wait on the bounded result sender together with cancellation
+and shutdown channels. Cancellation while that queue is full wakes the worker
+without a sleep interval, removes its unpromoted staging components and releases
+input claims. Result accounting increments before publication so an immediate
+consumer cannot underflow the pending-result counter.
+
+When write admission observes the disk reserve exhausted, the executor cancels
+the registered task with the largest total input size. One disk-pressure
+cancellation remains outstanding until that task releases its claim, preventing
+a burst of rejected writes from cancelling all tasks. Admission stays closed
+until the existing free-space check observes recovery. The cancellation registry
+now keeps one record per task instead of duplicating its token for every input.
+
+### Table DDL and compaction cancellation (T-025)
+
+DROP TABLE, DROP KEYSPACE and TRUNCATE pause compaction admission, invalidate
+submission tickets captured before input selection, cancel active tasks, and
+await claim release before removing table data. The task registry and input
+claims share one lock. Result publication and finalization notify async waiters;
+no Tokio worker blocks on compaction completion. A committed replacement still
+finishes its existing finalization before DDL proceeds. CQL, pair, cluster and
+Raft application boundaries hold the pause through schema/storage changes.
+Synchronous storage entry points return a busy error while work is active;
+async callers use `unregister_table_and_wait` or `truncate_and_wait`.
+Async APIs take `Arc<StorageEngine>` so an owned finalization job can survive a
+request disconnect. TRUNCATE retains its pause through asynchronous S3 cleanup;
+a dropped DDL waiter cannot strand a dequeued result or release its claim early.
+
+Operator stop requests use `CancelReason::Operator` under the task registry lock.
+They select all current tasks or one registered table, preserve the first recorded
+cancellation reason, and leave admission enabled. Counts describe the registry at
+request time; the caller does not wait for finalization or promise reclaimed disk.
+
+### Compaction digest-failure retry
+
+Output digest or verification failures retry with exponential backoff, starting
+at 1 s and capped at 60 s by default. Configure
+`FERROSA_COMPACTION_RETRY_BACKOFF_INITIAL_MS` (1–60,000 ms; default 1,000) and
+`FERROSA_COMPACTION_RETRY_BACKOFF_MAX_MS` (1–600,000 ms; default 60,000).
+Out-of-range values are clamped with a WARN; invalid integers use the default
+with an ERROR. If the maximum is below the initial delay, it is raised to the
+initial delay with a WARN.
+
+After three consecutive failures for a table, compaction pauses by default.
+`FERROSA_COMPACTION_DIGEST_FAILURE_LIMIT` sets the pause threshold (1–100;
+default 3; invalid values use the default). The in-memory pause clears on
+restart, or an operator can call
+`StorageEngine::resume_table_compactions_after_digest_failures(table_id)` to
+clear the pause and retry streak; the next failure starts at the initial delay.

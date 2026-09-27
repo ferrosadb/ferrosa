@@ -300,6 +300,17 @@ runs in the CI cluster-integration job and asserts native `fts_match` returns a
 stable flushed row from every 3-node coordinator. In-code TODO/FIXME density is
 very low (1 marker); the real gaps are tracked structurally — see the FMEA.
 
+Three slow `router.rs` paging/limit tests live in a `mod slow` gated behind the
+`slow-tests` feature instead of `#[ignore]`. PR CI compiles them
+(`--all-features`) but skips running them (`--skip ::slow::`);
+`nightly-slow-tests.yml` is where they run.
+
+### Write backpressure errors
+
+Storage's typed `Error::Overloaded { reason, table }` maps directly to CQL
+`OVERLOADED` (`0x1001`). The legacy string-detected backpressure path remains
+for older storage/cluster errors and logs when it is used.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position
