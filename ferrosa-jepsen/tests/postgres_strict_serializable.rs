@@ -81,6 +81,13 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         .context("connect to CQL cluster for strict-serializability table setup")?;
     cql_session
         .query_unpaged(
+            "CREATE KEYSPACE IF NOT EXISTS public WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}",
+            &[],
+        )
+        .await
+        .context("create PostgreSQL default schema keyspace through CQL")?;
+    cql_session
+        .query_unpaged(
             format!(
                 "CREATE TABLE {POSTGRES_DEFAULT_SCHEMA}.{table} (id text PRIMARY KEY, balance bigint)"
             ),
