@@ -35,8 +35,8 @@ pub mod finalize;
 pub mod intent;
 pub mod metadata;
 pub mod purge;
-pub(crate) mod retry;
 pub(crate) mod retire;
+pub(crate) mod retry;
 /// Stateful writes/compactions/restarts checked against a small reference model.
 #[cfg(test)]
 mod stateful_model_tests;

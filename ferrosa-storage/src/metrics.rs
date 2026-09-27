@@ -590,11 +590,9 @@ pub fn inc_compaction_paused_tables() {
 
 /// Decrement the process-wide count when a digest pause guard is released.
 pub fn dec_compaction_paused_tables() {
-    let _ = COMPACTION_PAUSED_TABLES.fetch_update(
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-        |count| Some(count.saturating_sub(1)),
-    );
+    let _ = COMPACTION_PAUSED_TABLES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        Some(count.saturating_sub(1))
+    });
 }
 
 /// Record a compaction input reader obtained through the engine-wide reader

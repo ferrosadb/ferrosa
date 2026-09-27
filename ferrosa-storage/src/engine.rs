@@ -2863,6 +2863,9 @@ impl StorageEngine {
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
+            compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
+            compaction_paused: parking_lot::Mutex::new(HashMap::new()),
+            compaction_retry_notify: Arc::new(tokio::sync::Notify::new()),
             upload_manager,
             compaction_upload_manager,
             local_cache,
@@ -3023,6 +3026,9 @@ impl StorageEngine {
             deferred_replay_mutations,
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
+            compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
+            compaction_paused: parking_lot::Mutex::new(HashMap::new()),
+            compaction_retry_notify: Arc::new(tokio::sync::Notify::new()),
             upload_manager,
             compaction_upload_manager,
             local_cache,
@@ -9865,7 +9871,11 @@ impl StorageEngine {
             if !self.tables.read().contains_key(&failure.table_id) {
                 continue;
             }
-            if self.compaction_paused.lock().contains_key(&failure.table_id) {
+            if self
+                .compaction_paused
+                .lock()
+                .contains_key(&failure.table_id)
+            {
                 continue;
             }
             let (streak, delay) = self.compaction_retry.lock().record_failure(
@@ -9877,10 +9887,9 @@ impl StorageEngine {
             if streak >= self.config.compaction.retry_digest_failure_limit {
                 let mut paused = self.compaction_paused.lock();
                 if !paused.contains_key(&failure.table_id) {
-                    let pause = self.compaction_executor.pause_table(
-                        &failure.table_id,
-                        ferrosa_common::CancelReason::Operator,
-                    );
+                    let pause = self
+                        .compaction_executor
+                        .pause_table(&failure.table_id, ferrosa_common::CancelReason::Operator);
                     paused.insert(failure.table_id.clone(), DigestFailurePause::new(pause));
                     tracing::error!(
                         table_id = %failure.table_id,
@@ -10040,21 +10049,19 @@ impl StorageEngine {
                 &result.output.path,
                 &result.output.id,
             ) {
-                  Ok(d) => d,
-                  Err(e) => {
-                      let message = format!(
-                          "failed to read staged output Digest.crc32: {e}"
-                      );
-                      crate::compaction::executor::remove_staged_output_components(
-                          &result.output.path,
-                          &result.output.id,
-                      );
-                      tracing::error!(failure = %message, %table_id, %task_id, "compaction: staged output digest verification failed; preserving inputs");
-                      self.handle_compaction_failures(vec![CompactionFailure {
-                          table_id: table_id.clone(),
-                          message,
-                      }]);
-                      continue;
+                Ok(d) => d,
+                Err(e) => {
+                    let message = format!("failed to read staged output Digest.crc32: {e}");
+                    crate::compaction::executor::remove_staged_output_components(
+                        &result.output.path,
+                        &result.output.id,
+                    );
+                    tracing::error!(failure = %message, %table_id, %task_id, "compaction: staged output digest verification failed; preserving inputs");
+                    self.handle_compaction_failures(vec![CompactionFailure {
+                        table_id: table_id.clone(),
+                        message,
+                    }]);
+                    continue;
                 }
             };
             let table_paused = self
@@ -11106,7 +11113,11 @@ impl StorageEngine {
     }
 
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) -> bool {
-        if !self.compaction_retry.lock().eligible(table_id, Instant::now()) {
+        if !self
+            .compaction_retry
+            .lock()
+            .eligible(table_id, Instant::now())
+        {
             return false;
         }
         let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
@@ -13061,6 +13072,9 @@ impl StorageEngine {
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
+            compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
+            compaction_paused: parking_lot::Mutex::new(HashMap::new()),
+            compaction_retry_notify: Arc::new(tokio::sync::Notify::new()),
             upload_manager,
             compaction_upload_manager,
             local_cache,

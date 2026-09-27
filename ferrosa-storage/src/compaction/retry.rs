@@ -24,7 +24,7 @@ impl CompactionRetryPolicy {
     pub(crate) fn eligible(&self, table_id: &TableId, now: Instant) -> bool {
         self.tables
             .get(table_id)
-            .map_or(true, |state| now >= state.next_eligible)
+            .is_none_or(|state| now >= state.next_eligible)
     }
 
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {

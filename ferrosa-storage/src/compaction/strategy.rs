@@ -99,12 +99,8 @@ impl CompactionConfig {
         } else {
             retry_backoff_max
         };
-        let retry_digest_failure_limit = positive_u32_from_env(
-            "FERROSA_COMPACTION_DIGEST_FAILURE_LIMIT",
-            3,
-            1,
-            100,
-        );
+        let retry_digest_failure_limit =
+            positive_u32_from_env("FERROSA_COMPACTION_DIGEST_FAILURE_LIMIT", 3, 1, 100);
 
         Self {
             min_threshold,
@@ -122,11 +118,11 @@ impl CompactionConfig {
 
 fn duration_from_env(name: &str, default_ms: u64, min_ms: u64, max_ms: u64) -> std::time::Duration {
     match std::env::var(name) {
-        Ok(value) => return duration_from_value(name, &value, default_ms, min_ms, max_ms),
-        Err(std::env::VarError::NotPresent) => return std::time::Duration::from_millis(default_ms),
+        Ok(value) => duration_from_value(name, &value, default_ms, min_ms, max_ms),
+        Err(std::env::VarError::NotPresent) => std::time::Duration::from_millis(default_ms),
         Err(error) => {
             tracing::error!(%error, variable = name, default_ms, "invalid compaction retry configuration; using default");
-            return std::time::Duration::from_millis(default_ms);
+            std::time::Duration::from_millis(default_ms)
         }
     }
 }
@@ -159,11 +155,11 @@ fn duration_from_value(
 
 fn positive_u32_from_env(name: &str, default: u32, min: u32, max: u32) -> u32 {
     match std::env::var(name) {
-        Ok(value) => return positive_u32_from_value(name, &value, default, min, max),
-        Err(std::env::VarError::NotPresent) => return default,
+        Ok(value) => positive_u32_from_value(name, &value, default, min, max),
+        Err(std::env::VarError::NotPresent) => default,
         Err(error) => {
             tracing::error!(%error, variable = name, default, "invalid compaction retry configuration; using default");
-            return default;
+            default
         }
     }
 }
@@ -729,10 +725,7 @@ mod tests {
             duration_from_value("test", "broken", 1_000, 1, 60_000),
             std::time::Duration::from_millis(1_000)
         );
-        assert_eq!(
-            positive_u32_from_value("test", "broken", 3, 1, 100),
-            3
-        );
+        assert_eq!(positive_u32_from_value("test", "broken", 3, 1, 100), 3);
     }
 
     #[test]
@@ -741,13 +734,7 @@ mod tests {
             duration_from_value("test", "0", 1_000, 10, 60_000),
             std::time::Duration::from_millis(10)
         );
-        assert_eq!(
-            positive_u32_from_value("test", "0", 3, 1, 100),
-            1
-        );
-        assert_eq!(
-            positive_u32_from_value("test", "200", 3, 1, 100),
-            100
-        );
+        assert_eq!(positive_u32_from_value("test", "0", 3, 1, 100), 1);
+        assert_eq!(positive_u32_from_value("test", "200", 3, 1, 100), 100);
     }
 }
