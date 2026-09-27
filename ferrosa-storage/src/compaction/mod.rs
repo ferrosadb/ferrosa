@@ -33,6 +33,7 @@ pub mod finalize;
 pub mod intent;
 pub mod metadata;
 pub mod purge;
+pub(crate) mod retire;
 pub mod strategy;
 pub mod strategy_ucs;
 

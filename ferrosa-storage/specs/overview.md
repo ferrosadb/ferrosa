@@ -185,3 +185,13 @@ Read-ahead config: `FERROSA_COMPACTION_READAHEAD_BYTES`, default 1 MiB,
 range 1..=256 MiB, rounded up to 4096 bytes. Invalid values emit ERROR and fall back;
 valid normalization emits WARN with configured/effective sizes. Shutdown can
 cancel a parked producer, then joins once the outstanding device call returns.
+
+### Durable input retirement (T-024)
+
+After the committed replacement is visible, retirement hides each input before
+reclaiming its files. A generation directory moves to `.retired-<generation>`;
+flat layouts move Data.db first, followed by every generation-prefixed component,
+including index sidecars. Directory fsyncs precede reclamation and follow removal.
+Any failure retains the replacement intent and records a warning and counter.
+The scoped `RetireInput` fault hook exercises failure after Data.db moved; restart
+and subsequent retries finish the remaining components idempotently.

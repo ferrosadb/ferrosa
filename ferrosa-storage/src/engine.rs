@@ -2,7 +2,7 @@
 //! Correctness: Correct when admitted writes are durable before visibility and reads,
 //! replay, flush, and maintenance preserve table and cursor invariants.
 //! Last revised: 2026-09-26
-//! Last changed: Scoped test-only retirement crash injection to the injected Tokio task.
+//! Last changed: Retain recovery intents on atomic input retirement failures.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -5539,7 +5539,9 @@ impl StorageEngine {
             .map(|gen| Self::compaction_input_retirement_stub(table_dir, gen))
             .collect();
         let table_id_for_retire = Self::table_id_from_table_dir(table_dir);
-        Self::evict_local_input_sstable_files(&table_id_for_retire, &stubs);
+        if !Self::evict_local_input_sstable_files(&table_id_for_retire, &stubs) {
+            return;
+        }
 
         if let Err(e) =
             crate::compaction::intent::CompactionIntentRecord::delete(table_dir, &record.task_id)
@@ -9411,7 +9413,9 @@ impl StorageEngine {
             // touch that separate mechanism.
             let mut cleanup_inputs = || {
                 let cleanup_start = Instant::now();
-                Self::evict_local_input_sstable_files(table_id, &result.task.inputs);
+                if !Self::evict_local_input_sstable_files(table_id, &result.task.inputs) {
+                    return;
+                }
                 crate::metrics::observe_compaction_phase(
                     crate::metrics::CompactionPhase::InputCleanup,
                     cleanup_start.elapsed(),
@@ -11819,18 +11823,8 @@ impl StorageEngine {
     fn evict_local_input_sstable_files(
         _table_id: &TableId,
         inputs: &[crate::compaction::metadata::SSTableMetadata],
-    ) {
-        let standard_components = [
-            "Data.db",
-            "Partitions.db",
-            "Rows.db",
-            "Filter.db",
-            "Statistics.db",
-            "TOC.txt",
-            "CompressionInfo.db",
-            "Digest.crc32",
-            "CRC.db",
-        ];
+    ) -> bool {
+        let mut complete = true;
         // `idx` feeds `CancelPoint::RetireInput` (test/test-support only:
         // `cancel_point!` compiles to nothing otherwise). In a production
         // build that makes the index genuinely unused; a manual counter
@@ -11844,21 +11838,7 @@ impl StorageEngine {
         )]
         for (idx, input) in inputs.iter().enumerate() {
             cancel_point!(&_table_id.to_string(), CancelPoint::RetireInput(idx));
-            for component in &standard_components {
-                let file_path = Self::generation_component_path(&input.path, &input.id, component)
-                    .unwrap_or_else(|| input.path.join(format!("{}-{component}", input.id)));
-                #[cfg(test)]
-                crate::flush::fsync_probe::note_unlink(&file_path);
-                if let Err(e) = std::fs::remove_file(&file_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(
-                            %e,
-                            path = %file_path.display(),
-                            "compaction: failed to remove retired input component; left for reconciliation (T-023)"
-                        );
-                    }
-                }
-            }
+            complete &= crate::compaction::retire::retire(&input.path, &input.id);
             // T-023 regression seam: simulate a process crash after exactly N
             // inputs have been retired, so tests can prove startup
             // reconciliation finishes retiring the rest instead of
@@ -11880,6 +11860,7 @@ impl StorageEngine {
                 );
             }
         }
+        complete
     }
 
     /// Read and parse a generation's `Digest.crc32` component (T-011 format).
@@ -22548,6 +22529,66 @@ mod tests {
              a pass. Implement the steps in this test's doc comment (T-070) \
              before removing this panic."
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_retire_failure_retains_intent_until_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        assert!(engine
+            .compaction_executor
+            .await_result_available(std::time::Duration::from_secs(10)));
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let generation = StorageEngine::scan_generations(&table_dir)[0].to_string();
+        let obstruction = table_dir.join(format!(".retired-{generation}"));
+        std::fs::write(&obstruction, b"inject retirement failure").unwrap();
+        engine.poll_compactions().await;
+        let records = leftover_intent_records(&table_dir);
+        assert_eq!(records.len(), 1);
+        let record = crate::compaction::intent::CompactionIntentRecord::read_at(&records[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Swapped
+        );
+        std::fs::remove_file(obstruction).unwrap();
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+        assert!(leftover_intent_records(&table_dir).is_empty());
+        assert!(!StorageEngine::scan_generations(&table_dir).contains(&generation.parse().unwrap()));
+    }
+
+    #[test]
+    fn compaction_retire_includes_sidecars_and_generation_directories() {
+        for nested in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let live = if nested {
+                dir.path().join("7")
+            } else {
+                dir.path().to_path_buf()
+            };
+            std::fs::create_dir_all(&live).unwrap();
+            for name in [
+                "7-Data.db",
+                "7-TOC.txt",
+                "7-title.sidecar",
+                "7-FTI-title.db",
+                "7-VEC-embedding.db",
+            ] {
+                std::fs::write(live.join(name), b"component").unwrap();
+            }
+            std::fs::write(dir.path().join("70-Data.db"), b"neighbor").unwrap();
+            let input = StorageEngine::compaction_input_retirement_stub(dir.path(), "7");
+            StorageEngine::evict_local_input_sstable_files(&table_id(), &[input]);
+            assert!(!live.join("7-title.sidecar").exists());
+            assert!(!live.join("7-FTI-title.db").exists());
+            assert!(!live.join("7-VEC-embedding.db").exists());
+            assert!(!dir.path().join(".retired-7").exists());
+            assert!(dir.path().join("70-Data.db").exists());
+            if nested {
+                assert!(!live.exists());
+            }
+        }
     }
 
     // ── T-022 / T-023: durable replacement record, commit/rollback, and

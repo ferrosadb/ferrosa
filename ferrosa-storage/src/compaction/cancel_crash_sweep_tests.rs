@@ -500,12 +500,8 @@ mod tests {
     // documented violation: the assertion itself failed ("I2 held anyway"),
     // which is exactly the self-check that comment was written to catch.
     //
-    // What T-024 (C4) still owns: retirement atomicity WITHIN a single
-    // generation at per-component granularity -- "one input half-deleted"
-    // (some of a generation's own component files gone, some not) -- which
-    // needs a hook finer than this harness's per-generation
-    // `CancelPoint::RetireInput(k)` can express. See
-    // `ferrosa-storage/specs/roadmap.md`.
+    // T-024 also covers a failure between component moves through its scoped
+    // RetireInput hook (`retire.rs`), then verifies that retry removes debris.
     crash_sweep_test!(
         cancel_crash_sweep_retire_input_0_compressed,
         CancelPoint::RetireInput(0),

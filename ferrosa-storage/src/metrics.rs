@@ -1,8 +1,8 @@
 //! Module: Record and render bounded process-wide storage telemetry.
 //! Correctness: Correct when counters are monotonic, gauges reflect complete
 //! operations, and observation never allocates in storage hot paths.
-//! Last revised: 2026-09-01
-//! Last changed: Added maximum and high-threshold SSTable read-fanout signals.
+//! Last revised: 2026-09-26
+//! Last changed: Retain recovery intents on atomic input retirement failures.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
@@ -341,6 +341,7 @@ static COMPACTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Compaction tasks that returned `Err` because their `CancelToken` was
 /// cancelled (T-021), as distinct from an ordinary failure.
+static COMPACTION_RETIRE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_CANCELLED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Sum, count and max of the latency from `CancelToken::cancel()` to the
 /// checkpoint that observed it and returned `Err` (T-021,
@@ -536,6 +537,11 @@ pub fn inc_compaction_failed() {
 /// Records a compaction task cancelled rather than failed (T-021).
 pub fn inc_compaction_cancelled() {
     COMPACTION_CANCELLED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one failed retirement operation; its intent remains available for replay.
+pub fn inc_compaction_retire_failures() {
+    COMPACTION_RETIRE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Records the latency from `CancelToken::cancel()` to the checkpoint that
@@ -1074,6 +1080,12 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_compaction_failed_total {}\n",
         COMPACTION_FAILED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_retire_failures_total Input retirement failures retained for reconciliation.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_retire_failures_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_retire_failures_total {}\n",
+        COMPACTION_RETIRE_FAILURES_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_compaction_cancelled_total Compaction tasks that returned Err because their CancelToken was cancelled.\n");
     out.push_str("# TYPE ferrosa_storage_compaction_cancelled_total counter\n");

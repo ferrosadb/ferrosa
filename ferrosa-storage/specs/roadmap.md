@@ -42,18 +42,10 @@ open work lives in specs and the items below.
     in-flight compaction early (shutdown still joins every worker and waits
     out the merge) — the crash-sweep only proves what a *crash* leaves
     behind, not that a *voluntary* cancel is fast or possible at all.
-  - **T-024, narrowed: per-component retirement atomicity within one
-    generation.** `evict_local_input_sstable_files` unlinks a generation's
-    component files one at a time with no atomicity across them ("one input
-    half-deleted" — some of a single generation's own files gone, some
-    not). The crash-sweep's `CancelPoint::RetireInput(k)` fires once per
-    whole input generation, not per component, so it cannot exercise this
-    shape; C4 (atomic, fsynced per-generation retirement, e.g. rename to
-    `.retired-<gen>/` before unlinking) needs a per-component hook a future
-    packet can add alongside the fix.
 - **Remove index artifacts with the generation they index (FMEA ST-24).**
-  `evict_local_input_sstable_files` and `delete_sstable_files` remove only the
-  seven SSTable components, so every compacted or evicted generation leaves its
+  T-024 now removes all sidecars during compaction. The separate
+  `delete_sstable_files` eviction path and historical debris still require
+  investigation; previously each retired generation left its
   `.sidecar`, `FTI-` and `VEC-` files behind (5,122 FTI sidecars against 11 live
   SSTables per node on one cluster). The query path no longer reads them, but
   they cost disk, and a one-time sweep is needed for tables that already
@@ -182,3 +174,10 @@ Read-ahead config: `FERROSA_COMPACTION_READAHEAD_BYTES`, default 1 MiB,
 range 1..=256 MiB, rounded up to 4096 bytes. Invalid values emit ERROR and fall back;
 valid normalization emits WARN with configured/effective sizes. Shutdown can
 cancel a parked producer, then joins once the outstanding device call returns.
+
+### Completed: T-024 local input retirement
+
+Generation directories and flat components, including secondary/full-text/vector
+sidecars, retire through durable hidden paths. Failures retain their intent and
+retry on startup. The remaining T-060 extension is a grace period at the single
+`remove_retired` reclamation seam; current retirement removes the files immediately.

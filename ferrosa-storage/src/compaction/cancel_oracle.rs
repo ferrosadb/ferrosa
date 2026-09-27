@@ -22,10 +22,8 @@
 //! after a (re)open. T-022 (generation reservation, forge t_cb6fa288) and
 //! T-023 (C3 startup reconciliation) together close every window this
 //! crate's crash-sweep exercises, so no `cancel_crash_sweep_*` case is gated
-//! behind a "known open window" feature any more. The remaining T-024 scope
-//! (per-component retirement atomicity within one generation) needs a finer
-//! hook than the crash-sweep's per-generation `CancelPoint` provides -- see
-//! `ferrosa-storage/specs/roadmap.md`.
+//! behind a "known open window" feature any more. T-024 additionally verifies
+//! per-component failures through the scoped retirement hook in `retire.rs`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};

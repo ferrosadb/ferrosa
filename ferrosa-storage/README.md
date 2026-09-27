@@ -685,3 +685,10 @@ accounts for the fact that cancellation cannot interrupt an arbitrary syscall.
 256 MiB, and rounds to a 4096-byte block. Invalid values log ERROR and use the
 default; changed alignment logs configured/effective values at WARN. No startup
 failure is introduced for a malformed value.
+
+Compaction retires local inputs through durable `.retired-<generation>` renames.
+Flat layouts hide Data.db first and include secondary, full-text and vector
+sidecars; generation directories move atomically. Failures emit WARN, increment
+`ferrosa_storage_compaction_retire_failures_total`, and retain the replacement
+intent so startup reconciliation can retry. Component names stream from the
+directory without collecting file contents or a component inventory.
