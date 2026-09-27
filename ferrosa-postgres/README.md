@@ -21,11 +21,12 @@ byte-identically over CQL — without `ferrosa-postgres` ever depending on the
 This is a **developer preview**. See [specs/fmea.md](specs/fmea.md) for the exact
 supported-vs-not surface. PostgreSQL transactions use a PostgreSQL-owned MVCC
 manager; CQL/Cassandra transactions remain on Accord. In cluster mode, PostgreSQL
-commits submit PG-owned mutations and their read/write table set through Accord.
-Accord apply also carries PostgreSQL row-version metadata to replicas, where each
-node retains history for its active snapshots. The distributed path is covered
-by native-driver tests; the Jepsen strict-serializability workload remains the
-acceptance gate before making a system-wide guarantee.
+commits submit PG-owned mutations and a snapshot through Accord. A global PG
+marker conservatively conflicts all PostgreSQL data commits; the read/write table
+set is not yet used for per-table Accord validation. Accord apply carries
+PostgreSQL row-version metadata to replicas, where each node retains history for
+its active snapshots. The distributed path has native-driver coverage; the
+Jepsen strict-serializability workload remains an acceptance gate.
 Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
 `= ANY($N)` / IN-lists.
 
@@ -58,21 +59,29 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   generated/echoed key. RETURNING rows honor the portal's result formats (binary
   works). `UPDATE`/`DELETE … RETURNING`, `ON CONFLICT`, and `= ANY($N)` are
   **not yet supported** and fail loud (`0A000`/parse error), never silently.
-- **PostgreSQL MVCC transactions** — `BEGIN ISOLATION LEVEL SERIALIZABLE` pins a
+- **PostgreSQL MVCC transactions** — explicit `BEGIN ISOLATION LEVEL
+  SERIALIZABLE` pins a
   local or Accord cluster timestamp. Simple and extended `SELECT` use sparse row
   overlays to restore versions changed after that timestamp; in-transaction
   inserts, updates, and deletes are visible to their own reads. Commit validates
   the transaction's read and write tables against local PostgreSQL MVCC epochs
-  and, in cluster mode, against the Accord snapshot before atomically applying
-  the buffered mutation batch. Row versions are staged before replica storage
+  in standalone mode. In cluster mode, a global PostgreSQL commit marker checks
+  the snapshot against every intervening PostgreSQL data commit; the table set
+  is not yet used for per-table Accord validation, so unrelated transactions can
+  cause conservative `40001` aborts. Accord atomically applies the buffered
+  mutation batch. Row versions are staged before replica storage
   apply and made visible after the atomic batch succeeds. Conflicts return
   `40001`; rollback and failed transactions
-  discard uncommitted mutations. Read validation is conservative at whole-table
-  granularity, so unrelated writes to a read table can cause aborts. Versions
-  older than every live snapshot are reclaimed automatically. The buffered write
-  set has a fixed `MAX_TXN_WRITES` limit of 10,000. This is not an environment
-  tunable. Distributed row-version history is in-memory and scoped to active
-  process snapshots; storage serves snapshots begun after restart. The Jepsen
+  discard uncommitted mutations. Only explicit `SERIALIZABLE` is supported;
+  explicit `READ COMMITTED` and `REPEATABLE READ` fail with `0A000`. Unqualified
+  `BEGIN` retains its legacy behavior and is not labeled strict serializable.
+  Versions older than every live snapshot are reclaimed automatically. The
+  buffered write set defaults to a 10,000 mutation cap, and each storage scan
+  defaults to a 64-row channel; both are startup-configurable. PostgreSQL also
+  expires active snapshots past a configurable maximum age so old transactions
+  cannot retain history indefinitely. Distributed row-version history is
+  in-memory and scoped to active process snapshots; storage serves snapshots
+  begun after restart. The Jepsen
   strict-serializability workload remains outstanding.
 - **DML execution** — INSERT/UPDATE/DELETE build storage rows through the shared
   `ferrosa-row-bridge` encoder. **Autocommit** uses the PostgreSQL MVCC commit
@@ -84,6 +93,22 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   `pg_attribute`/`pg_type` from live schema metadata with deterministic OIDs.
 - **TCP server** — `serve` / `QueryContext`: one spawned task per connection over
   a tokio `TcpListener`, sharing the auth store and the storage+schema context.
+
+## PostgreSQL MVCC resource bounds
+
+These startup environment variables can be changed without recompiling. Invalid
+values log an error and the process uses the complete defaults:
+
+| Environment variable | Default | Bound |
+|---|---:|---|
+| `FERROSA_POSTGRES_MAX_TXN_WRITES` | `10000` | Buffered mutations per transaction |
+| `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | `64` | In-flight rows between storage and the SQL executor |
+| `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
+| `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry and history-pruning interval |
+
+The scan buffer is a storage-side backpressure bound. The relational executor
+and PostgreSQL protocol renderer still materialize full query results. See the
+public [`PROFILE.md`](../PROFILE.md) for tuning guidance and caveats.
 
 ## Data flow
 

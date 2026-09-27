@@ -1879,6 +1879,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     storage.set_time_series_wasm_aggregate_executor(Arc::new(
         ferrosa_cql::wasm_aggregate::UdfTimeSeriesAggregateExecutor::new(Arc::clone(&udf_executor)),
     ));
+    let txn_registry_config = ferrosa_cql::txn_registry::TransactionRegistryConfig::from_env();
     let shared_state = Arc::new(ferrosa_cql::router::SharedState {
         core: Arc::new(ferrosa_session::SessionCore {
             engine: storage.clone(),
@@ -1922,12 +1923,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
         topology_policy,
         // Server-wide (per-node) transaction registry: the connection-independent
-        // BEGIN/IN TRANSACTION/COMMIT surface. Default 10s open-transaction timeout
-        // (A1b); the reaper below actively evicts abandoned transactions.
-        txn_registry: ferrosa_cql::txn_registry::TransactionRegistry::shared_default(),
+        // BEGIN/IN TRANSACTION/COMMIT surface. Runtime bounds keep open staged state
+        // finite; the reaper below actively evicts abandoned transactions.
+        txn_registry: ferrosa_cql::txn_registry::TransactionRegistry::shared_with_config(
+            txn_registry_config,
+        ),
     });
-    // Start the open-transaction reaper (A1b): sweeps every second, aborting and
-    // evicting any transaction past its deadline without a client statement.
+    // Start the open-transaction reaper (A1b): sweep cadence is configured with
+    // the registry bounds; expired transactions are evicted without client input.
     ferrosa_cql::txn_registry::spawn_transaction_reaper(shared_state.txn_registry.clone());
     let auth_disabled = cql_config.auth_disabled;
 
@@ -2362,7 +2365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine: storage.clone(),
             schema: schema.clone(),
             default_schema: "public".into(),
-            mvcc: std::sync::Arc::new(ferrosa_postgres::MvccManager::default()),
+            mvcc: std::sync::Arc::new(ferrosa_postgres::MvccManager::from_env()),
             accord_committer: shared_state.core.accord_transaction_committer(),
         });
         let pg_status = listener_status.clone();

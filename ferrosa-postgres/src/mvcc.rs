@@ -3,13 +3,158 @@
 //! CQL transactions are coordinated by Accord. This manager is deliberately
 //! separate: it versions PostgreSQL row images and tracks the oldest live
 //! PostgreSQL snapshot.
+//! Runtime bounds cover transaction write sets, scan buffering, and snapshot
+//! retention; malformed environment settings log and use defaults.
+//! Last revised: 2026-09-26
+//! Last changed: Added startup-configurable scan buffer capacity and snapshot expiry.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
+use std::error::Error;
+use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use ferrosa_common::accord::{Timestamp, TxnId};
 use ferrosa_sql::{Row, Value};
 use ferrosa_storage::commitlog::Mutation;
+
+pub(crate) const DEFAULT_MAX_TXN_WRITES: usize = 10_000;
+pub(crate) const DEFAULT_SCAN_BUFFER_ROWS: usize = 64;
+const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(600);
+const DEFAULT_SNAPSHOT_REAPER_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_TXN_WRITES_ENV: &str = "FERROSA_POSTGRES_MAX_TXN_WRITES";
+const SCAN_BUFFER_ROWS_ENV: &str = "FERROSA_POSTGRES_SCAN_BUFFER_ROWS";
+const MAX_SNAPSHOT_AGE_MS_ENV: &str = "FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS";
+const SNAPSHOT_REAPER_INTERVAL_MS_ENV: &str = "FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MvccConfig {
+    max_txn_writes: usize,
+    scan_buffer_rows: usize,
+    max_snapshot_age: Duration,
+    snapshot_reaper_interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MvccConfigError(String);
+
+impl fmt::Display for MvccConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for MvccConfigError {}
+
+impl Default for MvccConfig {
+    fn default() -> Self {
+        Self {
+            max_txn_writes: DEFAULT_MAX_TXN_WRITES,
+            scan_buffer_rows: DEFAULT_SCAN_BUFFER_ROWS,
+            max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
+            snapshot_reaper_interval: DEFAULT_SNAPSHOT_REAPER_INTERVAL,
+        }
+    }
+}
+
+impl MvccConfig {
+    fn from_overrides(
+        max_txn_writes: Option<&str>,
+        scan_buffer_rows: Option<&str>,
+        max_snapshot_age_ms: Option<&str>,
+        snapshot_reaper_interval_ms: Option<&str>,
+    ) -> Result<Self, MvccConfigError> {
+        let defaults = Self::default();
+        let max_txn_writes =
+            parse_positive_usize(MAX_TXN_WRITES_ENV, max_txn_writes, defaults.max_txn_writes)?;
+        let scan_buffer_rows = parse_positive_usize(
+            SCAN_BUFFER_ROWS_ENV,
+            scan_buffer_rows,
+            defaults.scan_buffer_rows,
+        )?;
+        let max_snapshot_age = parse_positive_duration(
+            MAX_SNAPSHOT_AGE_MS_ENV,
+            max_snapshot_age_ms,
+            defaults.max_snapshot_age,
+        )?;
+        let snapshot_reaper_interval = parse_positive_duration(
+            SNAPSHOT_REAPER_INTERVAL_MS_ENV,
+            snapshot_reaper_interval_ms,
+            defaults.snapshot_reaper_interval,
+        )?;
+        Ok(Self {
+            max_txn_writes,
+            scan_buffer_rows,
+            max_snapshot_age,
+            snapshot_reaper_interval,
+        })
+    }
+
+    fn from_env() -> Self {
+        fn read(name: &str) -> Result<Option<String>, MvccConfigError> {
+            match env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(error) => Err(MvccConfigError(format!("could not read {name}: {error}"))),
+            }
+        }
+
+        let overrides = (|| {
+            let max_txn_writes = read(MAX_TXN_WRITES_ENV)?;
+            let scan_buffer_rows = read(SCAN_BUFFER_ROWS_ENV)?;
+            let max_snapshot_age_ms = read(MAX_SNAPSHOT_AGE_MS_ENV)?;
+            let snapshot_reaper_interval_ms = read(SNAPSHOT_REAPER_INTERVAL_MS_ENV)?;
+            Self::from_overrides(
+                max_txn_writes.as_deref(),
+                scan_buffer_rows.as_deref(),
+                max_snapshot_age_ms.as_deref(),
+                snapshot_reaper_interval_ms.as_deref(),
+            )
+        })();
+        match overrides {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(%error, "invalid PostgreSQL MVCC configuration; using defaults");
+                Self::default()
+            }
+        }
+    }
+}
+
+fn parse_positive_usize(
+    name: &str,
+    value: Option<&str>,
+    default: usize,
+) -> Result<usize, MvccConfigError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| MvccConfigError(format!("invalid {name} value {value:?}: {error}")))?;
+    if parsed == 0 {
+        return Err(MvccConfigError(format!("{name} must be greater than zero")));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_duration(
+    name: &str,
+    value: Option<&str>,
+    default: Duration,
+) -> Result<Duration, MvccConfigError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let millis = value
+        .parse::<u64>()
+        .map_err(|error| MvccConfigError(format!("invalid {name} value {value:?}: {error}")))?;
+    if millis == 0 {
+        return Err(MvccConfigError(format!("{name} must be greater than zero")));
+    }
+    Ok(Duration::from_millis(millis))
+}
 
 /// A PostgreSQL transaction's buffered storage mutation. It is applied only
 /// by the PostgreSQL MVCC commit path; Cassandra's Accord buffers are separate.
@@ -35,6 +180,7 @@ pub(crate) struct RowChange {
 struct ActiveSnapshot {
     read_ts: u64,
     cluster_ts: Option<Timestamp>,
+    started_at: Instant,
 }
 
 #[derive(Default)]
@@ -50,10 +196,16 @@ struct State {
 
 /// Shared PostgreSQL version history. History stores only rows changed through
 /// PostgreSQL; CQL mutations remain on their existing Accord path.
-#[derive(Default)]
 pub struct MvccManager {
     state: Arc<Mutex<State>>,
     commit_gate: Arc<tokio::sync::Mutex<()>>,
+    config: MvccConfig,
+}
+
+impl Default for MvccManager {
+    fn default() -> Self {
+        Self::with_config(MvccConfig::default())
+    }
 }
 
 #[derive(Clone)]
@@ -87,6 +239,73 @@ impl Drop for SnapshotLease {
 }
 
 impl MvccManager {
+    /// Build a manager using validated runtime environment settings. Invalid
+    /// values are logged and the full default set is used.
+    pub fn from_env() -> Self {
+        Self::with_config(MvccConfig::from_env())
+    }
+
+    fn with_config(config: MvccConfig) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State::default())),
+            commit_gate: Arc::new(tokio::sync::Mutex::new(())),
+            config,
+        }
+    }
+
+    pub(crate) fn max_txn_writes(&self) -> usize {
+        self.config.max_txn_writes
+    }
+
+    pub(crate) fn scan_buffer_rows(&self) -> usize {
+        self.config.scan_buffer_rows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_max_txn_writes(max_txn_writes: usize) -> Self {
+        Self::with_config(MvccConfig {
+            max_txn_writes,
+            ..MvccConfig::default()
+        })
+    }
+
+    pub(crate) fn spawn_snapshot_reaper(manager: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(manager.config.snapshot_reaper_interval);
+            loop {
+                interval.tick().await;
+                let expired = manager.expire_snapshots_before(Instant::now());
+                if expired > 0 {
+                    tracing::warn!(
+                        expired,
+                        "expired PostgreSQL MVCC snapshot(s) past maximum age"
+                    );
+                }
+            }
+        })
+    }
+
+    fn expire_snapshots_before(&self, now: Instant) -> usize {
+        let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
+        let max_age = self.config.max_snapshot_age;
+        let before = state.active_snapshots.len();
+        state
+            .active_snapshots
+            .retain(|_, snapshot| now.saturating_duration_since(snapshot.started_at) < max_age);
+        let expired = before - state.active_snapshots.len();
+        if expired > 0 {
+            prune_versions(&mut state);
+        }
+        expired
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_all_snapshots_for_test(&self) -> usize {
+        self.expire_snapshots_before(
+            Instant::now() + self.config.max_snapshot_age + Duration::from_millis(1),
+        )
+    }
+
     /// Serialize PostgreSQL commit orchestration on this node while a
     /// distributed commit is in flight. Accord supplies the cross-node order.
     pub(crate) async fn commit_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
@@ -111,6 +330,7 @@ impl MvccManager {
             ActiveSnapshot {
                 read_ts,
                 cluster_ts,
+                started_at: Instant::now(),
             },
         );
         MvccSnapshot {
@@ -389,6 +609,7 @@ pub(crate) enum MvccCommitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn row(value: &str) -> Row {
         Row::new(vec![Value::Text(value.to_string())])
@@ -510,5 +731,123 @@ mod tests {
         drop(reader);
         drop(writer);
         assert_eq!(manager.retained_version_count(), 1);
+    }
+
+    #[test]
+    fn mvcc_config_defaults_write_cap_and_snapshot_max_age() {
+        let config = MvccConfig::from_overrides(None, None, None, None).unwrap();
+        assert_eq!(config.max_txn_writes, DEFAULT_MAX_TXN_WRITES);
+        assert_eq!(config.scan_buffer_rows, DEFAULT_SCAN_BUFFER_ROWS);
+        assert_eq!(config.max_snapshot_age, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn mvcc_config_accepts_write_cap_and_snapshot_max_age_overrides() {
+        let config =
+            MvccConfig::from_overrides(Some("25"), Some("128"), Some("30000"), Some("250"))
+                .unwrap();
+        assert_eq!(config.max_txn_writes, 25);
+        assert_eq!(config.scan_buffer_rows, 128);
+        assert_eq!(config.max_snapshot_age, Duration::from_secs(30));
+        assert_eq!(config.snapshot_reaper_interval, Duration::from_millis(250));
+        assert_eq!(MvccManager::with_config(config).scan_buffer_rows(), 128);
+    }
+
+    #[test]
+    fn mvcc_config_rejects_zero_and_malformed_overrides() {
+        assert!(MvccConfig::from_overrides(Some("0"), None, None, None).is_err());
+        assert!(MvccConfig::from_overrides(None, Some("0"), None, None).is_err());
+        assert!(MvccConfig::from_overrides(None, None, Some("0"), None).is_err());
+        assert!(MvccConfig::from_overrides(None, None, None, Some("0")).is_err());
+        assert!(MvccConfig::from_overrides(Some("x"), None, None, None).is_err());
+        assert!(MvccConfig::from_overrides(None, None, Some("x"), None).is_err());
+    }
+
+    #[test]
+    fn expiring_an_old_snapshot_releases_history_and_rejects_commit() {
+        let config = MvccConfig::from_overrides(None, None, Some("5"), None).unwrap();
+        let manager = MvccManager::with_config(config);
+        let setup = manager.snapshot();
+        manager
+            .commit(&setup, &HashSet::new(), || {
+                Ok(vec![change(None, Some(row("v1")))])
+            })
+            .unwrap();
+        drop(setup);
+
+        let old_snapshot = manager.snapshot();
+        let writer = manager.snapshot();
+        manager
+            .commit(&writer, &HashSet::new(), || {
+                Ok(vec![change(Some(row("v1")), Some(row("v2")))])
+            })
+            .unwrap();
+        drop(writer);
+        assert_eq!(manager.retained_version_count(), 2);
+
+        let expired = manager.expire_snapshots_before(Instant::now() + Duration::from_millis(6));
+        assert_eq!(expired, 1);
+        assert_eq!(manager.active_snapshot_count(), 0);
+        assert_eq!(manager.retained_version_count(), 1);
+        assert_eq!(
+            manager.validate_commit(&old_snapshot, &HashSet::new()),
+            Err(MvccCommitError::SnapshotExpired)
+        );
+    }
+
+    #[test]
+    fn staged_multi_row_accord_commit_is_visible_as_one_snapshot_version() {
+        let manager = MvccManager::default();
+        let before = vec![
+            RowChange {
+                table: "public.items".to_string(),
+                key: vec![Value::Int(1)],
+                partition_key: vec![1],
+                before: Some(row("left-before")),
+                after: Some(row("left-after")),
+            },
+            RowChange {
+                table: "public.items".to_string(),
+                key: vec![Value::Int(2)],
+                partition_key: vec![2],
+                before: Some(row("right-before")),
+                after: Some(row("right-after")),
+            },
+        ];
+        let metadata = serde_json::to_vec(&before).unwrap();
+        let commit_ts = Timestamp::synthetic(20);
+        <MvccManager as ferrosa_storage::accord::PostgresMvccApplyObserver>::prepare_postgres_apply(
+            &manager,
+            TxnId::new(1, Timestamp::synthetic(21)),
+            commit_ts,
+            &[metadata],
+        )
+        .unwrap();
+
+        let old_snapshot = manager.snapshot_at(Some(Timestamp::synthetic(19)));
+        let committed_snapshot = manager.snapshot_at(Some(commit_ts));
+        let old_rows = manager.table_overlay(&old_snapshot, "public.items");
+        let committed_rows = manager.table_overlay(&committed_snapshot, "public.items");
+
+        assert_eq!(
+            old_rows.get(&vec![Value::Int(1)]).and_then(Option::as_ref),
+            Some(&row("left-before"))
+        );
+        assert_eq!(
+            old_rows.get(&vec![Value::Int(2)]).and_then(Option::as_ref),
+            Some(&row("right-before"))
+        );
+        assert_eq!(
+            committed_rows
+                .get(&vec![Value::Int(1)])
+                .and_then(Option::as_ref),
+            Some(&row("left-after"))
+        );
+        assert_eq!(
+            committed_rows
+                .get(&vec![Value::Int(2)])
+                .and_then(Option::as_ref),
+            Some(&row("right-after"))
+        );
     }
 }

@@ -122,6 +122,33 @@ whose topology-aware driver can execute a query on a peer instead of the
 contact endpoint, or require schema UUID agreement before the workload has
 created any schema.
 
+PostgreSQL strict-serializability workload (external cluster):
+
+```bash
+# Start the bundled cluster once (all three nodes use the one built image):
+docker compose -f tests/docker/jepsen-cluster.yml build node1
+docker compose -f tests/docker/jepsen-cluster.yml up -d --no-build
+
+# Use a disposable test cluster and a SCRAM-enabled CQL role visible to all
+# nodes. For the compose cluster below, create the test-only role with:
+docker run --rm --network host cassandra:5.0 cqlsh 127.0.0.1 49042 \
+  -e "CREATE ROLE ferrosa_pg_jepsen WITH PASSWORD = 'ferrosa-jepsen-test' AND LOGIN = true AND SUPERUSER = true;"
+
+FERROSA_TEST_POSTGRES_URLS='postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:49052/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:49053/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:49054/postgres' \
+  cargo test -p ferrosa-jepsen --features postgres-jepsen \
+  --test postgres_strict_serializable -- --nocapture
+```
+
+This native-driver workload creates a unique two-row table, runs concurrent
+explicit `SERIALIZABLE` transfers through all supplied node URLs, records
+invocation/completion order and each committed transaction's reads/writes, then
+checks the full history and final balances on every node with the bounded
+strict-serializability checker. At least three reachable PostgreSQL URLs using
+the same CQL-backed role are required. The test fails loudly when the feature is
+enabled without its cluster variable. It currently checks concurrent histories
+without node-failure injection; the fault-schedule and restart acceptance gates
+remain separate and open.
+
 Local live-infra form:
 
 ```bash

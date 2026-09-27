@@ -10,9 +10,12 @@ executive_summary: >
   are supported; it shares the storage row codec with CQL via ferrosa-row-bridge
   (D10) and is differential-tested against real PostgreSQL 16. Explicit
   PostgreSQL SERIALIZABLE transactions use MVCC snapshots with read-your-writes
-  and conservative table-level conflict validation. In cluster mode, Accord
-  carries the snapshot and read/write table set into commit validation and applies
-  PostgreSQL row-version metadata to every replica. CQL/Cassandra transactions
+  and conflict validation. In standalone mode, validation uses local table
+  epochs. In cluster mode, a global PostgreSQL marker conservatively rejects a
+  snapshot if any PostgreSQL data transaction committed after it; the supplied
+  table set is not yet used for per-table Accord validation. Explicit isolation
+  modes other than SERIALIZABLE fail with `0A000`. Accord applies PostgreSQL
+  row-version metadata to every replica. CQL/Cassandra transactions
   remain on Accord's existing path. Native-driver cross-node coverage exists;
   the Jepsen strict-serializability workload remains the system-wide acceptance
   gate. `ON CONFLICT` remains unsupported.
@@ -71,11 +74,14 @@ differential oracle exercise.
 
 **Read path (`SELECT`):** SQL string → `ferrosa_sql::parse_statement` →
 `query::load_catalog` resolves every referenced table (FROM + optional JOIN) by
-draining `StorageEngine::range_iter` (async) up front and decomposing each
-`Partition` with the shared `ferrosa_row_bridge::partition_to_rows_with_storage_mapping`
-into an `InMemoryTable` → `ferrosa_sql::execute` runs the sync operators →
-`render_result` emits `RowDescription` + `DataRow`s (per the result formats) +
-`CommandComplete "SELECT n"`. The caller appends one `ReadyForQuery`.
+opening each referenced table as a bounded-channel storage provider. The scan
+producer decodes storage partitions as the synchronous executor pulls rows;
+the scan channel capacity defaults to 64 and is configurable. The relational
+executor still materializes base rows and `QueryResult.rows`, while
+`render_result` collects the complete wire-message vector, so response memory
+still scales with result size. `offload::execute_offloaded` runs sync operators
+on a blocking thread → `RowDescription` + `DataRow`s + `CommandComplete
+"SELECT n"`. The caller appends one `ReadyForQuery`.
 
 **Write path (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` driven by the target column's `CqlType` (`value_to_cql`, fail-loud on
@@ -100,6 +106,19 @@ The storage value bridge (`cql_to_value`) maps supported CQL scalars onto this
 model and reports a scan error for values without a representation.
 
 ## Key invariants
+
+## PostgreSQL MVCC resource bounds
+
+At startup, `FERROSA_POSTGRES_MAX_TXN_WRITES` sets the per-transaction buffered
+mutation cap (default 10,000), `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` sets the
+storage-to-executor row channel capacity (64), and
+`FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` expires older active snapshots
+(600,000 ms). `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` controls the
+expiry/pruning sweep cadence (1,000 ms). Invalid values log an error and select
+the complete default set without stopping startup. Expired transactions fail
+on subsequent snapshot validation with SQLSTATE `40001`. Tuning guidance and
+query-materialization caveats are in the public
+[`PROFILE.md`](../../PROFILE.md).
 
 1. **Fail loud, never fake.** Every failure maps to a concrete SQLSTATE + one
    `ErrorResponse`; the front-end never returns a fake empty result on error

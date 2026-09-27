@@ -352,10 +352,10 @@ async fn execute_simple_inner(
 
     match stmt {
         ferrosa_sql::Statement::Begin { isolation } => {
-            if isolation == Some(ferrosa_sql::IsolationLevel::RepeatableRead) {
+            if isolation.is_some_and(|level| level != ferrosa_sql::IsolationLevel::Serializable) {
                 return vec![query::error_response(
                     "0A000",
-                    "REPEATABLE READ isolation is not yet supported",
+                    "only SERIALIZABLE isolation is supported for explicit PostgreSQL transactions",
                 )];
             }
             let snapshot = if let Some(committer) = &ctx.accord_committer {
@@ -392,6 +392,10 @@ async fn execute_simple_inner(
         // transaction, DML is BUFFERED into the session write-set instead of
         // applied; autocommit (no open txn) applies immediately.
         _ => {
+            if let Some(error) = expired_transaction_error(ctx, session) {
+                session.mark_txn_failed();
+                return vec![error];
+            }
             if session.in_txn()
                 && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
             {
@@ -459,6 +463,28 @@ async fn execute_simple_inner(
     }
 }
 
+fn expired_transaction_error(ctx: &QueryContext, session: &Session) -> Option<BackendMessage> {
+    let snapshot = session.txn_snapshot()?;
+    match ctx
+        .mvcc
+        .validate_commit(snapshot, &std::collections::HashSet::new())
+    {
+        Ok(()) => None,
+        Err(MvccCommitError::SnapshotExpired) => Some(query::error_response(
+            "40001",
+            "PostgreSQL transaction snapshot expired",
+        )),
+        Err(MvccCommitError::SerializationFailure) => Some(query::error_response(
+            "40001",
+            "could not serialize PostgreSQL transaction",
+        )),
+        Err(MvccCommitError::Storage(error)) => Some(query::error_response(
+            "58000",
+            &format!("transaction validation failed: {error}"),
+        )),
+    }
+}
+
 /// Validate PostgreSQL snapshot conflicts and commit the buffered write-set.
 /// In cluster mode, Accord establishes the distributed order and atomic apply;
 /// in standalone mode, the MVCC manager applies the batch locally. CQL
@@ -488,6 +514,21 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     // no-op that commits cleanly — there is nothing to apply, so no atomicity to
     // honor. This is NOT a fake success: zero writes means zero state change.
     if writes.is_empty() {
+        if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &read_tables) {
+            session.end_txn();
+            return match error {
+                MvccCommitError::SerializationFailure | MvccCommitError::SnapshotExpired => {
+                    vec![query::error_response(
+                        "40001",
+                        "could not serialize PostgreSQL transaction",
+                    )]
+                }
+                MvccCommitError::Storage(error) => vec![query::error_response(
+                    "58000",
+                    &format!("transaction commit failed: {error}"),
+                )],
+            };
+        }
         if let Some(committer) = &ctx.accord_committer {
             let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
                 session.end_txn();
@@ -962,6 +1003,11 @@ async fn execute_portal_inner(
     };
     let parsed = stmt.parsed.clone();
 
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return vec![session.fail(error)];
+    }
+
     match parsed {
         PreparedKind::Select(select) => {
             if session.in_txn()
@@ -1166,6 +1212,7 @@ pub async fn serve<S>(
 where
     S: VerifierStore + Send + Sync + 'static,
 {
+    let _snapshot_reaper = crate::mvcc::MvccManager::spawn_snapshot_reaper(ctx.mvcc.clone());
     if let Some(committer) = &ctx.accord_committer {
         committer
             .register_postgres_mvcc_observer(ctx.mvcc.clone())
@@ -1489,6 +1536,194 @@ mod txn_atomicity_tests {
     }
 
     #[tokio::test]
+    async fn multi_row_snapshots_hide_partial_replica_apply() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut seed = Session::new();
+        for (key, value) in [("row-a", "before-a"), ("row-b", "before-b")] {
+            let insert = format!("INSERT INTO kv (k, v) VALUES ('{key}', '{value}')");
+            execute_simple(&ctx, &mut seed, &insert).await;
+        }
+
+        let before_ts = ferrosa_common::accord::Timestamp::synthetic(19);
+        let commit_ts = ferrosa_common::accord::Timestamp::synthetic(20);
+        let mut writer = Session::new();
+        writer.begin_txn(
+            Some(ferrosa_sql::IsolationLevel::Serializable),
+            ctx.mvcc.snapshot_with_cluster_ts(before_ts),
+        );
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "UPDATE kv SET v = 'after-a' WHERE k = 'row-a'",
+        )
+        .await;
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "UPDATE kv SET v = 'after-b' WHERE k = 'row-b'",
+        )
+        .await;
+        let mutations: Vec<_> = writer
+            .take_txn_writes()
+            .into_iter()
+            .map(|write| write.0)
+            .collect();
+        assert_eq!(mutations.len(), 2);
+
+        let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations).unwrap();
+        let metadata = serde_json::to_vec(&changes).unwrap();
+        let txn_id =
+            ferrosa_common::accord::TxnId::new(1, ferrosa_common::accord::Timestamp::synthetic(21));
+        let metadata_batch = [metadata];
+        <MvccManager as ferrosa_storage::accord::PostgresMvccApplyObserver>::prepare_postgres_apply(
+            &ctx.mvcc,
+            txn_id,
+            commit_ts,
+            &metadata_batch,
+        )
+        .unwrap();
+
+        // Pause at the replica's storage seam after the complete MVCC row-image
+        // set is staged but only the first partition has reached storage.
+        ctx.engine
+            .write_atomic_batch(vec![mutations[0].clone()])
+            .unwrap();
+
+        let old_snapshot = ctx.mvcc.snapshot_with_cluster_ts(before_ts);
+        let committed_snapshot = ctx.mvcc.snapshot_with_cluster_ts(commit_ts);
+        let rows_for = |messages: &[BackendMessage]| {
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    BackendMessage::DataRow { columns } if columns.len() == 2 => {
+                        let key = columns[0].as_ref()?.clone();
+                        let value = columns[1].as_ref()?.clone();
+                        Some((String::from_utf8(key).ok()?, String::from_utf8(value).ok()?))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        async fn read_at(
+            ctx: &QueryContext,
+            snapshot: &crate::mvcc::MvccSnapshot,
+        ) -> Vec<BackendMessage> {
+            query::execute_query_with_mvcc(
+                &ctx.engine,
+                &ctx.schema,
+                "SELECT k, v FROM kv ORDER BY k",
+                &ctx.default_schema,
+                Some(&ctx.mvcc),
+                Some(snapshot),
+                None,
+            )
+            .await
+        }
+
+        let old_rows = read_at(&ctx, &old_snapshot).await;
+        assert_eq!(
+            rows_for(&old_rows),
+            vec![
+                ("row-a".into(), "before-a".into()),
+                ("row-b".into(), "before-b".into())
+            ]
+        );
+        let committed_rows = read_at(&ctx, &committed_snapshot).await;
+        assert_eq!(
+            rows_for(&committed_rows),
+            vec![
+                ("row-a".into(), "after-a".into()),
+                ("row-b".into(), "after-b".into())
+            ]
+        );
+
+        ctx.engine
+            .write_atomic_batch(vec![mutations[1].clone()])
+            .unwrap();
+        <MvccManager as ferrosa_storage::accord::PostgresMvccApplyObserver>::on_postgres_apply(
+            &ctx.mvcc,
+            txn_id,
+            commit_ts,
+            &metadata_batch,
+        )
+        .unwrap();
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_transaction_survives_restart_and_uncommitted_buffer_does_not() {
+        let (dir, ctx) = make_ctx().await;
+        let mut committed = Session::new();
+        execute_simple(&ctx, &mut committed, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut committed,
+            "INSERT INTO kv (k, v) VALUES ('restart-committed', 'durable')",
+        )
+        .await;
+        let commit = execute_simple(&ctx, &mut committed, "COMMIT").await;
+        assert!(
+            matches!(&commit[..], [BackendMessage::CommandComplete { tag }] if tag == "COMMIT"),
+            "the transaction must commit before restart: {commit:?}"
+        );
+
+        let mut abandoned = Session::new();
+        execute_simple(&ctx, &mut abandoned, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut abandoned,
+            "INSERT INTO kv (k, v) VALUES ('restart-uncommitted', 'must-not-appear')",
+        )
+        .await;
+        drop(abandoned);
+
+        ctx.engine.shutdown().unwrap();
+        let recovered_engine =
+            Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        recovered_engine
+            .register_table(kv_storage_schema())
+            .unwrap();
+        let recovered_ctx = ctx_with(recovered_engine, ctx.schema.clone());
+
+        assert_eq!(row_count(&recovered_ctx, "restart-committed").await, 1);
+        assert_eq!(row_count(&recovered_ctx, "restart-uncommitted").await, 0);
+        recovered_ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_storage_preflight_rejects_the_entire_postgres_write_set() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new();
+        execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('atomic-good', 'must-not-commit-alone')",
+        )
+        .await;
+
+        let oversized_value = "x".repeat(300 * 1024);
+        let oversized_insert =
+            format!("INSERT INTO kv (k, v) VALUES ('atomic-oversized', '{oversized_value}')");
+        let staged = execute_simple(&ctx, &mut session, &oversized_insert).await;
+        assert!(
+            matches!(&staged[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
+            "the oversized row remains buffered until COMMIT: {staged:?}"
+        );
+
+        let commit = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert!(
+            is_error(&commit, "58000"),
+            "storage preflight failure must fail the commit: {commit:?}"
+        );
+        assert!(!session.in_txn());
+        assert_eq!(row_count(&ctx, "atomic-good").await, 0);
+        assert_eq!(row_count(&ctx, "atomic-oversized").await, 0);
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_txn_commit_does_not_apply() {
         // A statement that errors inside a txn poisons it; subsequent DML hits
         // 25P02; COMMIT is treated as ROLLBACK and nothing is applied.
@@ -1605,6 +1840,98 @@ mod txn_atomicity_tests {
         );
 
         execute_simple(&ctx, &mut reader, "ROLLBACK").await;
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_transaction_rejects_followup_read_instead_of_using_current_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut reader = Session::new();
+        let mut writer = Session::new();
+
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "INSERT INTO kv (k, v) VALUES ('expired-read', 'before')",
+        )
+        .await;
+        execute_simple(&ctx, &mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "UPDATE kv SET v = 'after' WHERE k = 'expired-read'",
+        )
+        .await;
+
+        assert_eq!(ctx.mvcc.expire_all_snapshots_for_test(), 1);
+        let messages = execute_simple(
+            &ctx,
+            &mut reader,
+            "SELECT v FROM kv WHERE k = 'expired-read'",
+        )
+        .await;
+        assert!(
+            is_error(&messages, "40001"),
+            "an expired transaction must fail instead of reading the newer row: {messages:?}"
+        );
+        assert!(reader.in_failed_txn());
+
+        execute_simple(&ctx, &mut reader, "ROLLBACK").await;
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_read_only_transaction_cannot_commit_successfully() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new();
+        execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        assert_eq!(ctx.mvcc.expire_all_snapshots_for_test(), 1);
+
+        let messages = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert!(
+            is_error(&messages, "40001"),
+            "expired read-only transactions must fail serialization validation: {messages:?}"
+        );
+        assert!(!session.in_txn(), "the failed transaction is ended");
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_transaction_rejects_extended_protocol_dml_before_buffering() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new();
+        execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        assert_eq!(ctx.mvcc.expire_all_snapshots_for_test(), 1);
+
+        assert!(matches!(
+            session.on_parse(
+                "insert".to_string(),
+                "INSERT INTO kv (k, v) VALUES ($1, 'late-write')",
+                vec![25],
+            ),
+            BackendMessage::ParseComplete
+        ));
+        assert!(matches!(
+            session.on_bind(
+                "expired-portal".to_string(),
+                "insert".to_string(),
+                &[],
+                &[Some(b"expired-write".to_vec())],
+                vec![],
+            ),
+            BackendMessage::BindComplete
+        ));
+
+        let messages = execute_portal_inner(&ctx, &mut session, "expired-portal").await;
+        assert!(
+            is_error(&messages, "40001"),
+            "expired extended DML must fail before it is acknowledged: {messages:?}"
+        );
+        assert!(session.in_failed_txn());
+        assert_eq!(session.txn_writes().len(), 0);
+
+        execute_simple(&ctx, &mut session, "ROLLBACK").await;
         ctx.engine.shutdown().unwrap();
     }
 

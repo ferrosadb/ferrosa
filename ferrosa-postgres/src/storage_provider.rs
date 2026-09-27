@@ -294,7 +294,7 @@ fn storage_to_table_indices(meta: &TableMetadata) -> Vec<usize> {
 /// delivered. Sized so a scan of wide rows keeps its in-flight window in the
 /// low megabytes while still leaving the producer enough slack to stay busy
 /// across a partition boundary.
-pub const SCAN_BUFFER_ROWS: usize = 64;
+pub const SCAN_BUFFER_ROWS: usize = crate::mvcc::DEFAULT_SCAN_BUFFER_ROWS;
 
 /// The first storage error hit by any scan in one query, shared by every table
 /// in that query's catalog.
@@ -485,6 +485,7 @@ pub struct StreamingTable {
     /// blocking thread with no runtime of its own — can still spawn a producer.
     handle: Handle,
     failure: ScanFailure,
+    scan_buffer_rows: usize,
 }
 
 impl fmt::Debug for StreamingTable {
@@ -502,7 +503,7 @@ impl TableProvider for StreamingTable {
     }
 
     fn scan(&self) -> Box<dyn Iterator<Item = Row> + '_> {
-        let (tx, rx) = mpsc::channel(SCAN_BUFFER_ROWS);
+        let (tx, rx) = mpsc::channel(self.scan_buffer_rows);
         self.handle.spawn(guard_scan_producer(
             produce_scan(self.ctx.clone(), tx, self.failure.clone()),
             self.failure.clone(),
@@ -531,7 +532,16 @@ pub async fn load_table(
     table: &str,
     failure: ScanFailure,
 ) -> Result<StreamingTable, LoadError> {
-    load_table_with_overlay(engine, schema, keyspace, table, failure, Default::default()).await
+    load_table_with_overlay(
+        engine,
+        schema,
+        keyspace,
+        table,
+        failure,
+        Default::default(),
+        SCAN_BUFFER_ROWS,
+    )
+    .await
 }
 
 pub(crate) async fn load_table_with_overlay(
@@ -541,6 +551,7 @@ pub(crate) async fn load_table_with_overlay(
     table: &str,
     failure: ScanFailure,
     overlay: std::collections::HashMap<Vec<Value>, Option<Row>>,
+    scan_buffer_rows: usize,
 ) -> Result<StreamingTable, LoadError> {
     let snapshot = schema.snapshot();
 
@@ -584,6 +595,7 @@ pub(crate) async fn load_table_with_overlay(
         }),
         handle: Handle::current(),
         failure,
+        scan_buffer_rows,
     })
 }
 
