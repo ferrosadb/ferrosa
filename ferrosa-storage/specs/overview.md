@@ -243,3 +243,9 @@ from manifested records. A failed S3-delete enqueue is logged and leaves the
 record for retry. Pinned and local-only compactions remove the record after
 local retirement without attempting S3 work. Mock-store crash tests interrupt
 pending-log, manifest-CAS, delete-enqueue, and pinned-retirement phases.
+### Operator compaction stop (T-025)
+
+Operator stop requests use `CancelReason::Operator` under the task registry lock.
+They select all current tasks or one registered table, preserve the first recorded
+cancellation reason, and leave admission enabled. Counts describe the registry at
+request time; the caller does not wait for finalization or promise reclaimed disk.

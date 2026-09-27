@@ -54,3 +54,6 @@ the channel/dependency review.
   reached over CQL or the web admin API — ctl never reimplements it.
 - Re-implementing corruption detection. SSTable verdicts must always delegate to
   `StorageEngine::smoke_test_generation` so ctl can never diverge from startup.
+
+- Implemented `compaction stop` for node/table-scoped cancellation requests,
+  authenticated with prompted or stdin passwords; HTTP and parser regressions.

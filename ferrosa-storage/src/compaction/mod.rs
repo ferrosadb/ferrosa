@@ -29,7 +29,7 @@ pub mod cancel_oracle;
 #[cfg(test)]
 mod cancel_token_tests;
 pub(crate) mod control;
-pub use control::TableCompactionPause;
+pub use control::{CompactionStopReport, TableCompactionPause};
 pub mod executor;
 pub mod finalize;
 pub mod intent;

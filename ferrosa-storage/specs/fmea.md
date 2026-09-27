@@ -110,3 +110,7 @@ DDL fails before changing storage while claims remain. `cancel_source_tracker_*`
 and `cancel_source_ddl_*` cover nested pauses, stale selection, result draining,
 held-result accounting and a finalizer releasing its claim on a single-thread
 runtime. Permit acquisition also selects on cancellation and shutdown.
+
+T-025 operator requests preserve existing cancellation reasons, count each task
+once under the registry lock, and keep future admission open. Scoped tests cover
+unselected tasks, repeated requests and empty registries.

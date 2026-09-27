@@ -182,21 +182,16 @@ sidecars, retire through durable hidden paths. Failures retain their intent and
 retry on startup. The remaining T-060 extension is a grace period at the single
 `remove_retired` reclamation seam; current retirement removes the files immediately.
 
-### T-025 progress: event-driven result delivery
+### Completed: T-025 cancellation and operator control
 
-Completed-result delivery now blocks on channel readiness, cancellation and
-shutdown without sleep polling, retaining move ownership until delivery succeeds.
-Source coordination remains open: synchronous DROP/TRUNCATE storage APIs need
-an async completion/submission-gate contract before they can safely await committed
-S3 finalization. Operator source wiring remains to be completed.
+Completed-result delivery waits on channel readiness, cancellation, and shutdown
+without sleep polling. Disk-reserve pressure cancels the largest eligible task
+while keeping admission fail-closed until space recovers. A shared tracker,
+invalidatable submission tickets, and async DROP/TRUNCATE wrappers drain
+finalization across CQL, pair, cluster, and Raft; sync storage calls return busy.
 
-Disk-reserve cancellation is implemented: one task record supplies its token and
-total input bytes; the largest eligible task is cancelled on reserve exhaustion,
-without weakening admission or repeatedly cancelling tasks before reclamation.
-
-- T-025 lifecycle: shared admission/task tracker, invalidatable pre-selection
-  tickets, async DROP/TRUNCATE drain wrappers across CQL/pair/cluster/Raft, and
-  synchronous busy semantics. Operator CLI wiring remains a separate slice.
+The authenticated operator API and ferrosa-ctl compaction stop cancel all
+current tasks or one table scope without disabling future scheduling.
 
 ### Completed: T-026 S3 compaction recovery
 

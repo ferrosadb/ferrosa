@@ -959,6 +959,13 @@ impl CompactionExecutor {
         }
     }
 
+    pub(crate) fn request_operator_stop(
+        &self,
+        table_id: Option<&crate::TableId>,
+    ) -> super::CompactionStopReport {
+        self.tracker.request_operator_stop(table_id)
+    }
+
     /// Request reclamation from the largest registered task. Keep only one
     /// disk-pressure cancellation outstanding until its input claim is released,
     /// so a burst of rejected writes cannot cancel every compaction at once.

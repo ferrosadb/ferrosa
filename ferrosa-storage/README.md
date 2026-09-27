@@ -749,3 +749,8 @@ async callers use `unregister_table_and_wait` or `truncate_and_wait`.
 Async APIs take `Arc<StorageEngine>` so an owned finalization job can survive a
 request disconnect. TRUNCATE retains its pause through asynchronous S3 cleanup;
 a dropped DDL waiter cannot strand a dequeued result or release its claim early.
+
+Operator stop requests use `CancelReason::Operator` under the task registry lock.
+They select all current tasks or one registered table, preserve the first recorded
+cancellation reason, and leave admission enabled. Counts describe the registry at
+request time; the caller does not wait for finalization or promise reclaimed disk.

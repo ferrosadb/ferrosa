@@ -44,3 +44,10 @@ that silently look successful when the node side does nothing**.
 - `src/auth.rs` tests cover password validation and `ALTER ROLE` escaping.
 - `src/commands/sstable.rs` tests run against genuine BTI fixtures via
   `ferrosa-storage`'s `test-support` feature.
+
+Operator compaction stop validates paired table scope before sending, sends names
+as JSON values, authenticates through the admin API, and checks the 202 response
+and echoed scope. A fixed 30-second request bound prevents an unreachable node
+from holding the CLI indefinitely; request acknowledgement bodies are capped at
+4 KiB. It reports cancellation requests, never completed termination. Parser and
+HTTP fixture tests cover scope, authentication, server errors and invalid replies.

@@ -69,3 +69,6 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the in-code `TODO`
 ### Pump wiring acceptance (T-045)
 
 The CQL wiring acceptance test writes compressed and plain tables through a real client/server, includes a row larger than a pump segment, flushes and compacts, tears down the first runtime, and verifies all rows through a reopened engine and fresh server.
+
+- T-025 operator slice: authenticated POST `/api/compaction/stop`, strict JSON
+  scope validation, asynchronous cancellation acknowledgement and route tests.

@@ -16,6 +16,7 @@ use tabled::settings::Style;
 use ferrosa_cql::client::{CqlClient, QueryResult};
 use ferrosa_cql::error::CqlError;
 
+pub mod compaction;
 /// Index health and rebuild (`ferrosa-ctl index ...`). Names the same two
 /// states the query planner already distinguishes when it withholds an index
 /// and takes a scan instead.

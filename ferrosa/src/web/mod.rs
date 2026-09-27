@@ -25,6 +25,7 @@
 
 pub mod api;
 pub mod auth;
+mod compaction;
 pub mod debug;
 pub mod observability;
 pub mod readiness;
@@ -110,6 +111,7 @@ pub fn build_router(state: WebAppState) -> Router {
         .nest("/api", observability::routes())
         .nest("/api/cluster", api::cluster_routes())
         .nest("/api/index", api::index_routes())
+        .nest("/api/compaction", compaction::routes())
         .nest("/api/debug", debug::debug_routes())
         .route("/api/ws", get(ws::ws_handler))
         .nest("/admin", api::admin_routes())

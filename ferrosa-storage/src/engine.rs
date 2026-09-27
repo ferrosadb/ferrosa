@@ -9806,6 +9806,27 @@ impl StorageEngine {
         self.schedule_compaction_backlog_round();
     }
 
+    /// Request cancellation of current compactions on this node. Future admission
+    /// stays enabled; committed replacements finish their normal finalization.
+    pub fn request_compaction_stop(
+        &self,
+        table_id: Option<&TableId>,
+    ) -> ferrosa_common::Result<crate::compaction::CompactionStopReport> {
+        if let Some(table_id) = table_id {
+            let tables = self.tables.read();
+            if !tables.contains_key(table_id) {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "table not registered: {table_id}"
+                )));
+            }
+            Ok(self
+                .compaction_executor
+                .request_operator_stop(Some(table_id)))
+        } else {
+            Ok(self.compaction_executor.request_operator_stop(None))
+        }
+    }
+
     /// Pause admission before cancellation. Enable the notification before checking
     /// claims/results so a result publication or release cannot be missed.
     pub async fn pause_table_compactions(

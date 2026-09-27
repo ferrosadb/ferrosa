@@ -114,3 +114,21 @@ virtual-table integration suite (`tests/integration.rs`, 11).
 - [Architecture overview](specs/overview.md) — channels, module map, data flow
 - [FMEA / known issues](specs/fmea.md) — failure modes + real gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+### Stop current compactions
+
+`ferrosa-ctl compaction stop` requests cancellation of every currently registered
+compaction on the selected node. Add `--keyspace KS --table TABLE` to target one
+table. Both scope flags are required together. `--host IP:CQL_PORT` selects the
+node and `--web-port` selects its admin port (default 9090).
+
+For authenticated nodes, add `--username ROLE`; the CLI prompts for its password.
+Use `--password-stdin` to read one password line from stdin instead. The server
+requires its existing admin/operator grant (or superuser), unless auth is disabled.
+
+The command sends JSON to `POST /api/compaction/stop` and requires HTTP 202 with
+`status: cancellation_requested`, the echoed scope, and task counts. Exit zero
+means the request was accepted. Cancellation completes asynchronously; committed
+replacements finish normally, and future compaction scheduling remains enabled.
+An idle node is a successful zero-task request. Errors, malformed replies and
+scope mismatches return a nonzero exit status.

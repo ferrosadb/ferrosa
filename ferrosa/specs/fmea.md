@@ -54,3 +54,8 @@ own their own internal FMEAs.
 ### Pump wiring acceptance (T-045)
 
 The CQL wiring acceptance test writes compressed and plain tables through a real client/server, includes a row larger than a pump segment, flushes and compacts, tears down the first runtime, and verifies all rows through a reopened engine and fresh server.
+
+Compaction stop scope is validated before registry access; unknown/partial scope
+cannot fall through to node-wide cancellation. The route is POST-only and remains
+behind the shared admin/operator authentication middleware. Tests exercise real
+queued compactions on two tables and verify selected cancellation preserves inputs.

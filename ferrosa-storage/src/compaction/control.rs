@@ -53,6 +53,13 @@ pub struct TableCompactionPause {
     table_id: TableId,
 }
 
+/// Snapshot of an operator cancellation request; completion is asynchronous.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CompactionStopReport {
+    pub matched_tasks: usize,
+    pub already_cancelled_tasks: usize,
+}
+
 impl TaskTracker {
     pub(crate) fn submission_ticket(&self, table_id: &TableId) -> Option<SubmissionTicket> {
         let mut state = self.state.lock();
@@ -141,6 +148,21 @@ impl TaskTracker {
         }
         drop(state);
         self.changed.notify_waiters();
+    }
+
+    pub(crate) fn request_operator_stop(&self, table_id: Option<&TableId>) -> CompactionStopReport {
+        let state = self.state.lock();
+        let mut report = CompactionStopReport::default();
+        for task in state
+            .tasks
+            .values()
+            .filter(|task| table_id.is_none_or(|table| table == &task.table_id))
+        {
+            report.matched_tasks += 1;
+            report.already_cancelled_tasks += usize::from(task.cancel.is_cancelled());
+            task.cancel.cancel(CancelReason::Operator);
+        }
+        report
     }
 
     pub(crate) fn cancel_all(&self, reason: CancelReason) {
@@ -285,6 +307,43 @@ mod tests {
             assert!(tracker.try_register(&work, &recreated).is_some());
             tracker.release(&work);
         });
+    }
+
+    #[test]
+    fn cancel_source_operator_scopes_requests_and_keeps_admission_open() {
+        let tracker = TaskTracker::default();
+        let first = task("first");
+        let other = task("other");
+        let first_ticket = tracker.submission_ticket(&first.table_id).unwrap();
+        let other_ticket = tracker.submission_ticket(&other.table_id).unwrap();
+        let first_cancel = tracker.try_register(&first, &first_ticket).unwrap();
+        let other_cancel = tracker.try_register(&other, &other_ticket).unwrap();
+        assert_eq!(
+            tracker.request_operator_stop(Some(&first.table_id)),
+            CompactionStopReport {
+                matched_tasks: 1,
+                already_cancelled_tasks: 0,
+            }
+        );
+        assert_eq!(first_cancel.reason(), Some(CancelReason::Operator));
+        assert!(!other_cancel.is_cancelled());
+        other_cancel.cancel(CancelReason::DiskReserve);
+        assert_eq!(
+            tracker.request_operator_stop(None),
+            CompactionStopReport {
+                matched_tasks: 2,
+                already_cancelled_tasks: 2,
+            }
+        );
+        assert_eq!(other_cancel.reason(), Some(CancelReason::DiskReserve));
+        tracker.release(&first);
+        assert!(tracker.try_register(&first, &first_ticket).is_some());
+        tracker.release(&first);
+        tracker.release(&other);
+        assert_eq!(
+            tracker.request_operator_stop(None),
+            CompactionStopReport::default()
+        );
     }
 
     #[test]
