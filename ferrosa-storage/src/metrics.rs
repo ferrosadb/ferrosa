@@ -2,7 +2,7 @@
 //! Correctness: Correct when counters are monotonic, gauges reflect complete
 //! operations, and observation never allocates in storage hot paths.
 //! Last revised: 2026-09-26
-//! Last changed: Retain recovery intents on atomic input retirement failures.
+//! Last changed: Export a bounded gauge for tables paused after digest failures.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -390,6 +390,7 @@ static COMPACTION_SKIPPED_OVERLAP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_PAUSED_TABLES: AtomicU64 = AtomicU64::new(0);
 /// Compaction tasks that returned `Err` because their `CancelToken` was
 /// cancelled (T-021), as distinct from an ordinary failure.
 static COMPACTION_RETIRE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -580,6 +581,20 @@ pub fn dec_compaction_running() {
 
 pub fn inc_compaction_failed() {
     COMPACTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Set the process-wide count of tables paused after digest verification failures.
+pub fn inc_compaction_paused_tables() {
+    COMPACTION_PAUSED_TABLES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Decrement the process-wide count when a digest pause guard is released.
+pub fn dec_compaction_paused_tables() {
+    let _ = COMPACTION_PAUSED_TABLES.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |count| Some(count.saturating_sub(1)),
+    );
 }
 
 /// Record a compaction input reader obtained through the engine-wide reader
@@ -1191,6 +1206,12 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_compaction_failed_total {}\n",
         COMPACTION_FAILED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_paused_tables Tables paused after repeated output digest or verification failures.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_paused_tables gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_paused_tables {}\n",
+        COMPACTION_PAUSED_TABLES.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_compaction_retire_failures_total Input retirement failures retained for reconciliation.\n");
     out.push_str("# TYPE ferrosa_storage_compaction_retire_failures_total counter\n");

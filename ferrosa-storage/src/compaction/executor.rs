@@ -1,6 +1,6 @@
 //! Correctness: A completed result is published once or its staging is reclaimed.
 //! Last revised: 2026-09-27
-//! Last changed: Coordinate table DDL with compaction cancellation and completion.
+//! Last changed: Publish retryable digest and readback failures through a bounded channel.
 //! Module: Execute bounded streaming compaction work on background threads.
 //! Correctness: Correct when input claims prevent overlap, completed outputs are
 //! finalized once, and maintenance result batches remain explicitly bounded.
@@ -518,6 +518,13 @@ pub struct CompactionResult {
     pub cancel: CancelToken,
 }
 
+/// Bounded notification that an output digest or readback verification failed.
+#[derive(Debug)]
+pub(crate) struct CompactionFailure {
+    pub table_id: crate::TableId,
+    pub message: String,
+}
+
 /// In-memory SSTable components produced by compaction.
 #[derive(Debug, Clone)]
 pub struct CompactionDirectUpload {
@@ -559,6 +566,35 @@ fn send_result_or_cancel<T>(
     }
 }
 
+fn send_failure_or_shutdown(
+    sender: &Sender<CompactionFailure>,
+    failure: CompactionFailure,
+    pending: &AtomicUsize,
+    shutdown: &Receiver<()>,
+) -> bool {
+    crossbeam_channel::select! {
+        send(sender, {
+            pending.fetch_add(1, Ordering::Release);
+            failure
+        }) -> sent => match sent {
+            Ok(()) => true,
+            Err(error) => {
+                pending.fetch_sub(1, Ordering::Release);
+                tracing::warn!(table_id = %error.0.table_id, "compaction: retry notification receiver stopped");
+                false
+            }
+        },
+        recv(shutdown) -> _ => false,
+    }
+}
+
+fn is_digest_verification_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("digest")
+        || message.contains("corruption: output")
+        || message.contains("output sstable is corrupt")
+}
+
 /// Runs compaction tasks on a background thread.
 ///
 /// `StorageEngine` submits tasks via `submit()` and polls results via
@@ -567,6 +603,8 @@ pub struct CompactionExecutor {
     task_txs: Vec<Sender<QueuedCompactionTask>>,
     next_worker: AtomicUsize,
     result_rx: Mutex<Receiver<CompactionResult>>,
+    failure_rx: Mutex<Receiver<CompactionFailure>>,
+    failure_notify: Arc<tokio::sync::Notify>,
     /// At most one result received by [`Self::await_result_available`] and not yet
     /// handed to a poll. Lock order: this slot, then `result_rx`.
     held_result: Mutex<Option<CompactionResult>>,
@@ -580,6 +618,7 @@ pub struct CompactionExecutor {
     /// unlike "does a file exist under compaction/", it cannot observe a
     /// half-written staging artifact as "done".
     pending_results: Arc<AtomicUsize>,
+    pending_failures: Arc<AtomicUsize>,
     /// Closing this (dropping the sole sender in `shutdown()`) wakes every
     /// worker blocked in `select!` on its task channel immediately — no poll
     /// interval (T-021 CD1, decisions.md D7).
@@ -624,8 +663,13 @@ impl CompactionExecutor {
         let (result_tx, result_rx) = crossbeam_channel::bounded::<CompactionResult>(
             worker_count.saturating_mul(RESULT_QUEUE_CAPACITY_PER_WORKER),
         );
+        let (failure_tx, failure_rx) = crossbeam_channel::bounded::<CompactionFailure>(
+            worker_count.saturating_mul(RESULT_QUEUE_CAPACITY_PER_WORKER),
+        );
+        let failure_notify = Arc::new(tokio::sync::Notify::new());
         let tracker = TaskTracker::default();
         let pending_results = Arc::new(AtomicUsize::new(0));
+        let pending_failures = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(CompactionGate::new(max_concurrent));
         // The sole sender lives on `Self`; dropping it in `shutdown()` closes
         // this channel and wakes every worker's `select!` at once — no poll
@@ -640,8 +684,11 @@ impl CompactionExecutor {
                 crossbeam_channel::bounded::<QueuedCompactionTask>(TASK_QUEUE_CAPACITY_PER_WORKER);
             task_txs.push(task_tx);
             let result_tx = result_tx.clone();
+            let failure_tx = failure_tx.clone();
+            let failure_notify = Arc::clone(&failure_notify);
             let tracker = tracker.clone();
             let pending_results = Arc::clone(&pending_results);
+            let pending_failures = Arc::clone(&pending_failures);
             let gate = Arc::clone(&gate);
             let reader_pool = reader_pool.clone();
             let shutdown_rx = shutdown_rx.clone();
@@ -758,6 +805,21 @@ impl CompactionExecutor {
                                 } else {
                                     crate::metrics::inc_compaction_failed();
                                     tracing::error!(%e, table_id = %task.table_id, "compaction: task failed");
+                                    if is_digest_verification_failure(&e) {
+                                        let failure = CompactionFailure {
+                                            table_id: task.table_id,
+                                            message: e,
+                                        };
+                                        let sent = send_failure_or_shutdown(
+                                            &failure_tx,
+                                            failure,
+                                            &pending_failures,
+                                            &shutdown_rx,
+                                        );
+                                        if sent {
+                                            failure_notify.notify_one();
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -771,10 +833,13 @@ impl CompactionExecutor {
             task_txs,
             next_worker: AtomicUsize::new(0),
             result_rx: Mutex::new(result_rx),
+            failure_rx: Mutex::new(failure_rx),
+            failure_notify,
             held_result: Mutex::new(None),
             handles: Mutex::new(handles),
             tracker,
             pending_results,
+            pending_failures,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         }
     }
@@ -895,6 +960,24 @@ impl CompactionExecutor {
             results.push(result);
         }
         results
+    }
+
+    /// Drains a bounded batch of retryable output digest failures.
+    pub(crate) fn poll_failures_bounded(&self, max_failures: usize) -> Vec<CompactionFailure> {
+        let rx = self.failure_rx.lock();
+        let mut failures = Vec::with_capacity(max_failures.min(8));
+        while failures.len() < max_failures {
+            let Ok(failure) = rx.try_recv() else {
+                break;
+            };
+            self.pending_failures.fetch_sub(1, Ordering::Release);
+            failures.push(failure);
+        }
+        failures
+    }
+
+    pub(crate) async fn wait_for_failure_notification(&self) {
+        self.failure_notify.notified().await;
     }
 
     /// Block until a completed compaction result is available to
@@ -3601,5 +3684,19 @@ mod tests {
         assert_eq!(auto_tuned_workers(1), 1);
         assert_eq!(auto_tuned_workers(4), 4);
         assert_eq!(auto_tuned_workers(64), MAX_AUTO_COMPACTION_PARALLELISM);
+    }
+
+    #[test]
+    fn compaction_backoff_classifies_digest_and_readback_failures() {
+        assert!(is_digest_verification_failure(
+            "flush output: Digest mismatch for Data.db"
+        ));
+        assert!(is_digest_verification_failure(
+            "CORRUPTION: output partitions_iter failed"
+        ));
+        assert!(is_digest_verification_failure(
+            "compaction output SSTable is corrupt"
+        ));
+        assert!(!is_digest_verification_failure("finish: disk full"));
     }
 }

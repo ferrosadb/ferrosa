@@ -2,7 +2,7 @@
 //! Correctness: Correct when admitted writes are durable before visibility and reads,
 //! replay, flush, and maintenance preserve table and cursor invariants.
 //! Last revised: 2026-09-27
-//! Last changed: Coordinate table DDL with compaction cancellation and completion.
+//! Last changed: Retry output digest failures with backoff and latch table pauses for operator resume.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -44,7 +44,9 @@ use crate::commitlog::CommitLog;
 #[cfg(any(test, feature = "test-support"))]
 use crate::compaction::cancel_harness::CancelPoint;
 use crate::compaction::cancel_point;
-use crate::compaction::executor::CompactionExecutor;
+use crate::compaction::control::TableCompactionPause;
+use crate::compaction::executor::{CompactionExecutor, CompactionFailure};
+use crate::compaction::retry::CompactionRetryPolicy;
 use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
 use crate::flush::{FileFlushTarget, REQUIRED_SSTABLE_COMPONENTS};
@@ -1080,6 +1082,23 @@ fn incremental_compaction_disk_reservation(input_bytes: u64, disk_reserve_bytes:
 ///
 /// One instance per node. Manages multiple tables, each with its own
 /// `TableStore`. The commit log is shared across all tables.
+struct DigestFailurePause {
+    _pause: TableCompactionPause,
+}
+
+impl DigestFailurePause {
+    fn new(pause: TableCompactionPause) -> Self {
+        crate::metrics::inc_compaction_paused_tables();
+        Self { _pause: pause }
+    }
+}
+
+impl Drop for DigestFailurePause {
+    fn drop(&mut self) {
+        crate::metrics::dec_compaction_paused_tables();
+    }
+}
+
 pub struct StorageEngine {
     config: StorageEngineConfig,
     write_admission: WriteAdmissionSettings,
@@ -1103,6 +1122,12 @@ pub struct StorageEngine {
     /// long as the node stays up.
     deferred_index_builds: parking_lot::Mutex<HashMap<TableId, Vec<DeferredIndexBuild>>>,
     compaction_executor: CompactionExecutor,
+    /// Retry history is one entry per table with a retryable verification failure.
+    compaction_retry: parking_lot::Mutex<CompactionRetryPolicy>,
+    /// Retaining these RAII guards latches operator-visible digest pauses until resume/drop.
+    compaction_paused: parking_lot::Mutex<HashMap<TableId, DigestFailurePause>>,
+    /// Wakes the maintenance task when a retry backoff expires.
+    compaction_retry_notify: Arc<tokio::sync::Notify>,
     upload_manager: Option<UploadManager>,
     compaction_upload_manager: Option<UploadManager>,
     local_cache: LocalCache,
@@ -2621,6 +2646,9 @@ impl StorageEngine {
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
+            compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
+            compaction_paused: parking_lot::Mutex::new(HashMap::new()),
+            compaction_retry_notify: Arc::new(tokio::sync::Notify::new()),
             upload_manager,
             compaction_upload_manager,
             local_cache,
@@ -4218,6 +4246,7 @@ impl StorageEngine {
     }
 
     fn unregister_table_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        self.clear_compaction_retry_state(table_id);
         if let Some(state) = self.tables.write().remove(table_id) {
             if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
                 self.soft_pressure_table_count
@@ -9799,6 +9828,10 @@ impl StorageEngine {
     /// enqueue input deletions → evict local input directories.
     pub async fn poll_compactions(&self) {
         const MAX_RESULTS_PER_MAINTENANCE_POLL: usize = 8;
+        let failures = self
+            .compaction_executor
+            .poll_failures_bounded(MAX_RESULTS_PER_MAINTENANCE_POLL);
+        self.handle_compaction_failures(failures);
         let results = self
             .compaction_executor
             .poll_results_bounded(MAX_RESULTS_PER_MAINTENANCE_POLL);
@@ -9824,6 +9857,93 @@ impl StorageEngine {
                 .request_operator_stop(Some(table_id)))
         } else {
             Ok(self.compaction_executor.request_operator_stop(None))
+        }
+    }
+
+    fn handle_compaction_failures(&self, failures: Vec<CompactionFailure>) {
+        for failure in failures {
+            if !self.tables.read().contains_key(&failure.table_id) {
+                continue;
+            }
+            if self.compaction_paused.lock().contains_key(&failure.table_id) {
+                continue;
+            }
+            let (streak, delay) = self.compaction_retry.lock().record_failure(
+                failure.table_id.clone(),
+                Instant::now(),
+                self.config.compaction.retry_backoff_initial,
+                self.config.compaction.retry_backoff_max,
+            );
+            if streak >= self.config.compaction.retry_digest_failure_limit {
+                let mut paused = self.compaction_paused.lock();
+                if !paused.contains_key(&failure.table_id) {
+                    let pause = self.compaction_executor.pause_table(
+                        &failure.table_id,
+                        ferrosa_common::CancelReason::Operator,
+                    );
+                    paused.insert(failure.table_id.clone(), DigestFailurePause::new(pause));
+                    tracing::error!(
+                        table_id = %failure.table_id,
+                        consecutive_digest_failures = streak,
+                        failure = %failure.message,
+                        "compaction: pausing table after repeated output digest/verification failures; operator resume or restart required"
+                    );
+                    self.compaction_retry.lock().remove(&failure.table_id);
+                }
+            } else {
+                tracing::warn!(
+                    table_id = %failure.table_id,
+                    consecutive_digest_failures = streak,
+                    retry_delay_ms = delay.as_millis() as u64,
+                    failure = %failure.message,
+                    "compaction: output digest/verification failed; retry scheduled with backoff"
+                );
+            }
+            self.compaction_retry_notify.notify_one();
+        }
+    }
+
+    /// Wait for an earliest retry deadline or a retry-state change.
+    pub async fn wait_for_compaction_retry_wakeup(&self) {
+        let notified = self.compaction_retry_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let deadline = self
+            .compaction_retry
+            .lock()
+            .next_deadline(Instant::now())
+            .map(tokio::time::Instant::from_std);
+        if let Some(deadline) = deadline {
+            tokio::select! {
+                _ = notified => {},
+                _ = self.compaction_executor.wait_for_failure_notification() => {},
+                _ = tokio::time::sleep_until(deadline) => {},
+            }
+        } else {
+            tokio::select! {
+                _ = notified => {},
+                _ = self.compaction_executor.wait_for_failure_notification() => {},
+            }
+        }
+    }
+
+    /// Resume automatic compaction for a table paused after repeated digest failures.
+    /// The retry streak is cleared so the next failure starts at the initial delay.
+    pub fn resume_table_compactions_after_digest_failures(&self, table_id: &TableId) -> bool {
+        let resumed = self.compaction_paused.lock().remove(table_id).is_some();
+        self.compaction_retry.lock().remove(table_id);
+        if resumed {
+            self.compaction_retry_notify.notify_one();
+            tracing::info!(%table_id, "compaction: digest-failure pause cleared by operator");
+        }
+        resumed
+    }
+
+    fn clear_compaction_retry_state(&self, table_id: &TableId) {
+        let retry_removed = self.compaction_retry.lock().remove(table_id);
+        self.compaction_paused.lock().remove(table_id);
+        if retry_removed {
+            self.compaction_retry_notify.notify_one();
         }
     }
 
@@ -9920,12 +10040,34 @@ impl StorageEngine {
                 &result.output.path,
                 &result.output.id,
             ) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!(%e, %table_id, %task_id, "compaction: failed to read staged output Digest.crc32; preserving inputs");
-                    continue;
+                  Ok(d) => d,
+                  Err(e) => {
+                      let message = format!(
+                          "failed to read staged output Digest.crc32: {e}"
+                      );
+                      crate::compaction::executor::remove_staged_output_components(
+                          &result.output.path,
+                          &result.output.id,
+                      );
+                      tracing::error!(failure = %message, %table_id, %task_id, "compaction: staged output digest verification failed; preserving inputs");
+                      self.handle_compaction_failures(vec![CompactionFailure {
+                          table_id: table_id.clone(),
+                          message,
+                      }]);
+                      continue;
                 }
             };
+            let table_paused = self
+                .compaction_paused
+                .lock()
+                .contains_key(&result.task.table_id);
+            let retry_removed = self
+                .compaction_retry
+                .lock()
+                .succeeded(&result.task.table_id, table_paused);
+            if retry_removed {
+                self.compaction_retry_notify.notify_one();
+            }
             let (promoted_gen, table_dir, final_target) = match self
                 .reserve_compaction_promotion_target(table_id, &result.output)
             {
@@ -10964,6 +11106,9 @@ impl StorageEngine {
     }
 
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) -> bool {
+        if !self.compaction_retry.lock().eligible(table_id, Instant::now()) {
+            return false;
+        }
         let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
             return false;
         };

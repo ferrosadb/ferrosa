@@ -2582,6 +2582,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = compact_interval.tick() => {
                     maintenance_engine.poll_compactions().await;
                 }
+                _ = maintenance_engine.wait_for_compaction_retry_wakeup() => {
+                    maintenance_engine.poll_compactions().await;
+                }
                 _ = urgent_flush_interval.tick() => {
                     if maintenance_engine.take_flush_request() {
                         let engine = maintenance_engine.clone();

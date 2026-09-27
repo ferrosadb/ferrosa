@@ -1,3 +1,8 @@
+//! Module: Select and configure SSTable compaction work.
+//! Correctness: Correct when strategy inputs stay bounded and retry settings normalize into safe ranges.
+//! Last revised: 2026-09-27
+//! Last changed: Add bounded environment-configured retry delays and digest pause limits.
+//!
 //! Compaction strategy trait and Size-Tiered implementation.
 //!
 //! The [`CompactionStrategy`] trait defines how to select SSTables for
@@ -41,6 +46,12 @@ pub struct CompactionConfig {
     pub bucket_high: f64,
     /// Directory for compaction output.
     pub output_dir: PathBuf,
+    /// Initial delay before retrying a digest or verification failure.
+    pub retry_backoff_initial: std::time::Duration,
+    /// Maximum delay between digest or verification retries.
+    pub retry_backoff_max: std::time::Duration,
+    /// Consecutive digest or verification failures that pause table compaction.
+    pub retry_digest_failure_limit: u32,
 }
 
 impl CompactionConfig {
@@ -66,6 +77,34 @@ impl CompactionConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1.5);
+        let retry_backoff_initial = duration_from_env(
+            "FERROSA_COMPACTION_RETRY_BACKOFF_INITIAL_MS",
+            1_000,
+            1,
+            60_000,
+        );
+        let retry_backoff_max = duration_from_env(
+            "FERROSA_COMPACTION_RETRY_BACKOFF_MAX_MS",
+            60_000,
+            1,
+            600_000,
+        );
+        let retry_backoff_max = if retry_backoff_max < retry_backoff_initial {
+            tracing::warn!(
+                initial_ms = retry_backoff_initial.as_millis(),
+                max_ms = retry_backoff_max.as_millis(),
+                "compaction retry max backoff is below initial backoff; normalizing max to initial"
+            );
+            retry_backoff_initial
+        } else {
+            retry_backoff_max
+        };
+        let retry_digest_failure_limit = positive_u32_from_env(
+            "FERROSA_COMPACTION_DIGEST_FAILURE_LIMIT",
+            3,
+            1,
+            100,
+        );
 
         Self {
             min_threshold,
@@ -74,8 +113,79 @@ impl CompactionConfig {
             bucket_low,
             bucket_high,
             output_dir,
+            retry_backoff_initial,
+            retry_backoff_max,
+            retry_digest_failure_limit,
         }
     }
+}
+
+fn duration_from_env(name: &str, default_ms: u64, min_ms: u64, max_ms: u64) -> std::time::Duration {
+    match std::env::var(name) {
+        Ok(value) => return duration_from_value(name, &value, default_ms, min_ms, max_ms),
+        Err(std::env::VarError::NotPresent) => return std::time::Duration::from_millis(default_ms),
+        Err(error) => {
+            tracing::error!(%error, variable = name, default_ms, "invalid compaction retry configuration; using default");
+            return std::time::Duration::from_millis(default_ms);
+        }
+    }
+}
+
+fn duration_from_value(
+    name: &str,
+    value: &str,
+    default_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
+) -> std::time::Duration {
+    let parsed = match value.parse::<u64>() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::error!(%error, variable = name, value, default_ms, "invalid compaction retry configuration; using default");
+            return std::time::Duration::from_millis(default_ms);
+        }
+    };
+    let normalized = parsed.clamp(min_ms, max_ms);
+    if normalized != parsed {
+        tracing::warn!(
+            variable = name,
+            configured_ms = parsed,
+            normalized_ms = normalized,
+            "compaction retry configuration was outside its supported range"
+        );
+    }
+    std::time::Duration::from_millis(normalized)
+}
+
+fn positive_u32_from_env(name: &str, default: u32, min: u32, max: u32) -> u32 {
+    match std::env::var(name) {
+        Ok(value) => return positive_u32_from_value(name, &value, default, min, max),
+        Err(std::env::VarError::NotPresent) => return default,
+        Err(error) => {
+            tracing::error!(%error, variable = name, default, "invalid compaction retry configuration; using default");
+            return default;
+        }
+    }
+}
+
+fn positive_u32_from_value(name: &str, value: &str, default: u32, min: u32, max: u32) -> u32 {
+    let parsed = match value.parse::<u32>() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::error!(%error, variable = name, value, default, "invalid compaction retry configuration; using default");
+            return default;
+        }
+    };
+    let normalized = parsed.clamp(min, max);
+    if normalized != parsed {
+        tracing::warn!(
+            variable = name,
+            configured = parsed,
+            normalized,
+            "compaction retry configuration was outside its supported range"
+        );
+    }
+    normalized
 }
 
 /// Size-Tiered Compaction Strategy.
@@ -307,6 +417,9 @@ mod tests {
             bucket_low: 0.5,
             bucket_high: 1.5,
             output_dir: PathBuf::from("/tmp/compaction"),
+            retry_backoff_initial: std::time::Duration::from_secs(1),
+            retry_backoff_max: std::time::Duration::from_secs(60),
+            retry_digest_failure_limit: 3,
         }
     }
 
@@ -608,5 +721,33 @@ mod tests {
             let ids2: Vec<&str> = t2.inputs.iter().map(|i| i.id.as_str()).collect();
             assert_eq!(ids1, ids2);
         }
+    }
+
+    #[test]
+    fn compaction_backoff_config_invalid_values_use_defaults() {
+        assert_eq!(
+            duration_from_value("test", "broken", 1_000, 1, 60_000),
+            std::time::Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            positive_u32_from_value("test", "broken", 3, 1, 100),
+            3
+        );
+    }
+
+    #[test]
+    fn compaction_backoff_config_normalizes_out_of_range_values() {
+        assert_eq!(
+            duration_from_value("test", "0", 1_000, 10, 60_000),
+            std::time::Duration::from_millis(10)
+        );
+        assert_eq!(
+            positive_u32_from_value("test", "0", 3, 1, 100),
+            1
+        );
+        assert_eq!(
+            positive_u32_from_value("test", "200", 3, 1, 100),
+            100
+        );
     }
 }
