@@ -27,6 +27,9 @@ use uuid::Uuid;
 
 const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 2;
+// Keep multirow transfer writes sequential so the fault schedule tests their
+// atomic effects without making every actor contend on the same two rows.
+const TRANSFER_WRITERS: usize = 1;
 const WRITE_SKEW_WRITERS: usize = 2;
 const WORKLOAD_STATE_READ_RETRIES: usize = 120;
 const INITIAL_BALANCE: i64 = 10_000;
@@ -118,9 +121,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     }
 
     let event_clock = Arc::new(AtomicU64::new(1));
-    let history = Arc::new(Mutex::new(Vec::with_capacity(
-        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
-    )));
+    let history = Arc::new(Mutex::new(Vec::with_capacity(expected_history_length())));
     let predicate_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
     let write_skew_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
     let (actor_failure_tx, actor_failure_rx) = tokio::sync::watch::channel(false);
@@ -138,12 +139,14 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
             let result = async {
                 for iteration in 0..TRANSACTIONS_PER_ACTOR {
                     let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
-                    let transfer =
-                        transfer_once(&client, &table, operation_id * 2, &event_clock).await?;
-                    history
-                        .lock()
-                        .expect("history mutex poisoned")
-                        .push(transfer);
+                    if is_transfer_writer(actor) {
+                        let transfer =
+                            transfer_once(&client, &table, operation_id, &event_clock).await?;
+                        history
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .push(transfer);
+                    }
                     let register =
                         register_once(&client, &table, operation_id * 2 + 1, &event_clock).await?;
                     history
@@ -218,7 +221,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     history.sort_by_key(|transaction| transaction.id);
     assert_eq!(
         history.len(),
-        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
+        expected_history_length(),
         "every invoked operation must have a recorded completion"
     );
     assert!(
@@ -811,6 +814,14 @@ fn is_write_skew_writer(actor: usize) -> bool {
     actor < WRITE_SKEW_WRITERS
 }
 
+fn is_transfer_writer(actor: usize) -> bool {
+    actor < TRANSFER_WRITERS
+}
+
+fn expected_history_length() -> usize {
+    ACTORS * (TRANSACTIONS_PER_ACTOR + 2) + TRANSFER_WRITERS * TRANSACTIONS_PER_ACTOR
+}
+
 fn convergence_node_count(total_nodes: usize, active_nodes: usize, fault_scheduled: bool) -> usize {
     if fault_scheduled {
         active_nodes
@@ -888,9 +899,10 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
-        is_retryable_serialization_state, is_write_skew_writer, predicate_observations,
-        wait_for_phase, FaultSchedule, TransactionOperation, ACTORS,
+        actor_client_count, actor_client_urls, convergence_node_count, expected_history_length,
+        initial_workload_statements, is_retryable_serialization_state, is_transfer_writer,
+        is_write_skew_writer, predicate_observations, wait_for_phase, FaultSchedule,
+        TransactionOperation, ACTORS,
     };
 
     #[test]
@@ -931,6 +943,17 @@ mod tests {
 
         assert_eq!(writers, [0, 1]);
         assert!(!is_write_skew_writer(ACTORS));
+    }
+
+    #[test]
+    fn fault_workload_keeps_multirow_transfers_on_one_actor() {
+        let writers = (0..ACTORS)
+            .filter(|actor| is_transfer_writer(*actor))
+            .collect::<Vec<_>>();
+
+        assert_eq!(writers, [0]);
+        assert!(!is_transfer_writer(ACTORS));
+        assert_eq!(expected_history_length(), 22);
     }
 
     #[test]
