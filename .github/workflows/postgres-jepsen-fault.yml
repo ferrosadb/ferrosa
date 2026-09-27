@@ -27,6 +27,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
 
       - name: Build and start the from-source PostgreSQL cluster
         run: |
@@ -67,7 +69,7 @@ jobs:
           rm -f "$FERROSA_TEST_POSTGRES_FAULT_READY_FILE" \
             "$FERROSA_TEST_POSTGRES_FAULT_ACTIVE_FILE" \
             "$FERROSA_TEST_POSTGRES_FAULT_COMPLETE_FILE"
-          cargo test -p ferrosa-jepsen --features postgres-jepsen \
+          cargo test -p ferrosa-jepsen --all-features \
             --test postgres_strict_serializable -- --nocapture \
             > /tmp/postgres-jepsen.log 2>&1 &
           test_pid=$!
