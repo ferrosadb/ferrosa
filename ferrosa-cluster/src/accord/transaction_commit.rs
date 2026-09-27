@@ -53,6 +53,9 @@ pub struct AccordTransactionCommitter {
     /// its own peer map, so that self-send fails "unknown peer"). `None` falls
     /// back to remote votes only (used by tests with an external coordinator).
     local_accord_state: Option<crate::accord::handlers::AccordState>,
+    /// Production creates the committer before cluster formation publishes the
+    /// local state, so retain the slot and load it when each transaction runs.
+    local_accord_state_slot: Option<crate::accord::handlers::AccordStateSlot>,
 }
 
 impl AccordTransactionCommitter {
@@ -70,6 +73,7 @@ impl AccordTransactionCommitter {
             applier,
             resolve,
             local_accord_state: None,
+            local_accord_state_slot: None,
         }
     }
 
@@ -84,19 +88,17 @@ impl AccordTransactionCommitter {
     }
 
     /// Wire the coordinator node's own Accord state from a shared
-    /// [`AccordStateSlot`](crate::accord::handlers::AccordStateSlot) if it is
-    /// populated. The controller fills the slot with this node's live
-    /// `AccordState` during cluster formation; the session layer, which builds
-    /// the committer, holds only the slot (it is constructed before formation).
-    /// An empty slot leaves the committer on remote-only votes — correct when
-    /// the node is not itself a replica, and the pre-fix behavior otherwise.
+    /// [`AccordStateSlot`](crate::accord::handlers::AccordStateSlot). The
+    /// controller fills the slot with this node's live `AccordState` during
+    /// cluster formation; because the session layer constructs the committer
+    /// before formation, the slot is loaded when each transaction runs. An
+    /// empty slot leaves the committer on remote-only votes — correct when the
+    /// node is not itself a replica.
     pub fn with_local_accord_state_slot(
         mut self,
         slot: &crate::accord::handlers::AccordStateSlot,
     ) -> Self {
-        if let Some(state) = slot.load_full() {
-            self.local_accord_state = Some(state);
-        }
+        self.local_accord_state_slot = Some(slot.clone());
         self
     }
 }
@@ -277,8 +279,14 @@ async fn drive_accord(
     // When the coordinator is itself a replica, let it vote on its own
     // PreAccept locally rather than dial itself (unreachable in its own peer
     // map). Without this a sole-replica transaction never reaches quorum.
-    if let Some(state) = &committer.local_accord_state {
-        driver = driver.with_local_accord_state(state.clone());
+    let local_accord_state = committer.local_accord_state.clone().or_else(|| {
+        committer
+            .local_accord_state_slot
+            .as_ref()
+            .and_then(|slot| slot.load_full())
+    });
+    if let Some(state) = local_accord_state {
+        driver = driver.with_local_accord_state(state);
     }
 
     match driver.run_transaction().await {
@@ -688,7 +696,6 @@ mod tests {
                 Arc::new(MockSyncWriter::new()),
                 applier.clone(),
             )));
-        slot.store(Some(state));
         let resolve: ReplicaResolver = Arc::new(move |_ks: &str, _key: &[u8]| Some(vec![host]));
         let committer = AccordTransactionCommitter::new(
             node_id,
@@ -698,6 +705,9 @@ mod tests {
             resolve,
         )
         .with_local_accord_state_slot(&slot);
+        // Cluster formation publishes this state after the session has already
+        // constructed its long-lived committer.
+        slot.store(Some(state));
 
         let outcome = committer
             .commit(vec![write("ks", b"k", b"v")])
