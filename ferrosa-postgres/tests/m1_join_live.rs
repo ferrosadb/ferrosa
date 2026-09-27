@@ -1219,37 +1219,64 @@ async fn cross_node_serializable_transaction_keeps_its_snapshot_after_peer_commi
         .expect("begin reader transaction on node B");
 
     let initial = client_b
-        .query_one("SELECT name FROM users WHERE id = 1", &[])
+        .query("SELECT id, name FROM users ORDER BY id", &[])
         .await
         .expect("read initial snapshot on node B");
-    assert_eq!(initial.get::<_, &str>(0), "alice");
+    assert_eq!(initial.len(), 2);
+    assert_eq!(initial[0].get::<_, &str>(1), "alice");
+    assert_eq!(initial[1].get::<_, &str>(1), "bob");
 
     client_a
         .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
         .await
-        .expect("begin writer transaction on node A");
+        .expect("begin multi-row writer transaction on node A");
     client_a
         .execute(
             "UPDATE users SET name = $1 WHERE id = $2",
             &[&"alice-updated", &1i32],
         )
         .await
-        .expect("buffer update on node A");
+        .expect("buffer first row update on node A");
+    client_a
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"bob-updated", &2i32],
+        )
+        .await
+        .expect("buffer second row update on node A");
     client_a
         .batch_execute("COMMIT")
         .await
-        .expect("commit update on node A");
+        .expect("commit both row updates on node A");
 
     let retained_snapshot = client_b
-        .query_one("SELECT name FROM users WHERE id = 1", &[])
+        .query("SELECT id, name FROM users ORDER BY id", &[])
         .await
-        .expect("repeat read must use the transaction's retained snapshot");
-    assert_eq!(retained_snapshot.get::<_, &str>(0), "alice");
+        .expect("repeat scan must use the transaction's retained snapshot");
+    assert_eq!(retained_snapshot.len(), 2);
+    assert_eq!(retained_snapshot[0].get::<_, &str>(1), "alice");
+    assert_eq!(retained_snapshot[1].get::<_, &str>(1), "bob");
 
     client_b
         .batch_execute("ROLLBACK")
         .await
         .expect("discard the read-only transaction after observing its stable snapshot");
+
+    client_a
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a fresh reader after the writer committed");
+    let committed_snapshot = client_a
+        .query("SELECT id, name FROM users ORDER BY id", &[])
+        .await
+        .expect("read the complete committed write-set");
+    assert_eq!(committed_snapshot.len(), 2);
+    assert_eq!(committed_snapshot[0].get::<_, &str>(1), "alice-updated");
+    assert_eq!(committed_snapshot[1].get::<_, &str>(1), "bob-updated");
+    client_a
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit fresh read-only transaction");
 }
 
 #[tokio::test]

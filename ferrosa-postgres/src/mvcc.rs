@@ -299,6 +299,13 @@ impl MvccManager {
         expired
     }
 
+    #[cfg(test)]
+    pub(crate) fn expire_all_snapshots_for_test(&self) -> usize {
+        self.expire_snapshots_before(
+            Instant::now() + self.config.max_snapshot_age + Duration::from_millis(1),
+        )
+    }
+
     /// Serialize PostgreSQL commit orchestration on this node while a
     /// distributed commit is in flight. Accord supplies the cross-node order.
     pub(crate) async fn commit_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
@@ -785,6 +792,66 @@ mod tests {
         assert_eq!(
             manager.validate_commit(&old_snapshot, &HashSet::new()),
             Err(MvccCommitError::SnapshotExpired)
+        );
+    }
+
+    #[test]
+    fn staged_multi_row_accord_commit_is_visible_as_one_snapshot_version() {
+        let manager = MvccManager::default();
+        let before = vec![
+            RowChange {
+                table: "public.items".to_string(),
+                key: vec![Value::Int(1)],
+                partition_key: vec![1],
+                before: Some(row("left-before")),
+                after: Some(row("left-after")),
+            },
+            RowChange {
+                table: "public.items".to_string(),
+                key: vec![Value::Int(2)],
+                partition_key: vec![2],
+                before: Some(row("right-before")),
+                after: Some(row("right-after")),
+            },
+        ];
+        let metadata = serde_json::to_vec(&before).unwrap();
+        let commit_ts = Timestamp::synthetic(20);
+        <MvccManager as ferrosa_storage::accord::PostgresMvccApplyObserver>::prepare_postgres_apply(
+            &manager,
+            TxnId::new(1, Timestamp::synthetic(21)),
+            commit_ts,
+            &[metadata],
+        )
+        .unwrap();
+
+        let old_snapshot = manager.snapshot_at(Some(Timestamp::synthetic(19)));
+        let committed_snapshot = manager.snapshot_at(Some(commit_ts));
+        let old_rows = manager.table_overlay(&old_snapshot, "public.items");
+        let committed_rows = manager.table_overlay(&committed_snapshot, "public.items");
+
+        assert_eq!(
+            old_rows
+                .get(&vec![Value::Int(1)])
+                .and_then(Option::as_ref),
+            Some(&row("left-before"))
+        );
+        assert_eq!(
+            old_rows
+                .get(&vec![Value::Int(2)])
+                .and_then(Option::as_ref),
+            Some(&row("right-before"))
+        );
+        assert_eq!(
+            committed_rows
+                .get(&vec![Value::Int(1)])
+                .and_then(Option::as_ref),
+            Some(&row("left-after"))
+        );
+        assert_eq!(
+            committed_rows
+                .get(&vec![Value::Int(2)])
+                .and_then(Option::as_ref),
+            Some(&row("right-after"))
         );
     }
 }
