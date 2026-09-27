@@ -41,6 +41,11 @@ resolution beyond the serialization header, or cluster routing.
   memory callers. T-081 streams completed partition/row trie nodes and CRC
   words directly to component pumps, reuses the row trie across partitions,
   and emits Bloom words from its existing bitset without a serialized copy.
+- **Deferred component sync** — `finish_to_directory` returns individually
+  durable files. The internal deferred-sync finish path is only for file-backed
+  outputs immediately handed to a `FlushTarget::flush_deferred_files` target;
+  that transaction owns staged-file sync and publication durability. Do not
+  publish or retain deferred outputs as independently durable SSTables.
 - **Source checksums (T-011)** — `Digest.crc32` (a single CRC32 over the final
   on-disk Data.db bytes) is written for every table; `CRC.db` (a per-chunk
   CRC32 table, Cassandra-compatible layout) is written for uncompressed

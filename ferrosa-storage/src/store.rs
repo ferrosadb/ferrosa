@@ -2949,14 +2949,14 @@ impl<F: FlushTarget> TableStore<F> {
             writer.add_partition(p)?;
         }
         let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
-            let output = writer.finish_to_directory(staging_dir)?;
+            let output = writer.finish_to_directory_deferred_sync(staging_dir)?;
             let output_bytes = output.total_size_bytes();
             crate::metrics::observe_flush_phase(
                 crate::metrics::FlushPhase::EncodeSstable,
                 phase_start.elapsed(),
             );
             let phase_start = Instant::now();
-            let reader = self.flush_target.flush_files(output)?;
+            let reader = self.flush_target.flush_deferred_files(output)?;
             crate::metrics::observe_flush_phase(
                 crate::metrics::FlushPhase::LocalWriteSstable,
                 phase_start.elapsed(),
@@ -3408,7 +3408,9 @@ impl<F: FlushTarget> TableStore<F> {
                         writer.add_partition(partition)?;
                     }
                     match &stage.0 {
-                        Some(dir) => writer.finish_to_directory(dir).map(ShardOutput::Files),
+                        Some(dir) => writer
+                            .finish_to_directory_deferred_sync(dir)
+                            .map(ShardOutput::Files),
                         None => writer.finish().map(ShardOutput::Memory),
                     }
                 })
@@ -3430,7 +3432,7 @@ impl<F: FlushTarget> TableStore<F> {
             let reader = match output {
                 ShardOutput::Files(output) => {
                     total_output_bytes += output.total_size_bytes();
-                    self.flush_target.flush_files(output)?
+                    self.flush_target.flush_deferred_files(output)?
                 }
                 ShardOutput::Memory(output) => {
                     total_output_bytes += (output.data.len()

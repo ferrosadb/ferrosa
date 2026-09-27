@@ -1538,9 +1538,20 @@ impl AlignedPump {
     /// partial block, sync durably, trim any padding, and return the exact
     /// logical length. Consumes the pump.
     pub fn finish(self) -> Result<u64> {
+        self.finish_with_sync(true)
+    }
+
+    /// Finish writing and leave durability to an owning transaction that will
+    /// sync the staged file before it can be published. Writes, async drain,
+    /// alignment, and tail truncation are identical to [`Self::finish`].
+    pub(crate) fn finish_deferred_sync(self) -> Result<u64> {
+        self.finish_with_sync(false)
+    }
+
+    fn finish_with_sync(self, sync: bool) -> Result<u64> {
         match &self.backend {
-            PumpBackend::Sync { .. } => self.finish_sync(),
-            PumpBackend::Async(_) => self.finish_async(),
+            PumpBackend::Sync { .. } => self.finish_sync(sync),
+            PumpBackend::Async(_) => self.finish_async(sync),
         }
     }
 
@@ -1581,7 +1592,17 @@ impl AlignedPump {
     /// for an async (`depth >= 1`) pump: the flusher thread owns the sink and
     /// `current` there, and a direct patch from the producer while segments
     /// may still be in flight would race.
-    pub fn finish_with_patched_header(mut self, header: &[u8]) -> Result<u64> {
+    pub fn finish_with_patched_header(self, header: &[u8]) -> Result<u64> {
+        self.finish_with_patched_header_sync(header, true)
+    }
+
+    /// Like [`Self::finish_with_patched_header`], but defer durability to the
+    /// caller that owns the staged file's publication transaction.
+    pub(crate) fn finish_with_patched_header_deferred_sync(self, header: &[u8]) -> Result<u64> {
+        self.finish_with_patched_header_sync(header, false)
+    }
+
+    fn finish_with_patched_header_sync(mut self, header: &[u8], sync: bool) -> Result<u64> {
         if !matches!(self.backend, PumpBackend::Sync { .. }) {
             return Err(Error::Io(io::Error::other(
                 "write pump: finish_with_patched_header only supports a depth-0 \
@@ -1609,10 +1630,10 @@ impl AlignedPump {
             sink.pwrite(header, 0)
                 .map_err(|e| wrap_sink_error(&self.path, 0, e))?;
         }
-        self.finish_sync()
+        self.finish_sync(sync)
     }
 
-    fn finish_sync(mut self) -> Result<u64> {
+    fn finish_sync(mut self, sync: bool) -> Result<u64> {
         self.finished = true;
         let flush_len = full_block_prefix(self.filled, self.block);
         let PumpBackend::Sync { sink } = &mut self.backend else {
@@ -1643,15 +1664,19 @@ impl AlignedPump {
             self.wrote_anything = true;
             self.physical += block as u64;
         }
-        sink.sync_data()
-            .map_err(|e| wrap_sink_error(&self.path, self.physical, e))?;
+        if sync {
+            sink.sync_data()
+                .map_err(|e| wrap_sink_error(&self.path, self.physical, e))?;
+        }
         if tail > 0 {
             sink.set_len(logical)
                 .map_err(|e| wrap_sink_error(&self.path, logical, e))?;
-            sink.sync_data()
-                .map_err(|e| wrap_sink_error(&self.path, logical, e))?;
+            if sync {
+                sink.sync_data()
+                    .map_err(|e| wrap_sink_error(&self.path, logical, e))?;
+            }
         }
-        if self.mode == DirectMode::Buffered {
+        if sync && self.mode == DirectMode::Buffered {
             // Degraded path used the page cache — drop the pages we just
             // wrote so they cannot drive the writeback storm this pump
             // exists to avoid.
@@ -1662,7 +1687,7 @@ impl AlignedPump {
         Ok(logical)
     }
 
-    fn finish_async(mut self) -> Result<u64> {
+    fn finish_async(mut self, sync: bool) -> Result<u64> {
         self.finished = true;
         let mut logical = self.physical;
         let mut tail_padded = false;
@@ -1717,15 +1742,19 @@ impl AlignedPump {
                 Error::Io(io::Error::other(err.message)),
             )),
             ShutdownResult::Clean(mut sink) => {
-                sink.sync_data()
-                    .map_err(|e| wrap_sink_error(&path, self.physical, e))?;
+                if sync {
+                    sink.sync_data()
+                        .map_err(|e| wrap_sink_error(&path, self.physical, e))?;
+                }
                 if tail_padded {
                     sink.set_len(logical)
                         .map_err(|e| wrap_sink_error(&path, logical, e))?;
-                    sink.sync_data()
-                        .map_err(|e| wrap_sink_error(&path, logical, e))?;
+                    if sync {
+                        sink.sync_data()
+                            .map_err(|e| wrap_sink_error(&path, logical, e))?;
+                    }
                 }
-                if mode == DirectMode::Buffered {
+                if sync && mode == DirectMode::Buffered {
                     sink.fadvise_dontneed()
                         .map_err(|e| wrap_sink_error(&path, logical, e))?;
                 }
@@ -2538,6 +2567,46 @@ mod pump_sync_tests {
         );
     }
 
+    #[test]
+    fn pump_deferred_sync_drains_and_truncates_before_returning() {
+        let block = 4096usize;
+        let segment = 2 * block;
+        let (sink, handle) = RecordingSink::new(DirectMode::Direct);
+        let mut pump = AlignedPump::open(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("deferred-tail.db"),
+        );
+        let data = write_pattern(&mut pump, segment + 10);
+        let logical = pump.finish_deferred_sync().expect("deferred finish");
+
+        assert_eq!(logical, data.len() as u64);
+        assert_eq!(handle.bytes(), data, "deferred finish must drain all bytes");
+        assert_eq!(handle.set_len_calls(), vec![logical]);
+        assert_eq!(
+            handle.sync_data_calls(),
+            0,
+            "the publication owner performs the durability barrier"
+        );
+
+        let (sink, handle) = FaultySink::new(DirectMode::Direct);
+        let sink = sink.at(0, Fault::Eio);
+        let mut pump = AlignedPump::open(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("deferred-write-failure.db"),
+        );
+        pump.write_all(&data[..10]).expect("stage tail");
+        assert!(pump.finish_deferred_sync().is_err());
+        assert_eq!(
+            handle.sync_data_calls(),
+            0,
+            "failed staged writes must not reach a durability barrier"
+        );
+    }
+
     /// Byte identity against the real production path: `AlignedPump` driving
     /// a real `FileSink` (via `DirectWriter`) round-trips every byte for
     /// lengths around block/segment boundaries.
@@ -2795,6 +2864,25 @@ mod pump_async_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pump_async_deferred_sync_drains_before_returning_without_syncing() {
+        let block = 4096usize;
+        let segment = 2 * block;
+        let (mut pump, handle) = open_recording_async(block, segment, 2);
+        let data = write_pattern(&mut pump, 3 * segment + 10, 577);
+
+        let logical = pump.finish_deferred_sync().expect("deferred async finish");
+
+        assert_eq!(logical, data.len() as u64);
+        assert_eq!(
+            handle.bytes(),
+            data,
+            "finish must join and drain the flusher"
+        );
+        assert_eq!(handle.set_len_calls(), vec![logical]);
+        assert_eq!(handle.sync_data_calls(), 0);
     }
 
     /// L4/T-034: the full 11-`Fault` `FaultySink` matrix, at depths 1..=4 —

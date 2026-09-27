@@ -1667,7 +1667,7 @@ impl CompactionExecutor {
         }
         let finish_start = Instant::now();
         let output = writer
-            .finish_to_directory(&staging_dir)
+            .finish_to_directory_deferred_sync(&staging_dir)
             .map_err(|e| format!("finish: {e}"))?;
         crate::metrics::observe_compaction_phase(
             crate::metrics::CompactionPhase::WriterFinish,
@@ -1695,7 +1695,7 @@ impl CompactionExecutor {
         }
         let local_write_start = Instant::now();
         let reader = flush_target
-            .flush_files(output)
+            .flush_deferred_files(output)
             .map_err(|e| format!("flush output: {e}"))?;
         crate::metrics::observe_compaction_phase(
             crate::metrics::CompactionPhase::LocalWriteSstable,

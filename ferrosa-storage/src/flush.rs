@@ -351,6 +351,22 @@ pub trait FlushTarget {
         self.flush(output.read_to_memory()?)
     }
 
+    /// Publish files produced by `finish_to_directory_deferred_sync`.
+    /// Implementations that stage files must sync them before promotion and
+    /// may apply their buffered page-cache policy after verification. The
+    /// default fails loudly so a deferred file output is never materialized
+    /// through [`FlushTarget::flush_files`].
+    fn flush_deferred_files(
+        &self,
+        _output: SSTableOutputFiles,
+    ) -> Result<SSTableReader<Self::Reader>> {
+        Err(ferrosa_common::Error::InvalidFormat(
+            "FlushTarget::flush_deferred_files is not implemented; deferred writer output must be \
+             explicitly handed to a target that owns its durability barrier"
+                .into(),
+        ))
+    }
+
     /// Returns the generation number of the most recently flushed SSTable.
     ///
     /// Used by `TableStore` to determine which generation number to use
@@ -755,6 +771,8 @@ pub(crate) mod fsync_probe {
     pub(crate) enum Event {
         Rename(PathBuf),
         FileFsync(PathBuf),
+        ReadbackVerified(PathBuf),
+        Fadvise(PathBuf),
         DirFsync(PathBuf),
         Unlink(PathBuf),
     }
@@ -831,6 +849,20 @@ pub(crate) mod fsync_probe {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Event::Rename(path.to_path_buf()));
+    }
+
+    pub(crate) fn note_readback_verified(path: &Path) {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Event::ReadbackVerified(path.to_path_buf()));
+    }
+
+    pub(crate) fn note_fadvise(path: &Path) {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Event::Fadvise(path.to_path_buf()));
     }
 
     /// Record an attempted unlink (e.g. of a retired compaction input
@@ -1430,7 +1462,7 @@ impl FileFlushTarget {
             }
             hasher.update(&buf[..n]);
         }
-        Self::fadvise_dontneed_after_digest_verify(&file, &data_path);
+        Self::fadvise_dontneed_after_verification(&file, &data_path);
 
         let actual = hasher.finalize();
         if actual != expected {
@@ -1444,13 +1476,12 @@ impl FileFlushTarget {
     }
 
     /// Advise the kernel to drop this file's pages from the page cache
-    /// (Linux only). Called right after the digest-verification read above
-    /// so that read does not leave the just-checked bytes resident in cache
-    /// -- see [`Self::verify_staged_data_digest`]. A no-op on other
-    /// platforms: there is no portable equivalent, and this is a cache hint,
-    /// not a correctness requirement.
+    /// (Linux only). Called after verification reads so they do not leave the
+    /// just-checked bytes resident in cache. A no-op on other platforms: there
+    /// is no portable equivalent, and this is a cache hint, not a correctness
+    /// requirement.
     #[cfg(target_os = "linux")]
-    fn fadvise_dontneed_after_digest_verify(file: &std::fs::File, path: &Path) {
+    fn fadvise_dontneed_after_verification(file: &std::fs::File, path: &Path) {
         use std::os::fd::AsRawFd;
         // SAFETY: `file` is a valid, open fd for the duration of this call;
         // offset/len 0 means "the whole file", and `posix_fadvise` is
@@ -1460,14 +1491,14 @@ impl FileFlushTarget {
             tracing::warn!(
                 path = %path.display(),
                 errno = rc,
-                "posix_fadvise(DONTNEED) failed after digest verification read; the \
+                "posix_fadvise(DONTNEED) failed after staged verification; the \
                  verification bytes may remain in the page cache"
             );
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn fadvise_dontneed_after_digest_verify(_file: &std::fs::File, _path: &Path) {}
+    fn fadvise_dontneed_after_verification(_file: &std::fs::File, _path: &Path) {}
 
     /// Build the `.tmp`-named counterpart of every path in `paths`, for
     /// opening a throwaway reader over staged (not-yet-promoted) bytes.
@@ -1483,6 +1514,46 @@ impl FileFlushTarget {
             compression_info: tmp(&paths.compression_info),
             digest: tmp(&paths.digest),
             crc: tmp(&paths.crc),
+        }
+    }
+
+    /// For deferred writer output, discard component pages only after the
+    /// publication transaction has synced and verified every staged file.
+    /// This preserves the buffered pump's cache policy without asking DONTNEED
+    /// to discard dirty, not-yet-durable pages.
+    fn fadvise_deferred_components(
+        paths: &FileComponentPaths,
+        has_compression_info: bool,
+        has_crc: bool,
+    ) {
+        let advise = |path: &Path| {
+            #[cfg(test)]
+            fsync_probe::note_fadvise(path);
+            match std::fs::File::open(path) {
+                Ok(file) => Self::fadvise_dontneed_after_verification(&file, path),
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to open verified staged component for page-cache advice"
+                ),
+            }
+        };
+        for path in [
+            &paths.data,
+            &paths.partitions,
+            &paths.rows,
+            &paths.filter,
+            &paths.statistics,
+            &paths.toc,
+            &paths.digest,
+        ] {
+            advise(path);
+        }
+        if has_compression_info {
+            advise(&paths.compression_info);
+        }
+        if has_crc {
+            advise(&paths.crc);
         }
     }
 
@@ -1736,6 +1807,164 @@ fn write_legacy_component(path: impl AsRef<Path>, bytes: &[u8]) -> std::io::Resu
     std::fs::write(path, bytes)
 }
 
+impl FileFlushTarget {
+    fn flush_files_inner(
+        &self,
+        output: SSTableOutputFiles,
+        drop_cache_after_verify: bool,
+    ) -> Result<SSTableReader<FileReadAt>> {
+        let gen = self.next_generation();
+        let paths = self.component_paths(gen);
+        let has_compression_info = output.compression_info.is_some();
+        tracing::info!(
+            gen,
+            data_size = output.data_len,
+            partitions_size = output.partitions_len,
+            dir = %self.base_dir.display(),
+            "flush: staging SSTable for verify-before-promote"
+        );
+
+        let tmp = Self::tmp_component_path;
+
+        std::fs::rename(&output.data, tmp(&paths.data))?;
+        std::fs::rename(&output.partitions, tmp(&paths.partitions))?;
+        std::fs::rename(&output.rows, tmp(&paths.rows))?;
+        std::fs::rename(&output.filter, tmp(&paths.filter))?;
+        std::fs::rename(&output.statistics, tmp(&paths.statistics))?;
+        std::fs::rename(&output.toc, tmp(&paths.toc))?;
+        std::fs::rename(&output.digest, tmp(&paths.digest))?;
+        if let Some(compression_info) = output.compression_info.as_ref() {
+            std::fs::rename(compression_info, tmp(&paths.compression_info))?;
+        }
+        if let Some(crc) = output.crc.as_ref() {
+            std::fs::rename(crc, tmp(&paths.crc))?;
+        }
+
+        // The staging dir is empty now regardless of what happens below, so
+        // clean it up eagerly rather than leaving a failure path to forget it.
+        let staging_parent = output.staging_dir.parent().map(Path::to_path_buf);
+        if let Err(e) = std::fs::remove_dir(&output.staging_dir) {
+            tracing::debug!(
+                gen, %e, dir = %output.staging_dir.display(),
+                "flush: could not remove empty staging dir"
+            );
+        }
+        if let Some(parent) = staging_parent {
+            if let Err(e) = std::fs::remove_dir(&parent) {
+                tracing::debug!(
+                    gen, %e, dir = %parent.display(),
+                    "flush: staging parent not empty or already removed"
+                );
+            }
+        }
+
+        // Verify-before-promote (`publication-safety.md` M2): every check
+        // below runs against the `.tmp` names, BEFORE `promote_tmp_components`
+        // makes anything live. A refusal at any point quarantines the `.tmp`
+        // set instead of returning with output under a name the startup scan
+        // will load. This closes G1: the previous order promoted to live
+        // names first and verified after, so a readback failure left a
+        // corrupt SSTable at a live name next to the WAL replay of the same
+        // rows.
+        if let Err(detail) = Self::check_staged_component_lengths(gen, &paths, &output) {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::LengthMismatch,
+                &detail,
+            ));
+        }
+
+        // Durability barrier on the STAGED bytes: fsync every `.tmp` component
+        // before the readback walk trusts what it reads, and before promote
+        // can rename them into place. `fsync_dir` after promote below then
+        // only needs to make the rename entries durable -- the component
+        // bytes underneath are already synced.
+        if let Err(e) =
+            self.fsync_tmp_components(&paths, has_compression_info, output.crc.is_some())
+        {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::Fsync,
+                &format!(
+                    "FLUSH CORRUPTION: staged components gen={gen} could not be fsynced: {e}."
+                ),
+            ));
+        }
+
+        // Recompute Digest.crc32 from the now-durable staged bytes and compare
+        // it with the producer's value (`publication-safety.md` M2 step 4 / M3,
+        // T-012). Unconditional -- flush and compaction (which calls this same
+        // function) both get it, and there is no environment variable that can
+        // disable it, unlike the row/partition count walk compaction runs
+        // separately. This runs BEFORE the structural readback walk below: a
+        // length-preserving content corruption changes the CRC32, so this is
+        // the check that actually catches it, not the decode walk.
+        if let Err(detail) = Self::verify_staged_data_digest(gen, &paths) {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::DigestMismatch,
+                &format!("FLUSH CORRUPTION: {detail}"),
+            ));
+        }
+
+        // Read back the STAGED file, not a promised promotion of it.
+        //
+        // On 2026-08-20 node2's compaction of agent_memory.session_task_focus_stack
+        // verified its output in the compaction staging directory -- "output
+        // verified (streaming readback matches merge) partitions=13 rows=17" --
+        // and nine seconds later the swap published it into the table directory
+        // under a different generation. That published file was corrupt:
+        //
+        //     read_exact_at: wanted 17063 bytes, got 818
+        //
+        // Nothing checked the published file itself. Verifying staged bytes
+        // and then promoting something else was not verification -- this now
+        // walks the exact `.tmp` bytes that promote will rename into place, on
+        // a THROWAWAY reader (the engine keeps the reader this function
+        // returns; verifying through it would leave cached state that a later
+        // corruption could hide behind).
+        let tmp_paths = Self::tmp_component_paths(&paths);
+        let readback =
+            Self::open_reader_from_paths(&tmp_paths, has_compression_info).and_then(|probe| {
+                let result = verify_promoted_sstable(&probe);
+                drop(probe);
+                result
+            });
+        if let Err(e) = readback {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::ReadbackFailed,
+                &format!("FLUSH CORRUPTION: staged SSTable gen={gen} could not be read back: {e}."),
+            ));
+        }
+
+        #[cfg(test)]
+        fsync_probe::note_readback_verified(&tmp_paths.data);
+        if drop_cache_after_verify {
+            Self::fadvise_deferred_components(
+                &tmp_paths,
+                has_compression_info,
+                output.crc.is_some(),
+            );
+        }
+
+        Self::promote_tmp_components(&paths, has_compression_info)?;
+
+        // The component bytes are already fsynced (above); only the rename
+        // entries need to become durable now.
+        Self::fsync_dir(&self.base_dir)?;
+
+        tracing::info!(
+            gen,
+            data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
+            path = %paths.data.display(),
+            "flush: staged SSTable verified, promoted, and fsynced"
+        );
+
+        Self::open_reader_from_paths(&paths, has_compression_info)
+    }
+}
+
 impl FlushTarget for FileFlushTarget {
     type Reader = FileReadAt;
 
@@ -1965,145 +2194,14 @@ impl FlushTarget for FileFlushTarget {
     }
 
     fn flush_files(&self, output: SSTableOutputFiles) -> Result<SSTableReader<FileReadAt>> {
-        let gen = self.next_generation();
-        let paths = self.component_paths(gen);
-        let has_compression_info = output.compression_info.is_some();
-        tracing::info!(
-            gen,
-            data_size = output.data_len,
-            partitions_size = output.partitions_len,
-            dir = %self.base_dir.display(),
-            "flush: staging SSTable for verify-before-promote"
-        );
+        self.flush_files_inner(output, false)
+    }
 
-        let tmp = Self::tmp_component_path;
-
-        std::fs::rename(&output.data, tmp(&paths.data))?;
-        std::fs::rename(&output.partitions, tmp(&paths.partitions))?;
-        std::fs::rename(&output.rows, tmp(&paths.rows))?;
-        std::fs::rename(&output.filter, tmp(&paths.filter))?;
-        std::fs::rename(&output.statistics, tmp(&paths.statistics))?;
-        std::fs::rename(&output.toc, tmp(&paths.toc))?;
-        std::fs::rename(&output.digest, tmp(&paths.digest))?;
-        if let Some(compression_info) = output.compression_info.as_ref() {
-            std::fs::rename(compression_info, tmp(&paths.compression_info))?;
-        }
-        if let Some(crc) = output.crc.as_ref() {
-            std::fs::rename(crc, tmp(&paths.crc))?;
-        }
-
-        // The staging dir is empty now regardless of what happens below, so
-        // clean it up eagerly rather than leaving a failure path to forget it.
-        let staging_parent = output.staging_dir.parent().map(Path::to_path_buf);
-        if let Err(e) = std::fs::remove_dir(&output.staging_dir) {
-            tracing::debug!(
-                gen, %e, dir = %output.staging_dir.display(),
-                "flush: could not remove empty staging dir"
-            );
-        }
-        if let Some(parent) = staging_parent {
-            if let Err(e) = std::fs::remove_dir(&parent) {
-                tracing::debug!(
-                    gen, %e, dir = %parent.display(),
-                    "flush: staging parent not empty or already removed"
-                );
-            }
-        }
-
-        // Verify-before-promote (`publication-safety.md` M2): every check
-        // below runs against the `.tmp` names, BEFORE `promote_tmp_components`
-        // makes anything live. A refusal at any point quarantines the `.tmp`
-        // set instead of returning with output under a name the startup scan
-        // will load. This closes G1: the previous order promoted to live
-        // names first and verified after, so a readback failure left a
-        // corrupt SSTable at a live name next to the WAL replay of the same
-        // rows.
-        if let Err(detail) = Self::check_staged_component_lengths(gen, &paths, &output) {
-            return Err(self.quarantine_staged_components(
-                gen,
-                crate::metrics::PublicationRefusedReason::LengthMismatch,
-                &detail,
-            ));
-        }
-
-        // Durability barrier on the STAGED bytes: fsync every `.tmp` component
-        // before the readback walk trusts what it reads, and before promote
-        // can rename them into place. `fsync_dir` after promote below then
-        // only needs to make the rename entries durable -- the component
-        // bytes underneath are already synced.
-        if let Err(e) =
-            self.fsync_tmp_components(&paths, has_compression_info, output.crc.is_some())
-        {
-            return Err(self.quarantine_staged_components(
-                gen,
-                crate::metrics::PublicationRefusedReason::Fsync,
-                &format!(
-                    "FLUSH CORRUPTION: staged components gen={gen} could not be fsynced: {e}."
-                ),
-            ));
-        }
-
-        // Recompute Digest.crc32 from the now-durable staged bytes and compare
-        // it with the producer's value (`publication-safety.md` M2 step 4 / M3,
-        // T-012). Unconditional -- flush and compaction (which calls this same
-        // function) both get it, and there is no environment variable that can
-        // disable it, unlike the row/partition count walk compaction runs
-        // separately. This runs BEFORE the structural readback walk below: a
-        // length-preserving content corruption changes the CRC32, so this is
-        // the check that actually catches it, not the decode walk.
-        if let Err(detail) = Self::verify_staged_data_digest(gen, &paths) {
-            return Err(self.quarantine_staged_components(
-                gen,
-                crate::metrics::PublicationRefusedReason::DigestMismatch,
-                &format!("FLUSH CORRUPTION: {detail}"),
-            ));
-        }
-
-        // Read back the STAGED file, not a promised promotion of it.
-        //
-        // On 2026-08-20 node2's compaction of agent_memory.session_task_focus_stack
-        // verified its output in the compaction staging directory -- "output
-        // verified (streaming readback matches merge) partitions=13 rows=17" --
-        // and nine seconds later the swap published it into the table directory
-        // under a different generation. That published file was corrupt:
-        //
-        //     read_exact_at: wanted 17063 bytes, got 818
-        //
-        // Nothing checked the published file itself. Verifying staged bytes
-        // and then promoting something else was not verification -- this now
-        // walks the exact `.tmp` bytes that promote will rename into place, on
-        // a THROWAWAY reader (the engine keeps the reader this function
-        // returns; verifying through it would leave cached state that a later
-        // corruption could hide behind).
-        let tmp_paths = Self::tmp_component_paths(&paths);
-        let readback =
-            Self::open_reader_from_paths(&tmp_paths, has_compression_info).and_then(|probe| {
-                let result = verify_promoted_sstable(&probe);
-                drop(probe);
-                result
-            });
-        if let Err(e) = readback {
-            return Err(self.quarantine_staged_components(
-                gen,
-                crate::metrics::PublicationRefusedReason::ReadbackFailed,
-                &format!("FLUSH CORRUPTION: staged SSTable gen={gen} could not be read back: {e}."),
-            ));
-        }
-
-        Self::promote_tmp_components(&paths, has_compression_info)?;
-
-        // The component bytes are already fsynced (above); only the rename
-        // entries need to become durable now.
-        Self::fsync_dir(&self.base_dir)?;
-
-        tracing::info!(
-            gen,
-            data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
-            path = %paths.data.display(),
-            "flush: staged SSTable verified, promoted, and fsynced"
-        );
-
-        Self::open_reader_from_paths(&paths, has_compression_info)
+    fn flush_deferred_files(
+        &self,
+        output: SSTableOutputFiles,
+    ) -> Result<SSTableReader<FileReadAt>> {
+        self.flush_files_inner(output, true)
     }
 
     fn last_generation(&self) -> u64 {
@@ -2742,7 +2840,9 @@ mod tests {
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
-        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let output = writer
+            .finish_to_directory_deferred_sync(&staging_dir)
+            .unwrap();
 
         // Damage the CONTENT while keeping the length exactly as recorded --
         // the shape a length comparison cannot see, and the shape that
@@ -2760,7 +2860,7 @@ mod tests {
         );
         std::fs::write(&output.data, &damaged).unwrap();
 
-        let msg = match target.flush_files(output) {
+        let msg = match target.flush_deferred_files(output) {
             Ok(_) => panic!(
                 "an SSTable whose contents cannot be read back must not be \
                  promoted into the live view"
@@ -3355,10 +3455,12 @@ mod tests {
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
-        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let output = writer
+            .finish_to_directory_deferred_sync(&staging_dir)
+            .unwrap();
         let has_ci = output.compression_info.is_some();
 
-        let _reader = target.flush_files(output).unwrap();
+        let _reader = target.flush_deferred_files(output).unwrap();
         let gen = target.generation();
 
         let synced = fsync_probe::synced_files();
@@ -3380,6 +3482,39 @@ mod tests {
                 "staged component {suffix} was not fsynced before verify; synced={synced:?}"
             );
         }
+
+        let events = fsync_probe::events();
+        let last_component_fsync = events
+            .iter()
+            .rposition(|event| matches!(event, fsync_probe::Event::FileFsync(_)))
+            .expect("component fsync events");
+        let readback_verified = events
+            .iter()
+            .position(|event| matches!(event, fsync_probe::Event::ReadbackVerified(_)))
+            .expect("readback completion event");
+        let first_fadvise = events
+            .iter()
+            .position(|event| matches!(event, fsync_probe::Event::Fadvise(_)))
+            .expect("deferred output cache advice");
+        let first_promotion = events
+            .iter()
+            .position(|event| matches!(event, fsync_probe::Event::Rename(_)))
+            .expect("promotion rename event");
+        let directory_fsync = events
+            .iter()
+            .position(|event| matches!(event, fsync_probe::Event::DirFsync(_)))
+            .expect("final directory fsync event");
+        assert!(last_component_fsync < readback_verified);
+        assert!(readback_verified < first_fadvise);
+        assert!(first_fadvise < first_promotion);
+        assert!(first_promotion < directory_fsync);
+        assert!(
+            events.iter().enumerate().all(|(index, event)| {
+                !matches!(event, fsync_probe::Event::Fadvise(_))
+                    || (readback_verified < index && index < first_promotion)
+            }),
+            "all deferred cache advice must follow verification and precede promotion: {events:?}"
+        );
         assert!(
             fsync_probe::synced_dirs().contains(&dir.path().to_path_buf()),
             "containing directory was not fsynced after promote"
@@ -3406,6 +3541,7 @@ mod tests {
     /// whatever the digest does not cover.
     #[test]
     fn publication_verify_refused_flush_is_quarantined_not_left_live() {
+        let _fsync_probe = fsync_probe::exclusive();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut partitions = vec![
@@ -3429,7 +3565,9 @@ mod tests {
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
-        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let output = writer
+            .finish_to_directory_deferred_sync(&staging_dir)
+            .unwrap();
 
         // Damage the CONTENT while keeping the length exactly as recorded --
         // the shape a length comparison cannot see.
@@ -3445,7 +3583,7 @@ mod tests {
             crate::metrics::PublicationRefusedReason::DigestMismatch,
         );
 
-        let msg = match target.flush_files(output) {
+        let msg = match target.flush_deferred_files(output) {
             Ok(_) => panic!("an SSTable whose contents cannot be read back must not be promoted"),
             Err(e) => e.to_string(),
         };
@@ -3469,6 +3607,14 @@ mod tests {
         assert!(
             quarantined_data.exists(),
             "the refused staged Data.db must be quarantined for salvage: {quarantined_data:?}"
+        );
+        let events = fsync_probe::events();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                fsync_probe::Event::ReadbackVerified(_) | fsync_probe::Event::Fadvise(_)
+            )),
+            "a digest-refused deferred output must not reach cache eviction: {events:?}"
         );
 
         assert!(

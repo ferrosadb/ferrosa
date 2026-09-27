@@ -253,14 +253,22 @@ impl ComponentWriter {
     fn finish(self) -> Result<u64> {
         self.pump.finish()
     }
+
+    fn finish_deferred_sync(self) -> Result<u64> {
+        self.pump.finish_deferred_sync()
+    }
 }
 
 /// Write borrowed component bytes without copying them into another component
 /// buffer. The pump owns a fixed aligned segment and returns logical length.
-fn pump_component(path: &Path, bytes: &[u8]) -> Result<u64> {
+fn pump_component_with_sync(path: &Path, bytes: &[u8], sync: bool) -> Result<u64> {
     let mut writer = ComponentWriter::create(path, sstable_direct_io_enabled())?;
     writer.write_all(bytes)?;
-    writer.finish()
+    if sync {
+        writer.finish()
+    } else {
+        writer.finish_deferred_sync()
+    }
 }
 
 /// Component destination shared by memory compatibility and production files.
@@ -292,9 +300,9 @@ impl ComponentSink {
         }
     }
 
-    fn finish_file(self, path: &Path) -> Result<u64> {
+    fn finish_file_with_sync(self, path: &Path, sync: bool) -> Result<u64> {
         match self {
-            Self::Memory(bytes) => pump_component(path, &bytes),
+            Self::Memory(bytes) => pump_component_with_sync(path, &bytes, sync),
             Self::File(file) => {
                 if file.path != path {
                     return Err(ferrosa_common::Error::InvalidData(format!(
@@ -303,7 +311,11 @@ impl ComponentSink {
                         path.display()
                     )));
                 }
-                file.writer.finish()
+                if sync {
+                    file.writer.finish()
+                } else {
+                    file.writer.finish_deferred_sync()
+                }
             }
         }
     }
@@ -544,14 +556,20 @@ impl StreamSink {
         }
     }
 
-    fn finish(mut self) -> Result<StreamFinish> {
+    fn finish(mut self, sync: bool) -> Result<StreamFinish> {
         let compression_info = match self.compressor.take() {
-            Some(compressor) => Some(compressor.finish(&mut self.pump, self.uncompressed_len)?),
+            Some(compressor) => {
+                Some(compressor.finish(&mut self.pump, self.uncompressed_len, sync)?)
+            }
             None => None,
         };
         // Captured before `finish()` consumes the pump.
         let digest = self.pump.digest();
-        let data_len = self.pump.finish()?;
+        let data_len = if sync {
+            self.pump.finish()?
+        } else {
+            self.pump.finish_deferred_sync()?
+        };
         let crc_db = self.chunk_crc.map(ChunkCrc::finish_sink).transpose()?;
         Ok(StreamFinish {
             data_path: self.data_path,
@@ -728,6 +746,7 @@ impl ChunkCompressor {
         mut self,
         data_pump: &mut AlignedPump,
         data_length: u64,
+        sync: bool,
     ) -> Result<CompressionInfoFinish> {
         if self.fill > 0 {
             self.lens.push(self.fill);
@@ -744,7 +763,12 @@ impl ChunkCompressor {
             self.chunk_count,
         );
         let path = self.info_path;
-        let len = self.info_pump.finish_with_patched_header(&header)?;
+        let len = if sync {
+            self.info_pump.finish_with_patched_header(&header)?
+        } else {
+            self.info_pump
+                .finish_with_patched_header_deferred_sync(&header)?
+        };
         Ok(CompressionInfoFinish { path, len })
     }
 }
@@ -1253,7 +1277,7 @@ impl SSTableWriter {
                 (data, compression_info, digest, crc)
             }
             DataSink::Stream(stream) => {
-                let artifacts = stream.finish()?;
+                let artifacts = stream.finish(true)?;
                 let data = std::fs::read(&artifacts.data_path)?;
                 if let Err(e) = std::fs::remove_file(&artifacts.data_path) {
                     tracing::warn!(
@@ -1328,7 +1352,36 @@ impl SSTableWriter {
     /// do not keep both the writer's uncompressed Data.db buffer and the
     /// finished compressed Data.db buffer in heap at the same time.
     pub fn finish_to_directory(self, staging_dir: impl AsRef<Path>) -> Result<SSTableOutputFiles> {
-        let staging_dir = staging_dir.as_ref().to_path_buf();
+        self.finish_to_directory_inner(staging_dir.as_ref(), true)
+    }
+
+    /// Finalize a file-backed SSTable while leaving component durability to
+    /// the transaction that owns staged publication.
+    ///
+    /// Every returned file must be passed to a target that syncs staged
+    /// components before promotion (for example `FlushTarget::flush_deferred_files`).
+    /// Use [`Self::finish_to_directory`] when the caller needs independently
+    /// durable component files. This deferred path retains pump draining,
+    /// direct-I/O alignment and tail truncation, but does not sync contents.
+    #[doc(hidden)]
+    pub fn finish_to_directory_deferred_sync(
+        self,
+        staging_dir: impl AsRef<Path>,
+    ) -> Result<SSTableOutputFiles> {
+        if !matches!(&self.data_buf, DataSink::Stream(_)) {
+            return Err(ferrosa_common::Error::InvalidData(
+                "deferred-sync SSTable finish requires a file-backed writer".into(),
+            ));
+        }
+        self.finish_to_directory_inner(staging_dir.as_ref(), false)
+    }
+
+    fn finish_to_directory_inner(
+        self,
+        staging_dir: &Path,
+        sync_components: bool,
+    ) -> Result<SSTableOutputFiles> {
+        let staging_dir = staging_dir.to_path_buf();
         std::fs::create_dir_all(&staging_dir)?;
 
         let first_key = self.first_key.unwrap_or_default();
@@ -1360,11 +1413,11 @@ impl SSTableWriter {
             &last_index_key,
             partition_count,
         )?;
-        let partitions_len = partitions.finish_file(&partitions_path)?;
+        let partitions_len = partitions.finish_file_with_sync(&partitions_path, sync_components)?;
 
         let mut filter = ComponentSink::file(filter_path.clone())?;
         self.bloom.write_to(&mut filter)?;
-        let filter_len = filter.finish_file(&filter_path)?;
+        let filter_len = filter.finish_file_with_sync(&filter_path, sync_components)?;
 
         let statistics = Self::build_statistics_db(
             &header,
@@ -1375,7 +1428,8 @@ impl SSTableWriter {
             total_rows,
             total_columns_set,
         );
-        let statistics_len = pump_component(&statistics_path, &statistics)?;
+        let statistics_len =
+            pump_component_with_sync(&statistics_path, &statistics, sync_components)?;
 
         // T-038: `DataSink::Stream` already streamed Data.db (and
         // CompressionInfo.db, if compressed) to `data_path`/
@@ -1389,7 +1443,7 @@ impl SSTableWriter {
             DataSink::Memory(data_buf) => {
                 let artifacts = Self::build_data_db_to_file(data_buf, &self.options, &data_path)?;
                 let compression_info_len = if let Some(info) = artifacts.compression_info.as_ref() {
-                    pump_component(&compression_info_path, info)?
+                    pump_component_with_sync(&compression_info_path, info, sync_components)?
                 } else {
                     0
                 };
@@ -1405,7 +1459,7 @@ impl SSTableWriter {
                 )
             }
             DataSink::Stream(stream) => {
-                let artifacts = stream.finish()?;
+                let artifacts = stream.finish(sync_components)?;
                 debug_assert_eq!(
                     artifacts.data_path, data_path,
                     "StreamSink was opened at a different Data.db path than finish_to_directory \
@@ -1430,18 +1484,21 @@ impl SSTableWriter {
         // Source checksums (T-011, D6): `Digest.crc32` for every table;
         // `CRC.db` only for uncompressed tables.
         let digest_bytes = checksum::format_digest(digest);
-        let digest_len = pump_component(&digest_path, &digest_bytes)?;
+        let digest_len = pump_component_with_sync(&digest_path, &digest_bytes, sync_components)?;
         let has_crc = crc_db.is_some();
         let crc_len = if let Some(crc_db) = crc_db {
-            crc_db.finish_file(&crc_path)?
+            crc_db.finish_file_with_sync(&crc_path, sync_components)?
         } else {
             0
         };
 
-        let rows_len = self.row_trie.into_sink().finish_file(&rows_path)?;
+        let rows_len = self
+            .row_trie
+            .into_sink()
+            .finish_file_with_sync(&rows_path, sync_components)?;
 
         let toc = Self::build_toc(has_compression);
-        let toc_len = pump_component(&toc_path, &toc)?;
+        let toc_len = pump_component_with_sync(&toc_path, &toc, sync_components)?;
 
         let output = SSTableOutputFiles {
             data: data_path,
@@ -4132,7 +4189,9 @@ mod tests {
             i64::from_be_bytes(partitions_db[len - 24..len - 16].try_into().unwrap());
         let key_count = i64::from_be_bytes(partitions_db[len - 16..len - 8].try_into().unwrap());
         let root_pos = i64::from_be_bytes(partitions_db[len - 8..len].try_into().unwrap());
-        eprintln!("Footer: key_bounds_offset={key_bounds_offset}, key_count={key_count}, root_pos={root_pos}");
+        eprintln!(
+            "Footer: key_bounds_offset={key_bounds_offset}, key_count={key_count}, root_pos={root_pos}"
+        );
 
         // Decode key bounds
         let kb_off = key_bounds_offset as usize;

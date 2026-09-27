@@ -23631,7 +23631,7 @@ mod tests {
             .filter(|(_, event)| match event {
                 Event::Rename(p) | Event::Unlink(p) => p.starts_with(&sstable_dir),
                 Event::DirFsync(p) => *p == sstable_dir,
-                Event::FileFsync(_) => false,
+                Event::FileFsync(_) | Event::ReadbackVerified(_) | Event::Fadvise(_) => false,
             })
             .collect();
 

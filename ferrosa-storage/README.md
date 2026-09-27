@@ -698,6 +698,12 @@ startup. Prometheus exports `ferrosa_storage_write_admission_delayed_total`,
 
 File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.
 
+Internal flush and compaction writers defer component sync to the
+`FileFlushTarget` staged handoff. The target syncs every staged component,
+verifies digests and structure, applies the buffered cache hint after readback,
+then promotes files and syncs the directory. Standalone SSTable callers keep
+the normal durable finish path.
+
 Shard workers collect moved component manifests directly into the fallible output vector; there is no intermediate vector of per-shard results.
 
 ### Backpressure verification (T-041)
