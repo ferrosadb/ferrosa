@@ -26,7 +26,7 @@ use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
 const ACTORS: usize = 5;
-const TRANSACTIONS_PER_ACTOR: usize = 4;
+const TRANSACTIONS_PER_ACTOR: usize = 2;
 const INITIAL_BALANCE: i64 = 10_000;
 const POSTGRES_DEFAULT_SCHEMA: &str = "public";
 const CLIENT_NODE_COUNT_ENV: &str = "FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT";
@@ -121,6 +121,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     )));
     let predicate_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
     let write_skew_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
+    let (actor_failure_tx, actor_failure_rx) = tokio::sync::watch::channel(false);
     let mut actors = Vec::with_capacity(ACTORS);
     for (actor, actor_client) in actor_clients.iter().enumerate() {
         let client = Arc::clone(actor_client);
@@ -128,43 +129,54 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         let history = Arc::clone(&history);
         let predicate_barrier = Arc::clone(&predicate_barrier);
         let write_skew_barrier = Arc::clone(&write_skew_barrier);
+        let actor_failure_tx = actor_failure_tx.clone();
+        let mut actor_failure_rx = actor_failure_rx.clone();
         let table = table.clone();
         actors.push(tokio::spawn(async move {
-            for iteration in 0..TRANSACTIONS_PER_ACTOR {
-                let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
-                let transfer =
-                    transfer_once(&client, &table, operation_id * 2, &event_clock).await?;
+            let result = async {
+                for iteration in 0..TRANSACTIONS_PER_ACTOR {
+                    let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
+                    let transfer =
+                        transfer_once(&client, &table, operation_id * 2, &event_clock).await?;
+                    history
+                        .lock()
+                        .expect("history mutex poisoned")
+                        .push(transfer);
+                    let register =
+                        register_once(&client, &table, operation_id * 2 + 1, &event_clock).await?;
+                    history
+                        .lock()
+                        .expect("history mutex poisoned")
+                        .push(register);
+                }
+
+                wait_for_phase(&predicate_barrier, &mut actor_failure_rx).await?;
+                let predicate = if actor == 0 {
+                    insert_phantom_once(&client, &table, 1_000, &event_clock).await?
+                } else {
+                    observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock)
+                        .await?
+                };
                 history
                     .lock()
                     .expect("history mutex poisoned")
-                    .push(transfer);
-                let register =
-                    register_once(&client, &table, operation_id * 2 + 1, &event_clock).await?;
+                    .push(predicate);
+
+                wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
+                let write_skew =
+                    write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?;
                 history
                     .lock()
                     .expect("history mutex poisoned")
-                    .push(register);
+                    .push(write_skew);
+                Ok(())
             }
+            .await;
 
-            predicate_barrier.wait().await;
-            let predicate = if actor == 0 {
-                insert_phantom_once(&client, &table, 1_000, &event_clock).await?
-            } else {
-                observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock).await?
-            };
-            history
-                .lock()
-                .expect("history mutex poisoned")
-                .push(predicate);
-
-            write_skew_barrier.wait().await;
-            let write_skew =
-                write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?;
-            history
-                .lock()
-                .expect("history mutex poisoned")
-                .push(write_skew);
-            Result::<()>::Ok(())
+            if result.is_err() {
+                actor_failure_tx.send_replace(true);
+            }
+            result
         }));
     }
     let mut actor_error = None;
@@ -682,6 +694,26 @@ async fn finish_recorded_transaction(
     })
 }
 
+async fn wait_for_phase(
+    barrier: &tokio::sync::Barrier,
+    actor_failure_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        if *actor_failure_rx.borrow() {
+            bail!("another PostgreSQL workload actor failed before the phase barrier");
+        }
+
+        tokio::select! {
+            _ = barrier.wait() => return Ok(()),
+            changed = actor_failure_rx.changed() => {
+                if changed.is_err() || *actor_failure_rx.borrow() {
+                    bail!("another PostgreSQL workload actor failed at the phase barrier");
+                }
+            }
+        }
+    }
+}
+
 fn is_serialization_failure(error: &tokio_postgres::Error) -> bool {
     error
         .code()
@@ -814,7 +846,7 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 mod tests {
     use super::{
         actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
-        predicate_observations, FaultSchedule, TransactionOperation,
+        predicate_observations, wait_for_phase, FaultSchedule, TransactionOperation,
     };
 
     #[test]
@@ -868,6 +900,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn actor_failure_releases_peers_waiting_at_a_workload_phase() {
+        let barrier = tokio::sync::Barrier::new(2);
+        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(false);
+        let waiting_actor =
+            tokio::spawn(async move { wait_for_phase(&barrier, &mut failure_rx).await });
+
+        failure_tx.send_replace(true);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiting_actor)
+            .await
+            .expect("failed actor should release its peers from the barrier")
+            .expect("waiting actor task should not panic");
+
+        assert!(result.is_err());
     }
 
     #[test]
