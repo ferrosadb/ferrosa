@@ -198,6 +198,20 @@ impl PumpTrace {
 
     /// Check complete component sets and the bounded, aligned write contract.
     pub fn assert_complete_sstables(&self, expected: usize) {
+        self.assert_complete_sstables_with_sync_policy(expected, false);
+    }
+
+    /// Check complete component sets and write shape when the publication
+    /// target owns the durability barrier instead of each pump.
+    pub fn assert_complete_sstables_with_deferred_sync(&self, expected: usize) {
+        self.assert_complete_sstables_with_sync_policy(expected, true);
+    }
+
+    fn assert_complete_sstables_with_sync_policy(
+        &self,
+        expected: usize,
+        allow_deferred_sync: bool,
+    ) {
         use std::collections::{BTreeMap, BTreeSet};
         assert!(
             self.bypasses().is_empty(),
@@ -231,11 +245,13 @@ impl PumpTrace {
                     .max()
                     .unwrap_or(0)
             });
-            assert!(
-                file.syncs > 0,
-                "component must be synced: {:?}",
-                file.opened.path
-            );
+            if !allow_deferred_sync {
+                assert!(
+                    file.syncs > 0,
+                    "component must be synced: {:?}",
+                    file.opened.path
+                );
+            }
             assert!(
                 file.writes.len() as u64 <= len.div_ceil(file.opened.segment as u64) + 1,
                 "write amplification for {:?}: {} writes for {len} bytes with segment {}",

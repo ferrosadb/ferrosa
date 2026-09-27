@@ -39,7 +39,7 @@ fn wiring_cql_flush_compact_restart() {
 
             tables.push(state.core.engine.table_schema(&tid).unwrap());
         }
-        trace.assert_complete_sstables(4);
+        trace.assert_complete_sstables_with_deferred_sync(4);
         state.core.engine.force_compact_all();
         assert!(state.core.engine.await_compaction_result(std::time::Duration::from_secs(60)));
         state.core.engine.poll_compactions().await;
@@ -50,7 +50,7 @@ fn wiring_cql_flush_compact_restart() {
         for table in &tables {
             assert_eq!(state.core.engine.sstable_count(&TableId::new(&table.keyspace, &table.table)), 1);
         }
-        trace.assert_complete_sstables(6);
+        trace.assert_complete_sstables_with_deferred_sync(6);
         (dir, state.core.schema.clone(), tables, trace)
     });
     drop(first);
@@ -112,5 +112,5 @@ fn wiring_cql_flush_compact_restart() {
         }
     });
     drop(second);
-    trace.assert_complete_sstables(6);
+    trace.assert_complete_sstables_with_deferred_sync(6);
 }
