@@ -75,6 +75,107 @@ process starts.
 | `/api/debug/flamechart?seconds=N` | Duration of the authenticated tracing activity chart | Default `5` seconds, capped at `60` |
 | `RUST_LOG` | Runtime tracing log filter | For example, `info` or `ferrosa=debug` |
 
+### CQL Accord transaction bounds
+
+These per-node CQL settings bound open Accord transaction state. They take effect
+when Ferrosa starts; invalid, zero, or inconsistent values log an error and use
+the defaults without stopping startup. The maximum staged-statement count includes both reads
+and writes. `USING TIMEOUT` may choose a transaction deadline up to the configured
+maximum.
+
+| Environment variable | What it bounds | Default |
+|---|---|---:|
+| `FERROSA_CQL_TRANSACTION_MAX_OPEN` | Concurrent open CQL Accord transactions per node | `10000` |
+| `FERROSA_CQL_TRANSACTION_MAX_STATEMENTS` | Staged reads plus writes in one transaction | `10000` |
+| `FERROSA_CQL_TRANSACTION_DEFAULT_TIMEOUT_MS` | Open transaction lifetime when no override is supplied | `10000` ms |
+| `FERROSA_CQL_TRANSACTION_MAX_TIMEOUT_MS` | Largest `BEGIN ... USING TIMEOUT` override | `600000` ms |
+| `FERROSA_CQL_TRANSACTION_REAPER_INTERVAL_MS` | How often expired open transactions are evicted | `1000` ms |
+
+These are CQL/Accord controls. They do not configure PostgreSQL transactions or
+PostgreSQL MVCC history.
+
+### Storage and query throughput
+
+These storage settings affect memory limits, write batching, read working sets,
+or background concurrency. Set them in the Ferrosa container environment and
+restart the process; they are read during startup or when the corresponding
+worker is initialized. Byte values are bytes unless the name says otherwise.
+
+| Setting | What it changes | Default |
+|---|---|---|
+| `FERROSA_FLUSH_THRESHOLD_BYTES` | Memtable size that triggers a flush | `67108864` (64 MiB) |
+| `FERROSA_MEMTABLE_BACKPRESSURE_BYTES` | Active memtable limit before writes are backpressured/rejected; defaults to `max(4 × flush threshold, 64 MiB)` | `268435456` (256 MiB with the default flush threshold) |
+| `FERROSA_MEMTABLE_NUM_SHARDS` | Number of memtable shards | `64` |
+| `FERROSA_FLUSH_MAX_AGE_SECS` | Maximum age before a memtable is flushed | `30` |
+| `FERROSA_FLUSH_PARALLELISM` | Shared flush worker count | Host available parallelism, clamped to `1..64` |
+| `FERROSA_CACHE_MAX_BYTES` | Maximum local SSTable cache size | `10737418240` (10 GiB) |
+| `FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES` | Free space reserved on the data filesystem; writes fail closed below it | `536870912` (512 MiB) |
+| `FERROSA_CACHE_MIN_BYTES` | Minimum local cache target | `0` |
+| `FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES` | Free-space point that starts local SSTable eviction | `2 × FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES` |
+| `FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES` | Free-space target after eviction | `max(low water, 3 × reserve)` |
+| `FERROSA_SSTABLE_READER_CACHE_CAP` | Maximum idle SSTable readers retained in the shared LRU pool | `256` |
+| `FERROSA_READ_MERGE_FANIN` | SSTable readers opened at once for a staged token-range merge | `32` |
+| `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` | Rows retained/emitted per range-read fragment | `4096` |
+| `FERROSA_RANGE_SPILL_THRESHOLD_BYTES` | Absolute memory threshold before a range result spills to local disk; overrides the percentage threshold | No absolute override |
+| `FERROSA_RANGE_SPILL_THRESHOLD_PCT` | Memory percentage threshold before range-result spill | Runtime memory budget default |
+| `FERROSA_COMMITLOG_BATCH_TARGET_BYTES` | Pending WAL bytes that trigger a group sync | `65536` (64 KiB) |
+| `FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS` | Maximum time a dirty WAL batch waits before sync | `10000` (10 ms) |
+| `FERROSA_COMPACTION_WORKERS` | Compaction worker threads | Host CPU count, bounded by implementation limits |
+| `FERROSA_MAX_CONCURRENT_COMPACTIONS` | Number of compactions allowed to execute concurrently | Auto-tuned from CPU and memory limits |
+| `FERROSA_COMPACTION_READAHEAD_BYTES` | Read-ahead window for direct compaction scans | SSTable scan default |
+| `FERROSA_INDEX_SIDECAR_TIMEOUT_MS` | Timeout for a remote index-sidecar request | `30000` (30 s) |
+| `FERROSA_BACKGROUND_MAX_BLOCKING` | Blocking-task thread cap for the background runtime | Runtime default |
+| `FERROSA_DATA_RUNTIME_THREADS` | Data runtime worker threads | `8` |
+| `FERROSA_CQL_RUNTIME_THREADS` | CQL runtime worker threads | `8` |
+| `FERROSA_BACKGROUND_RUNTIME_THREADS` | Background runtime worker threads | `2` |
+
+Direct I/O has separate switches for SSTable writes and compaction input scans.
+`FERROSA_SSTABLE_DIRECT_IO` controls immutable `Data.db` writes. Compaction input
+scans use `FERROSA_COMPACTION_DIRECT_READ`; `FERROSA_DIRECT_IO` is its fallback
+when the compaction-specific switch is unset. Both paths are on by default;
+set the relevant value to `0` to use buffered I/O. An unsupported filesystem
+falls back to buffered I/O for SSTable writes and records a fallback metric.
+These switches do not change write durability. Benchmark each mode on the same
+device and workload because bypassing the page cache can reduce cache pollution
+while changing repeated-read performance.
+
+For write throughput, compare commit-log batch size/delay and flush parallelism
+one change at a time. For memory pressure, watch memtable backpressure, reader
+pool pressure, local cache size, and range spill together. Raising a buffer or
+worker limit can move pressure to the page cache, local disk, or cgroup rather
+than remove it. Keep the profiling workload and resource limits fixed between
+runs.
+
+### PostgreSQL MVCC and SQL
+
+PostgreSQL MVCC and SQL resource bounds can be tuned at process startup without
+rebuilding Ferrosa:
+
+| Environment variable | What it bounds | Default |
+|---|---|---:|
+| `FERROSA_POSTGRES_MAX_TXN_WRITES` | Mutations buffered by one PostgreSQL transaction before it fails with a resource-limit error | `10000` |
+| `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | Rows buffered between a storage scan producer and the synchronous SQL executor | `64` |
+| `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | Maximum lifetime of an active PostgreSQL snapshot/transaction; later use fails with SQLSTATE `40001` | `600000` ms |
+| `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | Background cadence for expiring old snapshots and pruning history they retain | `1000` ms |
+
+Every value must be a positive integer. If any PostgreSQL override is invalid,
+Ferrosa logs an error and uses the complete default set without stopping
+startup. The scan buffer bounds rows in flight from storage; it does not limit
+the number of rows returned by a query. The SQL executor and protocol renderer
+still materialize query results, so increasing this buffer only changes the
+storage-side producer window.
+
+The maximum snapshot age bounds how long an abandoned or long-running
+transaction can retain old row versions. Once expired, its next query or commit
+fails with `40001`; the reaper removes its active lease and allows history
+pruning. Choose an age that accommodates legitimate transaction duration and
+tune the sweep interval separately if reclamation latency matters.
+In cluster mode, PostgreSQL commits submit the snapshot and read/write table set
+through Accord, and replica apply carries row-version metadata to support active
+snapshots on other nodes. Native-driver cross-node coverage is present; run the
+Jepsen PostgreSQL strict-serializability workload before treating that model as
+system-wide evidence.
+
 Use a lower `lg_prof_sample` value to capture more allocation events. Start with
 the default when measuring workload latency, since heavier sampling can change
 the result. jemalloc accepts `_RJEM_MALLOC_CONF` at startup; changes apply to a new

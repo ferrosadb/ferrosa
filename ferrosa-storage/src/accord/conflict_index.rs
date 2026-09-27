@@ -13,6 +13,14 @@
 use ferrosa_common::accord::{Timestamp, TxnId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+/// Reserved conflict key shared by PostgreSQL transactions to establish a
+/// cluster-wide serialization order. Its high-water mark is retained even when
+/// the ordinary bounded per-key high-water map is full.
+pub const POSTGRES_TRANSACTION_MARKER_KEY: &[u8] = b"\0ferrosa:postgres:serializable:v1";
+/// PostgreSQL begin and commit barriers share this key to order their Accord
+/// transactions. BEGIN-only barriers do not advance the data-commit marker.
+pub const POSTGRES_TRANSACTION_BARRIER_KEY: &[u8] = b"\0ferrosa:postgres:barrier:v1";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -91,6 +99,11 @@ pub struct ConflictIndex {
     /// still correct while they have live entries).
     single_key_hwm: HashMap<Vec<u8>, Timestamp>,
 
+    /// The PostgreSQL marker must never lose its high-water mark to the generic
+    /// per-key capacity limit: stale-snapshot validation depends on it.
+    postgres_marker_hwm: Option<Timestamp>,
+    postgres_barrier_hwm: Option<Timestamp>,
+
     /// Hard cap on total entries.
     max_entries: usize,
     current_entries: usize,
@@ -128,6 +141,8 @@ impl ConflictIndex {
             range_ops: BTreeMap::new(),
             indexed_writes: HashMap::new(),
             single_key_hwm: HashMap::new(),
+            postgres_marker_hwm: None,
+            postgres_barrier_hwm: None,
             max_entries,
             current_entries: 0,
         }
@@ -195,7 +210,19 @@ impl ConflictIndex {
             .and_then(|writes| writes.iter().map(|w| w.accord_ts.unwrap_or(w.t0)).max());
         // Fold in the per-key high-water-mark, which survives GC of the live
         // entries — so a later append still bumps past an already-applied one.
-        let hwm = self.single_key_hwm.get(key).copied();
+        let hwm = if key == POSTGRES_TRANSACTION_MARKER_KEY {
+            self.postgres_marker_hwm
+                .into_iter()
+                .chain(self.single_key_hwm.get(key).copied())
+                .max()
+        } else if key == POSTGRES_TRANSACTION_BARRIER_KEY {
+            self.postgres_barrier_hwm
+                .into_iter()
+                .chain(self.single_key_hwm.get(key).copied())
+                .max()
+        } else {
+            self.single_key_hwm.get(key).copied()
+        };
         match (live, hwm) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -223,7 +250,17 @@ impl ConflictIndex {
                 }
             }
             if touches_key {
-                raise_hwm(&mut self.single_key_hwm, key, t, self.max_entries);
+                if key.as_slice() == POSTGRES_TRANSACTION_MARKER_KEY {
+                    self.postgres_marker_hwm =
+                        Some(self.postgres_marker_hwm.map_or(t, |current| current.max(t)));
+                } else if key.as_slice() == POSTGRES_TRANSACTION_BARRIER_KEY {
+                    self.postgres_barrier_hwm = Some(
+                        self.postgres_barrier_hwm
+                            .map_or(t, |current| current.max(t)),
+                    );
+                } else {
+                    raise_hwm(&mut self.single_key_hwm, key, t, self.max_entries);
+                }
             }
         }
     }
@@ -551,6 +588,46 @@ mod tests {
 
         // A different key is unaffected (no false HWM bleed across keys).
         assert_eq!(idx.max_conflicting_timestamp(b"other"), None);
+    }
+
+    #[test]
+    fn postgres_marker_hwm_survives_when_bounded_key_hwm_is_full() {
+        let mut idx = ConflictIndex::new(1);
+        let ordinary = txn(10);
+        idx.register(
+            b"ordinary",
+            InFlightWrite {
+                txn_id: ordinary,
+                t0: ts(10),
+                accord_ts: Some(ts(10)),
+                status: TxnStatus::Committed,
+            },
+        )
+        .unwrap();
+        idx.set_commit_ts(&ordinary, ts(10));
+        idx.mark_applied(&ordinary);
+        idx.gc_applied();
+
+        let marker = txn(20);
+        idx.register(
+            POSTGRES_TRANSACTION_MARKER_KEY,
+            InFlightWrite {
+                txn_id: marker,
+                t0: ts(20),
+                accord_ts: Some(ts(20)),
+                status: TxnStatus::Committed,
+            },
+        )
+        .unwrap();
+        idx.set_commit_ts(&marker, ts(20));
+        idx.mark_applied(&marker);
+        idx.gc_applied();
+
+        assert_eq!(
+            idx.max_conflicting_timestamp(POSTGRES_TRANSACTION_MARKER_KEY),
+            Some(ts(20)),
+            "snapshot validation must retain the global marker timestamp even when normal key history fills the cap"
+        );
     }
 
     // -----------------------------------------------------------------------

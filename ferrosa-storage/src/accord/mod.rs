@@ -20,6 +20,7 @@ pub mod crash_recovery;
 pub mod entries;
 pub mod framed_log;
 pub mod oversized_entry;
+pub mod postgres_mvcc;
 pub mod protocol_log;
 pub mod read_2i;
 pub mod sidecar;
@@ -33,6 +34,10 @@ pub use crash_recovery::{
     ReplayedPhase, ReplayedTxnState,
 };
 pub use entries::{AccordAppliedEntry, AccordProtocolEntry};
+pub use postgres_mvcc::{
+    decode_mutation as decode_postgres_mvcc_mutation,
+    encode_mutation as encode_postgres_mvcc_mutation, PostgresMvccApplyObserver,
+};
 pub use protocol_log::ProtocolLog;
 pub use read_2i::{
     ConsistencyMode, DepWaitOutcome, IndexResult, LayerId, Read2iMerger, Read2iQuery,

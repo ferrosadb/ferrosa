@@ -2547,6 +2547,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2611,10 +2612,13 @@ dependencies = [
 name = "ferrosa-postgres"
 version = "0.22.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "ferrosa-cluster",
  "ferrosa-common",
+ "ferrosa-net",
  "ferrosa-row-bridge",
  "ferrosa-schema",
  "ferrosa-sql",
@@ -2624,13 +2628,17 @@ dependencies = [
  "hmac 0.12.1",
  "indexmap 2.14.0",
  "num-bigint",
+ "parking_lot 0.12.5",
  "pbkdf2 0.12.2",
  "proptest",
  "rand 0.8.6",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tracing",
  "uuid",
 ]
 

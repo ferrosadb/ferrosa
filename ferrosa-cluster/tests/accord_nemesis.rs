@@ -413,6 +413,8 @@ enum BatchAtomicityResult {
     NetworkError,
     /// Codec error (should not happen).
     CodecError,
+    /// Snapshot rejected before any statement was applied.
+    SnapshotStale,
 }
 
 impl BatchAtomicityResult {
@@ -424,6 +426,7 @@ impl BatchAtomicityResult {
             Err(AccordDriverError::ApplyQuorumUnavailable) => Self::ApplyQuorumUnavailable,
             Err(AccordDriverError::Network(_)) => Self::NetworkError,
             Err(AccordDriverError::Codec(_)) => Self::CodecError,
+            Err(AccordDriverError::SnapshotStale) => Self::SnapshotStale,
         }
     }
 

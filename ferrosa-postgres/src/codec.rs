@@ -433,7 +433,7 @@ mod tests {
             &[
                 ("user", "postgres"),
                 ("database", "ferrosa"),
-                ("ferrosa.isolation", "accord"),
+                ("ferrosa.isolation", "postgres-mvcc"),
             ],
         );
         let frame = read_startup(&mut buf).unwrap().unwrap();
@@ -451,7 +451,7 @@ mod tests {
                 // dotted custom GUC must survive (the D1/D11 connection-time opt-in path)
                 assert_eq!(
                     parameters[2],
-                    ("ferrosa.isolation".to_string(), "accord".to_string())
+                    ("ferrosa.isolation".to_string(), "postgres-mvcc".to_string())
                 );
             }
             other => panic!("expected Startup, got {other:?}"),

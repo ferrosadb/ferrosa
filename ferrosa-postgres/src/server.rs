@@ -22,6 +22,7 @@ use crate::connection::{ConnError, Connection};
 use crate::extended::{self, PreparedKind, Session};
 use crate::handshake::{HandshakeError, VerifierStore};
 use crate::messages::{BackendMessage, FrontendMessage};
+use crate::mvcc::{MvccCommitError, MvccManager};
 use crate::query;
 
 /// Shared context for the post-auth query phase: the storage engine and schema
@@ -31,10 +32,12 @@ pub struct QueryContext {
     pub engine: Arc<StorageEngine>,
     pub schema: Arc<Schema>,
     pub default_schema: String,
-    /// The Accord committer that drives a buffered `BEGIN`/`COMMIT` write-set to
-    /// an atomic multi-key transaction. `None` in standalone mode — a `COMMIT`
-    /// with buffered DML then fails loud (cluster mode required) rather than
-    /// faking atomicity (FMEA PG-1).
+    /// PostgreSQL-owned snapshot and serializability state. CQL transactions
+    /// continue to use Accord through the CQL session path.
+    pub mvcc: Arc<MvccManager>,
+    /// Distributed commit coordination for PostgreSQL transactions. PostgreSQL
+    /// owns snapshot/version validation; Accord supplies the cluster commit
+    /// order and atomic write apply. CQL's transaction path is unchanged.
     pub accord_committer: Option<Arc<dyn ferrosa_storage::accord::TransactionCommitter>>,
 }
 
@@ -107,7 +110,11 @@ where
                 }
             }
             Err(e) => {
-                let _ = write_fatal(&mut stream, sqlstate(&e), &format!("{e:?}")).await;
+                if let Err(write_error) =
+                    write_fatal(&mut stream, sqlstate(&e), &format!("{e:?}")).await
+                {
+                    tracing::debug!(%write_error, "could not send PostgreSQL startup error response");
+                }
                 return Ok(());
             }
         }
@@ -153,7 +160,11 @@ where
             }
             Err(e) => {
                 // Fail loud on a protocol violation, then close.
-                let _ = write_fatal(stream, codec_sqlstate(&e), &e.to_string()).await;
+                if let Err(write_error) =
+                    write_fatal(stream, codec_sqlstate(&e), &e.to_string()).await
+                {
+                    tracing::debug!(%write_error, "could not send PostgreSQL protocol error response");
+                }
                 return Ok(());
             }
         }
@@ -243,16 +254,78 @@ where
     Ok(false)
 }
 
+async fn begin_implicit_transaction(
+    ctx: &QueryContext,
+    session: &mut Session,
+) -> Result<(), BackendMessage> {
+    let Some(committer) = &ctx.accord_committer else {
+        return Ok(());
+    };
+    let cluster_ts = committer
+        .begin_postgres_snapshot(&ctx.default_schema)
+        .await
+        .map_err(|error| {
+            query::error_response(
+                "58000",
+                &format!("could not establish PostgreSQL transaction snapshot: {error}"),
+            )
+        })?;
+    session.begin_txn(
+        Some(ferrosa_sql::IsolationLevel::Serializable),
+        ctx.mvcc.snapshot_with_cluster_ts(cluster_ts),
+    );
+    Ok(())
+}
+
+/// Treat standalone PostgreSQL data statements as implicit transactions in
+/// cluster mode, so autocommit has the same Accord ordering as explicit BEGIN.
+async fn execute_simple(
+    ctx: &QueryContext,
+    session: &mut Session,
+    sql: &str,
+) -> Vec<BackendMessage> {
+    let is_data_statement = matches!(
+        ferrosa_sql::parse_statement(sql),
+        Ok(ferrosa_sql::Statement::Select(_)
+            | ferrosa_sql::Statement::Insert(_)
+            | ferrosa_sql::Statement::Update(_)
+            | ferrosa_sql::Statement::Delete(_))
+    );
+    if session.in_txn() || ctx.accord_committer.is_none() || !is_data_statement {
+        return execute_simple_inner(ctx, session, sql).await;
+    }
+    if let Err(error) = begin_implicit_transaction(ctx, session).await {
+        return vec![error];
+    }
+
+    let messages = execute_simple_inner(ctx, session, sql).await;
+    if messages
+        .iter()
+        .any(|message| matches!(message, BackendMessage::ErrorResponse { .. }))
+    {
+        session.end_txn();
+        return messages;
+    }
+
+    let commit_messages = commit_txn(ctx, session).await;
+    match commit_messages.first() {
+        Some(BackendMessage::CommandComplete { tag }) if tag == "COMMIT" => messages,
+        Some(BackendMessage::ErrorResponse { .. }) => commit_messages,
+        _ => vec![query::error_response(
+            "58000",
+            "implicit PostgreSQL transaction did not commit",
+        )],
+    }
+}
+
 /// Execute one simple-query string with transaction-state awareness.
 ///
 /// `BEGIN`/`COMMIT`/`ROLLBACK` drive the session's protocol transaction state
-/// (reported in the following `ReadyForQuery`). The front-end is read-only
-/// today, so a `COMMIT` has an empty write-set and nothing to apply; once DML
-/// lands, the accumulated writes commit here via Accord (blueprint D11 / the
-/// `T`-block-triggers-Accord seam). All other statements delegate to the
+/// (reported in the following `ReadyForQuery`). PostgreSQL DML buffers in the
+/// session and commits through the PostgreSQL MVCC manager. All other statements delegate to the
 /// stateless executor; an error inside a transaction aborts it (`T` → `E`), and
 /// while aborted only `COMMIT`/`ROLLBACK` are accepted (PG `25P02`).
-async fn execute_simple(
+async fn execute_simple_inner(
     ctx: &QueryContext,
     session: &mut Session,
     sql: &str,
@@ -278,8 +351,29 @@ async fn execute_simple(
     }
 
     match stmt {
-        ferrosa_sql::Statement::Begin => {
-            session.begin_txn();
+        ferrosa_sql::Statement::Begin { isolation } => {
+            if isolation.is_some_and(|level| level != ferrosa_sql::IsolationLevel::Serializable) {
+                return vec![query::error_response(
+                    "0A000",
+                    "only SERIALIZABLE isolation is supported for explicit PostgreSQL transactions",
+                )];
+            }
+            let snapshot = if let Some(committer) = &ctx.accord_committer {
+                match committer.begin_postgres_snapshot(&ctx.default_schema).await {
+                    Ok(cluster_ts) => ctx.mvcc.snapshot_with_cluster_ts(cluster_ts),
+                    Err(error) => {
+                        return vec![query::error_response(
+                            "58000",
+                            &format!(
+                                "could not establish PostgreSQL transaction snapshot: {error}"
+                            ),
+                        )];
+                    }
+                }
+            } else {
+                ctx.mvcc.snapshot()
+            };
+            session.begin_txn(isolation, snapshot);
             vec![BackendMessage::CommandComplete {
                 tag: "BEGIN".to_string(),
             }]
@@ -298,17 +392,61 @@ async fn execute_simple(
         // transaction, DML is BUFFERED into the session write-set instead of
         // applied; autocommit (no open txn) applies immediately.
         _ => {
+            if let Some(error) = expired_transaction_error(ctx, session) {
+                session.mark_txn_failed();
+                return vec![error];
+            }
+            if session.in_txn()
+                && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
+            {
+                if let ferrosa_sql::Statement::Select(select) = &stmt {
+                    let read_tables = session.txn_read_tables_mut();
+                    read_tables.insert(format!(
+                        "{}.{}",
+                        select.from.schema.as_deref().unwrap_or(&ctx.default_schema),
+                        select.from.table
+                    ));
+                    if let Some(join) = &select.join {
+                        read_tables.insert(format!(
+                            "{}.{}",
+                            join.table.schema.as_deref().unwrap_or(&ctx.default_schema),
+                            join.table.table
+                        ));
+                    }
+                }
+            }
+            let snapshot = if session.in_txn()
+                && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
+            {
+                session
+                    .txn_snapshot()
+                    .cloned()
+                    .unwrap_or_else(|| ctx.mvcc.snapshot())
+            } else {
+                ctx.mvcc.snapshot()
+            };
             let msgs = if session.in_txn() {
-                query::execute_query(
+                query::execute_query_with_mvcc(
                     &ctx.engine,
                     &ctx.schema,
                     sql,
                     &ctx.default_schema,
+                    Some(&ctx.mvcc),
+                    Some(&snapshot),
                     Some(session.txn_writes_mut()),
                 )
                 .await
             } else {
-                query::execute_query(&ctx.engine, &ctx.schema, sql, &ctx.default_schema, None).await
+                query::execute_query_with_mvcc(
+                    &ctx.engine,
+                    &ctx.schema,
+                    sql,
+                    &ctx.default_schema,
+                    Some(&ctx.mvcc),
+                    Some(&snapshot),
+                    None,
+                )
+                .await
             };
             if session.in_txn()
                 && msgs
@@ -325,19 +463,36 @@ async fn execute_simple(
     }
 }
 
-/// Drive the buffered `BEGIN`/`COMMIT` write-set through the Accord committer,
-/// then leave the transaction block. FAILS LOUD and never applies a buffered
-/// write outside the committer:
-///
-/// * standalone mode (no committer) → ErrorResponse (cluster mode required);
-/// * a clean Accord abort → ErrorResponse (`40001`/`25000`);
-/// * a commit that cannot reach a decision → ErrorResponse (`58000`).
+fn expired_transaction_error(ctx: &QueryContext, session: &Session) -> Option<BackendMessage> {
+    let snapshot = session.txn_snapshot()?;
+    match ctx
+        .mvcc
+        .validate_commit(snapshot, &std::collections::HashSet::new())
+    {
+        Ok(()) => None,
+        Err(MvccCommitError::SnapshotExpired) => Some(query::error_response(
+            "40001",
+            "PostgreSQL transaction snapshot expired",
+        )),
+        Err(MvccCommitError::SerializationFailure) => Some(query::error_response(
+            "40001",
+            "could not serialize PostgreSQL transaction",
+        )),
+        Err(MvccCommitError::Storage(error)) => Some(query::error_response(
+            "58000",
+            &format!("transaction validation failed: {error}"),
+        )),
+    }
+}
+
+/// Validate PostgreSQL snapshot conflicts and commit the buffered write-set.
+/// In cluster mode, Accord establishes the distributed order and atomic apply;
+/// in standalone mode, the MVCC manager applies the batch locally. CQL
+/// transaction behavior remains in its separate session path.
 ///
 /// In every case the transaction is ended and the buffer dropped, so the server
 /// never acks a transaction it did not commit.
 async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
-    use ferrosa_storage::accord::CommitOutcome;
-
     // A COMMIT on an aborted (poisoned) transaction never commits the partial
     // buffer — Postgres treats it as a ROLLBACK. Drop the buffer and report
     // ROLLBACK rather than committing an incomplete write-set.
@@ -349,44 +504,195 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     }
 
     let writes = session.take_txn_writes();
+    let read_tables = session.take_txn_read_tables();
+    let snapshot = session
+        .txn_snapshot()
+        .cloned()
+        .unwrap_or_else(|| ctx.mvcc.snapshot());
 
     // An empty write-set (`BEGIN; COMMIT;` with no DML, or only reads) is a
     // no-op that commits cleanly — there is nothing to apply, so no atomicity to
-    // honor and no committer required (matches the `TransactionCommitter`
-    // contract). This is NOT a fake success: zero writes means zero state change.
+    // honor. This is NOT a fake success: zero writes means zero state change.
     if writes.is_empty() {
+        if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &read_tables) {
+            session.end_txn();
+            return match error {
+                MvccCommitError::SerializationFailure | MvccCommitError::SnapshotExpired => {
+                    vec![query::error_response(
+                        "40001",
+                        "could not serialize PostgreSQL transaction",
+                    )]
+                }
+                MvccCommitError::Storage(error) => vec![query::error_response(
+                    "58000",
+                    &format!("transaction commit failed: {error}"),
+                )],
+            };
+        }
+        if let Some(committer) = &ctx.accord_committer {
+            let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
+                session.end_txn();
+                return vec![query::error_response(
+                    "58000",
+                    "cluster PostgreSQL transaction has no Accord snapshot timestamp",
+                )];
+            };
+            let outcome = committer
+                .validate_postgres_snapshot(&ctx.default_schema, cluster_snapshot)
+                .await;
+            session.end_txn();
+            return match outcome {
+                Ok(true) => {
+                    vec![BackendMessage::CommandComplete {
+                        tag: "COMMIT".to_string(),
+                    }]
+                }
+                Ok(false) => {
+                    vec![query::error_response(
+                        "40001",
+                        "could not serialize PostgreSQL transaction",
+                    )]
+                }
+                Err(error) => vec![query::error_response(
+                    "58000",
+                    &format!("transaction commit failed: {error}"),
+                )],
+            };
+        }
         session.end_txn();
         return vec![BackendMessage::CommandComplete {
             tag: "COMMIT".to_string(),
         }];
     }
 
-    let committer = match &ctx.accord_committer {
-        Some(c) => c.clone(),
-        None => {
-            session.end_txn();
-            // Buffered writes were never applied; fail loud rather than fake a
-            // COMMIT we cannot honor atomically.
-            return vec![query::error_response(
-                "0A000",
-                "multi-statement transactions require cluster mode (Accord)",
-            )];
+    let mut write_tables = read_tables;
+    let mutations: Vec<_> = writes
+        .into_iter()
+        .map(|write| {
+            write_tables.insert(format!("{}.{}", write.0.keyspace, write.0.table));
+            write.0
+        })
+        .collect();
+    let _commit_guard = ctx.mvcc.commit_guard().await;
+    let outcome = if let Some(committer) = &ctx.accord_committer {
+        if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &write_tables) {
+            Err(error)
+        } else {
+            let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations);
+            match changes {
+                Err(error) => Err(error),
+                Ok(changes) => {
+                    let mut changes_by_partition =
+                        std::collections::HashMap::<Vec<u8>, Vec<_>>::new();
+                    for change in changes {
+                        changes_by_partition
+                            .entry(change.partition_key.clone())
+                            .or_default()
+                            .push(change);
+                    }
+                    let accord_writes = mutations
+                                  .iter()
+                                  .map(|mutation| {
+                                      let mut bytes = vec![0; mutation.serialized_size()];
+                                      mutation.serialize_into(&mut bytes);
+                                      let partition_key = mutation.key.key.as_bytes().to_vec();
+                                      let metadata = changes_by_partition.remove(&partition_key);
+                                      let mutation_bytes = match metadata {
+                                          Some(changes) => {
+                                              let metadata = serde_json::to_vec(&changes).map_err(|error| {
+                                                  MvccCommitError::Storage(format!(
+                                                      "serialize PostgreSQL MVCC row versions: {error}"
+                                                  ))
+                                              })?;
+                                              ferrosa_storage::accord::encode_postgres_mvcc_mutation(
+                                                  &bytes,
+                                                  &metadata,
+                                              )
+                                              .map_err(MvccCommitError::Storage)?
+                                          }
+                                          None => bytes,
+                                      };
+                                      Ok(ferrosa_storage::accord::TransactionWrite {
+                                          keyspace: mutation.keyspace.clone(),
+                                          key: partition_key,
+                                          mutation: mutation_bytes,
+                                      })
+                                  })
+                                  .collect::<Result<Vec<_>, MvccCommitError>>()
+                                  .and_then(|writes| {
+                                      if changes_by_partition.is_empty() {
+                                          Ok(writes)
+                                      } else {
+                                          Err(MvccCommitError::Storage(format!(
+                                              "{} PostgreSQL row version(s) were not attached to an Accord partition",
+                                              changes_by_partition.values().map(Vec::len).sum::<usize>()
+                                          )))
+                                      }
+                                  });
+                    let accord_writes = match accord_writes {
+                        Ok(writes) => writes,
+                        Err(error) => {
+                            session.end_txn();
+                            return vec![query::error_response(
+                                "58000",
+                                &format!("transaction commit failed: {error:?}"),
+                            )];
+                        }
+                    };
+                    let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
+                        session.end_txn();
+                        return vec![query::error_response(
+                            "58000",
+                            "cluster PostgreSQL transaction has no Accord snapshot timestamp",
+                        )];
+                    };
+                    let tables = write_tables.iter().cloned().collect();
+                    match committer
+                        .commit_postgres(
+                            &ctx.default_schema,
+                            accord_writes,
+                            tables,
+                            cluster_snapshot,
+                        )
+                        .await
+                    {
+                        Ok(ferrosa_storage::accord::CommitOutcome::Committed) => {
+                            Ok(ctx.mvcc.current_commit_seq())
+                        }
+                        Ok(ferrosa_storage::accord::CommitOutcome::Aborted { .. }) => {
+                            Err(MvccCommitError::SerializationFailure)
+                        }
+                        Err(error) => Err(MvccCommitError::Storage(error.to_string())),
+                    }
+                }
+            }
         }
+    } else {
+        query::commit_mutations(
+            &ctx.engine,
+            &ctx.schema,
+            &ctx.mvcc,
+            &snapshot,
+            &write_tables,
+            mutations,
+        )
     };
-
-    let outcome = committer.commit(writes).await;
     session.end_txn();
     match outcome {
-        Ok(CommitOutcome::Committed) => vec![BackendMessage::CommandComplete {
+        Ok(_) => vec![BackendMessage::CommandComplete {
             tag: "COMMIT".to_string(),
         }],
-        Ok(CommitOutcome::Aborted { reason }) => vec![query::error_response(
+        Err(MvccCommitError::SerializationFailure) => vec![query::error_response(
             "40001",
-            &format!("transaction aborted: {reason}"),
+            "could not serialize PostgreSQL transaction",
         )],
-        Err(e) => vec![query::error_response(
+        Err(MvccCommitError::SnapshotExpired) => vec![query::error_response(
+            "40001",
+            "PostgreSQL transaction snapshot expired",
+        )],
+        Err(e @ MvccCommitError::Storage(_)) => vec![query::error_response(
             "58000",
-            &format!("transaction commit failed: {}", e.reason),
+            &format!("transaction commit failed: {e:?}"),
         )],
     }
 }
@@ -628,6 +934,57 @@ async fn execute_portal(
     session: &mut Session,
     portal_name: &str,
 ) -> Vec<BackendMessage> {
+    let is_data_statement = session
+        .portal(portal_name)
+        .and_then(|portal| session.statement(&portal.stmt_name))
+        .is_some_and(|stmt| {
+            matches!(
+                &stmt.parsed,
+                PreparedKind::Select(_)
+                    | PreparedKind::Exprs(_)
+                    | PreparedKind::Insert(_)
+                    | PreparedKind::Update(_)
+                    | PreparedKind::Delete(_)
+            )
+        });
+    if session.in_txn() || ctx.accord_committer.is_none() || !is_data_statement {
+        return execute_portal_inner(ctx, session, portal_name).await;
+    }
+    if let Err(error) = begin_implicit_transaction(ctx, session).await {
+        return vec![session.fail(error)];
+    }
+
+    let messages = execute_portal_inner(ctx, session, portal_name).await;
+    if messages
+        .iter()
+        .any(|message| matches!(message, BackendMessage::ErrorResponse { .. }))
+    {
+        session.end_txn();
+        return messages;
+    }
+
+    let commit_messages = commit_txn(ctx, session).await;
+    match commit_messages.first() {
+        Some(BackendMessage::CommandComplete { tag }) if tag == "COMMIT" => messages,
+        Some(BackendMessage::ErrorResponse { .. }) => {
+            session.mark_error();
+            commit_messages
+        }
+        _ => {
+            session.mark_error();
+            vec![query::error_response(
+                "58000",
+                "implicit PostgreSQL transaction did not commit",
+            )]
+        }
+    }
+}
+
+async fn execute_portal_inner(
+    ctx: &QueryContext,
+    session: &mut Session,
+    portal_name: &str,
+) -> Vec<BackendMessage> {
     let Some(portal) = session.portal(portal_name) else {
         return vec![session.fail(query::error_response(
             "34000",
@@ -646,15 +1003,54 @@ async fn execute_portal(
     };
     let parsed = stmt.parsed.clone();
 
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return vec![session.fail(error)];
+    }
+
     match parsed {
         PreparedKind::Select(select) => {
-            let (catalog, failure) =
-                match query::load_catalog(&ctx.engine, &ctx.schema, &select, &ctx.default_schema)
-                    .await
-                {
-                    Ok(loaded) => loaded,
-                    Err(err) => return vec![session.fail(err)],
-                };
+            if session.in_txn()
+                && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
+            {
+                let reads = session.txn_read_tables_mut();
+                reads.insert(format!(
+                    "{}.{}",
+                    select.from.schema.as_deref().unwrap_or(&ctx.default_schema),
+                    select.from.table
+                ));
+                if let Some(join) = &select.join {
+                    reads.insert(format!(
+                        "{}.{}",
+                        join.table.schema.as_deref().unwrap_or(&ctx.default_schema),
+                        join.table.table
+                    ));
+                }
+            }
+            let snapshot = if session.in_txn()
+                && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
+            {
+                session
+                    .txn_snapshot()
+                    .cloned()
+                    .unwrap_or_else(|| ctx.mvcc.snapshot())
+            } else {
+                ctx.mvcc.snapshot()
+            };
+            let (catalog, failure) = match query::load_catalog_with_mvcc(
+                &ctx.engine,
+                &ctx.schema,
+                &select,
+                &ctx.default_schema,
+                Some(&ctx.mvcc),
+                Some(&snapshot),
+                Some(session.txn_writes()),
+            )
+            .await
+            {
+                Ok(loaded) => loaded,
+                Err(err) => return vec![session.fail(err)],
+            };
             // Offloaded for the same reason as the simple-query path: the
             // relational executor is synchronous and CPU-bound, so running it
             // inline pins an async worker for the whole sort/join.
@@ -671,11 +1067,10 @@ async fn execute_portal(
             if let Some(err) = query::check_scan_failure(&failure) {
                 return vec![session.fail(err)];
             }
-            let errored = result.is_err();
             let msgs = query::render_execute_result(result, &result_formats);
             // On an execution error, set the skip flag so the rest of the
             // sequence is ignored until Sync (Postgres semantics).
-            if errored {
+            if matches!(msgs.first(), Some(BackendMessage::ErrorResponse { .. })) {
                 session.mark_error();
             }
             msgs
@@ -683,7 +1078,13 @@ async fn execute_portal(
         // No-FROM expression select: no tables, no params. Evaluate and render.
         PreparedKind::Exprs(items) => {
             match query::execute_scalar_select(&items, &ctx.default_schema) {
-                Ok(result) => query::render_execute_result(Ok(result), &result_formats),
+                Ok(result) => {
+                    let msgs = query::render_execute_result(Ok(result), &result_formats);
+                    if matches!(msgs.first(), Some(BackendMessage::ErrorResponse { .. })) {
+                        session.mark_error();
+                    }
+                    msgs
+                }
                 Err(msg) => vec![session.fail(msg)],
             }
         }
@@ -691,8 +1092,8 @@ async fn execute_portal(
         // `$N` substitution; the Execute path omits the leading RowDescription
         // for INSERT RETURNING (the client learned columns from Describe). In an
         // open transaction the write is BUFFERED into the session write-set
-        // (`Some(txn_writes_mut())`) and committed atomically via Accord at
-        // COMMIT; autocommit (no open txn) applies immediately. A failed DML
+        // (`Some(txn_writes_mut())`) and committed atomically via PostgreSQL
+        // MVCC at COMMIT; autocommit (no open txn) applies immediately. A failed DML
         // poisons the transaction (`execute_dml`).
         PreparedKind::Insert(ins) => {
             // Extended Execute: no leading RowDescription for RETURNING (sent at
@@ -702,27 +1103,24 @@ async fn execute_portal(
                 result_formats: &result_formats,
             };
             let in_txn = session.in_txn();
-            let msgs = if in_txn {
-                query::execute_insert(
-                    &ctx.engine,
-                    &ctx.schema,
-                    &ins,
-                    &ctx.default_schema,
-                    &params,
-                    returning_opts,
-                    Some(session.txn_writes_mut()),
-                )
+            let transaction_writes = if in_txn {
+                Some(session.txn_writes_mut())
             } else {
-                query::execute_insert(
-                    &ctx.engine,
-                    &ctx.schema,
-                    &ins,
-                    &ctx.default_schema,
-                    &params,
-                    returning_opts,
-                    None,
-                )
+                None
             };
+            let msgs = query::execute_insert(
+                query::DmlContext {
+                    engine: &ctx.engine,
+                    mvcc: Some(&ctx.mvcc),
+                    schema: &ctx.schema,
+                    default_schema: &ctx.default_schema,
+                    txn: transaction_writes,
+                },
+                &ins,
+                &params,
+                returning_opts,
+            )
+            .await;
             execute_dml(session, msgs)
         }
         PreparedKind::Update(upd) => {
@@ -730,21 +1128,25 @@ async fn execute_portal(
             let msgs = if in_txn {
                 query::execute_update(
                     &ctx.engine,
+                    Some(&ctx.mvcc),
                     &ctx.schema,
                     &upd,
                     &ctx.default_schema,
                     &params,
                     Some(session.txn_writes_mut()),
                 )
+                .await
             } else {
                 query::execute_update(
                     &ctx.engine,
+                    Some(&ctx.mvcc),
                     &ctx.schema,
                     &upd,
                     &ctx.default_schema,
                     &params,
                     None,
                 )
+                .await
             };
             execute_dml(session, msgs)
         }
@@ -753,21 +1155,25 @@ async fn execute_portal(
             let msgs = if in_txn {
                 query::execute_delete(
                     &ctx.engine,
+                    Some(&ctx.mvcc),
                     &ctx.schema,
                     &del,
                     &ctx.default_schema,
                     &params,
                     Some(session.txn_writes_mut()),
                 )
+                .await
             } else {
                 query::execute_delete(
                     &ctx.engine,
+                    Some(&ctx.mvcc),
                     &ctx.schema,
                     &del,
                     &ctx.default_schema,
                     &params,
                     None,
                 )
+                .await
             };
             execute_dml(session, msgs)
         }
@@ -806,20 +1212,27 @@ pub async fn serve<S>(
 where
     S: VerifierStore + Send + Sync + 'static,
 {
+    let _snapshot_reaper = crate::mvcc::MvccManager::spawn_snapshot_reaper(ctx.mvcc.clone());
+    if let Some(committer) = &ctx.accord_committer {
+        committer
+            .register_postgres_mvcc_observer(ctx.mvcc.clone())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+    }
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let store = Arc::clone(&store);
         let ctx = Arc::clone(&ctx);
         tokio::spawn(async move {
-            let _ = handle_connection(stream, store, ctx).await;
+            if let Err(error) = handle_connection(stream, store, ctx).await {
+                tracing::warn!(%peer, %error, "PostgreSQL connection ended with an I/O error");
+            }
         });
     }
 }
 
-/// Transaction atomicity (FMEA PG-1): a `BEGIN`/`COMMIT` block buffers its DML
-/// and only the Accord committer applies it. ROLLBACK discards the buffer (the
-/// writes were never applied); COMMIT with no committer fails loud instead of
-/// faking atomicity. Runs a real local `StorageEngine` (temp dir, no S3/Docker).
+/// PostgreSQL MVCC transaction behavior (FMEA PG-1): a `BEGIN`/`COMMIT` block
+/// buffers its DML and commits through the local MVCC manager. ROLLBACK discards
+/// the buffer. These tests do not establish cluster-wide commit ordering.
 #[cfg(test)]
 mod txn_atomicity_tests {
     use super::*;
@@ -829,7 +1242,6 @@ mod txn_atomicity_tests {
         EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
         ReplicationParams, SchemaConfig, TableMetadata, TableParams, TestAuditSink,
     };
-    use ferrosa_storage::accord::MockTransactionCommitter;
     use ferrosa_storage::{
         CommitLogConfig, CompactionConfig, StorageEngineConfig, SyncStrategyConfig,
     };
@@ -960,24 +1372,21 @@ mod txn_atomicity_tests {
         }
     }
 
-    fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>, committer: bool) -> QueryContext {
+    fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> QueryContext {
         QueryContext {
             engine,
             schema,
             default_schema: "public".to_string(),
-            accord_committer: if committer {
-                Some(Arc::new(MockTransactionCommitter::new()))
-            } else {
-                None
-            },
+            mvcc: Arc::new(MvccManager::default()),
+            accord_committer: None,
         }
     }
 
-    async fn make_ctx(committer: bool) -> (tempfile::TempDir, QueryContext) {
+    async fn make_ctx() -> (tempfile::TempDir, QueryContext) {
         let dir = tempfile::tempdir().unwrap();
         let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
         engine.register_table(kv_storage_schema()).unwrap();
-        let ctx = ctx_with(Arc::new(engine), Arc::new(schema_with_kv()), committer);
+        let ctx = ctx_with(Arc::new(engine), Arc::new(schema_with_kv()));
         (dir, ctx)
     }
 
@@ -1014,7 +1423,7 @@ mod txn_atomicity_tests {
     async fn rollback_discards_buffered_writes() {
         // BEGIN; INSERT (buffered); ROLLBACK ⇒ the row was never applied.
         // Contrast: an autocommit INSERT IS applied.
-        let (_dir, ctx) = make_ctx(true).await;
+        let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new();
 
         let m = execute_simple(&ctx, &mut session, "BEGIN").await;
@@ -1064,10 +1473,9 @@ mod txn_atomicity_tests {
     }
 
     #[tokio::test]
-    async fn commit_without_committer_fails_loud() {
-        // No committer (standalone mode): BEGIN; INSERT; COMMIT must FAIL LOUD
-        // (cluster mode required) and the buffered row must NOT be in storage.
-        let (_dir, ctx) = make_ctx(false).await;
+    async fn commit_uses_postgres_mvcc_without_accord() {
+        // PostgreSQL owns its MVCC commit path in standalone and cluster modes.
+        let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new();
 
         execute_simple(&ctx, &mut session, "BEGIN").await;
@@ -1081,14 +1489,8 @@ mod txn_atomicity_tests {
 
         let m = execute_simple(&ctx, &mut session, "COMMIT").await;
         assert!(
-            is_error(&m, "0A000"),
-            "COMMIT with no committer must fail loud (0A000), got {m:?}"
-        );
-        assert!(
-            m.iter()
-                .any(|msg| matches!(msg, BackendMessage::ErrorResponse { fields }
-                if fields.iter().any(|f| f.0 == b'M' && f.1.contains("cluster mode")))),
-            "the error must mention cluster mode: {m:?}"
+            matches!(&m[..], [BackendMessage::CommandComplete { tag }] if tag == "COMMIT"),
+            "PostgreSQL MVCC commit must not require the Cassandra Accord committer: {m:?}"
         );
         assert!(
             !session.in_txn(),
@@ -1096,18 +1498,16 @@ mod txn_atomicity_tests {
         );
         assert_eq!(
             row_count(&ctx, "x").await,
-            0,
-            "a COMMIT that cannot be honored NEVER applies the buffered write"
+            1,
+            "the PostgreSQL MVCC commit applies the buffered row"
         );
 
         ctx.engine.shutdown().unwrap();
     }
 
     #[tokio::test]
-    async fn commit_with_committer_acks_and_records_write_set() {
-        // With a committer, COMMIT drives the buffered write-set through it and
-        // acks COMMIT. (The mock records the set; it does not itself apply.)
-        let (_dir, ctx) = make_ctx(true).await;
+    async fn commit_applies_postgres_write_set() {
+        let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new();
 
         execute_simple(&ctx, &mut session, "BEGIN").await;
@@ -1117,12 +1517,208 @@ mod txn_atomicity_tests {
             "INSERT INTO kv (k, v) VALUES ('y', 'committed')",
         )
         .await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('y2', 'committed-too')",
+        )
+        .await;
         let m = execute_simple(&ctx, &mut session, "COMMIT").await;
         assert!(
             matches!(&m[..], [BackendMessage::CommandComplete { tag }] if tag == "COMMIT"),
-            "COMMIT acks via the committer: {m:?}"
+            "COMMIT acks via the PostgreSQL MVCC path: {m:?}"
         );
         assert!(!session.in_txn());
+        assert_eq!(row_count(&ctx, "y").await, 1);
+        assert_eq!(row_count(&ctx, "y2").await, 1);
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_row_snapshots_hide_partial_replica_apply() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut seed = Session::new();
+        for (key, value) in [("row-a", "before-a"), ("row-b", "before-b")] {
+            let insert = format!("INSERT INTO kv (k, v) VALUES ('{key}', '{value}')");
+            execute_simple(&ctx, &mut seed, &insert).await;
+        }
+
+        let before_ts = ferrosa_common::accord::Timestamp::synthetic(19);
+        let commit_ts = ferrosa_common::accord::Timestamp::synthetic(20);
+        let mut writer = Session::new();
+        writer.begin_txn(
+            Some(ferrosa_sql::IsolationLevel::Serializable),
+            ctx.mvcc.snapshot_with_cluster_ts(before_ts),
+        );
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "UPDATE kv SET v = 'after-a' WHERE k = 'row-a'",
+        )
+        .await;
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "UPDATE kv SET v = 'after-b' WHERE k = 'row-b'",
+        )
+        .await;
+        let mutations: Vec<_> = writer
+            .take_txn_writes()
+            .into_iter()
+            .map(|write| write.0)
+            .collect();
+        assert_eq!(mutations.len(), 2);
+
+        let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations).unwrap();
+        let metadata = serde_json::to_vec(&changes).unwrap();
+        let txn_id =
+            ferrosa_common::accord::TxnId::new(1, ferrosa_common::accord::Timestamp::synthetic(21));
+        let metadata_batch = [metadata];
+        <MvccManager as ferrosa_storage::accord::PostgresMvccApplyObserver>::prepare_postgres_apply(
+            &ctx.mvcc,
+            txn_id,
+            commit_ts,
+            &metadata_batch,
+        )
+        .unwrap();
+
+        // Pause at the replica's storage seam after the complete MVCC row-image
+        // set is staged but only the first partition has reached storage.
+        ctx.engine
+            .write_atomic_batch(vec![mutations[0].clone()])
+            .unwrap();
+
+        let old_snapshot = ctx.mvcc.snapshot_with_cluster_ts(before_ts);
+        let committed_snapshot = ctx.mvcc.snapshot_with_cluster_ts(commit_ts);
+        let rows_for = |messages: &[BackendMessage]| {
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    BackendMessage::DataRow { columns } if columns.len() == 2 => {
+                        let key = columns[0].as_ref()?.clone();
+                        let value = columns[1].as_ref()?.clone();
+                        Some((String::from_utf8(key).ok()?, String::from_utf8(value).ok()?))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        async fn read_at(
+            ctx: &QueryContext,
+            snapshot: &crate::mvcc::MvccSnapshot,
+        ) -> Vec<BackendMessage> {
+            query::execute_query_with_mvcc(
+                &ctx.engine,
+                &ctx.schema,
+                "SELECT k, v FROM kv ORDER BY k",
+                &ctx.default_schema,
+                Some(&ctx.mvcc),
+                Some(snapshot),
+                None,
+            )
+            .await
+        }
+
+        let old_rows = read_at(&ctx, &old_snapshot).await;
+        assert_eq!(
+            rows_for(&old_rows),
+            vec![
+                ("row-a".into(), "before-a".into()),
+                ("row-b".into(), "before-b".into())
+            ]
+        );
+        let committed_rows = read_at(&ctx, &committed_snapshot).await;
+        assert_eq!(
+            rows_for(&committed_rows),
+            vec![
+                ("row-a".into(), "after-a".into()),
+                ("row-b".into(), "after-b".into())
+            ]
+        );
+
+        ctx.engine
+            .write_atomic_batch(vec![mutations[1].clone()])
+            .unwrap();
+        <MvccManager as ferrosa_storage::accord::PostgresMvccApplyObserver>::on_postgres_apply(
+            &ctx.mvcc,
+            txn_id,
+            commit_ts,
+            &metadata_batch,
+        )
+        .unwrap();
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_transaction_survives_restart_and_uncommitted_buffer_does_not() {
+        let (dir, ctx) = make_ctx().await;
+        let mut committed = Session::new();
+        execute_simple(&ctx, &mut committed, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut committed,
+            "INSERT INTO kv (k, v) VALUES ('restart-committed', 'durable')",
+        )
+        .await;
+        let commit = execute_simple(&ctx, &mut committed, "COMMIT").await;
+        assert!(
+            matches!(&commit[..], [BackendMessage::CommandComplete { tag }] if tag == "COMMIT"),
+            "the transaction must commit before restart: {commit:?}"
+        );
+
+        let mut abandoned = Session::new();
+        execute_simple(&ctx, &mut abandoned, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut abandoned,
+            "INSERT INTO kv (k, v) VALUES ('restart-uncommitted', 'must-not-appear')",
+        )
+        .await;
+        drop(abandoned);
+
+        ctx.engine.shutdown().unwrap();
+        let recovered_engine =
+            Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        recovered_engine
+            .register_table(kv_storage_schema())
+            .unwrap();
+        let recovered_ctx = ctx_with(recovered_engine, ctx.schema.clone());
+
+        assert_eq!(row_count(&recovered_ctx, "restart-committed").await, 1);
+        assert_eq!(row_count(&recovered_ctx, "restart-uncommitted").await, 0);
+        recovered_ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_storage_preflight_rejects_the_entire_postgres_write_set() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new();
+        execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('atomic-good', 'must-not-commit-alone')",
+        )
+        .await;
+
+        let oversized_value = "x".repeat(300 * 1024);
+        let oversized_insert =
+            format!("INSERT INTO kv (k, v) VALUES ('atomic-oversized', '{oversized_value}')");
+        let staged = execute_simple(&ctx, &mut session, &oversized_insert).await;
+        assert!(
+            matches!(&staged[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
+            "the oversized row remains buffered until COMMIT: {staged:?}"
+        );
+
+        let commit = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert!(
+            is_error(&commit, "58000"),
+            "storage preflight failure must fail the commit: {commit:?}"
+        );
+        assert!(!session.in_txn());
+        assert_eq!(row_count(&ctx, "atomic-good").await, 0);
+        assert_eq!(row_count(&ctx, "atomic-oversized").await, 0);
 
         ctx.engine.shutdown().unwrap();
     }
@@ -1131,7 +1727,7 @@ mod txn_atomicity_tests {
     async fn failed_txn_commit_does_not_apply() {
         // A statement that errors inside a txn poisons it; subsequent DML hits
         // 25P02; COMMIT is treated as ROLLBACK and nothing is applied.
-        let (_dir, ctx) = make_ctx(true).await;
+        let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new();
 
         execute_simple(&ctx, &mut session, "BEGIN").await;
@@ -1168,7 +1764,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn select_inside_txn_still_works() {
         // A read inside a transaction is served normally (it does not buffer).
-        let (_dir, ctx) = make_ctx(true).await;
+        let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new();
         execute_simple(&ctx, &mut session, "BEGIN").await;
         let m = execute_simple(&ctx, &mut session, "SELECT 1").await;
@@ -1179,5 +1775,362 @@ mod txn_atomicity_tests {
         );
         assert!(!is_error(&m, "0A000"));
         ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_reads_keep_the_begin_snapshot_after_a_concurrent_commit() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut reader = Session::new();
+        let mut writer = Session::new();
+
+        let inserted = execute_simple(
+            &ctx,
+            &mut writer,
+            "INSERT INTO kv (k, v) VALUES ('snapshot-row', 'before')",
+        )
+        .await;
+        assert!(
+            matches!(&inserted[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
+            "fixture insert must succeed: {inserted:?}"
+        );
+
+        let begin = execute_simple(&ctx, &mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        assert!(
+            matches!(&begin[..], [BackendMessage::CommandComplete { tag }] if tag == "BEGIN"),
+            "serializable transaction must start: {begin:?}"
+        );
+        let read_value = |messages: &[BackendMessage]| {
+            messages.iter().find_map(|message| match message {
+                BackendMessage::DataRow { columns } => columns
+                    .first()
+                    .and_then(Option::as_ref)
+                    .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+                _ => None,
+            })
+        };
+        let before = execute_simple(
+            &ctx,
+            &mut reader,
+            "SELECT v FROM kv WHERE k = 'snapshot-row'",
+        )
+        .await;
+        assert_eq!(read_value(&before).as_deref(), Some("before"));
+
+        let updated = execute_simple(
+            &ctx,
+            &mut writer,
+            "UPDATE kv SET v = 'after' WHERE k = 'snapshot-row'",
+        )
+        .await;
+        assert!(
+            matches!(&updated[..], [BackendMessage::CommandComplete { tag }] if tag == "UPDATE 1"),
+            "concurrent update must commit: {updated:?}"
+        );
+
+        let after = execute_simple(
+            &ctx,
+            &mut reader,
+            "SELECT v FROM kv WHERE k = 'snapshot-row'",
+        )
+        .await;
+        assert_eq!(
+            read_value(&after).as_deref(),
+            Some("before"),
+            "a transaction must read from its BEGIN snapshot after another session commits"
+        );
+
+        execute_simple(&ctx, &mut reader, "ROLLBACK").await;
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_transaction_rejects_followup_read_instead_of_using_current_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut reader = Session::new();
+        let mut writer = Session::new();
+
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "INSERT INTO kv (k, v) VALUES ('expired-read', 'before')",
+        )
+        .await;
+        execute_simple(&ctx, &mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "UPDATE kv SET v = 'after' WHERE k = 'expired-read'",
+        )
+        .await;
+
+        assert_eq!(ctx.mvcc.expire_all_snapshots_for_test(), 1);
+        let messages = execute_simple(
+            &ctx,
+            &mut reader,
+            "SELECT v FROM kv WHERE k = 'expired-read'",
+        )
+        .await;
+        assert!(
+            is_error(&messages, "40001"),
+            "an expired transaction must fail instead of reading the newer row: {messages:?}"
+        );
+        assert!(reader.in_failed_txn());
+
+        execute_simple(&ctx, &mut reader, "ROLLBACK").await;
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_read_only_transaction_cannot_commit_successfully() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new();
+        execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        assert_eq!(ctx.mvcc.expire_all_snapshots_for_test(), 1);
+
+        let messages = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert!(
+            is_error(&messages, "40001"),
+            "expired read-only transactions must fail serialization validation: {messages:?}"
+        );
+        assert!(!session.in_txn(), "the failed transaction is ended");
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_transaction_rejects_extended_protocol_dml_before_buffering() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new();
+        execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        assert_eq!(ctx.mvcc.expire_all_snapshots_for_test(), 1);
+
+        assert!(matches!(
+            session.on_parse(
+                "insert".to_string(),
+                "INSERT INTO kv (k, v) VALUES ($1, 'late-write')",
+                vec![25],
+            ),
+            BackendMessage::ParseComplete
+        ));
+        assert!(matches!(
+            session.on_bind(
+                "expired-portal".to_string(),
+                "insert".to_string(),
+                &[],
+                &[Some(b"expired-write".to_vec())],
+                vec![],
+            ),
+            BackendMessage::BindComplete
+        ));
+
+        let messages = execute_portal_inner(&ctx, &mut session, "expired-portal").await;
+        assert!(
+            is_error(&messages, "40001"),
+            "expired extended DML must fail before it is acknowledged: {messages:?}"
+        );
+        assert!(session.in_failed_txn());
+        assert_eq!(session.txn_writes().len(), 0);
+
+        execute_simple(&ctx, &mut session, "ROLLBACK").await;
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serializable_transaction_reads_its_own_buffered_insert() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new();
+        execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('own-write', 'visible')",
+        )
+        .await;
+
+        let result =
+            execute_simple(&ctx, &mut session, "SELECT v FROM kv WHERE k = 'own-write'").await;
+        let value = result.iter().find_map(|message| match message {
+            BackendMessage::DataRow { columns } => columns
+                .first()
+                .and_then(Option::as_ref)
+                .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+            _ => None,
+        });
+        assert_eq!(value.as_deref(), Some("visible"));
+        execute_simple(&ctx, &mut session, "ROLLBACK").await;
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_reads_its_own_update_and_delete_but_rollback_hides_them() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut seed = Session::new();
+        execute_simple(
+            &ctx,
+            &mut seed,
+            "INSERT INTO kv (k, v) VALUES ('own-update', 'old')",
+        )
+        .await;
+        let mut writer = Session::new();
+        let mut observer = Session::new();
+        execute_simple(&ctx, &mut writer, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "UPDATE kv SET v = 'new' WHERE k = 'own-update'",
+        )
+        .await;
+        let updated =
+            execute_simple(&ctx, &mut writer, "SELECT v FROM kv WHERE k = 'own-update'").await;
+        assert_eq!(read_first_text_column(&updated).as_deref(), Some("new"));
+
+        execute_simple(&ctx, &mut writer, "DELETE FROM kv WHERE k = 'own-update'").await;
+        let deleted =
+            execute_simple(&ctx, &mut writer, "SELECT v FROM kv WHERE k = 'own-update'").await;
+        assert_eq!(read_first_text_column(&deleted), None);
+        assert_eq!(
+            row_count(&ctx, "own-update").await,
+            1,
+            "uncommitted writes stay invisible to other sessions"
+        );
+
+        execute_simple(&ctx, &mut writer, "ROLLBACK").await;
+        let after_rollback = execute_simple(
+            &ctx,
+            &mut observer,
+            "SELECT v FROM kv WHERE k = 'own-update'",
+        )
+        .await;
+        assert_eq!(
+            read_first_text_column(&after_rollback).as_deref(),
+            Some("old")
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serializable_read_write_skew_is_rejected_at_commit() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut seed = Session::new();
+        execute_simple(
+            &ctx,
+            &mut seed,
+            "INSERT INTO kv (k, v) VALUES ('left', '0')",
+        )
+        .await;
+        execute_simple(
+            &ctx,
+            &mut seed,
+            "INSERT INTO kv (k, v) VALUES ('right', '0')",
+        )
+        .await;
+
+        let mut first = Session::new();
+        let mut second = Session::new();
+        execute_simple(&ctx, &mut first, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(&ctx, &mut second, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(&ctx, &mut first, "SELECT v FROM kv WHERE k = 'right'").await;
+        execute_simple(&ctx, &mut second, "SELECT v FROM kv WHERE k = 'left'").await;
+        execute_simple(&ctx, &mut first, "UPDATE kv SET v = '1' WHERE k = 'left'").await;
+        execute_simple(&ctx, &mut second, "UPDATE kv SET v = '1' WHERE k = 'right'").await;
+
+        let first_commit = execute_simple(&ctx, &mut first, "COMMIT").await;
+        assert!(
+            matches!(&first_commit[..], [BackendMessage::CommandComplete { tag }] if tag == "COMMIT")
+        );
+        let second_commit = execute_simple(&ctx, &mut second, "COMMIT").await;
+        assert!(
+            is_error(&second_commit, "40001"),
+            "stale serializable write must abort: {second_commit:?}"
+        );
+        let unchanged =
+            execute_simple(&ctx, &mut first, "SELECT v FROM kv WHERE k = 'right'").await;
+        assert_eq!(read_first_text_column(&unchanged).as_deref(), Some("0"));
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serializable_predicate_read_detects_a_phantom_insert() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut seed = Session::new();
+        execute_simple(
+            &ctx,
+            &mut seed,
+            "INSERT INTO kv (k, v) VALUES ('anchor', '0')",
+        )
+        .await;
+
+        let mut reader = Session::new();
+        let mut inserter = Session::new();
+        execute_simple(&ctx, &mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'missing'").await;
+        execute_simple(&ctx, &mut inserter, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        execute_simple(
+            &ctx,
+            &mut inserter,
+            "INSERT INTO kv (k, v) VALUES ('missing', 'phantom')",
+        )
+        .await;
+        assert!(
+            matches!(&execute_simple(&ctx, &mut inserter, "COMMIT").await[..], [BackendMessage::CommandComplete { tag }] if tag == "COMMIT")
+        );
+
+        execute_simple(
+            &ctx,
+            &mut reader,
+            "UPDATE kv SET v = '1' WHERE k = 'anchor'",
+        )
+        .await;
+        let commit = execute_simple(&ctx, &mut reader, "COMMIT").await;
+        assert!(
+            is_error(&commit, "40001"),
+            "predicate phantom must abort: {commit:?}"
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn extended_protocol_select_uses_serializable_snapshot() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut writer = Session::new();
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "INSERT INTO kv (k, v) VALUES ('extended-snapshot', 'before')",
+        )
+        .await;
+
+        let mut reader = Session::new();
+        execute_simple(&ctx, &mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        reader.on_parse(
+            "read".to_string(),
+            "SELECT v FROM kv WHERE k = 'extended-snapshot'",
+            vec![],
+        );
+        reader.on_bind("portal".to_string(), "read".to_string(), &[], &[], vec![]);
+        let first = execute_portal(&ctx, &mut reader, "portal").await;
+        assert_eq!(read_first_text_column(&first).as_deref(), Some("before"));
+
+        execute_simple(
+            &ctx,
+            &mut writer,
+            "UPDATE kv SET v = 'after' WHERE k = 'extended-snapshot'",
+        )
+        .await;
+        let second = execute_portal(&ctx, &mut reader, "portal").await;
+        assert_eq!(read_first_text_column(&second).as_deref(), Some("before"));
+        execute_simple(&ctx, &mut reader, "ROLLBACK").await;
+        ctx.engine.shutdown().unwrap();
+    }
+
+    fn read_first_text_column(messages: &[BackendMessage]) -> Option<String> {
+        messages.iter().find_map(|message| match message {
+            BackendMessage::DataRow { columns } => columns
+                .first()
+                .and_then(Option::as_ref)
+                .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+            _ => None,
+        })
     }
 }

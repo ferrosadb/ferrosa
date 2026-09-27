@@ -16,10 +16,13 @@
 //! A1b, default 10s). Time is injected (`now: Instant`) so the deadline logic is
 //! deterministically testable with no wall-clock dependence.
 //!
-//! Last revised: 2026-07-20
-//! Last changed: New module — Phase A of the unified transaction manager (t_3120ec2f).
+//! Last revised: 2026-09-26
+//! Last changed: Added startup overrides with error logging and full-default fallback.
 
 use std::collections::HashMap;
+use std::env;
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,6 +58,175 @@ pub const MAX_OPEN_TIMEOUT: Duration = Duration::from_secs(600);
 /// Power-of-10 Rule 3: every server-side dynamic collection has a hard cap). A
 /// `BEGIN` past this FAILS LOUD.
 pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
+
+/// Environment variable names for the CQL transaction registry bounds.
+pub const MAX_OPEN_TRANSACTIONS_ENV: &str = "FERROSA_CQL_TRANSACTION_MAX_OPEN";
+pub const MAX_TRANSACTION_STATEMENTS_ENV: &str = "FERROSA_CQL_TRANSACTION_MAX_STATEMENTS";
+pub const DEFAULT_OPEN_TIMEOUT_MS_ENV: &str = "FERROSA_CQL_TRANSACTION_DEFAULT_TIMEOUT_MS";
+pub const MAX_OPEN_TIMEOUT_MS_ENV: &str = "FERROSA_CQL_TRANSACTION_MAX_TIMEOUT_MS";
+pub const REAPER_SWEEP_INTERVAL_MS_ENV: &str = "FERROSA_CQL_TRANSACTION_REAPER_INTERVAL_MS";
+
+/// Validated runtime settings for the connection-independent CQL transaction
+/// registry. Values default to the established limits and may be overridden by
+/// the environment without rebuilding the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionRegistryConfig {
+    max_entries: usize,
+    max_transaction_statements: usize,
+    default_timeout: Duration,
+    max_timeout: Duration,
+    reaper_sweep_interval: Duration,
+}
+
+/// Invalid transaction registry settings discovered while parsing overrides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionRegistryConfigError(String);
+
+impl fmt::Display for TransactionRegistryConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for TransactionRegistryConfigError {}
+
+impl Default for TransactionRegistryConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: DEFAULT_MAX_ENTRIES,
+            max_transaction_statements: crate::session::DEFAULT_MAX_TXN_STATEMENTS,
+            default_timeout: DEFAULT_OPEN_TIMEOUT,
+            max_timeout: MAX_OPEN_TIMEOUT,
+            reaper_sweep_interval: REAPER_SWEEP_INTERVAL,
+        }
+    }
+}
+
+impl TransactionRegistryConfig {
+    /// Parse optional environment values. This pure entry point keeps tests
+    /// deterministic; production uses [`Self::from_env`].
+    pub fn from_overrides(
+        max_entries: Option<&str>,
+        max_transaction_statements: Option<&str>,
+        default_timeout_ms: Option<&str>,
+        max_timeout_ms: Option<&str>,
+        reaper_sweep_interval_ms: Option<&str>,
+    ) -> Result<Self, TransactionRegistryConfigError> {
+        let defaults = Self::default();
+        let max_entries =
+            parse_positive_usize(MAX_OPEN_TRANSACTIONS_ENV, max_entries, defaults.max_entries)?;
+        let max_transaction_statements = parse_positive_usize(
+            MAX_TRANSACTION_STATEMENTS_ENV,
+            max_transaction_statements,
+            defaults.max_transaction_statements,
+        )?;
+        let default_timeout = parse_positive_duration(
+            DEFAULT_OPEN_TIMEOUT_MS_ENV,
+            default_timeout_ms,
+            defaults.default_timeout,
+        )?;
+        let max_timeout = parse_positive_duration(
+            MAX_OPEN_TIMEOUT_MS_ENV,
+            max_timeout_ms,
+            defaults.max_timeout,
+        )?;
+        let reaper_sweep_interval = parse_positive_duration(
+            REAPER_SWEEP_INTERVAL_MS_ENV,
+            reaper_sweep_interval_ms,
+            defaults.reaper_sweep_interval,
+        )?;
+
+        if default_timeout > max_timeout {
+            return Err(TransactionRegistryConfigError(format!(
+                "{DEFAULT_OPEN_TIMEOUT_MS_ENV} ({}) must not exceed {MAX_OPEN_TIMEOUT_MS_ENV} ({})",
+                default_timeout.as_millis(),
+                max_timeout.as_millis()
+            )));
+        }
+
+        Ok(Self {
+            max_entries,
+            max_transaction_statements,
+            default_timeout,
+            max_timeout,
+            reaper_sweep_interval,
+        })
+    }
+
+    /// Load registry bounds from environment variables. If any supplied value
+    /// is malformed or inconsistent, log the error and use the full defaults.
+    pub fn from_env() -> Self {
+        fn read(name: &str) -> Result<Option<String>, TransactionRegistryConfigError> {
+            match env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(error) => Err(TransactionRegistryConfigError(format!(
+                    "could not read {name}: {error}"
+                ))),
+            }
+        }
+
+        let config = (|| {
+            let max_entries = read(MAX_OPEN_TRANSACTIONS_ENV)?;
+            let max_transaction_statements = read(MAX_TRANSACTION_STATEMENTS_ENV)?;
+            let default_timeout_ms = read(DEFAULT_OPEN_TIMEOUT_MS_ENV)?;
+            let max_timeout_ms = read(MAX_OPEN_TIMEOUT_MS_ENV)?;
+            let reaper_sweep_interval_ms = read(REAPER_SWEEP_INTERVAL_MS_ENV)?;
+            Self::from_overrides(
+                max_entries.as_deref(),
+                max_transaction_statements.as_deref(),
+                default_timeout_ms.as_deref(),
+                max_timeout_ms.as_deref(),
+                reaper_sweep_interval_ms.as_deref(),
+            )
+        })();
+        match config {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(%error, "invalid CQL transaction registry configuration; using defaults");
+                Self::default()
+            }
+        }
+    }
+}
+
+fn parse_positive_usize(
+    name: &str,
+    value: Option<&str>,
+    default: usize,
+) -> Result<usize, TransactionRegistryConfigError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let parsed = value.parse::<usize>().map_err(|error| {
+        TransactionRegistryConfigError(format!("invalid {name} value {value:?}: {error}"))
+    })?;
+    if parsed == 0 {
+        return Err(TransactionRegistryConfigError(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_duration(
+    name: &str,
+    value: Option<&str>,
+    default: Duration,
+) -> Result<Duration, TransactionRegistryConfigError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let millis = value.parse::<u64>().map_err(|error| {
+        TransactionRegistryConfigError(format!("invalid {name} value {value:?}: {error}"))
+    })?;
+    if millis == 0 {
+        return Err(TransactionRegistryConfigError(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(Duration::from_millis(millis))
+}
 
 /// Bounded retries when minting a fresh id, so id generation cannot loop forever
 /// on the (astronomically unreachable) event of a 128-bit collision.
@@ -111,13 +283,15 @@ struct TransactionEntry {
 pub struct TransactionRegistry {
     entries: HashMap<CqlTxnId, TransactionEntry>,
     max_entries: usize,
+    max_transaction_statements: usize,
     default_timeout: Duration,
     max_timeout: Duration,
+    reaper_sweep_interval: Duration,
 }
 
 impl Default for TransactionRegistry {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_ENTRIES, DEFAULT_OPEN_TIMEOUT, MAX_OPEN_TIMEOUT)
+        Self::with_config(TransactionRegistryConfig::default())
     }
 }
 
@@ -128,8 +302,22 @@ impl TransactionRegistry {
         Self {
             entries: HashMap::new(),
             max_entries,
+            max_transaction_statements: crate::session::DEFAULT_MAX_TXN_STATEMENTS,
             default_timeout,
             max_timeout,
+            reaper_sweep_interval: REAPER_SWEEP_INTERVAL,
+        }
+    }
+
+    /// Construct a registry with validated runtime settings.
+    pub fn with_config(config: TransactionRegistryConfig) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries: config.max_entries,
+            max_transaction_statements: config.max_transaction_statements,
+            default_timeout: config.default_timeout,
+            max_timeout: config.max_timeout,
+            reaper_sweep_interval: config.reaper_sweep_interval,
         }
     }
 
@@ -137,6 +325,15 @@ impl TransactionRegistry {
     /// convenience for front-end wiring so callers need not name `parking_lot`.
     pub fn shared_default() -> SharedTransactionRegistry {
         Arc::new(Mutex::new(Self::default()))
+    }
+
+    /// Build a shared registry from values loaded at server startup.
+    pub fn shared_with_config(config: TransactionRegistryConfig) -> SharedTransactionRegistry {
+        Arc::new(Mutex::new(Self::with_config(config)))
+    }
+
+    fn reaper_sweep_interval(&self) -> Duration {
+        self.reaper_sweep_interval
     }
 
     /// Number of currently open transactions.
@@ -181,7 +378,7 @@ impl TransactionRegistry {
         }
         let timeout = self.resolve_timeout(timeout_override)?;
         let id = self.fresh_id()?;
-        let mut txn = CqlTransaction::new();
+        let mut txn = CqlTransaction::with_write_limit(self.max_transaction_statements);
         // A registry entry only ever holds an OPEN transaction; opening a fresh
         // machine cannot fail (assertion — Power-of-10 Rule 5).
         txn.begin()
@@ -367,7 +564,8 @@ pub fn spawn_transaction_reaper(
     registry: SharedTransactionRegistry,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(REAPER_SWEEP_INTERVAL);
+        let sweep_interval = registry.lock().reaper_sweep_interval();
+        let mut ticker = tokio::time::interval(sweep_interval);
         loop {
             ticker.tick().await;
             let reaped = registry.lock().reap_expired(Instant::now());
@@ -571,5 +769,94 @@ mod tests {
         let parsed = CqlTxnId::parse(&text).unwrap();
         assert_eq!(id, parsed, "an id survives Display -> parse round trip");
         assert!(CqlTxnId::parse("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn transaction_registry_config_defaults_preserve_existing_bounds() {
+        let config =
+            TransactionRegistryConfig::from_overrides(None, None, None, None, None).unwrap();
+
+        assert_eq!(config.max_entries, DEFAULT_MAX_ENTRIES);
+        assert_eq!(
+            config.max_transaction_statements,
+            crate::session::DEFAULT_MAX_TXN_STATEMENTS
+        );
+        assert_eq!(config.default_timeout, DEFAULT_OPEN_TIMEOUT);
+        assert_eq!(config.max_timeout, MAX_OPEN_TIMEOUT);
+        assert_eq!(config.reaper_sweep_interval, REAPER_SWEEP_INTERVAL);
+    }
+
+    #[test]
+    fn transaction_registry_config_accepts_runtime_overrides() {
+        let config = TransactionRegistryConfig::from_overrides(
+            Some("2500"),
+            Some("200"),
+            Some("20000"),
+            Some("90000"),
+            Some("250"),
+        )
+        .unwrap();
+
+        assert_eq!(config.max_entries, 2500);
+        assert_eq!(config.max_transaction_statements, 200);
+        assert_eq!(config.default_timeout, Duration::from_secs(20));
+        assert_eq!(config.max_timeout, Duration::from_secs(90));
+        assert_eq!(config.reaper_sweep_interval, Duration::from_millis(250));
+
+        let mut registry = TransactionRegistry::with_config(config);
+        assert_eq!(registry.default_timeout(), Duration::from_secs(20));
+        assert!(registry
+            .begin("alice", Instant::now(), Some(Duration::from_secs(90)))
+            .is_ok());
+        assert!(registry
+            .begin(
+                "alice",
+                Instant::now(),
+                Some(Duration::from_secs(90) + Duration::from_millis(1)),
+            )
+            .is_err());
+
+        let mut capped = TransactionRegistry::with_config(
+            TransactionRegistryConfig::from_overrides(Some("1"), None, None, None, None).unwrap(),
+        );
+        let now = Instant::now();
+        capped.begin("alice", now, None).unwrap();
+        assert!(matches!(
+            capped.begin("alice", now, None),
+            Err(CqlError::Overloaded(_))
+        ));
+
+        let mut write_limited = TransactionRegistry::with_config(
+            TransactionRegistryConfig::from_overrides(None, Some("2"), None, None, None).unwrap(),
+        );
+        let id = write_limited.begin("alice", now, None).unwrap();
+        write_limited.stage(id, "alice", now, tw(b"a")).unwrap();
+        write_limited.stage(id, "alice", now, tw(b"b")).unwrap();
+        assert!(write_limited.stage(id, "alice", now, tw(b"c")).is_err());
+    }
+
+    #[test]
+    fn transaction_registry_config_rejects_invalid_bounds() {
+        for (max_entries, max_statements, default_timeout_ms, max_timeout_ms, reaper_ms) in [
+            (Some("0"), None, None, None, None),
+            (None, Some("0"), None, None, None),
+            (None, None, Some("0"), None, None),
+            (None, None, None, Some("0"), None),
+            (None, None, None, None, Some("0")),
+            (None, None, Some("10001"), Some("10000"), None),
+            (Some("nope"), None, None, None, None),
+        ] {
+            assert!(
+                TransactionRegistryConfig::from_overrides(
+                    max_entries,
+                    max_statements,
+                    default_timeout_ms,
+                    max_timeout_ms,
+                    reaper_ms,
+                )
+                .is_err(),
+                "invalid transaction registry settings must fail loudly"
+            );
+        }
     }
 }

@@ -103,76 +103,191 @@ impl AccordTransactionCommitter {
 
 #[async_trait]
 impl TransactionCommitter for AccordTransactionCommitter {
+    fn register_postgres_mvcc_observer(
+        &self,
+        observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
+    ) -> Result<(), CommitError> {
+        self.applier
+            .register_postgres_mvcc_observer(observer)
+            .map_err(|reason| CommitError { reason })
+    }
+
     async fn commit(&self, writes: Vec<TransactionWrite>) -> Result<CommitOutcome, CommitError> {
         // BEGIN; COMMIT; with no DML is a no-op — never drive Accord for nothing.
         if writes.is_empty() {
             return Ok(CommitOutcome::Committed);
         }
 
-        // 1. Resolve each key's replicas; fail loud on an unplaceable key (never
-        //    commit a write to a guessed/empty replica set).
-        let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
-        let mut per_key: HashMap<Vec<u8>, Vec<Uuid>> = HashMap::new();
-        for w in &writes {
-            let replicas = (self.resolve)(&w.keyspace, &w.key).ok_or_else(|| CommitError {
-                reason: format!(
-                    "no replicas resolved for a key in keyspace '{}' (cluster mode required)",
-                    w.keyspace
-                ),
+        drive_accord(self, writes, ReadPredicate::Always, None)
+            .await
+            .map_err(|error| CommitError {
+                reason: error.to_string(),
             })?;
-            if replicas.is_empty() {
-                return Err(CommitError {
-                    reason: format!("empty replica set for a key in keyspace '{}'", w.keyspace),
-                });
-            }
-            for r in &replicas {
-                replica_union.insert(*r);
-            }
-            per_key.insert(w.key.clone(), replicas);
-        }
-        let replica_ids: Vec<Uuid> = replica_union.into_iter().collect();
+        Ok(CommitOutcome::Committed)
+    }
 
-        // 2. Build the write-set + the per-key participant resolver for the driver.
-        let write_set: Vec<(Vec<u8>, Vec<u8>)> =
-            writes.into_iter().map(|w| (w.key, w.mutation)).collect();
-        let per_key = Arc::new(per_key);
-        let pk = per_key.clone();
-        let participant_resolver =
-            move |k: &[u8]| -> Vec<Uuid> { pk.get(k).cloned().unwrap_or_default() };
+    async fn begin_postgres_snapshot(
+        &self,
+        keyspace: &str,
+    ) -> Result<ferrosa_common::accord::Timestamp, CommitError> {
+        use ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_BARRIER_KEY;
 
-        // 3. Drive one unconditional multi-key Accord transaction.
-        let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
-            self.node_id,
-            replica_ids,
-            self.transport.clone(),
-            false,
-            &self.clock,
-            write_set,
+        drive_accord(
+            self,
+            vec![TransactionWrite {
+                keyspace: keyspace.to_string(),
+                key: POSTGRES_TRANSACTION_BARRIER_KEY.to_vec(),
+                mutation: Vec::new(),
+            }],
+            ReadPredicate::SnapshotBarrier,
+            None,
         )
-        .with_per_key_replicas(Arc::new(participant_resolver))
-        .with_local_applier(self.applier.clone())
-        .with_read_predicate(ReadPredicate::Always);
+        .await
+        .map_err(|error| CommitError {
+            reason: error.to_string(),
+        })
+    }
 
-        // When the coordinator is itself a replica, let it vote on its own
-        // PreAccept locally rather than dial itself (unreachable in its own peer
-        // map). Without this a sole-replica transaction never reaches quorum.
-        if let Some(state) = &self.local_accord_state {
-            driver = driver.with_local_accord_state(state.clone());
+    async fn validate_postgres_snapshot(
+        &self,
+        keyspace: &str,
+        snapshot: ferrosa_common::accord::Timestamp,
+    ) -> Result<bool, CommitError> {
+        use ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_BARRIER_KEY;
+
+        match drive_accord(
+            self,
+            vec![TransactionWrite {
+                keyspace: keyspace.to_string(),
+                key: POSTGRES_TRANSACTION_BARRIER_KEY.to_vec(),
+                mutation: Vec::new(),
+            }],
+            ReadPredicate::SnapshotBarrier,
+            Some(snapshot),
+        )
+        .await
+        {
+            Ok(_) => Ok(true),
+            Err(AccordDriverError::SnapshotStale) => Ok(false),
+            Err(error) => Err(CommitError {
+                reason: error.to_string(),
+            }),
         }
+    }
 
-        match driver.run_transaction().await {
+    async fn commit_postgres(
+        &self,
+        keyspace: &str,
+        mut writes: Vec<TransactionWrite>,
+        _tables: Vec<String>,
+        snapshot: ferrosa_common::accord::Timestamp,
+    ) -> Result<CommitOutcome, CommitError> {
+        use ferrosa_storage::accord::conflict_index::{
+            POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
+        };
+
+        // The barrier key orders all BEGIN/COMMIT barriers. A second commit-only
+        // marker advances only for data transaction completions, so a BEGIN after
+        // our snapshot doesn't invalidate it. Empty mutation bytes participate in
+        // Accord conflicts and Apply finalization, but the storage applier drops
+        // them before applying data mutations.
+        writes.push(TransactionWrite {
+            keyspace: keyspace.to_string(),
+            key: POSTGRES_TRANSACTION_BARRIER_KEY.to_vec(),
+            mutation: Vec::new(),
+        });
+        writes.push(TransactionWrite {
+            keyspace: keyspace.to_string(),
+            key: POSTGRES_TRANSACTION_MARKER_KEY.to_vec(),
+            mutation: Vec::new(),
+        });
+
+        match drive_accord(self, writes, ReadPredicate::Always, Some(snapshot)).await {
             Ok(_) => Ok(CommitOutcome::Committed),
-            // A general transaction is unconditional (Always mode), so a condition
-            // abort should not arise — map it cleanly if it ever does.
-            Err(AccordDriverError::ConditionNotMet { .. }) => Ok(CommitOutcome::Aborted {
-                reason: "transaction condition not met".to_string(),
+            Err(AccordDriverError::SnapshotStale) => Ok(CommitOutcome::Aborted {
+                reason: "PostgreSQL transaction snapshot is stale".to_string(),
             }),
-            // Quorum/network/codec failures: the commit did not reach a decision —
-            // surface as Err so the front-end never acks an uncommitted transaction.
-            Err(e) => Err(CommitError {
-                reason: e.to_string(),
+            Err(error) => Err(CommitError {
+                reason: error.to_string(),
             }),
         }
+    }
+}
+
+async fn drive_accord(
+    committer: &AccordTransactionCommitter,
+    writes: Vec<TransactionWrite>,
+    predicate: ReadPredicate,
+    snapshot_ts: Option<ferrosa_common::accord::Timestamp>,
+) -> Result<ferrosa_common::accord::Timestamp, AccordDriverError> {
+    if writes.is_empty() {
+        return Err(AccordDriverError::Network(
+            "Accord transaction requires at least one conflict key".to_string(),
+        ));
+    }
+
+    // 1. Resolve each key's replicas; fail loud on an unplaceable key (never
+    //    commit a write to a guessed/empty replica set).
+    let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
+    let mut per_key: HashMap<Vec<u8>, Vec<Uuid>> = HashMap::new();
+    for w in &writes {
+        let replicas = (committer.resolve)(&w.keyspace, &w.key).ok_or_else(|| {
+            AccordDriverError::Network(format!(
+                "no replicas resolved for a key in keyspace '{}' (cluster mode required)",
+                w.keyspace
+            ))
+        })?;
+        if replicas.is_empty() {
+            return Err(AccordDriverError::Network(format!(
+                "empty replica set for a key in keyspace '{}'",
+                w.keyspace
+            )));
+        }
+        for r in &replicas {
+            replica_union.insert(*r);
+        }
+        per_key.insert(w.key.clone(), replicas);
+    }
+    let replica_ids: Vec<Uuid> = replica_union.into_iter().collect();
+
+    // 2. Build the write-set + the per-key participant resolver for the driver.
+    let write_set: Vec<(Vec<u8>, Vec<u8>)> =
+        writes.into_iter().map(|w| (w.key, w.mutation)).collect();
+    let per_key = Arc::new(per_key);
+    let pk = per_key.clone();
+    let participant_resolver =
+        move |k: &[u8]| -> Vec<Uuid> { pk.get(k).cloned().unwrap_or_default() };
+
+    // 3. Drive one unconditional multi-key Accord transaction.
+    let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+        committer.node_id,
+        replica_ids,
+        committer.transport.clone(),
+        false,
+        &committer.clock,
+        write_set,
+    )
+    .with_per_key_replicas(Arc::new(participant_resolver))
+    .with_local_applier(committer.applier.clone())
+    .with_read_predicate(predicate);
+    if let Some(snapshot_ts) = snapshot_ts {
+        driver = driver.with_postgres_snapshot(snapshot_ts);
+    }
+
+    // When the coordinator is itself a replica, let it vote on its own
+    // PreAccept locally rather than dial itself (unreachable in its own peer
+    // map). Without this a sole-replica transaction never reaches quorum.
+    if let Some(state) = &committer.local_accord_state {
+        driver = driver.with_local_accord_state(state.clone());
+    }
+
+    match driver.run_transaction().await {
+        Ok((timestamp, _)) => Ok(timestamp),
+        // A general transaction is unconditional (Always mode), so a condition
+        // abort should not arise — map it cleanly if it ever does.
+        // Quorum/network/codec failures: the commit did not reach a decision —
+        // surface as Err so the front-end never acks an uncommitted transaction.
+        Err(e) => Err(e),
     }
 }
 

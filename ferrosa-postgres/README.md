@@ -19,10 +19,16 @@ byte-identically over CQL — without `ferrosa-postgres` ever depending on the
 ~54k-LOC `ferrosa-cql` crate.
 
 This is a **developer preview**. See [specs/fmea.md](specs/fmea.md) for the exact
-supported-vs-not surface. Now wired: transaction atomicity via Accord,
-parameterized DML, and `INSERT … RETURNING`. Key remaining gaps: `ON CONFLICT`,
-`UPDATE`/`DELETE … RETURNING`, `= ANY($N)` / IN-lists, and read-your-writes
-inside an open transaction block.
+supported-vs-not surface. PostgreSQL transactions use a PostgreSQL-owned MVCC
+manager; CQL/Cassandra transactions remain on Accord. In cluster mode, PostgreSQL
+commits submit PG-owned mutations and a snapshot through Accord. A global PG
+marker conservatively conflicts all PostgreSQL data commits; the read/write table
+set is not yet used for per-table Accord validation. Accord apply carries
+PostgreSQL row-version metadata to replicas, where each node retains history for
+its active snapshots. The distributed path has native-driver coverage; the
+Jepsen strict-serializability workload remains an acceptance gate.
+Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
+`= ANY($N)` / IN-lists.
 
 ## What's implemented
 
@@ -53,26 +59,34 @@ inside an open transaction block.
   generated/echoed key. RETURNING rows honor the portal's result formats (binary
   works). `UPDATE`/`DELETE … RETURNING`, `ON CONFLICT`, and `= ANY($N)` are
   **not yet supported** and fail loud (`0A000`/parse error), never silently.
-- **Transaction atomicity via Accord** (FMEA PG-1) — `BEGIN`/`COMMIT`/`ROLLBACK`
-  drive the `ReadyForQuery` status byte `I`/`T`/`E`, and DML inside an open `T`
-  block is **buffered** as a `ferrosa_storage::accord::TransactionWrite` instead
-  of applied (`apply_or_buffer` in `query.rs`) — over BOTH the simple and the
-  extended (parameterized) protocols. `COMMIT` drives the whole write-set through
-  the injected `TransactionCommitter` as one atomic multi-key Accord transaction
-  (`commit_txn` in `server.rs`); `ROLLBACK` discards the buffer so the writes are
-  **never applied**. `INSERT … RETURNING` inside a `T` block returns its rows now
-  (built from the in-memory values) while the write commits at COMMIT. Fail-loud:
-  a statement that errors inside a block poisons it (`T → E`, only
-  `COMMIT`/`ROLLBACK` accepted, `25P02`); in standalone mode (no committer) a
-  `COMMIT` carrying buffered DML fails loud (`0A000`, cluster mode required)
-  rather than faking atomicity; an empty write-set commits cleanly. The buffer is
-  capped at `MAX_TXN_WRITES` (10 000). This mirrors the CQL `CqlTransaction` path.
-  *Not yet:* read-your-writes inside the open block (buffered writes are not
-  visible to in-transaction reads).
+- **PostgreSQL MVCC transactions** — explicit `BEGIN ISOLATION LEVEL
+  SERIALIZABLE` pins a
+  local or Accord cluster timestamp. Simple and extended `SELECT` use sparse row
+  overlays to restore versions changed after that timestamp; in-transaction
+  inserts, updates, and deletes are visible to their own reads. Commit validates
+  the transaction's read and write tables against local PostgreSQL MVCC epochs
+  in standalone mode. In cluster mode, a global PostgreSQL commit marker checks
+  the snapshot against every intervening PostgreSQL data commit; the table set
+  is not yet used for per-table Accord validation, so unrelated transactions can
+  cause conservative `40001` aborts. Accord atomically applies the buffered
+  mutation batch. Row versions are staged before replica storage
+  apply and made visible after the atomic batch succeeds. Conflicts return
+  `40001`; rollback and failed transactions
+  discard uncommitted mutations. Only explicit `SERIALIZABLE` is supported;
+  explicit `READ COMMITTED` and `REPEATABLE READ` fail with `0A000`. Unqualified
+  `BEGIN` retains its legacy behavior and is not labeled strict serializable.
+  Versions older than every live snapshot are reclaimed automatically. The
+  buffered write set defaults to a 10,000 mutation cap, and each storage scan
+  defaults to a 64-row channel; both are startup-configurable. PostgreSQL also
+  expires active snapshots past a configurable maximum age so old transactions
+  cannot retain history indefinitely. Distributed row-version history is
+  in-memory and scoped to active process snapshots; storage serves snapshots
+  begun after restart. The Jepsen
+  strict-serializability workload remains outstanding.
 - **DML execution** — INSERT/UPDATE/DELETE build storage rows through the shared
-  `ferrosa-row-bridge` encoder. **Autocommit** (no open transaction) applies
-  immediately via `engine.write_atomic_batch`; **inside a transaction** the write
-  is buffered (see above). UPDATE/DELETE are Cassandra-style blind
+  `ferrosa-row-bridge` encoder. **Autocommit** uses the PostgreSQL MVCC commit
+  path; **inside a transaction** the write is buffered until commit (see above).
+  UPDATE/DELETE are Cassandra-style blind
   upserts/tombstones keyed by a full-primary-key equality `WHERE` (reported as
   `UPDATE 1` / `DELETE 1`).
 - **`pg_catalog` projection** — `catalog` projects `pg_namespace`/`pg_class`/
@@ -80,14 +94,34 @@ inside an open transaction block.
 - **TCP server** — `serve` / `QueryContext`: one spawned task per connection over
   a tokio `TcpListener`, sharing the auth store and the storage+schema context.
 
+## PostgreSQL MVCC resource bounds
+
+These startup environment variables can be changed without recompiling. Invalid
+values log an error and the process uses the complete defaults:
+
+| Environment variable | Default | Bound |
+|---|---:|---|
+| `FERROSA_POSTGRES_MAX_TXN_WRITES` | `10000` | Buffered mutations per transaction |
+| `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | `64` | In-flight rows between storage and the SQL executor |
+| `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
+| `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry and history-pruning interval |
+
+The scan buffer is a storage-side backpressure bound. The relational executor
+and PostgreSQL protocol renderer still materialize full query results. See the
+public [`PROFILE.md`](../PROFILE.md) for tuning guidance and caveats.
+
 ## Data flow
 
 **Read (`SELECT`):** `Q`/`Execute` → `ferrosa_sql::parse_statement` →
-`load_catalog` materializes each referenced table (the async
-`StorageEngine::range_iter` stream is drained up front and decomposed via the
-shared `ferrosa_row_bridge::partition_to_rows_with_storage_mapping`) into an
-`InMemoryTable` → `offload::execute_offloaded` runs the sync operators **on a
-blocking thread** → `RowDescription` + `DataRow`s +
+`load_catalog` opens each referenced table as a streamed storage provider. A
+snapshot's sparse MVCC row overlay replaces current versions and restores
+deleted historical rows as the scan passes. The provider uses a bounded channel
+and decodes one storage partition at a time, but the relational executor
+materializes base scan rows and `QueryResult.rows`; rendering then builds a
+second vector of all wire messages before sending. Thus query execution and
+protocol output are not end-to-end streaming and peak memory grows with result
+size. `offload::execute_offloaded` runs the sync operators **on a blocking
+thread** → `RowDescription` + `DataRow`s +
 `CommandComplete "SELECT n"`.
 
 `ferrosa_sql::execute` is synchronous and CPU-bound (scan, filter, sort,
@@ -99,19 +133,22 @@ through `offload::execute_offloaded`, and
 `offload::tests::executor_does_not_run_on_the_async_worker` fails if either
 regresses (forge t_d3b2dec1).
 
-Known limitation: `load_catalog` still materializes whole tables, so a
-full-table `SELECT` is bounded by table size rather than by the query. That is
-tracked as forge t_f348ba0b, and it is gated on making `ferrosa_sql`'s
-`QueryResult` stream (t_50d99192) — streaming the loader alone would only move
-the memory peak.
+Known limitation: source-side scanning is bounded by one partition plus the
+channel, but the synchronous executor collects rows and the wire path collects
+encoded messages. A full-table query can therefore use memory proportional to
+its input/result size. End-to-end streaming requires changes to `ferrosa_sql`
+and the PostgreSQL message writer; streaming only the storage loader does not
+remove the materialization peak.
 
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +
 `build_row`/`build_delete_row` (the SAME `ferrosa-row-bridge` encoder CQL uses) →
-build a `Mutation` → `apply_or_buffer`: **autocommit** →
-`engine.write_atomic_batch` and `CommandComplete`; **in a transaction** →
-serialize the `Mutation` into a buffered `TransactionWrite` (applied later by the
-committer on `COMMIT`) and `CommandComplete`.
+build a `Mutation` → `apply_or_buffer`: **autocommit** → apply and publish MVCC
+row versions; **in a transaction** → buffer a PostgreSQL-owned `PgWrite`, later
+atomically applied by the PostgreSQL MVCC commit path. With a cluster committer,
+the PG-owned mutation batch is submitted through Accord. PostgreSQL MVCC read
+validation remains process-local and is not part of Accord's decision. CQL
+transaction writes retain their existing Accord contract.
 
 See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 
@@ -155,8 +192,8 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 
 ## Tests
 
-~119 in-crate unit tests (codec/messages/scram/handshake/connection/extended/
-query/storage_provider/catalog/store + `txn_atomicity_tests`) run with no
+134 in-crate unit tests (codec/messages/scram/handshake/connection/extended/
+query/storage_provider/catalog/store + `mvcc`/transaction tests) run with no
 infrastructure, plus integration tests:
 
 - `tests/m1_join_live.rs` (15) — full stack over a real `tokio-postgres` driver
@@ -164,9 +201,8 @@ infrastructure, plus integration tests:
   BY/LIMIT, error-recovery-after-`Sync`, AND the parameterized DML path
   (`INSERT`/`UPDATE`/`DELETE` via `$N`, `INSERT … RETURNING id`/`*`,
   `UPDATE`/`DELETE … RETURNING` fail-loud, and extended-protocol DML inside a
-  transaction: BEGIN/INSERT RETURNING/ROLLBACK discards, BEGIN/INSERT/COMMIT
-  via a mock committer, and standalone-COMMIT fail-loud). Local temp engine, no
-  Docker.
+  transaction: BEGIN/INSERT RETURNING/ROLLBACK discards and BEGIN/INSERT/COMMIT
+  uses the PostgreSQL MVCC manager). Local temp engine, no Docker.
 - `tests/scram_live.rs` (3) — real-driver SCRAM + `SELECT 1`, extended
   expression select, wrong-password rejection. In-process loopback.
 - `tests/differential_oracle.rs` (3, `#[cfg(feature = "live-infra-tests")]`) —

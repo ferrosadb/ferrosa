@@ -216,6 +216,26 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 - **Client** (`client.rs`) — a thin CQL client reusing `CqlCodec`, used by
   `ferrosa-ctl`.
 
+## CQL Accord transaction bounds
+
+The connection-independent `BEGIN TRANSACTION` registry has per-node runtime
+bounds loaded at startup. Environment variables override these defaults without
+rebuilding Ferrosa:
+
+| Environment variable | Default | Bound |
+|---|---:|---|
+| `FERROSA_CQL_TRANSACTION_MAX_OPEN` | `10000` | Open transactions in the node registry |
+| `FERROSA_CQL_TRANSACTION_MAX_STATEMENTS` | `10000` | Staged reads and writes combined per transaction |
+| `FERROSA_CQL_TRANSACTION_DEFAULT_TIMEOUT_MS` | `10000` | Default open transaction lifetime in milliseconds |
+| `FERROSA_CQL_TRANSACTION_MAX_TIMEOUT_MS` | `600000` | Largest accepted `USING TIMEOUT` value in milliseconds |
+| `FERROSA_CQL_TRANSACTION_REAPER_INTERVAL_MS` | `1000` | Expiration sweep cadence in milliseconds |
+
+All values must be positive, and the default timeout must not exceed the maximum.
+Malformed or inconsistent overrides log an error and use the defaults without
+stopping startup. The timeout evicts abandoned staged state; the registry and
+per-transaction statement caps bound concurrent memory use. See the public
+[`PROFILE.md`](../PROFILE.md) for the operator tuning guide.
+
 ## Bridge re-export (D10)
 
 The byte-for-byte CQL row codec and `Partition`→row decomposition do **not** live

@@ -13,15 +13,20 @@ fn crate_file(relative: &str) -> String {
 }
 
 fn assert_feature_gated(source: &str, test_name: &str) {
+    assert_feature_gated_by(source, test_name, "live-infra-tests");
+}
+
+fn assert_feature_gated_by(source: &str, test_name: &str, feature: &str) {
     let marker = format!("fn {test_name}(");
     let byte_index = source
         .find(&marker)
         .unwrap_or_else(|| panic!("missing live infra test {test_name}"));
     let prefix = &source[..byte_index];
     let nearby_attrs = prefix.lines().rev().take(4).collect::<Vec<_>>().join("\n");
+    let expected = format!(r#"#[cfg(feature = "{feature}")]"#);
     assert!(
-        nearby_attrs.contains(r#"#[cfg(feature = "live-infra-tests")]"#),
-        "{test_name} must be behind #[cfg(feature = \"live-infra-tests\")] so default cargo test does not report a missing-infra body as passed; attrs were:\n{nearby_attrs}"
+        nearby_attrs.contains(&expected),
+        "{test_name} must be behind {expected} so default cargo test does not report a missing-infra body as passed; attrs were:\n{nearby_attrs}"
     );
 }
 
@@ -63,6 +68,10 @@ fn live_infra_tests_are_feature_gated_not_false_passes() {
             "nemesis_kill_minority_docker",
         ),
         ("tests/nemesis_correctness.rs", "nemesis_clock_skew_docker"),
+        (
+            "tests/postgres_strict_serializable.rs",
+            "postgres_transactions_are_strictly_serializable",
+        ),
         ("tests/smoke_tier.rs", "smoke_tier_end_to_end"),
         ("tests/t3_topology.rs", "t3_topology_brings_up_two_dcs"),
         (
@@ -73,7 +82,11 @@ fn live_infra_tests_are_feature_gated_not_false_passes() {
 
     for (file, test_name) in cases {
         let source = crate_file(file);
-        assert_feature_gated(&source, test_name);
+        if file == "tests/postgres_strict_serializable.rs" {
+            assert_feature_gated_by(&source, test_name, "postgres-jepsen");
+        } else {
+            assert_feature_gated(&source, test_name);
+        }
     }
 }
 
@@ -89,4 +102,9 @@ fn all_live_only_test_targets_are_feature_gated() {
             "{file} performs only live CQL queries and must be absent from default cargo test"
         );
     }
+    let source = crate_file("tests/postgres_strict_serializable.rs");
+    assert!(
+        source.contains(r#"#![cfg(feature = "postgres-jepsen")]"#),
+        "PostgreSQL Jepsen target must be absent unless postgres-jepsen is enabled"
+    );
 }

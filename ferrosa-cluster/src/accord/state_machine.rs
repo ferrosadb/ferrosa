@@ -63,6 +63,10 @@ pub enum SmResponse {
         txn_id: TxnId,
         promised: PromisedBallot,
     },
+    /// A PostgreSQL snapshot is older than a conflicting transaction already
+    /// known to this replica. No conflict-index entries were added for the
+    /// rejected transaction.
+    SnapshotStale,
     /// No response (fire-and-forget: Commit, Apply).
     None,
 }
@@ -392,7 +396,21 @@ impl AccordStateMachine {
         t0: Timestamp,
         keys: &[&[u8]],
         ballot: BallotNumber,
+        epoch: u64,
+    ) -> SmResponse {
+        self.handle_preaccept_multi_with_snapshot(txn_id, t0, keys, ballot, epoch, None)
+    }
+
+    /// Snapshot-aware variant used only by PostgreSQL's Accord commit path.
+    /// CQL transactions continue through [`Self::handle_preaccept_multi`].
+    pub fn handle_preaccept_multi_with_snapshot(
+        &mut self,
+        txn_id: TxnId,
+        t0: Timestamp,
+        keys: &[&[u8]],
+        ballot: BallotNumber,
         _epoch: u64,
+        snapshot_ts: Option<Timestamp>,
     ) -> SmResponse {
         // Check if we've already promised a higher ballot for this txn.
         if let Some(state) = self.txn_states.get(&txn_id) {
@@ -421,6 +439,17 @@ impl AccordStateMachine {
             }
         }
 
+        // Check before registering this transaction, so an aborted stale
+        // snapshot never becomes a dependency that can block subsequent reads.
+        if let Some(snapshot_ts) = snapshot_ts {
+            let latest = self.conflict_index.max_conflicting_timestamp(
+                ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY,
+            );
+            if latest.is_some_and(|latest| latest > snapshot_ts) {
+                return SmResponse::SnapshotStale;
+            }
+        }
+
         // Query ConflictIndex for deps using t0 (not t), UNIONED across every
         // key the transaction writes — a conflict on any key is a dependency.
         let mut deps = HashSet::new();
@@ -445,7 +474,10 @@ impl AccordStateMachine {
         self.witness_timestamp(t);
 
         // Register the txn under EVERY key it writes, so a later conflicting
-        // txn on any of them sees it as a dependency.
+        // txn on any of them sees it as a dependency. A partial registration is
+        // unsafe: it could acknowledge a transaction without indexing all of its
+        // conflicts. Roll back and abstain if capacity is exhausted.
+        let newly_created = !self.txn_states.contains_key(&txn_id);
         for key in keys {
             let entry = InFlightWrite {
                 txn_id,
@@ -457,16 +489,23 @@ impl AccordStateMachine {
                 accord_ts: Some(t),
                 status: TxnStatus::PreAccepted,
             };
-            // Don't fail the protocol message on capacity errors, but log them.
             if let Err(e) = self.conflict_index.register(key, entry) {
-                tracing::error!(%e, "accord: conflict_index register failed");
+                self.conflict_index.remove(&txn_id);
+                if newly_created {
+                    self.txn_states.remove(&txn_id);
+                }
+                tracing::error!(
+                    txn_id = ?txn_id,
+                    key_count = keys.len(),
+                    %e,
+                    "accord: refusing PreAccept because conflict index registration was incomplete"
+                );
+                return SmResponse::None;
             }
         }
 
         // Track whether THIS call created the TxnState, so a persist failure can
         // roll back cleanly (a retried/duplicate PreAccept must not be erased).
-        let newly_created = !self.txn_states.contains_key(&txn_id);
-
         // Create or update TxnState.
         let state = self
             .txn_states
@@ -1343,6 +1382,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stale_postgres_snapshot_is_rejected_before_conflict_registration() {
+        use ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY;
+
+        let (mut sm, _) = make_sm(1);
+        let earlier = txn(1, 100);
+        let latest = ts(100);
+        sm.handle_preaccept(
+            earlier,
+            latest,
+            POSTGRES_TRANSACTION_MARKER_KEY,
+            BallotNumber(0),
+            0,
+        );
+        sm.handle_commit(earlier, latest, latest, vec![]);
+        sm.handle_apply(earlier, vec![]);
+        let conflicts_before_stale_attempt = sm.conflict_index().len();
+
+        let stale = txn(2, 200);
+        let response = sm.handle_preaccept_multi_with_snapshot(
+            stale,
+            ts(200),
+            &[POSTGRES_TRANSACTION_MARKER_KEY],
+            BallotNumber(0),
+            0,
+            Some(ts(99)),
+        );
+
+        assert!(matches!(response, SmResponse::SnapshotStale));
+        assert!(
+            sm.get_state(&stale).is_none(),
+            "stale txn must not be registered"
+        );
+        assert_eq!(
+            sm.conflict_index().len(),
+            conflicts_before_stale_attempt,
+            "stale txn leaves no conflict entry"
+        );
+    }
+
     /// Duplicate Commit is no-op.
     #[test]
     fn sm_idempotent_commit() {
@@ -1683,6 +1762,19 @@ mod tests {
             ),
             other => panic!("expected PreAcceptOK, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn sm_preaccept_capacity_failure_abstains_and_rolls_back_partial_registration() {
+        let (mut sm, _writer) = make_sm_with_capacity(1, 1);
+        let keys: &[&[u8]] = &[b"key_one", b"key_two"];
+        let txn_id = txn(2, 500);
+
+        let response = sm.handle_preaccept_multi(txn_id, ts(500), keys, BallotNumber(0), 0);
+
+        assert!(matches!(response, SmResponse::None));
+        assert!(sm.conflict_index().is_empty());
+        assert!(sm.get_state(&txn_id).is_none());
     }
 
     /// Multi-key PreAccept returns the UNION of dependencies across all of the

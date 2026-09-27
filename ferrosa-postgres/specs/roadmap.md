@@ -13,12 +13,16 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
-- **Accord-backed transaction atomicity** (FMEA PG-1, #206). DML in a `T` block
-  buffers as a `TransactionWrite` (`apply_or_buffer`) — over BOTH the simple and
-  extended protocols — and `COMMIT` drives the write-set through the injected
-  `TransactionCommitter` atomically (`commit_txn`); `ROLLBACK` discards the buffer
-  (never applied). No committer (standalone) ⇒ COMMIT of a non-empty buffer fails
-  loud; empty buffer commits cleanly. Mirrors the CQL `CqlTransaction` path.
+- **PostgreSQL MVCC transaction semantics.** Explicit SERIALIZABLE begins
+  pin a read timestamp; simple and extended SELECT use version overlays; buffered
+  writes are visible to their own transaction; commit checks table-level read
+  and write epochs in standalone mode and atomically applies through the local
+  storage engine. In cluster mode a global PostgreSQL commit marker currently
+  validates snapshots, conservatively aborting after any intervening PG commit.
+  Write skew, predicate conflicts, lost updates, and real-time-order violations
+  abort or return the committed value as appropriate; versions are reclaimed
+  after the oldest active snapshot advances. Explicit isolation levels other
+  than SERIALIZABLE fail loud. CQL transactions remain on Accord.
 - **Parameterized DML** (was FMEA PG-2, `feat/pg-extended-crud`).
   `INSERT`/`UPDATE`/`DELETE` accept bound `$N` parameters over the extended
   protocol: prepared as `PreparedKind::{Insert,Update,Delete}`, substituted at
@@ -32,9 +36,15 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Now (highest value)
 
-- **Read-your-writes inside an open transaction** (FMEA PG-1 residual). Buffered
-  writes are not yet visible to reads in the same transaction; wire the buffer
-  into the in-transaction read path (or document the snapshot-isolation gap).
+- **Jepsen PostgreSQL strict-serializability workload** (FMEA PG-11). PostgreSQL
+  mutation batches carry their snapshot into Accord; replica apply transports
+  row-version metadata for active snapshots. Cluster validation currently uses
+  a global marker instead of the supplied read/write table set. Exercise
+  multi-client register, transfer, write-skew, predicate, and real-time-order
+  histories with node failures before claiming the Jepsen model across nodes.
+- **End-to-end SELECT streaming.** The storage provider is bounded, but
+  `ferrosa_sql` collects base scans/results and PostgreSQL rendering buffers all
+  wire messages. Stream through the executor and socket writer to bound memory.
 
 ## Next
 
@@ -57,8 +67,8 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 - **CQL `Duration` + collections** (`List`/`Set`/`Map`/`Tuple`/`Udt`/`Vector`)
   support (FMEA PG-4) — widen `ferrosa_sql::Value` and the
-  `cql_to_value`/`value_to_cql` bridges, or fail loud where queried instead of
-  reading NULL.
+  `cql_to_value`/`value_to_cql` bridges. Until then, scans fail explicitly when
+  they encounter one of these values.
 - **Exact float/numeric text-format parity** with Postgres (FMEA PG-9).
 - **Real affected-row counts** for `UPDATE`/`DELETE` (FMEA PG-10) — read-before-
   write so the count reflects matches rather than always reporting `1`.

@@ -212,7 +212,6 @@ impl ConnTxn {
 /// closed — the server never acks a transaction it did not commit. A statement
 /// that fails *inside* a transaction poisons it: the next `COMMIT` fails loud
 /// rather than committing a partial write-set.
-#[derive(Default)]
 pub struct CqlTransaction {
     open: bool,
     /// Set when a buffered statement failed (or the write-set cap was hit): the
@@ -224,17 +223,35 @@ pub struct CqlTransaction {
     /// agreed commit timestamp and returned from `COMMIT` (read-in-transaction),
     /// positionally aligned with the rows in [`CommitReads`].
     reads: Vec<TransactionRead>,
+    max_statements: usize,
 }
 
 /// Max DML writes buffered in one transaction before it is poisoned. A client
 /// must not be able to OOM the server with an unbounded open `BEGIN` (Power-of-10
 /// Rule 3: every server-side dynamic collection has a hard cap).
-const MAX_TXN_WRITES: usize = 10_000;
+pub const DEFAULT_MAX_TXN_STATEMENTS: usize = 10_000;
+
+impl Default for CqlTransaction {
+    fn default() -> Self {
+        Self::with_write_limit(DEFAULT_MAX_TXN_STATEMENTS)
+    }
+}
 
 impl CqlTransaction {
     /// A fresh connection with no open transaction.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_write_limit(max_statements: usize) -> Self {
+        debug_assert!(max_statements > 0);
+        Self {
+            open: false,
+            poisoned: false,
+            buffer: Vec::new(),
+            reads: Vec::new(),
+            max_statements,
+        }
     }
 
     /// `true` while a transaction is open.
@@ -269,10 +286,11 @@ impl CqlTransaction {
                 "DML staged outside of a transaction".to_string(),
             ));
         }
-        if self.buffer.len() >= MAX_TXN_WRITES {
+        if self.buffer.len() >= self.max_statements {
             self.poisoned = true;
             return Err(CqlError::Invalid(format!(
-                "transaction write-set exceeds the {MAX_TXN_WRITES}-write limit; ROLLBACK required"
+                "transaction write-set exceeds the {}-write limit; ROLLBACK required",
+                self.max_statements
             )));
         }
         self.buffer.push(write);
@@ -289,10 +307,11 @@ impl CqlTransaction {
                 "SELECT staged outside of a transaction".to_string(),
             ));
         }
-        if self.buffer.len() + self.reads.len() >= MAX_TXN_WRITES {
+        if self.buffer.len() + self.reads.len() >= self.max_statements {
             self.poisoned = true;
             return Err(CqlError::Invalid(format!(
-                "transaction statement-set exceeds the {MAX_TXN_WRITES}-statement limit; ROLLBACK required"
+                "transaction statement-set exceeds the {}-statement limit; ROLLBACK required",
+                self.max_statements
             )));
         }
         self.reads.push(read);
@@ -516,7 +535,7 @@ mod tests {
         let committer = MockTransactionCommitter::new();
         let mut tx = CqlTransaction::new();
         tx.begin().unwrap();
-        for i in 0..MAX_TXN_WRITES {
+        for i in 0..DEFAULT_MAX_TXN_STATEMENTS {
             tx.stage(tw("ks", format!("k{i}").as_bytes())).unwrap();
         }
         // The write past the cap fails loud and poisons the transaction.
