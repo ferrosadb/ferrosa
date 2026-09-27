@@ -36,6 +36,9 @@ pub mod intent;
 pub mod metadata;
 pub mod purge;
 pub(crate) mod retire;
+/// Stateful writes/compactions/restarts checked against a small reference model.
+#[cfg(test)]
+mod stateful_model_tests;
 pub mod strategy;
 pub mod strategy_ucs;
 
