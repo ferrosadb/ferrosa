@@ -78,8 +78,8 @@ fn legacy_test_job_still_excludes_ferrosa_jepsen() {
 #[test]
 fn postgres_jepsen_compose_advertises_host_reachable_cql_ports() {
     let path = postgres_jepsen_compose_path();
-    let compose = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let compose =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let parsed: serde_yaml::Value =
         serde_yaml::from_str(&compose).expect("parse PostgreSQL Jepsen compose YAML");
     let services = parsed
