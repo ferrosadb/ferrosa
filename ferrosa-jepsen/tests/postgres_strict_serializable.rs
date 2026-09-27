@@ -58,12 +58,21 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     let (clients, connections) = connect_all(&urls).await?;
     let table = format!("pg_ssi_{}", Uuid::new_v4().simple());
     clients[0]
-        .batch_execute(&format!(
-            "CREATE TABLE {table} (id TEXT PRIMARY KEY, balance BIGINT NOT NULL);\
-             INSERT INTO {table} (id, balance) VALUES ('a', {INITIAL_BALANCE}), ('b', {INITIAL_BALANCE});"
-        ))
+        .execute(
+            &format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, balance BIGINT NOT NULL)"),
+            &[],
+        )
         .await
-        .context("create and initialize strict-serializability workload table")?;
+        .context("create strict-serializability workload table")?;
+    clients[0]
+        .execute(
+            &format!(
+                "INSERT INTO {table} (id, balance) VALUES ('a', {INITIAL_BALANCE}), ('b', {INITIAL_BALANCE})"
+            ),
+            &[],
+        )
+        .await
+        .context("initialize strict-serializability workload balances")?;
     wait_for_table_on_all_nodes(&clients, &table).await?;
 
     if let Some(schedule) = &fault_schedule {
