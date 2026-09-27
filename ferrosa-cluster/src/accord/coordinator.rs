@@ -655,6 +655,22 @@ fn agreed_row(reads: &[Vec<u8>], quorum: usize) -> Option<Vec<u8>> {
     None
 }
 
+async fn collect_until_decided<Fut, Response>(
+    responses: impl IntoIterator<Item = Fut>,
+    mut is_decided: impl FnMut(&Response) -> bool,
+) where
+    Fut: std::future::Future<Output = Response>,
+{
+    use futures::StreamExt;
+
+    let mut pending = futures::stream::FuturesUnordered::from_iter(responses);
+    while let Some(response) = pending.next().await {
+        if is_decided(&response) {
+            break;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExistenceVoteDecision {
     Apply,
@@ -1755,58 +1771,76 @@ impl AccordCoordinatorDriver {
                 }
             }
 
-            let remote_read_futs: Vec<_> = self
-                .replica_ids
-                .iter()
-                .filter(|&&id| id != self_id)
-                .map(|&peer_id| {
-                    let peers = Arc::clone(&self.peers);
-                    let msg = read_msg.clone();
-                    async move { peers.send(peer_id, msg, Lane::Data).await }
-                })
-                .collect();
-            let read_responses = futures::future::join_all(remote_read_futs).await;
-
-            for result in &read_responses {
+            let remote_read_futs: Vec<_> = if is_snapshot_barrier {
+                // Commit already proves the slow quorum for a snapshot barrier.
+                // The local dep-wait below proves this engine has applied prior
+                // conflicts; waiting on remote ReadVotes would make an unavailable
+                // minority delay PostgreSQL snapshot creation.
+                Vec::new()
+            } else {
+                self.replica_ids
+                    .iter()
+                    .filter(|&&id| id != self_id)
+                    .map(|&peer_id| {
+                        let peers = Arc::clone(&self.peers);
+                        let msg = read_msg.clone();
+                        async move { peers.send(peer_id, msg, Lane::Data).await }
+                    })
+                    .collect()
+            };
+            collect_until_decided(remote_read_futs, |result| {
                 match result {
                     Ok(Message::AccordReadOK(b)) if !b.is_empty() => {
                         match bincode::deserialize::<ReadVoteOkPayload>(b) {
                             Ok(vote) => {
                                 if is_generic {
-                                    // Generic IF: replica returns the row bytes at `t`
-                                    // (condition_holds is a neutral true). Collect for
-                                    // F+1 agreement; the coordinator evaluates the
-                                    // predicate authoritatively below.
+                                    // Generic IF: collect row bytes until F+1 matching
+                                    // reads decide the result. A lagging minority must
+                                    // not hold the read open after agreement is reached.
                                     read_rows.push(vote.current_row.clone());
                                 } else if vote.condition_holds {
                                     votes_true += 1;
                                 } else {
-                                    // INSERT IF NOT EXISTS existence path.
                                     votes_false += 1;
                                     if dissenting_row.is_empty() {
                                         dissenting_row = vote.current_row.clone();
                                     }
                                 }
                             }
-                            Err(_) => {
-                                // pre-Gap-4 replica or parse error: treat as
-                                // condition_holds=true (forward-compatible default).
+                            Err(error) => {
+                                tracing::warn!(
+                                    txn_id = ?txn_id,
+                                    error = %error,
+                                    "accord: could not decode ReadVote response; skipping malformed vote"
+                                );
                             }
                         }
                     }
-                    Ok(_) | Err(_) => {
-                        // No response or network error — skip (don't count as false vote).
-                        // Log network errors at warn level.
-                        if let Err(e) = result {
-                            tracing::warn!(
-                                txn_id = ?txn_id,
-                                error = %e,
-                                "accord: ReadVote RPC failed (non-fatal)"
-                            );
-                        }
+                    Ok(response) => {
+                        tracing::warn!(
+                            txn_id = ?txn_id,
+                            response_type = ?response.msg_type(),
+                            "accord: unexpected ReadVote response; skipping it"
+                        );
+                    }
+                    Err(e) => {
+                        // No response or network error — skip (don't count as false).
+                        tracing::warn!(
+                            txn_id = ?txn_id,
+                            error = %e,
+                            "accord: ReadVote RPC failed (non-fatal)"
+                        );
                     }
                 }
-            }
+
+                if is_generic {
+                    agreed_row(&read_rows, sq).is_some()
+                } else {
+                    decide_existence_votes(votes_true, votes_false, sq)
+                        != ExistenceVoteDecision::QuorumUnavailable
+                }
+            })
+            .await;
 
             // A successful Commit phase already proves the Accord slow quorum.
             // This local dep-wait is the remaining snapshot condition: the node
@@ -1872,7 +1906,7 @@ impl AccordCoordinatorDriver {
                         });
                     }
                 }
-            } else {
+            } else if !is_snapshot_barrier {
                 // F+1 matching votes decide BOTH outcomes. The legacy path only
                 // required a false quorum and treated every other shape — even
                 // zero replies — as permission to apply.
@@ -2316,6 +2350,34 @@ mod tests {
         );
     }
     use super::*;
+
+    #[tokio::test]
+    async fn read_vote_collection_stops_after_quorum_without_waiting_for_slow_replica() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        let responses: Vec<Pin<Box<dyn Future<Output = bool>>>> = vec![
+            Box::pin(async { true }),
+            Box::pin(async { true }),
+            Box::pin(std::future::pending()),
+        ];
+        let mut votes = 0;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            collect_until_decided(responses, |vote| {
+                votes += usize::from(*vote);
+                votes >= 2
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a slow minority replica must not delay quorum"
+        );
+        assert_eq!(votes, 2);
+    }
     use ferrosa_common::accord::{BallotNumber, Timestamp, TxnId};
 
     // -----------------------------------------------------------------------

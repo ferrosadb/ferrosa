@@ -285,7 +285,11 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   for `INSERT IF NOT EXISTS`, `ReadRow` for generic `IF`); a general multi-key
   SQL transaction uses `ReadPredicate::Always`, which **skips the read-vote
   entirely** and always applies after commit (there is no `IF` to evaluate). The
-  replica apply path is **dep-ordered**: `handle_apply` routes every real write
+  vote collector stops once F+1 matching votes decide the predicate, without
+  waiting for an unavailable minority. PostgreSQL snapshot barriers use the
+  committed slow quorum plus a local dependency/apply check and do not fan out
+  remote read-votes. The replica apply path is **dep-ordered**: `handle_apply`
+  routes every real write
   through `apply.rs`'s `DepWaitApplier`, so a mutation persists only once all of
   its dependencies have applied locally (otherwise it parks and the cascade
   applies it in order).

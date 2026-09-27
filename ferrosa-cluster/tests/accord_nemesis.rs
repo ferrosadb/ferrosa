@@ -308,41 +308,60 @@ async fn packet_reorder_linearizability() {
         )
         .with_local_accord_state(node_b.accord_state.clone());
 
-        // Start the message-faulted transaction FIRST, poll it immediately, and
-        // prove it is still in flight when the competitor starts. This makes the
-        // schedule concurrent rather than a sequential IF NOT EXISTS check.
+        // Start the message-faulted transaction FIRST. If its delayed edge is
+        // needed to reach quorum, prove it remains in flight before starting the
+        // competitor. A read-vote response from a minority may be delayed after
+        // F+1 matching votes already decide; in that case the first operation
+        // validly completes before the competitor begins.
         let start_stagger = Duration::from_millis(2);
+        let mut completed_before_competitor = false;
         let (result_a, result_b) = if delay_a {
             let mut faulted = Box::pin(driver_a.run_transaction());
-            tokio::select! {
-                result = &mut faulted => {
-                    panic!("round {round}: faulted coordinator A completed before competitor B started: {result:?}");
-                }
-                _ = tokio::time::sleep(start_stagger) => {}
+            let completed = tokio::time::timeout(start_stagger, &mut faulted).await;
+            if let Ok(result_a) = completed {
+                completed_before_competitor = true;
+                (result_a, driver_b.run_transaction().await)
+            } else {
+                tokio::join!(faulted, driver_b.run_transaction())
             }
-            tokio::join!(faulted, driver_b.run_transaction())
         } else {
             let mut faulted = Box::pin(driver_b.run_transaction());
-            tokio::select! {
-                result = &mut faulted => {
-                    panic!("round {round}: faulted coordinator B completed before competitor A started: {result:?}");
-                }
-                _ = tokio::time::sleep(start_stagger) => {}
+            let completed = tokio::time::timeout(start_stagger, &mut faulted).await;
+            if let Ok(result_b) = completed {
+                completed_before_competitor = true;
+                (driver_a.run_transaction().await, result_b)
+            } else {
+                let (result_b, result_a) = tokio::join!(faulted, driver_a.run_transaction());
+                (result_a, result_b)
             }
-            let (result_b, result_a) = tokio::join!(faulted, driver_a.run_transaction());
-            (result_a, result_b)
         };
         let delayed_side = if delay_a { "a" } else { "b" };
         let nemesis_desc = format!(
             "message_delay(side={delayed_side},type={delayed_type:?},edge={delayed_edge:?},\
              peer={delayed_peer},delay={delay_ms}ms)"
         );
-        assert_eq!(
-            delay_hits.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "round {round}: configured message-level fault did not fire exactly once: \
-             {nemesis_desc}"
-        );
+        let hits = delay_hits.load(std::sync::atomic::Ordering::Relaxed);
+        let early_read_quorum = completed_before_competitor
+            && matches!(delayed_type, MsgType::AccordRead)
+            && matches!(delayed_edge, DelayEdge::Response)
+            && if delay_a {
+                result_a.is_ok()
+            } else {
+                result_b.is_ok()
+            };
+        if early_read_quorum {
+            assert!(
+                hits <= 1,
+                "round {round}: a canceled minority ReadVote may fire at most once: \
+                 {nemesis_desc}"
+            );
+        } else {
+            assert_eq!(
+                hits, 1,
+                "round {round}: configured message-level fault did not fire exactly once: \
+                 {nemesis_desc}"
+            );
+        }
 
         // Count commits this round.
         let mut applied_this_round: u32 = 0;
