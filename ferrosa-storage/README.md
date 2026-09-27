@@ -582,6 +582,10 @@ Scale with `RACE_KEYS` / `RACE_READERS` / `RACE_SECS` / `RACE_FLUSH_EVERY`.
 
 ### Compaction cancel-safety and crash recovery (T-020–T-023)
 
+The T-023 retirement crash seam is scoped to the explicitly injected Tokio
+poll task. Concurrent tests and startup reconciliation do not inherit the
+fault; unwinding or dropping the scoped future removes the injection.
+
 `src/compaction/cancel_harness.rs` names every step in the compaction
 lifecycle (`CancelPoint`) and gives production code a `cancel_point!(...)`
 hook to call at each one, behind `cfg(any(test, feature = "test-support"))`

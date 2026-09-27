@@ -100,6 +100,9 @@ open work lives in specs and the items below.
 
 ## Recently landed
 
+- **T-023 test isolation.** The retirement crash seam is task-local and resets
+  on unwind or cancellation; unrelated compactions can run concurrently.
+
 - **Streaming writer callers (T-039).** Flush and compaction target staged
   `Data.db`; compaction shares cancellation with the pump and cleans partial
   output after writer teardown. Startup sweeps legacy `Data.raw` scratch.

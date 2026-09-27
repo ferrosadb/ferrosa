@@ -38,6 +38,10 @@ writer. Compaction shares its task cancellation token with the pump, and a
 borrowed staging guard removes incomplete output after the writer has dropped.
 Startup removes legacy `Data.raw` scratch before generation discovery.
 
+The test-only mid-retirement crash injection uses Tokio task-local scope, so
+concurrent compaction tests and synchronous recovery cannot inherit a fault.
+The scope unwinds with the injected future, including panic and cancellation.
+
 ## Module map
 
 | Module | Responsibility |

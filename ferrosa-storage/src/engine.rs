@@ -1,8 +1,8 @@
 //! Module: Compose commit log, memtable, flush, compaction, object storage, and cache.
 //! Correctness: Correct when admitted writes are durable before visibility and reads,
 //! replay, flush, and maintenance preserve table and cursor invariants.
-//! Last revised: 2026-09-01
-//! Last changed: Made automatic flush admission volume- and WAL-pressure-bounded.
+//! Last revised: 2026-09-26
+//! Last changed: Scoped test-only retirement crash injection to the injected Tokio task.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -72,14 +72,13 @@ const MAX_AGE_FLUSH_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AUTOMATIC_FLUSHES_PER_POLL: usize = 8;
 const MAX_COMPACTION_INPUTS_PER_TASK: usize = 64;
 
-/// T-023 fault-injection seam: makes `StorageEngine::evict_local_input_sstable_files`
-/// stop after retiring exactly this many inputs, simulating a process crash
-/// mid-retirement, so tests can prove startup reconciliation finishes the job
-/// (forge `t_fca66994`). `usize::MAX` (the default) never triggers it. Set
-/// via `StorageEngine::set_test_crash_after_input_retirements`.
+// T-023 crash injection belongs to the poll future that explicitly opts in.
+// Task-local scope follows Tokio task migration and resets on unwind/drop;
+// unrelated tasks and synchronous startup reconciliation never inherit it.
 #[cfg(test)]
-static TEST_CRASH_AFTER_N_INPUT_RETIREMENTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
+tokio::task_local! {
+    static TEST_CRASH_AFTER_N_INPUT_RETIREMENTS: usize;
+}
 
 fn effective_compaction_input_bounds(min_threshold: usize, max_threshold: usize) -> (usize, usize) {
     let max_threshold = max_threshold.clamp(2, MAX_COMPACTION_INPUTS_PER_TASK);
@@ -5105,21 +5104,6 @@ impl StorageEngine {
         {
             false
         }
-    }
-
-    /// Set the [`TEST_CRASH_AFTER_N_INPUT_RETIREMENTS`] fault-injection seam
-    /// (T-023): [`Self::evict_local_input_sstable_files`] stops after
-    /// retiring exactly `n` inputs, simulating a process crash mid-retirement.
-    /// Tests must call [`Self::clear_test_crash_after_input_retirements`]
-    /// before returning, since it is a single process-wide static.
-    #[cfg(test)]
-    pub(crate) fn set_test_crash_after_input_retirements(n: usize) {
-        TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.store(n, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear_test_crash_after_input_retirements() {
-        TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn temp_promotion_directory(
@@ -11861,14 +11845,15 @@ impl StorageEngine {
             // inputs have been retired, so tests can prove startup
             // reconciliation finishes retiring the rest instead of
             // resurrecting whatever the survivors were shadowing (forge
-            // t_fca66994). `usize::MAX` (the default) never triggers this.
+            // t_fca66994). Outside an explicit task-local scope it is disabled.
             // A panic (not a plain `return`) is deliberate: a real crash lets
             // no further code run -- no phase advance, no record deletion --
             // and only a panic reproduces that when the caller is run inside
             // `tokio::spawn` and its `JoinError` is discarded by the test.
             #[cfg(test)]
-            if idx + 1
-                == TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.load(std::sync::atomic::Ordering::SeqCst)
+            if TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+                .try_with(|count| idx + 1 == *count)
+                .unwrap_or(false)
             {
                 panic!(
                     "T-023 test seam: simulated crash after retiring {} of {} compaction inputs",
@@ -22688,6 +22673,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_retirement_crash_does_not_leak_to_unrelated_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = StorageEngine::compaction_input_retirement_stub(dir.path(), "1");
+        let unrelated = TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+            .scope(1, async move {
+                tokio::spawn(async move {
+                    StorageEngine::evict_local_input_sstable_files(&table_id(), &[input]);
+                })
+                .await
+            })
+            .await;
+        assert!(
+            unrelated.is_ok(),
+            "another task must not inherit crash injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_retirement_crash_scope_resets_after_panic_and_drop() {
+        use futures::FutureExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = StorageEngine::compaction_input_retirement_stub(dir.path(), "1");
+        let crash = TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.scope(1, async {
+            StorageEngine::evict_local_input_sstable_files(
+                &table_id(),
+                std::slice::from_ref(&input),
+            );
+        });
+        assert!(std::panic::AssertUnwindSafe(crash)
+            .catch_unwind()
+            .await
+            .is_err());
+        assert!(TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+            .try_with(|_| ())
+            .is_err());
+
+        // Poll and then drop a pending injected future on this same task.
+        let mut abandoned = Box::pin(TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.scope(1, async {
+            assert_eq!(TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.get(), 1);
+            std::future::pending::<()>().await;
+        }));
+        assert!(futures::poll!(abandoned.as_mut()).is_pending());
+        drop(abandoned);
+        assert!(TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+            .try_with(|_| ())
+            .is_err());
+        StorageEngine::evict_local_input_sstable_files(&table_id(), &[input]);
+    }
+
+    #[tokio::test]
     async fn compaction_commit_phase_reaches_swapped_before_retirement_finishes() {
         let dir = tempfile::tempdir().unwrap();
         let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
@@ -22700,10 +22736,12 @@ mod tests {
         // not be mistaken for the seam failing to fire.
         let mut crashed = false;
         for _ in 0..40 {
-            StorageEngine::set_test_crash_after_input_retirements(1);
             let poll_engine = Arc::clone(&engine);
-            let joined = tokio::spawn(async move { poll_engine.poll_compactions().await }).await;
-            StorageEngine::clear_test_crash_after_input_retirements();
+            let joined = tokio::spawn(
+                TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+                    .scope(1, async move { poll_engine.poll_compactions().await }),
+            )
+            .await;
             if joined.is_err() {
                 crashed = true;
                 break;
@@ -22844,10 +22882,12 @@ mod tests {
         // record deletion).
         let mut crashed = false;
         for _ in 0..40 {
-            StorageEngine::set_test_crash_after_input_retirements(1);
             let poll_engine = Arc::clone(&engine);
-            let joined = tokio::spawn(async move { poll_engine.poll_compactions().await }).await;
-            StorageEngine::clear_test_crash_after_input_retirements();
+            let joined = tokio::spawn(
+                TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+                    .scope(1, async move { poll_engine.poll_compactions().await }),
+            )
+            .await;
             if joined.is_err() {
                 crashed = true;
                 break;
