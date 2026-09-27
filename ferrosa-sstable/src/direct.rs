@@ -160,7 +160,8 @@ impl DirectIoSwitch {
 }
 
 /// Read `specific_name` and `FERROSA_DIRECT_IO` from the environment and resolve
-/// them, logging once (per `warned` flag) any value that is not a boolean.
+/// them, logging an error once (per `warned` flag) for any value that is not a
+/// boolean, then continuing with the resolved setting.
 ///
 /// `warned` is one static per call site: the writer asks for every Data.db it
 /// creates, and a line per file would bury the one that mattered.
@@ -171,11 +172,11 @@ pub fn configured(specific_name: &str, warned: &AtomicBool) -> DirectIoSwitch {
         std::env::var(DIRECT_IO_MASTER_ENV).ok().as_deref(),
     );
     if !switch.rejected.is_empty() && !warned.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
+        tracing::error!(
             rejected = ?switch.rejected,
             enabled = switch.enabled,
             "direct I/O switch is not a boolean (use 1/true/on/yes or 0/false/off/no); \
-             it is ignored and direct I/O is {}",
+             it is ignored and direct I/O is {}; continuing with the resolved setting",
             if switch.enabled { "ON (the default)" } else { "OFF" }
         );
     }
