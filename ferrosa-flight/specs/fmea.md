@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-flight
 doc: fmea
-last_updated: 2026-06-19
+last_updated: 2026-09-28
 ---
 
 # ferrosa-flight — FMEA / Known Issues
@@ -18,7 +18,8 @@ path, so confidentiality and silent-wrong-data severities dominate.
 | FL-4 | `GetFlightInfo` / `GetSchema` / `ListFlights` execute the real `SELECT` (page_size 1) just to learn the schema | A schema lookup runs a live single-row query: cost on an expensive predicate, and side effects of executing user CQL for metadata; `ListFlights` does this once per table | 5 | 4 | 5 | 100 | **Open gap.** Schema is derived by executing `query_to_batch` rather than from table metadata. Derive the Arrow schema from the schema snapshot (column types) without running the query. |
 | FL-5 | Whole result paged but a single page can still be large | Peak memory is one page (default 1024 rows); a row with huge blobs/collections makes one page heavy | 5 | 3 | 4 | 60 | **Mitigated.** Paged `DoGet` via the CQL cursor bounds memory to one page (vs. whole-set materialization). Page size is configurable (`with_page_size`); byte-budgeted paging is a refinement. |
 | FL-6 | Token signing key is process-held and supplied by the caller; no built-in rotation scheduler | A long-lived key compromise validates forged tokens until manually rotated | 7 | 2 | 5 | 70 | **Partial.** `verify_with_keys` supports a rotation overlap window (current + retired keys), HMAC-SHA256, constant-time verify, absolute expiry (default 1h). Key *provisioning/rotation cadence* is the embedder's responsibility (`ferrosa` binary). |
-| FL-7 | `serve` builds a plaintext `tonic` server with no TLS | Bearer tokens and query data traverse the wire in cleartext if the embedder does not add transport security | 8 | 3 | 4 | 96 | **By design / deferred to caller.** `flight_service` returns the bare service so the embedder can wrap it with TLS + their own incoming/shutdown wiring; the convenience `serve` is plaintext. Document that production must terminate TLS. |
+| FL-7 | Flight served without TLS | Bearer tokens and query data traverse the wire in cleartext | 8 | 1 | 2 | 16 | **Mitigated (t_58db6320).** `serve_service` serves TLS-only when `[flight] tls_cert/tls_key` are set (tokio-rustls, `ferrosa_net::tls` provider, ALPN h2); `require_tls` without a certificate refuses to start; `FERROSA_MODE=production` refuses an enabled Flight listener that does not require TLS. Only the `serve` convenience (tests/embedding) is plaintext. |
+| FL-10 | TLS handshakes stall or flood the accept loop | Slow or hostile clients hold handshake slots | 4 | 3 | 3 | 36 | **Mitigated.** Each handshake runs in its own task with a 10 s timeout; at most 256 in flight (the accept loop waits for a slot); failures are logged at WARN with the peer; accept() errors are logged on the failing/recovered edges. |
 | FL-8 | `PollFlightInfo` is synchronous — always returns `progress = 1.0`, no continuation | A client polling a long-running query gets an immediate "complete" with the full info, with no genuine async progress | 3 | 3 | 5 | 45 | **By design (v1).** Results are ready synchronously; real long-running async polling is W-002 follow-up. |
 | FL-9 | Distributed endpoint planning needs explicit `FERROSA_FLIGHT_BROADCAST` per node | If self-broadcast is unset, self-owned ranges advertise no location; a non-co-located client must already be on the right connection | 4 | 4 | 3 | 48 | **Mitigated (fail-honest).** Unresolvable addresses are omitted, never faked; the endpoint is still emitted so data stays reachable via the queried connection. Operationally requires each node to set its broadcast addr. |
 
@@ -32,8 +33,8 @@ path, so confidentiality and silent-wrong-data severities dominate.
 2. **FL-4 (RPN 100)** — schema discovery executes the user's query. Derive the
    Arrow schema from table metadata so `GetSchema`/`GetFlightInfo`/`ListFlights`
    do not run live queries.
-3. **FL-7 (RPN 96)** — the convenience `serve` is plaintext; production
-   deployments must wrap `flight_service` with TLS.
+3. **FL-7** is mitigated: the binary serves Flight over TLS and production
+   mode requires it.
 
 ## Detection assets
 
@@ -42,6 +43,8 @@ path, so confidentiality and silent-wrong-data severities dominate.
 - `tests/read_path.rs` — multi-page `DoGet`, bearer enforcement, non-`SELECT`
   rejection.
 - `tests/exchange_path.rs` — `DoExchange` per-batch ack + bearer enforcement.
+- `tests/tls_listener.rs` — TLS client round-trip, plaintext client refused,
+  `require_tls` / half-certificate errors, ALPN h2.
 - `convert.rs` unit tests — full forward type coverage and the fail-loud cases
   (`TypeMismatch`, `UnsupportedArrow`).
 - `token.rs` unit tests — tamper/expiry/wrong-key/rotation precedence.

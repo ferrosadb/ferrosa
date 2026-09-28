@@ -107,10 +107,14 @@ bind = "127.0.0.1:5432"
 # require_tls = false
 
 [flight]
+# Arrow Flight gRPC, only in builds with the `flight` feature (release `full`
+# builds). With a certificate the port speaks gRPC over TLS only (ALPN h2);
+# clients connect with https:// / grpc+tls://.
 bind = "127.0.0.1:8815"
-# Flight has no TLS yet: FERROSA_MODE=production refuses to start while it is
-# enabled (only in builds with the `flight` feature).
 # enabled = true
+# tls_cert = "~/.ferrosa/config/tls/server.crt"
+# tls_key  = "~/.ferrosa/config/tls/server.key"
+# require_tls = false
 
 # ---------------------------------------------------------------------------
 # Web admin console — also serves Prometheus metrics at /metrics.
@@ -147,8 +151,8 @@ bind = "127.0.0.1:9090"
 #
 # Production mode (FERROSA_MODE=production):
 #   Startup is refused unless auth is on, every ENABLED client listener
-#   (cql, postgres, graph + Bolt, sparql, web) sets require_tls = true with a
-#   tls_cert/tls_key, [internode] require_tls = true, and Flight is disabled.
+#   (cql, postgres, graph + Bolt, sparql, web, flight) sets require_tls = true
+#   with a tls_cert/tls_key, and [internode] require_tls = true.
 #   Each refusal names the listener and the key to set.
 #   Random 96-hex-char passwords are generated for each role and printed
 #   once to stderr at startup. Record them immediately — they are not

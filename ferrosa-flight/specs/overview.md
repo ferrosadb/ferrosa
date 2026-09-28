@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-flight
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-09-28
 executive_summary: >
   Apache Arrow Flight (gRPC) query endpoint for Ferrosa. A client carries a CQL
   SELECT in the Flight ticket; ferrosa-cql executes it (route_select_raw) and the
@@ -38,7 +38,7 @@ materialized as generated CQL `INSERT`s.
 | `convert` (`src/convert.rs`, ~980 LoC) | `rows_to_record_batch` (CQL result → Arrow, full type coverage incl. list/set/map/tuple/udt/vector/decimal) and `record_batch_to_rows` (Arrow → CQL, scalar subset, fail-loud) |
 | `plan` (`src/plan.rs`, ~320 LoC) | Pure distributed-read planner: ring token ranges → token-bounded `SELECT` endpoints + replica Flight locations (W-002) |
 | `token` (`src/token.rs`, ~230 LoC) | HMAC-SHA256 signed bearer tokens: `issue` / `verify` / `verify_with_keys` (rotation overlap) |
-| `server` (`src/server.rs`) | gRPC bootstrap: wrap in `FlightServiceServer`, bind-and-serve |
+| `server` (`src/server.rs`) | gRPC bootstrap: wrap in `FlightServiceServer`, bind-and-serve; TLS termination (tokio-rustls, config from `ferrosa_net::tls`, ALPN h2) feeding tonic's `serve_with_incoming` |
 | `lib` (`src/lib.rs`) | Module re-exports only |
 
 ## Data flow

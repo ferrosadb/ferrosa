@@ -9,8 +9,8 @@
 # This overlay clears the dev-only FERROSA_AUTH_DISABLED flag, enables       #
 # auth, and switches the binary to FERROSA_MODE=production. Production mode  #
 # refuses to start unless every enabled client listener (CQL, PostgreSQL,    #
-# graph HTTP, Bolt, SPARQL, web console) requires TLS and internode traffic  #
-# is TLS (t_d5d122ba), so this overlay also:                                 #
+# graph HTTP, Bolt, SPARQL, web console, Arrow Flight) requires TLS and      #
+# internode traffic is TLS (t_d5d122ba, t_58db6320), so this overlay also:   #
 #                                                                            #
 #   - mounts .compose-tls/nodeN (from scripts/gen-compose-test-certs.sh)     #
 #     read-only at /etc/ferrosa/tls in each node,                            #
@@ -61,9 +61,12 @@ x-ferrosa-secure-env: &ferrosa-secure-env
   FERROSA_WEB_TLS_CERT: /etc/ferrosa/tls/node.crt
   FERROSA_WEB_TLS_KEY: /etc/ferrosa/tls/node.key
   FERROSA_WEB_REQUIRE_TLS: "true"
-  # Arrow Flight has no TLS; production refuses it while enabled. Only
-  # `flight` builds bind it, and this keeps those builds startable too.
-  FERROSA_FLIGHT_ENABLED: "false"
+  # Arrow Flight (gRPC, only in `flight`/`full` builds): TLS like the rest.
+  # Builds without the feature ignore these.
+  FERROSA_FLIGHT_BIND: "0.0.0.0:8815"
+  FERROSA_FLIGHT_TLS_CERT: /etc/ferrosa/tls/node.crt
+  FERROSA_FLIGHT_TLS_KEY: /etc/ferrosa/tls/node.key
+  FERROSA_FLIGHT_REQUIRE_TLS: "true"
   # Internode: one-way server TLS, peers verified against the test CA.
   FERROSA_INTERNODE_TLS_CERT: /etc/ferrosa/tls/node.crt
   FERROSA_INTERNODE_TLS_KEY: /etc/ferrosa/tls/node.key

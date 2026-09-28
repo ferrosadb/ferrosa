@@ -76,6 +76,10 @@ bind = "127.0.0.1:5432"
 # require_tls = false
 
 [flight]
+# Arrow Flight gRPC (8815), only in builds with the `flight` feature (release
+# `full` builds). TLS is served with ALPN h2; gRPC clients connect with https://.
 bind = "127.0.0.1:8815"
-# No TLS yet; production mode requires enabled = false.
 # enabled = true
+# tls_cert = "/etc/ferrosa/tls/server.crt"
+# tls_key = "/etc/ferrosa/tls/server.key"
+# require_tls = false

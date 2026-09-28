@@ -424,6 +424,8 @@ struct ListenerTlsInputs {
     graph: listener_tls::ListenerTlsConfig,
     sparql: listener_tls::ListenerTlsConfig,
     web: listener_tls::ListenerTlsConfig,
+    /// `[flight] tls_cert/tls_key/require_tls` (env `FERROSA_FLIGHT_*`).
+    flight: listener_tls::ListenerTlsConfig,
     graph_enabled: bool,
     sparql_enabled: bool,
     /// `None` when the binary was built without the `flight` feature.
@@ -443,6 +445,7 @@ impl ListenerTlsInputs {
             graph: tls(file_config, "graph", "GRAPH"),
             sparql: tls(file_config, "sparql", "SPARQL"),
             web: tls(file_config, "web", "WEB"),
+            flight: tls(file_config, "flight", "FLIGHT"),
             graph_enabled: resolve_graph_enabled(file_config, |k| std::env::var(k).ok()),
             sparql_enabled: resolve_sparql_enabled(file_config, |k| std::env::var(k).ok()),
             flight_enabled,
@@ -453,12 +456,17 @@ impl ListenerTlsInputs {
     /// bad path or a half-configured listener stops startup naming the listener
     /// instead of surfacing later as a background listener failure.
     fn validate(&self) -> Result<(), String> {
-        let checks: [(&str, &listener_tls::ListenerTlsConfig, bool); 5] = [
+        let checks: [(&str, &listener_tls::ListenerTlsConfig, bool); 6] = [
             ("CQL", &self.cql, true),
             ("PostgreSQL", &self.postgres, true),
             ("graph HTTP / Bolt", &self.graph, self.graph_enabled),
             ("SPARQL", &self.sparql, self.sparql_enabled),
             ("web console", &self.web, true),
+            (
+                "Arrow Flight",
+                &self.flight,
+                self.flight_enabled == Some(true),
+            ),
         ];
         for (listener, cfg, enabled) in checks {
             // A disabled listener's require_tls is not enforced, but a
@@ -479,9 +487,9 @@ impl ListenerTlsInputs {
     /// The production-gate view of every listener this node may bind.
     ///
     /// Per listener: CQL, PostgreSQL, graph HTTP, Bolt, SPARQL and the web
-    /// console all support TLS and must require it when enabled. Arrow Flight
-    /// has no TLS implementation, so production refuses it while enabled
-    /// (`[flight] enabled = false`). CQL, PostgreSQL and the web console are
+    /// console all support TLS and must require it when enabled, and so does
+    /// Arrow Flight (t_58db6320) when the binary has the `flight` feature and
+    /// `[flight] enabled` is on. CQL, PostgreSQL and the web console are
     /// always enabled. With the graph engine disabled the graph HTTP port
     /// serves only a fixed 503 remediation stub (no data, no auth) and Bolt
     /// does not bind, so neither is gated then; the stub still uses TLS when a
@@ -519,20 +527,20 @@ impl ListenerTlsInputs {
             tls("web console", true, &self.web, "[web] require_tls"),
         ];
         if let Some(enabled) = self.flight_enabled {
-            listeners.push(ListenerTls {
-                listener: "Arrow Flight",
+            listeners.push(tls(
+                "Arrow Flight",
                 enabled,
-                tls_supported: false,
-                require_tls: false,
-                config_key: "[flight] enabled = false",
-            });
+                &self.flight,
+                "[flight] require_tls",
+            ));
         }
         listeners
     }
 }
 
 /// `[flight] enabled` (env `FERROSA_FLIGHT_ENABLED`), default on. Production
-/// mode refuses an enabled Flight listener because it has no TLS.
+/// mode requires an enabled Flight listener to require TLS
+/// (`[flight] tls_cert/tls_key/require_tls`), like every other listener.
 #[cfg(any(feature = "flight", test))]
 fn resolve_flight_enabled(file_config: &toml::Value) -> Result<bool, String> {
     match config_val_opt("FERROSA_FLIGHT_ENABLED", file_config, "flight", "enabled")
@@ -541,6 +549,65 @@ fn resolve_flight_enabled(file_config: &toml::Value) -> Result<bool, String> {
         None => Ok(true),
         Some(raw) => listener_tls::parse_bool_setting(&raw)
             .map_err(|e| format!("invalid [flight] enabled / FERROSA_FLIGHT_ENABLED: {e}")),
+    }
+}
+
+/// Build the Flight service from `FERROSA_FLIGHT_SIGNING_KEY` (ephemeral key
+/// with a WARN when unset), `FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS` (comma list)
+/// and `FERROSA_FLIGHT_TOKEN_TTL_SECS` (default 3600; a non-integer value is
+/// fatal rather than silently replaced by the default).
+#[cfg(feature = "flight")]
+fn build_flight_service(
+    state: std::sync::Arc<ferrosa_cql::router::SharedState>,
+) -> ferrosa_flight::service::FerrosaFlight {
+    let signing_key = match std::env::var("FERROSA_FLIGHT_SIGNING_KEY") {
+        Ok(k) if !k.is_empty() => k.into_bytes(),
+        _ => {
+            tracing::warn!(
+                "FERROSA_FLIGHT_SIGNING_KEY unset — using an ephemeral Flight token \
+                 key; bearer tokens will not survive a restart or work across nodes. \
+                 Set FERROSA_FLIGHT_SIGNING_KEY for stable auth."
+            );
+            uuid::Uuid::new_v4().into_bytes().to_vec()
+        }
+    };
+    let previous_keys: Vec<Vec<u8>> = std::env::var("FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS")
+        .ok()
+        .into_iter()
+        .flat_map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let token_ttl_secs = parse_flight_token_ttl(
+        std::env::var("FERROSA_FLIGHT_TOKEN_TTL_SECS").ok(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("FATAL: {error}");
+        std::process::exit(1);
+    });
+    let mut service = ferrosa_flight::service::FerrosaFlight::new(state, signing_key)
+        .with_token_ttl(token_ttl_secs);
+    if !previous_keys.is_empty() {
+        service = service.with_previous_keys(previous_keys);
+    }
+    service
+}
+
+/// `FERROSA_FLIGHT_TOKEN_TTL_SECS`: unset/empty → 3600; otherwise a positive
+/// integer. A typo used to fall back to 3600 silently.
+#[cfg(any(feature = "flight", test))]
+fn parse_flight_token_ttl(raw: Option<String>) -> Result<u64, String> {
+    match raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(3600),
+        Some(v) => match v.parse::<u64>() {
+            Ok(secs) if secs > 0 => Ok(secs),
+            _ => Err(format!(
+                "invalid FERROSA_FLIGHT_TOKEN_TTL_SECS {v:?}: expected a positive integer (seconds)"
+            )),
+        },
     }
 }
 
@@ -2234,62 +2301,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
 
-    // 9c. Arrow Flight (gRPC) query endpoint — port 8815, behind the `flight`
-    // feature. Auth is enforced per-RPC (signed bearer tokens); only
-    // anonymous-safe because every read RPC requires a verified token.
-    #[cfg(feature = "flight")]
-    {
-        let flight_addr = resolve_flight_bind(&file_config);
-        // `[flight] enabled = false` (FERROSA_FLIGHT_ENABLED=false) keeps the
-        // port closed; production requires it, since Flight has no TLS yet.
-        if listener_tls_inputs.flight_enabled != Some(true) {
-            tracing::info!("Arrow Flight server disabled ([flight] enabled = false)");
-        } else {
-            let signing_key = match std::env::var("FERROSA_FLIGHT_SIGNING_KEY") {
-                Ok(k) if !k.is_empty() => k.into_bytes(),
-                _ => {
-                    tracing::warn!(
-                        "FERROSA_FLIGHT_SIGNING_KEY unset — using an ephemeral Flight token \
-                             key; bearer tokens will not survive a restart or work across nodes. \
-                             Set FERROSA_FLIGHT_SIGNING_KEY for stable auth."
-                    );
-                    uuid::Uuid::new_v4().into_bytes().to_vec()
-                }
-            };
-            let previous_keys: Vec<Vec<u8>> = std::env::var("FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS")
-                .ok()
-                .into_iter()
-                .flat_map(|v| {
-                    v.split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.as_bytes().to_vec())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let token_ttl_secs: u64 = std::env::var("FERROSA_FLIGHT_TOKEN_TTL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3600);
-            let mut service =
-                ferrosa_flight::service::FerrosaFlight::new(flight_state, signing_key)
-                    .with_token_ttl(token_ttl_secs);
-            if !previous_keys.is_empty() {
-                service = service.with_previous_keys(previous_keys);
-            }
-            runtimes.background.spawn(async move {
-                if let Err(e) = ferrosa_flight::server::serve_service(flight_addr, service).await {
-                    tracing::error!(error = %e, "Arrow Flight server exited");
-                }
-            });
-            tracing::info!(%flight_addr, "Arrow Flight server listening");
-        }
-    }
-
     // Health of the listeners that start in background tasks (graph HTTP, Bolt,
     // SPARQL, Postgres). A bind failure used to be one ERROR line while `/readyz`
     // kept answering 200; each listener now records itself here, and `/readyz` and
     // `/metrics` report it.
     let listener_status = std::sync::Arc::new(crate::listener_status::ListenerStatus::default());
+
+    // 9c. Arrow Flight (gRPC) query endpoint — port 8815, behind the `flight`
+    // feature. Auth is enforced per-RPC (signed bearer tokens); only
+    // anonymous-safe because every read RPC requires a verified token. TLS from
+    // `[flight] tls_cert/tls_key/require_tls` (t_58db6320), built through
+    // ferrosa_net::tls like every other listener.
+    #[cfg(feature = "flight")]
+    {
+        let flight_addr = resolve_flight_bind(&file_config);
+        // `[flight] enabled = false` (FERROSA_FLIGHT_ENABLED=false) keeps the
+        // port closed.
+        if listener_tls_inputs.flight_enabled != Some(true) {
+            tracing::info!("Arrow Flight server disabled ([flight] enabled = false)");
+        } else {
+            // A certificate means the port serves TLS only, so replica
+            // locations in GetFlightInfo are advertised as grpc+tls://.
+            let serves_tls = listener_tls_inputs.flight.cert.is_some();
+            let service = build_flight_service(flight_state).with_tls_locations(serves_tls);
+            let flight_tls = ferrosa_flight::server::FlightTlsConfig {
+                cert_path: listener_tls_inputs.flight.cert.clone(),
+                key_path: listener_tls_inputs.flight.key.clone(),
+                require_tls: listener_tls_inputs.flight.require_tls,
+            };
+            listener_status.mark_up("flight");
+            let flight_status = listener_status.clone();
+            runtimes.background.spawn(async move {
+                let result =
+                    ferrosa_flight::server::serve_service(flight_addr, service, &flight_tls).await;
+                let reason = match result {
+                    Ok(()) => "Arrow Flight server exited".to_string(),
+                    Err(e) => e.to_string(),
+                };
+                tracing::error!(%flight_addr, error = %reason, "Arrow Flight server stopped");
+                flight_status.mark_failed("flight", reason);
+            });
+        }
+    }
 
     // 9b. Web observability console — reuse the same registry as the CQL router.
     let web_state = web::WebAppState {
@@ -4346,9 +4399,10 @@ mod tests {
             graph: tls_required(),
             sparql: tls_required(),
             web: tls_required(),
+            flight: tls_required(),
             graph_enabled: true,
             sparql_enabled: true,
-            flight_enabled: None,
+            flight_enabled: Some(true),
         }
     }
 
@@ -4428,22 +4482,93 @@ mod tests {
         assert!(violations.is_empty(), "{violations:?}");
     }
 
+    /// t_58db6320: Flight has TLS now, so production applies the same rule
+    /// as every other listener: enabled Flight must require TLS, and the
+    /// refusal names `[flight] require_tls`, `tls_cert` and `tls_key`.
     #[test]
-    fn production_refuses_an_enabled_flight_listener_which_has_no_tls() {
+    fn production_refuses_an_enabled_flight_listener_that_does_not_require_tls() {
         let mut inputs = all_listeners_require_tls();
-        inputs.flight_enabled = Some(true);
+        inputs.flight = listener_tls::ListenerTlsConfig::default();
         let messages: Vec<String> = production_violations(&inputs, true)
             .iter()
+            .filter(|v| v.blocks_startup())
             .map(|v| v.to_string())
             .collect();
+        let [message] = messages.as_slice() else {
+            panic!("expected exactly the Flight refusal, got {messages:?}");
+        };
+        for key in [
+            "the Arrow Flight listener",
+            "[flight] require_tls",
+            "[flight] tls_cert",
+            "[flight] tls_key",
+        ] {
+            assert!(message.contains(key), "missing {key:?}: {message}");
+        }
         assert!(
-            messages
-                .iter()
-                .any(|m| m.contains("Arrow Flight") && m.contains("[flight] enabled = false")),
-            "{messages:?}"
+            !message.contains("enabled = false"),
+            "Flight has TLS; the remedy is TLS, not disabling it: {message}"
         );
+
+        // Disabled Flight needs no TLS.
         inputs.flight_enabled = Some(false);
         assert!(production_violations(&inputs, true).is_empty());
+        // A build without the flight feature has no Flight listener at all.
+        inputs.flight_enabled = None;
+        assert!(production_violations(&inputs, true).is_empty());
+    }
+
+    #[test]
+    fn production_accepts_an_enabled_flight_listener_that_requires_tls() {
+        let inputs = all_listeners_require_tls();
+        assert_eq!(inputs.flight_enabled, Some(true));
+        let violations = production_violations(&inputs, true);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn flight_tls_keys_come_from_the_flight_section() {
+        let toml: toml::Value = "[flight]\ntls_cert = \"/f.crt\"\ntls_key = \"/f.key\"\n\
+                                 require_tls = true\n"
+            .parse()
+            .unwrap();
+        let inputs = ListenerTlsInputs::resolve(&toml);
+        assert_eq!(
+            inputs.flight,
+            listener_tls::ListenerTlsConfig {
+                cert: Some("/f.crt".into()),
+                key: Some("/f.key".into()),
+                require_tls: true,
+            }
+        );
+    }
+
+    #[test]
+    fn flight_tls_validation_names_flight_when_enabled_and_ignores_it_when_disabled() {
+        let mut inputs = all_listeners_require_tls();
+        for cfg in [
+            &mut inputs.cql,
+            &mut inputs.postgres,
+            &mut inputs.graph,
+            &mut inputs.sparql,
+            &mut inputs.web,
+        ] {
+            *cfg = listener_tls::ListenerTlsConfig::default();
+        }
+        inputs.flight = listener_tls::ListenerTlsConfig {
+            cert: None,
+            key: None,
+            require_tls: true,
+        };
+        let err = inputs
+            .validate()
+            .expect_err("enabled Flight with require_tls and no certificate must stop startup");
+        assert!(err.contains("Arrow Flight"), "{err}");
+
+        inputs.flight_enabled = Some(false);
+        inputs
+            .validate()
+            .expect("a disabled Flight listener's require_tls is not enforced");
     }
 
     #[test]
@@ -4510,5 +4635,16 @@ mod tests {
         assert_eq!(resolve_flight_enabled(&off), Ok(false));
         let typo: toml::Value = "[flight]\nenabled = \"flase\"\n".parse().unwrap();
         assert!(resolve_flight_enabled(&typo).is_err());
+    }
+
+    #[test]
+    fn flight_token_ttl_defaults_and_rejects_typos() {
+        assert_eq!(parse_flight_token_ttl(None), Ok(3600));
+        assert_eq!(parse_flight_token_ttl(Some(String::new())), Ok(3600));
+        assert_eq!(parse_flight_token_ttl(Some("600".into())), Ok(600));
+        for bad in ["1h", "-5", "0"] {
+            let err = parse_flight_token_ttl(Some(bad.into())).unwrap_err();
+            assert!(err.contains("FERROSA_FLIGHT_TOKEN_TTL_SECS"), "{err}");
+        }
     }
 }

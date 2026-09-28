@@ -1,8 +1,8 @@
 //! TLS helpers shared by every Ferrosa listener.
 //!
 //! This module is the ONE place the process picks a rustls crypto provider
-//! ([`crypto_provider`]). Internode, CQL, PostgreSQL, Bolt and the HTTP
-//! front-ends all build their `rustls::ServerConfig` through
+//! ([`crypto_provider`]). Internode, CQL, PostgreSQL, Bolt, Arrow Flight and
+//! the HTTP front-ends all build their `rustls::ServerConfig` through
 //! [`server_config_from_pem`], so swapping the provider (e.g. to a FIPS
 //! module) is a one-line change here rather than a hunt across crates. The
 //! provider is passed explicitly rather than installed as the process default,
@@ -20,6 +20,9 @@ use crate::error::{NetError, Result};
 
 /// ALPN protocol list for HTTP listeners (HTTP/2 preferred, HTTP/1.1 fallback).
 pub const HTTP_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
+
+/// ALPN protocol list for gRPC listeners (Arrow Flight): HTTP/2 only.
+pub const GRPC_ALPN: &[&[u8]] = &[b"h2"];
 
 /// The crypto provider every Ferrosa TLS endpoint uses.
 ///

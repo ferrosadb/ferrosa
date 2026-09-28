@@ -13,6 +13,14 @@ native wire. The command carried by a Flight `Ticket`/`FlightDescriptor` is a
 CQL string: a `SELECT` for reads, executed by `ferrosa_cql::router::route_select_raw`
 and converted column-by-column to an Arrow [`RecordBatch`](src/convert.rs).
 
+Transport is gRPC over **TLS** when a certificate is configured
+(t_58db6320): `server::serve_service` terminates TLS with `tokio-rustls` on a
+`rustls::ServerConfig` built by `ferrosa_net::tls` (the one crypto provider
+every Ferrosa listener uses), ALPN `h2`, and hands finished handshakes to tonic
+via `serve_with_incoming`. tonic's own `tls` feature is not enabled. With a
+certificate the port speaks TLS only; a plaintext client's handshake fails and
+the connection is closed (WARN with the peer address).
+
 Authentication is **bearer-token, never anonymous** (decision **D4**):
 `Handshake` validates CQL credentials and issues an HMAC-SHA256-signed token;
 every other RPC requires `authorization: Bearer <token>` and derives its
@@ -57,14 +65,14 @@ Every RPC is implemented — there are **no `Unimplemented` stubs**.
 | `convert` (`src/convert.rs`) | CQL result ↔ Arrow: `rows_to_record_batch` (full CQL type coverage) and `record_batch_to_rows` (scalar Arrow → CQL, fail-loud on the rest) |
 | `plan` (`src/plan.rs`) | Pure distributed-read planner: ring token ranges → token-bounded `SELECT` endpoints with replica locations (W-002) |
 | `token` (`src/token.rs`) | HMAC-SHA256 signed bearer tokens: `issue` / `verify` / `verify_with_keys` (key rotation) |
-| `server` (`src/server.rs`) | gRPC bootstrap: `flight_service` (mount on a `tonic` server) and `serve` (bind-and-run) |
+| `server` (`src/server.rs`) | gRPC bootstrap: `flight_service` (mount on a `tonic` server), `FlightTlsConfig` (cert/key/require_tls → rustls config via `ferrosa_net::tls`, ALPN h2), `serve_service` / `serve_on_listener` (TLS-only when configured, plaintext otherwise), `serve` (plaintext convenience) |
 
 ## Public API (key entry points)
 
 | Area | Items |
 |------|-------|
-| Service | `FerrosaFlight::new`, `.with_flight_advertise`, `.with_flight_port`, `.with_previous_keys`, `.with_token_ttl`, `.with_page_size` |
-| Server | `server::flight_service`, `server::serve`, `server::serve_service` |
+| Service | `FerrosaFlight::new`, `.with_flight_advertise`, `.with_flight_port`, `.with_tls_locations`, `.with_previous_keys`, `.with_token_ttl`, `.with_page_size` |
+| Server | `server::flight_service`, `server::FlightTlsConfig`, `server::serve_service`, `server::serve_on_listener`, `server::serve`, `server::ServeError`, `server::TlsConnection` |
 | Convert | `convert::rows_to_record_batch`, `convert::record_batch_to_rows`, `convert::cql_type_to_arrow`, `convert::ConvertError` |
 | Plan | `plan::distributed_endpoints`, `plan::ring_token_ranges`, `plan::token_bounded_select`, `plan::EndpointPlan` |
 | Token | `token::issue`, `token::verify`, `token::verify_with_keys`, `token::Claims`, `token::TokenError` |
@@ -74,7 +82,12 @@ Every RPC is implemented — there are **no `Unimplemented` stubs**.
 | Env var | Effect |
 |---------|--------|
 | `FERROSA_FLIGHT_BROADCAST` | This node's externally-reachable Flight address advertised for ranges it owns. Unset → self-owned ranges advertise **no** location (client falls back to the queried connection) rather than faking an address. |
-| `FERROSA_FLIGHT_PORT` | Flight gRPC port combined with a remote replica's internode host to build its advertised location (default `50051`). |
+| `FERROSA_FLIGHT_PORT` | Flight gRPC port combined with a remote replica's internode host to build its advertised location (default `50051`). The scheme is `grpc+tls://` when the service is built `.with_tls_locations(true)` (the binary does this when `[flight] tls_cert` is set), else `grpc://`. |
+
+TLS keys are read by the `ferrosa` binary (`[flight] tls_cert` / `tls_key` /
+`require_tls`, env `FERROSA_FLIGHT_TLS_CERT` / `_TLS_KEY` / `_REQUIRE_TLS`) and
+passed in as a `FlightTlsConfig`. `require_tls` without a certificate, or only
+one of cert/key, is an error naming "Arrow Flight", never a plaintext fallback.
 
 ## Dependencies
 
@@ -87,9 +100,12 @@ Every RPC is implemented — there are **no `Unimplemented` stubs**.
 - **`ferrosa-schema`** — `AuthContext`, `Schema::authenticate`, `is_system_keyspace`,
   the schema snapshot used to enumerate tables and partition keys.
 - **`ferrosa-common`** — `CqlValue` / `CqlType` (the value model converted to Arrow).
+- **`ferrosa-net`** — `tls::optional_server_config` / `GRPC_ALPN` (the shared
+  TLS builder and crypto provider).
 
-External: `arrow` + `arrow-flight` (53), `tonic` (0.12), `hmac`/`sha2`/`hex`
-(tokens), `futures`, `tokio`, `tracing`.
+External: `arrow` + `arrow-flight` (53), `tonic` (0.12, no `tls` feature),
+`rustls` / `tokio-rustls` (TLS termination), `hmac`/`sha2`/`hex` (tokens),
+`futures`, `tokio`, `tracing`.
 
 **Called by** (crates that depend on this):
 
@@ -97,13 +113,14 @@ External: `arrow` + `arrow-flight` (53), `tonic` (0.12), `hmac`/`sha2`/`hex`
 
 ## Tests
 
-46 tests total — 25 unit (`convert` 11, `token` 7, `plan` 7) + 21 integration:
+55 tests total — 25 unit (`convert` 11, `token` 7, `plan` 7) + 30 integration:
 
 - `tests/read_path.rs` (4) — `DoGet` streams a `SELECT` result as Arrow, paging across multiple pages, bearer required, non-`SELECT` rejected.
 - `tests/grpc_handshake.rs` (2) — full gRPC `Handshake` → `DoGet`; `DoPut` write then `DoGet` read-back over a real `tonic` channel.
 - `tests/exchange_path.rs` (2) — `DoExchange` upserts each batch and acks; requires a valid bearer.
 - `tests/minor_rpcs.rs` (11) — `ListFlights`, `PollFlightInfo`, `ListActions`, `DoAction` (`server.info` / `token.validate` / unknown / bearer).
-- `tests/distributed_endpoints.rs` (2) — standalone single endpoint; multi-range topology one endpoint per range.
+- `tests/distributed_endpoints.rs` (3) — standalone single endpoint; multi-range topology one endpoint per range; `grpc+tls://` locations when serving TLS.
+- `tests/tls_listener.rs` (8) — a TLS client (ALPN h2, same provider) completes `Handshake` + `ListFlights`; a plaintext gRPC client gets no RPC through and the server keeps serving TLS; an untrusted certificate is rejected; `require_tls` without a certificate / half a certificate is an error; ALPN is `h2` only; a missing certificate file stops `serve_service` before binding.
 
 ## Specs
 

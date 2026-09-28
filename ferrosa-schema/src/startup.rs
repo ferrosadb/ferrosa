@@ -94,11 +94,22 @@ impl std::fmt::Display for ProductionViolation {
             Self::ListenerTlsNotRequired {
                 listener,
                 config_key,
-            } => write!(
-                f,
-                "the {listener} listener does not require TLS; set {config_key} = true \
-                 with its tls_cert and tls_key"
-            ),
+            } => {
+                // `[flight] require_tls` -> name `[flight] tls_cert` and
+                // `[flight] tls_key` too, so the operator sees every key.
+                match config_key.strip_suffix("require_tls") {
+                    Some(section) => write!(
+                        f,
+                        "the {listener} listener does not require TLS; set {config_key} = true \
+                         with {section}tls_cert and {section}tls_key"
+                    ),
+                    None => write!(
+                        f,
+                        "the {listener} listener does not require TLS; set {config_key} = true \
+                         with its tls_cert and tls_key"
+                    ),
+                }
+            }
             Self::ListenerWithoutTlsSupport {
                 listener,
                 disable_key,
@@ -170,7 +181,7 @@ pub struct ProductionCheckConfig {
     /// Whether client/admin authentication is enabled.
     pub auth_enabled: bool,
     /// TLS posture of every client listener the node may bind (CQL,
-    /// PostgreSQL, graph HTTP, Bolt, SPARQL, web, Flight).
+    /// PostgreSQL, graph HTTP, Bolt, SPARQL, web, Arrow Flight).
     pub listeners: Vec<ListenerTls>,
     /// Whether internode connections require TLS (`[internode] require_tls`).
     pub internode_require_tls: bool,
@@ -258,6 +269,7 @@ mod tests {
             ("Bolt", "[graph] require_tls"),
             ("SPARQL", "[sparql] require_tls"),
             ("web console", "[web] require_tls"),
+            ("Arrow Flight", "[flight] require_tls"),
         ]
         .into_iter()
         .map(|(listener, config_key)| ListenerTls {
@@ -306,6 +318,7 @@ mod tests {
             ("Bolt", "[graph] require_tls"),
             ("SPARQL", "[sparql] require_tls"),
             ("web console", "[web] require_tls"),
+            ("Arrow Flight", "[flight] require_tls"),
         ] {
             let config = with_listener(name, |l| l.require_tls = false);
             let violations = validate_production_requirements(&config);
@@ -318,9 +331,15 @@ mod tests {
             });
             assert!(found.blocks_startup(), "{name}: must block startup");
             let message = found.to_string();
+            let section = key.strip_suffix("require_tls").unwrap();
+            let named = [
+                key.to_string(),
+                format!("{section}tls_cert"),
+                format!("{section}tls_key"),
+            ];
             assert!(
-                message.contains(name) && message.contains(key),
-                "{name}: the refusal must name the listener and {key}: {message}"
+                message.contains(name) && named.iter().all(|k| message.contains(k.as_str())),
+                "{name}: the refusal must name the listener and {named:?}: {message}"
             );
             assert_eq!(
                 violations.len(),
@@ -345,26 +364,28 @@ mod tests {
     #[test]
     fn an_enabled_listener_with_no_tls_support_is_refused_with_its_disable_key() {
         let mut config = passing_production_config();
+        // No shipped listener lacks TLS today (Arrow Flight gained it in
+        // t_58db6320); the rule stays for any future one.
         config.listeners.push(ListenerTls {
-            listener: "Arrow Flight",
+            listener: "Example",
             enabled: true,
             tls_supported: false,
             require_tls: false,
-            config_key: "[flight] enabled = false",
+            config_key: "[example] enabled = false",
         });
         let violations = validate_production_requirements(&config);
         let [v] = violations.as_slice() else {
-            panic!("expected exactly the Flight violation, got {violations:?}");
+            panic!("expected exactly the Example violation, got {violations:?}");
         };
         assert!(matches!(
             v,
             ProductionViolation::ListenerWithoutTlsSupport {
-                listener: "Arrow Flight",
+                listener: "Example",
                 ..
             }
         ));
         assert!(v.blocks_startup());
-        assert!(v.to_string().contains("[flight] enabled = false"), "{v}");
+        assert!(v.to_string().contains("[example] enabled = false"), "{v}");
 
         // Disabled, it is fine.
         config.listeners.last_mut().unwrap().enabled = false;
@@ -533,8 +554,8 @@ mod tests {
                 config_key: "[cql] require_tls",
             },
             ProductionViolation::ListenerWithoutTlsSupport {
-                listener: "Arrow Flight",
-                disable_key: "[flight] enabled = false",
+                listener: "Example",
+                disable_key: "[example] enabled = false",
             },
             ProductionViolation::CqlMutualTlsNotConfigured,
             ProductionViolation::InternodeTlsNotConfigured,

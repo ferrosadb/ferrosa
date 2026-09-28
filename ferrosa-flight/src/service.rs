@@ -59,12 +59,23 @@ const ENV_FLIGHT_BROADCAST: &str = "FERROSA_FLIGHT_BROADCAST";
 const ENV_FLIGHT_PORT: &str = "FERROSA_FLIGHT_PORT";
 
 /// Resolve the Flight gRPC port for remote replica locations from the
-/// environment, falling back to [`DEFAULT_FLIGHT_PORT`].
+/// environment, falling back to [`DEFAULT_FLIGHT_PORT`] when unset. A value
+/// that is not a port also falls back, but logs an ERROR naming the value (it
+/// used to fall back silently, advertising a port the operator never chose).
 fn flight_port_from_env() -> u16 {
-    std::env::var(ENV_FLIGHT_PORT)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_FLIGHT_PORT)
+    let Ok(raw) = std::env::var(ENV_FLIGHT_PORT) else {
+        return DEFAULT_FLIGHT_PORT;
+    };
+    match raw.trim().parse() {
+        Ok(port) => port,
+        Err(e) => {
+            tracing::error!(
+                value = %raw, error = %e, default = DEFAULT_FLIGHT_PORT,
+                "invalid {ENV_FLIGHT_PORT}; advertising the default Flight port for remote replicas"
+            );
+            DEFAULT_FLIGHT_PORT
+        }
+    }
 }
 
 /// This node's advertised Flight address from [`ENV_FLIGHT_BROADCAST`], if set.
@@ -96,6 +107,9 @@ pub struct FerrosaFlight {
     /// Flight gRPC port combined with a remote replica's internode host to
     /// build its advertised location (the ring records only internode addrs).
     flight_port: u16,
+    /// URI scheme for remote replica locations: `grpc+tls` when the Flight
+    /// listeners serve TLS (t_58db6320), `grpc` otherwise.
+    location_scheme: &'static str,
 }
 
 fn now_secs() -> u64 {
@@ -116,7 +130,17 @@ impl FerrosaFlight {
             page_size: DEFAULT_PAGE_SIZE,
             flight_advertise: flight_broadcast_from_env(),
             flight_port: flight_port_from_env(),
+            location_scheme: "grpc",
         }
+    }
+
+    /// Advertise remote replica locations as `grpc+tls://` (true) or
+    /// `grpc://` (false, the default). Set it to match whether the cluster's
+    /// Flight listeners serve TLS: a client that follows a `grpc://` location
+    /// to a TLS-only port cannot connect.
+    pub fn with_tls_locations(mut self, tls: bool) -> Self {
+        self.location_scheme = if tls { "grpc+tls" } else { "grpc" };
+        self
     }
 
     /// Override this node's advertised Flight address (the location used for
@@ -340,7 +364,10 @@ impl FerrosaFlight {
             .rsplit_once(':')
             .map(|(h, _)| h)
             .unwrap_or(&info.addr);
-        Some(format!("grpc://{host}:{}", self.flight_port))
+        Some(format!(
+            "{}://{host}:{}",
+            self.location_scheme, self.flight_port
+        ))
     }
 
     /// Build the distributed `FlightEndpoint` list for `select`.

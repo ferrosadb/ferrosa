@@ -11,6 +11,11 @@
 #      and confirm a plaintext CQL client is refused
 #   5. tear everything down (always, including volumes)
 #
+# Arrow Flight is not exercised: the overlay configures Flight TLS
+# (FERROSA_FLIGHT_TLS_CERT/_KEY/_REQUIRE_TLS), but the node image is built with
+# default features, which do not include `flight`, so nothing binds 8815.
+# Flight TLS is covered by ferrosa-flight/tests/tls_listener.rs.
+#
 # Requires the node image to exist already (no build): every node uses
 # ${FERROSA_SMOKE_IMAGE:-ferrosa-smoke:latest}, and the image must contain curl
 # for the healthcheck.

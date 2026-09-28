@@ -72,7 +72,8 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   cert/key/CA paths; `require_tls` fails startup loudly when no cert is
   configured (acceptor AND connector). This module is the process's single
   crypto-provider decision (`crypto_provider()`, currently `ring`): internode,
-  CQL, PostgreSQL, Bolt, graph HTTP, SPARQL and the web console build their
+  CQL, PostgreSQL, Bolt, graph HTTP, SPARQL, the web console and Arrow Flight
+  (ALPN `GRPC_ALPN` = `h2`) build their
   server config through `server_config_from_pem` / `optional_server_config`, so a
   provider swap (e.g. FIPS) is a one-line change here.
 - **Streaming support** (`stream_router`, `idle_timeout`) — `StreamRouter`
@@ -112,7 +113,7 @@ silently disable the TLS requirement) is **fatal** under `from_env_checked`, whi
 `ferrosa` uses at startup; a seed or broadcast hostname that does not resolve yet is
 logged at WARN and startup continues (the binary retries seeds by name). An empty
 value counts as unset.
-| TLS | `tls::build_tls_acceptor`, `tls::build_tls_connector`, `tls::crypto_provider`, `tls::server_config_from_pem`, `tls::optional_server_config`, `tls::HTTP_ALPN` |
+| TLS | `tls::build_tls_acceptor`, `tls::build_tls_connector`, `tls::crypto_provider`, `tls::server_config_from_pem`, `tls::optional_server_config`, `tls::HTTP_ALPN`, `tls::GRPC_ALPN` |
 
 ## Dependencies
 
