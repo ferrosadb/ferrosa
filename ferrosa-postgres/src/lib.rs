@@ -12,6 +12,7 @@
 //! **types** (`messages`) — the pure, infra-free foundation (harness layer H1)
 //! that the connection state machine and SCRAM exchange build on.
 
+pub(crate) mod authz;
 pub mod catalog;
 pub mod codec;
 pub mod connection;
@@ -26,7 +27,7 @@ pub mod server;
 pub mod storage_provider;
 pub mod store;
 
-pub use connection::{ConnError, Connection};
+pub use connection::{ConnError, Connection, TlsPolicy};
 pub use handshake::{Handshake, HandshakeError, VerifierStore};
 pub use store::SchemaVerifierStore;
 
@@ -37,4 +38,4 @@ pub use messages::{
 };
 pub use mvcc::{MvccManager, PgWrite};
 pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
-pub use server::QueryContext;
+pub use server::{PgTls, QueryContext};

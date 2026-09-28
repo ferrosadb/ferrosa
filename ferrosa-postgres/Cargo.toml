@@ -42,6 +42,10 @@ num-bigint = "0.4"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TLS for SSLRequest: the acceptor is built by ferrosa-net's shared TLS helper
+# (one crypto provider for every listener, t_e1c819ad).
+ferrosa-net = { path = "../ferrosa-net" }
+tokio-rustls = "0.26"
 
 [features]
 # Opt-in gate for tests that require external infrastructure (a real
@@ -57,8 +61,9 @@ indexmap = { version = "2", features = ["serde"] }
 proptest = "1"
 async-trait = "0.1"
 ferrosa-cluster = { path = "../ferrosa-cluster" }
-ferrosa-net = { path = "../ferrosa-net" }
 uuid = { version = "1", features = ["v4"] }
+rcgen = "0.14"
+rustls = { version = "0.23", features = ["ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7"
 tempfile = "3"

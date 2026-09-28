@@ -20,6 +20,27 @@ pub enum ConnError {
     Handshake(HandshakeError),
     /// A message arrived that is not valid for the current phase.
     Unexpected(&'static str),
+    /// The server requires TLS (`[postgres] require_tls`) and the client sent
+    /// its StartupMessage without first negotiating TLS via `SSLRequest`.
+    TlsRequired,
+}
+
+/// How the connection answers `SSLRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsPolicy {
+    /// Answer `SSLRequest` with `S` (a TLS acceptor is configured). When
+    /// false the server answers `N` and the session stays plaintext.
+    pub offer: bool,
+    /// Refuse a StartupMessage that was not preceded by a TLS handshake.
+    pub require: bool,
+}
+
+impl TlsPolicy {
+    /// No TLS: decline `SSLRequest`, accept plaintext startups.
+    pub const PLAINTEXT: TlsPolicy = TlsPolicy {
+        offer: false,
+        require: false,
+    };
 }
 
 impl From<CodecError> for ConnError {
@@ -36,6 +57,9 @@ impl From<HandshakeError> for ConnError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     AwaitingStartup,
+    /// `S` was sent in answer to `SSLRequest`; the caller must now run the TLS
+    /// handshake and call [`Connection::on_tls_established`].
+    AwaitingTls,
     Authenticating,
     Ready,
     Closed,
@@ -46,19 +70,48 @@ pub struct Connection<'a, S: VerifierStore> {
     inbuf: BytesMut,
     handshake: Handshake<'a, S>,
     phase: Phase,
+    tls: TlsPolicy,
+    tls_established: bool,
     /// `(process_id, secret_key)` advertised in BackendKeyData for cancellation.
     /// Placeholder `(0, 0)` until the cancel protocol is wired (follow-up).
     backend_key: (i32, i32),
 }
 
 impl<'a, S: VerifierStore> Connection<'a, S> {
-    pub fn new(store: &'a S, server_nonce: impl Into<String>) -> Self {
+    pub fn new(store: &'a S, server_nonce: impl Into<String>, tls: TlsPolicy) -> Self {
         Self {
             inbuf: BytesMut::new(),
             handshake: Handshake::new(store, server_nonce),
             phase: Phase::AwaitingStartup,
+            tls,
+            tls_established: false,
             backend_key: (0, 0),
         }
+    }
+
+    /// True after `S` was sent: the caller must run the server-side TLS
+    /// handshake on the socket before feeding any more bytes.
+    pub fn tls_upgrade_pending(&self) -> bool {
+        self.phase == Phase::AwaitingTls
+    }
+
+    /// The caller completed the TLS handshake; subsequent bytes are the
+    /// decrypted stream, starting with the client's StartupMessage.
+    pub fn on_tls_established(&mut self) -> Result<(), ConnError> {
+        if self.phase != Phase::AwaitingTls {
+            return Err(ConnError::Unexpected(
+                "TLS established without an SSLRequest",
+            ));
+        }
+        self.tls_established = true;
+        self.phase = Phase::AwaitingStartup;
+        Ok(())
+    }
+
+    /// The authenticated session's authorization context (role + superuser
+    /// flag), available once [`Connection::is_ready`].
+    pub fn auth_context(&self) -> Option<&ferrosa_schema::AuthContext> {
+        self.handshake.auth_context()
     }
 
     /// True once the client has authenticated and the server sent the first
@@ -94,10 +147,34 @@ impl<'a, S: VerifierStore> Connection<'a, S> {
             match self.phase {
                 Phase::AwaitingStartup => match codec::read_startup(&mut self.inbuf)? {
                     None => break,
-                    Some(StartupFrame::SslRequest) => out.put_u8(b'N'), // decline TLS (not wired yet)
+                    Some(StartupFrame::SslRequest) => {
+                        if self.tls_established {
+                            return Err(ConnError::Unexpected("SSLRequest inside a TLS session"));
+                        }
+                        if !self.tls.offer {
+                            out.put_u8(b'N'); // no certificate configured: stay plaintext
+                            continue;
+                        }
+                        // Anything the client sent after SSLRequest arrived
+                        // in plaintext; processing it as if it were inside
+                        // TLS would let a man-in-the-middle inject commands
+                        // (the CVE-2021-23214 shape). Refuse it.
+                        if !self.inbuf.is_empty() {
+                            return Err(ConnError::Unexpected(
+                                "data pipelined after SSLRequest before the TLS handshake",
+                            ));
+                        }
+                        out.put_u8(b'S');
+                        self.phase = Phase::AwaitingTls;
+                        break;
+                    }
                     Some(StartupFrame::CancelRequest { .. }) => {
                         self.phase = Phase::Closed;
                         break;
+                    }
+                    Some(StartupFrame::Startup(_)) if self.tls.require && !self.tls_established => {
+                        self.phase = Phase::Closed;
+                        return Err(ConnError::TlsRequired);
                     }
                     Some(StartupFrame::Startup(msg)) => {
                         for m in self.handshake.on_startup(&msg)? {
@@ -106,6 +183,12 @@ impl<'a, S: VerifierStore> Connection<'a, S> {
                         self.phase = Phase::Authenticating;
                     }
                 },
+                // The caller must run the TLS handshake before feeding bytes.
+                Phase::AwaitingTls => {
+                    return Err(ConnError::Unexpected(
+                        "bytes received before the TLS handshake completed",
+                    ))
+                }
                 Phase::Authenticating => match codec::read_frontend(&mut self.inbuf)? {
                     None => break,
                     Some(FrontendMessage::SaslResponse { data }) => {
@@ -201,6 +284,17 @@ mod tests {
         fn verifier(&self, user: &str) -> Option<ScramVerifier> {
             (user == "user").then(|| self.0.clone())
         }
+        fn admit(&self, _user: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn record_failure(&self, _user: &str) {}
+        fn record_success(&self, user: &str) -> Result<ferrosa_schema::AuthContext, String> {
+            Ok(ferrosa_schema::AuthContext {
+                role: user.to_string(),
+                is_superuser: false,
+                must_change_password: false,
+            })
+        }
     }
 
     fn store() -> MockStore {
@@ -243,7 +337,7 @@ mod tests {
     #[test]
     fn full_byte_level_handshake_reaches_ready() {
         let s = store();
-        let mut conn = Connection::new(&s, SERVER_NONCE);
+        let mut conn = Connection::new(&s, SERVER_NONCE, TlsPolicy::PLAINTEXT);
 
         // startup -> AuthenticationSASL ('R')
         let out1 = conn
@@ -265,14 +359,27 @@ mod tests {
         assert!(conn.is_ready());
     }
 
-    #[test]
-    fn ssl_request_is_declined_with_single_byte() {
-        let s = store();
-        let mut conn = Connection::new(&s, SERVER_NONCE);
+    fn ssl_request() -> Vec<u8> {
         let mut ssl = Vec::new();
         ssl.extend_from_slice(&8i32.to_be_bytes());
         ssl.extend_from_slice(&80877103i32.to_be_bytes());
-        assert_eq!(conn.on_bytes(&ssl).unwrap(), vec![b'N']);
+        ssl
+    }
+
+    const OFFER: TlsPolicy = TlsPolicy {
+        offer: true,
+        require: false,
+    };
+    const REQUIRE: TlsPolicy = TlsPolicy {
+        offer: true,
+        require: true,
+    };
+
+    #[test]
+    fn ssl_request_is_declined_with_single_byte() {
+        let s = store();
+        let mut conn = Connection::new(&s, SERVER_NONCE, TlsPolicy::PLAINTEXT);
+        assert_eq!(conn.on_bytes(&ssl_request()).unwrap(), vec![b'N']);
         assert!(!conn.is_ready() && !conn.is_closed());
         // then a real startup still works
         let out = conn.on_bytes(&startup_frame(&[("user", "user")])).unwrap();
@@ -280,9 +387,71 @@ mod tests {
     }
 
     #[test]
+    fn ssl_request_is_accepted_with_s_when_tls_is_offered() {
+        let s = store();
+        let mut conn = Connection::new(&s, SERVER_NONCE, OFFER);
+        assert_eq!(conn.on_bytes(&ssl_request()).unwrap(), vec![b'S']);
+        assert!(
+            conn.tls_upgrade_pending(),
+            "caller must now run the TLS handshake"
+        );
+        conn.on_tls_established().unwrap();
+        assert!(!conn.tls_upgrade_pending());
+        let out = conn.on_bytes(&startup_frame(&[("user", "user")])).unwrap();
+        assert_eq!(out[0], b'R', "startup proceeds inside TLS");
+    }
+
+    #[test]
+    fn bytes_pipelined_after_ssl_request_are_refused() {
+        // Plaintext bytes sent before the TLS handshake would otherwise be
+        // processed as if they arrived inside TLS (CVE-2021-23214 shape).
+        let s = store();
+        let mut conn = Connection::new(&s, SERVER_NONCE, OFFER);
+        let mut bytes = ssl_request();
+        bytes.extend_from_slice(&startup_frame(&[("user", "user")]));
+        assert!(matches!(
+            conn.on_bytes(&bytes),
+            Err(ConnError::Unexpected(_))
+        ));
+    }
+
+    #[test]
+    fn plaintext_startup_is_refused_when_tls_is_required() {
+        let s = store();
+        let mut conn = Connection::new(&s, SERVER_NONCE, REQUIRE);
+        assert_eq!(
+            conn.on_bytes(&startup_frame(&[("user", "user")])),
+            Err(ConnError::TlsRequired)
+        );
+        assert!(!conn.is_ready());
+    }
+
+    #[test]
+    fn tls_startup_is_accepted_when_tls_is_required() {
+        let s = store();
+        let mut conn = Connection::new(&s, SERVER_NONCE, REQUIRE);
+        assert_eq!(conn.on_bytes(&ssl_request()).unwrap(), vec![b'S']);
+        conn.on_tls_established().unwrap();
+        let out = conn.on_bytes(&startup_frame(&[("user", "user")])).unwrap();
+        assert_eq!(out[0], b'R');
+    }
+
+    #[test]
+    fn a_second_ssl_request_inside_tls_is_refused() {
+        let s = store();
+        let mut conn = Connection::new(&s, SERVER_NONCE, OFFER);
+        conn.on_bytes(&ssl_request()).unwrap();
+        conn.on_tls_established().unwrap();
+        assert!(matches!(
+            conn.on_bytes(&ssl_request()),
+            Err(ConnError::Unexpected(_))
+        ));
+    }
+
+    #[test]
     fn partial_startup_frame_buffers_until_complete() {
         let s = store();
-        let mut conn = Connection::new(&s, SERVER_NONCE);
+        let mut conn = Connection::new(&s, SERVER_NONCE, TlsPolicy::PLAINTEXT);
         let frame = startup_frame(&[("user", "user")]);
         let (head, tail) = frame.split_at(frame.len() - 3);
         assert_eq!(conn.on_bytes(head).unwrap(), Vec::<u8>::new()); // nothing yet
@@ -293,7 +462,7 @@ mod tests {
     #[test]
     fn query_before_engine_fails_loud_then_ready() {
         let s = store();
-        let mut conn = Connection::new(&s, SERVER_NONCE);
+        let mut conn = Connection::new(&s, SERVER_NONCE, TlsPolicy::PLAINTEXT);
         conn.on_bytes(&startup_frame(&[("user", "user")])).unwrap();
         conn.on_bytes(&sasl_initial(CLIENT_FIRST)).unwrap();
         conn.on_bytes(&p_frame(CLIENT_FINAL.as_bytes())).unwrap();
@@ -313,7 +482,7 @@ mod tests {
     fn bad_password_surfaces_handshake_error() {
         let salt = STANDARD.decode(SALT_B64).unwrap();
         let s = MockStore(ScramVerifier::from_password("wrong", &salt, 4096));
-        let mut conn = Connection::new(&s, SERVER_NONCE);
+        let mut conn = Connection::new(&s, SERVER_NONCE, TlsPolicy::PLAINTEXT);
         conn.on_bytes(&startup_frame(&[("user", "user")])).unwrap();
         conn.on_bytes(&sasl_initial(CLIENT_FIRST)).unwrap();
         let err = conn

@@ -68,9 +68,12 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   thread-safe `HandlerRegistry` (`MsgType` → `Arc<dyn RpcHandler>`) that supports
   dynamic registration after start. Graceful drain via `CancellationToken` with a
   bounded wait.
-- **TLS** (`tls`) — optional rustls (ring provider) `TlsAcceptor`/`TlsConnector`
-  built from PEM cert/key/CA paths; `require_tls` fails startup loudly when no
-  cert is configured.
+- **TLS** (`tls`) — optional rustls `TlsAcceptor`/`TlsConnector` built from PEM
+  cert/key/CA paths; `require_tls` fails startup loudly when no cert is
+  configured (acceptor AND connector). This module is the process's single
+  crypto-provider decision (`crypto_provider()`, currently `ring`): internode,
+  CQL and PostgreSQL build their server config through `server_config_from_pem` / `optional_server_config`, so a
+  provider swap (e.g. FIPS) is a one-line change here.
 - **Streaming support** (`stream_router`, `idle_timeout`) — `StreamRouter`
   dispatches multi-message streaming RPCs keyed by `request_id`; the idle-timeout
   watchdog aborts a consumer only after the producer is quiet for longer than the
@@ -108,7 +111,7 @@ silently disable the TLS requirement) is **fatal** under `from_env_checked`, whi
 `ferrosa` uses at startup; a seed or broadcast hostname that does not resolve yet is
 logged at WARN and startup continues (the binary retries seeds by name). An empty
 value counts as unset.
-| TLS | `tls::build_tls_acceptor`, `tls::build_tls_connector` |
+| TLS | `tls::build_tls_acceptor`, `tls::build_tls_connector`, `tls::crypto_provider`, `tls::server_config_from_pem`, `tls::optional_server_config`, `tls::HTTP_ALPN` |
 
 ## Dependencies
 

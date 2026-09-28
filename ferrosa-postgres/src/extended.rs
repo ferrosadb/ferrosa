@@ -70,8 +70,10 @@ pub struct Portal {
 }
 
 /// Per-connection extended-query store.
-#[derive(Default)]
 pub struct Session {
+    /// The authenticated role every statement on this connection is authorized
+    /// against (t_e1c819ad). Set once at login; never defaulted.
+    auth: ferrosa_schema::AuthContext,
     statements: HashMap<String, PreparedStatement>,
     portals: HashMap<String, Portal>,
     /// Set when an error occurs mid-sequence; skip messages until `Sync`.
@@ -103,8 +105,24 @@ fn param_format_for(formats: &[i16], i: usize) -> i16 {
 }
 
 impl Session {
-    pub fn new() -> Self {
-        Self::default()
+    /// A fresh session for the authenticated role `auth`.
+    pub fn new(auth: ferrosa_schema::AuthContext) -> Self {
+        Self {
+            auth,
+            statements: HashMap::new(),
+            portals: HashMap::new(),
+            error_pending: false,
+            txn: TransactionStatus::default(),
+            txn_isolation: None,
+            txn_snapshot: None,
+            txn_read_tables: HashSet::new(),
+            txn_writes: Vec::new(),
+        }
+    }
+
+    /// The role this session's statements are authorized against.
+    pub fn auth(&self) -> &ferrosa_schema::AuthContext {
+        &self.auth
     }
 
     /// Whether the session is currently skipping messages until the next `Sync`
@@ -425,9 +443,17 @@ pub fn parameter_description(param_oids: &[i32]) -> BackendMessage {
 mod tests {
     use super::*;
 
+    fn test_auth() -> ferrosa_schema::AuthContext {
+        ferrosa_schema::AuthContext {
+            role: "tester".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        }
+    }
+
     #[test]
     fn parse_stores_statement_and_acks() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         let ack = s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
         assert!(matches!(ack, BackendMessage::ParseComplete));
         assert!(s.statement("st").is_some());
@@ -437,7 +463,7 @@ mod tests {
 
     #[test]
     fn parse_error_sets_error_pending_and_no_parse_complete() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         let resp = s.on_parse("bad".into(), "SELCT garbage", vec![]);
         match resp {
             BackendMessage::ErrorResponse { fields } => {
@@ -451,7 +477,7 @@ mod tests {
 
     #[test]
     fn bind_decodes_binary_int_param_and_stores_portal() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
         let ack = s.on_bind(
             String::new(), // unnamed portal
@@ -469,7 +495,7 @@ mod tests {
 
     #[test]
     fn bind_missing_statement_fails_loud() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         let resp = s.on_bind("".into(), "ghost".into(), &[], &[], vec![]);
         assert!(matches!(
             resp,
@@ -480,7 +506,7 @@ mod tests {
 
     #[test]
     fn bind_rejects_malformed_value_instead_of_binding_null() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
 
         let response = s.on_bind(
@@ -505,7 +531,7 @@ mod tests {
 
     #[test]
     fn bind_rejects_malformed_binary_value_with_binary_sqlstate() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
 
         let response = s.on_bind("p".into(), "st".into(), &[1], &[Some(vec![1])], vec![]);
@@ -520,7 +546,7 @@ mod tests {
 
     #[test]
     fn bind_rejects_parameter_format_count_mismatch() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
 
         let response = s.on_bind(
@@ -541,7 +567,7 @@ mod tests {
 
     #[test]
     fn close_removes_statement_and_portal() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users", vec![]);
         s.on_bind("p".into(), "st".into(), &[], &[], vec![]);
         assert!(matches!(
@@ -558,7 +584,7 @@ mod tests {
 
     #[test]
     fn sync_clears_error_pending() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.on_parse("bad".into(), "SELCT x", vec![]);
         assert!(s.is_error_pending());
         s.on_sync();
@@ -580,7 +606,7 @@ mod tests {
 
     #[test]
     fn transaction_state_machine() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         // Starts idle.
         assert_eq!(s.txn_status(), TransactionStatus::Idle);
         assert!(!s.in_txn() && !s.in_failed_txn());

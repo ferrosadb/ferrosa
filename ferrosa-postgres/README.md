@@ -35,13 +35,34 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
 
 ## What's implemented
 
-- **Wire protocol (v3)** — startup (incl. `SSLRequest`, declined with `N` since
-  TLS is not wired), the sans-IO [`Connection`] phase machine
-  (`AwaitingStartup → Authenticating → Ready → Closed`), and message framing
-  (`codec` / `messages`).
+- **Wire protocol (v3)** — startup, the sans-IO [`Connection`] phase machine
+  (`AwaitingStartup → [AwaitingTls →] Authenticating → Ready → Closed`), and
+  message framing (`codec` / `messages`).
+- **TLS** (t_e1c819ad) — `SSLRequest` is answered `S` and upgraded with rustls
+  when `[postgres] tls_cert` / `tls_key` are set (env `FERROSA_POSTGRES_TLS_CERT`
+  / `_KEY`); otherwise `N`. `[postgres] require_tls = true`
+  (`FERROSA_POSTGRES_REQUIRE_TLS`) refuses a StartupMessage that did not
+  negotiate TLS with a FATAL `28000`. The acceptor comes from
+  `ferrosa_net::tls` — the same PEM loading and the single crypto provider the
+  CQL and internode listeners use. Bytes pipelined after `SSLRequest` are
+  refused (CVE-2021-23214 shape), as is a second `SSLRequest`.
 - **Authentication** — SCRAM-SHA-256 (`scram` + `handshake`), driven against the
   live `ferrosa-schema` role store via [`SchemaVerifierStore`]. Fail loud: an
-  unknown role / bad proof never authenticates.
+  unknown role / bad proof never authenticates, and a `NOLOGIN` role is refused
+  even with a valid proof.
+- **Failed-login limiter** (t_e1c819ad) — every login is admitted through the
+  schema's shared per-user limiter (`Schema::check_login_rate_limit`, the one
+  `Schema::authenticate` uses for CQL); unknown roles and bad proofs count as
+  failures. A lockout earned over PostgreSQL also refuses CQL for that user, and
+  vice versa. Refusal: FATAL `28000` "login throttled". The limiter is in-memory
+  per node.
+- **Authorization** (t_e1c819ad, `authz`) — every statement is checked with
+  `Schema::check_permission`, the CQL router's model: `SELECT` needs `SELECT` on
+  each table read, `INSERT`/`UPDATE`/`DELETE` need `MODIFY`, `RETURNING` also
+  needs `SELECT`, table-free statements need nothing. Checked on simple query,
+  extended `Describe`, and `Execute`; a denial is `42501`
+  `insufficient_privilege`. The mapping is an exhaustive match, so a new
+  statement kind cannot compile without a rule.
 - **Simple query protocol (`Q`)** — `execute_query` lowers one SQL string:
   `SELECT` (incl. a single `JOIN`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`),
   no-`FROM` scalar selects (`SELECT 1`, `SELECT version()`,
@@ -163,9 +184,9 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 
 | Area | Items |
 |------|-------|
-| Server | `server::serve`, `server::QueryContext`, `server::handle_connection` |
-| Connection | `connection::Connection`, `ConnError` |
-| Auth | `handshake::Handshake`, `VerifierStore`, `store::SchemaVerifierStore`, `scram::{ScramVerifier, ScramServerFirst, server_first, verify_client_final}` |
+| Server | `server::serve`, `server::QueryContext`, `server::PgTls`, `server::handle_connection` |
+| Connection | `connection::Connection`, `ConnError`, `TlsPolicy` |
+| Auth | `handshake::Handshake`, `VerifierStore` (verifier + limiter hooks), `store::SchemaVerifierStore`, `scram::{ScramVerifier, ScramServerFirst, server_first, verify_client_final}` |
 | Simple query | `query::execute_query` |
 | Extended query | `extended::Session` (`on_parse`/`on_bind`/`on_close`/`on_sync`), `query::decode_param`/`encode_value` |
 | Storage glue | `storage_provider::load_table`, `cql_to_value`, `LoadError` |
@@ -184,7 +205,11 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
   the SAME code `ferrosa-cql` uses, so there is no row-ordering divergence and no
   dependency on `ferrosa-cql`.
 - **`ferrosa-schema`** — keyspace/table metadata, column kinds, the role store
-  (`scram_credential`) the verifier reads.
+  (`scram_credential`) the verifier reads, the shared login limiter
+  (`check_login_rate_limit` / `record_login_failure` / `complete_login`) and
+  `check_permission`.
+- **`ferrosa-net`** — `tls::optional_server_config`, the shared TLS acceptor
+  builder and crypto provider.
 - **`ferrosa-sql`** — the bespoke relational engine: `parse_statement`,
   `execute`, `describe`, `infer_param_types`, `MapCatalog`, `Value`/`Column`.
 - **`ferrosa-sstable`** — names the `Partition` type `range_iter` streams.
@@ -212,6 +237,10 @@ infrastructure, plus integration tests:
   uses the PostgreSQL MVCC manager). Local temp engine, no Docker.
 - `tests/scram_live.rs` (3) — real-driver SCRAM + `SELECT 1`, extended
   expression select, wrong-password rejection. In-process loopback.
+- `tests/security_live.rs` (7) — against the schema-backed role store: `42501`
+  for a role without `SELECT` (simple + extended) / without `MODIFY` / `RETURNING`
+  without `SELECT`; repeated bad passwords lock the user out of PostgreSQL AND
+  CQL; TLS handshake succeeds and plaintext is refused when required.
 - `tests/differential_oracle.rs` (3, `#[cfg(feature = "live-infra-tests")]`) —
   runs a fixed corpus + DML against BOTH real PostgreSQL 16 (container) and
   ferrosa over the same data and asserts agreement. Gated; panics with setup

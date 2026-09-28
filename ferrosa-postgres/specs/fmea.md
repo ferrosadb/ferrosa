@@ -43,8 +43,8 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 - `SET`/`RESET` session GUCs (simple-query path returns `0A000`).
 - Function calls in DML `VALUES`; most scalar functions beyond
   `version()`/`current_database()`/`current_schema()`.
-- TLS (`SSLRequest` is declined with `N`); query cancellation (`BackendKeyData`
-  is a `(0,0)` placeholder).
+- Query cancellation (`BackendKeyData` is a `(0,0)` placeholder). TLS is
+  supported (t_e1c819ad); mutual TLS / client certificates are not.
 - Binary `numeric` result/param (rejected with an explicit unsupported-format error).
 - CQL `Duration` + collections (`List`/`Set`/`Map`/`Tuple`/`Udt`/`Vector`) are
   unsupported and now fail a scan instead of being reported as NULL.
@@ -61,7 +61,9 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 | PG-5 | **Row-codec divergence from CQL/engine** — a write encodes differently than the canonical codec | Postgres-written rows read back wrong/invisible over CQL or the engine (silent corruption) | 10 | 1 | 4 | 40 | **Structural (D10):** INSERT/UPDATE/DELETE use `ferrosa-row-bridge` `build_row`/`build_delete_row`/`build_decorated_key` — the SAME code CQL uses. Reinforced by the differential oracle (PG vs real PG) + the M1 live tests. |
 | PG-6 | **Missing table served as empty relation** | A typo'd table silently returns zero rows instead of erroring | 8 | 1 | 3 | 24 | **R15 guard:** `load_table` checks schema metadata first → `NoSuchTable` (`42P01`), distinct from an existing empty table. Covered by `load_table_missing_table_is_no_such_table`. |
 | PG-7 | **Binary `numeric` unsupported** — a client requests binary parameters or results | The query could misdecode numeric values or emit invalid wire bytes | 5 | 2 | 2 | 20 | Checked Bind decoding and `encode_value` return explicit unsupported-format errors rather than guessing text. Implement binary numeric (roadmap Next). |
-| PG-8 | **No TLS / no query cancel** — `SSLRequest` declined; `BackendKeyData` is `(0,0)` | Cleartext-only on the wire; `CancelRequest` closes the connection but cannot target a running query | 6 | 3 | 2 | 36 | Declined explicitly (`N`), not faked. Wire TLS + a real cancel key (roadmap). Threat-model note: `UnknownRole` is a user-enumeration oracle (run dummy verifier — follow-up). |
+| PG-8 | **No query cancel** — `BackendKeyData` is `(0,0)` | `CancelRequest` closes the connection but cannot target a running query | 4 | 3 | 2 | 24 | TLS is implemented (t_e1c819ad: `SSLRequest` → `S` + rustls, `[postgres] require_tls` refuses plaintext with `28000`, pipelined-bytes-after-`SSLRequest` refused). A real cancel key is roadmap. Threat-model note: `UnknownRole` is a user-enumeration oracle (run dummy verifier — follow-up). |
+| PG-12 | **Statement runs without authorization** — a role reads/writes a table it has no grant on | Privilege escalation over the PG listener | 9 | 1 | 2 | 18 | **Mitigated (t_e1c819ad).** `authz` checks `Schema::check_permission` on simple query, `Describe` and `Execute`; `42501` on denial. Exhaustive statement match — an unmapped kind does not compile. Covered by `tests/security_live.rs` (sabotage-verified). |
+| PG-13 | **Brute-force over PG bypasses the login limiter** | Unlimited password guessing; a CQL lockout does not protect the PG port | 8 | 1 | 2 | 16 | **Mitigated (t_e1c819ad).** `VerifierStore::admit/record_failure/record_success` route through the schema's shared per-user limiter; lockout is cross-protocol. The limiter is per node and in memory — a restart or another node resets the count (same as CQL). |
 | PG-9 | **Float/numeric text-format parity with Postgres** — floats use Rust `{}` shortest-form | A benign formatting difference vs PG (`1.5` vs `1.5000…`) | 3 | 4 | 4 | 48 | The differential oracle compares `f64`-parseable cells numerically with tolerance, so this is not a false alarm; exact text parity is follow-up. |
 | PG-10 | **UPDATE/DELETE report `1` row unconditionally** — Cassandra blind upsert/tombstone has no match count | A driver reading the affected-row count sees `1` even when no matching row existed | 4 | 5 | 5 | 100 | Documented Cassandra semantics (`execute_update`/`execute_delete`). Differs from PG's real match count; surface in docs / revisit with read-before-write. |
 

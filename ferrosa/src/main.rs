@@ -60,6 +60,7 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 mod cql_broadcast;
 mod listener_status;
+mod listener_tls;
 mod log_rotation;
 mod repair_wiring;
 mod runtime;
@@ -2354,11 +2355,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 11b. Postgres wire-protocol listener (port 5432). Authenticates real roles
-    // via the shared schema's SCRAM verifiers (D4); shares storage/schema with
-    // the other front-ends. Query execution is a fail-loud stub until the
-    // relational engine (ferrosa-sql) is wired in (M1).
+    // via the shared schema's SCRAM verifiers (D4) through the shared
+    // failed-login limiter, authorizes every statement with the CQL permission
+    // model, and negotiates TLS from `[postgres] tls_cert/tls_key/require_tls`
+    // (t_e1c819ad).
     {
         let pg_bind = resolve_postgres_bind(&file_config);
+        let pg_tls_config =
+            listener_tls::resolve_listener_tls_or_exit(&file_config, "postgres", "POSTGRES");
+        let pg_tls = match ferrosa_postgres::PgTls::from_pem(
+            pg_tls_config.cert.as_deref(),
+            pg_tls_config.key.as_deref(),
+            pg_tls_config.require_tls,
+        ) {
+            Ok(tls) => tls,
+            Err(error) => {
+                eprintln!(
+                    "FATAL: PostgreSQL listener TLS: {error}\n\
+                     Set [postgres] tls_cert and tls_key (or FERROSA_POSTGRES_TLS_CERT / \
+                     FERROSA_POSTGRES_TLS_KEY) to readable PEM files."
+                );
+                std::process::exit(1);
+            }
+        };
         let pg_store =
             std::sync::Arc::new(ferrosa_postgres::SchemaVerifierStore::new(schema.clone()));
         let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
@@ -2375,7 +2394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pg_status.mark_up("postgres");
                     tracing::info!(%pg_bind, "Postgres server listening");
                     if let Err(e) =
-                        ferrosa_postgres::server::serve(listener, pg_store, query_ctx).await
+                        ferrosa_postgres::server::serve(listener, pg_store, query_ctx, pg_tls).await
                     {
                         tracing::error!(%e, "Postgres server failed");
                         pg_status.mark_failed("postgres", &e);

@@ -46,7 +46,11 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
   inheritance + cycle-safe traversal. Password hashing (`bcrypt` cost-12 default
   or `argon2id`) with auto-rehash on login, `PasswordPolicy` (incl.
   `iso27001()`), per-username `AuthRateLimiter`, and SCRAM-SHA-256 verifier
-  derivation (`scram`, decision D4) for Postgres login.
+  derivation (`scram`, decision D4) for Postgres login. Logins verified outside
+  the registry (PostgreSQL SCRAM) go through the SAME limiter via
+  `Schema::check_login_rate_limit` / `record_login_failure` / `complete_login`
+  (t_e1c819ad), so a lockout is shared across protocols; `complete_login` also
+  refuses `NOLOGIN` roles, whose SCRAM verifier is stored all the same.
   Fresh installs do not create the historical `cassandra/cassandra` account.
   A legacy `cassandra` superuser is created only when the secrets provider
   supplies an explicit `superuser_password` (`FERROSA_SUPERUSER_PASSWORD` for

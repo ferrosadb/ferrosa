@@ -745,6 +745,58 @@ impl Schema {
         })
     }
 
+    /// Admission gate for a login whose credential proof is verified outside
+    /// this registry (the PostgreSQL SCRAM exchange).
+    ///
+    /// Consults the SAME per-username [`AuthRateLimiter`] that
+    /// [`Schema::authenticate`] (CQL, Bolt, HTTP, Flight) uses, so a user locked
+    /// out on one protocol is locked out on all of them. Call before doing any
+    /// verifier work; returns [`SchemaError::AuthenticationThrottled`] while the
+    /// user is in backoff or lockout.
+    pub fn check_login_rate_limit(&self, username: &str) -> crate::Result<()> {
+        self.rate_limiter.check_rate_limit(username)
+    }
+
+    /// Record a failed externally-verified login (bad proof, unknown role).
+    ///
+    /// Counts toward the shared per-username lockout and emits the same
+    /// `AuthFailed` audit event as a failed [`Schema::authenticate`].
+    pub fn record_login_failure(&self, username: &str) {
+        self.rate_limiter.record_failure(username);
+        self.emit_audit(AuditEventKind::AuthFailed {
+            role: username.to_string(),
+        });
+    }
+
+    /// Complete an externally-verified login whose proof has been checked.
+    ///
+    /// Re-resolves the role from the current snapshot and refuses (recording a
+    /// failure) if it no longer exists or cannot log in — a SCRAM verifier is
+    /// stored for `NOLOGIN` roles too, so the proof alone is not sufficient.
+    /// On success resets the shared failure counter, emits `AuthSuccess`, and
+    /// returns the session's [`AuthContext`] for permission checks.
+    pub fn complete_login(&self, username: &str) -> crate::Result<AuthContext> {
+        let snap = self.snapshot();
+        let Some(role) = snap.roles.get(username).filter(|r| r.can_login) else {
+            self.record_login_failure(username);
+            return Err(SchemaError::AuthenticationFailed);
+        };
+        self.rate_limiter.record_success(username);
+        let must_change = self
+            .default_password_roles
+            .lock()
+            .expect("default_password_roles lock poisoned")
+            .contains(username);
+        self.emit_audit(AuditEventKind::AuthSuccess {
+            role: username.to_string(),
+        });
+        Ok(AuthContext {
+            role: username.to_string(),
+            is_superuser: role.is_superuser,
+            must_change_password: must_change,
+        })
+    }
+
     /// Check whether `auth` has `perm` on `resource`.
     ///
     /// Delegates to the free function in `auth::permission`, passing the
@@ -2106,6 +2158,108 @@ mod tests {
             SchemaError::AuthenticationThrottled => {}
             other => panic!("expected AuthenticationThrottled, got: {other}"),
         }
+    }
+
+    /// t_e1c819ad: externally-verified (PostgreSQL SCRAM) login failures count
+    /// against the SAME per-user limiter as `authenticate` (CQL), in both
+    /// directions — a lockout earned on one protocol applies to the other.
+    #[test]
+    fn external_login_failures_share_the_cql_lockout() {
+        use std::time::Duration;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
+        }
+        let limited = || RateLimitConfig {
+            max_attempts: 2,
+            base_backoff: Duration::from_secs(60),
+            max_backoff: Duration::from_secs(60),
+            lockout_duration: Duration::from_secs(60),
+            window: Duration::from_secs(60),
+        };
+
+        // PostgreSQL failures lock out CQL.
+        let schema = Schema::new(SchemaConfig {
+            rate_limit: limited(),
+            ..test_config()
+        })
+        .unwrap();
+        assert!(schema.check_login_rate_limit("cassandra").is_ok());
+        schema.record_login_failure("cassandra");
+        schema.record_login_failure("cassandra");
+        assert!(matches!(
+            schema.check_login_rate_limit("cassandra"),
+            Err(SchemaError::AuthenticationThrottled)
+        ));
+        assert!(
+            matches!(
+                schema.authenticate("cassandra", "cassandra"),
+                Err(SchemaError::AuthenticationThrottled)
+            ),
+            "a lockout earned over PostgreSQL must also refuse CQL"
+        );
+
+        // CQL failures lock out PostgreSQL.
+        let schema = Schema::new(SchemaConfig {
+            rate_limit: limited(),
+            ..test_config()
+        })
+        .unwrap();
+        let _ = schema.authenticate("cassandra", "wrong1");
+        let _ = schema.authenticate("cassandra", "wrong2");
+        assert!(
+            matches!(
+                schema.check_login_rate_limit("cassandra"),
+                Err(SchemaError::AuthenticationThrottled)
+            ),
+            "a lockout earned over CQL must also refuse PostgreSQL"
+        );
+    }
+
+    #[test]
+    fn complete_login_refuses_unknown_and_nologin_roles() {
+        let schema = test_schema();
+        assert!(matches!(
+            schema.complete_login("nobody"),
+            Err(SchemaError::AuthenticationFailed)
+        ));
+        let su = superuser_auth();
+        schema
+            .create_role(
+                RoleMetadata {
+                    name: "nologin".to_string(),
+                    is_superuser: false,
+                    can_login: false,
+                    salted_hash: None,
+                    member_of: Default::default(),
+                    scram: None,
+                },
+                Some("Sup3r-secret-pw!"),
+                &su,
+            )
+            .unwrap();
+        assert!(matches!(
+            schema.complete_login("nologin"),
+            Err(SchemaError::AuthenticationFailed)
+        ));
+        schema
+            .create_role(
+                RoleMetadata {
+                    name: "app".to_string(),
+                    is_superuser: false,
+                    can_login: true,
+                    salted_hash: None,
+                    member_of: Default::default(),
+                    scram: None,
+                },
+                Some("Sup3r-secret-pw!"),
+                &su,
+            )
+            .unwrap();
+        let ctx = schema.complete_login("app").expect("login role");
+        assert!(!ctx.is_superuser);
+        assert_eq!(ctx.role, "app");
     }
 
     // ---- CRUD test helpers ----
