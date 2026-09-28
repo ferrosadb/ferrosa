@@ -1570,6 +1570,9 @@ impl ModeController {
             self.registry.register(MsgType::BootstrapComplete, handler);
         }
 
+        // Deliver hints to live replicas too, not only to ones that recover.
+        self.spawn_hint_delivery_sweep(self.cancel.clone());
+
         // Spawn periodic maintenance loop for memory-bounded data structures
         // and storage drain work requested by foreground writes.
         {

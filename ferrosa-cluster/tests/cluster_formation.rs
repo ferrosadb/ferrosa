@@ -184,6 +184,7 @@ struct TestClusterNode {
     #[allow(dead_code)]
     server: Arc<RpcServer>,
     peer_manager: Arc<PeerManager>,
+    storage: Arc<StorageEngine>,
     host_id: Uuid,
     bound_addr: SocketAddr,
     timeline: Timeline,
@@ -195,6 +196,7 @@ impl TestClusterNode {
     async fn start(host_id: Uuid) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
+        let node_storage = storage.clone();
         let schema = test_schema();
 
         // Use aggressive Raft election timeouts for testing.
@@ -213,6 +215,14 @@ impl TestClusterNode {
 
         let net_config = Arc::new(test_net_config());
         let registry = Arc::new(HandlerRegistry::new());
+        // Production registers this in ferrosa/src/main.rs, not in the
+        // controller; hint delivery replays hints as MutationForward.
+        registry.register(
+            ferrosa_net::codec::MsgType::MutationForward,
+            Arc::new(ferrosa_cluster::MutationForwardHandler::new(
+                storage.clone(),
+            )),
+        );
 
         let (controller, handles) = ModeController::new(
             config,
@@ -243,6 +253,7 @@ impl TestClusterNode {
             _handles: handles,
             server,
             peer_manager: pm,
+            storage: node_storage,
             host_id,
             bound_addr: addr,
             timeline,
@@ -852,4 +863,127 @@ async fn three_node_forms_when_seed_is_laggard() {
     node1.shutdown().await;
     node2.shutdown().await;
     node3.shutdown().await;
+}
+
+/// A hint for a replica that stays up must still be delivered.
+///
+/// Hints were replayed only on a peer-recovery event. A replica that missed a
+/// write while up (a post-quorum timeout, a schema it had not applied yet)
+/// never recovers from anything, so its hints sat on the coordinator forever
+/// and CL=ONE reads from it stayed short until repair (2026-09-28).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hints_for_a_live_replica_are_delivered_without_a_recovery_event() {
+    use ferrosa_cluster::pair::coordinator::encode_mutation;
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    use ferrosa_common::{CellValue, PartitionKey, Token};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use ferrosa_storage::{Mutation, TableId};
+
+    init_test_tracing();
+    let _slot = harness_slot::acquire_harness_slot().await;
+    let id1 = Uuid::from_bytes([0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let id2 = Uuid::from_bytes([0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let id3 = Uuid::from_bytes([0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let node1 = TestClusterNode::start(id1).await;
+    let node2 = TestClusterNode::start(id2).await;
+    let node3 = TestClusterNode::start(id3).await;
+
+    for (a, b) in [(&node1, &node2), (&node1, &node3), (&node2, &node3)] {
+        a.connect_to(b).await;
+        b.connect_to(a).await;
+    }
+    node1.controller.on_peer_connected((id2, node2.bound_addr));
+    node2.controller.on_peer_connected((id1, node1.bound_addr));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    node1.controller.on_peer_connected((id3, node3.bound_addr));
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    node2.controller.on_peer_connected((id3, node3.bound_addr));
+    node3.controller.on_peer_connected((id1, node1.bound_addr));
+    node3.controller.on_peer_connected((id2, node2.bound_addr));
+    let mut formed = false;
+    for _ in 0..100 {
+        if node1.mode() == DeploymentMode::Cluster {
+            formed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        formed,
+        "node1 must reach cluster mode, got {:?}",
+        node1.mode()
+    );
+    assert!(
+        node1.peer_manager.has_live_peer(id2),
+        "node2 is live from node1"
+    );
+
+    let schema = TableSchema {
+        keyspace: "hint_ks".to_string(),
+        table: "hint_tbl".to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        regular_columns: vec![ColumnDefinition {
+            name: "val".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        }],
+        extensions: Default::default(),
+    };
+    node2.storage.register_table(schema).unwrap();
+
+    let key = ferrosa_common::key::DecoratedKey {
+        token: Token(42),
+        key: PartitionKey::new(b"k".to_vec()),
+    };
+    let mutation = Mutation {
+        mutation_id: [0x77u8; 16],
+        keyspace: "hint_ks".to_string(),
+        table: "hint_tbl".to_string(),
+        key: key.clone(),
+        rows: vec![Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"hinted".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        }],
+        timestamp: 1000,
+    };
+    let hints = node1.controller.hint_store();
+    // Formation itself may already have hinted a write to node2; count ours
+    // on top of whatever is there.
+    let before = hints.pending_count(id2);
+    hints
+        .store(
+            id2,
+            "hint_ks",
+            "hint_tbl",
+            b"k".to_vec(),
+            encode_mutation(&mutation).to_vec(),
+            1000,
+        )
+        .unwrap();
+    assert_eq!(hints.pending_count(id2), before + 1);
+
+    let table_id = TableId::new("hint_ks", "hint_tbl");
+    let mut delivered = false;
+    for _ in 0..150 {
+        if node2.storage.read(&table_id, &key).unwrap().is_some() {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(delivered, "the hint for live node2 was never delivered");
+    for _ in 0..50 {
+        if hints.pending_count(id2) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        hints.pending_count(id2),
+        0,
+        "a delivered hint is cleaned up"
+    );
 }
