@@ -266,9 +266,43 @@ pub struct MutationForwardHandler {
     storage: Arc<StorageEngine>,
 }
 
+/// How long a replica waits for a table's schema to arrive via Raft before it
+/// refuses a forwarded write for that table.
+///
+/// A coordinator can forward a write the instant CREATE TABLE commits, while a
+/// replica's schema apply is a moment behind. Refusing then is safe (no ACK,
+/// the coordinator hints it) but, once the other replicas made QUORUM, it left
+/// the lagging replica permanently short of those rows until repair.
+const SCHEMA_ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const SCHEMA_ARRIVAL_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 impl MutationForwardHandler {
     pub fn new(storage: Arc<StorageEngine>) -> Self {
         Self { storage }
+    }
+
+    /// True once `table_id` is registered locally, waiting at most
+    /// [`SCHEMA_ARRIVAL_WAIT`]. Logs the start and the outcome of a wait, not
+    /// each poll.
+    async fn await_table_schema(&self, table_id: &TableId) -> bool {
+        if self.storage.table_schema(table_id).is_some() {
+            return true;
+        }
+        tracing::info!(table = %table_id, "MutationForward: table not registered yet, waiting for schema");
+        let started = std::time::Instant::now();
+        let max_polls = SCHEMA_ARRIVAL_WAIT.as_millis() / SCHEMA_ARRIVAL_POLL.as_millis();
+        for _ in 0..max_polls {
+            tokio::time::sleep(SCHEMA_ARRIVAL_POLL).await;
+            if self.storage.table_schema(table_id).is_some() {
+                tracing::info!(
+                    table = %table_id,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "MutationForward: schema arrived, applying write"
+                );
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -285,6 +319,16 @@ impl RpcHandler for MutationForwardHandler {
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
         let key = mutation.key;
         let timestamp = mutation.timestamp;
+        if !self.await_table_schema(&table_id).await {
+            metrics::inc_inbound_mutation_failure();
+            tracing::warn!(
+                table = %table_id,
+                waited_ms = SCHEMA_ARRIVAL_WAIT.as_millis() as u64,
+                "MutationForward for a table this replica never registered — not sending ACK; \
+                 the coordinator hints it"
+            );
+            return None;
+        }
         for row in mutation.rows {
             if let Err(e) = self.storage.write(&table_id, &key, row, timestamp) {
                 metrics::inc_inbound_mutation_failure();
@@ -824,6 +868,73 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let result = storage.read(&table_id, &test_key()).unwrap();
         assert!(result.is_some());
+    }
+
+    /// Found 2026-09-28 on a three-node cluster: right after CREATE TABLE, a
+    /// replica whose Raft schema apply was a moment behind rejected forwarded
+    /// writes with "table not registered". QUORUM succeeded on the other two,
+    /// the lagging replica never got the rows, and CL=ONE reads from it stayed
+    /// short (2495/2500) until repair. A replica must wait, bounded, for a
+    /// schema that is still arriving rather than drop the write.
+    #[tokio::test]
+    async fn mutation_forward_waits_for_a_table_whose_schema_is_still_arriving() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let handler = MutationForwardHandler::new(storage.clone());
+
+        let registrar = {
+            let storage = storage.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                register_test_table(&storage);
+            })
+        };
+
+        let mutation = Mutation {
+            mutation_id: [0x91u8; 16],
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            key: test_key(),
+            rows: vec![test_row()],
+            timestamp: 1000,
+        };
+        let msg = Message::MutationForward(encode_mutation(&mutation));
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let response = handler.handle(peer_id, msg).await;
+        registrar.await.unwrap();
+
+        assert!(
+            matches!(response, Some(Message::MutationAck(_))),
+            "a write racing its own table's schema must be applied, not dropped"
+        );
+        let table_id = TableId::new("test_ks", "test_tbl");
+        assert!(storage.read(&table_id, &test_key()).unwrap().is_some());
+    }
+
+    /// The wait is bounded: a table that never arrives still fails the write
+    /// (no ACK), so the coordinator hints it instead of the handler hanging.
+    #[tokio::test]
+    async fn mutation_forward_for_a_table_that_never_arrives_is_not_acked() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let handler = MutationForwardHandler::new(storage.clone());
+        let mutation = Mutation {
+            mutation_id: [0x92u8; 16],
+            keyspace: "test_ks".to_string(),
+            table: "never_created".to_string(),
+            key: test_key(),
+            rows: vec![test_row()],
+            timestamp: 1000,
+        };
+        let msg = Message::MutationForward(encode_mutation(&mutation));
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let started = std::time::Instant::now();
+        let response = handler.handle(peer_id, msg).await;
+        assert!(response.is_none(), "an unknown table must not be ACKed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the schema wait must be bounded"
+        );
     }
 
     #[test]
