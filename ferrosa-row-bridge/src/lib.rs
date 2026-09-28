@@ -79,6 +79,6 @@ pub use row::{cell_is_live, ldt_is_expired};
 // and the primary SELECT read path (`row::decode_output_row`) must call the
 // assembly directly. `ferrosa-cql::collection_cells` re-exports these.
 pub use collection::{
-    assemble_collection, assemble_column_cells, build_collection_cells, list_cell_path,
-    timeuuid_time, AssembleError, CollectionOp, UnsupportedCollectionOp,
+    assemble_collection, assemble_column_cells, build_collection_cells, corrupt_element_count,
+    list_cell_path, timeuuid_time, AssembleError, CollectionOp, UnsupportedCollectionOp,
 };

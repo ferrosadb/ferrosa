@@ -56,7 +56,10 @@ paging cursors) or emit raw byte slices.
    reads (100% data loss for that row). Enforced in `build_row`.
 3. **NULL is a tombstone, not an empty cell.** An explicit `Null` value emits a
    cell tombstone so reads return NULL, not `""`/`0`.
-4. **No dependency on `ferrosa-cql`.** Enforced structurally (it would create a
+4. **A corrupt cell is an error, not a missing value.** `assemble_column_cells`
+   returns `AssembleError` (and bumps `corrupt_element_count()`) when a cell
+   fails to decode; only an absent, deleted or expired column is `None`.
+5. **No dependency on `ferrosa-cql`.** Enforced structurally (it would create a
    cycle: `ferrosa-cql` → `ferrosa-row-bridge`).
 
 ## Position in the dependency graph

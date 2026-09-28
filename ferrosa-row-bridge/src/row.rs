@@ -320,7 +320,7 @@ fn decode_output_row(row: &Row, context: &RowDecodeContext<'_>) -> Vec<Option<Cq
                         .map(String::as_str)
                         .unwrap_or("?"),
                     error = %e,
-                    "failed to assemble complex collection column from per-element cells",
+                    "failed to decode column value (corrupt cell); value withheld, not treated as absent",
                 );
                 output_row[table_idx] = None;
             }

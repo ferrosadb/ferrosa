@@ -26,7 +26,8 @@ ordering — the top FMEA risk for the SQL front-end — so it lives here once.
   `col = col ± {..}` collection assignment as read-free per-element cells
   (set element / map key / list TimeUUID paths); `assemble_collection` /
   `assemble_column_cells` are the read-side inverse (reconcile-by-path LWW +
-  assemble). Lives here so the read path can assemble complex columns without an
+  assemble). A cell that fails to decode is an `AssembleError` (never `None`) and
+  bumps `corrupt_element_count()`. Lives here so the read path can assemble complex columns without an
   up-dependency on `ferrosa-cql`; `ferrosa-cql::collection_cells` re-exports it.
 - **Read-direction decomposition** — `partition_to_rows`,
   `partition_to_rows_with_storage_mapping`, `partition_to_rows_with_clustering`,

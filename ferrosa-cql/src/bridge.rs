@@ -951,7 +951,7 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
                     tracing::error!(
                         column = column_names.get(table_idx).map(String::as_str).unwrap_or("?"),
                         error = %e,
-                        "failed to assemble complex collection column from per-element cells",
+                        "failed to decode column value (corrupt cell); value withheld, not treated as absent",
                     );
                     output_row[table_idx] = None;
                 }

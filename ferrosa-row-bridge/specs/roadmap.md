@@ -19,6 +19,11 @@ dependency/usage review.
   Duration's signed-vint compatibility and malformed trailing-byte cases are
   already covered in-crate.
 
+- **Carry decode errors to the client** (FMEA RB-8). `decode_output_row` and the
+  `ferrosa-cql` bridge still log a corrupt cell and emit `None` for that column
+  because they return `Vec<Option<CqlValue>>`. Change them to return a `Result`
+  so the SELECT fails with table and key context.
+
 ## Next
 
 - **Enumerate the supported-type matrix per front-end.** Make explicit which CQL

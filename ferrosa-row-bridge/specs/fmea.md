@@ -18,7 +18,7 @@ severities are high.
 | RB-4 | In-crate test coverage gap — most canonical codec/row tests live in `ferrosa-cql`, not here | A change to this crate can pass `cargo test -p ferrosa-row-bridge` while breaking the real encoding | 8 | 4 | 7 | 224 | **Reduced, still open.** Duration now has an in-crate Cassandra wire vector and malformed-input regression. Move/duplicate the remaining codec + row builder unit tests into this crate. See roadmap. |
 | RB-5 | Composite partition-key encoding mismatch vs the engine's key format | Wrong partition routing / unreadable keys | 9 | 1 | 6 | 54 | `build_decorated_key` uses the documented `[2-byte len][bytes][0x00]` composite format; exercised by CQL + PG round-trips. |
 | RB-6 | Lossy/unsupported CQL types decoded as NULL silently | Data appears as NULL rather than erroring | 5 | 3 | 5 | 75 | Documented known gap (collections, UDT, tuple, vector decode to NULL in some paths). Track which types are in scope per front-end. |
-| RB-7 | Duration components used LEB128 instead of Cassandra's signed leading-ones vint format | Standard drivers decoded truncated duration values, marked the connection defunct, and failed all later requests | 8 | 8 | 2 | 128 → 8 | **Fixed:** encode/decode delegate to the canonical signed-vint implementation, reject trailing bytes, and assert Cassandra's exact wire vector in-crate. |
+| RB-7 | Duration components used LEB128 instead of Cassandra's signed leading-ones vint format | Standard drivers decoded truncated duration values, marked the connection defunct, and failed all later requests | 8 | 8 | 2 | 128 → 8 | **Fixed:** encode/decode delegate to the canonical signed-vint implementation, reject trailing bytes, and assert Cassandra's exact wire vector in-crate. || RB-8 | `assemble_column_cells` turned a corrupt simple cell (frozen list/map/tuple/UDT or scalar) into `None` via `decode_value(..).ok()` (jsonb FM-78, JB-T8) | Corrupt data read as a missing value: silent data loss; worse once jsonb nests in collections | 9 | 3 | 7 | 189 → 27 | **Fixed (T-034):** decode failure is an `AssembleError` with column type and byte length, counted by `corrupt_element_count()`. Callers (`row::decode_output_row`, `ferrosa-cql` bridge) log at error and still emit `None` for that column because their `Vec<Option<_>>` signature cannot carry an error; see roadmap. |
 
 ## Top risks to act on
 
@@ -34,3 +34,5 @@ severities are high.
   — PG-written rows must read identically over CQL.
 - `ferrosa-cql` bridge unit tests (build_decorated_key/build_row/encode_clustering).
 - In-crate duration signed-vint wire vector and trailing-byte rejection tests.
+- `collection_corrupt_element_is_error_not_none` (RB-8) and the
+  `corrupt_element_count()` counter.
