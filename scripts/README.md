@@ -29,6 +29,26 @@ scripts/audit-page-cache-boundaries.sh
 Add `--include-tests` when test and benchmark code is relevant, or pass a
 different Ferrosa checkout path as the final argument.
 
+### Production Compose overlay (TLS + auth)
+
+`docker-compose.secure.yml` runs the 3-node `docker-compose.yml` stack with
+`FERROSA_MODE=production`, auth on and TLS on every listener and internode.
+It needs certificates, so:
+
+```bash
+scripts/gen-compose-test-certs.sh            # throwaway CA + node1..3 certs -> .compose-tls/ (gitignored)
+scripts/secure-compose-smoke.sh              # up, HTTPS /readyz on all nodes, CQL over TLS, down
+FERROSA_CONTAINER_RUNTIME=podman scripts/secure-compose-smoke.sh
+```
+
+`secure-compose-smoke.sh` does not build: the node image
+(`FERROSA_SMOKE_IMAGE`, default `ferrosa-smoke:latest`) must exist and contain
+`curl`. It checks that
+plaintext HTTP and plaintext CQL are refused, runs one authenticated
+`cqlsh --ssl` query validated against the test CA, and always tears down
+(`FERROSA_SECURE_KEEP=1` keeps the cluster for debugging). CI runs it as the
+`secure-compose` job (t_3422ae92). The certificates are for tests only.
+
 ### `test-cluster-up.sh` — Local (Podman)
 
 Brings up a 3-node cluster via `podman compose` on ports **30042–30044** (CQL) and
