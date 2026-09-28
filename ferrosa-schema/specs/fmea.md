@@ -14,7 +14,7 @@ aspirations.
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
 | SC-1 | Well-known default credentials shipped | Development bootstrap seeds `ferrosa_admin`/`ferrosa_user` with passwords equal to their names. An operator who never rotates them leaves a trivially-guessable admin. | 9 | 5 | 4 | 180 | Partial. The historical implicit `cassandra/cassandra` superuser is removed: `cassandra` is created only when a secrets provider supplies an explicit `superuser_password`. Production seed roles receive random passwords, and password rotations are durable across restart. Development seed credentials remain intentionally well-known and must not be exposed to untrusted networks. |
-| SC-2 | Production TLS checks are stubs | `validate_production_requirements` has `CqlTlsNotConfigured` / `InternodeTlsNotConfigured` variants but the comment at `startup.rs:138` states the CQL/internode TLS checks are "stubs (added when those crates land)". Production mode passes TLS validation even with TLS fully disabled — a silent gap that contradicts fail-loud. | 8 | 5 | 7 | 280 | **Open gap.** The variants exist and `Display` works, but no code path ever pushes them. Wire the checks to real CQL/internode TLS config. |
+| SC-2 | (resolved) Production TLS checks were stubs | `validate_production_requirements` never pushed a TLS violation, so a `FERROSA_MODE=production` node with TLS off passed the gate. | 8 | 1 | 2 | 16 | **Resolved (t_d5d122ba).** `ProductionCheckConfig.listeners` carries every client listener's posture (`ListenerTls`); an enabled listener that does not require TLS is `ListenerTlsNotRequired` (names the listener and key), an enabled listener with no TLS implementation is `ListenerWithoutTlsSupport` (names the disable key), and `internode_require_tls = false` is `InternodeTlsNotConfigured`. All block startup. Mutual TLS is not required yet (t_b6c820f4). |
 | SC-3 | `apply_snapshot` / `create_table_internal` skip StorageEngine registration | These mutators update the in-memory snapshot but the doc-comment notes the caller MUST separately call `engine.register_table()`. A caller that forgets leaves a table visible in schema but unservable by storage — silent divergence. | 7 | 3 | 6 | 126 | Documented in the method doc-comment; not enforced in code. Relies on caller discipline (cluster catch-up path). |
 | SC-4 | `HASHED PASSWORD` roles cannot use Postgres SCRAM | `create_role_hashed` / `alter_role` with `HASHED PASSWORD` store the hash verbatim and set `scram = None` (a bcrypt/argon2 hash can't derive a SCRAM verifier). Such roles silently fail Postgres SCRAM login until a plaintext reset. | 5 | 4 | 5 | 100 | Documented D4 gap in `registry.rs` / `scram.rs`. `alter_role` clears the stale verifier so it fails closed; CQL login still works. |
 | SC-5 | Concurrent role-grant cycle race | `grant_role_internal` checks `would_create_cycle` against current state only. Two independently-committed grants (`GRANT a TO b`, `GRANT b TO a`) could in principle form a cycle. | 6 | 2 | 5 | 60 | Mitigated: Raft applies entries serially, so the second grant sees the first edge already present and is rejected. `check_permission` is additionally cycle-safe via a `visited` set, so even a leaked cycle cannot hang traversal. |
@@ -24,12 +24,7 @@ aspirations.
 
 ## Top risks to act on
 
-1. **SC-2 (RPN 280)** — production TLS validation is a stub. The security gate
-   *looks* complete (the violation variants exist) but never fires, so a
-   `FERROSA_MODE=production` deployment with TLS off passes. This is the most
-   dangerous kind of gap: a safety check that silently no-ops. Wire it to real
-   config.
-2. **SC-1 (RPN 180)** — development seed credentials. The implicit Cassandra
+1. **SC-1 (RPN 180)** — development seed credentials. The implicit Cassandra
    compatibility account is gone and production generates random seed passwords,
    but development `ferrosa_admin` / `ferrosa_user` credentials remain
    well-known. Development mode must stay off untrusted networks.
@@ -39,7 +34,8 @@ aspirations.
 - `auth/permission.rs` tests — superuser bypass, direct/keyspace/role-hierarchy
   grants, cycle-safety, deny-by-default.
 - `startup.rs` tests — production violations for default password, weak policy,
-  S3 HTTP, env secrets (but **not** TLS — see SC-2).
+  S3 HTTP, env secrets, every client listener without required TLS, an enabled
+  listener with no TLS support, and internode TLS not required (SC-2).
 - `auth/password.rs` + `scram.rs` tests — hash round-trip, rehash detection,
   hash-format validation, SCRAM derivation.
 - 354 in-crate tests + 19 integration tests

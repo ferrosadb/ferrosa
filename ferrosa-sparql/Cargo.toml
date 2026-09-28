@@ -27,6 +27,10 @@ futures = "0.3"
 
 # HTTP server
 axum = "0.8"
+# HTTPS (t_d5d122ba): TLS configs come from ferrosa-net's shared builder, so the
+# provider-less axum-server feature is used.
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+ferrosa-net = { path = "../ferrosa-net" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tower-http = { version = "0.6", features = ["catch-panic", "limit"] }
 
@@ -48,4 +52,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+rcgen = "0.14"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"

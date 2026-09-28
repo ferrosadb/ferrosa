@@ -86,7 +86,8 @@ fn production_mode_rejects_default_password() {
         secrets_provider_type: "aws-sm".into(), // pragma: allowlist secret
         s3_allow_http: false,
         auth_enabled: true,
-        cql_require_tls: true,
+        listeners: vec![],
+        internode_require_tls: true,
     };
     let violations = validate_production_requirements(&config);
     assert!(violations
@@ -103,7 +104,8 @@ fn production_mode_rejects_weak_password_policy() {
         secrets_provider_type: "aws-sm".into(), // pragma: allowlist secret
         s3_allow_http: false,
         auth_enabled: true,
-        cql_require_tls: true,
+        listeners: vec![],
+        internode_require_tls: true,
     };
     let violations = validate_production_requirements(&config);
     assert!(violations
@@ -120,7 +122,8 @@ fn development_mode_allows_permissive_policy() {
         secrets_provider_type: "env".into(), // pragma: allowlist secret
         s3_allow_http: true,
         auth_enabled: true,
-        cql_require_tls: true,
+        listeners: vec![],
+        internode_require_tls: true,
     };
     let violations = validate_production_requirements(&config);
     assert!(

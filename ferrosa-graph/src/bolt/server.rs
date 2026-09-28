@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
@@ -31,6 +31,11 @@ pub struct BoltConfig {
     pub max_connections: usize,
     /// When true, skip credential validation and authenticate as a superuser.
     pub auth_disabled: bool,
+    /// TLS (`bolt+s://`): when set, every connection is wrapped in TLS before
+    /// the Bolt handshake. Built by `ferrosa_net::tls` (t_d5d122ba).
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Refuse to start without `tls` (`[graph] require_tls`).
+    pub require_tls: bool,
 }
 
 impl Default for BoltConfig {
@@ -40,9 +45,14 @@ impl Default for BoltConfig {
             max_message_size: 16 * 1024 * 1024, // 16MB
             max_connections: 256,
             auth_disabled: false,
+            tls: None,
+            require_tls: false,
         }
     }
 }
+
+/// Upper bound on the server-side TLS handshake, as for CQL.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Mutable state tracked per connection.
 struct ConnectionState {
@@ -84,8 +94,19 @@ pub async fn start_bolt_server(
     config: BoltConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    if config.require_tls && config.tls.is_none() {
+        return Err(std::io::Error::other(
+            "Bolt: require_tls is true but no TLS certificate/key is configured \
+             ([graph] tls_cert / tls_key)",
+        ));
+    }
+    let tls_acceptor = config.tls.clone().map(tokio_rustls::TlsAcceptor::from);
     let listener = TcpListener::bind(config.bind_addr).await?;
-    tracing::info!(addr = %config.bind_addr, "Bolt server listening");
+    tracing::info!(
+        addr = %config.bind_addr,
+        tls = tls_acceptor.is_some(),
+        "Bolt server listening"
+    );
 
     let active_connections = Arc::new(AtomicUsize::new(0));
 
@@ -118,10 +139,31 @@ pub async fn start_bolt_server(
                 let engine = engine.clone();
                 let schema = schema.clone();
                 let cfg = config.clone();
+                let tls_acceptor = tls_acceptor.clone();
 
                 tokio::spawn(async move {
                     tracing::debug!(%peer_addr, "Bolt connection accepted");
-                    if let Err(e) = handle_connection(stream, engine, schema, cfg).await {
+                    let result = match tls_acceptor {
+                        None => handle_connection(stream, engine, schema, cfg).await,
+                        Some(acceptor) => {
+                            match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+                                .await
+                            {
+                                Ok(Ok(tls_stream)) => {
+                                    handle_connection(tls_stream, engine, schema, cfg).await
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!(%peer_addr, %e, "Bolt TLS handshake failed");
+                                    Ok(())
+                                }
+                                Err(_) => {
+                                    tracing::warn!(%peer_addr, "Bolt TLS handshake timed out");
+                                    Ok(())
+                                }
+                            }
+                        }
+                    };
+                    if let Err(e) = result {
                         tracing::debug!(%peer_addr, %e, "Bolt connection ended with error");
                     }
                     counter.fetch_sub(1, Ordering::Relaxed);
@@ -141,8 +183,8 @@ pub async fn start_bolt_server(
 }
 
 /// Handle a single Bolt connection from handshake through message loop.
-async fn handle_connection(
-    mut stream: TcpStream,
+async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     engine: Arc<GraphEngine>,
     schema: Arc<Schema>,
     config: BoltConfig,
@@ -172,7 +214,11 @@ async fn handle_connection(
         }
         None => {
             let resp = rejection_response();
-            let _ = stream.write_all(&resp).await;
+            // Best effort: the connection is refused either way, but say when
+            // the client could not even be told why.
+            if let Err(e) = stream.write_all(&resp).await {
+                tracing::debug!(%e, "could not send Bolt version rejection");
+            }
             return Err(GraphError::Internal("no supported Bolt version".into()));
         }
     }
@@ -615,8 +661,8 @@ async fn authenticate_bolt_fields(
 }
 
 /// Read a single chunked Bolt message from the stream.
-async fn read_message(
-    stream: &mut TcpStream,
+async fn read_message<S: AsyncRead + Unpin>(
+    stream: &mut S,
     _decoder: &mut ChunkDecoder,
     max_message_size: usize,
 ) -> Result<Vec<u8>, GraphError> {
@@ -653,7 +699,10 @@ async fn read_message(
 }
 
 /// Encode and write a Bolt message to the stream using chunked framing.
-async fn send_message(stream: &mut TcpStream, msg: &BoltMessage) -> Result<(), GraphError> {
+async fn send_message<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    msg: &BoltMessage,
+) -> Result<(), GraphError> {
     let encoded = msg.encode();
     let chunks = codec::chunk_encode(&encoded, codec::DEFAULT_MAX_CHUNK_SIZE);
     stream
@@ -668,7 +717,10 @@ async fn send_message(stream: &mut TcpStream, msg: &BoltMessage) -> Result<(), G
 }
 
 /// Send multiple reply messages.
-async fn send_replies(stream: &mut TcpStream, messages: &[BoltMessage]) -> Result<(), GraphError> {
+async fn send_replies<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    messages: &[BoltMessage],
+) -> Result<(), GraphError> {
     for msg in messages {
         send_message(stream, msg).await?;
     }

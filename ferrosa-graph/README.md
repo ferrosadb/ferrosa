@@ -108,7 +108,12 @@ resolved port.
 - **SUBSCRIBE** (`executor/subscribe.rs`) — per-connection subscription registry
   with a tunable per-connection cap (`FERROSA_GRAPH_MAX_SUBSCRIPTIONS`, default 8).
 - **Transports** — `http.rs` (axum, Basic auth, TLS, body-size limit, SSE for
-  SUBSCRIBE) and `bolt/` (Bolt v5 handshake, PackStream codec, message dispatch).
+  SUBSCRIBE) and `bolt/` (Bolt v5 handshake, PackStream codec, message dispatch,
+  TLS / `bolt+s`). Both take their rustls config from `ferrosa_net::tls` (the
+  single crypto provider; axum-server uses `tls-rustls-no-provider`), both refuse
+  to start when `require_tls` is set without a certificate, and the
+  disabled-engine stub serves over TLS when a certificate is configured
+  (t_d5d122ba). The binary feeds both from `[graph] tls_cert/tls_key/require_tls`.
 - **Cluster-aware DDL** — adjacency keyspace/table creation routes through the
   same `DdlPath` regular CQL `CREATE TABLE` uses, so every replica registers the
   system table (`ClusterGraphSchemaCoordinator`); a local coordinator is the
@@ -167,10 +172,10 @@ edge and the missing key rather than returning a null endpoint.
   `DdlOperation` for replicated adjacency DDL, `ConsistencyLevel`,
   `ReplicationStrategy`, `ClusterError`.
 - **`ferrosa-common`** — `DecoratedKey`, `PartitionKey`, `CellValue`, `Error`.
-- **`ferrosa-net`** — internode protocol types (`PeerManager`, `RpcServer`,
-  `Message`). **Used only by the integration test harness**
-  (`tests/graph_http_integration.rs`); it is a `[dev-dependencies]` entry, not a
-  production code path of this crate.
+- **`ferrosa-net`** — `tls::optional_server_config` / `crypto_provider` build
+  the graph HTTP and Bolt TLS configs (production path). The integration test
+  harness (`tests/graph_http_integration.rs`) also uses its internode types
+  (`PeerManager`, `RpcServer`, `Message`).
 - **`ferrosa-schema`** — `Schema`, `SchemaSnapshot`, `TableMetadata`,
   `AuthContext`, `check_permission`, `VirtualTableRegistry`.
 - **`ferrosa-sstable`** — `Partition`, `Row`, `CellValue`, `LivenessInfo`,
@@ -178,7 +183,7 @@ edge and the missing key rather than returning a null endpoint.
 - **`ferrosa-storage`** — `StorageEngine`, `Mutation`, `TableId`,
   `WriteObserver` / `ObserverMode` (the observer hook).
 
-External: `axum`/`axum-server`, `tokio`, `serde`/`serde_json`, `arc-swap`,
+External: `axum`/`axum-server` (`tls-rustls-no-provider`), `rustls`, `tokio-rustls`, `tokio`, `serde`/`serde_json`, `arc-swap`,
 `parking_lot`, `indexmap`, `phf`, `blake3`, `uuid`, `base64`, `hex`, `chrono`.
 
 **Called by** (crates that depend on this):
@@ -188,8 +193,10 @@ External: `axum`/`axum-server`, `tokio`, `serde`/`serde_json`, `arc-swap`,
 
 ## Tests
 
-353 in-crate unit/`tokio` tests plus three integration suites under `tests/`
-(`adjacency_replication.rs`, `graph_http_integration.rs`, `parser_proptest.rs`).
+353 in-crate unit/`tokio` tests plus four integration suites under `tests/`
+(`adjacency_replication.rs`, `graph_http_integration.rs`, `parser_proptest.rs`,
+`listener_tls.rs` — graph HTTP and Bolt over TLS, plaintext refused,
+`require_tls` without a certificate refuses to start).
 No `#[ignore]`, no `TODO`/`FIXME` markers in source. Highest coverage:
 `parser/parse_impl.rs` (81), `executor/eval.rs` (47), `executor/expand.rs` (44).
 

@@ -13,12 +13,10 @@ exist in the source — the gaps below come from code review, not grep.
 
 ## Now (highest value)
 
-- **Wire the production TLS checks** (FMEA SC-2). `validate_production_requirements`
-  already owns `CqlTlsNotConfigured`, `CqlMutualTlsNotConfigured`,
-  `InternodeTlsNotConfigured`, `InternodeMutualTlsNotConfigured` and
-  `UnencryptedLocalStorage`, but none is ever pushed. Thread real CQL/internode
-  TLS config into `ProductionCheckConfig` so a `FERROSA_MODE=production` node
-  with TLS disabled actually fails the gate. This is a silent safety no-op today.
+- **Production mutual TLS** (FMEA SC-2 follow-on). One-way TLS on every listener
+  and internode is enforced (t_d5d122ba); `CqlMutualTlsNotConfigured`,
+  `InternodeMutualTlsNotConfigured` and `UnencryptedLocalStorage` are still never
+  pushed. Mutual TLS is t_b6c820f4.
 
 - **Keep development seed credentials confined to development** (FMEA SC-1).
   Production now generates random passwords, and the legacy `cassandra` role

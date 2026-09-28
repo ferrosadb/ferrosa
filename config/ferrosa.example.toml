@@ -37,6 +37,11 @@ cluster_name  = "ferrosa"
 # broadcast = "127.0.0.1:17000"  # advertised to peers; only matters in clusters
 # seed      = "10.0.0.2:17000"   # comma-separated list of seed peers
 # psk       = "shared-secret"    # pre-shared key for internode auth
+# Internode TLS (one-way server TLS; required in FERROSA_MODE=production).
+# tls_cert    = "~/.ferrosa/config/tls/node.crt"
+# tls_key     = "~/.ferrosa/config/tls/node.key"
+# tls_ca      = "~/.ferrosa/config/tls/ca.crt"   # trust anchor for peers
+# require_tls = false
 
 # ---------------------------------------------------------------------------
 # Storage — local-only by default. Data lives under ~/.ferrosa/data and is
@@ -74,6 +79,10 @@ commit_log_segment_size  = 33554432   # 32 MiB
 enabled   = true
 bind      = "127.0.0.1:7474"      # HTTP / Cypher REST + graph visualizer (/viz)
 bolt_port = 7687                  # Bolt v5 (Neo4j drivers)
+# TLS for graph HTTP AND Bolt (bolt+s); same certificate for both listeners.
+# tls_cert = "~/.ferrosa/config/tls/server.crt"
+# tls_key  = "~/.ferrosa/config/tls/server.key"
+# require_tls = false
 
 # ---------------------------------------------------------------------------
 # SPARQL 1.1 endpoint (RDF). Enabled by default. Set `enabled = false` here OR
@@ -82,6 +91,9 @@ bolt_port = 7687                  # Bolt v5 (Neo4j drivers)
 [sparql]
 enabled = true                    # SPARQL HTTP endpoint (8080)
 bind = "127.0.0.1:8080"
+# tls_cert = "~/.ferrosa/config/tls/server.crt"
+# tls_key  = "~/.ferrosa/config/tls/server.key"
+# require_tls = false
 
 # ---------------------------------------------------------------------------
 # Postgres wire protocol and Arrow Flight are always local by default.
@@ -89,9 +101,16 @@ bind = "127.0.0.1:8080"
 # ---------------------------------------------------------------------------
 [postgres]
 bind = "127.0.0.1:5432"
+# TLS via SSLRequest (sslmode=require); require_tls refuses plaintext clients.
+# tls_cert = "~/.ferrosa/config/tls/server.crt"
+# tls_key  = "~/.ferrosa/config/tls/server.key"
+# require_tls = false
 
 [flight]
 bind = "127.0.0.1:8815"
+# Flight has no TLS yet: FERROSA_MODE=production refuses to start while it is
+# enabled (only in builds with the `flight` feature).
+# enabled = true
 
 # ---------------------------------------------------------------------------
 # Web admin console — also serves Prometheus metrics at /metrics.
@@ -100,6 +119,10 @@ bind = "127.0.0.1:8815"
 # ---------------------------------------------------------------------------
 [web]
 bind = "127.0.0.1:9090"
+# HTTPS for the console, /api, /admin, /metrics and /readyz.
+# tls_cert = "~/.ferrosa/config/tls/server.crt"
+# tls_key  = "~/.ferrosa/config/tls/server.key"
+# require_tls = false
 
 # ---------------------------------------------------------------------------
 # Auth notes
@@ -123,6 +146,10 @@ bind = "127.0.0.1:9090"
 #   a development-mode node to untrusted networks.
 #
 # Production mode (FERROSA_MODE=production):
+#   Startup is refused unless auth is on, every ENABLED client listener
+#   (cql, postgres, graph + Bolt, sparql, web) sets require_tls = true with a
+#   tls_cert/tls_key, [internode] require_tls = true, and Flight is disabled.
+#   Each refusal names the listener and the key to set.
 #   Random 96-hex-char passwords are generated for each role and printed
 #   once to stderr at startup. Record them immediately — they are not
 #   stored anywhere accessible after that startup.

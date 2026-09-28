@@ -72,7 +72,8 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   cert/key/CA paths; `require_tls` fails startup loudly when no cert is
   configured (acceptor AND connector). This module is the process's single
   crypto-provider decision (`crypto_provider()`, currently `ring`): internode,
-  CQL and PostgreSQL build their server config through `server_config_from_pem` / `optional_server_config`, so a
+  CQL, PostgreSQL, Bolt, graph HTTP, SPARQL and the web console build their
+  server config through `server_config_from_pem` / `optional_server_config`, so a
   provider swap (e.g. FIPS) is a one-line change here.
 - **Streaming support** (`stream_router`, `idle_timeout`) — `StreamRouter`
   dispatches multi-message streaming RPCs keyed by `request_id`; the idle-timeout
