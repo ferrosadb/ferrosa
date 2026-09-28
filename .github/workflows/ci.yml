@@ -61,8 +61,8 @@ jobs:
   # jsonb guards (T-025): serde_json features are unified workspace-wide, so one
   # dependent enabling arbitrary_precision / preserve_order / unbounded_depth
   # changes number and object semantics everywhere (hazards M8, M12). The value
-  # model crates must also stay arrow-free (D5a). T-100 appends ferrosa-jsonb to
-  # the guard-arrow-free.sh crate list.
+  # model crates must also stay arrow-free (D5a). The guard-arrow-free.sh crate
+  # list includes ferrosa-jsonb (T-100).
   json-guards:
     name: jsonb guards (serde_json features, arrow-free)
     runs-on: ubuntu-latest
@@ -74,7 +74,7 @@ jobs:
       - name: serde_json feature guard
         run: bash scripts/ci/guard-serde-json-features.sh
       - name: Arrow-free guard
-        run: bash scripts/ci/guard-arrow-free.sh ferrosa-common
+        run: bash scripts/ci/guard-arrow-free.sh ferrosa-common ferrosa-jsonb
       - name: Guard tests (seeded bad trees must fail)
         run: bash tests/test_guard_ci_json.sh
 

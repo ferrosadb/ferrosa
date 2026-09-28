@@ -1,0 +1,23 @@
+[package]
+name = "ferrosa-jsonb"
+description = "Exact, canonical, fail-loud jsonb value model for Ferrosa (leaf crate, no arrow-rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Leaf crate (D5a): no other ferrosa crate and no arrow*/parquet* crate, ever.
+# `scripts/ci/guard-arrow-free.sh ferrosa-common ferrosa-jsonb` enforces it.
+[dependencies]
+bytes = "1"
+num-bigint = "0.4"
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

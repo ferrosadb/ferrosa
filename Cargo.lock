@@ -2567,6 +2567,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-jsonb"
+version = "0.22.0"
+dependencies = [
+ "bytes",
+ "num-bigint",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ferrosa-loadgen"
 version = "0.22.0"
 dependencies = [

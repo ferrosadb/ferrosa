@@ -1,0 +1,6 @@
+# The crate denies unwrap/expect/panic/indexing in production code (M9);
+# test code may use them.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
