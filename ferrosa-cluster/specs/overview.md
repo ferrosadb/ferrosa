@@ -114,7 +114,9 @@ transactions before applying to storage at the agreed HLC timestamp. On the
 slow path, each AcceptOK reports the replica's effective dependencies, including
 conflicts observed locally after PreAccept; the coordinator carries the accepted
 quorum's dependency union into Commit so Accept cannot erase a newly observed
-ordering edge. LWT read-votes return as soon as F+1 matching votes decide, so an
+ordering edge. Apply fanout to remote replicas runs concurrently with the
+coordinator's local dependency wait, while success still requires both local
+`Applied` and the per-shard remote quorum. LWT read-votes return as soon as F+1 matching votes decide, so an
 unavailable minority does not hold a completed quorum open. PostgreSQL snapshot
 barriers rely on their committed slow quorum and the serving replica's local
 dependency/apply check, without remote read-vote fanout. See

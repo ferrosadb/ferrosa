@@ -79,7 +79,11 @@ replicas inline before returning.
 `AccordCoordinator` runs the EPaxos-family protocol across the shards a
 transaction touches. The common case commits in one round trip (fast path); a
 conflict forces the Accept phase (slow path). Apply waits on conflicting
-dependencies before writing to storage at the agreed HLC timestamp.
+dependencies before writing to storage at the agreed HLC timestamp. After the
+coordinator starts its local Apply, it drives remote Apply quorum fanout in
+parallel with waiting for local `Applied`; it reports success only after both
+conditions hold. This lets remote replicas progress when the coordinator is
+parked behind an unresolved dependency without acknowledging a local write early.
 An explicit no-write Apply resolves an absent local dependency and cascades any
 parked dependent writes. A missing target with real mutation bytes still fails
 without an Apply acknowledgement.

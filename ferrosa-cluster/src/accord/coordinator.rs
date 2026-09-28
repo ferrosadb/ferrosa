@@ -2238,37 +2238,6 @@ impl AccordCoordinatorDriver {
                     sm.handle_apply_writeset(txn_id, owned_writes)
                 })
                 .await;
-                if !crate::accord::handlers::await_txn_applied(local_sm, txn_id).await {
-                    let state = crate::accord::handlers::on_state_machine(local_sm, move |sm| {
-                        sm.get_state(&txn_id).map(|txn| {
-                            let dependencies = txn
-                                .deps
-                                .iter()
-                                .map(|dependency| {
-                                    (
-                                        *dependency,
-                                        sm.get_state(dependency).map(|state| state.phase),
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            (
-                                txn.phase,
-                                dependencies,
-                                txn.result.as_ref().map_or(0, Vec::len),
-                            )
-                        })
-                    })
-                    .await;
-                    tracing::error!(
-                        txn_id = ?txn_id,
-                        ?state,
-                        owned_write_count = self.write_set.iter().filter(|entry| self.replica_owns_key(self_id, &entry.key)).count(),
-                        "accord: coordinator local Apply did not reach Applied before the bounded wait"
-                    );
-                    return Err(AccordDriverError::Network(format!(
-                        "coordinator local Apply did not reach Applied (state={state:?})"
-                    )));
-                }
             } else if !owned_writes.is_empty() {
                 if let Some(applier) = &self.local_applier {
                     let deps: Vec<TxnId> = commit_deps.iter().copied().collect();
@@ -2293,37 +2262,93 @@ impl AccordCoordinatorDriver {
         // Apply quorum: the SAME per-shard rule as Commit (reusing the
         // `participant` built above). An Apply ack is an `AccordApplyOK` for this
         // txn — an empty body, or a payload whose `txn_id` matches.
-        let apply_txn = txn_id;
-        let is_apply_ok = move |r: &ferrosa_net::error::Result<Message>| {
-            matches!(r, Ok(Message::AccordApplyOK(b))
-                if b.is_empty()
-                    || bincode::deserialize::<ApplyOkPayload>(b)
-                        .map(|ok| ok.txn_id == apply_txn)
-                        .unwrap_or(false))
+        let local_state = if self_is_replica {
+            self.local_accord_state.clone()
+        } else {
+            None
+        };
+        let local_apply_wait = async move {
+            match local_state {
+                Some(state) => crate::accord::handlers::await_txn_applied(&state, txn_id).await,
+                None => true,
+            }
         };
 
         // Single-key keeps the v1 `AccordApply` wire (byte-identical). Multi-key
         // sends each replica a per-replica `AccordApplyV2` scoped to the keys it
-        // owns, so a replica never persists a key it is not a replica for.
-        let apply_ok = if self.write_set.len() == 1 {
-            let apply_bytes = self.apply_payload_bytes()?;
-            let apply_msg = Message::AccordApply(Bytes::from(apply_bytes));
-            self.quorum_broadcast(apply_msg, &participant, is_apply_ok)
-                .await
-        } else {
-            let per_peer = self.apply_v2_messages()?;
-            self.quorum_broadcast_per_peer(
-                &participant,
-                |peer_id| {
-                    per_peer
-                        .get(&peer_id)
-                        .cloned()
-                        .expect("every replica_id has a per-peer AccordApplyV2 message")
-                },
-                is_apply_ok,
-            )
-            .await
+        // owns, so a replica never persists a key it is not a replica for. Fanout
+        // runs alongside the local dependency wait: a parked coordinator replica
+        // must not suppress Apply propagation to the other replicas.
+        let remote_apply = async {
+            let apply_txn = txn_id;
+            let is_apply_ok = move |r: &ferrosa_net::error::Result<Message>| {
+                matches!(r, Ok(Message::AccordApplyOK(b))
+                    if b.is_empty()
+                        || bincode::deserialize::<ApplyOkPayload>(b)
+                            .map(|ok| ok.txn_id == apply_txn)
+                            .unwrap_or(false))
+            };
+            if self.write_set.len() == 1 {
+                let apply_bytes = self.apply_payload_bytes()?;
+                let apply_msg = Message::AccordApply(Bytes::from(apply_bytes));
+                Ok::<bool, AccordDriverError>(
+                    self.quorum_broadcast(apply_msg, &participant, is_apply_ok)
+                        .await,
+                )
+            } else {
+                let per_peer = self.apply_v2_messages()?;
+                Ok(self
+                    .quorum_broadcast_per_peer(
+                        &participant,
+                        |peer_id| {
+                            per_peer
+                                .get(&peer_id)
+                                .cloned()
+                                .expect("every replica_id has a per-peer AccordApplyV2 message")
+                        },
+                        is_apply_ok,
+                    )
+                    .await)
+            }
         };
+        let (local_applied, apply_result) = tokio::join!(local_apply_wait, remote_apply);
+
+        if !local_applied {
+            let state = if let Some(local_sm) = &self.local_accord_state {
+                crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                    sm.get_state(&txn_id).map(|txn| {
+                        let dependencies = txn
+                            .deps
+                            .iter()
+                            .map(|dependency| {
+                                (
+                                    *dependency,
+                                    sm.get_state(dependency).map(|state| state.phase),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        (
+                            txn.phase,
+                            dependencies,
+                            txn.result.as_ref().map_or(0, Vec::len),
+                        )
+                    })
+                })
+                .await
+            } else {
+                None
+            };
+            tracing::error!(
+                txn_id = ?txn_id,
+                ?state,
+                owned_write_count = self.write_set.iter().filter(|entry| self.replica_owns_key(self_id, &entry.key)).count(),
+                "accord: coordinator local Apply did not reach Applied before the bounded wait"
+            );
+            return Err(AccordDriverError::Network(format!(
+                "coordinator local Apply did not reach Applied (state={state:?})"
+            )));
+        }
+        let apply_ok = apply_result?;
         if !apply_ok {
             tracing::error!(
                 txn_id = ?txn_id,
@@ -3811,6 +3836,95 @@ mod tests {
                 other => panic!("unexpected Accord test message: {other:?}"),
             }
         }
+    }
+
+    struct ApplyObservedTransport {
+        apply_sent: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for ApplyObservedTransport {
+        async fn send(
+            &self,
+            _host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            assert!(matches!(msg, Message::AccordApply(_)));
+            let _ = self.apply_sent.send(());
+            Ok(Message::AccordApplyOK(Bytes::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_fans_out_while_local_dependency_is_parked() {
+        let self_id = uuid::Uuid::from_u128(1u128 << 64);
+        let remote_id = uuid::Uuid::from_u128(2u128 << 64);
+        let (apply_sent, mut apply_received) = tokio::sync::mpsc::unbounded_channel();
+        let transport = Arc::new(ApplyObservedTransport { apply_sent });
+        let clock = HybridLogicalClock::new(1, 0);
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            crate::accord::state_machine::AccordStateMachine::new(
+                1,
+                Arc::new(ferrosa_storage::accord::sync_writer::MockSyncWriter::new()),
+            ),
+        ));
+        let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+            1,
+            vec![self_id, remote_id],
+            transport,
+            false,
+            &clock,
+            vec![(b"key".to_vec(), b"mutation".to_vec())],
+        )
+        .with_local_accord_state(local_state.clone());
+
+        let txn_id = driver.txn_id();
+        let dependency = TxnId::new(3, Timestamp::synthetic(1));
+        let commit_t = Timestamp::synthetic(2);
+        crate::accord::handlers::on_state_machine(&local_state, move |sm| {
+            sm.handle_preaccept(txn_id, txn_id.0, b"key", BallotNumber(0), 0);
+            sm.handle_commit(txn_id, txn_id.0, commit_t, vec![dependency]);
+        })
+        .await;
+
+        let apply_task = tokio::spawn(async move {
+            driver
+                .apply_phase(commit_t, std::collections::HashSet::from([dependency]))
+                .await
+        });
+
+        // A remote replica must hear the committed txn even while this node is
+        // parked on its own dependency. Leave margin before the production
+        // dependency-wait deadline so a slow CI host cannot turn this into a
+        // timeout-sensitive correctness test.
+        let remote_apply =
+            tokio::time::timeout(std::time::Duration::from_secs(4), apply_received.recv())
+                .await
+                .expect("remote Apply must be sent before the local dependency wait expires");
+        assert_eq!(remote_apply, Some(()));
+        let local_phase = crate::accord::handlers::on_state_machine(&local_state, move |sm| {
+            sm.get_state(&txn_id).expect("local txn exists").phase
+        })
+        .await
+        .expect("state machine lock available");
+        assert_eq!(local_phase, TxnPhase::Committed);
+        assert!(
+            !apply_task.is_finished(),
+            "must not report success before local Applied"
+        );
+
+        crate::accord::handlers::on_state_machine(&local_state, move |sm| {
+            sm.handle_apply_writeset(dependency, Vec::new());
+        })
+        .await;
+        assert!(apply_task.await.unwrap().is_ok());
+        let local_phase = crate::accord::handlers::on_state_machine(&local_state, move |sm| {
+            sm.get_state(&txn_id).expect("local txn exists").phase
+        })
+        .await
+        .expect("state machine lock available");
+        assert_eq!(local_phase, TxnPhase::Applied);
     }
 
     #[tokio::test]
