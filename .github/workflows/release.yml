@@ -455,7 +455,7 @@ jobs:
           profiling_binary="target/${{ matrix.target }}/profiling/ferrosa"
           test -x "$profiling_binary"
           readelf --sections "$profiling_binary" | grep -q '\.debug_info'
-          _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_sample:0,prof_prefix:$RUNNER_TEMP/ferrosa-profile" \
+          MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_sample:0,prof_prefix:$RUNNER_TEMP/ferrosa-profile" \
             "$profiling_binary" --version
           find "$RUNNER_TEMP" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit | grep -q .
           install -m 0755 "$profiling_binary" "dist/${{ matrix.arch }}/ferrosa"

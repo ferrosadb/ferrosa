@@ -163,6 +163,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}", job)
         self.assertRegex(job, r"repository: ferrosadb/ferrosa-installer\n\s+ref: [0-9a-f]{40}")
 
+    def test_profiling_build_probe_uses_jemalloc_runtime_configuration(self):
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_sample:0,prof_prefix:$RUNNER_TEMP/ferrosa-profile"', workflow)
+        self.assertNotIn("_RJEM_MALLOC_CONF=", workflow)
+        self.assertIn("find \"$RUNNER_TEMP\" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit | grep -q .", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
