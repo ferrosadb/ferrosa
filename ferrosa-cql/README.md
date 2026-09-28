@@ -191,6 +191,15 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `BEGIN` / body / `COMMIT` statements and the documented single-query
   `BEGIN TRANSACTION; ...; COMMIT TRANSACTION;` block form use the same
   registry-backed Accord path; body errors roll the block back immediately.
+  **Every conditional write is evaluated, never dropped (t_cd5142b5).**
+  Standalone `UPDATE`/`DELETE ... IF <cond>`, `IF EXISTS` and `INSERT ... IF NOT
+  EXISTS` read the current row and evaluate the clause with the same
+  `accord_router::eval_if_conditions` the cluster path gates on, atomically
+  under a per-partition lock (`local_lwt.rs`) held until the write lands; the
+  reply is the standard `[applied]` row (plus current values when not applied).
+  Conditions inside `BEGIN TRANSACTION` blocks and inside any `BATCH`
+  (logged/unlogged/counter) are rejected with the typed
+  `CqlError::ConditionalUnsupported` (code 0x2200) before anything is written.
 - **SUBSCRIBE / CDC** (`subscribe.rs`, `event.rs`) — per-connection streaming
   subscriptions that re-run an inner SELECT on an interval and push delta frames;
   dual-timestamp (Accord ts + apply ts) events; CQL `EVENT` push via a broadcast

@@ -41,6 +41,7 @@ same encode/decode without depending on this large crate.
 | `frame` | ~1.4k | CQL header/body codec, opcodes, LZ4/Snappy compression, streaming flag |
 | `lexer` | ~1.4k | Hand-written CQL tokenizer |
 | `accord_router` | ~1.2k | LWT-on-Accord routing decisions + CAS execute-phase logic |
+| `local_lwt` | ~0.3k | Per-partition lock making standalone `IF` read-evaluate-write atomic |
 | `subscribe` | ~1.2k | Per-connection streaming subscriptions, dual-timestamp events |
 | `prometheus` | ~1.1k | Prometheus text rendering of virtual-table + runtime metrics |
 | `server` | ~1.1k | TCP accept loop, TLS, connection caps, `auth_disabled` resolution |
@@ -70,7 +71,12 @@ checks permissions (M8), converts `Term`s to `CqlValue`s via `bridge`, builds th
 `DecoratedKey` + storage `Row` via the re-exported `ferrosa-row-bridge` builders,
 and applies through `SessionCore`'s write path / `StorageEngine`. LWT statements
 (serial consistency set, cluster mode) detour through `accord_router` →
-`route_lwt_via_accord`. A void/applied RESULT frame is encoded back.
+`route_lwt_via_accord`. Standalone conditional statements
+(`IF <cond>`/`IF EXISTS`/`IF NOT EXISTS`) take `local_lwt::lock_partition`, read the
+row, evaluate with `accord_router::eval_if_conditions`, and write only if it holds,
+replying `[applied]` (+ current values). A conditional inside a transaction block
+or any BATCH is rejected with `CqlError::ConditionalUnsupported`. A void/applied
+RESULT frame is encoded back.
 
 **Read (SELECT).** Same front half; `router::route_select` resolves the table,
 plans the scan (`planner`, ORDER BY classification), reads `Partition`s from
@@ -178,6 +184,9 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
 5. **Fail loud on the Accord gap.** LWT routing in standalone/pair mode returns a
    clear `ServerError` rather than silently falling back to a non-linearizable
    local path (p0-03 policy).
+5a. **A condition is never dropped.** Every write path either evaluates its `IF`
+   clause atomically or rejects the statement (`ConditionalUnsupported`) before
+   writing; none applies a conditional statement unconditionally (t_cd5142b5).
 6. **16-byte TimeUUID from `now()`.** `eval_now()` guarantees a 16-byte encoding —
    a short one wedges TimeUUID-clustered tables at flush.
 

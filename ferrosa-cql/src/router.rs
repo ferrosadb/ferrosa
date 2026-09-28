@@ -2373,6 +2373,19 @@ fn build_transaction_write(
 ) -> Result<ferrosa_storage::accord::TransactionWrite, CqlError> {
     use ferrosa_storage::Mutation;
 
+    // Authorize first (D22, fail closed): a MODIFY-only principal gets
+    // Unauthorized before any other verdict on a conditional statement.
+    authorize_conditional_statement(state, ctx, stmt)?;
+
+    // A staged write carries only its mutation: there is no slot for a
+    // condition, so encoding one here would silently drop it and let the
+    // COMMIT apply the write unconditionally. Reject loudly instead.
+    if crate::accord_router::classify_lwt(stmt).is_some() {
+        return Err(CqlError::ConditionalUnsupported {
+            scope: "a BEGIN TRANSACTION block",
+        });
+    }
+
     let now_micros = || -> Result<i64, CqlError> {
         Ok(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8116,56 +8129,23 @@ async fn route_insert(
     let table_id = TableId::new(ks, &s.table);
     let strategy = keyspace_strategy(&state.schema, ks);
 
-    // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
+    // BUG-0016: IF NOT EXISTS. The existence check and the write are one
+    // atomic step under the partition lock (held until the write lands), so two
+    // racing inserts cannot both observe "absent".
+    let _lwt_guard = if s.if_not_exists {
+        Some(crate::local_lwt::lock_partition(&table_id, &decorated_key).await)
+    } else {
+        None
+    };
     if s.if_not_exists {
-        let existing_row = if let Some(partition) = state
-            .write_path
-            .load()
-            .read(&table_id, &decorated_key)
-            .await
-            .map_err(|e| CqlError::ServerError(format!("{e}")))?
-        {
-            let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
-            let all_col_types: Vec<CqlType> = table_meta
-                .columns
-                .values()
-                .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
-                .collect::<Result<Vec<_>, _>>()?;
-            let pk_indices: Vec<usize> = table_meta
-                .partition_key
-                .iter()
-                .filter_map(|name| table_meta.columns.get_index_of(name))
-                .collect();
-            let ck_indices: Vec<usize> = table_meta
-                .clustering_key
-                .iter()
-                .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
-                .collect();
-            let storage_to_table = storage_to_table_indices(table_meta);
-            let rows = bridge::partition_to_rows_with_storage_mapping(
-                &partition,
-                &all_col_names,
-                &all_col_types,
-                &pk_indices,
-                &ck_indices,
-                &storage_to_table,
-            );
-            let matching = if ck_values.is_empty() {
-                rows.into_iter().next()
-            } else {
-                rows.into_iter().find(|row| {
-                    ck_indices
-                        .iter()
-                        .zip(ck_values.iter())
-                        .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
-                })
-            };
-            matching
-        } else {
-            None
+        let target = LwtRow {
+            ks,
+            table_meta,
+            table_id: &table_id,
+            key: &decorated_key,
+            ck_values: &ck_values,
         };
-
-        if let Some(ref existing) = existing_row {
+        if let Some(existing) = read_lwt_row(state, &target).await? {
             // Row already exists — return [applied] = false with existing row data
             return encode_lwt_applied(
                 false,
@@ -8173,7 +8153,7 @@ async fn route_insert(
                 &s.table,
                 table_meta,
                 &state.schema,
-                Some(existing),
+                Some(existing.as_slice()),
             );
         }
     }
@@ -8387,6 +8367,103 @@ fn encode_lwt_applied(
     ))
 }
 
+/// The row a standalone conditional statement targets.
+struct LwtRow<'a> {
+    ks: &'a str,
+    table_meta: &'a TableMetadata,
+    table_id: &'a TableId,
+    key: &'a ferrosa_common::DecoratedKey,
+    ck_values: &'a [CqlValue],
+}
+
+/// Read the single row `target` addresses, as values in table-column order.
+///
+/// Reads the target partition through the write path and picks the one row
+/// matching the clustering key; nothing is retained beyond that row.
+async fn read_lwt_row(
+    state: &SharedState,
+    target: &LwtRow<'_>,
+) -> Result<Option<Vec<Option<CqlValue>>>, CqlError> {
+    let meta = target.table_meta;
+    let Some(partition) = state
+        .write_path
+        .load()
+        .read(target.table_id, target.key)
+        .await
+        .map_err(|e| CqlError::ServerError(format!("{e}")))?
+    else {
+        return Ok(None);
+    };
+    let names: Vec<String> = meta.columns.keys().cloned().collect();
+    let types: Vec<CqlType> = meta
+        .columns
+        .values()
+        .map(|c| resolve_col_type(&c.column_type, target.ks, &state.schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pk_idx: Vec<usize> = meta
+        .partition_key
+        .iter()
+        .filter_map(|n| meta.columns.get_index_of(n))
+        .collect();
+    let ck_idx: Vec<usize> = meta
+        .clustering_key
+        .iter()
+        .filter_map(|(n, _)| meta.columns.get_index_of(n))
+        .collect();
+    let rows = bridge::partition_to_rows_with_storage_mapping(
+        &partition,
+        &names,
+        &types,
+        &pk_idx,
+        &ck_idx,
+        &storage_to_table_indices(meta),
+    );
+    Ok(rows.into_iter().find(|row| {
+        ck_idx
+            .iter()
+            .zip(target.ck_values)
+            .all(|(&i, want)| row.get(i).and_then(|v| v.as_ref()) == Some(want))
+    }))
+}
+
+/// Evaluate a standalone `IF` clause against the current row.
+///
+/// The caller MUST hold [`crate::local_lwt::lock_partition`] for the row's
+/// partition until its write lands, which is what makes read-evaluate-write
+/// atomic on a node without Accord. Returns `Some(frame)` (`[applied]=false`
+/// plus the current values) when the condition fails and the write must not
+/// happen; `None` when it holds. The evaluator is the same
+/// [`crate::accord_router::eval_if_conditions`] the cluster path gates on.
+async fn eval_local_condition(
+    state: &SharedState,
+    target: &LwtRow<'_>,
+    conditions: &[IfCondition],
+    if_exists: bool,
+) -> Result<Option<BytesMut>, CqlError> {
+    let existing = read_lwt_row(state, target).await?;
+    let as_map: Option<HashMap<String, Option<CqlValue>>> = existing.as_ref().map(|row| {
+        target
+            .table_meta
+            .columns
+            .keys()
+            .cloned()
+            .zip(row.iter().cloned())
+            .collect()
+    });
+    let verdict = crate::accord_router::eval_if_conditions(conditions, if_exists, as_map.as_ref());
+    if verdict.applied {
+        return Ok(None);
+    }
+    Ok(Some(encode_lwt_applied(
+        false,
+        target.ks,
+        &target.table_id.table,
+        target.table_meta,
+        &state.schema,
+        existing.as_deref(),
+    )?))
+}
+
 // ── UPDATE ───────────────────────────────────────────────────────────────
 
 async fn route_update(
@@ -8406,6 +8483,11 @@ async fn route_update(
     )?;
 
     if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
+        if s.if_exists || !s.if_conditions.is_empty() {
+            return Err(CqlError::ConditionalUnsupported {
+                scope: "an UPDATE of a virtual table",
+            });
+        }
         return route_update_virtual_table(ctx, vtable.as_ref(), &s);
     }
 
@@ -8458,6 +8540,29 @@ async fn route_update(
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let table_id = TableId::new(ks, &s.table);
+
+    // Standalone LWT: the IF clause is decided against the current row while
+    // holding the partition lock, which is kept until the write below lands.
+    let conditional = s.if_exists || !s.if_conditions.is_empty();
+    let _lwt_guard = if conditional {
+        Some(crate::local_lwt::lock_partition(&table_id, &decorated_key).await)
+    } else {
+        None
+    };
+    if conditional {
+        let target = LwtRow {
+            ks,
+            table_meta,
+            table_id: &table_id,
+            key: &decorated_key,
+            ck_values: &ck_values,
+        };
+        if let Some(not_applied) =
+            eval_local_condition(state, &target, &s.if_conditions, s.if_exists).await?
+        {
+            return Ok(not_applied);
+        }
+    }
 
     // Check if any assignments require a read-modify-write (collection +/- or counter)
     let needs_read = s
@@ -8749,6 +8854,9 @@ async fn route_update(
             &strategy,
         )
         .await?;
+    if conditional {
+        return encode_lwt_applied(true, ks, &s.table, table_meta, &state.schema, None);
+    }
     Ok(result::encode_void())
 }
 
@@ -8922,6 +9030,29 @@ async fn route_delete(
     let table_id = TableId::new(ks, &s.table);
     let strategy = keyspace_strategy(&state.schema, ks);
 
+    // Standalone LWT: decide the IF clause under the partition lock, held
+    // until the tombstone below lands.
+    let conditional = s.if_exists || !s.if_conditions.is_empty();
+    let _lwt_guard = if conditional {
+        Some(crate::local_lwt::lock_partition(&table_id, &decorated_key).await)
+    } else {
+        None
+    };
+    if conditional {
+        let target = LwtRow {
+            ks,
+            table_meta,
+            table_id: &table_id,
+            key: &decorated_key,
+            ck_values: &ck_values,
+        };
+        if let Some(not_applied) =
+            eval_local_condition(state, &target, &s.if_conditions, s.if_exists).await?
+        {
+            return Ok(not_applied);
+        }
+    }
+
     state
         .write_path
         .load()
@@ -8934,6 +9065,9 @@ async fn route_delete(
             &strategy,
         )
         .await?;
+    if conditional {
+        return encode_lwt_applied(true, ks, &s.table, table_meta, &state.schema, None);
+    }
     Ok(result::encode_void())
 }
 
@@ -8952,6 +9086,25 @@ async fn route_batch(
             b.statements.len(),
             max_batch
         )));
+    }
+
+    // Authorize first (D22, fail closed): every conditional member needs
+    // SELECT+MODIFY, and Unauthorized takes precedence over any other verdict.
+    for member in &b.statements {
+        authorize_conditional_statement(state, ctx, member)?;
+    }
+
+    // Conditional batches (all conditions on one partition, applied atomically)
+    // are not implemented on this path. Reject before anything is written: the
+    // batch paths below never evaluate a condition, so accepting one would
+    // apply the mutations unconditionally while reporting success.
+    if b.statements
+        .iter()
+        .any(|s| crate::accord_router::classify_lwt(s).is_some())
+    {
+        return Err(CqlError::ConditionalUnsupported {
+            scope: "a BATCH statement",
+        });
     }
 
     match b.batch_type {
@@ -27588,6 +27741,20 @@ mod tests {
         for cql in lwt_conditional_statements() {
             let err = lwt_denied(&state, "mod_only", &cql).await;
             assert_unauthorized_without_row_data(&err, &cql);
+        }
+    }
+
+    /// D22 ordering: a MODIFY-only principal must get Unauthorized for a
+    /// conditional batch member, never the ConditionalUnsupported verdict.
+    #[tokio::test]
+    async fn modify_only_conditional_in_batch_is_unauthorized() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        for cql in lwt_conditional_statements() {
+            for kind in ["", "UNLOGGED "] {
+                let batch = format!("BEGIN {kind}BATCH {cql}; APPLY BATCH");
+                let err = lwt_denied(&state, "mod_only", &batch).await;
+                assert_unauthorized_without_row_data(&err, &batch);
+            }
         }
     }
 

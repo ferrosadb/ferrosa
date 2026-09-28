@@ -27,6 +27,7 @@ pub mod error;
 pub mod event;
 pub mod frame;
 pub mod lexer;
+pub mod local_lwt;
 pub mod observability;
 pub mod paging;
 pub mod param_cache;

@@ -17,8 +17,16 @@ real backlog is structural and security-shaped.
   `BEGIN TRANSACTION` blocks) now require SELECT as well as MODIFY and are
   rejected with `Unauthorized` before the condition is evaluated or the row is
   read, so no row data and no row-existence signal reaches a MODIFY-only
-  principal. Follow-up: standalone `UPDATE/DELETE ... IF <cond>` and
-  transaction-staged conditions do not evaluate the condition yet.
+  principal.
+- **Conditional writes are evaluated on every path (t_cd5142b5 / CQL-25).**
+  Standalone `IF`/`IF EXISTS`/`IF NOT EXISTS` run atomically under a
+  per-partition lock and return `[applied]`; conditions in `BEGIN TRANSACTION`
+  blocks and batches are rejected with `CqlError::ConditionalUnsupported`
+  instead of being dropped. Open follow-ups: evaluate conditions inside
+  Accord transactions (needs a condition slot on `TransactionWrite`) and
+  support single-partition conditional batches with per-row `[applied]`
+  results.
+
 - **Decodable system-schema aggregates (CQL-22, 2026-09-17).**
   `SELECT count(*) FROM system_schema.tables` now emits one bigint column and
   one aggregate row through the shared system-table encoder; ordinary projected

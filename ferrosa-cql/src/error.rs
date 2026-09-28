@@ -59,6 +59,13 @@ pub enum CqlError {
     /// classify it as a transient timeout; the message carries the budget and
     /// the elapsed time. The transaction is aborted: nothing was persisted.
     TransactionTimeout { timeout_ms: u64, elapsed_ms: u64 },
+    /// 0x2200 — a conditional statement (`IF <cond>`, `IF EXISTS`,
+    /// `IF NOT EXISTS`) appeared in a context that cannot evaluate its
+    /// condition atomically yet. `scope` names the context (for example
+    /// `"a BEGIN TRANSACTION block"`). The statement is rejected and nothing is
+    /// written: a condition is never dropped and the write never applied
+    /// unconditionally.
+    ConditionalUnsupported { scope: &'static str },
 }
 
 impl CqlError {
@@ -74,7 +81,7 @@ impl CqlError {
             Self::ReadTimeout { .. } => 0x1200,
             Self::SyntaxError(_) => 0x2000,
             Self::Unauthorized(_) => 0x2100,
-            Self::Invalid(_) => 0x2200,
+            Self::Invalid(_) | Self::ConditionalUnsupported { .. } => 0x2200,
             Self::ConfigError(_) => 0x2300,
             Self::AlreadyExists { .. } => 0x2400,
             Self::Unprepared(_) => 0x2500,
@@ -238,6 +245,12 @@ impl std::fmt::Display for CqlError {
                 f,
                 "transaction timed out and was aborted: budget={timeout_ms}ms, \
                  elapsed={elapsed_ms}ms; nothing was persisted"
+            ),
+            Self::ConditionalUnsupported { scope } => write!(
+                f,
+                "IF conditions are not supported in {scope}: the statement was \
+                 rejected and nothing was written (issue the conditional \
+                 statement on its own instead)"
             ),
         }
     }
