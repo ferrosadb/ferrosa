@@ -51,8 +51,10 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
    defense) is OFF until its transport lands (CL-15), so the guard is currently
    load-bearing, not a band-aid — keep it until both CL-15 and CL-1 close.
 4. **CL-4 / CL-5 (RPN 140 / 126)** — Accord recovery and the storage-apply seam are
-   the correctness-critical paths least covered by real-fault testing; prioritise
-   them in the Jepsen workload set and add cross-DC failure cases.
+   the correctness-critical paths least covered by real-fault testing. The
+   storage-apply seam now resolves merged dependencies when an explicit no-write
+   finalize reaches a replica that never registered that txn; retain the focused
+   regression and fault-schedule coverage, then add cross-DC failure cases.
 
 ## Detection assets
 

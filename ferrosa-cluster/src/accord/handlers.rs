@@ -418,11 +418,15 @@ impl RpcHandler for AccordHandler {
                     .map_err(|e| tracing::error!("AccordApply: deserialize failed: {e}"))
                     .ok()?;
                 let txn_id = payload.txn_id;
-                on_state_machine(&self.state, move |sm| {
+                let apply_status = on_state_machine(&self.state, move |sm| {
                     sm.handle_apply(txn_id, payload.result_data)
                 })
                 .await?;
-                if !await_txn_applied(&self.state, txn_id).await {
+                if !matches!(
+                    apply_status,
+                    crate::accord::state_machine::SmResponse::NoWriteFinalized
+                ) && !await_txn_applied(&self.state, txn_id).await
+                {
                     return None;
                 }
                 // Gap 5: return a structured ApplyOK so the coordinator can
@@ -448,11 +452,15 @@ impl RpcHandler for AccordHandler {
                     .ok()?;
                 let txn_id = payload.txn_id;
                 let writes: Vec<Vec<u8>> = payload.writes.into_iter().map(|w| w.mutation).collect();
-                on_state_machine(&self.state, move |sm| {
+                let apply_status = on_state_machine(&self.state, move |sm| {
                     sm.handle_apply_writeset(txn_id, writes)
                 })
                 .await?;
-                if !await_txn_applied(&self.state, txn_id).await {
+                if !matches!(
+                    apply_status,
+                    crate::accord::state_machine::SmResponse::NoWriteFinalized
+                ) && !await_txn_applied(&self.state, txn_id).await
+                {
                     return None;
                 }
                 let ok = ApplyOkPayload {
@@ -591,7 +599,7 @@ impl RpcHandler for AccordHandler {
 mod tests {
     use super::*;
     use crate::accord::state_machine::AccordStateMachine;
-    use crate::accord::wire::{ApplyV2Payload, WriteSetEntry};
+    use crate::accord::wire::{ApplyPayload, ApplyV2Payload, WriteSetEntry};
     use ferrosa_common::accord::{BallotNumber, TxnId, TxnPhase};
     use ferrosa_storage::accord::sync_writer::MockSyncWriter;
 
@@ -683,6 +691,57 @@ mod tests {
             state.lock().get_state(&txn_id).unwrap().phase,
             TxnPhase::Applied,
             "the multi-key txn must reach Applied after AccordApplyV2"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_no_write_apply_acks_and_releases_merged_dependency() {
+        let writer = std::sync::Arc::new(MockSyncWriter::new());
+        let sm = AccordStateMachine::new(1, writer);
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let handler = AccordHandler::new(state.clone(), 1);
+
+        let absent_dependency = TxnId::new(2, ts(1000));
+        let waiting_txn = TxnId::new(1, ts(1001));
+        {
+            let mut sm = state.lock();
+            sm.handle_preaccept(waiting_txn, ts(1001), b"key", BallotNumber(0), 0);
+            sm.handle_commit(waiting_txn, ts(1001), ts(1002), vec![absent_dependency]);
+            sm.handle_apply_writeset(waiting_txn, vec![b"mutation".to_vec()]);
+        }
+
+        let payload = ApplyPayload {
+            txn_id: absent_dependency,
+            result_data: Vec::new(),
+        };
+        let bytes = bincode::serialize(&payload).unwrap();
+        let peer: PeerId = (
+            uuid::Uuid::from_u128(2),
+            "127.0.0.1:0".parse().expect("valid socket addr"),
+        );
+        let unexpected_write = ApplyPayload {
+            txn_id: absent_dependency,
+            result_data: b"unexpected-write".to_vec(),
+        };
+        let response = handler
+            .handle(
+                peer,
+                Message::AccordApply(Bytes::from(bincode::serialize(&unexpected_write).unwrap())),
+            )
+            .await;
+        assert!(
+            response.is_none(),
+            "a missing real write must not be acknowledged"
+        );
+
+        let response = handler
+            .handle(peer, Message::AccordApply(Bytes::from(bytes)))
+            .await;
+
+        assert!(matches!(response, Some(Message::AccordApplyOK(_))));
+        assert_eq!(
+            state.lock().get_state(&waiting_txn).unwrap().phase,
+            TxnPhase::Applied
         );
     }
 

@@ -94,6 +94,26 @@ maximum.
 These are CQL/Accord controls. They do not configure PostgreSQL transactions or
 PostgreSQL MVCC history.
 
+### Accord phase timing
+
+The PreAccept fast-path wait is read once per process when the Accord driver is
+first constructed. If the final fast-path vote does not arrive in this window,
+the coordinator may switch to ballot-1 Accept only after it has actual votes
+from a slow quorum; a timeout is never treated as a vote. Invalid or zero values
+log an error and use the default. PostgreSQL writes also require a slow quorum
+from the transaction marker key's replicas before this cutoff can advance the
+protocol, so the combined multi-key replica set cannot bypass snapshot freshness.
+
+| Environment variable | What it changes | Default |
+|---|---|---:|
+| `FERROSA_ACCORD_PREACCEPT_FAST_PATH_TIMEOUT_MS` | Maximum wait for a possible final fast-path PreAccept response before using an already-collected slow quorum | `1000` ms |
+
+The default leaves time for Accept and local dependency application within the
+existing 5-second read dependency wait while allowing ordinary sub-second
+replica responses to retain the one-round fast path. Increase it when healthy
+replica response latency regularly exceeds one second; decrease it only when
+the extra Accept round is preferable to waiting for the final fast-path vote.
+
 ### SSTable write, compression, and reader buffers
 
 These process-start settings tune SSTable output buffering, compression working

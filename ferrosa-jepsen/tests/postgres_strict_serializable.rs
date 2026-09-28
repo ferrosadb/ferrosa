@@ -19,7 +19,7 @@ use ferrosa_jepsen::checker::strict_serializable::{
 use scylla::client::session_builder::SessionBuilder;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
@@ -27,6 +27,10 @@ use uuid::Uuid;
 
 const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 2;
+// Bound retries so an unavailable cluster cannot hold a test actor indefinitely.
+const TRANSFER_SERIALIZATION_RETRIES: usize = 8;
+const WRITE_SKEW_WRITERS: usize = 2;
+const WORKLOAD_STATE_READ_RETRIES: usize = 120;
 const INITIAL_BALANCE: i64 = 10_000;
 const POSTGRES_DEFAULT_SCHEMA: &str = "public";
 const CLIENT_NODE_COUNT_ENV: &str = "FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT";
@@ -116,65 +120,86 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     }
 
     let event_clock = Arc::new(AtomicU64::new(1));
+    let transfer_retry_count = Arc::new(AtomicUsize::new(0));
     let history = Arc::new(Mutex::new(Vec::with_capacity(
         ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
     )));
     let predicate_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
     let write_skew_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
-    let (actor_failure_tx, actor_failure_rx) = tokio::sync::watch::channel(false);
+    let (actor_failure_tx, actor_failure_rx) = tokio::sync::watch::channel(None::<String>);
     let mut actors = Vec::with_capacity(ACTORS);
     for (actor, actor_client) in actor_clients.iter().enumerate() {
         let client = Arc::clone(actor_client);
         let event_clock = Arc::clone(&event_clock);
+        let transfer_retry_count = Arc::clone(&transfer_retry_count);
         let history = Arc::clone(&history);
         let predicate_barrier = Arc::clone(&predicate_barrier);
         let write_skew_barrier = Arc::clone(&write_skew_barrier);
         let actor_failure_tx = actor_failure_tx.clone();
         let mut actor_failure_rx = actor_failure_rx.clone();
+        let mut actor_cancel_rx = actor_failure_rx.clone();
         let table = table.clone();
         actors.push(tokio::spawn(async move {
-            let result = async {
-                for iteration in 0..TRANSACTIONS_PER_ACTOR {
-                    let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
-                    let transfer =
-                        transfer_once(&client, &table, operation_id * 2, &event_clock).await?;
+            let result = run_until_actor_failure(
+                async {
+                    for iteration in 0..TRANSACTIONS_PER_ACTOR {
+                        let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
+                        let transfers =
+                            transfer_once(&client, &table, operation_id, &event_clock).await?;
+                        transfer_retry_count
+                            .fetch_add(transfers.len().saturating_sub(1), Ordering::Relaxed);
+                        history
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .extend(transfers);
+                        let register =
+                            register_once(&client, &table, operation_id * 2 + 1, &event_clock)
+                                .await?;
+                        history
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .push(register);
+                    }
+
+                    wait_for_phase(&predicate_barrier, &mut actor_failure_rx).await?;
+                    let predicate = if actor == 0 {
+                        insert_phantom_once(&client, &table, 1_000, &event_clock).await?
+                    } else {
+                        observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock)
+                            .await?
+                    };
                     history
                         .lock()
                         .expect("history mutex poisoned")
-                        .push(transfer);
-                    let register =
-                        register_once(&client, &table, operation_id * 2 + 1, &event_clock).await?;
+                        .push(predicate);
+
+                    wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
+                    let write_skew = if is_write_skew_writer(actor) {
+                        write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?
+                    } else {
+                        observe_predicate_once(&client, &table, 2_000 + actor as u64, &event_clock)
+                            .await?
+                    };
                     history
                         .lock()
                         .expect("history mutex poisoned")
-                        .push(register);
-                }
-
-                wait_for_phase(&predicate_barrier, &mut actor_failure_rx).await?;
-                let predicate = if actor == 0 {
-                    insert_phantom_once(&client, &table, 1_000, &event_clock).await?
-                } else {
-                    observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock)
-                        .await?
-                };
-                history
-                    .lock()
-                    .expect("history mutex poisoned")
-                    .push(predicate);
-
-                wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
-                let write_skew =
-                    write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?;
-                history
-                    .lock()
-                    .expect("history mutex poisoned")
-                    .push(write_skew);
-                Ok(())
-            }
+                        .push(write_skew);
+                    Ok(())
+                },
+                &mut actor_cancel_rx,
+            )
             .await;
 
-            if result.is_err() {
-                actor_failure_tx.send_replace(true);
+            if let Err(error) = &result {
+                let failure = format!("PostgreSQL workload actor {actor} failed: {error:#}");
+                actor_failure_tx.send_if_modified(|first_failure| {
+                    if first_failure.is_none() {
+                        *first_failure = Some(failure);
+                        true
+                    } else {
+                        false
+                    }
+                });
             }
             result
         }));
@@ -198,7 +223,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         return Err(error);
     }
 
-    let final_state = read_workload_state(&clients[0], &table).await?;
+    let final_state = read_workload_state_after_fault(&clients[0], &table).await?;
     let final_a = final_state["a"];
     let final_b = final_state["b"];
     let initial = BTreeMap::from([
@@ -212,7 +237,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     history.sort_by_key(|transaction| transaction.id);
     assert_eq!(
         history.len(),
-        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
+        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2) + transfer_retry_count.load(Ordering::Relaxed),
         "every invoked operation must have a recorded completion"
     );
     assert!(
@@ -373,6 +398,31 @@ async fn read_workload_state(client: &Client, table: &str) -> Result<BTreeMap<St
     Ok(state)
 }
 
+async fn read_workload_state_after_fault(
+    client: &Client,
+    table: &str,
+) -> Result<BTreeMap<String, i64>> {
+    let mut last_error = None;
+    for attempt in 0..=WORKLOAD_STATE_READ_RETRIES {
+        match read_workload_state(client, table).await {
+            Ok(state) => return Ok(state),
+            Err(error)
+                if error
+                    .downcast_ref::<tokio_postgres::Error>()
+                    .is_some_and(is_serialization_failure) =>
+            {
+                last_error = Some(error);
+                if attempt < WORKLOAD_STATE_READ_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("retry loop records a serialization failure"))
+        .context("read workload state after the replica fault")
+}
+
 async fn wait_for_workload_state(
     client: &Client,
     table: &str,
@@ -398,6 +448,15 @@ async fn wait_for_workload_state(
 }
 
 async fn transfer_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<Vec<RecordedTransaction>> {
+    retry_serializable_transactions(|| transfer_attempt(client, table, id, event_clock)).await
+}
+
+async fn transfer_attempt(
     client: &Client,
     table: &str,
     id: u64,
@@ -471,7 +530,6 @@ async fn transfer_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transfer,
@@ -484,7 +542,7 @@ async fn transfer_once(
 async fn register_once(
     client: &Client,
     table: &str,
-    id: u64,
+    _id: u64,
     event_clock: &AtomicU64,
 ) -> Result<RecordedTransaction> {
     let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
@@ -522,7 +580,6 @@ async fn register_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transaction,
@@ -535,7 +592,7 @@ async fn register_once(
 async fn observe_predicate_once(
     client: &Client,
     table: &str,
-    id: u64,
+    _id: u64,
     event_clock: &AtomicU64,
 ) -> Result<RecordedTransaction> {
     let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
@@ -553,7 +610,6 @@ async fn observe_predicate_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transaction,
@@ -566,7 +622,7 @@ async fn observe_predicate_once(
 async fn insert_phantom_once(
     client: &Client,
     table: &str,
-    id: u64,
+    _id: u64,
     event_clock: &AtomicU64,
 ) -> Result<RecordedTransaction> {
     let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
@@ -595,7 +651,6 @@ async fn insert_phantom_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transaction,
@@ -645,7 +700,6 @@ async fn write_skew_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transaction,
@@ -675,7 +729,6 @@ async fn read_predicate_values(
 
 async fn finish_recorded_transaction(
     client: &Client,
-    id: u64,
     invoked: u64,
     operations: Vec<TransactionOperation>,
     result: Result<(), tokio_postgres::Error>,
@@ -695,7 +748,7 @@ async fn finish_recorded_transaction(
     };
     let completed = event_clock.fetch_add(1, Ordering::SeqCst);
     Ok(RecordedTransaction {
-        id,
+        id: invoked,
         invoked,
         completed,
         committed,
@@ -703,22 +756,68 @@ async fn finish_recorded_transaction(
     })
 }
 
+async fn retry_serializable_transactions<F, Fut>(mut attempt: F) -> Result<Vec<RecordedTransaction>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<RecordedTransaction>>,
+{
+    let mut history = Vec::with_capacity(TRANSFER_SERIALIZATION_RETRIES + 1);
+    for _ in 0..=TRANSFER_SERIALIZATION_RETRIES {
+        let transaction = attempt().await?;
+        let committed = transaction.committed;
+        history.push(transaction);
+        if committed {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(history)
+}
+
 async fn wait_for_phase(
     barrier: &tokio::sync::Barrier,
-    actor_failure_rx: &mut tokio::sync::watch::Receiver<bool>,
+    actor_failure_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
 ) -> Result<()> {
     loop {
-        if *actor_failure_rx.borrow() {
-            bail!("another PostgreSQL workload actor failed before the phase barrier");
+        if let Some(error) = actor_failure_rx.borrow().as_ref() {
+            bail!("{error}");
         }
 
         tokio::select! {
             _ = barrier.wait() => return Ok(()),
             changed = actor_failure_rx.changed() => {
-                if changed.is_err() || *actor_failure_rx.borrow() {
-                    bail!("another PostgreSQL workload actor failed at the phase barrier");
+                if changed.is_err() {
+                    bail!("PostgreSQL workload actor failure signal closed at the phase barrier");
+                }
+                if let Some(error) = actor_failure_rx.borrow().as_ref() {
+                    bail!("{error}");
                 }
             }
+        }
+    }
+}
+
+async fn run_until_actor_failure<F>(
+    work: F,
+    actor_failure_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    if let Some(error) = actor_failure_rx.borrow().clone() {
+        bail!("{error}");
+    }
+
+    tokio::select! {
+        result = work => result,
+        changed = actor_failure_rx.changed() => {
+            if changed.is_err() {
+                bail!("PostgreSQL workload actor failure signal closed during actor work");
+            }
+            if let Some(error) = actor_failure_rx.borrow().as_ref() {
+                bail!("{error}");
+            }
+            bail!("PostgreSQL workload actor failure signal changed without an error");
         }
     }
 }
@@ -726,7 +825,11 @@ async fn wait_for_phase(
 fn is_serialization_failure(error: &tokio_postgres::Error) -> bool {
     error
         .code()
-        .is_some_and(|sqlstate| sqlstate.code() == "40001")
+        .is_some_and(|sqlstate| is_retryable_serialization_state(sqlstate.code()))
+}
+
+fn is_retryable_serialization_state(sqlstate: &str) -> bool {
+    sqlstate == "40001"
 }
 
 fn initial_workload_statements(table: &str) -> [String; 5] {
@@ -770,6 +873,10 @@ fn actor_client_count(url_count: usize, configured: Option<&str>) -> Result<usiz
 /// selected nodes without sharing a PostgreSQL transaction state machine.
 fn actor_client_urls<'a>(urls: &'a [&'a str], node_count: usize) -> Vec<&'a str> {
     (0..ACTORS).map(|actor| urls[actor % node_count]).collect()
+}
+
+fn is_write_skew_writer(actor: usize) -> bool {
+    actor < WRITE_SKEW_WRITERS
 }
 
 fn convergence_node_count(total_nodes: usize, active_nodes: usize, fault_scheduled: bool) -> usize {
@@ -850,8 +957,64 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 mod tests {
     use super::{
         actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
-        predicate_observations, wait_for_phase, FaultSchedule, TransactionOperation,
+        is_retryable_serialization_state, is_write_skew_writer, predicate_observations,
+        retry_serializable_transactions, run_until_actor_failure, wait_for_phase, FaultSchedule,
+        RecordedTransaction, TransactionOperation, ACTORS, TRANSFER_SERIALIZATION_RETRIES,
     };
+
+    #[tokio::test]
+    async fn serialization_retries_keep_aborted_attempts_and_stop_after_commit() {
+        let mut outcomes = [false, false, true].into_iter();
+        let history = retry_serializable_transactions(|| {
+            let committed = outcomes.next().expect("only three attempts expected");
+            async move {
+                Ok(RecordedTransaction {
+                    id: 0,
+                    invoked: 0,
+                    completed: 1,
+                    committed,
+                    operations: Vec::new(),
+                })
+            }
+        })
+        .await
+        .expect("serialization failures are recorded, not returned as errors");
+
+        assert_eq!(
+            history
+                .iter()
+                .map(|transaction| transaction.committed)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        assert!(
+            outcomes.next().is_none(),
+            "successful commit must stop retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn serialization_retries_are_bounded_and_keep_every_abort() {
+        let attempts = std::cell::Cell::new(0);
+        let history = retry_serializable_transactions(|| {
+            attempts.set(attempts.get() + 1);
+            async {
+                Ok(RecordedTransaction {
+                    id: 0,
+                    invoked: 0,
+                    completed: 1,
+                    committed: false,
+                    operations: Vec::new(),
+                })
+            }
+        })
+        .await
+        .expect("serialization failures are retained as aborted attempts");
+
+        assert_eq!(attempts.get(), TRANSFER_SERIALIZATION_RETRIES + 1);
+        assert_eq!(history.len(), TRANSFER_SERIALIZATION_RETRIES + 1);
+        assert!(history.iter().all(|transaction| !transaction.committed));
+    }
 
     #[test]
     fn workload_fixture_uses_single_row_inserts_supported_by_the_postgres_gateway() {
@@ -884,6 +1047,16 @@ mod tests {
     }
 
     #[test]
+    fn fault_workload_limits_write_skew_to_two_competing_actors() {
+        let writers = (0..ACTORS)
+            .filter(|actor| is_write_skew_writer(*actor))
+            .collect::<Vec<_>>();
+
+        assert_eq!(writers, [0, 1]);
+        assert!(!is_write_skew_writer(ACTORS));
+    }
+
+    #[test]
     fn predicate_observation_records_known_values_and_absent_phantom() {
         let observed = std::collections::BTreeMap::from([
             ("doctor-a".to_owned(), Some(1)),
@@ -910,20 +1083,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_serialization_failures_are_retryable_for_final_state_reads() {
+        assert!(is_retryable_serialization_state("40001"));
+        assert!(!is_retryable_serialization_state("23505"));
+        assert!(!is_retryable_serialization_state("08006"));
+    }
+
     #[tokio::test]
     async fn actor_failure_releases_peers_waiting_at_a_workload_phase() {
         let barrier = tokio::sync::Barrier::new(2);
-        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(false);
+        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(None::<String>);
         let waiting_actor =
             tokio::spawn(async move { wait_for_phase(&barrier, &mut failure_rx).await });
 
-        failure_tx.send_replace(true);
+        failure_tx.send_replace(Some(
+            "PostgreSQL workload actor 2 failed: execute PostgreSQL register transaction: connection reset"
+                .to_owned(),
+        ));
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiting_actor)
             .await
             .expect("failed actor should release its peers from the barrier")
             .expect("waiting actor task should not panic");
 
-        assert!(result.is_err());
+        let error = result.expect_err("peer should receive the actor failure");
+        assert!(error.to_string().contains("actor 2"));
+        assert!(error.to_string().contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn actor_failure_cancels_peer_work_and_preserves_originating_error() {
+        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(None::<String>);
+        let peer = tokio::spawn(async move {
+            run_until_actor_failure(std::future::pending(), &mut failure_rx).await
+        });
+
+        failure_tx.send_replace(Some(
+            "PostgreSQL workload actor 2 failed: execute PostgreSQL register transaction: connection reset"
+                .to_owned(),
+        ));
+        let error = tokio::time::timeout(std::time::Duration::from_millis(100), peer)
+            .await
+            .expect("actor failure should cancel peer database work")
+            .expect("peer task should not panic")
+            .expect_err("peer should receive the originating actor failure");
+
+        assert!(error.to_string().contains("actor 2"));
+        assert!(error.to_string().contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn actor_failure_already_signaled_cancels_late_peer_work() {
+        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(None::<String>);
+        failure_tx.send_replace(Some("PostgreSQL workload actor 1 failed".to_owned()));
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            run_until_actor_failure(std::future::pending(), &mut failure_rx),
+        )
+        .await
+        .expect("late actors must observe an already signaled peer failure")
+        .expect_err("peer should receive the prior actor failure");
+
+        assert!(error.to_string().contains("actor 1"));
     }
 
     #[test]

@@ -479,6 +479,10 @@ jobs:
             exit 1
           fi
           echo "PostgreSQL Jepsen cluster formed: all three nodes report the expected Normal ring"
+      - name: Replicate PostgreSQL roles to all nodes
+        run: |
+          docker run --rm --network host cassandra:5.0 cqlsh 127.0.0.1 49042 \
+            -e "ALTER KEYSPACE system_auth WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};"
       - name: Create the test CQL role
         run: |
           docker pull cassandra:5.0

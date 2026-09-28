@@ -80,6 +80,9 @@ replicas inline before returning.
 transaction touches. The common case commits in one round trip (fast path); a
 conflict forces the Accept phase (slow path). Apply waits on conflicting
 dependencies before writing to storage at the agreed HLC timestamp.
+An explicit no-write Apply resolves an absent local dependency and cascades any
+parked dependent writes. A missing target with real mutation bytes still fails
+without an Apply acknowledgement.
 
 ```mermaid
 sequenceDiagram

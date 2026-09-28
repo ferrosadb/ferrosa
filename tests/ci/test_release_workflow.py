@@ -17,12 +17,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn("actions/download-artifact@", workflow)
         self.assertNotIn("gh run download", workflow)
         self.assertEqual(
-            2,
+            3,
             workflow.count(
                 'bash .github/scripts/download-run-artifacts.sh \\\n            "${GITHUB_RUN_ID}"'
             ),
         )
-        self.assertEqual(2, workflow.count("actions: read"))
+        self.assertEqual(3, workflow.count("actions: read"))
         docker_job = workflow.split("  docker-image:\n", 1)[1].split("\n  release:\n", 1)[0]
         release_job = workflow.split("  release:\n", 1)[1]
         self.assertIn(
@@ -65,6 +65,20 @@ class ReleaseWorkflowTest(unittest.TestCase):
         )
         self.assertNotIn("manifest inspect failed", workflow)
         self.assertNotIn("docker buildx imagetools inspect \"${first_tag}\" ||", workflow)
+
+    def test_release_publishes_production_and_profiling_oci_downloads(self):
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("  publish-oci-downloads:\n", workflow)
+        job = workflow.split("  publish-oci-downloads:\n", 1)[1].split("\n  release:\n", 1)[0]
+        self.assertIn("ferrosa-minimal", job)
+        self.assertIn("ferrosa-profiling", job)
+        self.assertIn("--profile profiling", job)
+        self.assertIn("ferrosa/full,ferrosa/profiling", job)
+        self.assertIn("images/${{ matrix.arch }}/${{ steps.identity.outputs.channel }}", job)
+        self.assertIn("scripts/publish-images.sh", job)
+        self.assertIn("R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}", job)
+        self.assertIn("R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}", job)
+        self.assertRegex(job, r"repository: ferrosadb/ferrosa-installer\n\s+ref: [0-9a-f]{40}")
 
 
 if __name__ == "__main__":

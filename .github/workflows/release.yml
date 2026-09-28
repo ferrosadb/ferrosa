@@ -365,6 +365,159 @@ jobs:
           first_tag=$(echo "${{ steps.tags.outputs.tags }}" | awk '{print $1}')
           docker buildx imagetools inspect "${first_tag}"
 
+  # ── Downloadable production and profiling OCI archives ───────────────
+  publish-oci-downloads:
+    name: Publish ${{ matrix.image }} OCI / ${{ matrix.arch }}
+    needs:
+      - build-linux-x86_64
+      - build-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+            runner: ubuntu-latest
+            image: ferrosa-minimal
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            image: ferrosa-minimal
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+            runner: ubuntu-latest
+            image: ferrosa-profiling
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            image: ferrosa-profiling
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download the release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/download-run-artifacts.sh \
+            "${GITHUB_RUN_ID}" \
+            "${GITHUB_REPOSITORY}" \
+            artifacts
+
+      - name: Stage production runtime binaries
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.arch }}"
+          case "${{ matrix.arch }}" in
+            amd64)
+              tarball=$(find artifacts -name 'ferrosa-*-x86_64-unknown-linux-musl.tar.gz' -print -quit)
+              test -n "$tarball" || { echo "ERROR: x86_64 release tarball not found" >&2; exit 1; }
+              tar -xzf "$tarball" -C "dist/${{ matrix.arch }}" ./ferrosa ./ferrosa-ctl
+              ;;
+            arm64)
+              arm_tarball=$(find artifacts -name 'ferrosa-*-aarch64-unknown-linux-musl.tar.gz' -print -quit)
+              test -n "$arm_tarball" || { echo "ERROR: arm64 release tarball not found" >&2; exit 1; }
+              tar -xzf "$arm_tarball" -C "dist/${{ matrix.arch }}" ./ferrosa ./ferrosa-ctl
+              ;;
+          esac
+          chmod 0755 "dist/${{ matrix.arch }}/ferrosa" "dist/${{ matrix.arch }}/ferrosa-ctl"
+
+      - name: Install profiling build prerequisites
+        if: matrix.image == 'ferrosa-profiling'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: matrix.image == 'ferrosa-profiling'
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build optimized Ferrosa with DWARF symbols
+        if: matrix.image == 'ferrosa-profiling'
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
+        run: |
+          set -euo pipefail
+          cargo build --locked --profile profiling \
+            --target "${{ matrix.target }}" \
+            -p ferrosa --bin ferrosa --features ferrosa/full,ferrosa/profiling
+          profiling_binary="target/${{ matrix.target }}/profiling/ferrosa"
+          test -x "$profiling_binary"
+          readelf --sections "$profiling_binary" | grep -q '\.debug_info'
+          _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_sample:0,prof_prefix:$RUNNER_TEMP/ferrosa-profile" \
+            "$profiling_binary" --version
+          find "$RUNNER_TEMP" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit | grep -q .
+          install -m 0755 "$profiling_binary" "dist/${{ matrix.arch }}/ferrosa"
+
+      - name: Build a single-architecture OCI archive
+        run: |
+          set -euo pipefail
+          docker buildx create --name ferrosa-oci --use 2>/dev/null || docker buildx use ferrosa-oci
+          docker buildx inspect --bootstrap
+          mkdir -p "$RUNNER_TEMP/stage/oci"
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            -f Dockerfile.release \
+            --output "type=oci,dest=$RUNNER_TEMP/stage/oci/oci.tar" \
+            .
+          tar -tf "$RUNNER_TEMP/stage/oci/oci.tar" | grep -qx 'index.json'
+
+      - name: Check out the pinned image publisher
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ferrosadb/ferrosa-installer
+          ref: 4f35fbe7c03ef8bcc07b1f2e37736f756046ce69
+          path: .image-publisher
+          token: ${{ secrets.FERROSA_COMPONENTS_TOKEN }}
+
+      - name: Install the image publisher's upload dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/r2-publisher"
+          "$RUNNER_TEMP/r2-publisher/bin/pip" install boto3==1.40.0
+
+      - name: Select immutable publication identity
+        id: identity
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::12}"
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == push || "${{ github.event.inputs.prerelease }}" == false ]]; then
+            channel=stable
+          else
+            channel=nightly
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Publish immutable OCI archive with manifest and checksum
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          FERROSA_IMAGE_UPLOAD: s3
+          FERROSA_IMAGE_PYTHON: ${{ runner.temp }}/r2-publisher/bin/python
+          FERROSA_R2_BUCKET: ${{ vars.FERROSA_R2_BUCKET || 'downloads' }}
+        run: |
+          set -euo pipefail
+          prefix="images/${{ matrix.arch }}/${{ steps.identity.outputs.channel }}/${{ matrix.image }}/linux/oci"
+          .image-publisher/scripts/publish-images.sh \
+            --kind linux --name "${{ steps.identity.outputs.version }}" \
+            --prefix "$prefix" --dir "$RUNNER_TEMP/stage/oci" \
+            --version "${{ steps.identity.outputs.version }}"
+          echo "OCI archive: https://downloads.ferrosa.ai/${prefix}/${{ steps.identity.outputs.version }}/oci.tar" >> "$GITHUB_STEP_SUMMARY"
+          echo "Ferrosa source revision: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+
   # ── macOS Intel (x86_64) ──────────────────────────────────────────────
   release:
     name: Create Release

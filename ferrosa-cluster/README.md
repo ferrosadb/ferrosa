@@ -292,7 +292,9 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   routes every real write
   through `apply.rs`'s `DepWaitApplier`, so a mutation persists only once all of
   its dependencies have applied locally (otherwise it parks and the cascade
-  applies it in order).
+  applies it in order). An explicit no-write Apply also resolves an absent local
+  dependency and cascades parked dependents; this handles merged dependencies
+  learned from another replica without falsely acknowledging real writes.
 - `recovery.rs` — Paxos-style recovery selecting by highest `accepted_ballot`.
 - `transaction_commit.rs` — `AccordTransactionCommitter`: the cluster-side
   implementation of `ferrosa_storage`'s `TransactionCommitter` seam (ADR-021). CQL/
