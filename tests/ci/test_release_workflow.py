@@ -1,12 +1,95 @@
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_release_workflow_contract_tests_run_in_ci(self):
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("python3 -m unittest -q tests/ci/test_release_workflow.py", workflow)
+
+    def test_manual_branch_release_uses_a_debian_compatible_version(self):
+        version_script = ROOT / ".github" / "scripts" / "release-version.sh"
+        version = subprocess.run(
+            ["bash", str(version_script), "branch", "main", "42"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual("0.0.0-main.42", version)
+
+        tagged_version = subprocess.run(
+            ["bash", str(version_script), "tag", "v0.13.2", "42"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual("0.13.2", tagged_version)
+
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        debian_job = workflow.split("      - name: Build Debian package\n", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn(
+            'VERSION="$(bash .github/scripts/release-version.sh '
+            '"$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"',
+            debian_job,
+        )
+
+    def test_manual_branch_release_uses_the_same_version_in_all_tarballs(self):
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(
+            3,
+            workflow.count(
+                'FERROSA_RELEASE_TAG="v${VERSION}" bash .github/scripts/stage-release-tarball.sh'
+            ),
+        )
+
+    def test_tarball_stager_accepts_normalized_version_and_legacy_ref_name(self):
+        stage_script = ROOT / ".github" / "scripts" / "stage-release-tarball.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in ("ferrosa", "ferrosa-ctl"):
+                binary = binaries / name
+                binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                binary.chmod(0o755)
+
+            env = os.environ.copy()
+            env["GITHUB_REF_NAME"] = "main"
+            env["FERROSA_RELEASE_TAG"] = "v0.0.0-main.42"
+            subprocess.run(
+                ["bash", str(stage_script), "x86_64-unknown-linux-musl", str(binaries)],
+                cwd=root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(
+                (root / "dist/ferrosa-v0.0.0-main.42-x86_64-unknown-linux-musl.tar.gz").is_file()
+            )
+
+            env.pop("FERROSA_RELEASE_TAG")
+            env["GITHUB_REF_NAME"] = "v0.0.0-smoke"
+            subprocess.run(
+                ["bash", str(stage_script), "x86_64-unknown-linux-musl", str(binaries)],
+                cwd=root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(
+                (root / "dist/ferrosa-v0.0.0-smoke-x86_64-unknown-linux-musl.tar.gz").is_file()
+            )
+
     def test_release_builds_do_not_run_cache_post_jobs(self):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertNotIn("Swatinem/rust-cache@", workflow)

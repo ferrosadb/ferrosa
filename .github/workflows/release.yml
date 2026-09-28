@@ -49,13 +49,14 @@ jobs:
 
       - name: Stage release tarball
         run: |
-          bash .github/scripts/stage-release-tarball.sh \
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
+          FERROSA_RELEASE_TAG="v${VERSION}" bash .github/scripts/stage-release-tarball.sh \
             x86_64-unknown-linux-musl \
             target/x86_64-unknown-linux-musl/release
 
       - name: Build Debian package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
           ARCH="amd64"
           PKG_DIR="dist/ferrosa_${VERSION}_${ARCH}"
           DEB_FILE="dist/ferrosa_${VERSION}_${ARCH}.deb"
@@ -183,7 +184,8 @@ jobs:
 
       - name: Stage release tarball
         run: |
-          bash .github/scripts/stage-release-tarball.sh \
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
+          FERROSA_RELEASE_TAG="v${VERSION}" bash .github/scripts/stage-release-tarball.sh \
             aarch64-unknown-linux-musl \
             target/aarch64-unknown-linux-musl/release
 
@@ -253,13 +255,14 @@ jobs:
 
       - name: Stage release tarball
         run: |
-          bash .github/scripts/stage-release-tarball.sh \
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
+          FERROSA_RELEASE_TAG="v${VERSION}" bash .github/scripts/stage-release-tarball.sh \
             aarch64-apple-darwin \
             target/aarch64-apple-darwin/release
 
       - name: Package Homebrew bottle (tar.gz)
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
           BOTTLE_DIR="dist/ferrosa/${VERSION}"
           mkdir -p "${BOTTLE_DIR}/bin"
           cp target/aarch64-apple-darwin/release/ferrosa "${BOTTLE_DIR}/bin/"
@@ -321,8 +324,8 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa"
-          REF="${GITHUB_REF_NAME}"          # e.g. v0.13.0 or v2026.06.19.0017
-          VERSION="${REF#v}"
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
+          REF="v${VERSION}"                 # e.g. v0.13.0 or v0.0.0-main.123
           PRERELEASE="${{ github.event.inputs.prerelease }}"
           TAGS=""
           if [ "${PRERELEASE}" = "false" ]; then
@@ -590,7 +593,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
 
           NOTES=$(cat <<'NOTES'
           ## What's Included

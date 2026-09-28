@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage and tar a release for one target triple.
 #
-# Produces:  dist/ferrosa-${GITHUB_REF_NAME}-<target>.tar.gz
+# Produces:  dist/ferrosa-${RELEASE_TAG}-<target>.tar.gz
 #
 # Top-level layout inside the tarball (no wrapper directory):
 #   ferrosa
@@ -34,13 +34,13 @@ fi
 TARGET="$1"
 BIN_DIR="$2"
 
-if [[ -z "${GITHUB_REF_NAME:-}" ]]; then
-  echo "ERROR: GITHUB_REF_NAME must be set (run from a tag push)" >&2
+RELEASE_TAG="${FERROSA_RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
+if [[ -z "$RELEASE_TAG" ]]; then
+  echo "ERROR: set FERROSA_RELEASE_TAG or GITHUB_REF_NAME" >&2
   exit 2
 fi
 
-REF_NAME="$GITHUB_REF_NAME"
-TARBALL="dist/ferrosa-${REF_NAME}-${TARGET}.tar.gz"
+TARBALL="dist/ferrosa-${RELEASE_TAG}-${TARGET}.tar.gz"
 
 if [[ ! -x "${BIN_DIR}/ferrosa" ]]; then
   echo "ERROR: missing ferrosa binary at ${BIN_DIR}/ferrosa" >&2
