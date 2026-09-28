@@ -449,9 +449,13 @@ fn valid_table(t: &str) -> bool {
 
 /// Render a CQL value as a literal for a generated INSERT. Strings are escaped
 /// (`'` -> `''`) and blobs hex-encoded, so interpolation is injection-safe.
-/// `None` for NULL/non-finite-float/unsupported -> the column is omitted.
-fn cql_literal(v: &CqlValue) -> Option<String> {
-    Some(match v {
+///
+/// Fail-loud (FL-T016 / FM-65): a value with no literal form (non-finite float,
+/// or a type this generator cannot render) is an `Err(reason)`, never a silent
+/// omission; the caller names the column. `Null` is handled by the caller
+/// (an absent cell) and is reported here as unsupported if it ever reaches us.
+fn cql_literal(v: &CqlValue) -> Result<String, String> {
+    Ok(match v {
         CqlValue::Int(n) => n.to_string(),
         CqlValue::Bigint(n) | CqlValue::Counter(n) | CqlValue::Timestamp(n) => n.to_string(),
         CqlValue::Smallint(n) => n.to_string(),
@@ -460,21 +464,70 @@ fn cql_literal(v: &CqlValue) -> Option<String> {
         CqlValue::Float(bits) => {
             let f = f32::from_bits(*bits);
             if !f.is_finite() {
-                return None;
+                return Err(format!("non-finite float {f} has no CQL literal"));
             }
             format!("{f}")
         }
         CqlValue::Double(bits) => {
             let f = f64::from_bits(*bits);
             if !f.is_finite() {
-                return None;
+                return Err(format!("non-finite double {f} has no CQL literal"));
             }
             format!("{f}")
         }
         CqlValue::Text(s) | CqlValue::Ascii(s) => format!("'{}'", s.replace('\'', "''")),
         CqlValue::Blob(b) => format!("0x{}", hex::encode(b)),
-        _ => return None,
+        CqlValue::Null
+        | CqlValue::Decimal { .. }
+        | CqlValue::Uuid(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Timeuuid(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Vector(_)
+        | CqlValue::Udt(_) => {
+            return Err(format!("unsupported value type {}", value_kind(v)));
+        }
     })
+}
+
+/// Stable, human-readable name of a value's CQL type for error messages.
+fn value_kind(v: &CqlValue) -> &'static str {
+    match v {
+        CqlValue::Null => "null",
+        CqlValue::Ascii(_) => "ascii",
+        CqlValue::Bigint(_) => "bigint",
+        CqlValue::Blob(_) => "blob",
+        CqlValue::Boolean(_) => "boolean",
+        CqlValue::Counter(_) => "counter",
+        CqlValue::Decimal { .. } => "decimal",
+        CqlValue::Double(_) => "double",
+        CqlValue::Float(_) => "float",
+        CqlValue::Int(_) => "int",
+        CqlValue::Timestamp(_) => "timestamp",
+        CqlValue::Uuid(_) => "uuid",
+        CqlValue::Text(_) => "text",
+        CqlValue::Varint(_) => "varint",
+        CqlValue::Timeuuid(_) => "timeuuid",
+        CqlValue::Inet(_) => "inet",
+        CqlValue::Date(_) => "date",
+        CqlValue::Time(_) => "time",
+        CqlValue::Smallint(_) => "smallint",
+        CqlValue::Tinyint(_) => "tinyint",
+        CqlValue::Duration { .. } => "duration",
+        CqlValue::List(_) => "list",
+        CqlValue::Set(_) => "set",
+        CqlValue::Map(_) => "map",
+        CqlValue::Tuple(_) => "tuple",
+        CqlValue::Vector(_) => "vector",
+        CqlValue::Udt(_) => "udt",
+    }
 }
 
 /// A `DoExchange` acknowledgement for one applied batch: an otherwise-empty
@@ -497,12 +550,18 @@ async fn write_batch(
 ) -> Result<i64, Status> {
     let (names, rows) = crate::convert::record_batch_to_rows(batch)
         .map_err(|e| Status::invalid_argument(format!("Arrow conversion failed: {e}")))?;
-    let mut written: i64 = 0;
+    // Render every INSERT before writing any: an unrenderable column fails the
+    // whole batch up front, so no row lands without it. O(batch) memory; the
+    // upload itself still streams batch by batch.
+    let mut statements = Vec::with_capacity(rows.len());
     for row in &rows {
-        let Some(sql) = build_insert(table, &names, row)? else {
-            continue;
-        };
-        let stmt = ferrosa_cql::parser::parse(&sql)
+        if let Some(sql) = build_insert(table, &names, row)? {
+            statements.push(sql);
+        }
+    }
+    let mut written: i64 = 0;
+    for sql in &statements {
+        let stmt = ferrosa_cql::parser::parse(sql)
             .map_err(|e| Status::internal(format!("generated CQL parse error: {e}")))?;
         let ks: Option<String> = None;
         let ctx = RequestContext {
@@ -523,8 +582,9 @@ async fn write_batch(
 }
 
 /// Build an `INSERT INTO <table> (...) VALUES (...)` for one row, including only
-/// the present, representable columns. `Ok(None)` if the row has nothing to
-/// write. Errors on an invalid column identifier (injection guard).
+/// the present (non-NULL) columns. `Ok(None)` if the row has nothing to write.
+/// Errors on an invalid column identifier (injection guard) and, fail-loud, on
+/// any present value with no CQL literal, naming the column.
 #[allow(clippy::result_large_err)] // tonic Status is the uniform RPC error type
 fn build_insert(
     table: &str,
@@ -534,15 +594,19 @@ fn build_insert(
     let mut cols = Vec::new();
     let mut vals = Vec::new();
     for (name, cell) in names.iter().zip(row) {
-        let Some(value) = cell else { continue };
-        let Some(lit) = cql_literal(value) else {
-            continue;
+        // NULL is an absent cell by design: nothing to write for it.
+        let value = match cell {
+            None | Some(CqlValue::Null) => continue,
+            Some(v) => v,
         };
         if !valid_ident(name) {
             return Err(Status::invalid_argument(format!(
                 "invalid column identifier {name:?}"
             )));
         }
+        let lit = cql_literal(value).map_err(|reason| {
+            Status::invalid_argument(format!("column {name:?} cannot be written: {reason}"))
+        })?;
         cols.push(name.as_str());
         vals.push(lit);
     }
@@ -932,3 +996,36 @@ const SUPPORTED_ACTIONS: &[(&str, &str)] = &[
         "Validate the presented bearer token and return its verified role.",
     ),
 ];
+
+#[cfg(test)]
+mod literal_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_type_is_an_error_naming_the_type() {
+        let err = cql_literal(&CqlValue::Date(7)).unwrap_err();
+        assert!(err.contains("date"), "got {err}");
+    }
+
+    #[test]
+    fn non_finite_float_is_an_error() {
+        let nan = CqlValue::Float(f32::NAN.to_bits());
+        assert!(cql_literal(&nan).is_err());
+    }
+
+    #[test]
+    fn build_insert_names_the_offending_column() {
+        let names = vec!["id".to_string(), "d".to_string()];
+        let row = vec![Some(CqlValue::Int(1)), Some(CqlValue::Date(7))];
+        let status = build_insert("ks.t", &names, &row).unwrap_err();
+        assert!(status.message().contains("\"d\""), "{}", status.message());
+    }
+
+    #[test]
+    fn build_insert_skips_null_cells_by_design() {
+        let names = vec!["id".to_string(), "n".to_string()];
+        let row = vec![Some(CqlValue::Int(1)), Some(CqlValue::Null)];
+        let sql = build_insert("ks.t", &names, &row).unwrap().unwrap();
+        assert_eq!(sql, "INSERT INTO ks.t (id) VALUES (1)");
+    }
+}

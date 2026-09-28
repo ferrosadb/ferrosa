@@ -15,11 +15,11 @@ filling stubs.
 
 - **Typed write path for `DoPut` / `DoExchange` (FMEA FL-1).** Replace
   per-row `INSERT` text interpolation (`build_insert` + `cql_literal`) with a
-  typed prepared-statement or direct-mutation path. Today NULL, non-finite
-  floats, and any non-scalar `CqlValue` are *silently omitted* from the
-  generated INSERT — a successful `DoPut` can drop a column. The write path must
-  carry NULLs and the full CQL type set, fail-loud on the genuinely
-  unrepresentable.
+  typed prepared-statement or direct-mutation path. Since FL-T016 a non-finite
+  float or non-scalar `CqlValue` fails the put loudly (naming the column)
+  instead of being silently omitted; NULL cells are skipped by design. The
+  typed path must still carry the full CQL type set so those values can be
+  written rather than rejected.
 - **Derive schema without executing the query (FMEA FL-4).** `GetSchema`,
   `GetFlightInfo`, and `ListFlights` currently run the user's `SELECT` (page
   size 1) just to learn its Arrow schema. Build the schema from the table's

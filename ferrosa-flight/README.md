@@ -42,7 +42,10 @@ every other RPC requires `authorization: Bearer <token>` and derives its
 - **`GetSchema`** — returns just the Arrow schema (IPC-encoded) for a command.
 - **`DoPut`** — decodes inbound Arrow batches and writes each row into the
   `ferrosa-table` (`keyspace.table` metadata header) as a generated CQL `INSERT`
-  routed through the normal write path; returns the rows-applied count.
+  routed through the normal write path; returns the rows-applied count. A value
+  with no CQL literal (non-finite float, unsupported type) fails the put with
+  `InvalidArgument` naming the column; each batch is rendered in full before any
+  of its rows is written, so no row lands without a column (FL-T016).
 - **`DoExchange`** — bidirectional **upsert with per-batch ack**: consumes the
   same inbound batches as `DoPut` and emits one `FlightData` ack (rows-applied
   count in `app_metadata`) per batch, strictly ordered. (This is an upsert
