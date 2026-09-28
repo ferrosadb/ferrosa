@@ -145,7 +145,8 @@ NULL/Kleene logic, sort NULL placement, aggregate edge cases, numeric
 normalization, join key resolution, binder fail-loud paths, and the spill
 module's orders, replay buffer and orphan sweep.
 
-`tests/spill_operators.rs` (10 tests) holds the per-operator spill invariant:
+`tests/spill_operators.rs` (11 tests, including a negative control that proves
+the budget assertions fail when the threshold is unreachable) holds the per-operator spill invariant:
 given an input larger than the threshold, the operator returns EVERY row, peak
 resident rows stay an order of magnitude below the rows processed, output order
 is unchanged, a dropped stream removes its temp directory, and a reservation
