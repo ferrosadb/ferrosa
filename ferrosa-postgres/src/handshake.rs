@@ -195,7 +195,7 @@ impl<'a, S: VerifierStore> Handshake<'a, S> {
     }
 }
 
-/// Parse a SASLInitialResponse body: `mechanism\0` + i32(len) + client-first[len].
+/// Parse a SASLInitialResponse body: `mechanism\0` + `i32(len)` + `client-first[len]`.
 fn parse_sasl_initial(data: &[u8]) -> Result<(String, String), HandshakeError> {
     let malformed = |why: &'static str| HandshakeError::Scram(scram::ScramError::Malformed(why));
     let nul = data

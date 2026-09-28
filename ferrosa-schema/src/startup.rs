@@ -97,7 +97,7 @@ impl std::fmt::Display for ProductionViolation {
             } => write!(
                 f,
                 "the {listener} listener does not require TLS; set {config_key} = true \
-                 with its tls_cert and tls_key, or disable the listener"
+                 with its tls_cert and tls_key"
             ),
             Self::ListenerWithoutTlsSupport {
                 listener,
