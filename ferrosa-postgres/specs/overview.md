@@ -109,6 +109,10 @@ form and (for most) the binary form, with OIDs/sizes advertised in
 `Inet→inet(869)`, `Numeric→numeric(1700)`. Binary `numeric` and unsupported
 composites are rejected explicitly: the server does not send text bytes under a
 binary numeric OID or turn stored collection/duration values into SQL NULL.
+Bound parameters decode through `decode_param_checked` and fail loud: `22P02`
+(text value does not parse), `22P03` (malformed binary), `42704` (non-zero OID
+with no mapping, e.g. json/jsonb/timestamptz), `0A000` (binary numeric). Only
+OID 0 (unspecified) is taken as UTF-8 text; nothing becomes NULL on error.
 The storage value bridge (`cql_to_value`) maps supported CQL scalars onto this
 model and reports a scan error for values without a representation.
 

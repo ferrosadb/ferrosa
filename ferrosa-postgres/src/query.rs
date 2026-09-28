@@ -252,16 +252,70 @@ fn hex_digit(nibble: u8) -> u8 {
     }
 }
 
-/// Decode one bound parameter value into a [`SqlValue`].
+/// A parameter-decode failure: the SQLSTATE the `ErrorResponse` carries and a
+/// message. It never echoes the parameter value (it may be a credential).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParamError {
+    pub sqlstate: &'static str,
+    pub message: String,
+}
+
+impl ParamError {
+    fn new(sqlstate: &'static str, message: String) -> Self {
+        Self { sqlstate, message }
+    }
+
+    /// Text-format value that does not parse as its declared type
+    /// (`invalid_text_representation`, `22P02`).
+    fn text(type_oid: i32, why: &str) -> Self {
+        Self::new(
+            "22P02",
+            format!("invalid input syntax for parameter type OID {type_oid}: {why}"),
+        )
+    }
+
+    /// Binary-format value that is malformed for its declared type
+    /// (`invalid_binary_representation`, `22P03`).
+    fn binary(type_oid: i32, why: &str) -> Self {
+        Self::new(
+            "22P03",
+            format!("invalid binary representation for parameter type OID {type_oid}: {why}"),
+        )
+    }
+}
+
+/// Parameter type OIDs the decoder maps. Anything else (except `0`,
+/// unspecified) is refused rather than decoded as text.
+const SUPPORTED_PARAM_OIDS: [i32; 16] = [
+    16, 17, 19, 20, 21, 23, 25, 700, 701, 869, 1043, 1082, 1083, 1114, 1700, 2950,
+];
+
+/// Decode one bound parameter into a [`SqlValue`], failing loud.
 ///
 /// `format` is the Bind format code (`0` = text, `1` = binary); `type_oid` is
-/// the parameter's declared Postgres type OID (`0` = unspecified ⇒ lenient
-/// text). `bytes` is `None` for SQL NULL. For unknown OIDs we fall back to a
-/// best-effort textual decode (or NULL) rather than panic.
-pub fn decode_param(format: i16, type_oid: i32, bytes: Option<&[u8]>) -> SqlValue {
+/// the declared type OID (`0` = unspecified, treated as UTF-8 text). `bytes`
+/// is `None` for SQL NULL. A value that does not parse, a malformed binary
+/// value, and an OID with no mapping are all errors: none becomes NULL or text.
+pub(crate) fn decode_param_checked(
+    format: i16,
+    type_oid: i32,
+    bytes: Option<&[u8]>,
+) -> Result<SqlValue, ParamError> {
     let Some(raw) = bytes else {
-        return SqlValue::Null;
+        return Ok(SqlValue::Null);
     };
+    if !matches!(format, 0 | 1) {
+        return Err(ParamError::new(
+            "08P01",
+            format!("unsupported parameter format code {format}"),
+        ));
+    }
+    if type_oid != 0 && !SUPPORTED_PARAM_OIDS.contains(&type_oid) {
+        return Err(ParamError::new(
+            "42704",
+            format!("parameter type OID {type_oid} is not supported"),
+        ));
+    }
     if format == 1 {
         decode_param_binary(type_oid, raw)
     } else {
@@ -269,109 +323,53 @@ pub fn decode_param(format: i16, type_oid: i32, bytes: Option<&[u8]>) -> SqlValu
     }
 }
 
-/// Decode a wire parameter without converting malformed input into SQL NULL.
-/// `Bind` uses this checked entry point so a bad integer, timestamp, UUID, or
-/// malformed text value fails the statement instead of changing query meaning.
-pub(crate) fn decode_param_checked(
-    format: i16,
-    type_oid: i32,
-    bytes: Option<&[u8]>,
-) -> Result<SqlValue, (i16, String)> {
-    let Some(raw) = bytes else {
-        return Ok(SqlValue::Null);
-    };
-    if !matches!(format, 0 | 1) {
-        return Err((
-            format,
-            format!("unsupported parameter format code {format}"),
-        ));
-    }
-    if format == 1 && type_oid == 1700 {
-        return Err((
-            format,
-            "binary numeric parameters are not supported".to_string(),
-        ));
-    }
-    if format == 1 {
-        let expected_len = match type_oid {
-            21 => Some(2),
-            23 | 700 | 1082 => Some(4),
-            20 | 701 | 1083 | 1114 => Some(8),
-            16 => Some(1),
-            2950 => Some(16),
-            _ => None,
-        };
-        if expected_len.is_some_and(|len| raw.len() != len) {
-            return Err((
-                format,
-                format!("invalid binary representation for parameter type OID {type_oid}"),
-            ));
-        }
-    }
-
-    let value = decode_param(format, type_oid, Some(raw));
-    let malformed_uuid = type_oid == 2950
-        && (format == 0
-            && std::str::from_utf8(raw)
-                .ok()
-                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                .is_none());
-    if value == SqlValue::Null || malformed_uuid {
-        return Err((
-            format,
-            format!("invalid input syntax for parameter type OID {type_oid}"),
-        ));
-    }
-    Ok(value)
-}
-
 /// Text-format parameter decode: parse the UTF-8 string per the declared OID.
-fn decode_param_text(type_oid: i32, raw: &[u8]) -> SqlValue {
-    // A non-UTF-8 text parameter is a client protocol error; treat as NULL
-    // rather than panic (documented lenient fallback).
-    let Ok(s) = std::str::from_utf8(raw) else {
-        return SqlValue::Null;
-    };
+fn decode_param_text(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError> {
+    let s = std::str::from_utf8(raw)
+        .map_err(|_| ParamError::text(type_oid, "value is not valid UTF-8"))?;
+    let bad = |why: &str| ParamError::text(type_oid, why);
     match type_oid {
-        // int4 / int8 / int2: decimal integer.
-        23 | 20 | 21 => s
-            .parse::<i64>()
-            .map(SqlValue::Int)
-            .unwrap_or(SqlValue::Null),
-        // text / varchar / name.
-        25 | 1043 | 19 => SqlValue::Text(s.to_string()),
-        16 => decode_bool_text(s),
-        // float4 / float8.
+        // int4 / int8 / int2: decimal integer, range-checked per width.
+        23 | 20 | 21 => {
+            let n = s.trim().parse::<i64>().map_err(|_| bad("not an integer"))?;
+            let fits = match type_oid {
+                23 => i32::try_from(n).is_ok(),
+                21 => i16::try_from(n).is_ok(),
+                _ => true,
+            };
+            if fits {
+                Ok(SqlValue::Int(n))
+            } else {
+                Err(bad("integer out of range"))
+            }
+        }
+        // text / varchar / name; OID 0 (unspecified) is text too.
+        0 | 25 | 1043 | 19 => Ok(SqlValue::Text(s.to_string())),
+        16 => decode_bool_text(s).ok_or_else(|| bad("not a boolean")),
         700 | 701 => s
+            .trim()
             .parse::<f64>()
             .map(SqlValue::float)
-            .unwrap_or(SqlValue::Null),
-        // uuid: parse the canonical hyphenated form. A malformed value falls
-        // back to best-effort Text rather than panicking (documented lenient
-        // fallback, consistent with the unknown-OID arm).
+            .map_err(|_| bad("not a floating-point number")),
         2950 => uuid::Uuid::parse_str(s)
             .map(SqlValue::Uuid)
-            .unwrap_or_else(|_| SqlValue::Text(s.to_string())),
-        // bytea: a `\x<hex>` string decodes to raw bytes; a malformed hex body
-        // falls back to NULL (documented lenient fallback, no panic).
-        17 => decode_bytea_hex_text(s).unwrap_or(SqlValue::Null),
-        // timestamp (1114): `YYYY-MM-DD HH:MM:SS[.ffffff]`. A malformed value
-        // falls back to NULL (documented lenient fallback, no panic).
-        1114 => parse_timestamp_text(s).unwrap_or(SqlValue::Null),
-        // date (1082): `YYYY-MM-DD`.
-        1082 => parse_date_text(s).unwrap_or(SqlValue::Null),
-        // time (1083): `HH:MM:SS[.ffffff]`.
-        1083 => parse_time_text(s).unwrap_or(SqlValue::Null),
-        // inet (869): a canonical IP string parses to an `IpAddr`.
+            .map_err(|_| bad("not a uuid")),
+        // bytea: a `\x<hex>` string decodes to raw bytes.
+        17 => decode_bytea_hex_text(s).ok_or_else(|| bad("not a hex-format bytea")),
+        1114 => parse_timestamp_text(s).ok_or_else(|| bad("not a timestamp")),
+        1082 => parse_date_text(s).ok_or_else(|| bad("not a date")),
+        1083 => parse_time_text(s).ok_or_else(|| bad("not a time")),
         869 => s
             .parse::<std::net::IpAddr>()
             .map(SqlValue::Inet)
-            .unwrap_or(SqlValue::Null),
-        // numeric (1700): a plain decimal string. Numeric params are TEXT-only
-        // (binary numeric is out of scope — see `encode_value`/`decode_param_binary`).
-        1700 => parse_numeric_text(s).unwrap_or(SqlValue::Null),
-        // OID 0 (unspecified) or any unknown OID: lenient — keep as text.
-        _ => SqlValue::Text(s.to_string()),
+            .map_err(|_| bad("not an inet address")),
+        // Numeric params are TEXT-only (see `decode_param_binary`).
+        1700 => parse_numeric_text(s).ok_or_else(|| bad("not a numeric")),
+        // Unreachable behind the `SUPPORTED_PARAM_OIDS` gate; refuse anyway.
+        other => Err(ParamError::new(
+            "42704",
+            format!("parameter type OID {other} is not supported"),
+        )),
     }
 }
 
@@ -409,11 +407,28 @@ fn parse_time_text(s: &str) -> Option<SqlValue> {
     Some(SqlValue::Time(micros))
 }
 
-/// Parse a plain Postgres `numeric` text body (`[-]ddd[.ddd]`, no exponent) into
-/// a normalized [`SqlValue::Numeric`]. Returns `None` for malformed input.
+/// Largest decimal exponent accepted in numeric text (`1e5`); a larger one
+/// would materialise an absurd digit string when rendered.
+const MAX_NUMERIC_EXPONENT: i32 = 10_000;
+
+/// Parse a Postgres `numeric` text body (`[-]ddd[.ddd][e[+-]dd]`) into a
+/// [`SqlValue::Numeric`]. Returns `None` for malformed input or an exponent
+/// beyond [`MAX_NUMERIC_EXPONENT`].
 fn parse_numeric_text(s: &str) -> Option<SqlValue> {
-    use num_bigint::BigInt;
     let s = s.trim();
+    let Some((mantissa, exp)) = s.split_once(['e', 'E']) else {
+        return parse_numeric_mantissa(s, 0);
+    };
+    let exp = exp.parse::<i32>().ok()?;
+    if exp.abs() > MAX_NUMERIC_EXPONENT {
+        return None;
+    }
+    parse_numeric_mantissa(mantissa, exp)
+}
+
+/// Parse `[-]ddd[.ddd]` and apply a decimal exponent (`value * 10^exp`).
+fn parse_numeric_mantissa(s: &str, exp: i32) -> Option<SqlValue> {
+    use num_bigint::BigInt;
     if s.is_empty() {
         return None;
     }
@@ -439,7 +454,7 @@ fn parse_numeric_text(s: &str) -> Option<SqlValue> {
     }
     let magnitude = digits.parse::<BigInt>().ok()?;
     let unscaled = if sign < 0 { -magnitude } else { magnitude };
-    let scale = i32::try_from(frac_part.len()).ok()?;
+    let scale = i32::try_from(frac_part.len()).ok()?.checked_sub(exp)?;
     Some(SqlValue::numeric(unscaled, scale))
 }
 
@@ -473,75 +488,74 @@ fn hex_value(c: u8) -> Option<u8> {
     }
 }
 
-/// Postgres bool text spellings the driver may send.
-fn decode_bool_text(s: &str) -> SqlValue {
+/// Postgres bool text spellings the driver may send; `None` if unrecognised.
+fn decode_bool_text(s: &str) -> Option<SqlValue> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "t" | "true" | "1" | "y" | "yes" | "on" => SqlValue::Bool(true),
-        "f" | "false" | "0" | "n" | "no" | "off" => SqlValue::Bool(false),
-        _ => SqlValue::Null,
+        "t" | "true" | "1" | "y" | "yes" | "on" => Some(SqlValue::Bool(true)),
+        "f" | "false" | "0" | "n" | "no" | "off" => Some(SqlValue::Bool(false)),
+        _ => None,
     }
 }
 
-/// Binary-format parameter decode: big-endian per the declared OID.
-fn decode_param_binary(type_oid: i32, raw: &[u8]) -> SqlValue {
+/// Binary-format parameter decode: big-endian per the declared OID. Every
+/// wrong length or out-of-range value is a `22P03`, never NULL.
+fn decode_param_binary(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError> {
+    let bad = |why: &str| ParamError::binary(type_oid, why);
+    let int = |width: usize| be_int(raw, width).ok_or_else(|| bad("wrong length"));
     match type_oid {
-        // int4 (BE i32).
-        23 => be_int(raw, 4).map_or(SqlValue::Null, SqlValue::Int),
-        // int8 (BE i64).
-        20 => be_int(raw, 8).map_or(SqlValue::Null, SqlValue::Int),
-        // int2 (BE i16).
-        21 => be_int(raw, 2).map_or(SqlValue::Null, SqlValue::Int),
-        // text / varchar.
-        25 | 1043 => std::str::from_utf8(raw)
+        23 => int(4).map(SqlValue::Int),
+        20 => int(8).map(SqlValue::Int),
+        21 => int(2).map(SqlValue::Int),
+        // text / varchar / name; OID 0 (unspecified) is text too.
+        0 | 25 | 1043 | 19 => std::str::from_utf8(raw)
             .map(|s| SqlValue::Text(s.to_string()))
-            .unwrap_or(SqlValue::Null),
-        // bool: any non-zero byte is true.
-        16 => raw
-            .first()
-            .map_or(SqlValue::Null, |b| SqlValue::Bool(*b != 0)),
-        // float4 (BE f32 bits).
-        700 if raw.len() == 4 => {
-            SqlValue::float(f32::from_be_bytes(raw.try_into().unwrap()) as f64)
-        }
-        // float8 (BE f64 bits).
-        701 if raw.len() == 8 => SqlValue::float(f64::from_be_bytes(raw.try_into().unwrap())),
-        // uuid: 16 big-endian bytes. A wrong length falls back to NULL (no panic).
+            .map_err(|_| bad("value is not valid UTF-8")),
+        // bool: exactly one byte, any non-zero byte is true.
+        16 => match raw {
+            [b] => Ok(SqlValue::Bool(*b != 0)),
+            _ => Err(bad("wrong length")),
+        },
+        // float4 (BE f32 bits) / float8 (BE f64 bits).
+        700 => <[u8; 4]>::try_from(raw)
+            .map(|b| SqlValue::float(f64::from(f32::from_be_bytes(b))))
+            .map_err(|_| bad("wrong length")),
+        701 => <[u8; 8]>::try_from(raw)
+            .map(|b| SqlValue::float(f64::from_be_bytes(b)))
+            .map_err(|_| bad("wrong length")),
+        // uuid: 16 big-endian bytes.
         2950 => uuid::Uuid::from_slice(raw)
             .map(SqlValue::Uuid)
-            .unwrap_or(SqlValue::Null),
+            .map_err(|_| bad("wrong length")),
         // bytea: the raw bytes, copied verbatim.
-        17 => SqlValue::Bytea(raw.to_vec()),
+        17 => Ok(SqlValue::Bytea(raw.to_vec())),
         // timestamp (1114): BE i64 microseconds since the Postgres epoch
         // (2000-01-01). Shift to the Unix-epoch micros our `Value` carries.
-        1114 => be_int(raw, 8)
-            .and_then(|pg| pg.checked_add(PG_EPOCH_MICROS))
+        1114 => int(8)?
+            .checked_add(PG_EPOCH_MICROS)
             .map(SqlValue::Timestamp)
-            .unwrap_or(SqlValue::Null),
-        // date (1082): BE i32 days since the Postgres epoch (2000-01-01). Shift
-        // to days since the Unix epoch.
+            .ok_or_else(|| bad("timestamp out of range")),
+        // date (1082): BE i32 days since the Postgres epoch (2000-01-01).
         1082 => {
-            if raw.len() == 4 {
-                let pg_days = i32::from_be_bytes(raw.try_into().unwrap());
-                pg_days
-                    .checked_add(PG_EPOCH_DAYS)
-                    .map(SqlValue::Date)
-                    .unwrap_or(SqlValue::Null)
-            } else {
-                SqlValue::Null
-            }
+            let pg_days = i32::try_from(int(4)?).map_err(|_| bad("wrong length"))?;
+            pg_days
+                .checked_add(PG_EPOCH_DAYS)
+                .map(SqlValue::Date)
+                .ok_or_else(|| bad("date out of range"))
         }
-        // time (1083): BE i64 microseconds since midnight (same origin as our repr).
-        1083 => be_int(raw, 8).map(SqlValue::Time).unwrap_or(SqlValue::Null),
+        // time (1083): BE i64 microseconds since midnight.
+        1083 => int(8).map(SqlValue::Time),
         // inet (869): the Postgres inet binary (family, bits, is_cidr, len, addr).
-        869 => decode_inet_binary(raw).unwrap_or(SqlValue::Null),
-        // Unknown OID: best-effort text, else NULL (documented fallback — no panic).
-        // NOTE: binary `numeric` (1700) is intentionally NOT decoded here — it
-        // falls through to this best-effort arm. Binary numeric is out of scope
-        // (numeric params are text-only); the differential oracle uses
-        // simple_query (text), so this path is never exercised for numeric.
-        _ => std::str::from_utf8(raw)
-            .map(|s| SqlValue::Text(s.to_string()))
-            .unwrap_or(SqlValue::Null),
+        869 => decode_inet_binary(raw).ok_or_else(|| bad("malformed inet")),
+        // Binary numeric params are out of scope (text-only).
+        1700 => Err(ParamError::new(
+            "0A000",
+            "binary numeric parameters are not supported".to_string(),
+        )),
+        // Unreachable behind the `SUPPORTED_PARAM_OIDS` gate; refuse anyway.
+        other => Err(ParamError::new(
+            "42704",
+            format!("parameter type OID {other} is not supported"),
+        )),
     }
 }
 
@@ -2153,6 +2167,105 @@ mod tests {
         super::encode_value(format, col_type, value).expect("test value should encode")
     }
 
+    /// Decode a parameter that the test expects to be valid.
+    fn decode_param(format: i16, type_oid: i32, bytes: Option<&[u8]>) -> SqlValue {
+        decode_param_checked(format, type_oid, bytes).expect("test parameter should decode")
+    }
+
+    fn param_err(format: i16, type_oid: i32, bytes: &[u8]) -> ParamError {
+        decode_param_checked(format, type_oid, Some(bytes))
+            .expect_err("test parameter should be refused")
+    }
+
+    #[test]
+    fn pg_param_unknown_oid_is_refused() {
+        // jsonb, json, timestamptz, bpchar, an int4 array and a made-up OID
+        // have no mapping: refused in both formats, never decoded as text.
+        for oid in [3802, 114, 1184, 1042, 1007, 999_999] {
+            for format in [0, 1] {
+                let err = param_err(format, oid, b"{\"a\":1}");
+                assert_eq!(err.sqlstate, "42704", "oid {oid} format {format}");
+            }
+        }
+        // OID 0 (unspecified) stays UTF-8 text; NULL is NULL for any OID.
+        assert_eq!(
+            decode_param(0, 0, Some(b"raw")),
+            SqlValue::Text("raw".into())
+        );
+        assert_eq!(decode_param(0, 3802, None), SqlValue::Null);
+    }
+
+    #[test]
+    fn text_param_parse_failures_are_22p02_for_every_mapped_oid() {
+        let cases: [(i32, &[u8]); 16] = [
+            (23, b"not-an-integer"),
+            (23, b"2147483648"),
+            (21, b"40000"),
+            (20, b"9223372036854775808"),
+            (16, b"maybe"),
+            (701, b"1.2.3"),
+            (700, b""),
+            (2950, b"not-a-uuid"),
+            (17, b"\\xzz"),
+            (17, b"deadbeef"),
+            (1114, b"yesterday"),
+            (1082, b"2024-13-40"),
+            (1083, b"25:61:61"),
+            (869, b"999.1.1.1"),
+            (1700, b"12abc"),
+            (25, &[0xff, 0xfe]),
+        ];
+        for (oid, raw) in cases {
+            let err = param_err(0, oid, raw);
+            assert_eq!(err.sqlstate, "22P02", "oid {oid} raw {raw:?}");
+        }
+    }
+
+    #[test]
+    fn bin_param_malformations_are_22p03_for_every_mapped_oid() {
+        let cases: [(i32, &[u8]); 12] = [
+            (23, &[1]),
+            (20, &[0; 4]),
+            (21, &[0; 4]),
+            (16, &[]),
+            (16, &[0, 0]),
+            (700, &[0; 8]),
+            (701, &[0; 4]),
+            (2950, &[0; 15]),
+            (1114, &[0; 4]),
+            (1082, &[0; 8]),
+            (869, &[2, 32]),
+            (25, &[0xff, 0xfe]),
+        ];
+        for (oid, raw) in cases {
+            let err = param_err(1, oid, raw);
+            assert_eq!(err.sqlstate, "22P03", "oid {oid} raw {raw:?}");
+        }
+        // Binary numeric is unsupported, and says so.
+        assert_eq!(param_err(1, 1700, &[0; 8]).sqlstate, "0A000");
+    }
+
+    #[test]
+    fn numeric_text_param_accepts_exponents_and_refuses_absurd_ones() {
+        use num_bigint::BigInt;
+        assert_eq!(
+            decode_param(0, 1700, Some(b"1e5")),
+            SqlValue::numeric(BigInt::from(1), -5)
+        );
+        assert_eq!(
+            decode_param(0, 1700, Some(b"1.25E-2")),
+            SqlValue::numeric(BigInt::from(125), 4)
+        );
+        assert_eq!(param_err(0, 1700, b"1e999999").sqlstate, "22P02");
+        assert_eq!(param_err(0, 1700, b"e5").sqlstate, "22P02");
+    }
+
+    #[test]
+    fn param_errors_do_not_echo_the_value() {
+        let err = param_err(0, 23, b"s3cr3t-token");
+        assert!(!err.message.contains("s3cr3t"), "{}", err.message);
+    }
+
     #[test]
     fn column_type_oids_match_postgres_builtins() {
         assert_eq!(column_type_oid(ColumnType::Int), 23);
@@ -2368,11 +2481,8 @@ mod tests {
         let s = "550e8400-e29b-41d4-a716-446655440000";
         let u = uuid::Uuid::parse_str(s).unwrap();
         assert_eq!(decode_param(0, 2950, Some(s.as_bytes())), SqlValue::Uuid(u));
-        // A malformed uuid text falls back to best-effort Text (no panic).
-        assert_eq!(
-            decode_param(0, 2950, Some(b"not-a-uuid")),
-            SqlValue::Text("not-a-uuid".into())
-        );
+        // A malformed uuid text is refused, not kept as Text.
+        assert_eq!(param_err(0, 2950, b"not-a-uuid").sqlstate, "22P02");
     }
 
     #[test]
@@ -2581,9 +2691,9 @@ mod tests {
             decode_param(0, 1700, Some(b".5")),
             SqlValue::numeric(BigInt::from(5), 1)
         );
-        // Malformed values ⇒ NULL (lenient, no panic).
-        assert_eq!(decode_param(0, 1114, Some(b"not-a-time")), SqlValue::Null);
-        assert_eq!(decode_param(0, 1700, Some(b"1.2.3")), SqlValue::Null);
+        // Malformed values are 22P02, never NULL.
+        assert_eq!(param_err(0, 1114, b"not-a-time").sqlstate, "22P02");
+        assert_eq!(param_err(0, 1700, b"1.2.3").sqlstate, "22P02");
     }
 
     // ── Binary round-trips for timestamp/date/time/inet ───────────────────

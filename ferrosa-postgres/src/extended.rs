@@ -348,10 +348,9 @@ impl Session {
             .collect();
         let params = match params {
             Ok(params) => params,
-            Err((format, message)) => {
+            Err(err) => {
                 self.error_pending = true;
-                let code = if format == 1 { "22P03" } else { "22P02" };
-                return error_response(code, &message);
+                return error_response(err.sqlstate, &err.message);
             }
         };
 
@@ -527,6 +526,43 @@ mod tests {
             s.portal("p").is_none(),
             "invalid values must not create a portal"
         );
+    }
+
+    /// Bind one parameter and return the ErrorResponse SQLSTATE, asserting the
+    /// portal was not created and the session is in the error state.
+    fn bind_error_code(oid: i32, format: i16, value: &[u8]) -> String {
+        let mut s = Session::new();
+        s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![oid]);
+        let response = s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[format],
+            &[Some(value.to_vec())],
+            vec![],
+        );
+        assert!(s.is_error_pending(), "oid {oid} format {format}");
+        assert!(s.portal("p").is_none(), "oid {oid} format {format}");
+        match response {
+            BackendMessage::ErrorResponse { fields } => fields[1].1.clone(),
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_param_parse_failure_is_22p02_not_null() {
+        // Text format: int, uuid, timestamp (and the rest) are 22P02.
+        assert_eq!(bind_error_code(23, 0, b"12x"), "22P02");
+        assert_eq!(bind_error_code(2950, 0, b"not-a-uuid"), "22P02");
+        assert_eq!(bind_error_code(1114, 0, b"2024-99-99 25:00:00"), "22P02");
+        assert_eq!(bind_error_code(16, 0, b"maybe"), "22P02");
+        assert_eq!(bind_error_code(25, 0, &[0xff, 0xfe]), "22P02");
+        // Binary format: PG's invalid_binary_representation.
+        assert_eq!(bind_error_code(23, 1, &[1, 2]), "22P03");
+        assert_eq!(bind_error_code(2950, 1, &[0; 3]), "22P03");
+        assert_eq!(bind_error_code(1114, 1, &[0; 4]), "22P03");
+        // An unmapped OID is refused at Bind, in both formats.
+        assert_eq!(bind_error_code(3802, 0, b"{}"), "42704");
+        assert_eq!(bind_error_code(114, 1, b"{}"), "42704");
     }
 
     #[test]
