@@ -83,12 +83,13 @@ differential oracle exercise.
 `query::load_catalog` resolves every referenced table (FROM + optional JOIN) by
 opening each referenced table as a bounded-channel storage provider. The scan
 producer decodes storage partitions as the synchronous executor pulls rows;
-the scan channel capacity defaults to 64 and is configurable. The relational
-executor still materializes base rows and `QueryResult.rows`, while
-`render_result` collects the complete wire-message vector, so response memory
-still scales with result size. `offload::execute_offloaded` runs sync operators
-on a blocking thread → `RowDescription` + `DataRow`s + `CommandComplete
-"SELECT n"`. The caller appends one `ReadyForQuery`.
+the scan channel capacity defaults to 64 and is configurable. The executor
+(`ferrosa_sql::execute_streaming`) runs on a blocking thread and hands rows to
+the async side in bounded batches (`result_stream`); each batch is encoded and
+written to the socket before the next is taken, so response memory is O(batch).
+Extended `Execute` honours `max_rows` with `PortalSuspended`. → `RowDescription`
++ streamed `DataRow`s + `CommandComplete "SELECT n"`. The caller appends one
+`ReadyForQuery`.
 
 **Write path (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` driven by the target column's `CqlType` (`value_to_cql`, fail-loud on
@@ -142,8 +143,9 @@ query-materialization caveats are in the public
 4. **No `ferrosa-cql` dependency (D10).** Structural — enforced by the crate
    graph.
 5. **Async storage, sync engine.** The provider bridges the async storage scan
-   to the sync executor through a bounded channel and blocking iterator. The
-   executor still materializes scan/result rows; see the data-flow notes.
+   to the sync executor through a bounded channel and blocking iterator, and the
+   executor's rows return to the async side through another. Neither the scan
+   nor the result is ever gathered.
 
 ## Position in the dependency graph
 

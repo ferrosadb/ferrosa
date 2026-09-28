@@ -61,7 +61,7 @@ flowchart TD
   AGG --> SRT["sort (ORDER BY)"]
   PRJ --> SRT
   SRT --> LO["limit_offset"]
-  LO --> QR["QueryResult { columns, rows }"]
+  LO --> QR["RowSink: columns, then row by row"]
 ```
 
 Aggregate mode is entered iff `GROUP BY` is present, `HAVING` is present, or any

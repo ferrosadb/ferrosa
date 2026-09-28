@@ -13,11 +13,10 @@ toward the Postgres queries real clients send.
 
 ## Now (highest value)
 
-- **Stream `QueryResult` to the wire** (FMEA SQL-12). Every operator now spills,
-  so the one remaining unbounded buffer is `QueryResult.rows` — and it exists
-  because `ferrosa-postgres::render_result` builds all `DataRow` messages before
-  writing any. The fix is in the front end: write rows as they are produced, then
-  give `execute` a streaming return.
+- **(done) Stream the result to the wire** (FMEA SQL-12, `t_f348ba0b`).
+  `execute_streaming` + `RowSink` deliver rows as the pipeline yields them and
+  the Postgres front end forwards them with backpressure. Follow-up: retire the
+  collecting `execute`/`execute_with` once no test or tool needs a `Vec`.
 
 - **`IS NULL` / `IS NOT NULL`** (FMEA SQL-1). Add the `IS`/`NOT NULL` tokens and
   grammar plus an `IsNull` predicate path. Today NULL filtering is impossible in

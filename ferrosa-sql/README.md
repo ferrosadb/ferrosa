@@ -94,15 +94,17 @@ parse_statement ─▶ Statement (ast)
                                                  │ → simple project | hash_aggregate*
                                                  │ → dedup* → sort* → limit_offset
                                                  ▼
-                                              QueryResult { columns, rows }
+                                              RowSink::columns, then ::row per row
 ```
 
 `*` marks a blocking operator: it spills to disk past the context's byte
-threshold and streams its output. Everything upstream of `QueryResult` is
-bounded. The `rows` `Vec` itself is not — the Postgres front end's
-`render_result` builds every `DataRow` before writing any, so handing it a stream
-would relocate the buffer rather than remove it. Streaming the result to the wire
-is front-end work, tracked separately.
+threshold and streams its output. The pipeline is drained one row at a time into
+a `RowSink` (`execute_streaming`), so a caller that forwards rows holds O(batch),
+not O(result); the sink may block for backpressure and may stop the query early
+with `ControlFlow::Break`. An `Err` after rows were delivered means the delivered
+rows are an incomplete result and MUST be reported. `execute`/`execute_with`
+gather the rows into a `QueryResult` for tests and tools — they hold the whole
+result and are not for the wire (FMEA SQL-12, `t_f348ba0b`).
 
 ## Public API (key entry points)
 
@@ -110,7 +112,7 @@ is front-end work, tracked separately.
 |------|-------|
 | Parse | `parse`, `parse_statement`, `ParseError` |
 | AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `Expr`, `Operand`, `Term`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
-| Plan | `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
+| Plan | `execute_streaming`, `RowSink`, `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
 | Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `dedup`, `limit_offset`, `fallible`, `try_filter`, `try_project`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream`, `TryRowStream` |
 | Spill | `SpillCtx`, `SpillReserver`, `DirReserver`, `SpillStats`, `SpillError`, `default_temp_root`, `sweep_orphaned_temp_dirs` |
 | Catalog | `Catalog`, `MapCatalog`, `SharedTable`, `TableProvider`, `InMemoryTable` |

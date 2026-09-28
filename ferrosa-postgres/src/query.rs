@@ -44,6 +44,7 @@ use crate::messages::{BackendMessage, FieldDescription};
 use crate::mvcc::{
     MvccCommitError, MvccManager, MvccSnapshot, PgWrite, RowChange, DEFAULT_MAX_TXN_WRITES,
 };
+use crate::result_stream::{open_stream, ResultStream};
 use crate::storage_provider::{load_table_with_overlay, LoadError, ScanFailure, SCAN_BUFFER_ROWS};
 
 /// Build an `ErrorResponse` with the standard severity/code/message trio
@@ -795,6 +796,10 @@ pub async fn execute_query(
     execute_query_with_mvcc(engine, schema, sql, default_schema, None, None, txn).await
 }
 
+/// Collecting form of [`execute_query_streaming`]: every message, rows included,
+/// gathered into one `Vec`. For tests and tools that want the whole reply as a
+/// value; the server never calls it, because gathering a `SELECT`'s rows here is
+/// exactly the materialization the streaming path exists to avoid.
 pub(crate) async fn execute_query_with_mvcc(
     engine: &Arc<StorageEngine>,
     schema: &Schema,
@@ -804,52 +809,157 @@ pub(crate) async fn execute_query_with_mvcc(
     snapshot: Option<&MvccSnapshot>,
     txn: Option<&mut Vec<PgWrite>>,
 ) -> Vec<BackendMessage> {
-    // 1. Parse the top-level statement.
+    let mut messages: Vec<BackendMessage> = Vec::new();
+    let env = ReadEnv {
+        engine,
+        schema,
+        default_schema,
+        mvcc,
+        snapshot,
+    };
+    let tail = execute_query_streaming(env, sql, txn, &mut messages).await;
+    match tail {
+        Ok(tail) => messages.extend(tail),
+        Err(error) => messages.push(error_response(
+            "58000",
+            &format!("in-memory reply sink failed: {error}"),
+        )),
+    }
+    messages
+}
+
+/// Execute one simple-query SQL string. A `SELECT` streams its `RowDescription`
+/// and `DataRow`s to `out` as the executor yields them; the returned messages
+/// are what remains to send after that (the `CommandComplete`, or the
+/// `ErrorResponse` that ends a failed query). Everything else is bounded and is
+/// returned whole.
+///
+/// # Errors
+///
+/// An I/O error from `out`: the client went away mid-stream.
+pub(crate) async fn execute_query_streaming<O: ReplySink>(
+    env: ReadEnv<'_>,
+    sql: &str,
+    txn: Option<&mut Vec<PgWrite>>,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
     let stmt = match parse_statement(sql) {
         Ok(stmt) => stmt,
-        Err(e) => return vec![error_response("42601", &e.to_string())],
+        Err(e) => return Ok(vec![error_response("42601", &e.to_string())]),
     };
+    let Statement::Select(select) = stmt else {
+        return Ok(execute_statement(
+            env.engine,
+            env.schema,
+            stmt,
+            env.default_schema,
+            env.mvcc,
+            txn,
+        )
+        .await);
+    };
+    // Table query: load referenced tables (the R15 guard lives in
+    // `load_table` — a missing table is `NoSuchTable`, never an empty scan),
+    // then stream the executor's output. Simple query: all text, no params.
+    let pending = txn.as_deref().map(Vec::as_slice);
+    let mut stream = match open_select_stream(env, *select, pending, Vec::new()).await {
+        Ok(stream) => stream,
+        Err(error) => return Ok(vec![error]),
+    };
+    let fields = row_description_fields(stream.columns(), &[]);
+    out.send(vec![BackendMessage::RowDescription { fields }])
+        .await?;
+    Ok(stream.pump(None, &[], out).await?.into_messages())
+}
 
+/// What a read runs against: the storage engine and schema it resolves tables
+/// in, and the MVCC snapshot it sees.
+#[derive(Clone, Copy)]
+pub(crate) struct ReadEnv<'a> {
+    pub(crate) engine: &'a Arc<StorageEngine>,
+    pub(crate) schema: &'a Schema,
+    pub(crate) default_schema: &'a str,
+    pub(crate) mvcc: Option<&'a MvccManager>,
+    pub(crate) snapshot: Option<&'a MvccSnapshot>,
+}
+
+/// Load `select`'s tables and start its executor on a blocking thread, ready to
+/// be pumped. The single entry point for both simple and extended `SELECT`s.
+pub(crate) async fn open_select_stream(
+    env: ReadEnv<'_>,
+    select: ferrosa_sql::SelectStmt,
+    pending_writes: Option<&[PgWrite]>,
+    params: Vec<SqlValue>,
+) -> Result<ResultStream, BackendMessage> {
+    let (catalog, failure) = load_catalog_with_mvcc(
+        env.engine,
+        env.schema,
+        &select,
+        env.default_schema,
+        env.mvcc,
+        env.snapshot,
+        pending_writes,
+    )
+    .await?;
+    open_stream(
+        select,
+        catalog,
+        failure,
+        env.default_schema.to_string(),
+        params,
+    )
+    .await
+}
+
+/// Where a reply's messages go as they are produced. The server's sink writes
+/// them to the socket, so a streaming `SELECT` never accumulates its rows;
+/// `Vec<BackendMessage>` collects them for tests and tools.
+pub(crate) trait ReplySink {
+    /// Deliver `messages` in order. An error means the peer is gone.
+    async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()>;
+}
+
+impl ReplySink for Vec<BackendMessage> {
+    async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()> {
+        self.extend(messages);
+        Ok(())
+    }
+}
+
+/// Encode one result row as a `DataRow` under the portal's result formats.
+///
+/// # Errors
+///
+/// The message to report when a value has no encoding in the requested format.
+pub(crate) fn encode_data_row(
+    row: &Row,
+    col_types: &[ColumnType],
+    result_formats: &[i16],
+) -> Result<BackendMessage, String> {
+    let columns = row
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, v)| encode_value(result_format_for(result_formats, i), col_types[i], v))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BackendMessage::DataRow { columns })
+}
+
+/// Every statement that is not a table `SELECT`: bounded replies, returned whole.
+async fn execute_statement(
+    engine: &Arc<StorageEngine>,
+    schema: &Schema,
+    stmt: Statement,
+    default_schema: &str,
+    mvcc: Option<&MvccManager>,
+    txn: Option<&mut Vec<PgWrite>>,
+) -> Vec<BackendMessage> {
     match stmt {
-        // Table query: load referenced tables (the R15 guard lives in
-        // `load_table` — a missing table is `NoSuchTable`, never an empty
-        // scan), then execute over the materialized snapshots.
-        Statement::Select(select) => {
-            let (catalog, failure) = match load_catalog_with_mvcc(
-                engine,
-                schema,
-                &select,
-                default_schema,
-                mvcc,
-                snapshot,
-                txn.as_deref().map(Vec::as_slice),
-            )
-            .await
-            {
-                Ok(loaded) => loaded,
-                Err(err_msg) => return vec![err_msg],
-            };
-            // Offloaded: the relational executor is synchronous and CPU-bound
-            // (sort/hash-join), so running it inline would pin an async worker
-            // for the whole query — the PR #131 starvation shape. See `offload`.
-            let result = crate::offload::execute_offloaded(
-                *select,
-                catalog,
-                default_schema.to_string(),
-                Vec::new(),
-            )
-            .await;
-            // Before the result is trusted: a scan that hit a storage error
-            // closed its channel, so the executor finished "successfully" over
-            // a truncated row set.
-            if let Some(err_msg) = check_scan_failure(&failure) {
-                return vec![err_msg];
-            }
-            match result {
-                Ok(result) => render_result(result, &[]), // simple query: all text
-                Err(e) => vec![exec_error_response(&e)],
-            }
-        }
+        // Routed to `execute_query_streaming` before this point.
+        Statement::Select(_) => vec![error_response(
+            "XX000",
+            "internal error: a table SELECT reached the non-streaming path",
+        )],
         // No-`FROM` expression query: `SELECT 1`, `SELECT version()`, etc.
         Statement::SelectExprs(items) => match execute_scalar_select(&items, default_schema) {
             Ok(result) => render_result(result, &[]),

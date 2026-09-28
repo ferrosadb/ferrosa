@@ -136,9 +136,10 @@ values log an error and the process uses the complete defaults:
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
 | `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry and history-pruning interval |
 
-The scan buffer is a storage-side backpressure bound. The relational executor
-and PostgreSQL protocol renderer still materialize full query results. See the
-public [`PROFILE.md`](../PROFILE.md) for tuning guidance and caveats.
+The scan buffer is a storage-side backpressure bound. The result side is
+bounded too: rows reach the client in batches of `RESULT_BATCH_ROWS` (16) through
+a channel of `RESULT_CHANNEL_BATCHES` (2), with backpressure from the socket. See
+the public [`PROFILE.md`](../PROFILE.md) for tuning guidance and caveats.
 
 ## Data flow
 
@@ -146,29 +147,34 @@ public [`PROFILE.md`](../PROFILE.md) for tuning guidance and caveats.
 `load_catalog` opens each referenced table as a streamed storage provider. A
 snapshot's sparse MVCC row overlay replaces current versions and restores
 deleted historical rows as the scan passes. The provider uses a bounded channel
-and decodes one storage partition at a time, but the relational executor
-materializes base scan rows and `QueryResult.rows`; rendering then builds a
-second vector of all wire messages before sending. Thus query execution and
-protocol output are not end-to-end streaming and peak memory grows with result
-size. `offload::execute_offloaded` runs the sync operators **on a blocking
-thread** → `RowDescription` + `DataRow`s +
-`CommandComplete "SELECT n"`.
+and decodes one storage partition at a time. `ferrosa_sql::execute_streaming`
+runs **on a blocking thread** and pushes its output through a bounded channel of
+row batches (`result_stream`); the async side encodes each batch to `DataRow`s
+and writes it to the socket, so nothing gathers the result:
+`RowDescription` + `DataRow`s streamed + `CommandComplete "SELECT n"`.
 
-`ferrosa_sql::execute` is synchronous and CPU-bound (scan, filter, sort,
-hash-aggregate, hash-join). It must never be called inline from the async
+**Extended protocol.** `Execute` honours `max_rows`: the portal returns that many
+rows, answers `PortalSuspended`, and keeps its running query, so the next
+`Execute` continues from the next row (no gap, no duplicate). `Close`, a rebind
+of the portal name, `Sync` outside a transaction block, or a disconnect drops the
+query, which stops the executor. **Simple protocol** streams the same way.
+
+**Errors mid-stream.** A failure after rows were sent (an unencodable value, a
+spill error, a storage error during the scan) is reported as an `ErrorResponse`
+after the rows already written — as PostgreSQL does — never as a
+`CommandComplete` and never as a silently short result (FMEA PG-Tf348ba0b).
+
+`ferrosa_sql::execute_streaming` is synchronous and CPU-bound (scan, filter,
+sort, hash-aggregate, hash-join). It must never run inline on the async
 handlers: doing so pins an async worker for the whole query and starves
 connection keepalives — the failure mode PR #131 fixed on the CQL path. Both
-call sites (simple query in `query.rs`, extended query in `server.rs`) go
-through `offload::execute_offloaded`, and
-`offload::tests::executor_does_not_run_on_the_async_worker` fails if either
-regresses (forge t_d3b2dec1).
+call sites (simple and extended) start it through `result_stream::open_stream`,
+and `result_stream::tests::executor_does_not_run_on_the_async_worker` fails if
+that regresses (forge t_d3b2dec1).
 
-Known limitation: source-side scanning is bounded by one partition plus the
-channel, but the synchronous executor collects rows and the wire path collects
-encoded messages. A full-table query can therefore use memory proportional to
-its input/result size. End-to-end streaming requires changes to `ferrosa_sql`
-and the PostgreSQL message writer; streaming only the storage loader does not
-remove the materialization peak.
+Cost of suspension: a suspended portal parks one `spawn_blocking` thread in a
+channel send until it resumes or is closed. The runtimes cap blocking threads,
+so many concurrently suspended portals consume that budget.
 
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +

@@ -35,6 +35,7 @@ use crate::mvcc::{MvccSnapshot, PgWrite};
 use crate::query::{
     decode_param_checked, error_response, exec_error_response, row_description_fields,
 };
+use crate::result_stream::ResultStream;
 
 /// What a prepared statement parses to: a table query, a no-`FROM` expression
 /// query (`SELECT version()`, `SELECT 1`), or parameterized DML (`INSERT` /
@@ -92,6 +93,9 @@ pub struct Session {
     /// set through the PostgreSQL MVCC manager atomically; `ROLLBACK`/`end_txn` clears it
     /// so a discarded transaction never touches storage (FMEA PG-1).
     txn_writes: Vec<PgWrite>,
+    /// Running queries of suspended portals (`Execute` with `max_rows` stopped
+    /// short), keyed by portal name. Dropping an entry stops its executor.
+    streams: HashMap<String, ResultStream>,
 }
 
 /// The format code (0 text / 1 binary) for parameter `i` under the Bind fan-out
@@ -153,8 +157,32 @@ impl Session {
 
     /// Handle `Sync`: clear the error-skip flag. The caller then emits
     /// `ReadyForQuery`.
+    ///
+    /// Outside a transaction block the unit of work ends here, so suspended
+    /// portals are released with it (PostgreSQL destroys them at the implicit
+    /// commit). Inside a block they live until `Close`, a rebind of the same
+    /// name, or the end of the session.
     pub fn on_sync(&mut self) {
         self.error_pending = false;
+        if matches!(self.txn, TransactionStatus::Idle) {
+            self.streams.clear();
+        }
+    }
+
+    /// Take a suspended portal's running query, to continue it. The caller must
+    /// [`Session::park_stream`] it again if it suspends once more.
+    pub(crate) fn take_stream(&mut self, portal: &str) -> Option<ResultStream> {
+        self.streams.remove(portal)
+    }
+
+    /// Park a query whose portal was suspended, so the next `Execute` resumes it.
+    pub(crate) fn park_stream(&mut self, portal: String, stream: ResultStream) {
+        self.streams.insert(portal, stream);
+    }
+
+    /// How many portals currently hold a running, suspended query.
+    pub fn suspended_portals(&self) -> usize {
+        self.streams.len()
     }
 
     /// The protocol transaction status to report in `ReadyForQuery`.
@@ -354,6 +382,8 @@ impl Session {
             }
         };
 
+        // Rebinding a name replaces the portal, and with it any suspended query.
+        self.streams.remove(&portal);
         self.portals.insert(
             portal,
             Portal {
@@ -374,6 +404,8 @@ impl Session {
             }
             b'P' => {
                 self.portals.remove(name);
+                // Releases the running query of a suspended portal.
+                self.streams.remove(name);
             }
             _ => {}
         }
@@ -616,6 +648,72 @@ mod tests {
             BackendMessage::CloseComplete
         ));
         assert!(s.statement("st").is_none());
+    }
+
+    /// A running query for a portal, over a table far larger than the channel.
+    async fn running_query() -> crate::result_stream::ResultStream {
+        use ferrosa_sql::{Column, ColumnType, InMemoryTable, MapCatalog, RelSchema, Row};
+        let schema = RelSchema::new(vec![Column::new("id", ColumnType::Int)]);
+        let rows = (0..1_000)
+            .map(|i| Row::new(vec![SqlValue::Int(i)]))
+            .collect();
+        let catalog = MapCatalog::new().with_table(
+            "public",
+            "t",
+            std::sync::Arc::new(InMemoryTable::new(schema, rows)),
+        );
+        let Ok(Statement::Select(select)) = parse_statement("SELECT id FROM t") else {
+            panic!("fixture query must parse to a SELECT");
+        };
+        crate::result_stream::open_stream(
+            *select,
+            catalog,
+            crate::storage_provider::ScanFailure::default(),
+            "public".to_string(),
+            Vec::new(),
+        )
+        .await
+        .expect("query starts")
+    }
+
+    /// `Close` on a portal releases its suspended query.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_releases_a_suspended_portals_query() {
+        let mut s = Session::new();
+        s.park_stream("p".into(), running_query().await);
+        assert_eq!(s.suspended_portals(), 1);
+        s.on_close(b'P', "p");
+        assert_eq!(s.suspended_portals(), 0);
+        assert!(s.take_stream("p").is_none());
+    }
+
+    /// Rebinding a portal name replaces it, and its suspended query with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebind_releases_a_suspended_portals_query() {
+        let mut s = Session::new();
+        s.on_parse("st".into(), "SELECT id FROM users", vec![]);
+        s.on_bind("p".into(), "st".into(), &[], &[], vec![]);
+        s.park_stream("p".into(), running_query().await);
+        s.on_bind("p".into(), "st".into(), &[], &[], vec![]);
+        assert_eq!(s.suspended_portals(), 0);
+    }
+
+    /// Outside a transaction block `Sync` ends the unit of work and releases
+    /// suspended portals; inside one they survive until closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_releases_suspended_portals_only_outside_a_transaction() {
+        let mut s = Session::new();
+        s.park_stream("p".into(), running_query().await);
+        s.begin_txn(None, crate::mvcc::MvccManager::default().snapshot());
+        s.on_sync();
+        assert_eq!(s.suspended_portals(), 1, "a transaction keeps its portals");
+        s.end_txn();
+        s.on_sync();
+        assert_eq!(
+            s.suspended_portals(),
+            0,
+            "Sync outside a block releases them"
+        );
     }
 
     #[test]

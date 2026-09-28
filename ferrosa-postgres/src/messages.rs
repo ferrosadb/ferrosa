@@ -118,6 +118,9 @@ pub enum BackendMessage {
     NoData,
     /// `I` — EmptyQueryResponse: the query string was empty.
     EmptyQueryResponse,
+    /// `s` — PortalSuspended: an `Execute` stopped at its `max_rows` limit with
+    /// rows remaining; the next `Execute` on the portal resumes from there.
+    PortalSuspended,
 }
 
 impl BackendMessage {
@@ -141,6 +144,7 @@ impl BackendMessage {
             BackendMessage::ParameterDescription { .. } => b't',
             BackendMessage::NoData => b'n',
             BackendMessage::EmptyQueryResponse => b'I',
+            BackendMessage::PortalSuspended => b's',
         }
     }
 
@@ -212,7 +216,8 @@ impl BackendMessage {
             | BackendMessage::BindComplete
             | BackendMessage::CloseComplete
             | BackendMessage::NoData
-            | BackendMessage::EmptyQueryResponse => {}
+            | BackendMessage::EmptyQueryResponse
+            | BackendMessage::PortalSuspended => {}
             BackendMessage::ParameterDescription { type_oids } => {
                 body.put_i16(type_oids.len() as i16);
                 for oid in type_oids {

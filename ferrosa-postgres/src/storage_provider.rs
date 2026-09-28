@@ -22,7 +22,7 @@
 //!
 //! `blocking_recv` would panic on an async worker, and blocking one would be the
 //! deadlock this module used to avoid by materializing. It is legal here because
-//! the synchronous executor no longer runs on an async worker: the `offload`
+//! the synchronous executor no longer runs on an async worker: the `result_stream`
 //! module moved `ferrosa_sql::execute` onto `spawn_blocking` (t_d3b2dec1). That
 //! change is the prerequisite for this one — the sync consumer is now *allowed* to
 //! block, which is exactly what a bounded channel needs.
@@ -34,11 +34,10 @@
 //! channel only decides how far ahead the producer may run. A cap on rows
 //! *returned* would be a different thing entirely and is not what this is.
 //!
-//! This bounds the **source** side. The relational executor still collects its
-//! base row set (`ferrosa-sql`, `seq_scan(..).collect()`) and `QueryResult.rows`
-//! is a `Vec`, so an end-to-end `SELECT *` peak remains O(result) until that is
-//! streamed (t_50d99192). Those sites carry their own audit allowlist entries;
-//! nothing here hides them.
+//! This bounds the **source** side. The result side is bounded too: the
+//! executor's rows reach the client through `result_stream`, which delivers
+//! them in bounded batches with backpressure from the socket, so an end-to-end
+//! `SELECT *` holds O(batch) rows (t_f348ba0b).
 //!
 //! ### Re-scannable, because `scan()` is
 //!
@@ -453,7 +452,7 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
 /// The sync half of the hand-off: pulls rows the producer pushes.
 ///
 /// `blocking_recv` is legal here because the relational executor runs on a
-/// `spawn_blocking` thread (see the `offload` module). Dropping this iterator
+/// `spawn_blocking` thread (see the `result_stream` module). Dropping this iterator
 /// closes the channel, which is what tells the producer to stop.
 struct ScanIter {
     rx: mpsc::Receiver<Row>,

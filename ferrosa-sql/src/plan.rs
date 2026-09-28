@@ -7,6 +7,7 @@
 //! or empty results.
 
 use std::fmt;
+use std::ops::ControlFlow;
 
 use std::cmp::Ordering;
 
@@ -18,22 +19,56 @@ use crate::exec::{
     dedup, fallible, hash_aggregate, hash_join, limit_offset, seq_scan, sort, try_project, AggFunc,
     CmpOp, SortKey, TryRowStream,
 };
+use crate::provider::TableProvider;
 use crate::spill::{SpillCtx, SpillError};
 use crate::types::{Column, ColumnType, RelSchema, Row, Value};
 
-/// The result of executing a query: output column metadata + its rows.
+/// A fully collected query result: output column metadata + all of its rows.
 ///
-/// The row `Vec` is the one materialization left in this crate, and it is
-/// deliberate rather than overlooked. Every operator that feeds it now streams
-/// or spills (forge t_50d99192), so peak memory inside the engine is bounded by
-/// the spill threshold; but the Postgres front end's `render_result` builds all
-/// of its `DataRow` messages before writing any, so handing it a stream would
-/// move the buffer rather than remove it. Streaming the result to the wire is
-/// tracked separately — it belongs to the front end, not to the operators.
+/// This is the convenience shape for tests, tools and small internal queries.
+/// It is NOT what the wire front end uses: a collected result holds every row
+/// at once, which is the client-facing OOM this crate's streaming boundary
+/// exists to remove (forge t_f348ba0b, FMEA SQL-Tf348ba0b). A caller that
+/// forwards rows must use [`execute_streaming`] and a [`RowSink`] instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryResult {
     pub columns: Vec<Column>,
     pub rows: Vec<Row>,
+}
+
+/// The consumer end of [`execute_streaming`].
+///
+/// The executor calls [`RowSink::columns`] once, before any row, then
+/// [`RowSink::row`] once per output row in order. Returning
+/// [`ControlFlow::Break`] from either stops the pipeline at once: it is pulled
+/// lazily, so a consumer that has gone away (a closed portal, a dropped
+/// connection) does not pay for the rest of the result. Backpressure is the
+/// sink's own: `row` may block until its downstream has room, and the pipeline
+/// does not advance while it does.
+pub trait RowSink {
+    /// Receive the output column metadata. Break to abandon the query.
+    fn columns(&mut self, columns: &[Column]) -> ControlFlow<()>;
+    /// Receive one output row. Break to stop the query early.
+    fn row(&mut self, row: Row) -> ControlFlow<()>;
+}
+
+/// Sink behind [`execute`]: the one place rows are gathered into a `Vec`.
+#[derive(Default)]
+struct CollectSink {
+    columns: Vec<Column>,
+    rows: Vec<Row>,
+}
+
+impl RowSink for CollectSink {
+    fn columns(&mut self, columns: &[Column]) -> ControlFlow<()> {
+        self.columns = columns.to_vec();
+        ControlFlow::Continue(())
+    }
+
+    fn row(&mut self, row: Row) -> ControlFlow<()> {
+        self.rows.push(row);
+        ControlFlow::Continue(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +242,36 @@ pub fn execute_with(
     params: &[Value],
     ctx: &SpillCtx,
 ) -> Result<QueryResult, ExecError> {
+    let mut sink = CollectSink::default();
+    execute_streaming(stmt, catalog, default_schema, params, ctx, &mut sink)?;
+    Ok(QueryResult {
+        columns: sink.columns,
+        rows: sink.rows,
+    })
+}
+
+/// Execute `stmt`, delivering the output to `sink` row by row.
+///
+/// Nothing on this path gathers the result: the pipeline is drained one row at
+/// a time into the sink, so peak memory is whatever the operators hold (bounded
+/// by the spill threshold) plus whatever the sink chooses to buffer. Columns
+/// are delivered first, so a resolution error (`NoSuchTable`, `NotGrouped`, ...)
+/// is returned before any row and a sink never sees a half-described result.
+///
+/// # Errors
+///
+/// An [`ExecError`] returned after rows were delivered (a spill failure) means
+/// the delivered rows are an incomplete result. The caller MUST report it
+/// rather than treat the stream as finished. A sink that stops the query with
+/// [`ControlFlow::Break`] gets `Ok(())`; it knows why it stopped.
+pub fn execute_streaming(
+    stmt: &SelectStmt,
+    catalog: &dyn Catalog,
+    default_schema: &str,
+    params: &[Value],
+    ctx: &SpillCtx,
+    sink: &mut dyn RowSink,
+) -> Result<(), ExecError> {
     // Fail loud up front if a referenced `$N` has no bound value.
     if let Some(f) = &stmt.filter {
         validate_params(f, params)?;
@@ -214,57 +279,104 @@ pub fn execute_with(
     if let Some(h) = &stmt.having {
         validate_params(h, params)?;
     }
-
     let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
 
-    // Scan the FROM (and hash-join the JOIN, if any) into the base row stream.
-    // The binding scope / combined schema already came from `resolve_scope`.
-    //
-    // `hash_join` returns an owning stream, so the join provider's borrow ends
-    // at the call even though its rows keep flowing.
-    let from_provider = resolve_table(catalog, &stmt.from, default_schema)?;
-    let base_rows: TryRowStream<'_> = if let Some(join) = &stmt.join {
-        let join_provider = resolve_table(catalog, &join.table, default_schema)?;
-        let from_schema = from_provider.schema();
-        let join_schema = join_provider.schema();
-        let from_binding = stmt.from.binding_name();
-        let join_binding = join.table.binding_name();
-        let (left_key, right_key) = resolve_join_keys(
-            from_binding,
-            from_schema,
-            join_binding,
-            join_schema,
-            &join.left,
-            &join.right,
-        )?;
-        hash_join(
-            fallible(seq_scan(&*from_provider)),
-            fallible(seq_scan(&*join_provider)),
-            left_key,
-            right_key,
-            ctx,
-        )
-        .map_err(ExecError::Spill)?
-    } else {
-        fallible(seq_scan(&*from_provider))
+    // The providers must outlive the pipeline that scans them.
+    let from = resolve_table(catalog, &stmt.from, default_schema)?;
+    let join = match &stmt.join {
+        Some(j) => Some(resolve_table(catalog, &j.table, default_schema)?),
+        None => None,
     };
+    let sources = Sources {
+        from: &*from,
+        join: join.as_ref().map(|table| &**table as &dyn TableProvider),
+    };
+    let (columns, rows) = build_pipeline(stmt, &scope, &combined_schema, sources, params, ctx)?;
 
-    // WHERE: pre-resolve every comparison's column operand to a scope index
-    // (aggregates are illegal here), then keep rows that evaluate to Some(true)
-    // under Kleene logic. Streaming — a filter holds nothing.
-    let filtered: TryRowStream<'_> = if let Some(f) = &stmt.filter {
-        let idx_map = resolve_where_operands(f, &scope)?;
-        Box::new(base_rows.filter(move |r| match r {
-            // Never swallow a spill failure to make a predicate tidy.
-            Err(_) => true,
-            Ok(row) => {
-                let resolve = |op: &Operand| idx_map[&OperandKey::of(op)];
-                eval_kleene(f, row, params, &resolve) == Some(true)
-            }
-        }))
-    } else {
-        base_rows
+    if sink.columns(&columns).is_break() {
+        return Ok(());
+    }
+    for row in rows {
+        let row = row.map_err(ExecError::Spill)?;
+        if sink.row(row).is_break() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The scan sources of one query, borrowed for the life of its pipeline.
+#[derive(Clone, Copy)]
+struct Sources<'a> {
+    from: &'a dyn TableProvider,
+    join: Option<&'a dyn TableProvider>,
+}
+
+/// Scan the FROM (and hash-join the JOIN, if any) into the base row stream.
+fn base_stream<'a>(
+    stmt: &SelectStmt,
+    sources: Sources<'a>,
+    ctx: &SpillCtx,
+) -> Result<TryRowStream<'a>, ExecError> {
+    let (Some(join), Some(join_provider)) = (&stmt.join, sources.join) else {
+        return Ok(fallible(seq_scan(sources.from)));
     };
+    let (left_key, right_key) = resolve_join_keys(
+        stmt.from.binding_name(),
+        sources.from.schema(),
+        join.table.binding_name(),
+        join_provider.schema(),
+        &join.left,
+        &join.right,
+    )?;
+    // `hash_join` returns an owning stream, so its inputs' borrow ends at the
+    // call even though its rows keep flowing.
+    hash_join(
+        fallible(seq_scan(sources.from)),
+        fallible(seq_scan(join_provider)),
+        left_key,
+        right_key,
+        ctx,
+    )
+    .map_err(ExecError::Spill)
+}
+
+/// WHERE: pre-resolve every comparison's column operand to a scope index
+/// (aggregates are illegal here), then keep rows that evaluate to `Some(true)`
+/// under Kleene logic. Streaming — a filter holds nothing.
+fn filter_stream<'a>(
+    stmt: &'a SelectStmt,
+    scope: &[Bound],
+    base_rows: TryRowStream<'a>,
+    params: &'a [Value],
+) -> Result<TryRowStream<'a>, ExecError> {
+    let Some(f) = &stmt.filter else {
+        return Ok(base_rows);
+    };
+    let idx_map = resolve_where_operands(f, scope)?;
+    Ok(Box::new(base_rows.filter(move |r| match r {
+        // Never swallow a spill failure to make a predicate tidy.
+        Err(_) => true,
+        Ok(row) => {
+            let resolve = |op: &Operand| idx_map[&OperandKey::of(op)];
+            eval_kleene(f, row, params, &resolve) == Some(true)
+        }
+    })))
+}
+
+/// Build the whole operator pipeline for `stmt` and return its output columns
+/// with the lazy row stream. Nothing is pulled from the sources here except by
+/// blocking operators, which spill.
+fn build_pipeline<'a>(
+    stmt: &'a SelectStmt,
+    scope: &[Bound],
+    combined_schema: &RelSchema,
+    sources: Sources<'a>,
+    params: &'a [Value],
+    ctx: &SpillCtx,
+) -> Result<(Vec<Column>, TryRowStream<'a>), ExecError> {
+    let base_rows = base_stream(stmt, sources, ctx)?;
+    let filtered = filter_stream(stmt, scope, base_rows, params)?;
 
     // Aggregate mode iff GROUP BY is present, any select item is an aggregate,
     // or HAVING is present.
@@ -274,9 +386,9 @@ pub fn execute_with(
             if items.iter().any(|i| matches!(i, SelectItem::Aggregate { .. })));
 
     let (columns, rows) = if is_aggregate {
-        plan_aggregate(stmt, &scope, &combined_schema, filtered, params, ctx)?
+        plan_aggregate(stmt, scope, combined_schema, filtered, params, ctx)?
     } else {
-        plan_simple(stmt, &scope, &combined_schema, filtered, ctx)?
+        plan_simple(stmt, scope, combined_schema, filtered, ctx)?
     };
 
     // LIMIT / OFFSET apply lazily to the final output rows, so neither forces
@@ -284,19 +396,7 @@ pub fn execute_with(
     // could return — only on what the client asked for.
     let offset = stmt.offset.unwrap_or(0) as usize;
     let limit = stmt.limit.map(|n| n as usize);
-    let out = limit_offset(rows, offset, limit);
-
-    // Drain the operator pipeline into the buffered `QueryResult` contract.
-    // Every operator upstream of here is bounded; this last step is not, and is
-    // the known remaining gap (see [`QueryResult`]).
-    let mut buffered = Vec::new();
-    for row in out {
-        buffered.push(row.map_err(ExecError::Spill)?);
-    }
-    Ok(QueryResult {
-        columns,
-        rows: buffered,
-    })
+    Ok((columns, limit_offset(rows, offset, limit)))
 }
 
 /// Build the FROM/JOIN binding scope and the combined output schema for `stmt`,
