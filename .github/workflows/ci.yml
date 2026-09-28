@@ -58,6 +58,26 @@ jobs:
       - name: Guard tests
         run: bash tests/test_guard_no_memory_public.sh
 
+  # jsonb guards (T-025): serde_json features are unified workspace-wide, so one
+  # dependent enabling arbitrary_precision / preserve_order / unbounded_depth
+  # changes number and object semantics everywhere (hazards M8, M12). The value
+  # model crates must also stay arrow-free (D5a). T-100 appends ferrosa-jsonb to
+  # the guard-arrow-free.sh crate list.
+  json-guards:
+    name: jsonb guards (serde_json features, arrow-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Fetch crates (the guard tests resolve offline)
+        run: cargo fetch --locked
+      - name: serde_json feature guard
+        run: bash scripts/ci/guard-serde-json-features.sh
+      - name: Arrow-free guard
+        run: bash scripts/ci/guard-arrow-free.sh ferrosa-common
+      - name: Guard tests (seeded bad trees must fail)
+        run: bash tests/test_guard_ci_json.sh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
