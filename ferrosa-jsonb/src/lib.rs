@@ -10,9 +10,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod builder;
+pub mod encode;
 pub mod error;
 pub mod limits;
 pub mod number;
+
+pub use builder::{Encoded, JsonbBuilder};
+pub use encode::{BIGDECIMAL_PRIMITIVE_ID, ENVELOPE};
 
 pub use error::{JsonbError, LimitsError};
 pub use limits::{

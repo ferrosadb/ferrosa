@@ -134,7 +134,16 @@ impl Number {
         }
     }
 
-    fn to_bigint(&self) -> BigInt {
+    /// The unscaled integer when it fits `i128` (every kind except a wide `Big`).
+    pub(crate) fn unscaled_i128(&self) -> Option<i128> {
+        match &self.0 {
+            Repr::I64(v) => Some(i128::from(*v)),
+            Repr::I128 { unscaled, .. } => Some(*unscaled),
+            Repr::Big { .. } => None,
+        }
+    }
+
+    pub(crate) fn to_bigint(&self) -> BigInt {
         match &self.0 {
             Repr::I64(v) => BigInt::from(*v),
             Repr::I128 { unscaled, .. } => BigInt::from(*unscaled),

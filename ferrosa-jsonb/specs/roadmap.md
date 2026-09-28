@@ -8,16 +8,17 @@ last_updated: 2026-09-28
 
 ## Now
 
-- T-101 done: `Number`. Follow-ups for T-102: canonical Variant encoding of
-  `NumberKind`, and a clippy `disallowed-methods` entry restricting f64 parsing to
-  `number.rs` (not added in T-101).
+- T-102 done: canonical encoder, builder, bigdecimal primitive 63. Still open from
+  T-101: a clippy `disallowed-methods` entry restricting f64 parsing to `number.rs`.
+- Integration tests are separate crates, so they carry their own
+  `#![allow(clippy::expect_used, ...)]`; `clippy.toml` covers `cfg(test)` only.
 - Wire `Limits::from_config` into `ferrosa/src/main.rs`, passing the commit-log
   segment size (`DEFAULT_SEGMENT_SIZE`, 32 MiB on main), and map the TOML section
   into `LimitsConfig`. Not done in T-100: the binary has no jsonb dependency yet.
 
 ## Next
 
-- Value, canonical codec, validator, builder (K1), then text parse and export.
+- Validator and reader (T-103), text parse (T-104), print, export.
 
 ## Later
 

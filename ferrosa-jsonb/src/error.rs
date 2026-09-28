@@ -36,6 +36,9 @@ pub enum JsonbError {
     /// A duplicate object key under `DuplicateKeyPolicy::Error` (D6b).
     #[error("jsonb object has a duplicate key")]
     DuplicateKey,
+    /// The builder was driven out of order (T-102): `reason` names the misuse.
+    #[error("jsonb builder misuse: {reason}")]
+    BuilderMisuse { reason: &'static str },
 }
 
 /// A limits configuration was refused at startup (D14b, D14d, FM-108).

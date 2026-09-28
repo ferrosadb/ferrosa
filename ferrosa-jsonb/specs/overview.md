@@ -62,6 +62,30 @@ round-trip formatting; integral floats get scale 1; NaN and infinities are
 `NonFiniteNumber`. `to_f64_if_shortest_round_trips` returns `Some` only when the
 `f64` re-renders to the same value.
 
+## Canonical encoder and builder (T-102)
+
+`JsonbBuilder` (builder.rs) turns events into an arena of nodes (scalars are
+pre-encoded into one byte pool; containers hold child indices) with an explicit frame
+stack. `encode_tree` (encode.rs) then writes the cell in three iterative steps:
+(1) collect the sorted unique key dictionary, (2) compute every node's encoded size
+children-first (a child's arena index is always above its parent's, so a reverse scan
+needs no stack), (3) check the total against `Limits` and `HardCeilings`, allocate
+once, and write depth-first with an explicit stack. Object entries are sorted by key
+bytes when the object closes, so field ids ascend (C5).
+
+Cell: `0xF1`, metadata (`header 0x11 | (offset_size-1)<<5`, dictionary size, offsets,
+key bytes), value. Numbers: int8/16/32/64 at scale 0; decimal4/8/16 (scale byte then
+little-endian unscaled) by magnitude and scale; otherwise primitive 63.
+
+Size enforcement is incremental: every attached node adds its smallest possible
+encoding to a running lower bound checked against `max_encoded_bytes` and the hard
+ceiling, so an oversized document fails while being built. The bound counts a
+duplicate key's value until the object closes, then returns it; the exact size is
+checked again before the output is allocated.
+
+Byte equality implies value equality, not the reverse (`1.0` and `1` differ in bytes).
+Value equality arrives with the reader (T-103 on).
+
 ## Incremental enforcement
 
 `Limits::check_*` and `HardCeilings::check_*` are pure comparisons meant to be

@@ -29,7 +29,25 @@ ferrosa-common ferrosa-jsonb` enforces it). Runtime dependencies are `bytes`,
 - D14a digit caps run on the lexeme before any `BigInt` is built (JB-D2).
 - New errors: `InvalidNumber { offset }`, `NonFiniteNumber`.
 
-Not yet implemented: the value, codec, validator and builder (T-102 on).
+## Implemented (T-102)
+
+- `JsonbBuilder`: begin/end/key/scalar events, iterative (no recursion, depth
+  bounded by `Limits::max_depth`), size checked as values arrive. `finish()` returns
+  `Encoded { bytes, duplicate_keys_dropped }`: the canonical cell, `0xF1` envelope
+  then Variant v1 metadata then value (architecture 3.2, C1-C11 as amended by D2a).
+- Canonical form: sorted unique dictionary, minimal offset and field-id widths, the
+  smallest numeric kind at the stored scale (decimals keep their scale), no
+  Float/Double. `ferrosa.bigdecimal` is primitive id 63 (header `0xFC`, zigzag-varint
+  scale, unsigned-varint length, minimal two's-complement big-endian unscaled) and is
+  used only when `decimal16` cannot hold the value.
+- Duplicate keys: last wins, counted in `duplicate_keys_dropped`; under
+  `DuplicateKeyPolicy::Error` they are `JsonbError::DuplicateKey` (D6b).
+- New error: `JsonbError::BuilderMisuse { reason }` for out-of-order events.
+- Tests: hand-derived byte tests (`tests/hand_bytes.rs`), a golden corpus of 237
+  values (`tests/golden/canonical_v1/corpus.txt`, `tests/golden_v1.rs`) and the
+  primitive-table conformance test that pins id 63 as unassigned upstream.
+
+Not yet implemented: the validator and reader (T-103 on), text parse and print.
 
 ## Safety
 
