@@ -23,6 +23,10 @@ use ferrosa_storage::index::{
 /// Request sent to the worker pool from the HTTP handler.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct BuildRequest {
+    /// Engine-issued job id. Names the job's local scratch directory; the
+    /// builder never lets the caller pick a path. Validated by
+    /// [`BuildRequest::validate`].
+    pub job_id: String,
     pub sstable_id: String,
     pub index_name: String,
     pub index_type: String,
@@ -30,9 +34,12 @@ pub struct BuildRequest {
     pub artifact_kind: Option<String>,
     #[serde(default)]
     pub direct_upload: bool,
+    /// Informational only. The builder uses its own configured object store.
+    #[serde(default)]
     pub s3_endpoint: String,
+    /// Informational only. The builder uses its own configured object store.
+    #[serde(default)]
     pub s3_bucket: String,
-    pub s3_prefix: String,
     pub table: (String, String),
     pub column_position: usize,
     /// Clustering-key component metadata for indexes on CLUSTERING columns.
@@ -98,9 +105,52 @@ impl BuildResponse {
     }
 }
 
+/// Longest accepted identifier (`job_id`, `sstable_id`, `index_name`, keyspace, table).
+const MAX_COMPONENT_LEN: usize = 128;
+
+/// Refuse any identifier that could escape its directory or key prefix.
+///
+/// Accepts only `[A-Za-z0-9._-]`, 1..=128 bytes, with no `..` substring and not
+/// starting with `.`. This rules out path separators, dot segments, NUL, and
+/// anything else that could steer an S3 key or local path (JB-T3).
+pub fn validate_path_component(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > MAX_COMPONENT_LEN {
+        return Err(format!(
+            "invalid {field}: length must be 1..={MAX_COMPONENT_LEN}"
+        ));
+    }
+    if value.starts_with('.') || value.contains("..") {
+        return Err(format!("invalid {field}: dot segments are not allowed"));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(format!(
+            "invalid {field}: only [A-Za-z0-9._-] characters are allowed"
+        ));
+    }
+    Ok(())
+}
+
+/// Derive the S3 prefix of an SSTable from validated components and the
+/// builder's configured base prefix, using the engine's layout
+/// `{base}/{hex}/{keyspace.table}/{sstable_id}`. Never takes a caller prefix.
+pub fn derive_s3_prefix(base: &str, table: &(String, String), sstable_id: &str) -> String {
+    let hex = ferrosa_storage::upload::hex_prefix_for(sstable_id);
+    let base = base.trim_matches('/');
+    if base.is_empty() {
+        format!("{hex}/{}.{}/{sstable_id}", table.0, table.1)
+    } else {
+        format!("{base}/{hex}/{}.{}/{sstable_id}", table.0, table.1)
+    }
+}
+
 /// Bounded worker pool that processes index build jobs.
 pub struct WorkerPool {
     object_store: Arc<dyn ObjectStore>,
+    /// Configured base key prefix; the only prefix source (never the caller).
+    s3_base_prefix: String,
     temp_dir: PathBuf,
     max_temp_bytes: u64,
     temp_bytes_used: AtomicU64,
@@ -122,6 +172,7 @@ impl WorkerPool {
 
         Self {
             object_store,
+            s3_base_prefix: String::new(),
             temp_dir,
             max_temp_bytes,
             temp_bytes_used: AtomicU64::new(0),
@@ -129,6 +180,13 @@ impl WorkerPool {
             jobs_failed: AtomicUsize::new(0),
             semaphore: tokio::sync::Semaphore::new(max_workers),
         }
+    }
+
+    /// Set the configured base S3 key prefix (must match the engine's prefix).
+    #[must_use]
+    pub fn with_s3_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.s3_base_prefix = prefix.into();
+        self
     }
 
     /// Number of active workers.
@@ -150,6 +208,11 @@ impl WorkerPool {
     /// SSTable components, builds the index, uploads the sidecar, and
     /// cleans up.
     pub async fn execute(&self, req: BuildRequest) -> BuildResponse {
+        if let Err(e) = req.validate() {
+            self.jobs_failed.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(error = %e, "rejected build request with invalid identifiers");
+            return BuildResponse::failed(e, None);
+        }
         let _permit = match self.semaphore.acquire().await {
             Ok(p) => p,
             Err(_) => {
@@ -194,7 +257,9 @@ impl WorkerPool {
     /// Internal: download, build, upload, cleanup.
     async fn do_build(&self, req: &BuildRequest) -> Result<(String, u64), String> {
         // Create a per-job temp directory.
-        let job_dir = self.temp_dir.join(&req.sstable_id);
+        // Every path is derived from validated identifiers and configuration.
+        let s3_prefix = derive_s3_prefix(&self.s3_base_prefix, &req.table, &req.sstable_id);
+        let job_dir = self.temp_dir.join(&req.job_id);
         tokio::fs::create_dir_all(&job_dir)
             .await
             .map_err(|e| format!("create temp dir: {e}"))?;
@@ -211,7 +276,7 @@ impl WorkerPool {
 
         let mut downloaded_bytes: u64 = 0;
         for component in &components {
-            let s3_path = ObjectPath::from(format!("{}/{component}", req.s3_prefix));
+            let s3_path = ObjectPath::from(format!("{s3_prefix}/{component}"));
             let local_path = job_dir.join(format!("{}-{component}", req.sstable_id));
 
             match self.object_store.get(&s3_path).await {
@@ -228,8 +293,8 @@ impl WorkerPool {
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
                     if current + data.len() as u64 > self.max_temp_bytes {
                         self.temp_bytes_used
-                            .fetch_sub(data.len() as u64, Ordering::Relaxed);
-                        let _ = tokio::fs::remove_dir_all(&job_dir).await;
+                            .fetch_sub(data.len() as u64 + downloaded_bytes, Ordering::Relaxed);
+                        cleanup_dir(&job_dir).await;
                         return Err("temp disk budget exceeded".into());
                     }
 
@@ -240,14 +305,14 @@ impl WorkerPool {
                 Err(object_store::Error::NotFound { .. }) => {
                     // CompressionInfo.db is optional.
                     if *component != "CompressionInfo.db" {
-                        let _ = tokio::fs::remove_dir_all(&job_dir).await;
+                        cleanup_dir(&job_dir).await;
                         self.temp_bytes_used
                             .fetch_sub(downloaded_bytes, Ordering::Relaxed);
                         return Err(format!("{component} not found at {s3_path}"));
                     }
                 }
                 Err(e) => {
-                    let _ = tokio::fs::remove_dir_all(&job_dir).await;
+                    cleanup_dir(&job_dir).await;
                     self.temp_bytes_used
                         .fetch_sub(downloaded_bytes, Ordering::Relaxed);
                     return Err(format!("download {component}: {e}"));
@@ -272,6 +337,7 @@ impl WorkerPool {
         let mut sidecar_s3_path = String::new();
 
         for (index_name, entries) in &build_result.sidecar_entries {
+            validate_path_component("sidecar index name", index_name)?;
             total_entries += entries.len() as u64;
             let sidecar_filename = format!("{}-{index_name}.sidecar", req.sstable_id);
             let local_sidecar = job_dir.join(&sidecar_filename);
@@ -283,7 +349,7 @@ impl WorkerPool {
                 .await
                 .map_err(|e| format!("read sidecar: {e}"))?;
 
-            let s3_sidecar_path = ObjectPath::from(format!("{}/{sidecar_filename}", req.s3_prefix));
+            let s3_sidecar_path = ObjectPath::from(format!("{s3_prefix}/{sidecar_filename}"));
             sidecar_s3_path = s3_sidecar_path.to_string();
 
             self.object_store
@@ -295,13 +361,33 @@ impl WorkerPool {
         // Cleanup temp files.
         self.temp_bytes_used
             .fetch_sub(downloaded_bytes, Ordering::Relaxed);
-        let _ = tokio::fs::remove_dir_all(&job_dir).await;
+        cleanup_dir(&job_dir).await;
 
         Ok((sidecar_s3_path, total_entries))
     }
 }
 
+/// Best-effort removal of a job's scratch directory. A failure is logged, never
+/// silent: leaked scratch space eventually exhausts the temp budget.
+async fn cleanup_dir(dir: &std::path::Path) {
+    if let Err(e) = tokio::fs::remove_dir_all(dir).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(dir = %dir.display(), error = %e, "failed to remove job scratch dir");
+        }
+    }
+}
+
 impl BuildRequest {
+    /// Reject any request whose identifiers could steer a path or S3 key.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_path_component("job_id", &self.job_id)?;
+        validate_path_component("sstable_id", &self.sstable_id)?;
+        validate_path_component("index_name", &self.index_name)?;
+        validate_path_component("keyspace", &self.table.0)?;
+        validate_path_component("table", &self.table.1)?;
+        Ok(())
+    }
+
     fn is_quantized_direct_upload(&self) -> bool {
         self.direct_upload
             && self
@@ -388,12 +474,12 @@ mod tests {
         // Construct the request the way the engine sends it (JSON), to prove the
         // wire field deserializes.
         let json = serde_json::json!({
+            "job_id": "job-1",
             "sstable_id": "gen-7",
             "index_name": "name_adult_idx",
             "index_type": "filtered",
             "s3_endpoint": "memory://",
             "s3_bucket": "b",
-            "s3_prefix": "p/ks.tbl/gen-7",
             "table": ["ks", "tbl"],
             "column_position": 0,
             "priority": "normal",
@@ -412,12 +498,12 @@ mod tests {
     #[test]
     fn build_request_without_predicate_yields_none() {
         let json = serde_json::json!({
+            "job_id": "job-1",
             "sstable_id": "gen-1",
             "index_name": "email_idx",
             "index_type": "btree",
             "s3_endpoint": "memory://",
             "s3_bucket": "b",
-            "s3_prefix": "p/ks.tbl/gen-1",
             "table": ["ks", "tbl"],
             "column_position": 0,
             "priority": "normal",
@@ -431,12 +517,12 @@ mod tests {
     #[test]
     fn build_request_threads_clustering_source_into_job() {
         let json = serde_json::json!({
+            "job_id": "job-1",
             "sstable_id": "gen-9",
             "index_name": "ck_idx",
             "index_type": "btree",
             "s3_endpoint": "memory://",
             "s3_bucket": "b",
-            "s3_prefix": "p/ks.tbl/gen-9",
             "table": ["ks", "tbl"],
             "column_position": 1,
             "clustering_source": {
@@ -467,12 +553,12 @@ mod tests {
     #[test]
     fn build_request_threads_partition_key_source_into_job() {
         let json = serde_json::json!({
+            "job_id": "job-1",
             "sstable_id": "gen-9",
             "index_name": "idx_by_tenant",
             "index_type": "btree",
             "s3_endpoint": "memory://",
             "s3_bucket": "b",
-            "s3_prefix": "p/ks.tbl/gen-9",
             "table": ["ks", "tbl"],
             "column_position": 0,
             "partition_key_source": {
@@ -513,6 +599,7 @@ mod tests {
         let pool = WorkerPool::new(1, store, 1024 * 1024);
         let response = pool
             .execute(BuildRequest {
+                job_id: "job-1".into(),
                 sstable_id: "gen-42".into(),
                 index_name: "idx_embedding".into(),
                 index_type: "vector".into(),
@@ -520,7 +607,6 @@ mod tests {
                 direct_upload: true,
                 s3_endpoint: "memory://".into(),
                 s3_bucket: "bucket".into(),
-                s3_prefix: "prod/42/ks.tbl/gen-42".into(),
                 table: ("ks".into(), "tbl".into()),
                 column_position: 0,
                 clustering_source: None,
@@ -558,5 +644,83 @@ mod tests {
         assert_eq!(response.artifact_manifest_entry, Some(entry));
         assert_eq!(response.sidecar_s3_path, None);
         assert_eq!(response.elapsed_ms, Some(37));
+    }
+
+    fn request(sstable_id: &str, index_name: &str) -> BuildRequest {
+        BuildRequest {
+            job_id: "job-1".into(),
+            sstable_id: sstable_id.into(),
+            index_name: index_name.into(),
+            index_type: "btree".into(),
+            artifact_kind: None,
+            direct_upload: false,
+            s3_endpoint: String::new(),
+            s3_bucket: String::new(),
+            table: ("ks".into(), "tbl".into()),
+            column_position: 0,
+            clustering_source: None,
+            partition_key_source: None,
+            priority: "normal".into(),
+            filter_predicate: None,
+        }
+    }
+
+    /// JB-T3: identifiers with separators or dot segments are refused, and the
+    /// S3 prefix comes from configuration plus validated ids, never the caller.
+    #[tokio::test]
+    async fn index_builder_rejects_caller_supplied_paths() {
+        for bad in [
+            "../etc/passwd",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "gen..1",
+            "",
+            "gen\0",
+            ".hidden",
+        ] {
+            assert!(
+                request(bad, "idx").validate().is_err(),
+                "sstable_id {bad:?}"
+            );
+            assert!(
+                request("gen-1", bad).validate().is_err(),
+                "index_name {bad:?}"
+            );
+            let mut r = request("gen-1", "idx");
+            r.job_id = bad.into();
+            assert!(r.validate().is_err(), "job_id {bad:?}");
+            let mut r = request("gen-1", "idx");
+            r.table = ("ks".into(), bad.into());
+            assert!(r.validate().is_err(), "table {bad:?}");
+        }
+        assert!(request("gen-42", "idx_email").validate().is_ok());
+
+        // A caller-supplied s3_prefix is not even a field: it is ignored.
+        let json = serde_json::json!({
+            "job_id": "job-1", "sstable_id": "gen-1", "index_name": "i",
+            "index_type": "btree", "s3_prefix": "victim-tenant/secrets",
+            "table": ["ks", "tbl"], "column_position": 0, "priority": "normal",
+        });
+        let req: BuildRequest = serde_json::from_value(json).unwrap();
+        let prefix = derive_s3_prefix("base", &req.table, &req.sstable_id);
+        assert!(prefix.starts_with("base/"), "{prefix}");
+        assert!(prefix.ends_with("/ks.tbl/gen-1"), "{prefix}");
+        assert!(!prefix.contains("victim"));
+
+        // A refused job fails without touching the store.
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let pool = WorkerPool::new(1, store.clone(), 1024);
+        let resp = pool.execute(request("../../x", "idx")).await;
+        assert_eq!(resp.status, "failed");
+        assert_eq!(pool.jobs_failed(), 1);
+        assert!(store_is_empty(&store).await);
+    }
+
+    async fn store_is_empty(store: &object_store::memory::InMemory) -> bool {
+        let l = store.list_with_delimiter(None).await.unwrap();
+        l.objects.is_empty() && l.common_prefixes.is_empty()
     }
 }

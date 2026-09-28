@@ -71,13 +71,8 @@ pub async fn run(
                             }
                         }
 
-                        let sstable_prefix = if s3_prefix.is_empty() {
-                            format!("{hex}/{}/{}", entry.table_id, entry.sstable_id)
-                        } else {
-                            format!("{s3_prefix}/{hex}/{}/{}", entry.table_id, entry.sstable_id)
-                        };
-
                         let req = BuildRequest {
+                            job_id: format!("pull-{}-{index_name}", entry.sstable_id),
                             sstable_id: entry.sstable_id.clone(),
                             index_name: index_name.clone(),
                             index_type: "btree".into(), // pull mode uses default
@@ -85,7 +80,6 @@ pub async fn run(
                             direct_upload: false,
                             s3_endpoint: String::new(), // uses pre-configured store
                             s3_bucket: String::new(),
-                            s3_prefix: sstable_prefix,
                             table: (entry.keyspace.clone(), entry.table.clone()),
                             column_position: *col_pos,
                             clustering_source: None,

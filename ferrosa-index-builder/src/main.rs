@@ -15,8 +15,9 @@ struct Cli {
     #[arg(long, default_value = "push")]
     mode: String,
 
-    /// Listen address for HTTP server (push mode).
-    #[arg(long, default_value = "0.0.0.0:8090")]
+    /// Listen address for HTTP server (push mode). Defaults to loopback; bind
+    /// a routable address explicitly and only on a trusted network.
+    #[arg(long, default_value = "127.0.0.1:8090")]
     listen: SocketAddr,
 
     /// Number of worker threads for index building.
@@ -51,6 +52,12 @@ struct Cli {
     #[arg(long, env = "FERROSA_S3_SECRET_ACCESS_KEY")]
     s3_secret_access_key: Option<String>,
 
+    /// Shared secret the engine presents as `Authorization: Bearer <token>`
+    /// (push mode, required, at least 16 bytes). Set the same value as
+    /// `FERROSA_INDEX_BUILDER_TOKEN` on the engine.
+    #[arg(long, env = "FERROSA_INDEX_BUILDER_TOKEN", hide_env_values = true)]
+    auth_token: Option<String>,
+
     /// Maximum bytes of temporary files on local disk.
     #[arg(long, default_value = "10737418240")]
     max_temp_bytes: u64,
@@ -82,19 +89,32 @@ async fn main() {
         cli.workers,
         std::sync::Arc::clone(&object_store),
         cli.max_temp_bytes,
-    );
+    )
+    .with_s3_prefix(cli.s3_prefix.clone());
 
     let worker_pool = std::sync::Arc::new(worker_pool);
 
     match cli.mode.as_str() {
         "push" => {
+            let token = cli
+                .auth_token
+                .as_deref()
+                .ok_or_else(|| {
+                    "push mode requires --auth-token or FERROSA_INDEX_BUILDER_TOKEN".to_string()
+                })
+                .and_then(ferrosa_index_builder::server::AuthToken::new)
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
             tracing::info!(
                 listen = %cli.listen,
                 workers = cli.workers,
                 mode = "push",
                 "starting ferrosa-index-builder"
             );
-            let app = ferrosa_index_builder::server::router(std::sync::Arc::clone(&worker_pool));
+            let app =
+                ferrosa_index_builder::server::router(std::sync::Arc::clone(&worker_pool), token);
             let listener = tokio::net::TcpListener::bind(cli.listen)
                 .await
                 .expect("failed to bind listener");

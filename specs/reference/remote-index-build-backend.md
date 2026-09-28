@@ -321,6 +321,10 @@ Environment variable overrides (12-factor):
 FERROSA_INDEX_BACKEND=remote
 FERROSA_INDEX_SIDECAR_ENDPOINTS=http://builder-1:8090,http://builder-2:8090
 FERROSA_INDEX_SIDECAR_TIMEOUT_MS=30000
+# Shared secret, same value on engine and builder (builder: >= 16 bytes, required
+# in push mode). Sent as `Authorization: Bearer`; the builder listens on
+# 127.0.0.1:8090 by default and derives all S3 keys itself (T-032, JB-T3).
+FERROSA_INDEX_BUILDER_TOKEN=<secret>
 ```
 
 ### Engine Initialization Changes

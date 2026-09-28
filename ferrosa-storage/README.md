@@ -548,6 +548,12 @@ compaction executor's task/result queues), `crc32fast`, `sha2`, `dashmap`,
   **`ferrosa-loadgen`**, **`ferrosa-postgres`**, **`ferrosa-session`**,
   **`ferrosa-sparql`**.
 
+**Remote index builder client**: `index::RemoteBackend` authenticates to
+`ferrosa-index-builder` with `Authorization: Bearer $FERROSA_INDEX_BUILDER_TOKEN`
+(logged loudly when unset, since the builder then refuses and every build falls
+back to local), sends an engine-issued `job_id` instead of an S3 prefix, and
+rejects an implausible `sidecar_s3_path` in the response.
+
 ## Tests
 
 ~1024 test functions across in-module `#[test]`/`#[tokio::test]` and 17

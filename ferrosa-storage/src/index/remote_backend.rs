@@ -7,7 +7,7 @@
 //! [`IndexBackendConfig`] is the engine-level enum that controls which
 //! backend the [`super::IndexBuildScheduler`] uses (or disables it entirely).
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -229,6 +229,24 @@ pub struct RemoteBackend {
     local_fallback: LocalBackend,
     /// Round-robin counter for endpoint selection.
     next_endpoint: AtomicU32,
+    /// Shared secret presented to the builder as `Authorization: Bearer`.
+    /// From `FERROSA_INDEX_BUILDER_TOKEN`; the builder refuses requests without it.
+    auth_token: Option<String>,
+}
+
+/// Issue a fresh engine-side job id (`[A-Za-z0-9-]`, the builder's only source
+/// for its scratch directory name).
+fn next_job_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "job-{nanos}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 impl RemoteBackend {
@@ -255,6 +273,20 @@ impl RemoteBackend {
             circuit_breakers,
             local_fallback,
             next_endpoint: AtomicU32::new(0),
+            auth_token: Self::token_from_env(),
+        }
+    }
+
+    fn token_from_env() -> Option<String> {
+        match std::env::var("FERROSA_INDEX_BUILDER_TOKEN") {
+            Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+            _ => {
+                tracing::error!(
+                    "FERROSA_INDEX_BUILDER_TOKEN is not set: the remote index builder \
+                     rejects unauthenticated requests, so every remote build will fall back to local"
+                );
+                None
+            }
         }
     }
 
@@ -275,9 +307,11 @@ impl RemoteBackend {
             .build();
         let agent = config.new_agent();
 
-        let response = agent
-            .post(&url)
-            .header("Content-Type", "application/json")
+        let mut request = agent.post(&url).header("Content-Type", "application/json");
+        if let Some(token) = &self.auth_token {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+        let response = request
             .send_json(&body)
             .map_err(|e| format!("HTTP request to {endpoint} failed: {e}"))?;
 
@@ -341,10 +375,11 @@ impl RemoteBackend {
 /// defaults to an unfiltered build). The predicate value bytes are already in
 /// storage encoding, so the round-trip is type-system independent.
 fn build_request_body(job: &IndexBuildJob, resolver: &S3PathResolver) -> serde_json::Value {
-    let table_id = format!("{}.{}", job.table.0, job.table.1);
-    let s3_prefix = resolver.resolve(&table_id, &job.sstable_id);
 
+    // No `s3_prefix`: the builder derives every S3 key and local path from its
+    // own configuration plus these validated identifiers (JB-T3).
     let mut body = serde_json::json!({
+        "job_id": next_job_id(),
         "sstable_id": job.sstable_id,
         "index_name": job.index_name,
         "index_type": format!("{:?}", job.index_type).to_lowercase(),
@@ -352,7 +387,6 @@ fn build_request_body(job: &IndexBuildJob, resolver: &S3PathResolver) -> serde_j
         "direct_upload": job.index_type == ferrosa_index::IndexType::Vector,
         "s3_endpoint": resolver.endpoint,
         "s3_bucket": resolver.bucket,
-        "s3_prefix": s3_prefix,
         "table": [&job.table.0, &job.table.1],
         "column_position": job.column_position,
         "priority": match job.priority {
@@ -427,7 +461,6 @@ struct BuildResponse {
     error: Option<String>,
     #[serde(default)]
     elapsed_ms: Option<u64>,
-    #[allow(dead_code)]
     #[serde(default)]
     sidecar_s3_path: Option<String>,
     #[allow(dead_code)]
@@ -439,6 +472,19 @@ struct BuildResponse {
 
 impl BuildResponse {
     fn into_index_build_result(self, job: &IndexBuildJob) -> Result<IndexBuildResult, String> {
+        // Do not trust the builder's reported sidecar location: it must be a
+        // sidecar object for THIS sstable, with no traversal segments.
+        if let Some(path) = &self.sidecar_s3_path {
+            let plausible = !path.contains("..")
+                && path.ends_with(".sidecar")
+                && path.contains(job.sstable_id.as_str());
+            if !plausible {
+                return Err(format!(
+                    "remote builder reported implausible sidecar path {path:?} for sstable {}",
+                    job.sstable_id
+                ));
+            }
+        }
         let mut artifact_manifest_entries = Vec::new();
         if job.index_type == ferrosa_index::IndexType::Vector {
             let entry = self.artifact_manifest_entry.ok_or_else(|| {

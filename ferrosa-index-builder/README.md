@@ -41,6 +41,16 @@ and the `/internal/index/build` route) *is* the interface — see
   `clustering_source` (`component`, `total`) for indexes on CLUSTERING columns;
   the worker threads it into `IndexBuildJob` so `LocalBackend` extracts the
   value from the composite clustering key instead of looking for a row cell.
+- **Authenticated, engine-issued jobs (JB-T3)**: `POST /internal/index/build`
+  requires `Authorization: Bearer <token>` (constant-time compare; `--auth-token`
+  / `FERROSA_INDEX_BUILDER_TOKEN`, at least 16 bytes; push mode refuses to start
+  without it). The engine sets the same `FERROSA_INDEX_BUILDER_TOKEN`. `--listen`
+  defaults to `127.0.0.1:8090`. The request has no `s3_prefix`: the builder
+  derives `{--s3-prefix}/{hex}/{keyspace.table}/{sstable_id}` itself, the
+  scratch dir comes from the engine-issued `job_id`, and `job_id`, `sstable_id`,
+  `index_name`, keyspace and table are refused unless `[A-Za-z0-9._-]`, at most
+  128 bytes, no `..`, no leading `.`. The engine also rejects an implausible
+  `sidecar_s3_path` in the response. `/health` stays unauthenticated.
 - **Fail-closed for quantized vectors**: a `direct_upload` + `hvq_qvec` request
   returns `status: "failed"` with an explicit "not implemented" message rather
   than silently producing an unpublishable artifact.
@@ -107,7 +117,9 @@ External: `axum`, `tokio`, `object_store` (aws), `reqwest`, `clap`, `serde`,
 
 ## Tests
 
-7 in-crate unit/async tests (`src/server.rs`, `src/worker.rs`): the `/health`
+12 in-crate unit/async tests (`src/server.rs`, `src/worker.rs`), including
+`index_builder_rejects_unauthenticated_request` and
+`index_builder_rejects_caller_supplied_paths`: the `/health`
 route, index-type and priority parsing, filter-predicate threading into the job,
 the quantized fail-closed path, and the quantized manifest response shape. There
 is **no `tests/` integration dir** and no end-to-end S3 download→build→upload
