@@ -83,6 +83,10 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   generated/echoed key. RETURNING rows honor the portal's result formats (binary
   works). `UPDATE`/`DELETE … RETURNING`, `ON CONFLICT`, and `= ANY($N)` are
   **not yet supported** and fail loud (`0A000`/parse error), never silently.
+- **Corrupt stored cells fail the query (t_cf7ca2cc)** — the shared row bridge
+  returns `RowDecodeError`; the streaming scan records a failure naming
+  `keyspace.table` and the column, so the client gets an error rather than a NULL
+  (FMEA `PG-Tcf7ca2cc`).
 - **PostgreSQL MVCC transactions** — explicit `BEGIN ISOLATION LEVEL
   SERIALIZABLE` pins a
   local or Accord cluster timestamp. Simple and extended `SELECT` use sparse row

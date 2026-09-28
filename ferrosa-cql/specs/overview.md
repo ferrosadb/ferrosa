@@ -51,7 +51,7 @@ same encode/decode without depending on this large crate.
 | `types` | ~0.6k | 16-bit CQL type system, codec re-export |
 | `transaction_keys` / `transaction_limits` | ~1.0k | Accord partition-key extraction, per-connection txn limits |
 | `planner` | ~0.8k | Scan planning: `PartitionKeyLookup` / `PartitionIndexLookup` (keyed index consult for full-PK + indexed residual, t_430c4188) / `SingleIndex` / `IndexScanWithFilter` / `IndexIntersection` / `FullScan` |
-| `error` / `paging` / `duration` / `session` / `topology` / `event` / `observability` / `prepared` | — | Error type + `From<RowBridgeError>`, paging cursor, duration type, session, topology policy, EVENT, metrics, prepared cache |
+| `error` / `paging` / `duration` / `session` / `topology` / `event` / `observability` / `prepared` | — | Error type + `From<RowBridgeError>` / `From<RowDecodeError>` (`CqlError::CorruptCell`, a server error naming the table), paging cursor, duration type, session, topology policy, EVENT, metrics, prepared cache |
 | `virtual_tables/` | ~4.5k | `system_observability.*` runtime introspection tables |
 
 ## Concurrency model

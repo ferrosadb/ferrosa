@@ -66,13 +66,17 @@ pub enum CqlError {
     /// written: a condition is never dropped and the write never applied
     /// unconditionally.
     ConditionalUnsupported { scope: &'static str },
+    /// 0x0000 — a stored cell could not be decoded. The read fails; the value
+    /// is never returned as NULL (FM CQL-Tcf7ca2cc). Carries table, column and
+    /// partition-key context.
+    CorruptCell(ferrosa_row_bridge::RowDecodeError),
 }
 
 impl CqlError {
     /// Returns the CQL error code for this error.
     pub fn error_code(&self) -> u32 {
         match self {
-            Self::ServerError(_) => 0x0000,
+            Self::ServerError(_) | Self::CorruptCell(_) => 0x0000,
             Self::Protocol(_) | Self::ProtocolVersionMismatch { .. } => 0x000A,
             Self::BadCredentials => 0x0100,
             Self::Unavailable { .. } => 0x1000,
@@ -183,6 +187,7 @@ impl std::fmt::Display for CqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ServerError(msg) => write!(f, "server error: {msg}"),
+            Self::CorruptCell(err) => write!(f, "server error: {err}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::BadCredentials => write!(f, "bad credentials"),
             Self::Unavailable {
@@ -333,6 +338,26 @@ impl From<ferrosa_common::Error> for CqlError {
 impl From<ferrosa_row_bridge::RowBridgeError> for CqlError {
     fn from(err: ferrosa_row_bridge::RowBridgeError) -> Self {
         Self::Invalid(err.0)
+    }
+}
+
+/// A corrupt stored cell is a server-side data fault, not a client mistake:
+/// it maps to a server error (0x0000), never to a row with a NULL.
+impl From<ferrosa_row_bridge::RowDecodeError> for CqlError {
+    fn from(err: ferrosa_row_bridge::RowDecodeError) -> Self {
+        Self::CorruptCell(err)
+    }
+}
+
+impl CqlError {
+    /// Name the table on a [`CqlError::CorruptCell`]; every other error passes
+    /// through unchanged. Applied at the level that knows the table.
+    #[must_use]
+    pub fn in_table(mut self, table: &str) -> Self {
+        if let Self::CorruptCell(err) = &mut self {
+            *err = err.clone().in_table(table);
+        }
+        self
     }
 }
 

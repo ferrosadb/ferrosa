@@ -800,6 +800,7 @@ pub use ferrosa_row_bridge::{
     decode_clustering, decode_pk, encode_clustering, partition_to_rows,
     partition_to_rows_with_clustering, partition_to_rows_with_storage_mapping,
     visit_partition_rows_with_clustering, write_partition_raw_rows_with_storage_mapping,
+    RowDecodeError,
 };
 
 // ---------------------------------------------------------------------------
@@ -825,6 +826,9 @@ impl CellMeta {
     };
 }
 
+/// Decoded rows plus per-cell metadata parallel to them.
+pub type RowsWithMeta = (Vec<Vec<Option<CqlValue>>>, Vec<Vec<CellMeta>>);
+
 /// Like [`partition_to_rows`], but also returns per-cell metadata (timestamp, TTL)
 /// needed by `writetime()` and `TTL()` CQL functions.
 ///
@@ -836,7 +840,7 @@ pub fn partition_to_rows_with_metadata(
     column_types: &[CqlType],
     pk_columns: &[usize],
     ck_columns: &[usize],
-) -> (Vec<Vec<Option<CqlValue>>>, Vec<Vec<CellMeta>>) {
+) -> Result<RowsWithMeta, RowDecodeError> {
     let pk_set: std::collections::HashSet<usize> = pk_columns.iter().copied().collect();
     let ck_set: std::collections::HashSet<usize> = ck_columns.iter().copied().collect();
     let storage_to_table: Vec<usize> = (0..column_names.len())
@@ -860,7 +864,7 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
     pk_columns: &[usize],
     ck_columns: &[usize],
     storage_to_table: &[usize],
-) -> (Vec<Vec<Option<CqlValue>>>, Vec<Vec<CellMeta>>) {
+) -> Result<RowsWithMeta, RowDecodeError> {
     let mut result = Vec::new();
     let mut meta_result = Vec::new();
 
@@ -889,9 +893,9 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
         for (i, &col_idx) in pk_columns.iter().enumerate() {
             if col_idx < column_types.len() {
                 if let Some(bytes) = pk_values.get(i) {
-                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
-                        output_row[col_idx] = Some(val);
-                    }
+                    let val = decode_value(&column_types[col_idx], bytes)
+                        .map_err(|e| corrupt_cell(column_names, col_idx, &partition.key, e))?;
+                    output_row[col_idx] = Some(val);
                 }
             }
         }
@@ -900,9 +904,9 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
         for (i, &col_idx) in ck_columns.iter().enumerate() {
             if col_idx < column_types.len() {
                 if let Some(bytes) = ck_values.get(i) {
-                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
-                        output_row[col_idx] = Some(val);
-                    }
+                    let val = decode_value(&column_types[col_idx], bytes)
+                        .map_err(|e| corrupt_cell(column_names, col_idx, &partition.key, e))?;
+                    output_row[col_idx] = Some(val);
                 }
             }
         }
@@ -941,28 +945,34 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
             // Value assembly is shared with the primary SELECT read path so the
             // two cannot diverge (complex → reconcile-by-path + assemble; simple
             // → newest live cell; legacy whole-value collection decodes whole).
-            match crate::collection_cells::assemble_column_cells(
+            output_row[table_idx] = crate::collection_cells::assemble_column_cells(
                 &column_types[table_idx],
                 &cells,
                 now_secs,
-            ) {
-                Ok(value) => output_row[table_idx] = value,
-                Err(e) => {
-                    tracing::error!(
-                        column = column_names.get(table_idx).map(String::as_str).unwrap_or("?"),
-                        error = %e,
-                        "failed to decode column value (corrupt cell); value withheld, not treated as absent",
-                    );
-                    output_row[table_idx] = None;
-                }
-            }
+            )
+            .map_err(|e| corrupt_cell(column_names, table_idx, &partition.key, e))?;
         }
 
         result.push(output_row);
         meta_result.push(meta_row);
     }
 
-    (result, meta_result)
+    Ok((result, meta_result))
+}
+
+/// A corrupt cell fails the read (CQL-Tcf7ca2cc); it is never returned as NULL.
+fn corrupt_cell(
+    column_names: &[String],
+    table_idx: usize,
+    key: &ferrosa_common::DecoratedKey,
+    reason: impl std::fmt::Display,
+) -> RowDecodeError {
+    let column = column_names
+        .get(table_idx)
+        .map(String::as_str)
+        .unwrap_or("?");
+    tracing::error!(column, error = %reason, "corrupt cell: failing the read");
+    RowDecodeError::new(column, key.key.as_bytes(), reason.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1948,7 +1958,8 @@ mod tests {
             &column_types,
             &pk_columns,
             &ck_columns,
-        );
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Some(CqlValue::Int(42)));
         assert_eq!(rows[0][1], Some(CqlValue::Text("alice".into())));
@@ -1975,7 +1986,8 @@ mod tests {
             rows: vec![tombstone_row],
         };
 
-        let rows = partition_to_rows(&partition, &["id".into()], &[CqlType::Int], &[0], &[]);
+        let rows =
+            partition_to_rows(&partition, &["id".into()], &[CqlType::Int], &[0], &[]).unwrap();
         assert!(rows.is_empty());
     }
 
@@ -2007,7 +2019,8 @@ mod tests {
             &[CqlType::Int, CqlType::Varchar],
             &[0],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Some(CqlValue::Int(1)));
         // Tombstone cell -> None
@@ -2045,7 +2058,8 @@ mod tests {
             &[CqlType::Int, CqlType::Varchar],
             &[0],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Some(CqlValue::Int(1)));
         assert_eq!(rows[0][1], None, "expired cell must read as null");
@@ -2081,7 +2095,8 @@ mod tests {
             &[CqlType::Int, CqlType::Varchar],
             &[0],
             &[],
-        );
+        )
+        .unwrap();
         assert!(
             rows.is_empty(),
             "fully expired TTL row must not be returned"
@@ -2118,7 +2133,8 @@ mod tests {
             &[CqlType::Int, CqlType::Varchar],
             &[0],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][1], Some(CqlValue::Text("alice".into())));
     }
@@ -2876,7 +2892,8 @@ mod tests {
             &column_types,
             &pk_columns,
             &ck_columns,
-        );
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(metas.len(), 1);
         assert_eq!(rows[0][0], Some(CqlValue::Int(42)));
@@ -2936,7 +2953,8 @@ mod tests {
             &column_types,
             &[0usize],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0][1],
@@ -2998,7 +3016,8 @@ mod tests {
             &column_types,
             &[0usize],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(
             rows[0][1],
             Some(CqlValue::Set(vec![CqlValue::Text("b".into())])),
@@ -3039,7 +3058,8 @@ mod tests {
             &column_types,
             &[0usize],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(
             rows[0][1],
             Some(CqlValue::List(vec![CqlValue::Int(7), CqlValue::Int(8)])),

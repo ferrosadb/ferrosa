@@ -146,6 +146,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   millis) on an already-corrupt on-disk timestamp instead of emitting an
   undecodable value that would crash `SELECT *` for the whole partition. See
   FMEA `CQL-12`.
+  **Corrupt cells fail the read (t_cf7ca2cc)**: the row-bridge decomposition
+  returns `RowDecodeError`, surfaced as `CqlError::CorruptCell` (server error
+  0x0000, message names `keyspace.table`, column and partition key) instead of a
+  row with a NULL. See FMEA `CQL-Tcf7ca2cc`.
 - **Result encoding** (`result.rs`, `types.rs`) — CQL RESULT-frame encoder, the
   16-bit type system, and the re-exported `encode_value`/`decode_value` codec.
 - **Prepared statements** (`prepared.rs`) — `moka` W-TinyLFU cache keyed by the

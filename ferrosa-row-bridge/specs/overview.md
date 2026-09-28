@@ -58,7 +58,11 @@ paging cursors) or emit raw byte slices.
    cell tombstone so reads return NULL, not `""`/`0`.
 4. **A corrupt cell is an error, not a missing value.** `assemble_column_cells`
    returns `AssembleError` (and bumps `corrupt_element_count()`) when a cell
-   fails to decode; only an absent, deleted or expired column is `None`.
+   fails to decode; only an absent, deleted or expired column is `None`. The
+   row decomposition (`partition_to_rows*`, `visit_/consume_partition_rows_*`)
+   propagates it as `RowDecodeError` (column, partition key, reason; the caller
+   adds the table with `in_table`). Undecodable partition/clustering key
+   components fail the same way. There is no fallback to NULL.
 5. **No dependency on `ferrosa-cql`.** Enforced structurally (it would create a
    cycle: `ferrosa-cql` → `ferrosa-row-bridge`).
 

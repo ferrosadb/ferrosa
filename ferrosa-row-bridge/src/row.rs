@@ -12,19 +12,26 @@ use ferrosa_common::{CellValue, CqlType, CqlValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 
 use crate::codec::{decode_value, encode_value};
-use crate::RowBridgeError;
+use crate::{RowBridgeError, RowDecodeError};
+
+/// A decoded row paired with its raw clustering-key bytes.
+pub type ClusteredRow = (Vec<u8>, Vec<Option<CqlValue>>);
 
 /// Convert a storage `Partition` back to result rows for CQL RESULT encoding.
 ///
 /// Each returned row is a `Vec<Option<CqlValue>>` with one entry per column
 /// in `column_names`. Tombstone rows and cells are represented as `None`.
+///
+/// # Errors
+/// [`RowDecodeError`] when a stored key or cell cannot be decoded. A corrupt
+/// value is never returned as `None`.
 pub fn partition_to_rows(
     partition: &ferrosa_sstable::types::Partition,
     column_names: &[String],
     column_types: &[CqlType],
     pk_columns: &[usize],
     ck_columns: &[usize],
-) -> Vec<Vec<Option<CqlValue>>> {
+) -> Result<Vec<Vec<Option<CqlValue>>>, RowDecodeError> {
     let pk_set: std::collections::HashSet<usize> = pk_columns.iter().copied().collect();
     let ck_set: std::collections::HashSet<usize> = ck_columns.iter().copied().collect();
     let storage_to_table: Vec<usize> = (0..column_names.len())
@@ -65,7 +72,7 @@ pub fn partition_to_rows_with_storage_mapping(
     pk_columns: &[usize],
     ck_columns: &[usize],
     storage_to_table: &[usize],
-) -> Vec<Vec<Option<CqlValue>>> {
+) -> Result<Vec<Vec<Option<CqlValue>>>, RowDecodeError> {
     let mut result = Vec::new();
     visit_partition_rows_with_clustering(
         partition,
@@ -78,8 +85,8 @@ pub fn partition_to_rows_with_storage_mapping(
             result.push(row);
             ControlFlow::Continue(())
         },
-    );
-    result
+    )?;
+    Ok(result)
 }
 
 /// Like [`partition_to_rows_with_storage_mapping`] but pairs each produced
@@ -96,7 +103,7 @@ pub fn partition_to_rows_with_clustering(
     pk_columns: &[usize],
     ck_columns: &[usize],
     storage_to_table: &[usize],
-) -> Vec<(Vec<u8>, Vec<Option<CqlValue>>)> {
+) -> Result<Vec<ClusteredRow>, RowDecodeError> {
     let mut result = Vec::new();
     visit_partition_rows_with_clustering(
         partition,
@@ -109,8 +116,8 @@ pub fn partition_to_rows_with_clustering(
             result.push((clustering.to_vec(), row));
             ControlFlow::Continue(())
         },
-    );
-    result
+    )?;
+    Ok(result)
 }
 
 /// Visit surviving rows in a partition one at a time, paired with borrowed
@@ -128,7 +135,8 @@ pub fn visit_partition_rows_with_clustering<F>(
     ck_columns: &[usize],
     storage_to_table: &[usize],
     mut visit: F,
-) where
+) -> Result<(), RowDecodeError>
+where
     F: FnMut(&[u8], Vec<Option<CqlValue>>) -> ControlFlow<()>,
 {
     let now_secs = read_now_secs();
@@ -141,6 +149,7 @@ pub fn visit_partition_rows_with_clustering<F>(
         ck_columns,
         storage_to_table,
         now_secs,
+        partition_key: partition.key.key.as_bytes(),
     };
 
     for row in &partition.rows {
@@ -148,11 +157,12 @@ pub fn visit_partition_rows_with_clustering<F>(
             continue;
         }
 
-        let output_row = decode_output_row(row, &decode_context);
+        let output_row = decode_output_row(row, &decode_context)?;
         if let ControlFlow::Break(()) = visit(row.clustering.as_slice(), output_row) {
             break;
         }
     }
+    Ok(())
 }
 
 /// Consume surviving rows in a partition one at a time, moving clustering-key
@@ -171,7 +181,7 @@ pub fn consume_partition_rows_with_clustering<F>(
     ck_columns: &[usize],
     storage_to_table: &[usize],
     mut visit: F,
-) -> Vec<u8>
+) -> Result<Vec<u8>, RowDecodeError>
 where
     F: FnMut(&[u8], Vec<u8>, Vec<Option<CqlValue>>) -> ControlFlow<()>,
 {
@@ -186,6 +196,7 @@ where
         ck_columns,
         storage_to_table,
         now_secs,
+        partition_key: key.key.as_bytes(),
     };
 
     {
@@ -195,14 +206,14 @@ where
                 continue;
             }
 
-            let output_row = decode_output_row(&row, &decode_context);
+            let output_row = decode_output_row(&row, &decode_context)?;
             if let ControlFlow::Break(()) = visit(pk_bytes, row.clustering, output_row) {
                 break;
             }
         }
     }
 
-    key.key.into_bytes()
+    Ok(key.key.into_bytes())
 }
 
 fn read_now_secs() -> i32 {
@@ -252,32 +263,57 @@ struct RowDecodeContext<'a> {
     ck_columns: &'a [usize],
     storage_to_table: &'a [usize],
     now_secs: i32,
+    partition_key: &'a [u8],
 }
 
-fn decode_output_row(row: &Row, context: &RowDecodeContext<'_>) -> Vec<Option<CqlValue>> {
+impl RowDecodeContext<'_> {
+    fn column_name(&self, idx: usize) -> &str {
+        self.column_names
+            .get(idx)
+            .map(String::as_str)
+            .unwrap_or("?")
+    }
+
+    fn corrupt(&self, idx: usize, reason: impl std::fmt::Display) -> RowDecodeError {
+        RowDecodeError::new(
+            self.column_name(idx),
+            self.partition_key,
+            reason.to_string(),
+        )
+    }
+}
+
+/// Decode a primary-key or clustering value into `output_row[col_idx]`.
+/// A stored key component that does not decode is corruption, not NULL.
+fn decode_key_component(
+    context: &RowDecodeContext<'_>,
+    col_idx: usize,
+    bytes: Option<&Vec<u8>>,
+    output_row: &mut [Option<CqlValue>],
+) -> Result<(), RowDecodeError> {
+    let (Some(ty), Some(bytes)) = (context.column_types.get(col_idx), bytes) else {
+        return Ok(());
+    };
+    let val = decode_value(ty, bytes).map_err(|e| context.corrupt(col_idx, e))?;
+    output_row[col_idx] = Some(val);
+    Ok(())
+}
+
+fn decode_output_row(
+    row: &Row,
+    context: &RowDecodeContext<'_>,
+) -> Result<Vec<Option<CqlValue>>, RowDecodeError> {
     let mut output_row: Vec<Option<CqlValue>> = vec![None; context.column_names.len()];
 
     // Fill PK columns.
     for (i, &col_idx) in context.pk_columns.iter().enumerate() {
-        if col_idx < context.column_types.len() {
-            if let Some(bytes) = context.pk_values.get(i) {
-                if let Ok(val) = decode_value(&context.column_types[col_idx], bytes) {
-                    output_row[col_idx] = Some(val);
-                }
-            }
-        }
+        decode_key_component(context, col_idx, context.pk_values.get(i), &mut output_row)?;
     }
 
     // Fill CK columns.
     let ck_values = decode_clustering(&row.clustering, context.ck_columns.len());
     for (i, &col_idx) in context.ck_columns.iter().enumerate() {
-        if col_idx < context.column_types.len() {
-            if let Some(bytes) = ck_values.get(i) {
-                if let Ok(val) = decode_value(&context.column_types[col_idx], bytes) {
-                    output_row[col_idx] = Some(val);
-                }
-            }
-        }
+        decode_key_component(context, col_idx, ck_values.get(i), &mut output_row)?;
     }
 
     // Fill regular/static columns from cells. Cell indices are in storage
@@ -304,30 +340,24 @@ fn decode_output_row(row: &Row, context: &RowDecodeContext<'_>) -> Vec<Option<Cq
     }
 
     for (table_idx, cells) in cells_by_col {
-        match crate::collection::assemble_column_cells(
+        // A cell that cannot be assembled fails the read (RB-Tcf7ca2cc); it is
+        // never presented to the client as NULL.
+        output_row[table_idx] = crate::collection::assemble_column_cells(
             &context.column_types[table_idx],
             &cells,
             context.now_secs,
-        ) {
-            Ok(value) => output_row[table_idx] = value,
-            Err(e) => {
-                // A complex column whose per-element cells cannot be assembled
-                // is logged loudly rather than silently dropped.
-                tracing::error!(
-                    column = context
-                        .column_names
-                        .get(table_idx)
-                        .map(String::as_str)
-                        .unwrap_or("?"),
-                    error = %e,
-                    "failed to decode column value (corrupt cell); value withheld, not treated as absent",
-                );
-                output_row[table_idx] = None;
-            }
-        }
+        )
+        .map_err(|e| {
+            tracing::error!(
+                column = context.column_name(table_idx),
+                error = %e,
+                "corrupt cell: failing the read",
+            );
+            context.corrupt(table_idx, e)
+        })?;
     }
 
-    output_row
+    Ok(output_row)
 }
 
 /// Decompose a storage `Partition` into raw per-column byte slices, invoking
@@ -683,7 +713,8 @@ mod tests {
             &[CqlType::Int, CqlType::List(Box::new(CqlType::Int))],
             &[0],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(
             rows[0][1],
             Some(CqlValue::List(vec![CqlValue::Int(10), CqlValue::Int(20)])),
@@ -722,7 +753,8 @@ mod tests {
             &[CqlType::Int, CqlType::Set(Box::new(CqlType::Varchar))],
             &[0],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(
             rows[0][1],
             Some(CqlValue::Set(vec![CqlValue::Text("b".into())]))
@@ -741,10 +773,92 @@ mod tests {
             &[CqlType::Int, CqlType::List(Box::new(CqlType::Int))],
             &[0],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(
             rows[0][1],
             Some(CqlValue::List(vec![CqlValue::Int(7), CqlValue::Int(8)])),
+        );
+    }
+
+    /// FM RB-Tcf7ca2cc: a corrupt simple cell fails the read with a typed error
+    /// naming the column and partition key. It is never returned as NULL.
+    #[test]
+    fn corrupt_simple_cell_fails_the_read() {
+        // An INT cell must be 4 bytes; 2 bytes is corrupt.
+        let partition = single_row_partition(vec![(0, CellValue::live(vec![0, 1], 100))]);
+        let err = partition_to_rows(
+            &partition,
+            &["id".into(), "v".into()],
+            &[CqlType::Int, CqlType::Int],
+            &[0],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(err.column(), "v");
+        assert_eq!(
+            err.partition_key(),
+            encode_value(&CqlValue::Int(1)).as_slice()
+        );
+        assert!(err.to_string().contains("column v"), "{err}");
+        assert_eq!(err.in_table("ks.t").table(), Some("ks.t"));
+    }
+
+    /// The streaming visitor stops at the corrupt row and reports the error.
+    #[test]
+    fn corrupt_simple_cell_fails_the_streaming_visitor() {
+        let partition = single_row_partition(vec![(0, CellValue::live(vec![0, 1], 100))]);
+        let mut visited = 0;
+        let result = visit_partition_rows_with_clustering(
+            &partition,
+            &["id".into(), "v".into()],
+            &[CqlType::Int, CqlType::Int],
+            &[0],
+            &[],
+            &[1],
+            |_, _| {
+                visited += 1;
+                ControlFlow::Continue(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(visited, 0, "a corrupt row must not reach the visitor");
+    }
+
+    /// The consuming variant reports the same error.
+    #[test]
+    fn corrupt_simple_cell_fails_the_consuming_visitor() {
+        let partition = single_row_partition(vec![(0, CellValue::live(vec![0, 1], 100))]);
+        let result = consume_partition_rows_with_clustering(
+            partition,
+            &["id".into(), "v".into()],
+            &[CqlType::Int, CqlType::Int],
+            &[0],
+            &[],
+            &[1],
+            |_, _, _| ControlFlow::Continue(()),
+        );
+        assert_eq!(result.unwrap_err().column(), "v");
+    }
+
+    /// An uncorrupted read is unchanged.
+    #[test]
+    fn uncorrupted_simple_cell_reads_unchanged() {
+        let partition = single_row_partition(vec![(
+            0,
+            CellValue::live(encode_value(&CqlValue::Int(9)), 100),
+        )]);
+        let rows = partition_to_rows(
+            &partition,
+            &["id".into(), "v".into()],
+            &[CqlType::Int, CqlType::Int],
+            &[0],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Some(CqlValue::Int(1)), Some(CqlValue::Int(9))]]
         );
     }
 }

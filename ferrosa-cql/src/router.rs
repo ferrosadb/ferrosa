@@ -1098,7 +1098,7 @@ async fn count_rows_from_partitions(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1153,7 +1153,7 @@ async fn extend_rows_from_partitions(
     pk_indices: &[usize],
     ck_indices: &[usize],
     storage_to_table: &[usize],
-) {
+) -> Result<(), CqlError> {
     for (idx, partition) in partitions.iter().enumerate() {
         let mut prows = bridge::partition_to_rows_with_storage_mapping(
             partition,
@@ -1162,12 +1162,13 @@ async fn extend_rows_from_partitions(
             pk_indices,
             ck_indices,
             storage_to_table,
-        );
+        )?;
         all_rows.append(&mut prows);
         if should_yield_during_partition_scan(idx + 1, cooperative_scan_yield_every_partitions()) {
             tokio::task::yield_now().await;
         }
     }
+    Ok(())
 }
 
 /// Drain a projected partition stream into `all_rows`, moving each partition
@@ -1198,7 +1199,7 @@ async fn extend_rows_from_partition_stream(
             pk_indices,
             ck_indices,
             storage_to_table,
-        );
+        )?;
         all_rows.append(&mut prows);
         processed_partitions += 1;
         if should_yield_during_partition_scan(
@@ -1234,7 +1235,7 @@ async fn collect_index_rows_with_limit(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1290,7 +1291,7 @@ async fn sort_rows_from_partition_stream_spilling(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1341,7 +1342,7 @@ async fn count_rows_from_partition_stream(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1588,7 +1589,7 @@ async fn fold_builtin_aggregates(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1816,7 +1817,7 @@ async fn collect_page_from_partition_stream(
                 }
                 ControlFlow::Continue(())
             },
-        );
+        )?;
         if cursor_from_current_partition {
             last_pk = partition_key;
         }
@@ -1888,7 +1889,7 @@ async fn collect_distinct_partition_page_from_stream(
                 first_row = Some(output_row);
                 ControlFlow::Break(())
             },
-        );
+        )?;
 
         let Some(row) = first_row else {
             continue;
@@ -2023,7 +2024,7 @@ async fn collect_filtered_page_from_partition_stream(
                 }
                 ControlFlow::Continue(())
             },
-        );
+        )?;
         if cursor_from_current_partition {
             last_pk = partition_key;
         }
@@ -2755,7 +2756,7 @@ fn decode_agreed_row_to_map(
         &pk_indices,
         &ck_indices,
         &storage_to_table,
-    );
+    )?;
 
     let row_values = match rows.into_iter().next() {
         None => return Ok(None),
@@ -4641,6 +4642,24 @@ pub async fn route_prepared_select_fast(
     s: &SelectStatement,
     bound_terms: &[Term],
 ) -> Option<Result<RouteResult, CqlError>> {
+    let outcome = route_prepared_select_fast_inner(state, ctx, s, bound_terms).await?;
+    // A corrupt stored cell names its table (CQL-Tcf7ca2cc).
+    Some(outcome.map_err(|e| {
+        let ks = s
+            .keyspace
+            .as_deref()
+            .or(ctx.current_keyspace.as_deref())
+            .unwrap_or("<no keyspace>");
+        e.in_table(&format!("{ks}.{}", s.table))
+    }))
+}
+
+async fn route_prepared_select_fast_inner(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &SelectStatement,
+    bound_terms: &[Term],
+) -> Option<Result<RouteResult, CqlError>> {
     // `allow_filtering` is deliberately NOT disqualifying.
     //
     // It is a PERMISSION — "I will take the scan if no index can serve me" —
@@ -4833,7 +4852,7 @@ pub async fn route_prepared_select_fast(
                 &pk_indices,
                 &ck_indices,
                 &storage_to_table,
-            );
+            )?;
             let selected = select_columns(&rows, &all_col_names, &col_names);
             if let Some(limit) = limit {
                 selected.into_iter().take(limit.max(0) as usize).collect()
@@ -5006,7 +5025,7 @@ async fn route_geo_select(
                 rowctx.pk_indices,
                 rowctx.ck_indices,
                 rowctx.storage_to_table,
-            );
+            )?;
             rows.append(&mut prows);
         }
         Ok(rows)
@@ -5216,7 +5235,21 @@ thread_local! {
     static BOUNDED_PARTITION_ROWS_MATERIALIZED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Run a user-table SELECT. A corrupt stored cell fails the read with the
+/// table named (CQL-Tcf7ca2cc); the decode layers below only know the column
+/// and partition key, so the table is attached here, where it is known.
 async fn route_select_user_table(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    ks: &str,
+    s: &SelectStatement,
+) -> Result<SelectRawResult, CqlError> {
+    route_select_user_table_inner(state, ctx, ks, s)
+        .await
+        .map_err(|e| e.in_table(&format!("{ks}.{}", s.table)))
+}
+
+async fn route_select_user_table_inner(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     ks: &str,
@@ -5456,7 +5489,7 @@ async fn route_select_user_table(
                         &pk_indices,
                         &ck_indices,
                         &storage_to_table,
-                    );
+                    )?;
                     // Post-filter: apply remaining (non-fts_match) WHERE predicates.
                     filter_rows_by_select_predicates(
                         &mut prows,
@@ -5804,7 +5837,7 @@ async fn route_select_user_table(
                 &pk_indices,
                 &ck_indices,
                 &storage_to_table,
-            ));
+            )?);
         }
         #[cfg(test)]
         PK_LOOKUP_ROWS_VISITED.with(|c| c.set(c.get() + pk_rows.len()));
@@ -6003,7 +6036,7 @@ async fn route_select_user_table(
                 &ck_indices,
                 &storage_to_table,
             )
-            .await;
+            .await?;
             ann_rows
         } else {
             match scan_plan {
@@ -6087,7 +6120,7 @@ async fn route_select_user_table(
                         &ck_indices,
                         &storage_to_table,
                     )
-                    .await;
+                    .await?;
                     filter_rows_by_select_predicates(
                         &mut all_rows,
                         s,
@@ -7007,7 +7040,7 @@ async fn route_select_user_table(
                                     &ck_indices,
                                     &storage_to_table,
                                 )
-                                .await;
+                                .await?;
                             } else {
                                 return Err(CqlError::Invalid(
                                     "unbounded full-table materialization is disabled; use a \
@@ -7432,7 +7465,7 @@ pub(crate) fn cdc_event_to_result_frame(
         &pk_indices,
         &ck_indices,
         &storage_to_table,
-    );
+    )?;
     let selected = select_columns(&all_rows, &all_col_names, &col_names);
     Ok(Some(result::encode_rows(
         &col_names,
@@ -8415,7 +8448,10 @@ async fn read_lwt_row(
         &pk_idx,
         &ck_idx,
         &storage_to_table_indices(meta),
-    );
+    )
+    .map_err(|e| {
+        CqlError::CorruptCell(e.in_table(format!("{}.{}", target.ks, target.table_id.table)))
+    })?;
     Ok(rows.into_iter().find(|row| {
         ck_idx
             .iter()
@@ -8602,7 +8638,7 @@ async fn route_update(
                 &pk_indices,
                 &ck_indices,
                 &storage_to_table,
-            );
+            )?;
             // Find the row matching our CK values
             if ck_values.is_empty() {
                 rows.into_iter().next()
@@ -12265,7 +12301,7 @@ fn try_pk_in_lookup(
                 pk_indices,
                 ck_indices,
                 storage_to_table,
-            );
+            )?;
             all_rows.append(&mut prows);
         }
     }
@@ -17437,6 +17473,90 @@ mod tests {
             1,
             "row written only to storage must be returned by the SELECT"
         );
+    }
+
+    /// Seed `cc_ks.t (id int PRIMARY KEY, v text)` with a healthy row (id=1) and
+    /// a row (id=2) whose `v` cell is invalid UTF-8: corrupt for a text column
+    /// (the engine rejects wrong-width fixed types at write, not bad text).
+    async fn seed_corrupt_text_cell(state: &SharedState, ctx: &RequestContext<'_>) {
+        for cql in [
+            "CREATE KEYSPACE cc_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE cc_ks.t (id int PRIMARY KEY, v text)",
+            "INSERT INTO cc_ks.t (id, v) VALUES (1, 'ok')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(state, ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let key = bridge::build_decorated_key(&[CqlValue::Int(2)], &[CqlType::Int]).unwrap();
+        let row = ferrosa_sstable::Row {
+            clustering: vec![],
+            cells: vec![(
+                0,
+                ferrosa_common::CellValue::live(vec![0xff, 0xfe], 5_000_000),
+            )],
+            deletion: ferrosa_sstable::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::LivenessInfo::with_timestamp(5_000_000),
+        };
+        let tid = TableId::new("cc_ks", "t");
+        state.engine.write(&tid, &key, row, 5_000_000).unwrap();
+    }
+
+    /// CQL-Tcf7ca2cc: a partition with one corrupt simple cell fails the SELECT
+    /// with a server error that names the table; it is not a row with a NULL.
+    #[tokio::test]
+    async fn corrupt_simple_cell_fails_select_and_names_the_table() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_corrupt_text_cell(&state, &ctx).await;
+
+        for cql in [
+            "SELECT * FROM cc_ks.t",
+            "SELECT id, v FROM cc_ks.t WHERE id = 2",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            let err = match route(&state, &ctx, stmt).await {
+                Err(e) => e,
+                Ok(_) => panic!("{cql}: a corrupt cell must fail the read, not return a NULL"),
+            };
+            let CqlError::CorruptCell(inner) = &err else {
+                panic!("{cql}: expected CorruptCell, got {err:?}");
+            };
+            assert_eq!(inner.table(), Some("cc_ks.t"), "{cql}");
+            assert_eq!(inner.column(), "v", "{cql}");
+            assert_eq!(err.error_code(), 0x0000, "server error, not a client error");
+        }
+    }
+
+    /// An uncorrupted read of the same table is unchanged.
+    #[tokio::test]
+    async fn uncorrupted_row_in_same_table_still_reads() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_corrupt_text_cell(&state, &ctx).await;
+
+        let stmt = crate::parser::parse("SELECT id, v FROM cc_ks.t WHERE id = 1").unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(extract_row_count(&body), 1);
     }
 
     /// Dogfooding parity: `CREATE TYPE` persists a `system_schema.types` row

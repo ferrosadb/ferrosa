@@ -375,7 +375,7 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
         // Mirror the CQL SELECT path: one engine row per logical CQL row, with
         // values in the table's declared column order. The decomposition is
         // per-partition, so this holds one partition's rows, not the table's.
-        for cql_row in ferrosa_row_bridge::partition_to_rows_with_storage_mapping(
+        let cql_rows = match ferrosa_row_bridge::partition_to_rows_with_storage_mapping(
             &partition,
             &ctx.col_names,
             &ctx.col_types,
@@ -383,6 +383,17 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
             &ctx.ck_idx,
             &ctx.storage_to_table,
         ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                // A corrupt cell fails the query. It must never surface as a
+                // NULL or a truncated result (PG-Tcf7ca2cc).
+                let error =
+                    error.in_table(format!("{}.{}", ctx.table_id.keyspace, ctx.table_id.table));
+                failure.record(format!("scan failed: {error}"));
+                return;
+            }
+        };
+        for cql_row in cql_rows {
             let values: Vec<Value> = match cql_row
                 .iter()
                 .map(|cell| match cell {
@@ -753,7 +764,12 @@ pub(crate) fn read_row_image(
         &pk,
         &ck,
         &storage_to_table,
-    );
+    )
+    .map_err(|error| {
+        error
+            .in_table(format!("{}.{}", mutation.keyspace, mutation.table))
+            .to_string()
+    })?;
     let Some((_, cells)) = rows.into_iter().next() else {
         return Ok(None);
     };
@@ -1267,6 +1283,43 @@ mod tests {
             failure.take(),
             None,
             "a healthy empty scan must not record a failure"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// PG-Tcf7ca2cc: a partition with one corrupt simple cell fails the scan
+    /// with an error that names the table and column. The corrupt row is never
+    /// emitted as a row with a NULL; the healthy partition still reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_records_failure_naming_table_for_a_corrupt_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+        let tid = TableId::new("ks", "t");
+
+        // `name` (ordinal 0) is text: invalid UTF-8 is corrupt. (The engine
+        // rejects wrong-width fixed types at write, but not bad text.)
+        let mut corrupt = storage_row(1, "bad", 0, 1000);
+        corrupt.cells[0] = (0, CellValue::live(vec![0xff, 0xfe], 1000));
+        let key = DecoratedKey::new(PartitionKey::new(b"corrupt".to_vec()));
+        engine.write(&tid, &key, corrupt, 1000).unwrap();
+
+        let failure = ScanFailure::default();
+        let table = Arc::new(
+            load_table(&engine, &schema, "ks", "t", failure.clone())
+                .await
+                .expect("load succeeds"),
+        );
+        let rows = scan_rows(table).await;
+
+        let message = failure.take().expect("a corrupt cell must fail the scan");
+        assert!(message.contains("ks.t"), "must name the table: {message}");
+        assert!(message.contains("name"), "must name the column: {message}");
+        assert!(
+            rows.is_empty(),
+            "a corrupt row must not be emitted with a NULL: {rows:?}"
         );
 
         engine.shutdown().unwrap();

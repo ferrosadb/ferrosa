@@ -19,10 +19,9 @@ dependency/usage review.
   Duration's signed-vint compatibility and malformed trailing-byte cases are
   already covered in-crate.
 
-- **Carry decode errors to the client** (FMEA RB-8). `decode_output_row` and the
-  `ferrosa-cql` bridge still log a corrupt cell and emit `None` for that column
-  because they return `Vec<Option<CqlValue>>`. Change them to return a `Result`
-  so the SELECT fails with table and key context.
+- ~~**Carry decode errors to the client** (FMEA RB-8)~~ Done (t_cf7ca2cc,
+  FMEA RB-Tcf7ca2cc): the `partition_to_rows*` family, both visitors and the
+  `ferrosa-cql` metadata decomposition return `Result<_, RowDecodeError>`.
 
 ## Next
 
