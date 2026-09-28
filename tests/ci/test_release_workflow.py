@@ -192,6 +192,21 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("--disable-zlibdebuginfo", script)
         self.assertIn("cflags=-mno-outline-atomics", script)
 
+    def test_all_feature_test_workflows_install_host_libunwind(self):
+        for workflow_path in (
+            CI_WORKFLOW,
+            ROOT / ".github" / "workflows" / "nightly-fuzz.yml",
+            ROOT / ".github" / "workflows" / "nightly-slow-tests.yml",
+        ):
+            with self.subTest(workflow=workflow_path.name):
+                self.assertIn("libunwind-dev", workflow_path.read_text(encoding="utf-8"))
+
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        test_job = workflow.split("  test:\n", 1)[1].split("\n  postgres-oracle:\n", 1)[0]
+        integration_job = workflow.split("  integration:\n", 1)[1].split("\n  docs:\n", 1)[0]
+        self.assertIn("sudo apt-get install -y capnproto libunwind-dev", test_job)
+        self.assertIn("sudo apt-get install -y capnproto libunwind-dev", integration_job)
+
 
 if __name__ == "__main__":
     unittest.main()

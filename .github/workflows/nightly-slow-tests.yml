@@ -96,11 +96,7 @@ jobs:
       - name: Install capnproto
         run: |
           set -euo pipefail
-          if command -v capnp >/dev/null 2>&1; then
-            echo "capnp already present: $(capnp --version)"
-            exit 0
-          fi
-          sudo apt-get update && sudo apt-get install -y capnproto
+          sudo apt-get update && sudo apt-get install -y capnproto libunwind-dev
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}

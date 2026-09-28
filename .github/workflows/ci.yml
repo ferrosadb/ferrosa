@@ -95,7 +95,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - name: Install capnproto
-        run: sudo apt-get update && sudo apt-get install -y capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto libunwind-dev
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: false
@@ -781,7 +781,7 @@ jobs:
             /usr/share/swift || true
           df -h /
       - name: Install capnproto
-        run: sudo apt-get update && sudo apt-get install -y capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto libunwind-dev
       - name: Download prebuilt node image
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
