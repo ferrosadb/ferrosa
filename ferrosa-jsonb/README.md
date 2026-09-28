@@ -18,7 +18,18 @@ ferrosa-common ferrosa-jsonb` enforces it). Runtime dependencies are `bytes`,
   and 16383 after the decimal point (D14a), 256 MiB encoded (D14d).
 - `DuplicateKeyPolicy` (D6b): `LastWins` (default) or `Error`.
 
-Not yet implemented: the value, number, codec, validator and builder (T-101 on).
+## Implemented (T-101)
+
+- `Number`: exact decimal (`i64`, `i128` with scale, or `BigInt` with scale). Built
+  by `Number::parse_lexeme`, `from_i64`, `from_u64`, `from_f64_shortest`. Scale is
+  preserved (`1.10` stays scale 2). `Display` prints canonical text with scale.
+  `Eq`, `Ord` and `Hash` compare by value (`1.0 == 1 == 1.00`).
+- `NumberKind` via `Number::kind()`: the smallest Variant kind (int8..int64,
+  decimal4/8/16, `ferrosa.bigdecimal`); u64 above `i64::MAX` is decimal16 scale 0 (T11).
+- D14a digit caps run on the lexeme before any `BigInt` is built (JB-D2).
+- New errors: `InvalidNumber { offset }`, `NonFiniteNumber`.
+
+Not yet implemented: the value, codec, validator and builder (T-102 on).
 
 ## Safety
 

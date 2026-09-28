@@ -44,6 +44,24 @@ write-path maximum passed by the caller (commit-log segment size, D14d). Precede
 is TOML, then env, then default. `from_config_with_env` injects the environment so
 tests never call `set_var`.
 
+## Number (T-101)
+
+`Number` is exact: no implicit `f64`. `parse_lexeme` follows architecture C9. The
+stored scale is `max(0, F - e)` for `F` fraction digits and exponent `e`; the
+unscaled integer is rescaled to match, `-0` is `0`, and no trailing zero is
+stripped. Order of work: (1) grammar scan, (2) digit counts in `i64` arithmetic
+(exponent saturates, so `1e2147483648` cannot overflow), (3) `HardCeilings::check_digits`,
+(4) only then `BigInt::parse_bytes`. An integer part of 147456 digits or more is
+refused without scanning further, so a 10 MiB single-number document fails in
+microseconds.
+
+Representation is canonical: `I64` only at scale 0, else `I128`, else `Big`.
+`Eq`/`Hash`/`Ord` use a value form (unscaled, scale) with trailing zeros removed to
+scale 0, for comparison only (D2a). `from_f64_shortest` uses Rust's shortest
+round-trip formatting; integral floats get scale 1; NaN and infinities are
+`NonFiniteNumber`. `to_f64_if_shortest_round_trips` returns `Some` only when the
+`f64` re-renders to the same value.
+
 ## Incremental enforcement
 
 `Limits::check_*` and `HardCeilings::check_*` are pure comparisons meant to be

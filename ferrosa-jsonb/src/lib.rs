@@ -12,9 +12,11 @@
 
 pub mod error;
 pub mod limits;
+pub mod number;
 
 pub use error::{JsonbError, LimitsError};
 pub use limits::{
     DuplicateKeyPolicy, HardCeilings, Limits, LimitsConfig, HARD_MAX_DEPTH,
     HARD_MAX_DIGITS_AFTER_POINT, HARD_MAX_DIGITS_BEFORE_POINT, HARD_MAX_ENCODED_BYTES,
 };
+pub use number::{Number, NumberKind};

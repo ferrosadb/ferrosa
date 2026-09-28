@@ -24,6 +24,12 @@ pub enum JsonbError {
     /// A number has too many digits after the decimal point (D14a).
     #[error("jsonb number has {digits} digits after the decimal point, above the limit of {max}")]
     DigitsAfterPointExceeded { digits: usize, max: usize },
+    /// The text is not a JSON number lexeme; `offset` is the byte position.
+    #[error("jsonb number lexeme is malformed at byte offset {offset}")]
+    InvalidNumber { offset: usize },
+    /// NaN or an infinity has no jsonb number form (D12a, FM-48).
+    #[error("jsonb cannot represent a non-finite number")]
+    NonFiniteNumber,
     /// A key list (for example an exists-list argument) is too long.
     #[error("jsonb key list has {len} keys, above the limit of {max}")]
     KeyListTooLong { len: usize, max: usize },

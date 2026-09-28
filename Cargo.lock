@@ -2572,6 +2572,7 @@ version = "0.22.0"
 dependencies = [
  "bytes",
  "num-bigint",
+ "proptest",
  "thiserror 2.0.18",
 ]
 
