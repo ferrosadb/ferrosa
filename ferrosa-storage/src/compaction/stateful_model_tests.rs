@@ -23,7 +23,10 @@ use crate::TableId;
 
 const MODEL_KEYS: [u8; 4] = [0, 1, 2, 3];
 const MAX_PROGRAM_OPS: usize = 16;
-const MODEL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hang guard, not a pacing budget: every wait below is on a completion signal
+/// (hook fired, drain finished, result posted). It only turns a worker that never
+/// finishes into a loud failure, so it is sized for a heavily loaded CI box.
+const MODEL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -160,10 +163,18 @@ async fn run_compaction(engine: &Arc<StorageEngine>, table: &TableId, cancel: bo
     let scope = table.to_string();
     let guard = if cancel {
         let fired_for_hook = Arc::clone(&fired);
+        let scope_for_hook = scope.clone();
         Some(CancelHookGuard::install(
             scope.clone(),
             Arc::new(move |point| {
                 if point == CancelPoint::MergePartitionFirst {
+                    // ST-T9e30472a: cancel from INSIDE the hook, on the worker
+                    // thread, so the cancel lands at exactly this checkpoint.
+                    // Cancelling from the test thread after observing `fired`
+                    // raced the merge: under load the worker could finish and
+                    // post a live result first, which then sat un-polled and
+                    // was integrated (and discarded) by the next Compact op.
+                    cancel_now(&scope_for_hook, CancelReason::Operator);
                     fired_for_hook.store(true, Ordering::SeqCst);
                 }
             }),
@@ -180,7 +191,6 @@ async fn run_compaction(engine: &Arc<StorageEngine>, table: &TableId, cancel: bo
         })
         .await;
         assert!(reached_checkpoint.is_ok(), "cancel hook did not fire");
-        cancel_now(&scope, CancelReason::Operator);
         let drained = tokio::time::timeout(
             MODEL_TIMEOUT,
             engine.pause_table_compactions(table, CancelReason::Operator),
