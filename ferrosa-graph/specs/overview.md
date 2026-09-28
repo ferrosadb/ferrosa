@@ -87,6 +87,10 @@ full sequence.
    observable (logs repaired/orphan counts) and idempotent. It is a safety net,
    never the source of truth — fail-loud philosophy: the observer is expected to
    keep the index correct; the reconciler quantifies and closes residual drift.
+   **Write values are never silently emptied.** CREATE/MERGE property values
+   that are not literals (maps, lists, computed expressions) return a typed
+   `GraphError::Validation` on the schema-less path instead of storing empty
+   bytes (FMEA G-11); jsonb storage of maps/lists arrives with D12.
 3. **Adjacency clustering wire format is fixed.** Each clustering component is
    `[u16 BE length][bytes]`: `(direction:1B, edge_label:text, neighbor_id:blob)`.
    The SSTable writer's composite parser (`validate_clustering_shape`) rejects any

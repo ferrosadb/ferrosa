@@ -3733,6 +3733,24 @@ fn expr_to_column_bytes(
     }
 }
 
+/// Encode properties positionally (no table metadata) into cells.
+///
+/// A non-literal value (map, list, computed expression) is a typed error, never
+/// an empty cell: silently storing empty bytes is data loss (FM-50). Storing
+/// maps and lists as jsonb is a later packet (D12).
+fn schemaless_cells<'a>(
+    props: impl Iterator<Item = &'a (String, Expr)>,
+    timestamp: i64,
+) -> Result<Vec<(u16, CellValue)>> {
+    props
+        .enumerate()
+        .map(|(idx, (_name, expr))| {
+            let bytes = expr_to_bytes(expr)?;
+            Ok((idx as u16, CellValue::live(bytes, timestamp)))
+        })
+        .collect()
+}
+
 fn create_row_from_schema(
     op: &CreateOp,
     meta: Option<&ferrosa_schema::metadata::table::TableMetadata>,
@@ -3741,15 +3759,7 @@ fn create_row_from_schema(
     let Some(meta) = meta else {
         let key_bytes = uuid::Uuid::new_v4().as_bytes().to_vec();
         let hex_key = hex::encode(&key_bytes);
-        let cells: Vec<(u16, CellValue)> = op
-            .props
-            .iter()
-            .enumerate()
-            .map(|(idx, (_name, expr))| {
-                let bytes = expr_to_bytes(expr).unwrap_or_default();
-                (idx as u16, CellValue::live(bytes, timestamp))
-            })
-            .collect();
+        let cells = schemaless_cells(op.props.iter(), timestamp)?;
         return Ok((
             DecoratedKey::new(PartitionKey::new(key_bytes)),
             Row {
@@ -3955,7 +3965,7 @@ async fn execute_create(
 ///
 /// Key layout: `blake3(key_name_0 || NUL || value_bytes_0 || NUL || key_name_1 || ...)`
 /// sorted by `key_name`.
-fn content_addressed_key(match_props: &[(String, Expr)]) -> Vec<u8> {
+fn content_addressed_key(match_props: &[(String, Expr)]) -> Result<Vec<u8>> {
     let mut sorted: Vec<&(String, Expr)> = match_props.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -3963,11 +3973,11 @@ fn content_addressed_key(match_props: &[(String, Expr)]) -> Vec<u8> {
     for (name, expr) in &sorted {
         hasher.update(name.as_bytes());
         hasher.update(b"\x00");
-        let val_bytes = expr_to_bytes(expr).unwrap_or_default();
+        let val_bytes = expr_to_bytes(expr)?;
         hasher.update(&val_bytes);
         hasher.update(b"\x00");
     }
-    hasher.finalize().as_bytes().to_vec()
+    Ok(hasher.finalize().as_bytes().to_vec())
 }
 
 fn graph_write_consistency() -> ConsistencyLevel {
@@ -4409,7 +4419,7 @@ fn build_merge_write_shape(
 
     let key_bytes: Vec<u8> = if op.table.graph_type == "edge" {
         match &op.src_match_props {
-            Some(src_props) => content_addressed_key(src_props),
+            Some(src_props) => content_addressed_key(src_props)?,
             None => {
                 tracing::error!(
                     file = file!(),
@@ -4432,12 +4442,12 @@ fn build_merge_write_shape(
             }
         }
     } else {
-        content_addressed_key(&op.match_props)
+        content_addressed_key(&op.match_props)?
     };
 
     let clustering: Vec<u8> = if op.table.graph_type == "edge" {
         match &op.dst_match_props {
-            Some(dst_props) => content_addressed_key(dst_props),
+            Some(dst_props) => content_addressed_key(dst_props)?,
             None => {
                 tracing::error!(
                     file = file!(),
@@ -4478,26 +4488,16 @@ fn build_merge_write_shape(
                 .collect();
             encode_storage_ordered_cells(meta, &property_exprs, timestamp)?
         } else {
-            op.match_props
-                .iter()
-                .chain(op.create_props.iter())
-                .enumerate()
-                .map(|(idx, (_name, expr))| {
-                    let bytes = expr_to_bytes(expr).unwrap_or_default();
-                    (idx as u16, CellValue::live(bytes, timestamp))
-                })
-                .collect()
+            schemaless_cells(
+                op.match_props.iter().chain(op.create_props.iter()),
+                timestamp,
+            )?
         }
     } else {
-        op.match_props
-            .iter()
-            .chain(op.create_props.iter())
-            .enumerate()
-            .map(|(idx, (_name, expr))| {
-                let bytes = expr_to_bytes(expr).unwrap_or_default();
-                (idx as u16, CellValue::live(bytes, timestamp))
-            })
-            .collect()
+        schemaless_cells(
+            op.match_props.iter().chain(op.create_props.iter()),
+            timestamp,
+        )?
     };
 
     Ok(MergeWriteShape {
@@ -9538,5 +9538,124 @@ mod tests {
             stream.next().await.is_none(),
             "the stream must terminate after a projection error, not keep yielding"
         );
+    }
+
+    // --- T-012 / FM-50: non-literal property values fail loud ---------------
+
+    fn non_literal_exprs() -> Vec<(&'static str, Expr)> {
+        vec![
+            (
+                "map",
+                Expr::Map(vec![(
+                    "k".to_string(),
+                    Expr::Literal(Literal::String("v".to_string())),
+                )]),
+            ),
+            ("list", Expr::List(vec![Expr::Literal(Literal::Integer(1))])),
+            ("var", Expr::Var("x".to_string())),
+        ]
+    }
+
+    fn non_literal_table(graph_type: &str) -> crate::planner::ResolvedTable {
+        crate::planner::ResolvedTable {
+            keyspace: "ks".to_string(),
+            table: "t".to_string(),
+            label: "L".to_string(),
+            graph_type: graph_type.to_string(),
+        }
+    }
+
+    fn non_literal_merge_op(props: Vec<(String, Expr)>, create: Vec<(String, Expr)>) -> MergeOp {
+        MergeOp {
+            var: None,
+            table: non_literal_table("vertex"),
+            match_props: props,
+            create_props: create,
+            src_match_props: None,
+            src_var: None,
+            dst_match_props: None,
+            dst_var: None,
+        }
+    }
+
+    fn assert_typed_validation_error<T>(what: &str, result: std::result::Result<T, GraphError>) {
+        match result {
+            Err(GraphError::Validation(msg)) => {
+                assert!(msg.contains("cannot convert"), "{what}: message was {msg}")
+            }
+            Err(other) => panic!("{what}: expected GraphError::Validation, got {other:?}"),
+            Ok(_) => panic!("{what}: expected an error, got Ok (silent empty-bytes write)"),
+        }
+    }
+
+    #[test]
+    fn graph_non_literal_property_is_typed_error_create_schemaless() {
+        for (what, expr) in non_literal_exprs() {
+            let op = CreateOp {
+                var: None,
+                table: non_literal_table("vertex"),
+                props: vec![("p".to_string(), expr)],
+            };
+            assert_typed_validation_error(what, create_row_from_schema(&op, None, 1));
+        }
+    }
+
+    #[test]
+    fn graph_non_literal_property_is_typed_error_content_key() {
+        for (what, expr) in non_literal_exprs() {
+            let props = vec![("p".to_string(), expr)];
+            assert_typed_validation_error(what, content_addressed_key(&props));
+        }
+    }
+
+    #[test]
+    fn graph_non_literal_property_is_typed_error_merge_without_schema() {
+        for (what, expr) in non_literal_exprs() {
+            let ok = vec![("id".to_string(), Expr::Literal(Literal::Integer(1)))];
+            let op = non_literal_merge_op(ok, vec![("p".to_string(), expr)]);
+            assert_typed_validation_error(what, build_merge_write_shape(&op, &[], None, 1));
+        }
+    }
+
+    #[test]
+    fn graph_non_literal_property_is_typed_error_merge_schema_without_table() {
+        let schema = test_schema();
+        for (what, expr) in non_literal_exprs() {
+            let ok = vec![("id".to_string(), Expr::Literal(Literal::Integer(1)))];
+            let op = non_literal_merge_op(ok, vec![("p".to_string(), expr)]);
+            assert_typed_validation_error(
+                what,
+                build_merge_write_shape(&op, &[], Some(&schema), 1),
+            );
+        }
+    }
+
+    #[test]
+    fn graph_non_literal_property_is_typed_error_merge_match_prop() {
+        for (what, expr) in non_literal_exprs() {
+            let op = non_literal_merge_op(vec![("p".to_string(), expr)], vec![]);
+            assert_typed_validation_error(what, build_merge_write_shape(&op, &[], None, 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_non_literal_property_is_typed_error_execute_create_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wp = WritePath::direct(test_storage_engine(tmp.path()));
+        let creates = vec![CreateOp {
+            var: None,
+            table: non_literal_table("vertex"),
+            props: vec![("p".to_string(), non_literal_exprs().remove(0).1)],
+        }];
+        let result = execute_create(
+            &wp,
+            &creates,
+            None,
+            &GraphEngineConfig::default(),
+            Instant::now(),
+            None,
+        )
+        .await;
+        assert_typed_validation_error("execute_create", result);
     }
 }

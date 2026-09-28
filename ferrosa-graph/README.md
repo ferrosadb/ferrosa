@@ -101,6 +101,9 @@ resolved port.
 - **Variable-length paths** (`executor/varpath.rs`, `leapfrog.rs`) — BFS over
   `min..=max` hops with a visited set for cycle detection and a
   `max_var_path_visited` vertex budget (threat T13).
+- **Property write encoding** (`executor/expand.rs`) — schema-less CREATE/MERGE
+  accept literal values only; a map, list or computed expression returns
+  `GraphError::Validation` rather than storing empty bytes (FMEA G-11).
 - **Aggregations** (`executor/aggregate.rs`) — `count`, `sum`, `avg`, `min`,
   `max`, `collect`, with `max_groups` / `max_collect_size` caps.
 - **Adjacency index** (`adjacency/`) — `schema` (table layout + naming),
