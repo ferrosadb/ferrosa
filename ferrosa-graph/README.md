@@ -114,6 +114,11 @@ resolved port.
   to start when `require_tls` is set without a certificate, and the
   disabled-engine stub serves over TLS when a certificate is configured
   (t_d5d122ba). The binary feeds both from `[graph] tls_cert/tls_key/require_tls`.
+
+  SUBSCRIBE) and `bolt/` (Bolt v5 handshake, PackStream codec, message dispatch). The PackStream decoder bounds
+  List/Map/Structure nesting at `codec::MAX_NESTING_DEPTH` (128) and rejects
+  declared counts the input cannot satisfy, so a pre-auth HELLO cannot overflow
+  the stack or force a huge allocation (`CodecError::NestingTooDeep`).
 - **Cluster-aware DDL** — adjacency keyspace/table creation routes through the
   same `DdlPath` regular CQL `CREATE TABLE` uses, so every replica registers the
   system table (`ClusterGraphSchemaCoordinator`); a local coordinator is the

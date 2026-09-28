@@ -19,6 +19,8 @@ pub enum CodecError {
     InvalidUtf8,
     /// A message exceeded the maximum allowed size.
     MessageTooLarge(usize),
+    /// List/Map/Structure nesting exceeded the given maximum depth.
+    NestingTooDeep(usize),
 }
 
 impl fmt::Display for CodecError {
@@ -29,6 +31,9 @@ impl fmt::Display for CodecError {
             Self::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
             Self::MessageTooLarge(size) => {
                 write!(f, "message too large: {size} bytes")
+            }
+            Self::NestingTooDeep(limit) => {
+                write!(f, "value nested deeper than the limit of {limit} levels")
             }
         }
     }
@@ -236,8 +241,25 @@ fn encode_structure(tag: u8, fields: &[PackValue], buf: &mut Vec<u8>) {
 
 /// Decode a [`PackValue`] from PackStream bytes.
 ///
-/// Returns the decoded value and the number of bytes consumed.
+/// Returns the decoded value and the number of bytes consumed. Fails with
+/// [`CodecError::NestingTooDeep`] when List/Map/Structure nesting exceeds
+/// [`MAX_NESTING_DEPTH`].
 pub fn decode(data: &[u8]) -> Result<(PackValue, usize), CodecError> {
+    decode_at(data, 0)
+}
+
+/// Maximum List/Map/Structure nesting depth accepted by [`decode`].
+///
+/// The decoder recurses once per nesting level and runs before authentication
+/// (HELLO), on a 2 MiB tokio worker stack, on messages up to 16 MiB. One byte
+/// (`0x91`) buys one level, so unbounded depth lets an unauthenticated peer
+/// overflow the stack and abort the process. 128 matches the HTTP envelope
+/// limit and is far beyond any real Bolt message (typically <= 5 levels);
+/// worst-case stack use at this depth is a few tens of KiB.
+pub const MAX_NESTING_DEPTH: usize = 128;
+
+/// `depth` is the number of enclosing containers already open.
+fn decode_at(data: &[u8], depth: usize) -> Result<(PackValue, usize), CodecError> {
     if data.is_empty() {
         return Err(CodecError::UnexpectedEnd);
     }
@@ -306,34 +328,34 @@ pub fn decode(data: &[u8]) -> Result<(PackValue, usize), CodecError> {
         MARKER_LIST_8 => {
             ensure_len(data, 2)?;
             let len = data[1] as usize;
-            decode_list_items(data, len, 2)
+            decode_list_items(data, len, 2, depth)
         }
         MARKER_LIST_16 => {
             ensure_len(data, 3)?;
             let len = u16::from_be_bytes(data[1..3].try_into().unwrap()) as usize;
-            decode_list_items(data, len, 3)
+            decode_list_items(data, len, 3, depth)
         }
         MARKER_LIST_32 => {
             ensure_len(data, 5)?;
             let len = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
-            decode_list_items(data, len, 5)
+            decode_list_items(data, len, 5, depth)
         }
 
         // ── Map sizes ──
         MARKER_MAP_8 => {
             ensure_len(data, 2)?;
             let len = data[1] as usize;
-            decode_map_entries(data, len, 2)
+            decode_map_entries(data, len, 2, depth)
         }
         MARKER_MAP_16 => {
             ensure_len(data, 3)?;
             let len = u16::from_be_bytes(data[1..3].try_into().unwrap()) as usize;
-            decode_map_entries(data, len, 3)
+            decode_map_entries(data, len, 3, depth)
         }
         MARKER_MAP_32 => {
             ensure_len(data, 5)?;
             let len = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
-            decode_map_entries(data, len, 5)
+            decode_map_entries(data, len, 5, depth)
         }
 
         // ── Structure sizes ──
@@ -341,13 +363,13 @@ pub fn decode(data: &[u8]) -> Result<(PackValue, usize), CodecError> {
             ensure_len(data, 3)?; // marker + 1-byte len + tag
             let len = data[1] as usize;
             let tag = data[2];
-            decode_struct_fields(data, tag, len, 3)
+            decode_struct_fields(data, tag, len, 3, depth)
         }
         MARKER_STRUCT_16 => {
             ensure_len(data, 4)?; // marker + 2-byte len + tag
             let len = u16::from_be_bytes(data[1..3].try_into().unwrap()) as usize;
             let tag = data[3];
-            decode_struct_fields(data, tag, len, 4)
+            decode_struct_fields(data, tag, len, 4, depth)
         }
 
         // ── Tiny types (ranges) ──
@@ -367,19 +389,19 @@ pub fn decode(data: &[u8]) -> Result<(PackValue, usize), CodecError> {
             // Tiny list: 0x90..=0x9F
             else if (MARKER_TINY_LIST..MARKER_TINY_LIST + 0x10).contains(&marker) {
                 let len = (marker & 0x0F) as usize;
-                decode_list_items(data, len, 1)
+                decode_list_items(data, len, 1, depth)
             }
             // Tiny map: 0xA0..=0xAF
             else if (MARKER_TINY_MAP..MARKER_TINY_MAP + 0x10).contains(&marker) {
                 let len = (marker & 0x0F) as usize;
-                decode_map_entries(data, len, 1)
+                decode_map_entries(data, len, 1, depth)
             }
             // Tiny struct: 0xB0..=0xBF
             else if (MARKER_TINY_STRUCT..MARKER_TINY_STRUCT + 0x10).contains(&marker) {
                 let len = (marker & 0x0F) as usize;
                 ensure_len(data, 2)?; // marker + tag
                 let tag = data[1];
-                decode_struct_fields(data, tag, len, 2)
+                decode_struct_fields(data, tag, len, 2, depth)
             } else {
                 Err(CodecError::InvalidMarker(marker))
             }
@@ -416,14 +438,37 @@ fn decode_string_n(
     Ok((PackValue::String(s.to_owned()), header + len))
 }
 
+/// Enter a container: enforce the depth limit and reject counts that the
+/// remaining input cannot possibly satisfy (each element needs at least
+/// `min_bytes_per_item` bytes), so a tiny header cannot force a huge
+/// pre-allocation.
+fn enter_container(
+    data: &[u8],
+    count: usize,
+    offset: usize,
+    min_bytes_per_item: usize,
+    depth: usize,
+) -> Result<(), CodecError> {
+    if depth >= MAX_NESTING_DEPTH {
+        return Err(CodecError::NestingTooDeep(MAX_NESTING_DEPTH));
+    }
+    let remaining = data.len().saturating_sub(offset);
+    match count.checked_mul(min_bytes_per_item) {
+        Some(needed) if needed <= remaining => Ok(()),
+        _ => Err(CodecError::UnexpectedEnd),
+    }
+}
+
 fn decode_list_items(
     data: &[u8],
     count: usize,
     mut offset: usize,
+    depth: usize,
 ) -> Result<(PackValue, usize), CodecError> {
+    enter_container(data, count, offset, 1, depth)?;
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
-        let (val, consumed) = decode(&data[offset..])?;
+        let (val, consumed) = decode_at(&data[offset..], depth + 1)?;
         items.push(val);
         offset += consumed;
     }
@@ -434,17 +479,21 @@ fn decode_map_entries(
     data: &[u8],
     count: usize,
     mut offset: usize,
+    depth: usize,
 ) -> Result<(PackValue, usize), CodecError> {
+    // Each entry is at least a 1-byte key marker plus a 1-byte value.
+    enter_container(data, count, offset, 2, depth)?;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         // Key must be a string
-        let (key_val, consumed) = decode(&data[offset..])?;
+        let key_start = offset;
+        let (key_val, consumed) = decode_at(&data[offset..], depth + 1)?;
         offset += consumed;
         let key = match key_val {
             PackValue::String(s) => s,
-            _ => return Err(CodecError::InvalidMarker(data[offset - consumed])),
+            _ => return Err(CodecError::InvalidMarker(data[key_start])),
         };
-        let (val, consumed) = decode(&data[offset..])?;
+        let (val, consumed) = decode_at(&data[offset..], depth + 1)?;
         offset += consumed;
         entries.push((key, val));
     }
@@ -456,10 +505,12 @@ fn decode_struct_fields(
     tag: u8,
     count: usize,
     mut offset: usize,
+    depth: usize,
 ) -> Result<(PackValue, usize), CodecError> {
+    enter_container(data, count, offset, 1, depth)?;
     let mut fields = Vec::with_capacity(count);
     for _ in 0..count {
-        let (val, consumed) = decode(&data[offset..])?;
+        let (val, consumed) = decode_at(&data[offset..], depth + 1)?;
         fields.push(val);
         offset += consumed;
     }
@@ -871,6 +922,110 @@ mod tests {
                     format!("{:?}", decoded)
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+    use crate::bolt::message::BoltMessage;
+
+    /// `levels` nested one-element tiny lists around an Int leaf.
+    fn nested_lists(levels: usize) -> Vec<u8> {
+        let mut buf = vec![0x91; levels];
+        buf.push(0x01);
+        buf
+    }
+
+    #[test]
+    fn nesting_at_the_limit_decodes() {
+        let buf = nested_lists(MAX_NESTING_DEPTH);
+        let (_, consumed) = decode(&buf).expect("exactly MAX_NESTING_DEPTH levels must decode");
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn nesting_past_the_limit_is_a_typed_error() {
+        let buf = nested_lists(MAX_NESTING_DEPTH + 1);
+        match decode(&buf) {
+            Err(CodecError::NestingTooDeep(limit)) => assert_eq!(limit, MAX_NESTING_DEPTH),
+            other => panic!("expected NestingTooDeep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_and_structures_share_the_depth_budget() {
+        // Tiny map {"a": <next>} and tiny struct (tag 1, one field) alternate.
+        let mut buf = Vec::new();
+        for i in 0..=MAX_NESTING_DEPTH {
+            if i % 2 == 0 {
+                buf.extend_from_slice(&[0xA1, 0x81, b'a']);
+            } else {
+                buf.extend_from_slice(&[0xB1, 0x01]);
+            }
+        }
+        buf.push(0x01);
+        assert!(matches!(
+            decode(&buf),
+            Err(CodecError::NestingTooDeep(MAX_NESTING_DEPTH))
+        ));
+    }
+
+    /// 1M nested lists (1 MiB of input) overflowed a 2 MiB stack before the
+    /// depth limit existed. Runs on the ordinary test thread.
+    #[test]
+    fn million_deep_message_does_not_overflow_the_stack() {
+        let buf = nested_lists(1_000_000);
+        assert!(matches!(
+            decode(&buf),
+            Err(CodecError::NestingTooDeep(MAX_NESTING_DEPTH))
+        ));
+    }
+
+    /// Same attack as a pre-auth HELLO: STRUCT(0x01) { {"x": <deep>} }.
+    #[test]
+    fn deep_hello_is_rejected_by_message_decode() {
+        let mut buf = vec![0xB1, 0x01, 0xA1, 0x81, b'x'];
+        buf.extend(nested_lists(1_000_000));
+        let err = BoltMessage::decode(&buf).expect_err("deep HELLO must be rejected");
+        assert!(matches!(err, CodecError::NestingTooDeep(_)), "{err:?}");
+    }
+
+    #[test]
+    fn realistic_hello_still_decodes() {
+        let hello = PackValue::Structure {
+            tag: 0x01,
+            fields: vec![PackValue::Map(vec![
+                (
+                    "user_agent".into(),
+                    PackValue::String("neo4j-python/5.0".into()),
+                ),
+                (
+                    "routing".into(),
+                    PackValue::Map(vec![(
+                        "address".into(),
+                        PackValue::List(vec![PackValue::String("localhost:7687".into())]),
+                    )]),
+                ),
+                ("patch_bolt".into(), PackValue::List(vec![])),
+            ])],
+        };
+        let mut buf = Vec::new();
+        encode(&hello, &mut buf);
+        assert!(matches!(
+            BoltMessage::decode(&buf),
+            Ok(BoltMessage::Hello { .. })
+        ));
+    }
+
+    #[test]
+    fn huge_declared_count_with_truncated_body_is_an_error() {
+        // LIST_32 / MAP_32 declaring u32::MAX elements with no body.
+        for marker in [MARKER_LIST_32, MARKER_MAP_32] {
+            let mut buf = vec![marker];
+            buf.extend_from_slice(&u32::MAX.to_be_bytes());
+            assert!(matches!(decode(&buf), Err(CodecError::UnexpectedEnd)));
         }
     }
 }

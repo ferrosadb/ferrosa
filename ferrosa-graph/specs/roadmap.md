@@ -41,6 +41,9 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
   whose filters keep most of a large table still holds a query-sized frontier.
   The `AnchorScan` operator in `specs/streaming-executor-design.md` is the
   remaining step.
+- **Fuzz the PackStream decoder (FMEA G-10).** Depth and pre-allocation are
+  bounded and unit-tested; add a cargo-fuzz target over `bolt::codec::decode`
+  and `BoltMessage::decode` to find the next parser hazard.
 - **Cost-aware variable-length paths (FMEA G-4).** Add a planner estimate for
   `[*min..max]` fan-out and reject/flag unbounded `[*]` at `EXPLAIN` time; make the
   vertex budget cardinality-aware rather than a single global cap.

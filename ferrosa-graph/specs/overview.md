@@ -56,7 +56,7 @@ resolved Bolt port.
 | `adjacency::reconcile` | background safety-net scan (repair missing, tombstone orphans) |
 | `engine` (~3.2k LoC) | composition root: orchestrates parse→plan→exec, lazy adjacency setup, FOREACH / CALL {} expansion, DDL coordinators |
 | `http` | axum HTTP/JSON endpoint, Basic auth, TLS, body limit, SSE for SUBSCRIBE |
-| `bolt` | Bolt v5 handshake, PackStream codec, message dispatch, TCP server |
+| `bolt` | Bolt v5 handshake, PackStream codec (nesting depth capped at 128, counts validated against remaining input), message dispatch, TCP server |
 
 ## Data flow (summary)
 
