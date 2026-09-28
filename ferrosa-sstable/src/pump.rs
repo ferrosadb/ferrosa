@@ -1084,6 +1084,33 @@ fn prime_receiver_waiter<T>(receiver: &Receiver<T>) {
     }
 }
 
+/// Prime the producer's two-receiver selector before writes are accepted.
+/// Priming each receiver separately does not warm Crossbeam's selector state
+/// for the two-operation shape used by `wait_for_free_segment_blocking`.
+fn prime_pair_waiter<T, U>(first: &Receiver<T>, second: &Receiver<U>) {
+    let mut selection = Select::new();
+    let first_index = selection.recv(first);
+    let second_index = selection.recv(second);
+    let discard_unavailable = |operation: crossbeam_channel::SelectedOperation<'_>| {
+        if operation.index() == first_index {
+            assert!(operation.recv(first).is_err(), "priming consumed a payload");
+        } else if operation.index() == second_index {
+            assert!(
+                operation.recv(second).is_err(),
+                "priming consumed a payload"
+            );
+        }
+    };
+    if let Ok(operation) = selection.try_select() {
+        discard_unavailable(operation);
+    }
+    // The blocking wait uses Crossbeam's timed-select path after the quick
+    // probe. A zero-duration select initializes that path without parking.
+    if let Ok(operation) = selection.select_timeout(Duration::ZERO) {
+        discard_unavailable(operation);
+    }
+}
+
 fn run_flusher(
     mut sink: Box<dyn SegmentSink>,
     full_rx: Receiver<Filled>,
@@ -1474,8 +1501,7 @@ impl AlignedPump {
         let (free_tx, free_rx) = bounded::<AlignedBuf>(cap);
         let (err_tx, err_rx) = bounded::<PumpError>(1);
         let (ready_tx, ready_rx) = bounded(1);
-        prime_receiver_waiter(&free_rx);
-        prime_receiver_waiter(abort.closed());
+        prime_pair_waiter(&free_rx, abort.closed());
         for _ in 0..cap {
             // Pre-fill `free` with every segment this pump will ever own
             // (decisions.md D2): the ring IS the two channels — there is no
