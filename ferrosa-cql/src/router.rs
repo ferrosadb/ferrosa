@@ -3248,6 +3248,11 @@ pub async fn route(
         &ctx.auth.role,
     );
 
+    // Conditional statements need SELECT as well as MODIFY. Reject before the
+    // Accord path can touch the row, a peer, or any cluster-state error that
+    // would tell a MODIFY-only caller something about the table.
+    authorize_conditional_statement(state, ctx, &stmt)?;
+
     // Check if this statement requires Accord consensus (LWT).
     // Determined by serial_consistency being set in the request context.
     {
@@ -8049,12 +8054,8 @@ async fn route_insert(
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
     validate_keyspace_exists(&state.schema, ks)?;
 
-    // Permission check (M8)
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
-    )?;
+    // Permission check (M8); IF NOT EXISTS also needs SELECT (fail closed).
+    check_write_permission(state, ctx, ks, &s.table, s.if_not_exists)?;
 
     let snap = state.schema.snapshot();
     let table_meta = snap
@@ -8166,14 +8167,14 @@ async fn route_insert(
 
         if let Some(ref existing) = existing_row {
             // Row already exists — return [applied] = false with existing row data
-            return Ok(encode_lwt_applied(
+            return encode_lwt_applied(
                 false,
                 ks,
                 &s.table,
                 table_meta,
                 &state.schema,
                 Some(existing),
-            ));
+            );
         }
     }
 
@@ -8192,14 +8193,7 @@ async fn route_insert(
 
     if s.if_not_exists {
         // Insert was applied — return [applied] = true
-        Ok(encode_lwt_applied(
-            true,
-            ks,
-            &s.table,
-            table_meta,
-            &state.schema,
-            None,
-        ))
+        encode_lwt_applied(true, ks, &s.table, table_meta, &state.schema, None)
     } else {
         Ok(result::encode_void())
     }
@@ -8293,6 +8287,57 @@ fn route_update_virtual_table(
     Ok(result::encode_void())
 }
 
+/// Authorize a DML write on `ks.table`.
+///
+/// Every write needs MODIFY. A *conditional* write (`IF NOT EXISTS`,
+/// `IF EXISTS`, `IF <cond>`) additionally needs SELECT: the outcome of the
+/// condition (`[applied]`, and on failure the current row) is a read of the
+/// table, so a MODIFY-only principal could otherwise probe row existence and
+/// contents (JB-I2, t_9d641778).
+///
+/// This fails closed. It must run BEFORE anything reads the row or evaluates
+/// the condition, and a rejection carries no row data and is identical whether
+/// or not the row exists, so the response reveals nothing about the table.
+fn check_write_permission(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    ks: &str,
+    table: &str,
+    conditional: bool,
+) -> Result<(), CqlError> {
+    let resource = Resource::Table(ks.to_string(), table.to_string());
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Modify, &resource)?;
+    if conditional {
+        state
+            .schema
+            .check_permission(ctx.auth, Permission::Select, &resource)?;
+    }
+    Ok(())
+}
+
+/// Fail-closed authorization for a conditional INSERT/UPDATE/DELETE, applied at
+/// the top of dispatch. A no-op for every other statement (their handlers
+/// authorize themselves). See [`check_write_permission`].
+fn authorize_conditional_statement(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+) -> Result<(), CqlError> {
+    if crate::accord_router::classify_lwt(stmt).is_none() {
+        return Ok(());
+    }
+    let (ks_opt, table) = match stmt {
+        Statement::Insert(s) => (&s.keyspace, &s.table),
+        Statement::Update(s) => (&s.keyspace, &s.table),
+        Statement::Delete(s) => (&s.keyspace, &s.table),
+        _ => return Ok(()),
+    };
+    let ks = resolve_keyspace(ks_opt, ctx.current_keyspace)?;
+    check_write_permission(state, ctx, ks, table, true)
+}
+
 /// Encode a lightweight-transaction `[applied]` result.
 ///
 /// Cassandra semantics:
@@ -8309,15 +8354,15 @@ fn encode_lwt_applied(
     table_meta: &TableMetadata,
     schema: &Schema,
     existing_row: Option<&[Option<CqlValue>]>,
-) -> BytesMut {
+) -> Result<BytesMut, CqlError> {
     if applied {
-        return result::encode_rows(
+        return Ok(result::encode_rows(
             &["[applied]".to_string()],
             &[CqlType::Boolean],
             keyspace,
             table,
             &[vec![Some(CqlValue::Boolean(true))]],
-        );
+        ));
     }
 
     let mut col_names = vec!["[applied]".to_string()];
@@ -8326,13 +8371,20 @@ fn encode_lwt_applied(
 
     for (i, (name, cm)) in table_meta.columns.iter().enumerate() {
         col_names.push(name.clone());
-        let cql_type = resolve_col_type(&cm.column_type, keyspace, schema).unwrap_or(CqlType::Blob);
+        // An unresolvable column type is an error, never silently a blob.
+        let cql_type = resolve_col_type(&cm.column_type, keyspace, schema)?;
         col_types.push(cql_type);
         let val = existing_row.and_then(|r| r.get(i)).and_then(|v| v.clone());
         row.push(val);
     }
 
-    result::encode_rows(&col_names, &col_types, keyspace, table, &[row])
+    Ok(result::encode_rows(
+        &col_names,
+        &col_types,
+        keyspace,
+        table,
+        &[row],
+    ))
 }
 
 // ── UPDATE ───────────────────────────────────────────────────────────────
@@ -8344,11 +8396,13 @@ async fn route_update(
 ) -> Result<BytesMut, CqlError> {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    // Permission check (M8)
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+    // Permission check (M8); conditional updates also need SELECT (fail closed).
+    check_write_permission(
+        state,
+        ctx,
+        ks,
+        &s.table,
+        s.if_exists || !s.if_conditions.is_empty(),
     )?;
 
     if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
@@ -8792,11 +8846,13 @@ async fn route_delete(
 ) -> Result<BytesMut, CqlError> {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    // Permission check (M8)
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+    // Permission check (M8); conditional deletes also need SELECT (fail closed).
+    check_write_permission(
+        state,
+        ctx,
+        ks,
+        &s.table,
+        s.if_exists || !s.if_conditions.is_empty(),
     )?;
 
     let snap = state.schema.snapshot();
@@ -9034,11 +9090,7 @@ fn materialize_insert(
 > {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
-    )?;
+    check_write_permission(state, ctx, ks, &s.table, s.if_not_exists)?;
 
     let snap = state.schema.snapshot();
     let table_meta = snap
@@ -9121,10 +9173,12 @@ fn materialize_update(
 > {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+    check_write_permission(
+        state,
+        ctx,
+        ks,
+        &s.table,
+        s.if_exists || !s.if_conditions.is_empty(),
     )?;
 
     let snap = state.schema.snapshot();
@@ -9300,10 +9354,12 @@ fn materialize_delete(
 > {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+    check_write_permission(
+        state,
+        ctx,
+        ks,
+        &s.table,
+        s.if_exists || !s.if_conditions.is_empty(),
     )?;
 
     let snap = state.schema.snapshot();
@@ -27438,6 +27494,234 @@ mod tests {
             "GRANT SELECT ON TABLE should succeed: {:?}",
             result.err()
         );
+    }
+
+    // ── Conditional statements fail closed without SELECT (t_9d641778) ──
+
+    const LWT_SECRET: &str = "top-secret-document";
+
+    fn role_auth(role: &str) -> AuthContext {
+        AuthContext {
+            role: role.into(),
+            is_superuser: false,
+            must_change_password: false,
+        }
+    }
+
+    /// Keyspace `lwtz`, table `t` seeded with row k=1 holding `LWT_SECRET`,
+    /// role `mod_only` (MODIFY) and role `rw_user` (SELECT + MODIFY).
+    async fn lwt_authz_fixture() -> (SharedState, TempDir) {
+        let (state, dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        for cql in [
+            "CREATE KEYSPACE lwtz WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE lwtz.t (k int PRIMARY KEY, v text)",
+            &format!("INSERT INTO lwtz.t (k, v) VALUES (1, '{LWT_SECRET}')"),
+            "CREATE ROLE mod_only WITH PASSWORD = 'pass' AND LOGIN = true",
+            "CREATE ROLE rw_user WITH PASSWORD = 'pass' AND LOGIN = true",
+            "GRANT MODIFY ON lwtz.t TO mod_only",
+            "GRANT MODIFY ON lwtz.t TO rw_user",
+            "GRANT SELECT ON lwtz.t TO rw_user",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        (state, dir)
+    }
+
+    /// Run `cql` as `role` and return the routing error, panicking if it succeeded.
+    async fn lwt_denied(state: &SharedState, role: &str, cql: &str) -> CqlError {
+        let auth = role_auth(role);
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        let stmt = crate::parser::parse(cql).unwrap();
+        match route(state, &ctx, stmt).await {
+            Ok(_) => panic!("{role} must be rejected for `{cql}`"),
+            Err(e) => e,
+        }
+    }
+
+    fn assert_unauthorized_without_row_data(err: &CqlError, cql: &str) {
+        assert!(
+            matches!(err, CqlError::Unauthorized(_)),
+            "`{cql}` must fail with Unauthorized, got {err:?}"
+        );
+        let text = format!("{err:?} {err}");
+        assert!(
+            !text.contains(LWT_SECRET),
+            "`{cql}` error leaked row data: {text}"
+        );
+    }
+
+    /// Every conditional shape, each against an existing row (k=1) and a
+    /// missing row (k=99), each with a condition that fails and one that
+    /// would succeed. All must be rejected identically.
+    fn lwt_conditional_statements() -> Vec<String> {
+        let mut out = Vec::new();
+        for k in [1, 99] {
+            out.push(format!(
+                "UPDATE lwtz.t SET v = 'x' WHERE k = {k} IF v = 'WRONG'"
+            ));
+            out.push(format!(
+                "UPDATE lwtz.t SET v = 'x' WHERE k = {k} IF v = '{LWT_SECRET}'"
+            ));
+            out.push(format!("UPDATE lwtz.t SET v = 'x' WHERE k = {k} IF EXISTS"));
+            out.push(format!("DELETE FROM lwtz.t WHERE k = {k} IF v = 'WRONG'"));
+            out.push(format!(
+                "DELETE FROM lwtz.t WHERE k = {k} IF v = '{LWT_SECRET}'"
+            ));
+            out.push(format!("DELETE FROM lwtz.t WHERE k = {k} IF EXISTS"));
+            out.push(format!(
+                "INSERT INTO lwtz.t (k, v) VALUES ({k}, 'x') IF NOT EXISTS"
+            ));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn modify_only_conditional_statements_are_unauthorized() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        for cql in lwt_conditional_statements() {
+            let err = lwt_denied(&state, "mod_only", &cql).await;
+            assert_unauthorized_without_row_data(&err, &cql);
+        }
+    }
+
+    #[tokio::test]
+    async fn modify_only_failing_if_returns_no_row_data() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        let cql = "UPDATE lwtz.t SET v = 'x' WHERE k = 1 IF v = 'WRONG'";
+        let err = lwt_denied(&state, "mod_only", cql).await;
+        assert_unauthorized_without_row_data(&err, cql);
+    }
+
+    #[tokio::test]
+    async fn modify_only_would_succeed_if_is_unauthorized_and_not_applied() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        let cql = format!("UPDATE lwtz.t SET v = 'changed' WHERE k = 1 IF v = '{LWT_SECRET}'");
+        let err = lwt_denied(&state, "mod_only", &cql).await;
+        assert_unauthorized_without_row_data(&err, &cql);
+
+        // The write must not have landed: a superuser's IF NOT EXISTS reports
+        // the row still holding its original value.
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        let stmt = crate::parser::parse("INSERT INTO lwtz.t (k, v) VALUES (1, 'z') IF NOT EXISTS")
+            .unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(LWT_SECRET),
+            "original value must have survived"
+        );
+        assert!(
+            !text.contains("changed"),
+            "the rejected write must not land"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_and_modify_conditional_results_are_unchanged() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        let auth = role_auth("rw_user");
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        // Not-applied branch: [applied]=false plus the current row.
+        let stmt = crate::parser::parse("INSERT INTO lwtz.t (k, v) VALUES (1, 'z') IF NOT EXISTS")
+            .unwrap();
+        let RouteResult::Result(failed) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let snap = state.schema.snapshot();
+        let table_meta = snap
+            .tables
+            .get(&("lwtz".to_string(), "t".to_string()))
+            .unwrap();
+        let expected_false = encode_lwt_applied(
+            false,
+            "lwtz",
+            "t",
+            table_meta,
+            &state.schema,
+            Some(&[
+                Some(CqlValue::Int(1)),
+                Some(CqlValue::Text(LWT_SECRET.into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(failed, expected_false);
+
+        // Applied branch: the single [applied]=true column.
+        let stmt = crate::parser::parse("INSERT INTO lwtz.t (k, v) VALUES (2, 'z') IF NOT EXISTS")
+            .unwrap();
+        let RouteResult::Result(applied) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let expected_true = result::encode_rows(
+            &["[applied]".to_string()],
+            &[CqlType::Boolean],
+            "lwtz",
+            "t",
+            &[vec![Some(CqlValue::Boolean(true))]],
+        );
+        assert_eq!(applied, expected_true);
+
+        // UPDATE/DELETE ... IF are authorized for SELECT+MODIFY (both branches).
+        for cql in [
+            "UPDATE lwtz.t SET v = 'x' WHERE k = 1 IF v = 'WRONG'",
+            "UPDATE lwtz.t SET v = 'x' WHERE k = 1 IF EXISTS",
+            "DELETE FROM lwtz.t WHERE k = 2 IF v = 'z'",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("SELECT+MODIFY `{cql}` must be allowed: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn modify_only_conditional_in_transaction_is_unauthorized() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        for cql in lwt_conditional_statements() {
+            let auth = role_auth("mod_only");
+            let no_ks = None;
+            let ctx = test_ctx(&auth, &no_ks);
+            let mut shim = None;
+            let now = std::time::Instant::now();
+
+            // Transaction block: BEGIN TRANSACTION; <conditional>; COMMIT TRANSACTION;
+            let block =
+                crate::parser::parse(&format!("BEGIN TRANSACTION; {cql}; COMMIT TRANSACTION;"))
+                    .unwrap();
+            let err = route_transactional(&state, &ctx, &block, &mut shim, now)
+                .await
+                .expect("transaction block is handled by route_transactional")
+                .err()
+                .unwrap_or_else(|| panic!("`{cql}` in a transaction block must be rejected"));
+            assert_unauthorized_without_row_data(&err, &cql);
+
+            // Bare DML staged into an open compat-shim transaction.
+            let begin = crate::parser::parse("BEGIN TRANSACTION").unwrap();
+            route_transactional(&state, &ctx, &begin, &mut shim, now)
+                .await
+                .expect("BEGIN handled")
+                .expect("BEGIN succeeds");
+            let stmt = crate::parser::parse(&cql).unwrap();
+            let err = route_transactional(&state, &ctx, &stmt, &mut shim, now)
+                .await
+                .expect("bare DML with an open shim is handled")
+                .err()
+                .unwrap_or_else(|| panic!("`{cql}` staged in a transaction must be rejected"));
+            assert_unauthorized_without_row_data(&err, &cql);
+        }
     }
 
     /// t_fb280b30: in standalone (Direct) mode a GRANT must be written to

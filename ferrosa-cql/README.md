@@ -184,7 +184,9 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 - **LWT / transactions** (`accord_router.rs`, `transaction_keys.rs`,
   `transaction_limits.rs`) — routing decision (Accord in cluster mode, local in
   standalone), `IF [NOT] EXISTS` / `IF <cond>` CAS semantics with the `[applied]`
-  result column, partition-key extraction for Accord, and per-connection
+  result column (conditional statements require SELECT as well as MODIFY and
+  fail closed with `Unauthorized` before the condition is evaluated, in CQL,
+  batches and transaction blocks alike), partition-key extraction for Accord, and per-connection
   transaction limits (concurrency / timeout / key count). Both separately sent
   `BEGIN` / body / `COMMIT` statements and the documented single-query
   `BEGIN TRANSACTION; ...; COMMIT TRANSACTION;` block form use the same

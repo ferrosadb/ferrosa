@@ -167,6 +167,11 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
    corrupt cross-front-end reads.
 2. **Permission check on every route.** Each `route_*` function calls
    `Schema::check_permission` (M8); warn-mode logs+counts denials but proceeds.
+   Writes go through `check_write_permission`: MODIFY always, plus SELECT for any
+   conditional (`IF ...`) statement, checked before the condition is evaluated or
+   the row is read (fail closed; no row data and no existence signal on denial).
+   `authorize_conditional_statement` applies this at the top of `route()`, and the
+   `materialize_*` helpers (batches, transactions) share it.
 3. **Batch size capped.** `MAX_BATCH_STATEMENTS` (default 500, M12) bounds BATCH.
 4. **Range-checked narrowing.** `bridge` range-checks all narrowing integer
    conversions (M5); no `unwrap()` on user data (M4).
