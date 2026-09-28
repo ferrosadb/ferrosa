@@ -239,11 +239,81 @@ impl ModeController {
             }
         };
 
+        if !self.hint_deliveries_in_flight.lock().insert(peer_id) {
+            tracing::debug!(%peer_id, "hint delivery already running for peer; not starting another");
+            return;
+        }
         let hint_store = self.hint_store.clone();
         let hint_config = self.hint_config.clone();
+        let in_flight = self.hint_deliveries_in_flight.clone();
 
         self.spawn_tracked(async move {
             HintDeliveryTask::run(peer_id, hint_store, peer_manager, &hint_config).await;
+            in_flight.lock().remove(&peer_id);
+        });
+    }
+
+    /// Start the periodic hint-delivery sweep. Every `delivery_interval_ms`
+    /// it delivers to each live peer that has pending hints and no delivery
+    /// already running — the replicas recovery-triggered delivery never
+    /// reaches because they never went down.
+    pub(super) fn spawn_hint_delivery_sweep(&self, cancel: tokio_util::sync::CancellationToken) {
+        let Some(peer_manager) = (**self.peer_manager.load()).clone() else {
+            tracing::error!("hint delivery sweep not started: peer_manager not set");
+            return;
+        };
+        let hint_store = self.hint_store.clone();
+        let hint_config = self.hint_config.clone();
+        let in_flight = self.hint_deliveries_in_flight.clone();
+        let data_runtime = self.data_runtime.get().cloned();
+        let period = std::time::Duration::from_millis(hint_config.delivery_interval_ms.max(100));
+        self.spawn_tracked(async move {
+            let mut interval = tokio::time::interval(period);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+                let pending = hint_store.peers_with_pending_hints();
+                if pending.is_empty() {
+                    continue;
+                }
+                let due = {
+                    let busy = in_flight.lock();
+                    crate::hints::delivery::peers_due_for_hint_delivery(
+                        &pending,
+                        |p| peer_manager.has_live_peer(p),
+                        &busy,
+                    )
+                };
+                for peer_id in due {
+                    if !in_flight.lock().insert(peer_id) {
+                        continue;
+                    }
+                    tracing::info!(
+                        %peer_id,
+                        pending = hint_store.pending_count(peer_id),
+                        "hint delivery sweep: delivering to a live peer"
+                    );
+                    let (store, pm, cfg, flight) = (
+                        hint_store.clone(),
+                        peer_manager.clone(),
+                        hint_config.clone(),
+                        in_flight.clone(),
+                    );
+                    let job = async move {
+                        HintDeliveryTask::run(peer_id, store, pm, &cfg).await;
+                        flight.lock().remove(&peer_id);
+                    };
+                    // Detached: on shutdown the runtime aborts it mid-replay.
+                    // That is safe — `cleanup` only runs after a complete
+                    // replay, so undelivered hints stay on disk.
+                    match &data_runtime {
+                        Some(rt) => drop(rt.spawn(job)),
+                        None => drop(tokio::spawn(job)),
+                    }
+                }
+            }
         });
     }
 }

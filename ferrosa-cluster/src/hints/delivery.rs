@@ -37,6 +37,25 @@ use super::{HintConfig, HintStore};
 // HintDeliveryTask
 // ---------------------------------------------------------------------------
 
+/// Peers the periodic sweep should start a delivery for: they have pending
+/// hints, are live, and no delivery for them is already running.
+///
+/// Recovery-triggered delivery covers peers that went down and came back. A
+/// replica that stays up but misses a write (a post-quorum timeout, a schema
+/// it had not applied yet) produces no recovery event, so without this sweep
+/// its hints were never delivered.
+pub fn peers_due_for_hint_delivery(
+    pending: &[Uuid],
+    is_live: impl Fn(Uuid) -> bool,
+    in_flight: &std::collections::HashSet<Uuid>,
+) -> Vec<Uuid> {
+    pending
+        .iter()
+        .copied()
+        .filter(|peer| !in_flight.contains(peer) && is_live(*peer))
+        .collect()
+}
+
 /// Stateless namespace for the hint delivery background loop.
 pub struct HintDeliveryTask;
 
@@ -146,6 +165,24 @@ mod tests {
     use super::*;
     use crate::hints::{HintConfig, HintStore};
     use tempfile::TempDir;
+
+    /// Hints for a replica that never went down were only delivered on a
+    /// peer-recovery event, which such a replica never produces. The sweep
+    /// picks every live peer with pending hints that is not already draining.
+    #[test]
+    fn sweep_selects_live_peers_with_pending_hints_not_already_draining() {
+        let (live, down, busy) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let pending = vec![live, down, busy];
+        let in_flight: std::collections::HashSet<Uuid> = [busy].into_iter().collect();
+        let due = peers_due_for_hint_delivery(&pending, |p| p != down, &in_flight);
+        assert_eq!(due, vec![live]);
+    }
+
+    #[test]
+    fn sweep_selects_nothing_without_pending_hints() {
+        let due = peers_due_for_hint_delivery(&[], |_| true, &std::collections::HashSet::new());
+        assert!(due.is_empty());
+    }
 
     fn make_store(dir: &TempDir) -> Arc<HintStore> {
         let config = HintConfig {

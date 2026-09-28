@@ -52,6 +52,17 @@ struct PeerHintState {
     total_bytes: u64,
     record_count: usize,
     needs_repair: bool,
+    /// Set by `drain`: the highest segment number that drain covers, and the
+    /// record/byte totals it covers. `cleanup` removes exactly that and no
+    /// more, so hints stored while delivery is replaying survive it.
+    drained: Option<DrainMark>,
+}
+
+#[derive(Clone, Copy)]
+struct DrainMark {
+    through_segment: u32,
+    records: usize,
+    bytes: u64,
 }
 
 impl PeerHintState {
@@ -62,6 +73,7 @@ impl PeerHintState {
             total_bytes: 0,
             record_count: 0,
             needs_repair: false,
+            drained: None,
         }
     }
 }
@@ -310,6 +322,19 @@ impl HintStore {
         let segments = scan_segments(&pdir)
             .map_err(|e| ClusterError::Internal(format!("hints: scan for drain failed: {e}")))?;
 
+        // Everything stored so far is in `segments`. Move later writes to a
+        // fresh segment and remember what this drain covers, still under the
+        // lock, so `cleanup` cannot delete a hint stored after this point.
+        if let Some(state) = peers.get_mut(&peer_id) {
+            let through_segment = segments.last().map_or(state.segment_counter, |(n, _)| *n);
+            state.segment_counter = state.segment_counter.max(through_segment) + 1;
+            state.drained = Some(DrainMark {
+                through_segment,
+                records: state.record_count,
+                bytes: state.total_bytes,
+            });
+        }
+
         Ok(HintDrain {
             segments,
             current_reader: None,
@@ -325,25 +350,45 @@ impl HintStore {
     /// Delete all segment files that have been fully consumed by `drain`.
     /// After this call, the peer directory will be empty (or absent).
     pub fn cleanup(&self, peer_id: Uuid) {
+        let mut peers = self.peers.lock().unwrap();
+        let Some(state) = peers.get_mut(&peer_id) else {
+            return;
+        };
+        let Some(mark) = state.drained.take() else {
+            tracing::error!(%peer_id, "hints: cleanup without a preceding drain — nothing removed");
+            return;
+        };
         let pdir = peer_dir(&self.config.dir, peer_id);
-        if let Ok(segments) = scan_segments(&pdir) {
-            for (_, path) in &segments {
-                if let Err(e) = fs::remove_file(path) {
-                    tracing::warn!("hints: cleanup failed to remove {:?}: {e}", path);
+        match scan_segments(&pdir) {
+            Ok(segments) => {
+                for (_, path) in segments.iter().filter(|(n, _)| *n <= mark.through_segment) {
+                    if let Err(e) = fs::remove_file(path) {
+                        tracing::warn!("hints: cleanup failed to remove {:?}: {e}", path);
+                    }
                 }
             }
+            Err(e) => tracing::warn!(%peer_id, %e, "hints: cleanup could not list segments"),
         }
-        // Try to remove the peer directory itself (only succeeds if empty).
-        if let Err(e) = fs::remove_dir(&pdir) {
-            tracing::warn!(%e, "hints: failed to remove peer hint dir");
+        state.record_count = state.record_count.saturating_sub(mark.records);
+        state.total_bytes = state.total_bytes.saturating_sub(mark.bytes);
+        if state.record_count == 0 && state.writer.is_none() {
+            // Only succeeds if empty; a later store recreates it.
+            if let Err(e) = fs::remove_dir(&pdir) {
+                tracing::warn!(%e, "hints: failed to remove peer hint dir");
+            }
         }
+    }
 
-        // Clear in-memory state.
-        let mut peers = self.peers.lock().unwrap();
-        if let Some(state) = peers.get_mut(&peer_id) {
-            state.total_bytes = 0;
-            state.record_count = 0;
-        }
+    /// Peers that have at least one undelivered hint, sorted.
+    pub fn peers_with_pending_hints(&self) -> Vec<Uuid> {
+        let peers = self.peers.lock().unwrap();
+        let mut out: Vec<Uuid> = peers
+            .iter()
+            .filter(|(_, s)| s.record_count > 0)
+            .map(|(id, _)| *id)
+            .collect();
+        out.sort();
+        out
     }
 }
 
@@ -429,6 +474,48 @@ mod tests {
                 i as i64,
             )
             .unwrap();
+    }
+
+    /// A hint stored while delivery is replaying (between `drain` and
+    /// `cleanup`) was not part of that drain. `cleanup` deleted every segment
+    /// and zeroed the counters, so the late hint vanished without a log line.
+    #[test]
+    fn a_hint_stored_during_delivery_survives_cleanup() {
+        let dir = TempDir::new().unwrap();
+        let store = HintStore::new(make_config(&dir, 32, 1024)).unwrap();
+        let peer = Uuid::new_v4();
+        for i in 0..3 {
+            store_hint(&store, peer, i);
+        }
+
+        let drained: Vec<HintRecord> = store.drain(peer).unwrap().collect();
+        assert_eq!(drained.len(), 3);
+        store_hint(&store, peer, 99); // arrives mid-delivery
+        store.cleanup(peer);
+
+        assert_eq!(
+            store.pending_count(peer),
+            1,
+            "the late hint is still pending"
+        );
+        let rest: Vec<HintRecord> = store.drain(peer).unwrap().collect();
+        assert_eq!(rest.len(), 1, "only the late hint remains");
+        assert_eq!(rest[0].timestamp, 99);
+    }
+
+    /// Peers with pending hints are discoverable, so a periodic sweep can
+    /// deliver to replicas that never went down.
+    #[test]
+    fn peers_with_pending_hints_lists_only_peers_that_have_some() {
+        let dir = TempDir::new().unwrap();
+        let store = HintStore::new(make_config(&dir, 32, 1024)).unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        store_hint(&store, a, 1);
+        store_hint(&store, b, 2);
+        let drained: Vec<HintRecord> = store.drain(b).unwrap().collect();
+        assert_eq!(drained.len(), 1);
+        store.cleanup(b);
+        assert_eq!(store.peers_with_pending_hints(), vec![a]);
     }
 
     // -----------------------------------------------------------------------

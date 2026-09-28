@@ -203,6 +203,10 @@ pub struct ModeController {
     pub(super) hint_store: Arc<HintStore>,
     /// Hint delivery configuration — batch size, interval, etc.
     pub(super) hint_config: HintConfig,
+    /// Peers with a hint delivery running now. Shared by recovery-triggered
+    /// delivery and the periodic sweep so one peer is never drained twice at
+    /// once (two drains would replay the same hints and race `cleanup`).
+    pub(super) hint_deliveries_in_flight: Arc<Mutex<std::collections::HashSet<Uuid>>>,
     /// Set of host IDs approved to join the cluster.
     ///
     /// Mirrors `RaftState.approved_nodes` for synchronous access in join checks.
@@ -420,6 +424,7 @@ impl ModeController {
             peer_dcs: Mutex::new(HashMap::new()),
             hint_store,
             hint_config,
+            hint_deliveries_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
@@ -533,6 +538,7 @@ impl ModeController {
             peer_dcs: Mutex::new(HashMap::new()),
             hint_store,
             hint_config,
+            hint_deliveries_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
@@ -597,6 +603,7 @@ impl ModeController {
             peer_dcs: Mutex::new(HashMap::new()),
             hint_store,
             hint_config,
+            hint_deliveries_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
