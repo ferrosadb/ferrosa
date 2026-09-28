@@ -128,6 +128,7 @@ the number of concurrent operations.
 | `FERROSA_SSTABLE_MAX_WRITE_SEGMENT_BYTES` | Maximum requested segment size | `16 MiB`; minimum `1 MiB`, maximum `1 GiB - 256 bytes - 4 KiB` for the per-pump safety budget and block rounding |
 | `FERROSA_SSTABLE_WRITE_QUEUE_DEPTH` | Segments queued ahead of the writer | `3`; `0` selects synchronous writes; upper bound is the configured queue maximum and actual segment/depth combination must fit the 1 GiB per-pump budget |
 | `FERROSA_SSTABLE_MAX_WRITE_QUEUE_DEPTH` | Maximum queue depth | `16`; minimum `3`, safety ceiling `floor(1 GiB / 257 bytes) - 1`; the active segment/depth combination has a stricter checked budget |
+| `FERROSA_SSTABLE_PUMP_WAIT_WARMUP_TIMEOUT_MS` | Maximum time pump open waits to initialize the producer thread's timed blocking-wait path before writes begin | `1 ms`; `1`–`100 ms`; invalid values log an error and use the default. The free-segment channel is empty during warmup, so this normally costs up to the configured duration once per pump open |
 | `FERROSA_SSTABLE_COMPRESSION_THREADS` | Compression worker count | Available parallelism capped at `4`; from `1` to the configured maximum |
 | `FERROSA_SSTABLE_MAX_COMPRESSION_THREADS` | Maximum compression workers | `4`; from `4` to `64` (bounds thread stack and scheduler overhead) |
 | `FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS` | Chunks held in one compression batch | `16`; from `1` to the configured maximum; combined input and `compress_bound` output buffers per compressor must fit within `1 GiB` |

@@ -479,13 +479,18 @@ scratch similarly retain their largest observed shape. Bloom's existing fixed
 10,000-key estimate allocates its bitset once; this packet changes serialization,
 not Bloom sizing or false-positive semantics.
 
-Open primes Crossbeam's cached Context and selector capacity on both pump
-threads. Built-in abort signals only disconnect a one-slot channel, avoiding
-rendezvous select packets while preserving wakeups for every receiver. The
-unchanged 64 MiB row test measures zero allocations; existing pump allocation
-and cancellation gates remain unchanged. The compressed steady-state gate
-still detects one Rayon external-job injection allocation per measured run;
-that scheduling issue remains separate from metadata serialization.
+Open initializes Crossbeam's cached Context and selector capacity on both pump
+threads. It also exercises the producer's real timed park path before writes
+begin, because a zero-duration select does not initialize that path. The
+`FERROSA_SSTABLE_PUMP_WAIT_WARMUP_TIMEOUT_MS` setting bounds this one-time
+startup wait (default 1 ms, valid 1–100 ms); invalid values log an error and
+fall back to the default. Built-in abort signals only disconnect a one-slot
+channel, avoiding rendezvous select packets while preserving wakeups for every
+receiver. The unchanged 64 MiB row test measures zero allocations; existing
+pump allocation and cancellation gates remain unchanged. The compressed
+steady-state gate still detects one Rayon external-job injection allocation
+per measured run; that scheduling issue remains separate from metadata
+serialization.
 
 `CompressionInfo::read` rejects negative signed fields, non-positive chunk
 lengths, inconsistent chunk counts, and offset lists that are not zero-based

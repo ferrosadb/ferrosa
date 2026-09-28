@@ -93,6 +93,9 @@ const MAX_SAFE_REQUESTED_SEGMENT_BYTES: usize =
 const DEFAULT_QUEUE_DEPTH: usize = 3;
 const MIN_QUEUE_DEPTH: usize = 0; // 0 = synchronous
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 16;
+const DEFAULT_WAIT_WARMUP_TIMEOUT_MS: u64 = 1;
+const MAX_WAIT_WARMUP_TIMEOUT_MS: u64 = 100;
+const WAIT_WARMUP_TIMEOUT_ENV: &str = "FERROSA_SSTABLE_PUMP_WAIT_WARMUP_TIMEOUT_MS";
 
 static SEGMENT_BYTES_WARNED: AtomicBool = AtomicBool::new(false);
 static QUEUE_DEPTH_WARNED: AtomicBool = AtomicBool::new(false);
@@ -1104,10 +1107,41 @@ fn prime_pair_waiter<T, U>(first: &Receiver<T>, second: &Receiver<U>) {
     if let Ok(operation) = selection.try_select() {
         discard_unavailable(operation);
     }
-    // The blocking wait uses Crossbeam's timed-select path after the quick
-    // probe. A zero-duration select initializes that path without parking.
-    if let Ok(operation) = selection.select_timeout(Duration::ZERO) {
+    // Crossbeam's zero-duration select returns before initializing the thread's
+    // actual park path. Exercise one bounded timed wait while the channels are
+    // empty so the first production backpressure wait does not pay that setup
+    // allocation. This runs during open, before the free channel is populated.
+    if let Ok(operation) = selection.select_timeout(wait_path_warmup_timeout()) {
         discard_unavailable(operation);
+    }
+}
+
+fn parse_wait_path_warmup_timeout(value: Option<&str>) -> std::result::Result<Duration, ()> {
+    let Some(value) = value else {
+        return Ok(Duration::from_millis(DEFAULT_WAIT_WARMUP_TIMEOUT_MS));
+    };
+    match value.parse::<u64>() {
+        Ok(milliseconds) if (1..=MAX_WAIT_WARMUP_TIMEOUT_MS).contains(&milliseconds) => {
+            Ok(Duration::from_millis(milliseconds))
+        }
+        _ => Err(()),
+    }
+}
+
+fn wait_path_warmup_timeout() -> Duration {
+    let raw = std::env::var(WAIT_WARMUP_TIMEOUT_ENV).ok();
+    match parse_wait_path_warmup_timeout(raw.as_deref()) {
+        Ok(timeout) => timeout,
+        Err(()) => {
+            tracing::error!(
+                variable = WAIT_WARMUP_TIMEOUT_ENV,
+                value = ?raw,
+                default_ms = DEFAULT_WAIT_WARMUP_TIMEOUT_MS,
+                max_ms = MAX_WAIT_WARMUP_TIMEOUT_MS,
+                "invalid write-pump wait-path warmup timeout; using the default"
+            );
+            Duration::from_millis(DEFAULT_WAIT_WARMUP_TIMEOUT_MS)
+        }
     }
 }
 
@@ -2735,6 +2769,29 @@ mod tests {
         for (input, expected) in cases {
             let got = parse_usize_bounded(*input, MIN_QUEUE_DEPTH, DEFAULT_MAX_QUEUE_DEPTH);
             assert_eq!(got, *expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn wait_path_warmup_timeout_defaults_and_rejects_nonpositive_or_excessive_values() {
+        assert_eq!(
+            parse_wait_path_warmup_timeout(None),
+            Ok(Duration::from_millis(DEFAULT_WAIT_WARMUP_TIMEOUT_MS))
+        );
+        assert_eq!(
+            parse_wait_path_warmup_timeout(Some("1")),
+            Ok(Duration::from_millis(1))
+        );
+        assert_eq!(
+            parse_wait_path_warmup_timeout(Some("100")),
+            Ok(Duration::from_millis(MAX_WAIT_WARMUP_TIMEOUT_MS))
+        );
+        for invalid in ["", "0", "101", "-1", "not-a-number"] {
+            assert_eq!(
+                parse_wait_path_warmup_timeout(Some(invalid)),
+                Err(()),
+                "{invalid:?}"
+            );
         }
     }
 
