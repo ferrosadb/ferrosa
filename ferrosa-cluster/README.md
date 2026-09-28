@@ -373,6 +373,13 @@ producer/backpressure bounds). The gated multi-node live confirmation is `fly_st
 `live-infra-tests` + `FERROSA_TEST_FLY=1`), which drives
 `deploy/fly-stream-scan/`; it panics loudly on missing infra rather than passing.
 
+Replicated `CREATE INDEX` (FM-70 / CL-18, `t_1f2741a0`) is guarded end to end by
+`replicated_create_index` (three in-process Raft voters, each with its own
+`StorageEngine` + `Schema` via `TestCluster::with_voters_and_engines`; the DDL is
+proposed once on the leader and every node must build the index and answer an
+indexed read) and, on a real cluster, `replicated_jsonb_index_live` (feature
+`live-infra-tests` + `FERROSA_TEST_CLUSTER_NODES`, panics when unset).
+
 The multi-node `TestCluster` harness (`tests/common/raft_harness.rs`) runs
 openraft with short timers (50 ms heartbeat, 200–400 ms election). To keep
 election convergence deterministic when `cargo test` runs many runtime-heavy test

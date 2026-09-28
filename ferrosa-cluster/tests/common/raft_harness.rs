@@ -59,6 +59,7 @@ use ferrosa_cluster::membership::MembershipNetwork;
 use ferrosa_cluster::raft::log_store::SledLogStore;
 use ferrosa_cluster::raft::state_machine::{FerrosStateMachine, RaftState};
 use ferrosa_cluster::raft::{FerrosRaft, FerrosRaftConfig, RaftCommand, RaftResponse};
+use ferrosa_storage::engine::StorageEngine;
 
 // ---------------------------------------------------------------------------
 // RpcEnvelope — channel message carrying a request + a reply oneshot.
@@ -427,6 +428,10 @@ pub struct TestNode {
     /// Lock-shared handle to the underlying state machine. Use
     /// `state_machine.snapshot_state()` to read application state.
     pub state_machine: SharedStateMachine,
+    /// This node's own storage engine. `Some` only for clusters built with
+    /// [`TestCluster::with_voters_and_engines`]; the state machine then applies
+    /// replicated DDL to it exactly as a production node does.
+    pub engine: Option<Arc<StorageEngine>>,
     /// Handle to the inbound dispatcher loop; aborted at shutdown.
     dispatcher: tokio::task::JoinHandle<()>,
     /// Held to keep tempdir alive for the lifetime of the test.
@@ -549,6 +554,16 @@ impl MembershipNetwork for HarnessMembershipNetwork {
 impl TestCluster {
     /// Spin up an N-voter cluster and call `initialize` on node 0.
     pub async fn with_voters(n: usize) -> Self {
+        Self::build_voters(n, false).await
+    }
+
+    /// Like [`Self::with_voters`], but every node applies committed DDL to its
+    /// own real `StorageEngine` and `Schema` (see `TestNode::engine`).
+    pub async fn with_voters_and_engines(n: usize) -> Self {
+        Self::build_voters(n, true).await
+    }
+
+    async fn build_voters(n: usize, with_engine: bool) -> Self {
         assert!(n >= 1, "TestCluster requires at least 1 node");
 
         // Bound cross-binary oversubscription across the build + election window
@@ -583,7 +598,13 @@ impl TestCluster {
 
         let mut nodes = Vec::with_capacity(n);
         for &node_id in &node_ids {
-            let node = build_test_node(node_id, raft_lib_config.clone(), registry.clone()).await;
+            let node = build_test_node(
+                node_id,
+                raft_lib_config.clone(),
+                registry.clone(),
+                with_engine,
+            )
+            .await;
             nodes.push(node);
         }
 
@@ -626,8 +647,13 @@ impl TestCluster {
     /// the leader's `add_learner` will start replicating to the new
     /// node_id immediately, so the dispatcher must be ready first.
     pub async fn add_pending_node(&self, node_id: u64) {
-        let node =
-            build_test_node(node_id, self.raft_lib_config.clone(), self.registry.clone()).await;
+        let node = build_test_node(
+            node_id,
+            self.raft_lib_config.clone(),
+            self.registry.clone(),
+            false,
+        )
+        .await;
         if self
             .leadership_pinned
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -907,17 +933,78 @@ impl TestCluster {
 // build_test_node — wires log store, state machine, network, dispatcher.
 // ---------------------------------------------------------------------------
 
+/// A real storage engine for one harness node, rooted in `dir`.
+fn open_node_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
+    use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngineConfig};
+    std::fs::create_dir_all(dir).expect("create engine dir");
+    let config = StorageEngineConfig {
+        commit_log: CommitLogConfig {
+            log_dir: dir.to_path_buf(),
+            checkpoint_dir: dir.to_path_buf(),
+            archive: None,
+            ..CommitLogConfig::default()
+        },
+        compaction: CompactionConfig::from_env(dir.join("compaction")),
+        object_store: None,
+        local_cache_max_bytes: 1024 * 1024,
+        local_disk_free_reserve_bytes: 0,
+        flush_threshold_bytes: 4096,
+        memtable_backpressure_bytes: u64::MAX,
+        flush_max_age_secs: 5,
+        data_dir: dir.to_path_buf(),
+        index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        auth_enabled: false,
+        auth_warn: false,
+        write_verify: false,
+        max_pending_replay_mutations_without_schema: 1024,
+        memtable_num_shards: 64,
+    };
+    let engine = Arc::new(StorageEngine::new(config, None).expect("open storage engine"));
+    engine
+        .register_system_tables()
+        .expect("register system tables");
+    engine
+}
+
+/// A schema registry for one harness node.
+fn open_node_schema() -> ferrosa_schema::Schema {
+    use ferrosa_schema::{
+        AuthMethod, LogAuditSink, PasswordHasher, PasswordPolicy, RateLimitConfig, SchemaConfig,
+    };
+    let config = SchemaConfig {
+        hasher: PasswordHasher::default(),
+        password_policy: PasswordPolicy::permissive(),
+        auth_method: AuthMethod::Password,
+        rate_limit: RateLimitConfig::default(),
+        audit_sink: Box::new(LogAuditSink),
+        secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+        mode: ferrosa_schema::startup::DeploymentMode::Development,
+    };
+    ferrosa_schema::Schema::new(config).expect("schema registry")
+}
+
 async fn build_test_node(
     node_id: u64,
     config: Arc<RaftLibConfig>,
     registry: NodeRegistry,
+    with_engine: bool,
 ) -> TestNode {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let log_path: PathBuf = tempdir.path().join(format!("raft-{node_id}"));
     std::fs::create_dir_all(&log_path).expect("create raft log dir");
     let log_store = SledLogStore::new(&log_path).expect("open sled log store");
 
-    let state_machine = SharedStateMachine::new(FerrosStateMachine::new());
+    let (sm, engine) = if with_engine {
+        let engine = open_node_engine(&tempdir.path().join(format!("engine-{node_id}")));
+        let schema = Arc::new(open_node_schema());
+        (
+            FerrosStateMachine::with_side_effects(schema, Arc::clone(&engine)),
+            Some(engine),
+        )
+    } else {
+        (FerrosStateMachine::new(), None)
+    };
+    let state_machine = SharedStateMachine::new(sm);
     let state_machine_for_node = state_machine.clone();
 
     // Bound the inbound channel so a stalled node back-pressures
@@ -986,6 +1073,7 @@ async fn build_test_node(
         node_id,
         raft,
         state_machine: state_machine_for_node,
+        engine,
         dispatcher,
         _tempdir: tempdir,
         registry,
