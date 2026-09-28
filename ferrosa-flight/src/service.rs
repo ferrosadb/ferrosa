@@ -46,17 +46,30 @@ const DEFAULT_PAGE_SIZE: usize = 1024;
 
 /// Default Flight gRPC port advertised in distributed `FlightEndpoint`
 /// locations. Used for remote replicas (whose ring metadata records only the
-/// internode address) when `FERROSA_FLIGHT_PORT` is unset.
-const DEFAULT_FLIGHT_PORT: u16 = 50051;
+/// internode address) when `FERROSA_FLIGHT_PORT` is unset. It is the port the
+/// `ferrosa` binary binds by default (`127.0.0.1:8815`); it used to be 50051,
+/// which nothing listened on, so every advertised remote location was dead
+/// unless the operator set `FERROSA_FLIGHT_PORT`.
+pub const DEFAULT_FLIGHT_PORT: u16 = 8815;
 
 /// Env var: this node's externally-reachable Flight address advertised to
-/// clients (e.g. `grpc://flight.example.com:50051`). Used as the location for
+/// clients (e.g. `grpc+tls://flight.example.com:8815`). Used as the location for
 /// ranges this node owns.
 const ENV_FLIGHT_BROADCAST: &str = "FERROSA_FLIGHT_BROADCAST";
 
 /// Env var: the Flight gRPC port to combine with a remote replica's internode
 /// host when building its advertised location.
-const ENV_FLIGHT_PORT: &str = "FERROSA_FLIGHT_PORT";
+pub const ENV_FLIGHT_PORT: &str = "FERROSA_FLIGHT_PORT";
+
+/// Parse a `FERROSA_FLIGHT_PORT` value strictly: a non-zero port number.
+pub fn parse_flight_port(raw: &str) -> Result<u16, String> {
+    match raw.trim().parse::<u16>() {
+        Ok(port) if port != 0 => Ok(port),
+        _ => Err(format!(
+            "invalid {ENV_FLIGHT_PORT} {raw:?}: expected a port number 1-65535"
+        )),
+    }
+}
 
 /// Resolve the Flight gRPC port for remote replica locations from the
 /// environment, falling back to [`DEFAULT_FLIGHT_PORT`] when unset. A value
@@ -66,7 +79,7 @@ fn flight_port_from_env() -> u16 {
     let Ok(raw) = std::env::var(ENV_FLIGHT_PORT) else {
         return DEFAULT_FLIGHT_PORT;
     };
-    match raw.trim().parse() {
+    match parse_flight_port(&raw) {
         Ok(port) => port,
         Err(e) => {
             tracing::error!(
@@ -708,7 +721,12 @@ impl FlightService for FerrosaFlight {
             .state
             .schema
             .authenticate(username, password)
-            .map_err(|_| Status::unauthenticated("invalid credentials"))?;
+            .map_err(|e| {
+                // The client only learns "invalid credentials"; the reason
+                // (unknown role, bad password, throttled, NOLOGIN) is logged.
+                tracing::warn!(%username, error = %e, "Arrow Flight handshake authentication failed");
+                Status::unauthenticated("invalid credentials")
+            })?;
 
         let claims = crate::token::Claims {
             role: auth.role,

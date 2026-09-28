@@ -82,11 +82,12 @@ Every RPC is implemented — there are **no `Unimplemented` stubs**.
 | Env var | Effect |
 |---------|--------|
 | `FERROSA_FLIGHT_BROADCAST` | This node's externally-reachable Flight address advertised for ranges it owns. Unset → self-owned ranges advertise **no** location (client falls back to the queried connection) rather than faking an address. |
-| `FERROSA_FLIGHT_PORT` | Flight gRPC port combined with a remote replica's internode host to build its advertised location (default `50051`). The scheme is `grpc+tls://` when the service is built `.with_tls_locations(true)` (the binary does this when `[flight] tls_cert` is set), else `grpc://`. |
+| `FERROSA_FLIGHT_PORT` | Flight gRPC port combined with a remote replica's internode host to build its advertised location. Library default `service::DEFAULT_FLIGHT_PORT` = `8815`, the binary's default bind port (it was `50051`, which nothing listened on). The `ferrosa` binary advertises its own `[flight] bind` port unless this is set, and a malformed value stops startup. The scheme is `grpc+tls://` when the service is built `.with_tls_locations(true)` (the binary does this when the Flight listener has a certificate, its own or the node-wide `[tls]` one), else `grpc://`. |
 
-TLS keys are read by the `ferrosa` binary (`[flight] tls_cert` / `tls_key` /
-`require_tls`, env `FERROSA_FLIGHT_TLS_CERT` / `_TLS_KEY` / `_REQUIRE_TLS`) and
-passed in as a `FlightTlsConfig`. `require_tls` without a certificate, or only
+TLS keys are read by the `ferrosa` binary — the node-wide `[tls] cert/key/
+require` (env `FERROSA_TLS_*`), overridden by `[flight] tls_cert` / `tls_key` /
+`require_tls` (env `FERROSA_FLIGHT_TLS_CERT` / `_TLS_KEY` / `_REQUIRE_TLS`) —
+and passed in as a `FlightTlsConfig`. `require_tls` without a certificate, or only
 one of cert/key, is an error naming "Arrow Flight", never a plaintext fallback.
 
 ## Dependencies
@@ -119,7 +120,13 @@ External: `arrow` + `arrow-flight` (53), `tonic` (0.12, no `tls` feature),
 - `tests/grpc_handshake.rs` (2) — full gRPC `Handshake` → `DoGet`; `DoPut` write then `DoGet` read-back over a real `tonic` channel.
 - `tests/exchange_path.rs` (2) — `DoExchange` upserts each batch and acks; requires a valid bearer.
 - `tests/minor_rpcs.rs` (11) — `ListFlights`, `PollFlightInfo`, `ListActions`, `DoAction` (`server.info` / `token.validate` / unknown / bearer).
-- `tests/distributed_endpoints.rs` (3) — standalone single endpoint; multi-range topology one endpoint per range; `grpc+tls://` locations when serving TLS.
+- `tests/distributed_endpoints.rs` (3) — standalone single endpoint; multi-range topology one endpoint per range; `grpc+tls://` locations when serving TLS, default advertised port 8815, `with_flight_port` override.
+End to end, `scripts/flight-tls-probe.sh <host:port> <ca>` (curl + python3)
+checks a running node: plaintext gRPC refused, unauthenticated ListFlights
+answered UNAUTHENTICATED over TLS, Handshake issues a token, authenticated
+ListFlights succeeds. CI's secure-compose job runs it against a
+`flight`-feature 3-node production cluster.
+
 - `tests/tls_listener.rs` (8) — a TLS client (ALPN h2, same provider) completes `Handshake` + `ListFlights`; a plaintext gRPC client gets no RPC through and the server keeps serving TLS; an untrusted certificate is rejected; `require_tls` without a certificate / half a certificate is an error; ALPN is `h2` only; a missing certificate file stops `serve_service` before binding.
 
 ## Specs

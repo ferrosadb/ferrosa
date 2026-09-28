@@ -228,6 +228,19 @@ async fn remote_locations_use_the_tls_scheme_when_flight_serves_tls() {
 
     let plain = locations(FerrosaFlight::new(Arc::clone(&state), KEY.to_vec())).await;
     assert!(!plain.is_empty(), "remote replicas are advertised");
+    // The default advertised port is the port the binary binds by default
+    // (8815). It was 50051, which nothing listens on.
+    assert!(
+        plain.iter().all(|uri| uri.ends_with(":8815")),
+        "default advertised Flight port must match the default bind port: {plain:?}"
+    );
+    let custom =
+        locations(FerrosaFlight::new(Arc::clone(&state), KEY.to_vec()).with_flight_port(18815))
+            .await;
+    assert!(
+        custom.iter().all(|uri| uri.ends_with(":18815")),
+        "with_flight_port overrides the default: {custom:?}"
+    );
     assert!(
         plain.iter().all(|uri| uri.starts_with("grpc://10.0.0.")),
         "plaintext listener advertises grpc: {plain:?}"

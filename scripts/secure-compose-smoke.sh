@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prove the production Compose overlay starts and serves authenticated CQL
-# over TLS (t_3422ae92).
+# and Arrow Flight over TLS (t_3422ae92, t_58db6320).
 #
 #   1. generate throwaway test certificates (scripts/gen-compose-test-certs.sh)
 #   2. bring up docker-compose.yml + docker-compose.secure.yml (3 nodes,
@@ -9,16 +9,18 @@
 #      test CA), and confirm plaintext HTTP to the same port is NOT served
 #   4. run one authenticated CQL query over TLS (cqlsh --ssl, CA-validated),
 #      and confirm a plaintext CQL client is refused
-#   5. tear everything down (always, including volumes)
+#   5. Arrow Flight on node1 (published 8815): scripts/flight-tls-probe.sh —
+#      plaintext gRPC refused, authenticated Handshake + ListFlights over TLS
+#   6. tear everything down (always, including volumes)
 #
-# Arrow Flight is not exercised: the overlay configures Flight TLS
-# (FERROSA_FLIGHT_TLS_CERT/_KEY/_REQUIRE_TLS), but the node image is built with
-# default features, which do not include `flight`, so nothing binds 8815.
-# Flight TLS is covered by ferrosa-flight/tests/tls_listener.rs.
+# Every node gets ONE node-wide certificate (FERROSA_TLS_*) in the overlay, so
+# this also proves a single [tls] certificate covers every listener.
 #
 # Requires the node image to exist already (no build): every node uses
-# ${FERROSA_SMOKE_IMAGE:-ferrosa-smoke:latest}, and the image must contain curl
-# for the healthcheck.
+# ${FERROSA_SMOKE_IMAGE:-ferrosa-smoke:latest}. The image must contain curl
+# for the healthcheck and a ferrosa binary built with the `flight` feature
+# (a default-features binary never binds 8815 and step 5 fails, saying so).
+# The host needs curl with HTTP/2 and python3 for the Flight probe.
 #
 # Environment:
 #   FERROSA_CONTAINER_RUNTIME  docker (default) or podman
@@ -145,4 +147,25 @@ if "$runtime" run --rm --network "$network" "$cqlsh_image" \
 fi
 log "plaintext CQL client refused"
 
-log "PASS: production overlay started, all nodes ready over HTTPS, CQL over TLS works"
+# ── Arrow Flight over TLS ──────────────────────────────────────────────────
+# node1 publishes 8815. The node certificate carries DNS:localhost and is
+# verified against the test CA.
+log "probing Arrow Flight on node1 (localhost:8815)"
+flight_up=0
+for attempt in $(seq 1 20); do
+    if curl -s --max-time 5 --cacert .compose-tls/ca.crt -o /dev/null \
+        "https://localhost:8815/" 2>/dev/null; then
+        flight_up=1
+        break
+    fi
+    log "attempt $attempt: Flight TLS port not answering yet"
+    sleep 3
+done
+if [[ $flight_up -ne 1 ]]; then
+    log "ERROR: nothing serves TLS on node1:8815 — is the image built with --features flight?"
+    exit 1
+fi
+FLIGHT_PROBE_USER=ferrosa_admin FLIGHT_PROBE_PASSWORD="$FERROSA_SEED_ADMIN_PASSWORD" \
+    scripts/flight-tls-probe.sh localhost:8815 .compose-tls/ca.crt
+
+log "PASS: production overlay started with one node-wide certificate; HTTPS, CQL and Arrow Flight over TLS work"

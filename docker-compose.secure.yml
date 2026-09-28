@@ -14,8 +14,9 @@
 #                                                                            #
 #   - mounts .compose-tls/nodeN (from scripts/gen-compose-test-certs.sh)     #
 #     read-only at /etc/ferrosa/tls in each node,                            #
-#   - sets <listener> TLS cert/key + REQUIRE_TLS for every listener and      #
-#     internode TLS cert/key/CA + REQUIRE_TLS,                               #
+#   - sets ONE node-wide certificate (FERROSA_TLS_CERT/KEY/CA/REQUIRE) that  #
+#     covers every listener and internode,                                   #
+#   - publishes Arrow Flight (8815) on node1 for the TLS probe,              #
 #   - pins each node to 172.28.77.10N on a fixed subnet: internode TLS        #
 #     verifies the peer's IP address, and the test certificates carry those  #
 #     IPs as SANs,                                                           #
@@ -45,33 +46,17 @@ x-ferrosa-secure-env: &ferrosa-secure-env
   FERROSA_AUTH_ENABLED: "true"
   FERROSA_MODE: "production"
   FERROSA_SEED_ADMIN_PASSWORD: "${FERROSA_SEED_ADMIN_PASSWORD:-}"
-  # Client listeners: each requires TLS with the node certificate.
-  FERROSA_CQL_TLS_CERT: /etc/ferrosa/tls/node.crt
-  FERROSA_CQL_TLS_KEY: /etc/ferrosa/tls/node.key
-  FERROSA_CQL_REQUIRE_TLS: "true"
-  FERROSA_POSTGRES_TLS_CERT: /etc/ferrosa/tls/node.crt
-  FERROSA_POSTGRES_TLS_KEY: /etc/ferrosa/tls/node.key
-  FERROSA_POSTGRES_REQUIRE_TLS: "true"
-  FERROSA_GRAPH_TLS_CERT: /etc/ferrosa/tls/node.crt     # graph HTTP + Bolt
-  FERROSA_GRAPH_TLS_KEY: /etc/ferrosa/tls/node.key
-  FERROSA_GRAPH_REQUIRE_TLS: "true"
-  FERROSA_SPARQL_TLS_CERT: /etc/ferrosa/tls/node.crt
-  FERROSA_SPARQL_TLS_KEY: /etc/ferrosa/tls/node.key
-  FERROSA_SPARQL_REQUIRE_TLS: "true"
-  FERROSA_WEB_TLS_CERT: /etc/ferrosa/tls/node.crt
-  FERROSA_WEB_TLS_KEY: /etc/ferrosa/tls/node.key
-  FERROSA_WEB_REQUIRE_TLS: "true"
-  # Arrow Flight (gRPC, only in `flight`/`full` builds): TLS like the rest.
-  # Builds without the feature ignore these.
+  # ONE node-wide certificate ([tls] / FERROSA_TLS_*) covers every client
+  # listener (CQL, PostgreSQL, graph HTTP + Bolt, SPARQL, web console, Arrow
+  # Flight) and internode; REQUIRE makes each of them refuse plaintext. A
+  # listener's own FERROSA_<LISTENER>_TLS_* would override it; none is set.
+  FERROSA_TLS_CERT: /etc/ferrosa/tls/node.crt
+  FERROSA_TLS_KEY: /etc/ferrosa/tls/node.key
+  FERROSA_TLS_CA: /etc/ferrosa/tls/ca.crt       # internode peer verification
+  FERROSA_TLS_REQUIRE: "true"
+  # Arrow Flight binds only in `flight`/`full` builds; reachable on the
+  # compose network and published on node1 for scripts/flight-tls-probe.sh.
   FERROSA_FLIGHT_BIND: "0.0.0.0:8815"
-  FERROSA_FLIGHT_TLS_CERT: /etc/ferrosa/tls/node.crt
-  FERROSA_FLIGHT_TLS_KEY: /etc/ferrosa/tls/node.key
-  FERROSA_FLIGHT_REQUIRE_TLS: "true"
-  # Internode: one-way server TLS, peers verified against the test CA.
-  FERROSA_INTERNODE_TLS_CERT: /etc/ferrosa/tls/node.crt
-  FERROSA_INTERNODE_TLS_KEY: /etc/ferrosa/tls/node.key
-  FERROSA_INTERNODE_TLS_CA: /etc/ferrosa/tls/ca.crt
-  FERROSA_INTERNODE_REQUIRE_TLS: "true"
 
 x-ferrosa-secure-healthcheck: &ferrosa-secure-healthcheck
   test: ["CMD", "curl", "-sf", "--cacert", "/etc/ferrosa/tls/ca.crt", "https://127.0.0.1:9090/readyz"]
@@ -86,6 +71,8 @@ services:
       <<: *ferrosa-secure-env
     volumes:
       - ./.compose-tls/node1:/etc/ferrosa/tls:ro
+    ports:
+      - "8815:8815"   # Arrow Flight over TLS (flight builds)
     networks:
       default:
         ipv4_address: 172.28.77.101

@@ -69,6 +69,20 @@ commit_log_segment_size  = 33554432   # 32 MiB
 # allow_http = false
 
 # ---------------------------------------------------------------------------
+# TLS for the whole node: ONE certificate used by every listener below (CQL,
+# PostgreSQL, graph HTTP + Bolt, SPARQL, web console, Arrow Flight) and by
+# internode, unless a section sets its own tls_cert/tls_key/require_tls.
+# `require = true` makes every listener refuse plaintext; with it (and auth)
+# FERROSA_MODE=production is satisfied. Env: FERROSA_TLS_CERT / _KEY / _CA /
+# FERROSA_TLS_REQUIRE.
+# ---------------------------------------------------------------------------
+[tls]
+# cert    = "~/.ferrosa/config/tls/server.crt"
+# key     = "~/.ferrosa/config/tls/server.key"
+# ca      = "~/.ferrosa/config/tls/ca.crt"    # internode peer verification
+# require = false
+
+# ---------------------------------------------------------------------------
 # Graph engine (Cypher / Bolt). Enabled by default so the Cypher/Bolt endpoints
 # and the graph visualizer are available out of the box (and so ferrosa-memory
 # works against a fresh install). Set `enabled = false` here OR
@@ -151,8 +165,9 @@ bind = "127.0.0.1:9090"
 #
 # Production mode (FERROSA_MODE=production):
 #   Startup is refused unless auth is on, every ENABLED client listener
-#   (cql, postgres, graph + Bolt, sparql, web, flight) sets require_tls = true
-#   with a tls_cert/tls_key, and [internode] require_tls = true.
+#   (cql, postgres, graph + Bolt, sparql, web, flight) requires TLS with a
+#   certificate, and internode requires TLS. [tls] cert/key/ca + require = true
+#   covers all of them at once.
 #   Each refusal names the listener and the key to set.
 #   Random 96-hex-char passwords are generated for each role and printed
 #   once to stderr at startup. Record them immediately — they are not

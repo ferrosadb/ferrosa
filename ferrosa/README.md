@@ -51,7 +51,26 @@ apply when neither source sets the listener.
 
 ### TLS and production mode (t_d5d122ba)
 
-Every client listener takes TLS from its own section with the same three keys
+**One certificate for the whole node.** `[tls]` (env `FERROSA_TLS_*`) sets a
+single certificate that every listener and internode use unless they set their
+own, so a typical node needs only:
+
+```toml
+[tls]
+cert    = "/etc/ferrosa/tls/node.crt"   # FERROSA_TLS_CERT
+key     = "/etc/ferrosa/tls/node.key"   # FERROSA_TLS_KEY
+ca      = "/etc/ferrosa/tls/ca.crt"     # FERROSA_TLS_CA (internode peer verification)
+require = true                          # FERROSA_TLS_REQUIRE: every listener + internode refuse plaintext
+```
+
+That satisfies the production gate for every listener (Arrow Flight included)
+and internode. The certificate needs the SANs clients use for each port
+(internode verifies the peer IP). A section's own keys override `[tls]`: its
+`tls_cert`/`tls_key` pair (taken as a pair, never mixed with the `[tls]` key),
+and its `require_tls` (so `[sparql] require_tls = false` opts one listener out
+— and production then refuses it by name).
+
+Every client listener can also take TLS from its own section with the same three keys
 (TOML wins; env fallback `FERROSA_<PREFIX>_TLS_CERT` / `_TLS_KEY` /
 `_REQUIRE_TLS`): `[cql]`, `[postgres]`, `[graph]` (graph HTTP **and** Bolt),
 `[sparql]`, `[web]`, `[flight]` (Arrow Flight, `flight` builds) — `tls_cert`,
@@ -144,7 +163,8 @@ flat under tight cgroups; override at process startup with `_RJEM_MALLOC_CONF`.
 | `FERROSA_AUTH_DISABLED` | **deprecated** direct override — honored with a warning |
 | `FERROSA_SEED` | comma-separated seed peers (`host:port`, DNS-resolved) |
 | `FERROSA_GRAPH_ENABLED` / `FERROSA_SPARQL_ENABLED` | enable graph (HTTP+Bolt) / SPARQL front-ends |
-| `FERROSA_FLIGHT_BIND` / `FERROSA_FLIGHT_ENABLED` / `FERROSA_FLIGHT_SIGNING_KEY` / `FERROSA_FLIGHT_TOKEN_TTL_SECS` / `FERROSA_FLIGHT_TLS_CERT` / `_TLS_KEY` / `_REQUIRE_TLS` | Flight endpoint (when `flight` feature is built) |
+| `FERROSA_TLS_CERT` / `_KEY` / `_CA` / `FERROSA_TLS_REQUIRE` | node-wide certificate for every listener + internode (`[tls]`), overridden per section |
+| `FERROSA_FLIGHT_BIND` / `FERROSA_FLIGHT_ENABLED` / `FERROSA_FLIGHT_SIGNING_KEY` / `FERROSA_FLIGHT_TOKEN_TTL_SECS` / `FERROSA_FLIGHT_PORT` / `FERROSA_FLIGHT_TLS_CERT` / `_TLS_KEY` / `_REQUIRE_TLS` | Flight endpoint (when `flight` feature is built); `FERROSA_FLIGHT_PORT` is the port advertised for remote replicas, default the node's own `[flight] bind` port |
 | `FERROSA_TELEMETRY_ENABLED` | install the OTel tracing layer (when `otel` feature is built) |
 | `FERROSA_SELFHEAL_ENABLED` | self-heal quarantine controller (default on) |
 | `FERROSA_FLUSH_INTERVAL_SECS`, `FERROSA_URGENT_*` | maintenance-loop cadences |

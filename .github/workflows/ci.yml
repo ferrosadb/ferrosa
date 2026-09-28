@@ -583,9 +583,33 @@ jobs:
   # over HTTPS on every node, runs one authenticated CQL query over TLS, and
   # tears down. Before this job the overlay had no TLS settings at all, so
   # nothing proved it could start.
+  # A `flight`-feature release binary for the secure-compose job only. The
+  # shared ferrosa-test-node image stays on default features: paired
+  # repositories run it, and it must not start binding Arrow Flight for them.
+  build-flight-binary:
+    name: Build flight release binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: flight-binary
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Build glibc release binary with Arrow Flight
+        run: cargo build --release -p ferrosa --features flight
+      - name: Upload flight binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferrosa-flight-binary
+          path: target/release/ferrosa
+          retention-days: 7
+
   secure-compose:
     name: Production Compose overlay (TLS + auth)
-    needs: build-node-image
+    needs: [build-node-image, build-flight-binary]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -602,16 +626,24 @@ jobs:
         with:
           name: ferrosa-node-image
           path: /tmp/ferrosa-node-image
-      - name: Load the node image and add curl for the HTTPS healthcheck
+      - name: Download the flight release binary
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ferrosa-flight-binary
+          path: /tmp/secure-smoke-image
+      - name: Load the node image, swap in the flight binary, add curl
         run: |
           set -euo pipefail
           docker load --input /tmp/ferrosa-node-image/ferrosa-node-image.tar.gz
           # docker-compose.yml names node images ferrosa-smoke:latest; the
-          # healthcheck needs curl, which the thin CI image does not carry.
-          mkdir -p /tmp/secure-smoke-image
+          # healthcheck needs curl, which the thin CI image does not carry,
+          # and the Arrow Flight probe needs a binary built with `flight`.
+          chmod +x /tmp/secure-smoke-image/ferrosa
           printf '%s\n' \
             'FROM ferrosa-test-node:latest' \
             'RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*' \
+            'COPY ferrosa /usr/local/bin/ferrosa' \
+            'EXPOSE 8815' \
             > /tmp/secure-smoke-image/Dockerfile
           for attempt in 1 2 3 4; do
             docker build -t ferrosa-smoke:latest /tmp/secure-smoke-image && break
@@ -631,7 +663,7 @@ jobs:
               sleep $((attempt * 10))
             done
           done
-      - name: Start the overlay, check HTTPS readiness and CQL over TLS, tear down
+      - name: Start the overlay, check HTTPS, CQL and Arrow Flight over TLS, tear down
         run: |
           set -euo pipefail
           FERROSA_SEED_ADMIN_PASSWORD="$(openssl rand -hex 24)"

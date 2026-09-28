@@ -2,6 +2,16 @@
 # Config-file values override environment variables.
 # Copy to /etc/ferrosa/ferrosa.toml or specify with FERROSA_CONFIG env var.
 
+# One certificate for every listener and internode (overridden by any
+# section's own tls_cert/tls_key/require_tls). Env FERROSA_TLS_CERT / _KEY /
+# _CA / FERROSA_TLS_REQUIRE. With require = true (and auth) production mode
+# is satisfied.
+[tls]
+# cert = "/etc/ferrosa/tls/node.crt"
+# key = "/etc/ferrosa/tls/node.key"
+# ca = "/etc/ferrosa/tls/ca.crt"
+# require = false
+
 [cql]
 bind = "127.0.0.1:9042"
 auth_disabled = false
@@ -45,8 +55,8 @@ memtable_num_shards = 64
 # endpoint to a LAN or cluster, explicitly set its bind address to a non-loopback
 # value and configure authentication before doing so.
 #
-# FERROSA_MODE=production refuses to start unless every ENABLED listener sets
-# require_tls = true (with tls_cert/tls_key) and [internode] require_tls = true.
+# FERROSA_MODE=production refuses to start unless every ENABLED listener and
+# internode require TLS — [tls] require = true with cert/key does it once.
 
 [graph]
 enabled = true                    # graph HTTP (7474) + Bolt (7687); set false to disable
