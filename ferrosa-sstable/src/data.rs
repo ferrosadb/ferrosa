@@ -226,9 +226,13 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let flags = flags_buf[0];
 
         if flags & END_OF_PARTITION != 0 {
-            // No clustered rows at all — consume the marker and
-            // stream_clustered_rows will be a no-op.
-            self.pos += 1;
+            // No clustered rows at all. Leave pos AT the marker: the row
+            // phase (`stream_clustered_rows` / `read_next_clustered_row`)
+            // always reads one flags byte and consumes END_OF_PARTITION
+            // itself. Consuming it here made that phase read the NEXT
+            // partition's key bytes as a row, drifting the parse — which
+            // the startup smoke test reported as corruption, so self-heal
+            // quarantined healthy SSTables holding partition-level deletes.
             return Ok(Some((key, deletion, None)));
         }
         if flags & IS_MARKER != 0 {

@@ -2450,6 +2450,118 @@ mod tests {
         }
     }
 
+    /// The three partition shapes a flush sees after DELETEs on a table with
+    /// no clustering column: live rows, a newer partition delete over an older
+    /// still-stored row, and a partition delete of rows flushed earlier (no
+    /// rows at all). `n` partitions, cycling through the shapes.
+    fn mixed_delete_partitions(n: i64) -> Vec<Partition> {
+        let payload = vec![b'x'; 200];
+        let live_row = |ts: i64| Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(payload.clone(), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        let mut partitions: Vec<Partition> = (0..n)
+            .map(|i| {
+                let (deletion, rows) = match i % 3 {
+                    0 => (DeletionTime::LIVE, vec![live_row(1_000 + i)]),
+                    1 => (
+                        DeletionTime::new(100_000 + i, 1_790_000_000),
+                        vec![live_row(1_000 + i)],
+                    ),
+                    _ => (DeletionTime::new(100_000 + i, 1_790_000_000), vec![]),
+                };
+                Partition {
+                    key: make_key(&i.to_string()),
+                    deletion,
+                    static_row: None,
+                    rows,
+                }
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        partitions
+    }
+
+    #[test]
+    fn flushed_mix_of_live_shadowed_and_tombstone_only_partitions_reads_back() {
+        let mut schema = test_schema();
+        schema.clustering_columns.clear();
+        for n in [300i64, 1_200] {
+            let partitions = mixed_delete_partitions(n);
+            let header = build_serialization_header(&schema, &partitions);
+            let mut writer = SSTableWriter::new(WriteOptions::default(), header);
+            for p in &partitions {
+                writer.add_partition(p).unwrap();
+            }
+            let out = writer.finish().unwrap();
+            let reader = ferrosa_sstable::reader::SSTableReader::open(
+                ferrosa_sstable::reader::SSTableComponents {
+                    data: out.data,
+                    partitions: out.partitions,
+                    rows: out.rows,
+                    filter: out.filter,
+                    compression_info: out.compression_info,
+                    statistics: out.statistics,
+                },
+            )
+            .unwrap();
+
+            // The startup smoke test and self-heal read with the two-phase
+            // streaming path, not `next_partition`. It must agree.
+            let mut stream = reader.partitions_iter().unwrap();
+            for (idx, want) in partitions.iter().enumerate() {
+                let (key, deletion, _static) = stream
+                    .next_partition_header_only()
+                    .unwrap_or_else(|e| panic!("n={n}: streamed header {idx} failed: {e}"))
+                    .unwrap_or_else(|| panic!("n={n}: streamed EOF after {idx} partitions"));
+                assert_eq!(
+                    key, want.key,
+                    "n={n}: streamed partition {idx} out of place"
+                );
+                assert_eq!(
+                    deletion, want.deletion,
+                    "n={n}: streamed partition {idx} deletion"
+                );
+                let mut rows = 0usize;
+                stream
+                    .stream_clustered_rows(|_| {
+                        rows += 1;
+                        Ok(())
+                    })
+                    .unwrap_or_else(|e| panic!("n={n}: streamed rows of partition {idx}: {e}"));
+                assert_eq!(
+                    rows,
+                    want.rows.len(),
+                    "n={n}: streamed partition {idx} rows"
+                );
+            }
+
+            let mut iter = reader.partitions_iter().unwrap();
+            for (read, want) in partitions.iter().enumerate() {
+                let got = iter
+                    .next_partition()
+                    .unwrap_or_else(|e| panic!("n={n}: partition {read} failed to read: {e}"))
+                    .unwrap_or_else(|| panic!("n={n}: EOF after {read} partitions"));
+                assert_eq!(got.key, want.key, "n={n}: partition {read} out of place");
+                assert_eq!(
+                    got.deletion, want.deletion,
+                    "n={n}: partition {read} deletion"
+                );
+                assert_eq!(
+                    got.rows.len(),
+                    want.rows.len(),
+                    "n={n}: partition {read} rows"
+                );
+            }
+            assert!(
+                iter.next_partition().unwrap().is_none(),
+                "n={n}: trailing data"
+            );
+        }
+    }
+
     fn assert_data_db_promoted_last(base_dir: &Path, gen: u64) {
         let generation_prefix = format!("{gen}-");
         let renamed: Vec<_> = fsync_probe::renamed_files()
