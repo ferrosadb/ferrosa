@@ -167,7 +167,30 @@ class ReleaseWorkflowTest(unittest.TestCase):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_sample:0,prof_prefix:$RUNNER_TEMP/ferrosa-profile"', workflow)
         self.assertNotIn("_RJEM_MALLOC_CONF=", workflow)
-        self.assertIn("find \"$RUNNER_TEMP\" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit | grep -q .", workflow)
+        self.assertIn("profile_file=$(find \"$RUNNER_TEMP\" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit)", workflow)
+        self.assertIn('test -s "$profile_file"', workflow)
+
+    def test_profiling_feature_uses_libunwind_for_musl_stack_samples(self):
+        manifest = (ROOT / "ferrosa" / "Cargo.toml").read_text(encoding="utf-8")
+        self.assertIn('version = "0.7"', manifest)
+        self.assertIn('profiling = ["tikv-jemallocator/profiling_libunwind"]', manifest)
+
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('bash .github/scripts/build-musl-libunwind.sh "${{ matrix.target }}" "$unwind_prefix"', workflow)
+        self.assertIn('CPPFLAGS="-I$unwind_prefix/include"', workflow)
+        self.assertIn('LDFLAGS="-L$unwind_prefix/lib"', workflow)
+        self.assertIn('RUSTFLAGS="${RUSTFLAGS:-} -Lnative=$unwind_prefix/lib"', workflow)
+        self.assertIn("if readelf --program-headers \"$profiling_binary\" | grep 'INTERP'; then", workflow)
+
+        build_script = ROOT / ".github" / "scripts" / "build-musl-libunwind.sh"
+        script = build_script.read_text(encoding="utf-8")
+        self.assertIn("ddf0e32dd5fafe5283198d37e4bf9decf7ba1770b6e7e006c33e6df79e6a6157", script)
+        self.assertIn('x86_64-unknown-linux-musl)', script)
+        self.assertIn('aarch64-unknown-linux-musl)', script)
+        self.assertIn("--disable-shared", script)
+        self.assertIn("--disable-minidebuginfo", script)
+        self.assertIn("--disable-zlibdebuginfo", script)
+        self.assertIn("cflags=-mno-outline-atomics", script)
 
 
 if __name__ == "__main__":

@@ -436,6 +436,12 @@ jobs:
         if: matrix.image == 'ferrosa-profiling'
         run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
 
+      - name: Build musl libunwind for profiling
+        if: matrix.image == 'ferrosa-profiling'
+        run: |
+          unwind_prefix="$RUNNER_TEMP/musl-libunwind"
+          bash .github/scripts/build-musl-libunwind.sh "${{ matrix.target }}" "$unwind_prefix"
+
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         if: matrix.image == 'ferrosa-profiling'
         with:
@@ -449,15 +455,24 @@ jobs:
           CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
         run: |
           set -euo pipefail
+          unwind_prefix="$RUNNER_TEMP/musl-libunwind"
+          export CPPFLAGS="-I$unwind_prefix/include"
+          export LDFLAGS="-L$unwind_prefix/lib"
+          export RUSTFLAGS="${RUSTFLAGS:-} -Lnative=$unwind_prefix/lib"
           cargo build --locked --profile profiling \
             --target "${{ matrix.target }}" \
             -p ferrosa --bin ferrosa --features ferrosa/full,ferrosa/profiling
           profiling_binary="target/${{ matrix.target }}/profiling/ferrosa"
           test -x "$profiling_binary"
           readelf --sections "$profiling_binary" | grep -q '\.debug_info'
+          if readelf --program-headers "$profiling_binary" | grep 'INTERP'; then
+            echo "profiling binary unexpectedly requires a dynamic loader" >&2
+            exit 1
+          fi
           MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_sample:0,prof_prefix:$RUNNER_TEMP/ferrosa-profile" \
             "$profiling_binary" --version
-          find "$RUNNER_TEMP" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit | grep -q .
+          profile_file=$(find "$RUNNER_TEMP" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit)
+          test -s "$profile_file"
           install -m 0755 "$profiling_binary" "dist/${{ matrix.arch }}/ferrosa"
 
       - name: Build a single-architecture OCI archive
