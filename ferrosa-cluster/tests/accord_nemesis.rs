@@ -159,7 +159,91 @@ struct ScheduledPeerTransport {
     delayed_type: MsgType,
     delayed_edge: DelayEdge,
     delay: Duration,
-    hits: Arc<std::sync::atomic::AtomicUsize>,
+    ledger: Arc<FaultLedger>,
+}
+
+/// What happened to the one scheduled delay in a round.
+///
+/// A coordinator may legitimately drop a pending message once it has a
+/// quorum (read votes stop at F+1 agreement, 5e4505ea). So "the delay fired"
+/// is not a fixed fact of a schedule; whether a dropped minority reply was
+/// ever consumed depends on which replica answered first. What IS fixed:
+/// the fault targeted exactly one message, and that message's delay either
+/// ran out or was dropped — once.
+#[derive(Default)]
+struct FaultLedger {
+    armed: std::sync::atomic::AtomicUsize,
+    completed: std::sync::atomic::AtomicUsize,
+    cancelled: std::sync::atomic::AtomicUsize,
+}
+
+impl FaultLedger {
+    /// Wait until every armed delay has ended, at most `bound`, and return
+    /// the final `(armed, completed, cancelled)`.
+    ///
+    /// Some coordinator fan-outs are detached tasks that keep driving every
+    /// peer send after the transaction decides, so the delayed message can
+    /// still be in flight when `run_transaction` returns. Each such send ends
+    /// when its peer replies or its own bounded wait expires.
+    async fn settle(&self, bound: Duration) -> (usize, usize, usize) {
+        let step = Duration::from_millis(5);
+        for _ in 0..(bound.as_millis() / step.as_millis()) {
+            let (armed, completed, cancelled) = self.snapshot();
+            if armed > 0 && completed + cancelled == armed {
+                break;
+            }
+            tokio::time::sleep(step).await;
+        }
+        self.snapshot()
+    }
+
+    /// `(armed, completed, cancelled)`.
+    fn snapshot(&self) -> (usize, usize, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (
+            self.armed.load(SeqCst),
+            self.completed.load(SeqCst),
+            self.cancelled.load(SeqCst),
+        )
+    }
+}
+
+/// One armed delay. Armed when the targeted message is first seen; counted
+/// completed when its delay runs out, or cancelled if it is dropped first
+/// (including while the request it wraps is still in flight).
+struct ArmedDelay {
+    ledger: Arc<FaultLedger>,
+    done: bool,
+}
+
+impl ArmedDelay {
+    fn arm(ledger: Arc<FaultLedger>) -> Self {
+        ledger
+            .armed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            ledger,
+            done: false,
+        }
+    }
+
+    async fn run(&mut self, delay: Duration) {
+        tokio::time::sleep(delay).await;
+        self.done = true;
+        self.ledger
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for ArmedDelay {
+    fn drop(&mut self) {
+        if !self.done {
+            self.ledger
+                .cancelled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -170,22 +254,62 @@ impl AccordTransport for ScheduledPeerTransport {
         msg: ferrosa_net::message::Message,
         lane: ferrosa_net::codec::Lane,
     ) -> ferrosa_net::error::Result<ferrosa_net::message::Message> {
-        use std::sync::atomic::Ordering;
-
         let matches = host_id == self.delayed_peer && msg.msg_type() == self.delayed_type;
-        if matches && matches!(self.delayed_edge, DelayEdge::Request) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            tokio::time::sleep(self.delay).await;
+        // Armed before anything is awaited, so a send dropped at any point
+        // after this is accounted as cancelled rather than never having
+        // existed.
+        let mut armed = matches.then(|| ArmedDelay::arm(Arc::clone(&self.ledger)));
+        if let (Some(delay), DelayEdge::Request) = (armed.as_mut(), self.delayed_edge) {
+            delay.run(self.delay).await;
         }
 
         let response = self.peers.send(host_id, msg, lane).await;
 
-        if matches && matches!(self.delayed_edge, DelayEdge::Response) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            tokio::time::sleep(self.delay).await;
+        if let (Some(delay), DelayEdge::Response) = (armed.as_mut(), self.delayed_edge) {
+            delay.run(self.delay).await;
         }
         response
     }
+}
+
+/// The fault ledger counts a delay whose future is dropped mid-flight.
+///
+/// This is the round-4 flake, made deterministic: the coordinator reaches
+/// F+1 read votes and drops the pending ReadVote to the delayed minority
+/// replica (5e4505ea). The old counter only counted a response delay after
+/// the response arrived, so a dropped one counted 0 and "fired exactly once"
+/// failed whenever that replica lost the race — about 2 runs in 5 under load.
+#[tokio::test(start_paused = true)]
+async fn a_delay_dropped_mid_flight_is_counted_as_cancelled() {
+    let ledger = Arc::new(FaultLedger::default());
+    let armed = {
+        let ledger = Arc::clone(&ledger);
+        async move {
+            let mut delay = ArmedDelay::arm(ledger);
+            delay.run(Duration::from_secs(10)).await;
+        }
+    };
+    assert!(tokio::time::timeout(Duration::from_millis(10), armed)
+        .await
+        .is_err());
+    assert_eq!(
+        ledger.snapshot(),
+        (1, 0, 1),
+        "armed once, never completed, cancelled once"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_delay_that_runs_out_is_counted_as_completed_once() {
+    let ledger = Arc::new(FaultLedger::default());
+    let mut delay = ArmedDelay::arm(Arc::clone(&ledger));
+    delay.run(Duration::from_millis(5)).await;
+    drop(delay);
+    assert_eq!(
+        ledger.snapshot(),
+        (1, 1, 0),
+        "armed once, completed once, not cancelled"
+    );
 }
 
 /// packet_reorder_linearizability — in-process delay nemesis proxy (3-node).
@@ -256,7 +380,7 @@ async fn packet_reorder_linearizability() {
     for round in 0..5usize {
         let key_round = [key.clone(), (round as u32).to_le_bytes().to_vec()].concat();
         let (delay_a, delayed_type, delayed_edge, delayed_peer, delay_ms) = schedules[round];
-        let delay_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ledger = Arc::new(FaultLedger::default());
 
         let transport_a: Arc<dyn AccordTransport> = if delay_a {
             Arc::new(ScheduledPeerTransport {
@@ -265,7 +389,7 @@ async fn packet_reorder_linearizability() {
                 delayed_type,
                 delayed_edge,
                 delay: Duration::from_millis(delay_ms),
-                hits: Arc::clone(&delay_hits),
+                ledger: Arc::clone(&ledger),
             })
         } else {
             node_a.peer_manager.clone()
@@ -279,7 +403,7 @@ async fn packet_reorder_linearizability() {
                 delayed_type,
                 delayed_edge,
                 delay: Duration::from_millis(delay_ms),
-                hits: Arc::clone(&delay_hits),
+                ledger: Arc::clone(&ledger),
             })
         };
 
@@ -314,12 +438,10 @@ async fn packet_reorder_linearizability() {
         // F+1 matching votes already decide; in that case the first operation
         // validly completes before the competitor begins.
         let start_stagger = Duration::from_millis(2);
-        let mut completed_before_competitor = false;
         let (result_a, result_b) = if delay_a {
             let mut faulted = Box::pin(driver_a.run_transaction());
             let completed = tokio::time::timeout(start_stagger, &mut faulted).await;
             if let Ok(result_a) = completed {
-                completed_before_competitor = true;
                 (result_a, driver_b.run_transaction().await)
             } else {
                 tokio::join!(faulted, driver_b.run_transaction())
@@ -328,7 +450,6 @@ async fn packet_reorder_linearizability() {
             let mut faulted = Box::pin(driver_b.run_transaction());
             let completed = tokio::time::timeout(start_stagger, &mut faulted).await;
             if let Ok(result_b) = completed {
-                completed_before_competitor = true;
                 (driver_a.run_transaction().await, result_b)
             } else {
                 let (result_b, result_a) = tokio::join!(faulted, driver_a.run_transaction());
@@ -340,28 +461,21 @@ async fn packet_reorder_linearizability() {
             "message_delay(side={delayed_side},type={delayed_type:?},edge={delayed_edge:?},\
              peer={delayed_peer},delay={delay_ms}ms)"
         );
-        let hits = delay_hits.load(std::sync::atomic::Ordering::Relaxed);
-        let early_read_quorum = completed_before_competitor
-            && matches!(delayed_type, MsgType::AccordRead)
-            && matches!(delayed_edge, DelayEdge::Response)
-            && if delay_a {
-                result_a.is_ok()
-            } else {
-                result_b.is_ok()
-            };
-        if early_read_quorum {
-            assert!(
-                hits <= 1,
-                "round {round}: a canceled minority ReadVote may fire at most once: \
-                 {nemesis_desc}"
-            );
-        } else {
-            assert_eq!(
-                hits, 1,
-                "round {round}: configured message-level fault did not fire exactly once: \
-                 {nemesis_desc}"
-            );
-        }
+        // Exact accounting, independent of which replica answered first: the
+        // fault targeted exactly one message (never a retry or a second
+        // message), and that message's delay ran out or was dropped once.
+        let (armed, completed, cancelled) = ledger.settle(Duration::from_secs(30)).await;
+        assert_eq!(
+            armed, 1,
+            "round {round}: the fault must target exactly one message: {nemesis_desc} \
+             (armed={armed} completed={completed} cancelled={cancelled})"
+        );
+        assert_eq!(
+            completed + cancelled,
+            armed,
+            "round {round}: every armed delay must end once: {nemesis_desc} \
+             (armed={armed} completed={completed} cancelled={cancelled})"
+        );
 
         // Count commits this round.
         let mut applied_this_round: u32 = 0;
