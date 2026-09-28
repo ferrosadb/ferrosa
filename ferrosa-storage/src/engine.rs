@@ -21643,6 +21643,82 @@ mod tests {
 
     const LONG_AGO_LDT: u32 = 1_000_000_000;
 
+    /// P0 found 2026-09-28 in a real 3-node quorum: 5000 rows, half deleted,
+    /// then compaction. The compaction output passed its own streaming
+    /// readback, then failed the startup smoke test ("read_exact_at: wanted N
+    /// bytes, got M"), so self-heal quarantined it and the node served a
+    /// near-empty table. Same shape here, no cluster: a table with no
+    /// clustering column, partition deletes inside gc grace, several inputs.
+    #[tokio::test]
+    async fn compaction_output_with_deleted_partitions_passes_the_startup_smoke_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        let mut schema = test_schema();
+        schema.clustering_columns.clear();
+        engine.register_table(schema).unwrap();
+        let tid = table_id();
+        let payload = vec![b'x'; 200];
+        for i in 0..5000i64 {
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(payload.clone(), 1_000 + i))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000 + i),
+            };
+            engine
+                .write(&tid, &make_key(&i.to_string()), row, 1_000 + i)
+                .unwrap();
+            if i % 1_000 == 999 {
+                engine.flush(&tid).unwrap();
+            }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        for i in (0..5000i64).step_by(2) {
+            let ts = 100_000 + i;
+            engine
+                .write(
+                    &tid,
+                    &make_key(&i.to_string()),
+                    partition_delete_row(ts, now),
+                    ts,
+                )
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        assert!(
+            engine.sstable_count(&tid) >= 2,
+            "compaction needs several inputs"
+        );
+
+        engine.force_compact_all();
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.sstable_count(&tid), 1, "compaction must swap in");
+
+        let table_dir = engine.table_sstable_dir(&tid);
+        let gens = StorageEngine::list_generations_in_dir(&table_dir);
+        assert_eq!(
+            gens.len(),
+            1,
+            "only the compaction output remains: {gens:?}"
+        );
+        for gen in gens {
+            if let Err(e) = StorageEngine::smoke_test_generation(&table_dir, gen) {
+                panic!("compaction output gen {gen} fails the startup smoke test: {e}");
+            }
+        }
+    }
+
     #[test]
     fn tombstone_purging_is_on_unless_explicitly_switched_off() {
         assert!(parse_purge_enabled(None));
