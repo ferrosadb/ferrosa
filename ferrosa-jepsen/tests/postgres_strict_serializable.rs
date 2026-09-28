@@ -28,7 +28,7 @@ use uuid::Uuid;
 const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 2;
 // Bound retries so an unavailable cluster cannot hold a test actor indefinitely.
-const TRANSFER_SERIALIZATION_RETRIES: usize = 8;
+const SERIALIZATION_RETRIES: usize = 8;
 const WRITE_SKEW_WRITERS: usize = 2;
 const WORKLOAD_STATE_READ_RETRIES: usize = 120;
 const INITIAL_BALANCE: i64 = 10_000;
@@ -121,6 +121,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
 
     let event_clock = Arc::new(AtomicU64::new(1));
     let transfer_retry_count = Arc::new(AtomicUsize::new(0));
+    let write_skew_retry_count = Arc::new(AtomicUsize::new(0));
     let history = Arc::new(Mutex::new(Vec::with_capacity(
         ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
     )));
@@ -132,6 +133,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         let client = Arc::clone(actor_client);
         let event_clock = Arc::clone(&event_clock);
         let transfer_retry_count = Arc::clone(&transfer_retry_count);
+        let write_skew_retry_count = Arc::clone(&write_skew_retry_count);
         let history = Arc::clone(&history);
         let predicate_barrier = Arc::clone(&predicate_barrier);
         let write_skew_barrier = Arc::clone(&write_skew_barrier);
@@ -174,16 +176,29 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
                         .push(predicate);
 
                     wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
-                    let write_skew = if is_write_skew_writer(actor) {
-                        write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?
+                    if is_write_skew_writer(actor) {
+                        let transactions =
+                            write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock)
+                                .await?;
+                        write_skew_retry_count
+                            .fetch_add(transactions.len().saturating_sub(1), Ordering::Relaxed);
+                        history
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .extend(transactions);
                     } else {
-                        observe_predicate_once(&client, &table, 2_000 + actor as u64, &event_clock)
-                            .await?
-                    };
-                    history
-                        .lock()
-                        .expect("history mutex poisoned")
-                        .push(write_skew);
+                        let observation = observe_predicate_once(
+                            &client,
+                            &table,
+                            2_000 + actor as u64,
+                            &event_clock,
+                        )
+                        .await?;
+                        history
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .push(observation);
+                    }
                     Ok(())
                 },
                 &mut actor_cancel_rx,
@@ -237,7 +252,9 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     history.sort_by_key(|transaction| transaction.id);
     assert_eq!(
         history.len(),
-        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2) + transfer_retry_count.load(Ordering::Relaxed),
+        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2)
+            + transfer_retry_count.load(Ordering::Relaxed)
+            + write_skew_retry_count.load(Ordering::Relaxed),
         "every invoked operation must have a recorded completion"
     );
     assert!(
@@ -665,6 +682,15 @@ async fn write_skew_once(
     table: &str,
     id: u64,
     event_clock: &AtomicU64,
+) -> Result<Vec<RecordedTransaction>> {
+    retry_serializable_transactions(|| write_skew_attempt(client, table, id, event_clock)).await
+}
+
+async fn write_skew_attempt(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
 ) -> Result<RecordedTransaction> {
     let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
     let mut operations = Vec::with_capacity(4);
@@ -761,8 +787,8 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<RecordedTransaction>>,
 {
-    let mut history = Vec::with_capacity(TRANSFER_SERIALIZATION_RETRIES + 1);
-    for _ in 0..=TRANSFER_SERIALIZATION_RETRIES {
+    let mut history = Vec::with_capacity(SERIALIZATION_RETRIES + 1);
+    for _ in 0..=SERIALIZATION_RETRIES {
         let transaction = attempt().await?;
         let committed = transaction.committed;
         history.push(transaction);
@@ -959,7 +985,7 @@ mod tests {
         actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
         is_retryable_serialization_state, is_write_skew_writer, predicate_observations,
         retry_serializable_transactions, run_until_actor_failure, wait_for_phase, FaultSchedule,
-        RecordedTransaction, TransactionOperation, ACTORS, TRANSFER_SERIALIZATION_RETRIES,
+        RecordedTransaction, TransactionOperation, ACTORS, SERIALIZATION_RETRIES,
     };
 
     #[tokio::test]
@@ -1011,8 +1037,8 @@ mod tests {
         .await
         .expect("serialization failures are retained as aborted attempts");
 
-        assert_eq!(attempts.get(), TRANSFER_SERIALIZATION_RETRIES + 1);
-        assert_eq!(history.len(), TRANSFER_SERIALIZATION_RETRIES + 1);
+        assert_eq!(attempts.get(), SERIALIZATION_RETRIES + 1);
+        assert_eq!(history.len(), SERIALIZATION_RETRIES + 1);
         assert!(history.iter().all(|transaction| !transaction.committed));
     }
 

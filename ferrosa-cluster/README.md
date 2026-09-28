@@ -28,6 +28,11 @@ token ring and a Raft-replicated metadata state machine:
 
 It also implements **Accord** (`accord/`), an EPaxos-family protocol for
 strict-serializable multi-key / cross-shard transactions and LWT.
+During Apply, remote replica fanout runs concurrently with the coordinator's
+local dependency wait. The coordinator reports success only after its local
+transaction reaches `Applied` and every participating shard reaches Apply
+quorum, so a locally parked dependency does not delay propagation or become an
+early acknowledgement.
 
 > **Correctness-evidence honesty.** The Accord and Raft subsystems have extensive
 > *in-crate, deterministic* tests (state-machine, recovery, property, and

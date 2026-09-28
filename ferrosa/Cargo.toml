@@ -54,7 +54,7 @@ uuid = { version = "1", features = ["v4"] }
 # Replaces glibc malloc to avoid thread-arena retention (27× 64MB arenas ≈ 1.7GB RSS on 3-node cluster).
 # Confirmed by live podman testing on 2026-04-19 — cluster memory stays flat vs. climbing to OOM.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
 
 [features]
 default = []
@@ -70,9 +70,9 @@ otel = [
 # `live-infra-tests` (test-only) and `ferrosa-cluster/sprint-03-engine-transfer`
 # (in-progress). Used by release artifacts and the published Docker image.
 full = ["otel", "flight", "ferrosa-cql/asc-udf"]
-# Enables jemalloc's heap profiler in diagnostic builds. Profiling remains off
-# at runtime until the operator opts in through MALLOC_CONF.
-profiling = ["tikv-jemallocator/profiling"]
+# Enables jemalloc's heap profiler with libunwind, which avoids the default
+# unwinder crash on Linux musl. Profiling remains off until MALLOC_CONF opts in.
+profiling = ["tikv-jemallocator/profiling_libunwind"]
 
 # Optional OTel dependencies, gated behind the `otel` feature.
 [dependencies.tracing-opentelemetry]
