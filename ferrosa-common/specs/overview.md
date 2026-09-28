@@ -43,7 +43,7 @@ here so storage and schema share it without a cycle through `ferrosa-sstable`.
 | `key` (`src/key.rs`) | 176 | `PartitionKey`, `DecoratedKey` (cached token, token-then-bytes order, `filter_hash`) |
 | `error` (`src/error.rs`) | 168 | `Error` / `Result`; typed `CorruptSstable` repair signal; `is_backpressure` |
 | `cell` (`src/cell.rs`) | 151 | `CellValue` live/expiring/tombstone + sentinels |
-| `data_type` (`src/data_type.rs`) | 89 | `DataType` scalar descriptor (`#[non_exhaustive]`) |
+| `data_type` (`src/data_type.rs`) | 89 | `DataType` scalar descriptor (exhaustive) |
 | `token` (`src/token.rs`) | 79 | `Token` newtype + `from_key` |
 | `task_pool` (`src/task_pool.rs`) | 71 | `TaskPool` runtime-aware spawn helper |
 | `test_generators` (`src/test_generators.rs`) | 48 | proptest strategies (feature `test-generators`) |
@@ -96,8 +96,10 @@ flowchart TD
    for NaN — required wherever values are used as sorted keys.
 5. **`CorruptSstable` is a typed signal, never string-matched.** The repair range
    is read via `corrupt_sstable_range()`.
-6. **`#[non_exhaustive]` on `Error` and `DataType`.** New variants can be added
-   without a semver break; downstream matches must keep a wildcard arm.
+6. **`#[non_exhaustive]` on `Error` only.** `DataType` dropped it (jsonb M3) so
+   downstream matches are exhaustive and the compiler flags every site when a
+   variant is added. `CqlValue::cmp` and its storage/schema callers have no
+   wildcard arms either.
 
 ## Position in the dependency graph
 

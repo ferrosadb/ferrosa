@@ -1,9 +1,8 @@
 //! CQL data type descriptors.
 //!
 //! [`DataType`] names the CQL scalar types that can appear in column
-//! definitions. It is intentionally `#[non_exhaustive]` so that new types
-//! (collections, UDTs, counters) can be added in future releases without
-//! breaking downstream crates.
+//! definitions. It is deliberately exhaustive (not `#[non_exhaustive]`) so the
+//! compiler flags every downstream match when a type is added.
 //!
 //! The display representation uses the lowercase CQL keyword, e.g.
 //! `DataType::BigInt` formats as `"bigint"`.
@@ -16,10 +15,10 @@ use std::fmt;
 /// The raw bytes for a value live in [`crate::CellValue`]; `DataType` adds
 /// the type layer on top.
 ///
-/// `#[non_exhaustive]` allows adding variants (e.g. `List`, `Map`, `Udt`)
-/// without breaking downstream match arms.
+/// This enum is deliberately **not** `#[non_exhaustive]`: downstream matches
+/// must be exhaustive so the compiler flags every site when a variant is
+/// added (jsonb hazard H3, decision M3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum DataType {
     /// UTF-8 string (`text` / `varchar`).
     Text,

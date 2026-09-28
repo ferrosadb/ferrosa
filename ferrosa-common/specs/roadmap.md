@@ -42,8 +42,9 @@ the code, not from leftover tags.
   when a consumer needs them — the current behavior is a documented fail-loud
   limitation, not a bug.
 - **Audit `#[non_exhaustive]` downstream matches (FMEA FC-6).** When new
-  `Error`/`DataType` variants are added, sweep downstream wildcard arms so a new
-  error isn't silently swallowed by a catch-all.
+  `Error` variants are added, sweep downstream wildcard arms so a new
+  error isn't silently swallowed by a catch-all. (`DataType` is exhaustive
+  since T-020, so the compiler does this for it.)
 
 ## Non-goals
 

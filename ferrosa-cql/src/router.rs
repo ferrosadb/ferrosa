@@ -7458,8 +7458,6 @@ fn data_type_to_cql_type(dt: &DataType) -> CqlType {
         DataType::Timestamp => CqlType::Timestamp,
         DataType::Blob => CqlType::Blob,
         DataType::Duration => CqlType::Duration,
-        // DataType is #[non_exhaustive]; treat unknown variants as blob.
-        _ => CqlType::Blob,
     }
 }
 

@@ -3,6 +3,7 @@
 //! Maps CQL type names to Cassandra marshal type class names and converts
 //! `TableMetadata` into `ferrosa_common::schema::TableSchema`.
 
+use ferrosa_common::cql_type::CqlType;
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 
 use crate::metadata::column::ColumnKind;
@@ -47,31 +48,84 @@ pub fn cql_to_marshal_type(cql_type: &str) -> String {
         }
     }
 
-    // Scalar types
-    match trimmed {
-        "text" | "varchar" => "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-        "int" => "org.apache.cassandra.db.marshal.Int32Type".to_string(),
-        "bigint" => "org.apache.cassandra.db.marshal.LongType".to_string(),
-        "boolean" => "org.apache.cassandra.db.marshal.BooleanType".to_string(),
-        "float" => "org.apache.cassandra.db.marshal.FloatType".to_string(),
-        "double" => "org.apache.cassandra.db.marshal.DoubleType".to_string(),
-        "blob" => "org.apache.cassandra.db.marshal.BytesType".to_string(),
-        "timestamp" => "org.apache.cassandra.db.marshal.TimestampType".to_string(),
-        "uuid" => "org.apache.cassandra.db.marshal.UUIDType".to_string(),
-        "timeuuid" => "org.apache.cassandra.db.marshal.TimeUUIDType".to_string(),
-        "inet" => "org.apache.cassandra.db.marshal.InetAddressType".to_string(),
-        "counter" => "org.apache.cassandra.db.marshal.CounterColumnType".to_string(),
-        "ascii" => "org.apache.cassandra.db.marshal.AsciiType".to_string(),
-        "decimal" => "org.apache.cassandra.db.marshal.DecimalType".to_string(),
-        "varint" => "org.apache.cassandra.db.marshal.IntegerType".to_string(),
-        "smallint" => "org.apache.cassandra.db.marshal.ShortType".to_string(),
-        "tinyint" => "org.apache.cassandra.db.marshal.ByteType".to_string(),
-        "date" => "org.apache.cassandra.db.marshal.SimpleDateType".to_string(),
-        "time" => "org.apache.cassandra.db.marshal.TimeType".to_string(),
-        "duration" => "org.apache.cassandra.db.marshal.DurationType".to_string(),
-        // Unknown types: return as-is for forward compatibility
-        other => other.to_string(),
+    // Scalar types. A name that is not a scalar (a UDT name, `tuple<..>`,
+    // `vector<..>`) is returned as-is: it is not a marshal class this
+    // function can name, so the caller sees the original text.
+    match scalar_from_name(trimmed)
+        .as_ref()
+        .and_then(scalar_marshal_class)
+    {
+        Some(class) => class.to_string(),
+        None => trimmed.to_string(),
     }
+}
+
+/// Parse a scalar CQL type name (case-sensitive, as before) into a `CqlType`.
+///
+/// Returns `None` for anything that is not a scalar keyword.
+fn scalar_from_name(name: &str) -> Option<CqlType> {
+    Some(match name {
+        "text" | "varchar" => CqlType::Varchar,
+        "int" => CqlType::Int,
+        "bigint" => CqlType::Bigint,
+        "boolean" => CqlType::Boolean,
+        "float" => CqlType::Float,
+        "double" => CqlType::Double,
+        "blob" => CqlType::Blob,
+        "timestamp" => CqlType::Timestamp,
+        "uuid" => CqlType::Uuid,
+        "timeuuid" => CqlType::Timeuuid,
+        "inet" => CqlType::Inet,
+        "counter" => CqlType::Counter,
+        "ascii" => CqlType::Ascii,
+        "decimal" => CqlType::Decimal,
+        "varint" => CqlType::Varint,
+        "smallint" => CqlType::Smallint,
+        "tinyint" => CqlType::Tinyint,
+        "date" => CqlType::Date,
+        "time" => CqlType::Time,
+        "duration" => CqlType::Duration,
+        _ => return None,
+    })
+}
+
+/// Marshal class for a scalar `CqlType`.
+///
+/// Exhaustive over `CqlType`: a new variant must choose a marshal class (or
+/// explicitly join the non-scalar group) here, rather than falling through
+/// to a pass-through string (jsonb hazard H3, FM-19).
+fn scalar_marshal_class(t: &CqlType) -> Option<&'static str> {
+    let class = match t {
+        CqlType::Varchar => "org.apache.cassandra.db.marshal.UTF8Type",
+        CqlType::Int => "org.apache.cassandra.db.marshal.Int32Type",
+        CqlType::Bigint => "org.apache.cassandra.db.marshal.LongType",
+        CqlType::Boolean => "org.apache.cassandra.db.marshal.BooleanType",
+        CqlType::Float => "org.apache.cassandra.db.marshal.FloatType",
+        CqlType::Double => "org.apache.cassandra.db.marshal.DoubleType",
+        CqlType::Blob => "org.apache.cassandra.db.marshal.BytesType",
+        CqlType::Timestamp => "org.apache.cassandra.db.marshal.TimestampType",
+        CqlType::Uuid => "org.apache.cassandra.db.marshal.UUIDType",
+        CqlType::Timeuuid => "org.apache.cassandra.db.marshal.TimeUUIDType",
+        CqlType::Inet => "org.apache.cassandra.db.marshal.InetAddressType",
+        CqlType::Counter => "org.apache.cassandra.db.marshal.CounterColumnType",
+        CqlType::Ascii => "org.apache.cassandra.db.marshal.AsciiType",
+        CqlType::Decimal => "org.apache.cassandra.db.marshal.DecimalType",
+        CqlType::Varint => "org.apache.cassandra.db.marshal.IntegerType",
+        CqlType::Smallint => "org.apache.cassandra.db.marshal.ShortType",
+        CqlType::Tinyint => "org.apache.cassandra.db.marshal.ByteType",
+        CqlType::Date => "org.apache.cassandra.db.marshal.SimpleDateType",
+        CqlType::Time => "org.apache.cassandra.db.marshal.TimeType",
+        CqlType::Duration => "org.apache.cassandra.db.marshal.DurationType",
+        // Non-scalars are composed by the string wrappers in
+        // `cql_to_marshal_type` (or passed through as UDT/tuple/vector text).
+        CqlType::List(_)
+        | CqlType::Map(_, _)
+        | CqlType::Set(_)
+        | CqlType::Tuple(_)
+        | CqlType::Udt { .. }
+        | CqlType::Vector(_, _) => return None,
+    };
+    Some(class)
 }
 
 /// Strip a wrapper type prefix like `set<...>` and return the inner type.
@@ -344,6 +398,48 @@ mod tests {
             cql_to_marshal_type("counter"),
             "org.apache.cassandra.db.marshal.CounterColumnType"
         );
+    }
+
+    #[test]
+    fn no_wildcard_default_for_new_variant() {
+        // Every scalar name maps to a class; every non-scalar CqlType has no
+        // scalar class (never a silent default).
+        for name in [
+            "text",
+            "varchar",
+            "int",
+            "bigint",
+            "boolean",
+            "float",
+            "double",
+            "blob",
+            "timestamp",
+            "uuid",
+            "timeuuid",
+            "inet",
+            "counter",
+            "ascii",
+            "decimal",
+            "varint",
+            "smallint",
+            "tinyint",
+            "date",
+            "time",
+            "duration",
+        ] {
+            let t = scalar_from_name(name).expect("scalar name parses");
+            let class = scalar_marshal_class(&t).expect("scalar has a class");
+            assert_eq!(cql_to_marshal_type(name), class);
+        }
+        let non_scalars = [
+            CqlType::List(Box::new(CqlType::Int)),
+            CqlType::Tuple(vec![CqlType::Int]),
+            CqlType::Vector(Box::new(CqlType::Float), 3),
+        ];
+        for t in &non_scalars {
+            assert_eq!(scalar_marshal_class(t), None);
+        }
+        assert_eq!(scalar_from_name("my_udt"), None);
     }
 
     #[test]

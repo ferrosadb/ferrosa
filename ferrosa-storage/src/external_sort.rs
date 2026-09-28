@@ -122,7 +122,26 @@ fn cql_value_payload_bytes(v: &CqlValue) -> usize {
                 .sum::<usize>()
                 + items.len() * std::mem::size_of::<Option<CqlValue>>()
         }
-        _ => 0,
+        // Fixed-size variants own no heap payload beyond the enum itself.
+        CqlValue::Null
+        | CqlValue::Bigint(_)
+        | CqlValue::Boolean(_)
+        | CqlValue::Counter(_)
+        | CqlValue::Double(_)
+        | CqlValue::Float(_)
+        | CqlValue::Int(_)
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Timeuuid(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Smallint(_)
+        | CqlValue::Tinyint(_)
+        | CqlValue::Duration { .. } => 0,
+        // Heap-allocated payloads whose size is not tracked precisely.
+        // Listed explicitly so a new variant must choose its accounting.
+        CqlValue::Decimal { .. } | CqlValue::Varint(_) | CqlValue::Udt(_) => 0,
     }
 }
 
@@ -487,6 +506,25 @@ impl<T: SpillRow, C: SpillOrder<T>> KWayMerge<T, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_wildcard_default_for_new_variant() {
+        // Variable-length payloads are counted; a large document-like value
+        // must never account as 0 bytes (jsonb hazard H3, FM-18).
+        assert_eq!(cql_value_payload_bytes(&CqlValue::Text("abcd".into())), 4);
+        assert_eq!(cql_value_payload_bytes(&CqlValue::Ascii("ab".into())), 2);
+        assert_eq!(cql_value_payload_bytes(&CqlValue::Blob(vec![0; 9])), 9);
+        assert_eq!(cql_value_payload_bytes(&CqlValue::Vector(vec![0; 3])), 12);
+        assert!(cql_value_payload_bytes(&CqlValue::List(vec![CqlValue::Text("x".into())])) > 1);
+        assert!(cql_value_payload_bytes(&CqlValue::Set(vec![CqlValue::Int(1)])) > 0);
+        assert!(
+            cql_value_payload_bytes(&CqlValue::Map(vec![(CqlValue::Int(1), CqlValue::Int(2))])) > 0
+        );
+        assert!(cql_value_payload_bytes(&CqlValue::Tuple(vec![Some(CqlValue::Int(1))])) > 0);
+        // Fixed-size variants own no heap payload.
+        assert_eq!(cql_value_payload_bytes(&CqlValue::Int(1)), 0);
+        assert_eq!(cql_value_payload_bytes(&CqlValue::Null), 0);
+    }
 
     fn irow(v: i64) -> Row {
         vec![Some(CqlValue::Bigint(v))]

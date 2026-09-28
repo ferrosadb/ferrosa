@@ -31,7 +31,7 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
 - **Storage cell** — `CellValue` with live / expiring / tombstone constructors
   and `is_live`/`is_tombstone`/`is_expiring`; sentinels `NO_TIMESTAMP`,
   `NO_TTL`, `NO_DELETION_TIME`.
-- **CQL type model** — `DataType` (scalar descriptor, `#[non_exhaustive]`),
+- **CQL type model** — `DataType` (scalar descriptor, exhaustive: not `#[non_exhaustive]`),
   `CqlType` (full type tree incl. List/Map/Set/Tuple/Udt/Vector, with protocol
   `type_id()`), and `CqlValue` (runtime value with manual IEEE-754-total `Ord`).
 - **Errors** — `Error` (`#[non_exhaustive]`) + `Result`; notable typed variant

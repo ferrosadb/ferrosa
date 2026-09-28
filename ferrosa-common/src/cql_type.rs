@@ -153,11 +153,6 @@ impl PartialOrd for CqlValue {
 impl Ord for CqlValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
-        let d_self = std::mem::discriminant(self);
-        let d_other = std::mem::discriminant(other);
-        if d_self != d_other {
-            return self.discriminant_index().cmp(&other.discriminant_index());
-        }
         match (self, other) {
             (Self::Null, Self::Null) => Ordering::Equal,
             (Self::Ascii(a), Self::Ascii(b)) | (Self::Text(a), Self::Text(b)) => a.cmp(b),
@@ -211,7 +206,37 @@ impl Ord for CqlValue {
                 a.len().cmp(&b.len())
             }
             (Self::Udt(a), Self::Udt(b)) => a.cmp(b),
-            _ => Ordering::Equal, // same discriminant, unreachable
+            // Different variants: order by variant index. Every variant is
+            // listed on the left so adding a `CqlValue` variant without a
+            // same-variant arm above fails to compile instead of comparing
+            // Equal (jsonb hazard H3, FM-18).
+            (Self::Null, _)
+            | (Self::Ascii(_), _)
+            | (Self::Bigint(_), _)
+            | (Self::Blob(_), _)
+            | (Self::Boolean(_), _)
+            | (Self::Counter(_), _)
+            | (Self::Decimal { .. }, _)
+            | (Self::Double(_), _)
+            | (Self::Float(_), _)
+            | (Self::Int(_), _)
+            | (Self::Timestamp(_), _)
+            | (Self::Uuid(_), _)
+            | (Self::Text(_), _)
+            | (Self::Varint(_), _)
+            | (Self::Timeuuid(_), _)
+            | (Self::Inet(_), _)
+            | (Self::Date(_), _)
+            | (Self::Time(_), _)
+            | (Self::Smallint(_), _)
+            | (Self::Tinyint(_), _)
+            | (Self::Duration { .. }, _)
+            | (Self::List(_), _)
+            | (Self::Set(_), _)
+            | (Self::Map(_), _)
+            | (Self::Tuple(_), _)
+            | (Self::Vector(_), _)
+            | (Self::Udt(_), _) => self.discriminant_index().cmp(&other.discriminant_index()),
         }
     }
 }
@@ -330,5 +355,109 @@ mod tests {
         assert_eq!(CqlType::Varchar.type_id(), 0x000D);
         assert_eq!(CqlType::List(Box::new(CqlType::Int)).type_id(), 0x0020);
         assert_eq!(CqlType::Tuple(vec![CqlType::Int]).type_id(), 0x0031);
+    }
+
+    /// One (lo, hi) pair per `CqlValue` variant, lo < hi by content.
+    fn ordered_pairs() -> Vec<(CqlValue, CqlValue)> {
+        use std::net::Ipv4Addr;
+        let u1 = uuid::Uuid::from_u128(1);
+        let u2 = uuid::Uuid::from_u128(2);
+        let dur = |d| CqlValue::Duration {
+            months: 0,
+            days: d,
+            nanos: 0,
+        };
+        vec![
+            (CqlValue::Null, CqlValue::Null),
+            (CqlValue::Ascii("a".into()), CqlValue::Ascii("b".into())),
+            (CqlValue::Bigint(1), CqlValue::Bigint(2)),
+            (CqlValue::Blob(vec![1]), CqlValue::Blob(vec![2])),
+            (CqlValue::Boolean(false), CqlValue::Boolean(true)),
+            (CqlValue::Counter(1), CqlValue::Counter(2)),
+            (
+                CqlValue::Decimal {
+                    scale: 1,
+                    unscaled: 1.into(),
+                },
+                CqlValue::Decimal {
+                    scale: 1,
+                    unscaled: 2.into(),
+                },
+            ),
+            (
+                CqlValue::Double(1.0f64.to_bits()),
+                CqlValue::Double(2.0f64.to_bits()),
+            ),
+            (
+                CqlValue::Float(1.0f32.to_bits()),
+                CqlValue::Float(2.0f32.to_bits()),
+            ),
+            (CqlValue::Int(1), CqlValue::Int(2)),
+            (CqlValue::Timestamp(1), CqlValue::Timestamp(2)),
+            (CqlValue::Uuid(u1), CqlValue::Uuid(u2)),
+            (CqlValue::Text("a".into()), CqlValue::Text("b".into())),
+            (CqlValue::Varint(1.into()), CqlValue::Varint(2.into())),
+            (CqlValue::Timeuuid(u1), CqlValue::Timeuuid(u2)),
+            (
+                CqlValue::Inet(Ipv4Addr::new(10, 0, 0, 1).into()),
+                CqlValue::Inet(Ipv4Addr::new(10, 0, 0, 2).into()),
+            ),
+            (CqlValue::Date(1), CqlValue::Date(2)),
+            (CqlValue::Time(1), CqlValue::Time(2)),
+            (CqlValue::Smallint(1), CqlValue::Smallint(2)),
+            (CqlValue::Tinyint(1), CqlValue::Tinyint(2)),
+            (dur(1), dur(2)),
+            (
+                CqlValue::List(vec![CqlValue::Int(1)]),
+                CqlValue::List(vec![CqlValue::Int(2)]),
+            ),
+            (
+                CqlValue::Set(vec![CqlValue::Int(1)]),
+                CqlValue::Set(vec![CqlValue::Int(2)]),
+            ),
+            (
+                CqlValue::Map(vec![(CqlValue::Int(1), CqlValue::Int(1))]),
+                CqlValue::Map(vec![(CqlValue::Int(1), CqlValue::Int(2))]),
+            ),
+            (
+                CqlValue::Tuple(vec![Some(CqlValue::Int(1))]),
+                CqlValue::Tuple(vec![Some(CqlValue::Int(2))]),
+            ),
+            (
+                CqlValue::Vector(vec![1.0f32.to_bits()]),
+                CqlValue::Vector(vec![2.0f32.to_bits()]),
+            ),
+            (
+                CqlValue::Udt(vec![("x".into(), Some(CqlValue::Int(1)))]),
+                CqlValue::Udt(vec![("x".into(), Some(CqlValue::Int(2)))]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn cqlvalue_cmp_has_no_equal_wildcard() {
+        use std::cmp::Ordering;
+        let pairs = ordered_pairs();
+        assert_eq!(pairs.len(), 27, "one pair per CqlValue variant");
+        for (lo, hi) in &pairs {
+            assert_eq!(lo.cmp(lo), Ordering::Equal, "{lo:?} equals itself");
+            if lo == hi {
+                continue; // Null has a single value
+            }
+            assert_eq!(lo.cmp(hi), Ordering::Less, "{lo:?} < {hi:?}");
+            assert_eq!(hi.cmp(lo), Ordering::Greater, "{hi:?} > {lo:?}");
+        }
+    }
+
+    #[test]
+    fn no_wildcard_default_for_new_variant() {
+        // Values of different variants never compare Equal, and the order
+        // follows the variant index in both directions.
+        let pairs = ordered_pairs();
+        for (i, (a, _)) in pairs.iter().enumerate() {
+            for (j, (b, _)) in pairs.iter().enumerate() {
+                assert_eq!(a.cmp(b), i.cmp(&j), "{a:?} vs {b:?}");
+            }
+        }
     }
 }
