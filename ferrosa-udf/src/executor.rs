@@ -17,6 +17,7 @@
 //! the `cql-value` discriminant names and payloads matching the WIT contract.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ferrosa_common::{CqlType, CqlValue};
@@ -26,7 +27,7 @@ use wasmtime::{Engine, Store};
 
 use crate::convert::{cql_to_wit, wit_to_cql, WitCqlValue};
 use crate::error::UdfError;
-use crate::sandbox::SandboxConfig;
+use crate::sandbox::{GuestState, MemoryLimitTrap, SandboxConfig, MEMORY_CONFIG_KEY};
 
 /// Opaque handle to a compiled function. O(1) array-index lookup on hot path.
 /// Ephemeral: per-process only, never serialized or sent over the network.
@@ -65,7 +66,7 @@ impl FunctionRegistry {
 
 /// A pre-instantiated WASM component instance with its associated store.
 struct PooledInstance {
-    store: Store<()>,
+    store: Store<GuestState>,
     instance: Instance,
 }
 
@@ -130,6 +131,40 @@ pub struct UdfExecutor {
     config: SandboxConfig,
     registry: RwLock<FunctionRegistry>,
     pool: RwLock<InstancePool>,
+    memory_edge: Arc<MemoryLimitEdge>,
+}
+
+/// Edge-triggered logging of guest memory-limit failures.
+///
+/// Logs once when failures start and once when a call succeeds again, however
+/// many calls fail in between.
+#[derive(Default)]
+struct MemoryLimitEdge {
+    failing: AtomicBool,
+}
+
+impl MemoryLimitEdge {
+    fn record<T>(&self, result: Result<T, UdfError>) -> Result<T, UdfError> {
+        match &result {
+            Err(err @ UdfError::MemoryLimitExceeded { .. }) => {
+                if !self.failing.swap(true, Ordering::Relaxed) {
+                    tracing::error!(
+                        "UDF guest memory limit exceeded; further failures suppressed \
+                         until a call succeeds: {err}"
+                    );
+                }
+            }
+            Ok(_) => {
+                if self.failing.load(Ordering::Relaxed)
+                    && self.failing.swap(false, Ordering::Relaxed)
+                {
+                    tracing::info!("UDF guest memory-limit failures recovered");
+                }
+            }
+            Err(_) => {}
+        }
+        result
+    }
 }
 
 /// Live invocation of one streaming aggregate component.
@@ -137,8 +172,9 @@ pub struct UdfExecutor {
 /// The instance owns its Wasmtime store and component instance so callers can
 /// feed values one row at a time, then finalize exactly once.
 pub struct StreamingAggregateInvocation {
-    store: Store<()>,
+    store: Store<GuestState>,
     instance: Instance,
+    edge: Arc<MemoryLimitEdge>,
 }
 
 impl StreamingAggregateInvocation {
@@ -149,9 +185,10 @@ impl StreamingAggregateInvocation {
             .ok_or_else(|| {
                 UdfError::ExecutionFailed("component does not export 'update' function".into())
             })?;
-        update
+        let result = update
             .call(&mut self.store, &[Val::Float64(value)], &mut [])
-            .map_err(map_component_call_error)
+            .map_err(map_component_call_error);
+        self.edge.record(result)
     }
 
     pub fn finalize(mut self) -> Result<f64, UdfError> {
@@ -162,9 +199,10 @@ impl StreamingAggregateInvocation {
                 UdfError::ExecutionFailed("component does not export 'finalize' function".into())
             })?;
         let mut results = vec![Val::Float64(f64::NAN)];
-        finalize
+        let called = finalize
             .call(&mut self.store, &[], &mut results)
-            .map_err(map_component_call_error)?;
+            .map_err(map_component_call_error);
+        self.edge.record(called)?;
         match results.pop() {
             Some(Val::Float64(value)) => Ok(value),
             Some(other) => Err(UdfError::TypeMismatch(format!(
@@ -184,6 +222,7 @@ impl UdfExecutor {
     /// engine epoch once per `config.max_execution_time` interval. This is
     /// required for epoch-based interruption to trigger correctly.
     pub fn new(config: SandboxConfig) -> Result<Self, UdfError> {
+        config.validate()?;
         let mut engine_config = wasmtime::Config::new();
         engine_config.consume_fuel(true);
         engine_config.epoch_interruption(true);
@@ -212,7 +251,20 @@ impl UdfExecutor {
             config,
             registry: RwLock::new(FunctionRegistry::new()),
             pool,
+            memory_edge: Arc::new(MemoryLimitEdge::default()),
         })
+    }
+
+    /// Create a store with the sandbox limiter and `fuel` installed.
+    fn new_store(&self, fuel: u64) -> Result<Store<GuestState>, UdfError> {
+        let mut store = Store::new(&self.engine, GuestState::new(&self.config));
+        store.limiter(|state| state);
+        store
+            .set_fuel(fuel)
+            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(1);
+        Ok(store)
     }
 
     /// Pre-compile a WASM binary. Called on INSERT into wasm_binaries.
@@ -392,6 +444,18 @@ impl UdfExecutor {
         arg_types: &[CqlType],
         return_type: &CqlType,
     ) -> Result<CqlValue, UdfError> {
+        let result = self.call_inner(keyspace, func_name, args, arg_types, return_type);
+        self.memory_edge.record(result)
+    }
+
+    fn call_inner(
+        &self,
+        keyspace: &str,
+        func_name: &str,
+        args: Vec<CqlValue>,
+        arg_types: &[CqlType],
+        return_type: &CqlType,
+    ) -> Result<CqlValue, UdfError> {
         let key = (
             keyspace.to_string(),
             func_name.to_string(),
@@ -420,16 +484,12 @@ impl UdfExecutor {
             (s, warm.instance)
         } else {
             // Pool miss — create a fresh store and instantiate.
-            let mut s = Store::new(&self.engine, ());
-            s.set_fuel(self.config.max_fuel)
-                .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
-            s.epoch_deadline_trap();
-            s.set_epoch_deadline(1);
+            let mut s = self.new_store(self.config.max_fuel)?;
 
-            let linker = Linker::<()>::new(&self.engine);
+            let linker = Linker::<GuestState>::new(&self.engine);
             let inst = linker
                 .instantiate(&mut s, &compiled.component)
-                .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+                .map_err(map_instantiate_error)?;
             (s, inst)
         };
 
@@ -446,16 +506,7 @@ impl UdfExecutor {
         let mut results = vec![Val::Bool(false)]; // placeholder for result slot
         let call_result = invoke_func
             .call(&mut store, &[args_val], &mut results)
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("fuel") {
-                    UdfError::ResourceExhausted(format!("out of fuel: {msg}"))
-                } else if msg.contains("epoch") {
-                    UdfError::ResourceExhausted(format!("execution timeout: {msg}"))
-                } else {
-                    UdfError::ExecutionFailed(msg)
-                }
-            });
+            .map_err(map_component_call_error);
 
         // Propagate call errors without returning the instance to the pool.
         call_result?;
@@ -496,6 +547,17 @@ impl UdfExecutor {
         &self,
         key: FunctionKey,
         args: Vec<CqlValue>,
+        arg_types: &[CqlType],
+        return_type: &CqlType,
+    ) -> Result<CqlValue, UdfError> {
+        let result = self.call_by_key_inner(key, args, arg_types, return_type);
+        self.memory_edge.record(result)
+    }
+
+    fn call_by_key_inner(
+        &self,
+        key: FunctionKey,
+        args: Vec<CqlValue>,
         _arg_types: &[CqlType],
         return_type: &CqlType,
     ) -> Result<CqlValue, UdfError> {
@@ -504,18 +566,12 @@ impl UdfExecutor {
             Arc::clone(reg.slots.get(key.0).ok_or(UdfError::KeyInvalid)?)
         };
 
-        let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(self.config.max_fuel)
-            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+        let mut store = self.new_store(self.config.max_fuel)?;
 
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(1);
-
-        let linker = Linker::<()>::new(&self.engine);
+        let linker = Linker::<GuestState>::new(&self.engine);
         let instance = linker
             .instantiate(&mut store, &compiled.component)
-            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+            .map_err(map_instantiate_error)?;
 
         let invoke_func = instance.get_func(&mut store, "invoke").ok_or_else(|| {
             UdfError::ExecutionFailed("component does not export 'invoke' function".into())
@@ -527,16 +583,7 @@ impl UdfExecutor {
         let mut results = vec![Val::Bool(false)];
         invoke_func
             .call(&mut store, &[args_val], &mut results)
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("fuel") {
-                    UdfError::ResourceExhausted(format!("out of fuel: {msg}"))
-                } else if msg.contains("epoch") {
-                    UdfError::ResourceExhausted(format!("execution timeout: {msg}"))
-                } else {
-                    UdfError::ExecutionFailed(msg)
-                }
-            })?;
+            .map_err(map_component_call_error)?;
 
         // See note above on wasmtime ≥44 deprecating post_return.
         #[allow(deprecated)]
@@ -594,24 +641,25 @@ impl UdfExecutor {
             )));
         }
 
-        let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(self.config.max_aggregate_fuel)
-            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(1);
+        let mut store = self.new_store(self.config.max_aggregate_fuel)?;
 
-        let linker = Linker::<()>::new(&self.engine);
+        let linker = Linker::<GuestState>::new(&self.engine);
         let instance = linker
             .instantiate(&mut store, &compiled.component)
-            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+            .map_err(map_instantiate_error)?;
 
         let init = instance.get_func(&mut store, "init").ok_or_else(|| {
             UdfError::ExecutionFailed("component does not export 'init' function".into())
         })?;
-        init.call(&mut store, &[], &mut [])
-            .map_err(map_component_call_error)?;
-        Ok(StreamingAggregateInvocation { store, instance })
+        let inited = init
+            .call(&mut store, &[], &mut [])
+            .map_err(map_component_call_error);
+        self.memory_edge.record(inited)?;
+        Ok(StreamingAggregateInvocation {
+            store,
+            instance,
+            edge: Arc::clone(&self.memory_edge),
+        })
     }
 
     /// Create a fresh UDA instance by opaque key (hot path — O(1) SlotMap lookup).
@@ -621,24 +669,18 @@ impl UdfExecutor {
     pub fn create_uda_instance_by_key(
         &self,
         key: FunctionKey,
-    ) -> Result<(Store<()>, wasmtime::component::Instance), UdfError> {
+    ) -> Result<(Store<GuestState>, wasmtime::component::Instance), UdfError> {
         let compiled = {
             let reg = self.registry.read().expect("registry lock poisoned");
             Arc::clone(reg.slots.get(key.0).ok_or(UdfError::KeyInvalid)?)
         };
 
-        let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(self.config.max_aggregate_fuel)
-            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+        let mut store = self.new_store(self.config.max_aggregate_fuel)?;
 
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(1);
-
-        let linker = Linker::<()>::new(&self.engine);
+        let linker = Linker::<GuestState>::new(&self.engine);
         let instance = linker
             .instantiate(&mut store, &compiled.component)
-            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+            .map_err(map_instantiate_error)?;
 
         Ok((store, instance))
     }
@@ -652,7 +694,7 @@ impl UdfExecutor {
         keyspace: &str,
         name: &str,
         arg_types: &[CqlType],
-    ) -> Result<(Store<()>, wasmtime::component::Instance), UdfError> {
+    ) -> Result<(Store<GuestState>, wasmtime::component::Instance), UdfError> {
         let compiled = {
             let reg = self.registry.read().expect("registry lock poisoned");
             let fk = reg
@@ -665,18 +707,12 @@ impl UdfExecutor {
             Arc::clone(reg.slots.get(fk.0).expect("index/slots out of sync"))
         };
 
-        let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(self.config.max_aggregate_fuel)
-            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+        let mut store = self.new_store(self.config.max_aggregate_fuel)?;
 
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(1);
-
-        let linker = Linker::<()>::new(&self.engine);
+        let linker = Linker::<GuestState>::new(&self.engine);
         let instance = linker
             .instantiate(&mut store, &compiled.component)
-            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+            .map_err(map_instantiate_error)?;
 
         Ok((store, instance))
     }
@@ -690,7 +726,24 @@ fn has_streaming_aggregate_abi_marker(wasm_bytes: &[u8]) -> bool {
         .any(|window| window == STREAMING_AGGREGATE_ABI_MARKER)
 }
 
+fn map_instantiate_error(error: wasmtime::Error) -> UdfError {
+    match map_component_call_error(error) {
+        UdfError::ExecutionFailed(msg) => {
+            UdfError::ExecutionFailed(format!("instantiation failed: {msg}"))
+        }
+        other => other,
+    }
+}
+
 fn map_component_call_error(error: wasmtime::Error) -> UdfError {
+    if let Some(trap) = error.downcast_ref::<MemoryLimitTrap>() {
+        return UdfError::MemoryLimitExceeded {
+            config_key: MEMORY_CONFIG_KEY,
+            configured_bytes: trap.configured_bytes,
+            requested_bytes: trap.requested_bytes,
+            what: "linear memory",
+        };
+    }
     let msg = error.to_string();
     if msg.contains("fuel") {
         UdfError::ResourceExhausted(format!("out of fuel: {msg}"))
@@ -1282,7 +1335,7 @@ mod tests {
         // Verify the engine was configured correctly by creating a store
         // and checking that fuel operations succeed.
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
-        let mut store = Store::new(&executor.engine, ());
+        let mut store = executor.new_store(1000).unwrap();
         // set_fuel should succeed when fuel consumption is enabled
         store.set_fuel(1000).expect("fuel should be enabled");
         // epoch deadline should be settable when epoch interruption is enabled
@@ -1827,6 +1880,106 @@ mod tests {
             b"contract=init/update/finalize;value=f64;state=component-instance",
         );
         bytes
+    }
+
+    /// Streaming aggregate whose `update` grows linear memory by 16 MiB.
+    fn memory_grower_component_bytes() -> Vec<u8> {
+        let mut bytes = wat::parse_str(
+            r#"
+            (component
+              (core module $m
+                (memory 1)
+                (func (export "init"))
+                (func (export "update") (param f64)
+                  (drop (memory.grow (i32.const 256))))
+                (func (export "finalize") (result f64) (f64.const 0)))
+              (core instance $i (instantiate $m))
+              (func (export "init") (canon lift (core func $i "init")))
+              (func (export "update") (param "value" f64) (canon lift (core func $i "update")))
+              (func (export "finalize") (result f64) (canon lift (core func $i "finalize")))
+            )
+            "#,
+        )
+        .expect("component WAT must parse");
+        append_component_custom_section(
+            &mut bytes,
+            "ferrosa:streaming-aggregate:v1",
+            b"contract=init/update/finalize;value=f64;state=component-instance",
+        );
+        bytes
+    }
+
+    fn run_grower(max_memory_bytes: usize) -> Result<f64, UdfError> {
+        let executor = UdfExecutor::new(SandboxConfig {
+            max_memory_bytes,
+            ..Default::default()
+        })
+        .unwrap();
+        executor
+            .compile_streaming_aggregate(
+                "ks",
+                "grow",
+                &[CqlType::Double],
+                &memory_grower_component_bytes(),
+            )
+            .unwrap();
+        executor.call_streaming_aggregate("ks", "grow", &[CqlType::Double], [1.0])
+    }
+
+    #[test]
+    fn memory_growth_past_limit_fails_with_typed_error() {
+        let limit = 8 * 1024 * 1024;
+        match run_grower(limit).unwrap_err() {
+            UdfError::MemoryLimitExceeded {
+                configured_bytes, ..
+            } => assert_eq!(configured_bytes, limit),
+            other => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_limit_is_read_from_config_not_hardcoded() {
+        // Same guest, two configured values: 8 MiB rejects it, 64 MiB allows it.
+        assert!(matches!(
+            run_grower(8 * 1024 * 1024),
+            Err(UdfError::MemoryLimitExceeded { .. })
+        ));
+        run_grower(64 * 1024 * 1024).expect("guest fits under a 64 MiB limit");
+        let msg = run_grower(4 * 1024 * 1024).unwrap_err().to_string();
+        assert!(
+            msg.contains("4194304") && msg.contains("max_memory_bytes"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn memory_limit_edge_flips_on_failure_and_recovery() {
+        let edge = MemoryLimitEdge::default();
+        let fail = || {
+            Err::<(), _>(UdfError::MemoryLimitExceeded {
+                config_key: MEMORY_CONFIG_KEY,
+                configured_bytes: 1,
+                requested_bytes: 2,
+                what: "linear memory",
+            })
+        };
+        assert!(edge.record(fail()).is_err());
+        assert!(edge.failing.load(Ordering::Relaxed));
+        assert!(edge.record(fail()).is_err());
+        assert!(edge.failing.load(Ordering::Relaxed));
+        edge.record(Ok(())).unwrap();
+        assert!(!edge.failing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn executor_rejects_invalid_config() {
+        let err = UdfExecutor::new(SandboxConfig {
+            max_memory_bytes: 0,
+            ..Default::default()
+        })
+        .err()
+        .expect("zero limit must be rejected");
+        assert!(matches!(err, UdfError::InvalidConfig(_)));
     }
 
     fn append_component_custom_section(bytes: &mut Vec<u8>, name: &str, payload: &[u8]) {

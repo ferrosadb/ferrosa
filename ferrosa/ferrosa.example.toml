@@ -21,6 +21,12 @@ max_connections_per_ip = 64
 # tls_key = "/etc/ferrosa/tls/server.key"
 # require_tls = false
 
+[udf]
+# Per-Store cap on WASM guest linear memory, in bytes (default 16 MiB).
+# Env fallback: FERROSA_UDF_MAX_MEMORY_BYTES (TOML wins). Valid range
+# 65536..=4294967296; 0 or out-of-range aborts startup.
+# max_memory_bytes = 16777216
+
 [internode]
 bind = "127.0.0.1:17000"
 # broadcast = "192.168.1.1:17000"

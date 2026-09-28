@@ -29,7 +29,7 @@ are encapsulated so no caller depends on Wasmtime directly.
 |--------|----------------|
 | `executor` (`src/executor.rs`, ~1868 LoC) | `UdfExecutor`, `FunctionRegistry` (SlotMap), `InstancePool`, fuel/epoch wiring, `Val` `<->` `WitCqlValue` encode/decode, streaming-aggregate driver |
 | `convert` (`src/convert.rs`, ~754 LoC) | `WitCqlValue` enum + type-directed `cql_to_wit` / `wit_to_cql` (all 26 cases) |
-| `sandbox` (`src/sandbox.rs`) | `SandboxConfig` resource limits (memory, fuel, epoch timeout, cache, upload size) |
+| `sandbox` (`src/sandbox.rs`) | `SandboxConfig` resource limits (memory, fuel, epoch timeout, cache, upload size), `validate()`, and `GuestState`, the `ResourceLimiter` over wasmtime `StoreLimits` installed on every `Store`. Memory cap comes from `[udf] max_memory_bytes` / `FERROSA_UDF_MAX_MEMORY_BYTES` (default 16 MiB). |
 | `arena` (`src/arena.rs`) | `UdfArena` per-query bump allocator |
 | `error` (`src/error.rs`) | `UdfError` |
 | `asc` (`src/asc.rs`, feature `asc-udf`) | inline AssemblyScript -> core-WASM via QuickJS + wasmtime-backed `WebAssembly` shim |

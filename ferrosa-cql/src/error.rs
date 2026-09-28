@@ -395,6 +395,12 @@ impl From<ferrosa_udf::UdfError> for CqlError {
             }
             UdfError::ExecutionFailed(msg) => Self::Invalid(format!("UDF execution failed: {msg}")),
             UdfError::KeyInvalid => Self::Invalid("UDF function key is invalid or expired".into()),
+            err @ UdfError::MemoryLimitExceeded { .. } => {
+                Self::Invalid(format!("UDF resource exhausted: {err}"))
+            }
+            UdfError::InvalidConfig(msg) => {
+                Self::Invalid(format!("UDF sandbox misconfigured: {msg}"))
+            }
         }
     }
 }

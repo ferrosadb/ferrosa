@@ -24,6 +24,12 @@ max_connections_per_ip = 64
 # tls_key  = "~/.ferrosa/config/tls/server.key"
 # require_tls = false
 
+[udf]
+# Per-Store cap on WASM guest linear memory, in bytes (default 16 MiB).
+# Env fallback: FERROSA_UDF_MAX_MEMORY_BYTES (TOML wins). Valid range
+# 65536..=4294967296; 0 or out-of-range aborts startup.
+# max_memory_bytes = 16777216
+
 # ---------------------------------------------------------------------------
 # Internode RPC — used by multi-node clusters. A single-node install never
 # accepts inbound peers, but ferrosa-net still binds the listener at startup.

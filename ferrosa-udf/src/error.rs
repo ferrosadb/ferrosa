@@ -14,6 +14,26 @@ pub enum UdfError {
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
 
+    /// A guest tried to grow linear memory past the configured sandbox limit.
+    #[error(
+        "guest memory limit exceeded: {what} would reach {requested_bytes} bytes, \
+         over the configured {config_key} = {configured_bytes} bytes"
+    )]
+    MemoryLimitExceeded {
+        /// Config key that set the limit (TOML `[udf] max_memory_bytes`).
+        config_key: &'static str,
+        /// The configured limit in bytes.
+        configured_bytes: usize,
+        /// Size the guest asked for, in bytes.
+        requested_bytes: usize,
+        /// What was being grown (`linear memory`).
+        what: &'static str,
+    },
+
+    /// The sandbox configuration is unusable (rejected at startup).
+    #[error("invalid UDF sandbox config: {0}")]
+    InvalidConfig(String),
+
     #[error("execution failed: {0}")]
     ExecutionFailed(String),
 

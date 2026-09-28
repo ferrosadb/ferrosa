@@ -125,6 +125,30 @@ fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str)
         .or_else(|| std::env::var(env_key).ok())
 }
 
+/// Resolve the UDF sandbox config: `[udf] max_memory_bytes` (TOML) overrides
+/// `FERROSA_UDF_MAX_MEMORY_BYTES`, which overrides the 16 MiB default.
+///
+/// Returns an error string for an unparsable or out-of-range value; the caller
+/// exits loud rather than running with an unusable sandbox.
+fn resolve_udf_sandbox_config(config: &toml::Value) -> Result<ferrosa_udf::SandboxConfig, String> {
+    let raw = config_val(
+        "FERROSA_UDF_MAX_MEMORY_BYTES",
+        config,
+        "udf",
+        "max_memory_bytes",
+        &ferrosa_udf::sandbox::DEFAULT_MAX_MEMORY_BYTES.to_string(),
+    );
+    let max_memory_bytes: usize = raw.trim().parse().map_err(|e| {
+        format!("[udf] max_memory_bytes / FERROSA_UDF_MAX_MEMORY_BYTES = {raw:?} is not a byte count: {e}")
+    })?;
+    let sandbox = ferrosa_udf::SandboxConfig {
+        max_memory_bytes,
+        ..Default::default()
+    };
+    sandbox.validate().map_err(|e| e.to_string())?;
+    Ok(sandbox)
+}
+
 const DEFAULT_WEB_BIND: &str = "127.0.0.1:9090";
 const DEFAULT_CQL_BIND: &str = "127.0.0.1:9042";
 const DEFAULT_GRAPH_HTTP_BIND: &str = "127.0.0.1:7474";
@@ -2154,9 +2178,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so what the router records is what operators read.
     let full_scan_tracker = Arc::new(ferrosa_cql::virtual_tables::FullScanTracker::new());
     let index_usage_tracker = Arc::new(ferrosa_cql::virtual_tables::IndexUsageTracker::new());
+    let udf_sandbox = match resolve_udf_sandbox_config(&file_config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("FATAL: invalid UDF sandbox configuration: {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        max_memory_bytes = udf_sandbox.max_memory_bytes,
+        "UDF guest memory limit"
+    );
     let udf_executor = Arc::new(
-        ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default())
-            .expect("failed to initialize UDF executor"),
+        ferrosa_udf::UdfExecutor::new(udf_sandbox).expect("failed to initialize UDF executor"),
     );
     storage.set_time_series_wasm_aggregate_executor(Arc::new(
         ferrosa_cql::wasm_aggregate::UdfTimeSeriesAggregateExecutor::new(Arc::clone(&udf_executor)),
@@ -3134,6 +3168,25 @@ fn seeds_to_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn udf_toml(v: &str) -> toml::Value {
+        format!("[udf]\nmax_memory_bytes = {v}\n").parse().unwrap()
+    }
+
+    #[test]
+    fn udf_memory_limit_comes_from_toml() {
+        let a = resolve_udf_sandbox_config(&udf_toml("4194304")).unwrap();
+        let b = resolve_udf_sandbox_config(&udf_toml("33554432")).unwrap();
+        assert_eq!(a.max_memory_bytes, 4_194_304);
+        assert_eq!(b.max_memory_bytes, 33_554_432);
+    }
+
+    #[test]
+    fn udf_memory_limit_rejects_zero_absurd_and_garbage() {
+        assert!(resolve_udf_sandbox_config(&udf_toml("0")).is_err());
+        assert!(resolve_udf_sandbox_config(&udf_toml("99999999999999")).is_err());
+        assert!(resolve_udf_sandbox_config(&udf_toml("\"lots\"")).is_err());
+    }
 
     fn empty_config() -> toml::Value {
         toml::Value::Table(toml::map::Map::new())

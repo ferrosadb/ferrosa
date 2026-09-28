@@ -23,9 +23,6 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the in-code design notes
 
 ## Next
 
-- **Enforce `max_memory_bytes`** (FMEA UDF-6). Install a `Store` limiter
-  (`ResourceLimiter` / `StoreLimits`) so the configured per-invocation memory cap
-  is actually applied — today it is config-only.
 - **Tighten the epoch timeout** (FMEA UDF-2). Tick the engine epoch at a fraction
   of `max_execution_time` (or raise the deadline count) so the wall-clock bound
   cannot overshoot ~2×.
