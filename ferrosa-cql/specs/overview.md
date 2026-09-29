@@ -233,3 +233,7 @@ A hub, not a leaf. Depends on eleven sibling crates (`ferrosa-cdc`,
 `-sstable`, `-storage`, `-udf`); depended on by `ferrosa`, `ferrosa-ctl`,
 `ferrosa-flight`, `ferrosa-loadgen`. See the
 [root crate index](../../specs/crates.md) for the full graph.
+
+## jsonb (T-150)
+
+jsonb has no CQL literal binding yet: `term_to_cql_value` refuses every literal into a jsonb target with a "not yet supported (T-170/T-171)" error, and `CONTAINS` over `list<jsonb>` errors instead of matching nothing. Results follow D6a: the wire type is varchar and the cell is the JSON text; `toJson` prints the document. LWT `IF` orders jsonb by D18 (T-150).

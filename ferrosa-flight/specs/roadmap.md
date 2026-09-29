@@ -56,3 +56,7 @@ filling stubs.
   Flight adapter: gRPC framing, auth, CQL↔Arrow conversion, and endpoint planning.
 - A second CQL value encoder. Conversion lives in `convert.rs`; the engine's row
   codec lives in `ferrosa-row-bridge` / `ferrosa-cql`.
+
+## jsonb (T-150)
+
+Done: type threading. Remaining: Arrow Variant export for jsonb.

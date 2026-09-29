@@ -388,6 +388,12 @@ fn encode_rows_metadata_paged(
 /// Tuple:        `[u16 type_id][u16 count][type]*count`
 /// UDT:          `[u16 type_id][string ks][string name][u16 n][string field_name + type]*n`
 fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
+    // D6a: CQL clients see jsonb as text (varchar), which agrees with the
+    // varchar cell bytes below. The rest of the CQL jsonb wire is T-170.
+    if matches!(cql_type, CqlType::Jsonb) {
+        buf.put_u16(CqlType::Varchar.type_id());
+        return;
+    }
     buf.put_u16(cql_type.type_id());
     match cql_type {
         CqlType::List(elem) | CqlType::Set(elem) => {
@@ -432,6 +438,7 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
                 | CqlType::Set(_)
                 | CqlType::Tuple(_)
                 | CqlType::Udt { .. }
+                | CqlType::Jsonb
                 | CqlType::Vector(_, _) => "org.apache.cassandra.db.marshal.FloatType",
             };
             let class_name =
@@ -471,7 +478,9 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
         | CqlType::Time
         | CqlType::Smallint
         | CqlType::Tinyint
-        | CqlType::Duration => {}
+        | CqlType::Duration
+        // Returned before the match (D6a); listed so a new type must choose.
+        | CqlType::Jsonb => {}
     }
 }
 
@@ -548,6 +557,12 @@ fn encode_cell_value(buf: &mut BytesMut, value: &CqlValue) {
             buf.put_i8(*n);
         }
         CqlValue::Null => buf.put_i32(-1),
+        // D6a: jsonb cells are its JSON text under the varchar wire type.
+        CqlValue::Jsonb(_) => {
+            let text = crate::bridge::cql_value_to_json(value);
+            buf.put_i32(text.len() as i32);
+            buf.put_slice(text.as_bytes());
+        }
         CqlValue::Decimal { .. }
         | CqlValue::Varint(_)
         | CqlValue::Duration { .. }
@@ -955,5 +970,24 @@ mod tests {
 
         // Must be at the exact end of the buffer
         assert_eq!(pos, buf.len(), "no trailing bytes — exact CQL frame");
+    }
+
+    fn jsonb_cell(text: &str) -> CqlValue {
+        use ferrosa_jsonb::{parse_text, Limits, LimitsConfig};
+        let limits = Limits::from_config_with_env(&LimitsConfig::default(), &|_| None, 64 << 20)
+            .expect("default limits");
+        let enc = parse_text(text.as_bytes(), &limits).expect("valid json");
+        CqlValue::Jsonb(ferrosa_common::JsonbValue::from_encoded(enc).expect("valid cell"))
+    }
+
+    #[test]
+    fn jsonb_is_reported_as_varchar_with_text_cells_d6a() {
+        let mut buf = BytesMut::new();
+        encode_type(&mut buf, &CqlType::Jsonb);
+        assert_eq!(&buf[..], &CqlType::Varchar.type_id().to_be_bytes());
+        let mut cell = BytesMut::new();
+        encode_cell(&mut cell, &Some(jsonb_cell("[1]")));
+        assert_eq!(&cell[..4], &3i32.to_be_bytes());
+        assert_eq!(&cell[4..], b"[1]");
     }
 }

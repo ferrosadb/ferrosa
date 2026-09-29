@@ -73,3 +73,10 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 |----|--------------|--------|-----------|------------|
 | CQL-T022-01 | `bridge::resolve_builtin_type`, `cql_type_name`, `cql_type_display_name` keep private name tables | Drift from the row-bridge parser and schema converters (FM-20) | `bridge::tests::type_names_consumers_agree` | Thin delegates to `ferrosa_common::cql_type::names` (see COM-T022-01) |
 | CQL-T022-02 | `connection.rs` and `router.rs` function-argument type switches still hold their own scalar names | Not covered by T-022 | Known, out of scope | Follow-up: migrate to the registry |
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| CQL-T150-01 | jsonb literal reported as a generic type mismatch, or CONTAINS silently false | Client cannot tell "unsupported" from "wrong type" | 5 | 3 | 2 | 30 | Guard at the top of `term_to_cql_value`; explicit error in the CONTAINS path. Tests: `jsonb_literals_are_a_typed_refusal_not_a_type_mismatch`. |
+| CQL-T150-02 | jsonb cell sent under type id 0x0000 with no class name | Malformed RESULT frame | 8 | 2 | 2 | 32 | `encode_type` reports varchar (D6a); cells carry JSON text. Test: `jsonb_is_reported_as_varchar_with_text_cells_d6a`. Known gap: a jsonb nested in a collection cell still carries its canonical bytes (T-170). |

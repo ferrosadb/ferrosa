@@ -92,6 +92,14 @@ pub(crate) fn eval_now() -> CqlValue {
     CqlValue::Timeuuid(uuid::Uuid::from_bytes(bytes))
 }
 
+/// jsonb has no CQL literal, wire or `toJson` binding until T-170/T-171; every
+/// CQL path that reaches one refuses loudly with this error (T-150).
+pub(crate) fn jsonb_unsupported(what: &str) -> CqlError {
+    CqlError::Invalid(format!(
+        "jsonb is not yet supported in CQL {what} (planned: T-170/T-171)"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Function 1: term_to_cql_value
 // ---------------------------------------------------------------------------
@@ -102,6 +110,11 @@ pub(crate) fn eval_now() -> CqlValue {
 /// Narrowing integer conversions are range-checked (M5). Bind markers are
 /// rejected in non-prepared queries.
 pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlError> {
+    // jsonb has no CQL literal form yet (T-170/T-171). Refuse with a designed
+    // error before any per-literal arm can misreport it as a type mismatch.
+    if matches!(target, CqlType::Jsonb) && !matches!(term, Term::Null | Term::BindMarker(_)) {
+        return Err(jsonb_unsupported("literals"));
+    }
     match term {
         Term::Null => Ok(CqlValue::Null),
 
@@ -155,7 +168,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             | CqlType::Set(_)
             | CqlType::Tuple(_)
             | CqlType::Udt { .. }
-            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+            | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got integer literal",
                 cql_type_name(target)
             ))),
@@ -210,7 +224,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             | CqlType::Set(_)
             | CqlType::Tuple(_)
             | CqlType::Udt { .. }
-            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+            | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got float literal",
                 cql_type_name(target)
             ))),
@@ -299,7 +314,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             | CqlType::Set(_)
             | CqlType::Tuple(_)
             | CqlType::Udt { .. }
-            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+            | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got string literal",
                 cql_type_name(target)
             ))),
@@ -331,7 +347,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             | CqlType::Set(_)
             | CqlType::Tuple(_)
             | CqlType::Udt { .. }
-            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+            | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got boolean literal",
                 cql_type_name(target)
             ))),
@@ -363,13 +380,16 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             | CqlType::Set(_)
             | CqlType::Tuple(_)
             | CqlType::Udt { .. }
-            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+            | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got uuid literal",
                 cql_type_name(target)
             ))),
         },
 
         Term::BlobLiteral(b) => match target {
+            // Guarded above; explicit so a new arm cannot fall through.
+            CqlType::Jsonb => Err(jsonb_unsupported("literals")),
             CqlType::Blob => Ok(CqlValue::Blob(b.clone())),
             // EXECUTE bind values may arrive as raw bytes (BlobLiteral) when
             // the prepared statement's bound_columns couldn't be resolved.
@@ -443,6 +463,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
         },
 
         Term::ListLiteral(items) => match target {
+            // Guarded above; explicit so a new arm cannot fall through.
+            CqlType::Jsonb => Err(jsonb_unsupported("literals")),
             CqlType::List(elem_type) => {
                 let converted: Result<Vec<CqlValue>, _> = items
                     .iter()
@@ -534,7 +556,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             | CqlType::Map(_, _)
             | CqlType::Tuple(_)
             | CqlType::Udt { .. }
-            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+            | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got set literal",
                 cql_type_name(target)
             ))),
@@ -602,7 +625,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             | CqlType::Duration
             | CqlType::List(_)
             | CqlType::Tuple(_)
-            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+            | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got map literal",
                 cql_type_name(target)
             ))),
@@ -644,7 +668,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             | CqlType::Map(_, _)
             | CqlType::Set(_)
             | CqlType::Udt { .. }
-            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+            | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got tuple literal",
                 cql_type_name(target)
             ))),
@@ -675,7 +700,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     // specs/in-process/bug-memtable-flush-wedge-truncated-
                     // timeuuid-from-now-function.md.
                     CqlType::Timeuuid => Ok(eval_now()),
-                    CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Timestamp | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Inet | CqlType::Date | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+                    CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Timestamp | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Inet | CqlType::Date | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                         "type mismatch: now() returns timeuuid, but column expects {}",
                         cql_type_name(target)
                     ))),
@@ -684,7 +710,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     CqlType::Timestamp => {
                         Ok(CqlValue::Timestamp(chrono::Utc::now().timestamp_millis()))
                     }
-                    CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Timeuuid | CqlType::Inet | CqlType::Date | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+                    CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Timeuuid | CqlType::Inet | CqlType::Date | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                         "type mismatch: currenttimestamp() returns timestamp, but column expects {}",
                         cql_type_name(target)
                     ))),
@@ -709,7 +736,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                             let millis = (uuid_ts - UUID_EPOCH_OFFSET) / 10_000;
                             Ok(CqlValue::Timestamp(millis as i64))
                         }
-                        CqlValue::Null | CqlValue::Ascii(_) | CqlValue::Bigint(_) | CqlValue::Blob(_) | CqlValue::Boolean(_) | CqlValue::Counter(_) | CqlValue::Decimal { .. } | CqlValue::Double(_) | CqlValue::Float(_) | CqlValue::Int(_) | CqlValue::Timestamp(_) | CqlValue::Uuid(_) | CqlValue::Text(_) | CqlValue::Varint(_) | CqlValue::Inet(_) | CqlValue::Date(_) | CqlValue::Time(_) | CqlValue::Smallint(_) | CqlValue::Tinyint(_) | CqlValue::Duration { .. } | CqlValue::List(_) | CqlValue::Set(_) | CqlValue::Map(_) | CqlValue::Tuple(_) | CqlValue::Vector(_) | CqlValue::Udt(_) => Err(CqlError::Invalid(
+                        CqlValue::Null | CqlValue::Ascii(_) | CqlValue::Bigint(_) | CqlValue::Blob(_) | CqlValue::Boolean(_) | CqlValue::Counter(_) | CqlValue::Decimal { .. } | CqlValue::Double(_) | CqlValue::Float(_) | CqlValue::Int(_) | CqlValue::Timestamp(_) | CqlValue::Uuid(_) | CqlValue::Text(_) | CqlValue::Varint(_) | CqlValue::Inet(_) | CqlValue::Date(_) | CqlValue::Time(_) | CqlValue::Smallint(_) | CqlValue::Tinyint(_) | CqlValue::Duration { .. } | CqlValue::List(_) | CqlValue::Set(_) | CqlValue::Map(_) | CqlValue::Tuple(_) | CqlValue::Vector(_) | CqlValue::Udt(_)
+            | CqlValue::Jsonb(_) => Err(CqlError::Invalid(
                             "toTimestamp requires a timeuuid argument".into(),
                         )),
                     }
@@ -720,7 +748,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 }
                 "currentdate" | "current_date" if args.is_empty() => match target {
                     CqlType::Date => Ok(CqlValue::Date(today_cql_date())),
-                    CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Timestamp | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Timeuuid | CqlType::Inet | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+                    CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Timestamp | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Timeuuid | CqlType::Inet | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                         "type mismatch: currentDate() returns date, but column expects {}",
                         cql_type_name(target)
                     ))),
@@ -766,7 +795,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             | CqlType::Set(_)
             | CqlType::Tuple(_)
             | CqlType::Udt { .. }
-            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
+            | CqlType::Vector(_, _)
+            | CqlType::Jsonb => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got a duration literal",
                 cql_type_name(target)
             ))),
@@ -815,7 +845,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 | CqlValue::Map(_)
                 | CqlValue::Tuple(_)
                 | CqlValue::Vector(_)
-                | CqlValue::Udt(_) => {
+                | CqlValue::Udt(_)
+                | CqlValue::Jsonb(_) => {
                     return Err(CqlError::Invalid("expected a duration offset".into()))
                 }
             };
@@ -852,7 +883,8 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 | CqlValue::Map(_)
                 | CqlValue::Tuple(_)
                 | CqlValue::Vector(_)
-                | CqlValue::Udt(_) => Err(CqlError::Invalid(
+                | CqlValue::Udt(_)
+                | CqlValue::Jsonb(_) => Err(CqlError::Invalid(
                     "temporal arithmetic requires a date or timestamp base".into(),
                 )),
             }
@@ -1338,6 +1370,14 @@ pub fn cql_value_to_json(value: &CqlValue) -> String {
             format!("[{}]", elements.join(", "))
         }
 
+        // jsonb — the document itself (already JSON text). A print failure
+        // means the validated cell is corrupt in memory; it is logged and the
+        // output is visibly not JSON rather than a plausible value.
+        CqlValue::Jsonb(j) => ferrosa_common::jsonb_canonical_text(j).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "toJson: jsonb cell failed to print");
+            format!("\"<jsonb print error: {e}>\"")
+        }),
+
         // UDT — JSON object
         CqlValue::Udt(fields) => {
             let pairs: Vec<String> = fields
@@ -1359,6 +1399,9 @@ pub fn cql_value_to_json(value: &CqlValue) -> String {
 fn cql_value_to_json_key(value: &CqlValue) -> String {
     match value {
         CqlValue::Ascii(s) | CqlValue::Text(s) => json_escape_string(s),
+        // Unreachable for valid schemas (D21 bans jsonb map keys); quoted and
+        // escaped so a stray one still yields valid JSON.
+        CqlValue::Jsonb(_) => json_escape_string(&cql_value_to_json(value)),
         other @ (CqlValue::Null
         | CqlValue::Bigint(_)
         | CqlValue::Blob(_)
@@ -3357,5 +3400,39 @@ mod tests {
         assert_eq!(row.deletion.marked_for_delete_at, 7000);
         assert!(row.cells.is_empty());
         assert!(row.clustering.is_empty());
+    }
+
+    fn jsonb_cell(text: &str) -> CqlValue {
+        use ferrosa_jsonb::{parse_text, Limits, LimitsConfig};
+        let limits = Limits::from_config_with_env(&LimitsConfig::default(), &|_| None, 64 << 20)
+            .expect("default limits");
+        let enc = parse_text(text.as_bytes(), &limits).expect("valid json");
+        CqlValue::Jsonb(ferrosa_common::JsonbValue::from_encoded(enc).expect("valid cell"))
+    }
+
+    #[test]
+    fn jsonb_literals_are_a_typed_refusal_not_a_type_mismatch() {
+        for term in [
+            Term::StringLiteral("{}".into()),
+            Term::IntegerLiteral(1),
+            Term::BlobLiteral(vec![1, 2, 3]),
+            Term::ListLiteral(vec![]),
+        ] {
+            let err = term_to_cql_value(&term, &CqlType::Jsonb).unwrap_err();
+            assert!(err.to_string().contains("T-170"), "{term:?}: {err}");
+        }
+        // NULL into a jsonb column stays valid.
+        assert_eq!(
+            term_to_cql_value(&Term::Null, &CqlType::Jsonb).unwrap(),
+            CqlValue::Null
+        );
+    }
+
+    #[test]
+    fn to_json_prints_a_jsonb_cell_as_its_document() {
+        let v = jsonb_cell("{\"a\": [1, 2.50]}");
+        assert_eq!(cql_value_to_json(&v), "{\"a\":[1,2.50]}");
+        let list = CqlValue::List(vec![v]);
+        assert_eq!(cql_value_to_json(&list), "[{\"a\":[1,2.50]}]");
     }
 }

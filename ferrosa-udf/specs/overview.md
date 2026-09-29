@@ -118,3 +118,7 @@ Leaf-adjacent: depends only on `ferrosa-common` (plus external Wasmtime/QuickJS
 toolchain crates). Depended on by `ferrosa`, `ferrosa-cql`, `ferrosa-ctl`, and
 `ferrosa-session`. See the [root crate index](../../specs/crates.md) for the full
 graph.
+
+## jsonb (T-150)
+
+`convert::cql_to_wit` now returns `Result`: a `Jsonb` value (top level or nested) is a typed `UdfError::TypeMismatch` because the WIT contract has no jsonb case (T-150).

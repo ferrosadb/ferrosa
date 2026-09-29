@@ -126,3 +126,7 @@ FERROSA_ASC_BUNDLE=/tmp/asc-host/asc-bundle.mjs \
 - [Architecture overview](specs/overview.md) — module map, ABI, invariants, data flow
 - [FMEA / known issues](specs/fmea.md) — failure modes + gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+## jsonb (T-150)
+
+`convert::cql_to_wit` now returns `Result`: a `Jsonb` value (top level or nested) is a typed `UdfError::TypeMismatch` because the WIT contract has no jsonb case (T-150).

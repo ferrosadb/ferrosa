@@ -60,3 +60,7 @@ exist in the source — the gaps below come from code review, not grep.
 - **Wire-protocol framing / query planning** — those belong to the front-ends
   (`ferrosa-cql`, `ferrosa-postgres`, `ferrosa-flight`).
 </content>
+
+## jsonb (T-150)
+
+Done: type threading. Remaining: None for T-150.

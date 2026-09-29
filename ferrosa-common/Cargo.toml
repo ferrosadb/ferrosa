@@ -12,6 +12,9 @@ repository.workspace = true
 # (not ferrosa-storage) so a future ferrosa-sstable write pump can share the
 # exact same token as compaction.
 crossbeam-channel = "0.5"
+# `CqlValue::Jsonb` holds the validated value (T-150, dsm.md F1). ferrosa-jsonb is
+# a leaf crate, so this edge cannot form a cycle.
+ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 num-bigint = "0.4"
 proptest = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }

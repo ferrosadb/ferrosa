@@ -56,8 +56,12 @@ pub enum WitCqlValue {
 }
 
 /// Convert a CqlValue to its WIT representation.
-pub fn cql_to_wit(value: &CqlValue) -> WitCqlValue {
-    match value {
+///
+/// jsonb has no WIT case yet, so a `Jsonb` value (top level or nested) is a
+/// typed refusal, never a lossy text fallback (T-150; the UDF jsonb bridge is a
+/// later packet, COM-T150-UDF-01).
+pub fn cql_to_wit(value: &CqlValue) -> Result<WitCqlValue, UdfError> {
+    Ok(match value {
         CqlValue::Null => WitCqlValue::Null,
         CqlValue::Int(v) => WitCqlValue::IntVal(*v),
         CqlValue::Bigint(v) => WitCqlValue::BigintVal(*v),
@@ -85,20 +89,15 @@ pub fn cql_to_wit(value: &CqlValue) -> WitCqlValue {
             days,
             nanos,
         } => WitCqlValue::DurationVal(*months, *days, *nanos),
-        CqlValue::List(items) => WitCqlValue::ListVal(items.iter().map(cql_to_wit).collect()),
-        CqlValue::Set(items) => WitCqlValue::SetVal(items.iter().map(cql_to_wit).collect()),
+        CqlValue::List(items) => WitCqlValue::ListVal(convert_all(items)?),
+        CqlValue::Set(items) => WitCqlValue::SetVal(convert_all(items)?),
         CqlValue::Map(entries) => WitCqlValue::MapVal(
             entries
                 .iter()
-                .map(|(k, v)| (cql_to_wit(k), cql_to_wit(v)))
-                .collect(),
+                .map(|(k, v)| Ok((cql_to_wit(k)?, cql_to_wit(v)?)))
+                .collect::<Result<Vec<_>, UdfError>>()?,
         ),
-        CqlValue::Tuple(items) => WitCqlValue::TupleVal(
-            items
-                .iter()
-                .map(|opt| opt.as_ref().map_or(WitCqlValue::Null, cql_to_wit))
-                .collect(),
-        ),
+        CqlValue::Tuple(items) => WitCqlValue::TupleVal(convert_optional(items)?),
         CqlValue::Vector(bits) => WitCqlValue::ListVal(
             bits.iter()
                 .map(|b| WitCqlValue::FloatVal(f32::from_bits(*b)))
@@ -107,15 +106,27 @@ pub fn cql_to_wit(value: &CqlValue) -> WitCqlValue {
         CqlValue::Udt(fields) => WitCqlValue::UdtVal(
             fields
                 .iter()
-                .map(|(name, opt)| {
-                    (
-                        name.clone(),
-                        opt.as_ref().map_or(WitCqlValue::Null, cql_to_wit),
-                    )
-                })
-                .collect(),
+                .map(|(name, opt)| Ok((name.clone(), convert_opt(opt.as_ref())?)))
+                .collect::<Result<Vec<_>, UdfError>>()?,
         ),
-    }
+        CqlValue::Jsonb(_) => {
+            return Err(UdfError::TypeMismatch(
+                "jsonb values cannot be passed to UDFs yet (no WIT case)".into(),
+            ))
+        }
+    })
+}
+
+fn convert_all(items: &[CqlValue]) -> Result<Vec<WitCqlValue>, UdfError> {
+    items.iter().map(cql_to_wit).collect()
+}
+
+fn convert_opt(item: Option<&CqlValue>) -> Result<WitCqlValue, UdfError> {
+    item.map_or(Ok(WitCqlValue::Null), cql_to_wit)
+}
+
+fn convert_optional(items: &[Option<CqlValue>]) -> Result<Vec<WitCqlValue>, UdfError> {
+    items.iter().map(|o| convert_opt(o.as_ref())).collect()
 }
 
 /// Convert a WIT representation back to CqlValue.
@@ -240,7 +251,7 @@ mod tests {
     #[test]
     fn roundtrip_null() {
         let orig = CqlValue::Null;
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::Null);
         let back = wit_to_cql(&wit, &CqlType::Int).unwrap();
         assert_eq!(back, orig);
@@ -249,7 +260,7 @@ mod tests {
     #[test]
     fn roundtrip_int() {
         let orig = CqlValue::Int(42);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::IntVal(42));
         let back = wit_to_cql(&wit, &CqlType::Int).unwrap();
         assert_eq!(back, orig);
@@ -258,7 +269,7 @@ mod tests {
     #[test]
     fn roundtrip_bigint() {
         let orig = CqlValue::Bigint(i64::MAX);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::BigintVal(i64::MAX));
         let back = wit_to_cql(&wit, &CqlType::Bigint).unwrap();
         assert_eq!(back, orig);
@@ -268,7 +279,7 @@ mod tests {
     fn roundtrip_float() {
         let f: f32 = 1.5;
         let orig = CqlValue::Float(f.to_bits());
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::FloatVal(f));
         let back = wit_to_cql(&wit, &CqlType::Float).unwrap();
         assert_eq!(back, orig);
@@ -278,7 +289,7 @@ mod tests {
     fn roundtrip_double() {
         let f: f64 = 1.5;
         let orig = CqlValue::Double(f.to_bits());
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::DoubleVal(f));
         let back = wit_to_cql(&wit, &CqlType::Double).unwrap();
         assert_eq!(back, orig);
@@ -288,7 +299,7 @@ mod tests {
     fn roundtrip_boolean() {
         for b in [true, false] {
             let orig = CqlValue::Boolean(b);
-            let wit = cql_to_wit(&orig);
+            let wit = cql_to_wit(&orig).expect("convertible");
             assert_eq!(wit, WitCqlValue::BooleanVal(b));
             let back = wit_to_cql(&wit, &CqlType::Boolean).unwrap();
             assert_eq!(back, orig);
@@ -298,7 +309,7 @@ mod tests {
     #[test]
     fn roundtrip_text() {
         let orig = CqlValue::Text("hello world".to_string());
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::TextVal("hello world".to_string()));
         let back = wit_to_cql(&wit, &CqlType::Varchar).unwrap();
         assert_eq!(back, orig);
@@ -307,7 +318,7 @@ mod tests {
     #[test]
     fn roundtrip_ascii() {
         let orig = CqlValue::Ascii("ASCII".to_string());
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::AsciiVal("ASCII".to_string()));
         let back = wit_to_cql(&wit, &CqlType::Ascii).unwrap();
         assert_eq!(back, orig);
@@ -316,7 +327,7 @@ mod tests {
     #[test]
     fn roundtrip_blob() {
         let orig = CqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::BlobVal(vec![0xDE, 0xAD, 0xBE, 0xEF]));
         let back = wit_to_cql(&wit, &CqlType::Blob).unwrap();
         assert_eq!(back, orig);
@@ -326,7 +337,7 @@ mod tests {
     fn roundtrip_uuid() {
         let u = uuid::Uuid::new_v4();
         let orig = CqlValue::Uuid(u);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::UuidVal(u.to_string()));
         let back = wit_to_cql(&wit, &CqlType::Uuid).unwrap();
         assert_eq!(back, orig);
@@ -336,7 +347,7 @@ mod tests {
     fn roundtrip_timeuuid() {
         let u = uuid::Uuid::new_v4(); // not a real timeuuid but fine for conversion test
         let orig = CqlValue::Timeuuid(u);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::TimeuuidVal(u.to_string()));
         let back = wit_to_cql(&wit, &CqlType::Timeuuid).unwrap();
         assert_eq!(back, orig);
@@ -345,7 +356,7 @@ mod tests {
     #[test]
     fn roundtrip_timestamp() {
         let orig = CqlValue::Timestamp(1_700_000_000_000);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::TimestampVal(1_700_000_000_000));
         let back = wit_to_cql(&wit, &CqlType::Timestamp).unwrap();
         assert_eq!(back, orig);
@@ -355,7 +366,7 @@ mod tests {
     fn roundtrip_date() {
         // CQL date: unsigned 32-bit, center-epoch at 2^31.
         let orig = CqlValue::Date(2_147_483_648); // epoch day
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         // u32 -> i32 wraps: 2^31 as i32 is i32::MIN
         assert_eq!(wit, WitCqlValue::DateVal(2_147_483_648u32 as i32));
         let back = wit_to_cql(&wit, &CqlType::Date).unwrap();
@@ -365,7 +376,7 @@ mod tests {
     #[test]
     fn roundtrip_time() {
         let orig = CqlValue::Time(43_200_000_000_000); // noon in nanoseconds
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::TimeVal(43_200_000_000_000));
         let back = wit_to_cql(&wit, &CqlType::Time).unwrap();
         assert_eq!(back, orig);
@@ -374,7 +385,7 @@ mod tests {
     #[test]
     fn roundtrip_smallint() {
         let orig = CqlValue::Smallint(-1234);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::SmallintVal(-1234));
         let back = wit_to_cql(&wit, &CqlType::Smallint).unwrap();
         assert_eq!(back, orig);
@@ -383,7 +394,7 @@ mod tests {
     #[test]
     fn roundtrip_tinyint() {
         let orig = CqlValue::Tinyint(-42);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::TinyintVal(-42));
         let back = wit_to_cql(&wit, &CqlType::Tinyint).unwrap();
         assert_eq!(back, orig);
@@ -393,7 +404,7 @@ mod tests {
     fn roundtrip_inet_v4() {
         let addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
         let orig = CqlValue::Inet(addr);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::InetVal("192.168.1.1".to_string()));
         let back = wit_to_cql(&wit, &CqlType::Inet).unwrap();
         assert_eq!(back, orig);
@@ -403,7 +414,7 @@ mod tests {
     fn roundtrip_inet_v6() {
         let addr = IpAddr::V6(Ipv6Addr::LOCALHOST);
         let orig = CqlValue::Inet(addr);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         let back = wit_to_cql(&wit, &CqlType::Inet).unwrap();
         assert_eq!(back, orig);
     }
@@ -411,7 +422,7 @@ mod tests {
     #[test]
     fn roundtrip_counter() {
         let orig = CqlValue::Counter(999);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::CounterVal(999));
         let back = wit_to_cql(&wit, &CqlType::Counter).unwrap();
         assert_eq!(back, orig);
@@ -423,7 +434,7 @@ mod tests {
             scale: 3,
             unscaled: BigInt::from(123456),
         };
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         match &wit {
             WitCqlValue::DecimalVal(bytes, scale) => {
                 assert_eq!(*scale, 3);
@@ -438,7 +449,7 @@ mod tests {
     #[test]
     fn roundtrip_varint() {
         let orig = CqlValue::Varint(BigInt::from(-999_999_999_i64));
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         match &wit {
             WitCqlValue::VarintVal(bytes) => {
                 assert_eq!(
@@ -459,7 +470,7 @@ mod tests {
             days: 15,
             nanos: 3_600_000_000_000, // 1 hour
         };
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::DurationVal(1, 15, 3_600_000_000_000));
         let back = wit_to_cql(&wit, &CqlType::Duration).unwrap();
         assert_eq!(back, orig);
@@ -470,7 +481,7 @@ mod tests {
     #[test]
     fn roundtrip_list() {
         let orig = CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2), CqlValue::Int(3)]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(
             wit,
             WitCqlValue::ListVal(vec![
@@ -486,7 +497,7 @@ mod tests {
     #[test]
     fn roundtrip_set() {
         let orig = CqlValue::Set(vec![CqlValue::Text("a".into()), CqlValue::Text("b".into())]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         let back = wit_to_cql(&wit, &CqlType::Set(Box::new(CqlType::Varchar))).unwrap();
         assert_eq!(back, orig);
     }
@@ -497,7 +508,7 @@ mod tests {
             (CqlValue::Int(1), CqlValue::Text("one".into())),
             (CqlValue::Int(2), CqlValue::Text("two".into())),
         ]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         let back = wit_to_cql(
             &wit,
             &CqlType::Map(Box::new(CqlType::Int), Box::new(CqlType::Varchar)),
@@ -509,7 +520,7 @@ mod tests {
     #[test]
     fn roundtrip_empty_list() {
         let orig = CqlValue::List(vec![]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::ListVal(vec![]));
         let back = wit_to_cql(&wit, &CqlType::List(Box::new(CqlType::Int))).unwrap();
         assert_eq!(back, orig);
@@ -524,7 +535,7 @@ mod tests {
             None,
             Some(CqlValue::Text("hello".into())),
         ]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(
             wit,
             WitCqlValue::TupleVal(vec![
@@ -551,7 +562,7 @@ mod tests {
             ("zip".to_string(), Some(CqlValue::Int(62701))),
             ("apt".to_string(), None),
         ]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(
             wit,
             WitCqlValue::UdtVal(vec![
@@ -584,7 +595,7 @@ mod tests {
     #[test]
     fn null_in_tuple_roundtrips() {
         let orig = CqlValue::Tuple(vec![None, None]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(
             wit,
             WitCqlValue::TupleVal(vec![WitCqlValue::Null, WitCqlValue::Null])
@@ -596,7 +607,7 @@ mod tests {
     #[test]
     fn null_in_udt_roundtrips() {
         let orig = CqlValue::Udt(vec![("field".to_string(), None)]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(
             wit,
             WitCqlValue::UdtVal(vec![("field".to_string(), WitCqlValue::Null)])
@@ -712,7 +723,7 @@ mod tests {
             CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2)]),
             CqlValue::List(vec![CqlValue::Int(3)]),
         ]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         let target = CqlType::List(Box::new(CqlType::List(Box::new(CqlType::Int))));
         let back = wit_to_cql(&wit, &target).unwrap();
         assert_eq!(back, orig);
@@ -724,7 +735,7 @@ mod tests {
             CqlValue::Text("key".into()),
             CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2)]),
         )]);
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         let target = CqlType::Map(
             Box::new(CqlType::Varchar),
             Box::new(CqlType::List(Box::new(CqlType::Int))),
@@ -738,7 +749,7 @@ mod tests {
     #[test]
     fn roundtrip_float_nan() {
         let orig = CqlValue::Float(f32::NAN.to_bits());
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         let back = wit_to_cql(&wit, &CqlType::Float).unwrap();
         // NaN bits should be preserved
         assert_eq!(back, orig);
@@ -747,7 +758,7 @@ mod tests {
     #[test]
     fn roundtrip_double_infinity() {
         let orig = CqlValue::Double(f64::INFINITY.to_bits());
-        let wit = cql_to_wit(&orig);
+        let wit = cql_to_wit(&orig).expect("convertible");
         let back = wit_to_cql(&wit, &CqlType::Double).unwrap();
         assert_eq!(back, orig);
     }

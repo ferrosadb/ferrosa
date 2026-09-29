@@ -335,3 +335,7 @@ for older storage/cluster errors and logs when it is used.
 - Topic reference: [`specs/reference/cql.md`](../specs/reference/cql.md)
 
 > T-022: `bridge::{resolve_builtin_type, cql_type_name, cql_type_display_name}` delegate to `ferrosa_common::cql_type::names`.
+
+## jsonb (T-150)
+
+jsonb has no CQL literal binding yet: `term_to_cql_value` refuses every literal into a jsonb target with a "not yet supported (T-170/T-171)" error, and `CONTAINS` over `list<jsonb>` errors instead of matching nothing. Results follow D6a: the wire type is varchar and the cell is the JSON text; `toJson` prints the document. LWT `IF` orders jsonb by D18 (T-150).

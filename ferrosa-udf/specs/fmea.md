@@ -45,3 +45,9 @@ sandbox-escape and determinism failures dominate the top of the table.
   `FERROSA_ASC_BUNDLE` (panic with setup instructions if absent).
 - Out-of-crate: `ferrosa-cql` exercises DDL replication, query-time invocation,
   the UDA driver (`wasm_aggregate.rs`), and the asc compile path (`router.rs`).
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| UDF-T150-01 | jsonb passed to a UDF as text or dropped | UDF sees a value it cannot interpret | 6 | 2 | 2 | 24 | Explicit refusal in `cql_to_wit`; executor propagates it. |

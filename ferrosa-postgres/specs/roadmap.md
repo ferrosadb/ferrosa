@@ -96,3 +96,7 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 - Query planning / binding / relational operators — those live in `ferrosa-sql`.
 - The storage row encoding — that is `ferrosa-row-bridge` (shared with CQL, D10).
 - Cassandra wire compatibility — that is the CQL front-end (`ferrosa-cql`).
+
+## jsonb (T-150)
+
+Done: type threading. Remaining: T-160: `Value::Jsonb`; T-161a: OID 3802 codec.

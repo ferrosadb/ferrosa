@@ -287,3 +287,7 @@ FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-postgres \
 - [Data flow](specs/data-flow.md) — SELECT + INSERT sequence diagrams
 
 Public marketing page: `docs/database/postgres.html` (ferrosadb.com).
+
+## jsonb (T-150)
+
+`CqlType::Jsonb` has a named arm in `pg_types::column_type_of` that advertises `text`; reading or writing a jsonb value is refused (`0A000` on write, a conversion error on read) until T-160 adds the SQL value and T-161a the wire codec (T-150).

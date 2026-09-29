@@ -138,3 +138,7 @@ ListFlights succeeds. CI's secure-compose job runs it against a
 - [FMEA / known issues](specs/fmea.md) — failure modes + real gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
 - [Data flow](specs/data-flow.md) — Handshake → token → DoGet → CQL exec → Arrow stream
+
+## jsonb (T-150)
+
+jsonb has no Arrow mapping yet: `cql_type_to_arrow` returns `None`, the column builder returns `ConvertError::Unsupported`, and `cql_literal` reports it unsupported (T-150).

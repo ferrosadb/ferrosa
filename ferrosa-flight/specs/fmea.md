@@ -51,3 +51,9 @@ path, so confidentiality and silent-wrong-data severities dominate.
 - `token.rs` unit tests — tamper/expiry/wrong-key/rotation precedence.
 - `plan.rs` unit tests — per-range tickets, RF>1 multi-location, unresolvable
   address omitted (not faked).
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| FLT-T150-01 | jsonb exported as a lossy Arrow type | Consumers read a wrong type | 6 | 2 | 2 | 24 | Explicit unsupported arms; the Variant export is a later packet (arrow stays out of ferrosa-jsonb, D5a). |

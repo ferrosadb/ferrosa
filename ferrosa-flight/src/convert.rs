@@ -82,6 +82,9 @@ pub fn cql_type_to_arrow(t: &CqlType) -> Option<DataType> {
         // Text representations for types whose exact value is best preserved as a
         // string (IP literal; arbitrary-precision integer).
         Inet | Varint => DataType::Utf8,
+        // jsonb <-> Arrow is the Variant export packet (arrow stays out of
+        // ferrosa-jsonb, D5a); until then it is an explicit "unsupported" (T-150).
+        Jsonb => return None,
         Date => DataType::Date32,
         Time => DataType::Time64(TimeUnit::Nanosecond),
         Duration => DataType::Interval(IntervalUnit::MonthDayNano),
@@ -317,6 +320,8 @@ fn build_values(
         ),
         CqlType::Inet => string_col!("inet", CqlValue::Inet(ip) => ip.to_string()),
         CqlType::Varint => string_col!("varint", CqlValue::Varint(v) => v.to_string()),
+        // Typed refusal until the Arrow Variant export lands (T-150).
+        CqlType::Jsonb => return Err(ConvertError::Unsupported(CqlType::Jsonb)),
         CqlType::Blob => {
             let owned: Vec<Option<Vec<u8>>> = {
                 let mut out = Vec::with_capacity(values.len());

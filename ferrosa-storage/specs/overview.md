@@ -266,3 +266,7 @@ default with an ERROR). The pause and retry streak are in memory: restart clears
 operator can call
 `StorageEngine::resume_table_compactions_after_digest_failures(table_id)` to
 resume and reset the streak.
+
+## jsonb (T-150)
+
+`external_sort` payload accounting counts the canonical jsonb bytes (T-150); a document-sized value never accounts as 0.

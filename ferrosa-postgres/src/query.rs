@@ -1259,6 +1259,13 @@ fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, BackendMessa
         (CqlType::Varint, SqlValue::Numeric { unscaled, scale }) if *scale == 0 => {
             CqlValue::Varint(unscaled.clone())
         }
+        // No SQL jsonb value until T-160 (PG-T150-02): an explicit refusal.
+        (CqlType::Jsonb, _) => {
+            return Err(error_response(
+                "0A000",
+                "jsonb columns are not yet supported over PostgreSQL (T-160)",
+            ))
+        }
         (CqlType::Ascii, _)
         | (CqlType::Bigint, _)
         | (CqlType::Blob, _)

@@ -491,7 +491,8 @@ fn cql_literal(v: &CqlValue) -> Result<String, String> {
         | CqlValue::Map(_)
         | CqlValue::Tuple(_)
         | CqlValue::Vector(_)
-        | CqlValue::Udt(_) => {
+        | CqlValue::Udt(_)
+        | CqlValue::Jsonb(_) => {
             return Err(format!("unsupported value type {}", value_kind(v)));
         }
     })
@@ -527,6 +528,7 @@ fn value_kind(v: &CqlValue) -> &'static str {
         CqlValue::Tuple(_) => "tuple",
         CqlValue::Vector(_) => "vector",
         CqlValue::Udt(_) => "udt",
+        CqlValue::Jsonb(_) => "jsonb",
     }
 }
 

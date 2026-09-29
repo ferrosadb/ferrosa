@@ -200,3 +200,7 @@ manifest publication, and S3 input-delete enqueue. Startup rebuilds absent uploa
 ledger entries from replacement records, replays the uploads, and retries deletes
 after manifest publication. Enqueue failures preserve the record for another
 attempt. A mock-store crash sweep covers the S3 and pinned-local boundaries.
+
+## jsonb (T-150)
+
+Done: type threading. Remaining: None for T-150.

@@ -45,3 +45,10 @@ severities are high.
 | ID | Failure mode | Effect | Detection | Mitigation |
 |----|--------------|--------|-----------|------------|
 | RB-T022-01 | `TypeParser::parse_type` keeps its own scalar switch | Drift from the CQL bridge and schema tables (FM-20) | `type_names_consumers_agree` in `ferrosa-cql` (exercises `parse_cql_type`) | Scalars resolve via `ferrosa_common::cql_type::names::scalar_from_name`; the parser keeps only the collection/tuple/vector/frozen/UDT grammar |
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| RB-T150-01 | Corrupt stored jsonb cell decoded as a value or as NULL | Silent data loss or a bad document | 9 | 2 | 2 | 36 | `decode_value` validates and returns `corrupt jsonb cell: ...`; the row path wraps it in `RowDecodeError`. Test: `corrupt_jsonb_cell_is_a_typed_error_not_null`. |
+| RB-T150-02 | Forbidden jsonb nesting accepted by the type parser | A set/map-key of jsonb reaches storage | 8 | 2 | 2 | 32 | `reject_forbidden_jsonb` runs after both parse entry points. Test: `parse_rejects_set_map_key_and_vector_of_jsonb`. |

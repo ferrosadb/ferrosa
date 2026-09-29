@@ -55,3 +55,11 @@ exhaustive `CqlValue` ordering property test (FC-3), and no observability on the
 | COM-T022-01 | A scalar name is added to one front-end switch but not another (drift, FM-20) | Same column type parses in one path and errors or mis-marshals in another | `type_names_round_trip_every_scalar`, consumer-agreement tests in `ferrosa-cql` and `ferrosa-schema` | One registry in `cql_type::names`; every former switch delegates to it |
 | COM-T022-02 | A new `CqlType` variant is omitted from the registry | Variant has no name or marshal class | Exhaustive `entry` match (compile error); `SCALAR_TYPES` length asserted in the round-trip test | No `_ =>` arm on `CqlType` in the registry |
 | COM-T022-03 | Case-sensitivity mismatch between callers (`cql_to_marshal_type` is exact, parsers fold case) | `INT` marshals as pass-through text | `lookup_is_exact_and_ci_variant_folds_case` pins both behaviours | `scalar_from_name` exact, `scalar_from_name_ci` folded; callers keep prior behaviour (drift recorded, not fixed) |
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| COM-T150-01 | Jsonb variant compares Equal across kinds or ignores D18 | ORDER BY, MIN, MAX and frozen equality wrong | 9 | 2 | 2 | 36 | Same-variant arm delegates to `JsonbValue::cmp`; the cross-variant arm lists `Jsonb` explicitly. Tests: `cqlvalue_cmp_jsonb_is_not_always_equal`, `cqlvalue_jsonb_ord_eq_hash_delegate_to_jsonb_value`. |
+| COM-T150-02 | Unknown quoted custom class accepted as a type | A schema silently means something else | 7 | 2 | 2 | 28 | `custom_class_type` resolves only the D20 class; anything else is `UnknownCustomClass`. Test: `type_names_jsonb_and_poc_alias`. |
+| COM-T150-03 | set/map-key/vector of jsonb constructed | Needs a jsonb order in key bytes (D3) | 8 | 2 | 2 | 32 | `check_jsonb_nesting` is exhaustive and recursive. Test: `nesting_rules_d21`. |

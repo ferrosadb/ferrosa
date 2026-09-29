@@ -47,3 +47,9 @@ aspirations.
 | ID | Failure mode | Effect | Detection | Mitigation |
 |----|--------------|--------|-----------|------------|
 | SCH-T022-01 | `cql_to_marshal_type` / `aggregate_tables::cql_type_to_string` keep private name tables | Drift from the CQL parser tables (FM-20) | `type_names_consumers_agree` (aggregate_tables), `no_wildcard_default_for_new_variant` (convert) | Both delegate to `ferrosa_common::cql_type::names` (see COM-T022-01) |
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| SCH-T150-01 | New CqlValue variant unhandled in initcond rendering | Compile error only | 2 | 1 | 1 | 2 | Named arm; the exhaustive match forced it. |

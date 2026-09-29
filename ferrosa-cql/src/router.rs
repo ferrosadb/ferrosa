@@ -274,6 +274,7 @@ fn vector_bits_from_term(term: &Term, target_type: &CqlType) -> Result<Vec<u32>,
         | CqlValue::Set(_)
         | CqlValue::Map(_)
         | CqlValue::Tuple(_)
+        | CqlValue::Jsonb(_)
         | CqlValue::Udt(_)) => Err(CqlError::Invalid(format!(
             "ANN query value must resolve to vector, got {other:?}"
         ))),
@@ -2148,6 +2149,7 @@ fn eval_to_timestamp(timeuuid: &CqlValue) -> Result<CqlValue, CqlError> {
         | CqlValue::Map(_)
         | CqlValue::Tuple(_)
         | CqlValue::Vector(_)
+        | CqlValue::Jsonb(_)
         | CqlValue::Udt(_) => Err(CqlError::Invalid(
             "toTimestamp requires a timeuuid argument".into(),
         )),
@@ -4999,6 +5001,7 @@ fn row_geo_point(row: &[Option<CqlValue>], col_idx: usize) -> Option<(f64, f64)>
                 | Some(CqlValue::Map(_))
                 | Some(CqlValue::Tuple(_))
                 | Some(CqlValue::Vector(_))
+                | Some(CqlValue::Jsonb(_))
                 | Some(CqlValue::Udt(_)) => return None,
             };
             let lon = match elems[1] {
@@ -5029,6 +5032,7 @@ fn row_geo_point(row: &[Option<CqlValue>], col_idx: usize) -> Option<(f64, f64)>
                 | Some(CqlValue::Map(_))
                 | Some(CqlValue::Tuple(_))
                 | Some(CqlValue::Vector(_))
+                | Some(CqlValue::Jsonb(_))
                 | Some(CqlValue::Udt(_)) => return None,
             };
             Some((lat, lon))
@@ -5061,6 +5065,7 @@ fn row_geo_point(row: &[Option<CqlValue>], col_idx: usize) -> Option<(f64, f64)>
         | Some(Some(CqlValue::Set(_)))
         | Some(Some(CqlValue::Map(_)))
         | Some(Some(CqlValue::Vector(_)))
+        | Some(Some(CqlValue::Jsonb(_)))
         | Some(Some(CqlValue::Udt(_))) => None,
     }
 }
@@ -7782,6 +7787,7 @@ fn encode_virtual_rows_streaming(
                             | CqlValue::Map(_)
                             | CqlValue::Tuple(_)
                             | CqlValue::Vector(_)
+                            | CqlValue::Jsonb(_)
                             | CqlValue::Udt(_)) => other,
                         }))
                     }
@@ -8864,6 +8870,7 @@ async fn route_update(
                 | (CqlType::Map(_, _), _)
                 | (CqlType::Set(_), _)
                 | (CqlType::Tuple(_), _)
+                | (CqlType::Jsonb, _)
                 | (CqlType::Udt { .. }, _)
                 | (CqlType::Vector(_, _), _) => cql_type.clone(),
             };
@@ -8941,6 +8948,7 @@ async fn route_update(
                                     | CqlValue::Map(_)
                                     | CqlValue::Tuple(_)
                                     | CqlValue::Vector(_)
+                                    | CqlValue::Jsonb(_)
                                     | CqlValue::Udt(_) => None,
                                 })
                                 .unwrap_or(0);
@@ -8975,6 +8983,7 @@ async fn route_update(
                     | CqlType::Set(_)
                     | CqlType::Tuple(_)
                     | CqlType::Udt { .. }
+                    | CqlType::Jsonb
                     | CqlType::Vector(_, _) => {
                         let new_val = bridge::term_to_cql_value(value, &cql_type)?;
                         let col_table_idx = table_meta
@@ -9036,6 +9045,7 @@ async fn route_update(
                                     | CqlValue::Map(_)
                                     | CqlValue::Tuple(_)
                                     | CqlValue::Vector(_)
+                                    | CqlValue::Jsonb(_)
                                     | CqlValue::Udt(_) => None,
                                 })
                                 .unwrap_or(0);
@@ -9084,6 +9094,7 @@ async fn route_update(
                     | CqlType::Set(_)
                     | CqlType::Tuple(_)
                     | CqlType::Udt { .. }
+                    | CqlType::Jsonb
                     | CqlType::Vector(_, _) => {
                         // Set/list subtraction: remove matching elements.
                         let to_remove = bridge::term_to_cql_value(value, &cql_type)?;
@@ -9150,6 +9161,7 @@ async fn route_update(
                     | CqlType::Duration
                     | CqlType::Set(_)
                     | CqlType::Tuple(_)
+                    | CqlType::Jsonb
                     | CqlType::Udt { .. }
                     | CqlType::Vector(_, _) => {
                         return Err(CqlError::Invalid(format!(
@@ -9255,6 +9267,7 @@ fn collection_add(existing: Option<&CqlValue>, new_val: &CqlValue) -> CqlValue {
         | (Some(CqlValue::Map(_)), _)
         | (Some(CqlValue::Tuple(_)), _)
         | (Some(CqlValue::Vector(_)), _)
+        | (Some(CqlValue::Jsonb(_)), _)
         | (Some(CqlValue::Udt(_)), _) => new_val.clone(),
     }
 }
@@ -10766,6 +10779,7 @@ fn filter_value_to_term(value: &str, cql_type: &CqlType) -> Result<Term, CqlErro
         | CqlType::Map(_, _)
         | CqlType::Set(_)
         | CqlType::Tuple(_)
+        | CqlType::Jsonb
         | CqlType::Udt { .. }
         | CqlType::Vector(_, _) => Ok(Term::StringLiteral(value.to_string())),
     }
@@ -12429,6 +12443,7 @@ fn build_column_info(
                                         | CqlType::Map(_, _)
                                         | CqlType::Set(_)
                                         | CqlType::Tuple(_)
+                                        | CqlType::Jsonb
                                         | CqlType::Udt { .. }
                                         | CqlType::Vector(_, _) => CqlType::Double,
                                     }
@@ -13115,9 +13130,15 @@ fn evaluate_where_predicates(
                 | CqlType::Tinyint
                 | CqlType::Duration
                 | CqlType::Tuple(_)
+                | CqlType::Jsonb
                 | CqlType::Udt { .. }
                 | CqlType::Vector(_, _) => return Ok(false),
             };
+            // The needle coercion below swallows errors into "no match"; a
+            // jsonb element must not vanish that way (T-150, no silent fallback).
+            if element_type == CqlType::Jsonb {
+                return Err(bridge::jsonb_unsupported("CONTAINS predicates"));
+            }
             let needle = match bridge::term_to_cql_value(&wc.value, &element_type) {
                 Ok(v) => v,
                 Err(_) => return Ok(false),
@@ -13148,6 +13169,7 @@ fn evaluate_where_predicates(
                 | CqlValue::Duration { .. }
                 | CqlValue::Tuple(_)
                 | CqlValue::Vector(_)
+                | CqlValue::Jsonb(_)
                 | CqlValue::Udt(_) => false,
             };
             if !found {
@@ -13181,6 +13203,7 @@ fn evaluate_where_predicates(
                 | CqlType::List(_)
                 | CqlType::Set(_)
                 | CqlType::Tuple(_)
+                | CqlType::Jsonb
                 | CqlType::Udt { .. }
                 | CqlType::Vector(_, _) => return Ok(false),
             };
@@ -13215,6 +13238,7 @@ fn evaluate_where_predicates(
                 | CqlValue::Set(_)
                 | CqlValue::Tuple(_)
                 | CqlValue::Vector(_)
+                | CqlValue::Jsonb(_)
                 | CqlValue::Udt(_) => false,
             };
             if !found {
@@ -13282,6 +13306,7 @@ fn evaluate_where_predicates(
                     | (CqlValue::Map(_), _)
                     | (CqlValue::Tuple(_), _)
                     | (CqlValue::Vector(_), _)
+                    | (CqlValue::Jsonb(_), _)
                     | (CqlValue::Udt(_), _) => *actual == expected,
                 }
             }
@@ -13319,6 +13344,7 @@ fn evaluate_where_predicates(
                 | (CqlValue::Map(_), _)
                 | (CqlValue::Tuple(_), _)
                 | (CqlValue::Vector(_), _)
+                | (CqlValue::Jsonb(_), _)
                 | (CqlValue::Udt(_), _) => false,
             },
             ComparisonOp::Like => match (actual, &expected) {
@@ -13349,6 +13375,7 @@ fn evaluate_where_predicates(
                 | (CqlValue::Map(_), _)
                 | (CqlValue::Tuple(_), _)
                 | (CqlValue::Vector(_), _)
+                | (CqlValue::Jsonb(_), _)
                 | (CqlValue::Udt(_), _) => false,
             },
             ComparisonOp::In => unreachable!("IN handled above"),
@@ -13849,6 +13876,7 @@ fn cql_value_to_f64(val: &CqlValue) -> Option<f64> {
         | CqlValue::Map(_)
         | CqlValue::Tuple(_)
         | CqlValue::Vector(_)
+        | CqlValue::Jsonb(_)
         | CqlValue::Udt(_) => None,
     }
 }
@@ -13887,6 +13915,7 @@ fn f64_to_cql_aggregate(val: f64, col_type: &CqlType) -> CqlValue {
         | CqlType::Map(_, _)
         | CqlType::Set(_)
         | CqlType::Tuple(_)
+        | CqlType::Jsonb
         | CqlType::Udt { .. }
         | CqlType::Vector(_, _) => CqlValue::Double(val.to_bits()),
     }

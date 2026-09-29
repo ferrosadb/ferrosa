@@ -71,3 +71,7 @@ paging cursors) or emit raw byte slices.
 Leaf-adjacent: depends only on `ferrosa-common`, `ferrosa-sstable`,
 `ferrosa-schema`. Depended on by `ferrosa-cql` and `ferrosa-postgres`. See the
 [root crate index](../../specs/crates.md) for the full graph.
+
+## jsonb (T-150)
+
+`encode_value` writes the canonical jsonb cell bytes; `decode_value` validates them (`JsonbValue::from_bytes`) and a corrupt cell is an error, never NULL. jsonb nests in list, map value, tuple and UDT (D21). `parse_cql_type*` accept `jsonb` and refuse `set<jsonb>`, `map<jsonb, _>` and `vector<jsonb, _>` at parse (T-150).

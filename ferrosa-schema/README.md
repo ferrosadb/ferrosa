@@ -125,3 +125,7 @@ validation. Live gaps are tracked in [specs/fmea.md](specs/fmea.md).
 </invoke>
 
 > T-022: `cql_to_marshal_type` and the aggregate-table type stringifier delegate to `ferrosa_common::cql_type::names`.
+
+## jsonb (T-150)
+
+`system_schema.aggregates` initcond rendering lists `CqlValue::Jsonb` with the other non-literal values (T-150). No schema behaviour changed.

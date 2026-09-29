@@ -122,7 +122,8 @@ fn cql_value_to_literal(val: &CqlValue) -> String {
         | CqlValue::Set(_)
         | CqlValue::Map(_)
         | CqlValue::Vector(_)
-        | CqlValue::Udt(_) => format!("{val:?}"),
+        | CqlValue::Udt(_)
+        | CqlValue::Jsonb(_) => format!("{val:?}"),
     }
 }
 

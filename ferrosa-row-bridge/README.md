@@ -98,3 +98,7 @@ gap — see [specs/fmea.md](specs/fmea.md) and [specs/roadmap.md](specs/roadmap.
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
 
 > T-022: `TypeParser` resolves scalar names through `ferrosa_common::cql_type::names`; it keeps only the type grammar.
+
+## jsonb (T-150)
+
+`encode_value` writes the canonical jsonb cell bytes; `decode_value` validates them (`JsonbValue::from_bytes`) and a corrupt cell is an error, never NULL. jsonb nests in list, map value, tuple and UDT (D21). `parse_cql_type*` accept `jsonb` and refuse `set<jsonb>`, `map<jsonb, _>` and `vector<jsonb, _>` at parse (T-150).

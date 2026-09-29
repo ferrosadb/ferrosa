@@ -499,7 +499,10 @@ impl UdfExecutor {
         })?;
 
         // Convert CQL args to WIT variant Vals
-        let wit_args: Vec<WitCqlValue> = args.iter().map(cql_to_wit).collect();
+        let wit_args: Vec<WitCqlValue> = args
+            .iter()
+            .map(cql_to_wit)
+            .collect::<Result<_, UdfError>>()?;
         let args_val = wit_cql_list_to_val(&wit_args);
 
         // Call the function with dynamic args/results
@@ -577,7 +580,10 @@ impl UdfExecutor {
             UdfError::ExecutionFailed("component does not export 'invoke' function".into())
         })?;
 
-        let wit_args: Vec<WitCqlValue> = args.iter().map(cql_to_wit).collect();
+        let wit_args: Vec<WitCqlValue> = args
+            .iter()
+            .map(cql_to_wit)
+            .collect::<Result<_, UdfError>>()?;
         let args_val = wit_cql_list_to_val(&wit_args);
 
         let mut results = vec![Val::Bool(false)];

@@ -100,3 +100,10 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
   writes, serializable conflicts, phantoms, rollback, and extended protocol.
 - in-crate unit tests for codecs, SQLSTATE mapping, SCRAM vectors, the R15
   guard, and the transaction state machine.
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| PG-T150-01 | jsonb value shown as SQL NULL or text | Silent wrong data | 9 | 2 | 2 | 36 | `cql_to_value` returns an error for `Jsonb`. Scans propagate it as a query error. |
+| PG-T150-02 | jsonb INSERT coerced through a type mismatch or a guess | Wrong stored value | 8 | 2 | 2 | 32 | `value_to_cql` has an explicit `(Jsonb, _)` arm returning `0A000`. |

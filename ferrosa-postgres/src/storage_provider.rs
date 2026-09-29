@@ -161,6 +161,10 @@ pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
         | CqlValue::Vector(_) => {
             return Err(format!("unsupported CQL value for PostgreSQL: {v:?}"))
         }
+        // No SQL jsonb value until T-160; refuse rather than show NULL (PG-T150-01).
+        CqlValue::Jsonb(_) => {
+            return Err("jsonb values are not yet supported over PostgreSQL (T-160)".to_string())
+        }
     })
 }
 

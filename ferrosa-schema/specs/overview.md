@@ -102,3 +102,7 @@ A mid-layer crate: depends only on `ferrosa-common`, `ferrosa-index`,
 `ferrosa-session`, `ferrosa-storage`, `ferrosa-view`). See the
 [root crate index](../../specs/crates.md) for the full graph.
 </content>
+
+## jsonb (T-150)
+
+`system_schema.aggregates` initcond rendering lists `CqlValue::Jsonb` with the other non-literal values (T-150). No schema behaviour changed.

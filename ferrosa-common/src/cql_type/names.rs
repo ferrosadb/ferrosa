@@ -12,6 +12,9 @@
 
 use super::CqlType;
 
+/// The Cassandra jsonb proof-of-concept custom class (D20).
+pub const JSONB_MARSHAL_CLASS: &str = "org.apache.cassandra.db.marshal.JsonbType";
+
 /// Registry row for one scalar type.
 struct ScalarInfo {
     /// Canonical lowercase CQL name.
@@ -41,7 +44,7 @@ const fn info(
 }
 
 /// Every scalar `CqlType`, for name lookup. Order is irrelevant.
-pub static SCALAR_TYPES: [CqlType; 20] = [
+pub static SCALAR_TYPES: [CqlType; 21] = [
     CqlType::Ascii,
     CqlType::Bigint,
     CqlType::Blob,
@@ -62,6 +65,7 @@ pub static SCALAR_TYPES: [CqlType; 20] = [
     CqlType::Smallint,
     CqlType::Tinyint,
     CqlType::Duration,
+    CqlType::Jsonb,
 ];
 
 /// Exhaustive registry match over every `CqlType` variant.
@@ -123,6 +127,9 @@ fn entry(t: &CqlType) -> Entry {
             &[],
             "org.apache.cassandra.db.marshal.DurationType",
         ),
+        // The marshal class is the POC's custom class (D20): accepted as a DDL
+        // alias by `custom_class_type`, and reported for schema round trips.
+        CqlType::Jsonb => info("jsonb", &[], JSONB_MARSHAL_CLASS),
         CqlType::List(_) => Entry::Composite("list"),
         CqlType::Map(_, _) => Entry::Composite("map"),
         CqlType::Set(_) => Entry::Composite("set"),
@@ -176,6 +183,112 @@ pub fn scalar_from_name_ci(name: &str) -> Option<CqlType> {
         .cloned()
 }
 
+/// A quoted custom class name that is not the jsonb alias (D20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCustomClass(pub String);
+
+impl std::fmt::Display for UnknownCustomClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unsupported custom type class '{}': only '{JSONB_MARSHAL_CLASS}' (jsonb) is accepted",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownCustomClass {}
+
+/// Resolve a quoted custom class to a type. Only the POC jsonb class resolves;
+/// every other class is a loud error (D20, FM-37).
+pub fn custom_class_type(class: &str) -> Result<CqlType, UnknownCustomClass> {
+    if class == JSONB_MARSHAL_CLASS {
+        Ok(CqlType::Jsonb)
+    } else {
+        Err(UnknownCustomClass(class.to_string()))
+    }
+}
+
+/// Where a `jsonb` was found that D21 forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonbNestingError {
+    /// `set<jsonb>`: a set needs a stored order inside the cell (D3).
+    SetElement,
+    /// `map<jsonb, _>`: a map key needs the same (D3).
+    MapKey,
+    /// `vector<jsonb>`: vectors are numeric.
+    VectorElement,
+}
+
+impl std::fmt::Display for JsonbNestingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self {
+            Self::SetElement => {
+                "set<jsonb> is not supported: a set element needs a jsonb order in key bytes (D3, D21)"
+            }
+            Self::MapKey => {
+                "map<jsonb, ...> is not supported: a map key needs a jsonb order in key bytes (D3, D21)"
+            }
+            Self::VectorElement => "vector<jsonb> is not supported: vector elements are numeric (D21)",
+        };
+        f.write_str(what)
+    }
+}
+
+impl std::error::Error for JsonbNestingError {}
+
+/// Reject the jsonb nestings D21 forbids, at any depth. jsonb as a list
+/// element, map value, tuple element or UDT field is allowed.
+pub fn check_jsonb_nesting(t: &CqlType) -> Result<(), JsonbNestingError> {
+    match t {
+        CqlType::Set(inner) => {
+            if **inner == CqlType::Jsonb {
+                return Err(JsonbNestingError::SetElement);
+            }
+            check_jsonb_nesting(inner)
+        }
+        CqlType::Map(k, v) => {
+            if **k == CqlType::Jsonb {
+                return Err(JsonbNestingError::MapKey);
+            }
+            check_jsonb_nesting(k)?;
+            check_jsonb_nesting(v)
+        }
+        CqlType::Vector(elem, _) => {
+            if **elem == CqlType::Jsonb {
+                return Err(JsonbNestingError::VectorElement);
+            }
+            check_jsonb_nesting(elem)
+        }
+        CqlType::List(inner) => check_jsonb_nesting(inner),
+        CqlType::Tuple(types) => types.iter().try_for_each(check_jsonb_nesting),
+        CqlType::Udt { fields, .. } => fields
+            .iter()
+            .try_for_each(|(_, ty)| check_jsonb_nesting(ty)),
+        CqlType::Ascii
+        | CqlType::Bigint
+        | CqlType::Blob
+        | CqlType::Boolean
+        | CqlType::Counter
+        | CqlType::Decimal
+        | CqlType::Double
+        | CqlType::Float
+        | CqlType::Int
+        | CqlType::Timestamp
+        | CqlType::Uuid
+        | CqlType::Varchar
+        | CqlType::Varint
+        | CqlType::Timeuuid
+        | CqlType::Inet
+        | CqlType::Date
+        | CqlType::Time
+        | CqlType::Smallint
+        | CqlType::Tinyint
+        | CqlType::Duration
+        | CqlType::Jsonb => Ok(()),
+    }
+}
+
 /// Short kind name for error messages: the scalar name, or `list`, `map`,
 /// `set`, `tuple`, `vector`, `udt`.
 pub fn kind_name(t: &CqlType) -> &'static str {
@@ -208,7 +321,7 @@ mod tests {
 
     #[test]
     fn type_names_round_trip_every_scalar() {
-        assert_eq!(SCALAR_TYPES.len(), 20);
+        assert_eq!(SCALAR_TYPES.len(), 21);
         for ty in SCALAR_TYPES.iter() {
             let name = scalar_name(ty).expect("scalar has a canonical name");
             assert_eq!(scalar_from_name(name).as_ref(), Some(ty), "{name}");
@@ -254,5 +367,69 @@ mod tests {
         assert_eq!(display_name(&map), "map<text, int>");
         let vec = CqlType::Vector(Box::new(CqlType::Float), 3);
         assert_eq!(display_name(&vec), "vector<float, 3>");
+    }
+
+    #[test]
+    fn type_names_jsonb_and_poc_alias() {
+        assert_eq!(scalar_from_name("jsonb"), Some(CqlType::Jsonb));
+        assert_eq!(scalar_name(&CqlType::Jsonb), Some("jsonb"));
+        assert_eq!(
+            custom_class_type("org.apache.cassandra.db.marshal.JsonbType"),
+            Ok(CqlType::Jsonb)
+        );
+        let err = custom_class_type("org.apache.cassandra.db.marshal.UTF8Type");
+        assert_eq!(
+            err,
+            Err(UnknownCustomClass(
+                "org.apache.cassandra.db.marshal.UTF8Type".to_string()
+            ))
+        );
+        assert!(custom_class_type("").is_err());
+    }
+
+    #[test]
+    fn jsonb_marshal_class_is_the_poc_alias() {
+        assert_eq!(
+            scalar_marshal_class(&CqlType::Jsonb),
+            Some("org.apache.cassandra.db.marshal.JsonbType")
+        );
+    }
+
+    #[test]
+    fn nesting_rules_d21() {
+        let j = || Box::new(CqlType::Jsonb);
+        assert_eq!(check_jsonb_nesting(&CqlType::List(j())), Ok(()));
+        assert_eq!(
+            check_jsonb_nesting(&CqlType::Map(Box::new(CqlType::Varchar), j())),
+            Ok(())
+        );
+        assert_eq!(
+            check_jsonb_nesting(&CqlType::Tuple(vec![CqlType::Jsonb])),
+            Ok(())
+        );
+        assert_eq!(
+            check_jsonb_nesting(&CqlType::Set(j())),
+            Err(JsonbNestingError::SetElement)
+        );
+        assert_eq!(
+            check_jsonb_nesting(&CqlType::Map(j(), Box::new(CqlType::Int))),
+            Err(JsonbNestingError::MapKey)
+        );
+        assert_eq!(
+            check_jsonb_nesting(&CqlType::Vector(j(), 3)),
+            Err(JsonbNestingError::VectorElement)
+        );
+        // Rejected at depth too.
+        let deep = CqlType::List(Box::new(CqlType::Set(j())));
+        assert_eq!(
+            check_jsonb_nesting(&deep),
+            Err(JsonbNestingError::SetElement)
+        );
+        let udt = CqlType::Udt {
+            keyspace: "k".into(),
+            name: "u".into(),
+            fields: vec![("f".into(), CqlType::Jsonb)],
+        };
+        assert_eq!(check_jsonb_nesting(&udt), Ok(()));
     }
 }

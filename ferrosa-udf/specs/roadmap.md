@@ -46,3 +46,7 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the in-code design notes
 - CQL parsing, schema metadata, DDL replication, or query planning — those belong
   to `ferrosa-cql` / `ferrosa-session`, which orchestrate this crate.
 - Languages other than WASM components and (behind `asc-udf`) AssemblyScript.
+
+## jsonb (T-150)
+
+Done: type threading. Remaining: A jsonb WIT case is a later packet.

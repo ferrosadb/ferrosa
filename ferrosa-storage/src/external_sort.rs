@@ -139,6 +139,9 @@ fn cql_value_payload_bytes(v: &CqlValue) -> usize {
         | CqlValue::Smallint(_)
         | CqlValue::Tinyint(_)
         | CqlValue::Duration { .. } => 0,
+        // The canonical cell bytes are the heap payload (jsonb is document-sized,
+        // so it must never account as 0: ST-T150-01).
+        CqlValue::Jsonb(j) => j.as_bytes().len(),
         // Heap-allocated payloads whose size is not tracked precisely.
         // Listed explicitly so a new variant must choose its accounting.
         CqlValue::Decimal { .. } | CqlValue::Varint(_) | CqlValue::Udt(_) => 0,
@@ -506,6 +509,22 @@ impl<T: SpillRow, C: SpillOrder<T>> KWayMerge<T, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jsonb_payload_counts_its_cell_bytes() {
+        use ferrosa_jsonb::{parse_text, JsonbValue, Limits, LimitsConfig};
+        let limits = Limits::from_config_with_env(&LimitsConfig::default(), &|_| None, 64 << 20)
+            .expect("default limits");
+        let text = format!("[\"{}\"]", "x".repeat(1000));
+        let enc = parse_text(text.as_bytes(), &limits).expect("valid json");
+        let j = JsonbValue::from_encoded(enc).expect("valid cell");
+        let len = j.as_bytes().len();
+        let v = CqlValue::Jsonb(j);
+        assert!(len > 1000);
+        assert_eq!(cql_value_payload_bytes(&v), len);
+        let row: Row = vec![Some(v)];
+        assert!(estimate_row_bytes(&row) > 1000);
+    }
 
     #[test]
     fn no_wildcard_default_for_new_variant() {

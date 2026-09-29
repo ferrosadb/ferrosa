@@ -10,6 +10,8 @@ repository.workspace = true
 # CqlType / CqlValue live here (re-exported by ferrosa-cql); DecoratedKey,
 # PartitionKey, CellValue also come from common.
 ferrosa-common = { path = "../ferrosa-common" }
+# `CqlValue::Jsonb` cells are validated on decode (T-150, D4).
+ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 # Storage row/partition types (`Partition`, `Row`, `CellValue` liveness helpers).
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 # `Schema` for UDT-aware type-name resolution in `parse_cql_type_in_keyspace`.

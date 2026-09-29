@@ -125,6 +125,8 @@ slow-tests = []
 [dev-dependencies]
 async-trait = "0.1"
 ferrosa-common = { path = "../ferrosa-common", features = ["test-generators"] }
+# Builds `CqlValue::Jsonb` values for the external-sort accounting test (T-150).
+ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 # Plumbing for T-033/T-038 (sstable-write-pump): the write-pump fault-injection
 # sinks (RecordingSink, FaultySink, GateSink) are `pub(crate)` in
 # ferrosa-sstable today, so this feature does not yet expose anything this

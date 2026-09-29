@@ -112,3 +112,7 @@ Cancellation uses a one-slot Crossbeam channel solely for disconnection. No
 payload is sent or consumed; every cloned receiver observes closure, including
 clones created after cancellation. Fixed capacity avoids zero-channel select
 packet allocations in storage pump waits (T-081).
+
+## jsonb (T-150)
+
+`CqlType::Jsonb` and `CqlValue::Jsonb(ferrosa_jsonb::JsonbValue)` (T-150). The value is validated and never raw bytes; `Ord`/`Eq`/`Hash` delegate to `JsonbValue` (D18, D2a) and `discriminant_index` gives it index 27. The name registry has `jsonb` with the POC marshal class `org.apache.cassandra.db.marshal.JsonbType`; `custom_class_type` resolves only that class (D20) and `check_jsonb_nesting` rejects `set<jsonb>`, `map<jsonb, _>` and `vector<jsonb>` at any depth (D21). `jsonb_canonical_text` prints a value. New edge: `ferrosa-common` -> `ferrosa-jsonb` (leaf; `guard-arrow-free.sh` passes).

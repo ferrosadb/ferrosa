@@ -821,3 +821,7 @@ default 3; invalid values use the default). The in-memory pause clears on
 restart, or an operator can call
 `StorageEngine::resume_table_compactions_after_digest_failures(table_id)` to
 clear the pause and retry streak; the next failure starts at the initial delay.
+
+## jsonb (T-150)
+
+`external_sort` payload accounting counts the canonical jsonb bytes (T-150); a document-sized value never accounts as 0.

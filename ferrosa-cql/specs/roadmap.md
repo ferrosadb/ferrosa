@@ -144,3 +144,7 @@ real backlog is structural and security-shaped.
   re-exported here. Changes to encoding belong there, not in this crate.
 - Cassandra internode wire compatibility — Ferrosa uses its own internode protocol
   (`ferrosa-net`); only the *client* CQL protocol is Cassandra-compatible.
+
+## jsonb (T-150)
+
+Done: type threading. Remaining: T-170/T-171: CQL jsonb literals, bind values and nested wire form.

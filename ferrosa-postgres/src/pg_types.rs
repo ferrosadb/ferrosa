@@ -28,9 +28,10 @@
 //!
 //! `jsonb` (OID 3802), `json` (114) and `jsonpath` (4072) are reserved by
 //! [`PG_OID_JSONB`], [`PG_OID_JSON`] and [`PG_OID_JSONPATH`]. There is no
-//! `CqlType` variant yet (type threading is a later packet), so no entry maps to
-//! them. When the variant lands, add its arm to [`pg_type_of`] and its entry to
-//! [`ALL_PG_TYPES`]; the exhaustive match makes a missed arm a compile error.
+//! engine column type yet (`Value::Jsonb` is T-160, the wire codec T-161a).
+//! `CqlType::Jsonb` (T-150) has a named arm in `column_type_of` that advertises
+//! `text`; values are refused by the storage provider until T-160. When T-160
+//! lands, retarget that arm and add the entry to [`ALL_PG_TYPES`].
 
 use std::fmt;
 
@@ -168,6 +169,11 @@ fn column_type_of(t: &CqlType) -> (ColumnType, bool) {
         | CqlType::Tuple(_)
         | CqlType::Udt { .. }
         | CqlType::Vector(_, _) => (ColumnType::Text, true),
+        // Designed interim (T-150): the engine has no jsonb column type until
+        // T-160, so jsonb is advertised as text. Values are NOT delivered
+        // (`storage_provider::cql_to_value` refuses them, PG-T150-01); OID 3802
+        // is wired by T-161a.
+        CqlType::Jsonb => (ColumnType::Text, true),
     }
 }
 
@@ -298,7 +304,10 @@ mod tests {
     fn composites_are_named_text_rendered_arms() {
         for t in every_cql_type() {
             let pg = pg_type_of(&t);
-            let composite = !SCALAR_TYPES.contains(&t) || t == CqlType::Duration;
+            // jsonb is a scalar name but has no engine column type until T-160,
+            // so it takes the text-rendered arm (`column_type_of`).
+            let composite =
+                !SCALAR_TYPES.contains(&t) || t == CqlType::Duration || t == CqlType::Jsonb;
             assert_eq!(pg.text_rendered, composite, "{t:?}");
             if composite {
                 assert_eq!((pg.oid, pg.column_type), (25, ColumnType::Text));

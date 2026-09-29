@@ -44,3 +44,7 @@ dependency/usage review.
 
 - Protocol framing, query planning, or transport — those belong to the front-ends
   (`ferrosa-cql` / `ferrosa-postgres`), not here.
+
+## jsonb (T-150)
+
+Done: type threading. Remaining: T-151: `CorruptJsonb` typed variant on the cell codec.

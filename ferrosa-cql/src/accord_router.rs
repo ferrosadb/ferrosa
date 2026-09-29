@@ -526,6 +526,7 @@ fn as_integer(value: &CqlValue) -> Option<num_bigint::BigInt> {
         | CqlValue::Map(_)
         | CqlValue::Tuple(_)
         | CqlValue::Vector(_)
+        | CqlValue::Jsonb(_)
         | CqlValue::Udt(_) => None,
     }
 }
@@ -570,6 +571,8 @@ fn cmp_values(a: &Option<CqlValue>, b: &Option<CqlValue>) -> Option<std::cmp::Or
             let b_f = f32::from_bits(*b_bits);
             a_f.partial_cmp(&b_f)
         }
+        // jsonb orders by the D18 total order; a mixed pair is not comparable.
+        (Some(CqlValue::Jsonb(a)), Some(CqlValue::Jsonb(b))) => Some(a.cmp(b)),
         (None, _)
         | (Some(CqlValue::Null), _)
         | (Some(CqlValue::Ascii(_)), _)
@@ -597,7 +600,8 @@ fn cmp_values(a: &Option<CqlValue>, b: &Option<CqlValue>) -> Option<std::cmp::Or
         | (Some(CqlValue::Map(_)), _)
         | (Some(CqlValue::Tuple(_)), _)
         | (Some(CqlValue::Vector(_)), _)
-        | (Some(CqlValue::Udt(_)), _) => None,
+        | (Some(CqlValue::Udt(_)), _)
+        | (Some(CqlValue::Jsonb(_)), _) => None,
     }
 }
 

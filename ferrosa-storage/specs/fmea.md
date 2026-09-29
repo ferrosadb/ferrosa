@@ -115,3 +115,9 @@ runtime. Permit acquisition also selects on cancellation and shutdown.
 T-025 operator requests preserve existing cancellation reasons, count each task
 once under the registry lock, and keep future admission open. Scoped tests cover
 unselected tasks, repeated requests and empty registries.
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| ST-T150-01 | jsonb payload accounted as 0 bytes in the external sorter | Spill threshold never trips; OOM | 8 | 2 | 2 | 32 | `cql_value_payload_bytes` returns `as_bytes().len()`. Test: `jsonb_payload_counts_its_cell_bytes`. |
