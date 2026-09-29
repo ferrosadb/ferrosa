@@ -105,11 +105,18 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Install cargo-nextest
         # nextest runs one process per test and schedules across every core,
-        # where libtest runs each test *binary* serially. The suite's wall clock
-        # was therefore the sum of every binary's slowest test: a single
-        # ~840s test (sidecar_memory_bound) held 43% of this job on its own.
-        # Pinned like every other action in this file.
+        # where libtest runs each test *binary* serially. Combined with the
+        # `slow-tests` gating below, this is where the 36-minute job's time
+        # went: one 836s test in a two-test binary held 43% of it.
+        #
+        # `tool:` is required: this action normally picks the tool from its
+        # `@<tool>` tag, so a version-SHA pin alone selects nothing. It warns
+        # "no tool specified" and installs nothing, and the run then dies at
+        # the test step — which is exactly how this first failed (cargo-nextest
+        # absent, exit 101). Pin the SHA AND name the tool.
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: nextest
       - name: Free disk space
         # The --all-features debug test build alone exceeds 30GB of target
         # artifacts; the old reclaim (dotnet/android/ghc ≈ 11GB) still left
