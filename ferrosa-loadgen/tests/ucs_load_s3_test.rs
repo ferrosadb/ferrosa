@@ -42,6 +42,8 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
         compaction_upload_workers: 4,
         compaction_upload_queue_depth: 8,
         delete_workers: 2,
+        max_requests_per_second: None,
+        max_concurrent_requests: None,
     };
 
     StorageEngineConfig {

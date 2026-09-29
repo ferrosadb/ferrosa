@@ -438,24 +438,22 @@ jobs:
 
   # Reuses the node image artifact from build-node-image so this live
   # PostgreSQL fault schedule does not compile a second server binary.
-  #
-  # SKIPPED (2026-09-29, by maintainer decision) — known failure, not a pass.
-  # While node 3 is paused, a transaction it coordinated stays PreAccepted and
-  # nothing recovers it: Accord recovery is not wired in production
-  # (ferrosa-cluster FMEA CL-4 / CL-20). A conflicting PostgreSQL snapshot
-  # barrier then times out ("snapshot barrier dependencies were not applied
-  # locally", SQLSTATE 58000) and the strict-serializability workload aborts.
-  # It fails on main too. Re-enable by deleting this `if:` once recovery is
-  # wired — forge t_64c1b2d6 (fix) and t_3017b690 (turn this back on).
-  #
-  # NOTE for this branch: the fix is intended to land in its own follow-on PR,
-  # but until it does this job is red on every PR, so the skip stays here too.
-  # The test (ferrosa-jepsen/tests/postgres_strict_serializable.rs) is NOT
-  # deleted or #[ignore]d — it still compiles under --all-features and can be
-  # run by hand:
-  #   cargo test -p ferrosa-jepsen --all-features --test postgres_strict_serializable
   postgres-jepsen-fault:
     name: PostgreSQL Jepsen fault schedule
+    # SKIPPED (2026-09-29, by maintainer decision) — known failure, not a pass.
+    # While node 3 is paused, a transaction it coordinated stays PreAccepted
+    # and nothing recovers it: Accord recovery is not wired in production
+    # (ferrosa-cluster FMEA CL-4 / CL-20). A conflicting PostgreSQL snapshot
+    # barrier then times out ("snapshot barrier dependencies were not applied
+    # locally", SQLSTATE 58000) and the strict-serializability workload aborts.
+    # It fails on main too. Re-enable by deleting this `if:` once recovery is
+    # wired — forge t_64c1b2d6 (fix) and t_3017b690 (turn this back on).
+    #
+    # This skip matches main (landed via #468). PR #470 is stacked on this
+    # branch and does the real work: it fixes the Accord path AND deletes this
+    # `if:`, so the job runs and proves the fix against a real paused node.
+    # Do not "helpfully" re-enable it here — that is 470's job, and its re-enable
+    # is the evidence that its fix works.
     if: ${{ false }}
     needs: build-node-image
     runs-on: ubuntu-latest
