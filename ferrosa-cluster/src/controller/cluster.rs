@@ -206,20 +206,51 @@ pub(super) fn plan_invite_peer_connection(
     }
 }
 
+/// The address to dial each cluster peer at: its own internode address.
+///
+/// The address `connected_peers` tracks for a peer wins -- `on_inbound_peer`
+/// resolved it from the peer's advertised internode broadcast, and an
+/// outbound peer is tracked at the address we dialled -- and otherwise the
+/// address given (an invite's, whose sender resolved it the same way) is
+/// used as stated.
+///
+/// This used to rewrite every address to `peer_ip:<this node's bind port>`,
+/// which only holds while every node shares one internode port. Co-located
+/// nodes do not (t_7c01df7e): node3 on :39200 filed a pool for node2 at
+/// 127.0.0.1:39200, its own address, put that address in Raft membership,
+/// and sent it to node1 in a ClusterInvite.
+pub(super) fn cluster_peer_dial_addrs(
+    peers: &[(Uuid, SocketAddr)],
+    connected: &[(Uuid, SocketAddr)],
+) -> Vec<(Uuid, SocketAddr)> {
+    peers
+        .iter()
+        .map(|(id, given)| {
+            let tracked = connected.iter().find(|(c, _)| c == id).map(|(_, a)| *a);
+            (*id, tracked.unwrap_or(*given))
+        })
+        .collect()
+}
+
 /// The internode address to record for a `ClusterInvite`'s initiator.
 ///
 /// `observed` is the RPC sender's address: the source address of the
 /// connection the invite arrived on, whose port is ephemeral. Prefer the
-/// address we already dial the initiator at, then the internode address it
-/// advertised in its handshake. Only when neither is known fall back to the
-/// observed IP plus OUR port -- the old assumption, wrong for co-located
-/// nodes -- and report that by returning `true` so the caller can log it.
+/// address `connected_peers` tracks for the initiator, then the address we
+/// already dial it at, then the internode address it advertised in its
+/// handshake. Only when none is known fall back to the observed IP plus OUR
+/// port -- the old assumption, wrong for co-located nodes -- and report that
+/// by returning `true` so the caller can log it.
 pub(super) fn plan_invite_initiator_addr(
+    tracked: Option<SocketAddr>,
     known: Option<&str>,
     advertised: Option<&str>,
     observed: SocketAddr,
     local_internode_port: u16,
 ) -> (SocketAddr, bool) {
+    if let Some(addr) = tracked {
+        return (addr, false);
+    }
     if let Some(addr) = known.and_then(|known| known.parse().ok()) {
         return (addr, false);
     }
@@ -767,11 +798,12 @@ impl ModeController {
         if !self.leaving_standalone_permitted(DeploymentMode::Cluster) {
             return;
         }
-        // `peers` are internode addresses as tracked in `connected_peers`: the
-        // address dialled for an outbound peer, the resolved advertised
-        // address for an inbound one. They used to be rewritten to each
-        // peer's IP plus OUR port, which put every co-located peer at our own
-        // address in the ring (t_7c01df7e).
+        // Each peer at its own internode address -- see
+        // `cluster_peer_dial_addrs`. Every peer used to be rewritten to its IP
+        // plus OUR port, which put every co-located peer at our own address in
+        // the ring and in Raft membership (t_7c01df7e).
+        let connected = self.connected_peers.lock().clone();
+        let peers = cluster_peer_dial_addrs(&peers, &connected);
         let phase_runner = super::bootstrap::runner::BootstrapPhaseRunner::canonical();
         tracing::debug!(
             phase_count = phase_runner.phase_order().len(),
@@ -3096,11 +3128,18 @@ impl RpcHandler for ClusterInviteHandler {
                 if initiator != self.local_host_id
                     && !all_peers.iter().any(|(id, _)| *id == initiator)
                 {
+                    let tracked = ctrl
+                        .connected_peers
+                        .lock()
+                        .iter()
+                        .find(|(id, _)| *id == initiator)
+                        .map(|(_, addr)| *addr);
                     let known = self.peer_manager.peer_addr(initiator).await;
                     let advertised = self
                         .peer_manager
                         .get_peer_internode_broadcast_sync(initiator);
                     let (addr, assumed) = plan_invite_initiator_addr(
+                        tracked,
                         known.as_deref(),
                         advertised.as_deref(),
                         from.1,

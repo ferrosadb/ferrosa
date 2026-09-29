@@ -566,6 +566,45 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(8))]
+
+    /// Invite-initiator site (t_7c01df7e): an invite arriving on a connection
+    /// from the initiator's ephemeral source port makes this node dial the
+    /// initiator at the internode address it advertised -- never at `from.1`,
+    /// never at its IP plus our port.
+    #[test]
+    fn invite_initiator_is_dialled_at_its_advertised_address_on_any_co_located_layout(
+        (own_port, initiator_port, ephemeral) in co_located_ports(),
+        peer_port in 46000u16..46500,
+    ) {
+        on_runtime(async move {
+            let dir = tempfile::tempdir().unwrap();
+            let local = Uuid::from_u128(3);
+            let controller = co_located_controller(dir.path(), own_port, local);
+            let pm = controller.peer_manager.load().as_ref().clone().expect("peer manager");
+            let initiator = Uuid::from_u128(2);
+            let advertised: SocketAddr = format!("127.0.0.1:{initiator_port}").parse().unwrap();
+            pm.set_peer_internode_broadcast(initiator, advertised.to_string()).await;
+            let handler = super::cluster::ClusterInviteHandler::new(
+                local,
+                pm,
+                controller.net_config.clone(),
+                Arc::downgrade(&controller),
+            );
+            let peer = Uuid::from_u128(1);
+            let invited: SocketAddr = format!("127.0.0.1:{peer_port}").parse().unwrap();
+            handler
+                .handle(
+                    (initiator, format!("127.0.0.1:{ephemeral}").parse().unwrap()),
+                    Message::ClusterInvite { initiator, peers: vec![(peer, invited)] },
+                )
+                .await;
+            assert_eq!(controller.dial_target(initiator), Some(advertised));
+        });
+    }
+}
+
 /// A formation path that computes our own address for another peer is
 /// refused at the one place every dial passes through.
 #[test]
@@ -682,28 +721,116 @@ async fn raft_initializes_on_third_peer() {
     assert_eq!(controller.mode(), DeploymentMode::Cluster);
 }
 
-/// The one place an ephemeral port reached cluster formation: a
-/// `ClusterInvite`'s initiator was recorded at the RPC sender's address,
-/// whose port is the source port of its connection. It used to be repaired by
-/// rewriting EVERY peer to its IP plus our port inside `transition_to_cluster`,
-/// which is also what put co-located peers at our own address (t_7c01df7e).
-/// The initiator is now resolved where it enters.
+/// The peers reached us inbound, so the addresses handed over carry
+/// ephemeral source ports. What they advertised on connect is what
+/// `connected_peers` tracks (on_inbound_peer), and that must win. It used to
+/// be recovered by rewriting every address to OUR port, which dialled
+/// ourselves whenever peers do not share our port (t_7c01df7e, CL-22).
+#[tokio::test]
+async fn transition_to_cluster_normalizes_ephemeral_peer_ports_before_seeding_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    controller.connected_peers.lock().extend([
+        (peer1_id, "10.89.1.53:17000".parse().unwrap()),
+        (peer2_id, "10.89.1.54:17000".parse().unwrap()),
+    ]);
+    controller.transition_to_cluster(vec![
+        (peer1_id, "10.89.1.53:50318".parse().unwrap()),
+        (peer2_id, "10.89.1.54:50319".parse().unwrap()),
+    ]);
+
+    let ring = controller
+        .token_ring()
+        .expect("cluster transition should publish a token ring snapshot");
+    let peer1 = ring
+        .get_node(uuid_to_node_id(peer1_id))
+        .expect("peer1 should be seeded into the initial ring");
+    let peer2 = ring
+        .get_node(uuid_to_node_id(peer2_id))
+        .expect("peer2 should be seeded into the initial ring");
+    assert_eq!(peer1.addr, "10.89.1.53:17000");
+    assert_eq!(peer2.addr, "10.89.1.54:17000");
+}
+
+/// t_7c01df7e: forming a cluster keeps each peer's own port. Found live on
+/// GPU-PC after 0af1e04a: node3 on :39200 logged "cluster: reverse connection
+/// established uuid=<node2> reverse_addr=127.0.0.1:39200" -- its own address
+/// -- and node1 then received an invite naming node2 at :39200.
+#[test]
+fn cluster_peer_addresses_keep_each_peers_own_port() {
+    let node1 = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+    let node2 = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+    let given: Vec<(Uuid, SocketAddr)> = vec![
+        (node1, "127.0.0.1:39000".parse().unwrap()),
+        (node2, "127.0.0.1:39100".parse().unwrap()),
+    ];
+    let dial = super::cluster::cluster_peer_dial_addrs(&given, &[]);
+    assert_eq!(
+        dial, given,
+        "no peer's port may be replaced with ours (:39200)"
+    );
+}
+
+/// The address a peer advertised when it connected wins over the one we were
+/// handed, e.g. an invite built by a node that has not seen it connect.
+#[test]
+fn cluster_peer_addresses_prefer_the_tracked_advertised_address() {
+    let node2 = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+    let handed = vec![(node2, "127.0.0.1:39200".parse().unwrap())];
+    let tracked = vec![(node2, "127.0.0.1:39100".parse().unwrap())];
+    let dial = super::cluster::cluster_peer_dial_addrs(&handed, &tracked);
+    assert_eq!(dial, tracked);
+}
+
+/// A `ClusterInvite`'s initiator is recorded at its own internode address,
+/// never at the RPC sender's address (`from.1`), whose port is the source
+/// port of its connection.
 #[test]
 fn invite_initiator_is_recorded_at_its_known_internode_address() {
-    let observed: SocketAddr = "10.89.1.53:50318".parse().unwrap();
-    assert_eq!(
-        super::cluster::plan_invite_initiator_addr(Some("10.89.1.53:17000"), None, observed, 17000),
-        ("10.89.1.53:17000".parse().unwrap(), false)
-    );
+    let observed: SocketAddr = "127.0.0.1:49171".parse().unwrap();
     assert_eq!(
         super::cluster::plan_invite_initiator_addr(
-            Some("127.0.0.1:29000"),
+            Some("127.0.0.1:29000".parse().unwrap()),
+            Some("127.0.0.1:29999"),
             None,
-            "127.0.0.1:49171".parse().unwrap(),
+            observed,
             29200,
         ),
         ("127.0.0.1:29000".parse().unwrap(), false),
-        "co-located: the known address, never ours"
+        "the address connected_peers tracks wins"
+    );
+    assert_eq!(
+        super::cluster::plan_invite_initiator_addr(
+            None,
+            Some("127.0.0.1:29000"),
+            None,
+            observed,
+            29200
+        ),
+        ("127.0.0.1:29000".parse().unwrap(), false),
+        "then the address we already dial it at"
     );
 }
 
@@ -711,12 +838,18 @@ fn invite_initiator_is_recorded_at_its_known_internode_address() {
 fn invite_initiator_falls_back_to_its_advertised_address_then_to_our_port_loudly() {
     let observed: SocketAddr = "127.0.0.1:49171".parse().unwrap();
     assert_eq!(
-        super::cluster::plan_invite_initiator_addr(None, Some("127.0.0.1:29000"), observed, 29200),
+        super::cluster::plan_invite_initiator_addr(
+            None,
+            None,
+            Some("127.0.0.1:29000"),
+            observed,
+            29200
+        ),
         ("127.0.0.1:29000".parse().unwrap(), false)
     );
     // Nothing known: the old assumption, flagged so the caller warns.
     assert_eq!(
-        super::cluster::plan_invite_initiator_addr(None, None, observed, 29200),
+        super::cluster::plan_invite_initiator_addr(None, None, None, observed, 29200),
         ("127.0.0.1:29200".parse().unwrap(), true)
     );
 }
