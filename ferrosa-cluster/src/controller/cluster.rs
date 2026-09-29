@@ -676,6 +676,10 @@ impl ModeController {
     /// for mesh formation. Does NOT initialize Raft — that happens in
     /// `transition_to_cluster` after all peers are connected.
     pub(super) fn transition_to_forming(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        // T-300: no departure from standalone while jsonb columns exist.
+        if !self.leaving_standalone_permitted(DeploymentMode::Forming) {
+            return;
+        }
         if self.peer_manager.load().is_none() {
             tracing::error!("cannot transition to forming: peer_manager not set");
             return;
@@ -723,6 +727,10 @@ impl ModeController {
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
     pub(super) fn transition_to_cluster(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        // T-300: no departure from standalone while jsonb columns exist.
+        if !self.leaving_standalone_permitted(DeploymentMode::Cluster) {
+            return;
+        }
         let peers: Vec<(Uuid, SocketAddr)> = peers
             .into_iter()
             .map(|(peer_uuid, addr)| (peer_uuid, self.normalize_cluster_peer_addr(addr)))

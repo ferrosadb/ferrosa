@@ -113,3 +113,14 @@ A mid-layer crate: depends only on `ferrosa-common`, `ferrosa-index`,
 and refuses jsonb in key columns (any depth, UDTs resolved through the snapshot's
 type map) and the D21 nestings. Every schema-mutating entry point calls it, and
 `apply_snapshot` checks the whole snapshot before applying anything.
+
+## jsonb DDL gate (T-300)
+
+D24 lets jsonb ship on a single node before the capability ledger. `Schema`
+carries the node's live `DeploymentMode` (an `ArcSwap` cell the cluster
+controller adopts as its own, so it cannot lag). `jsonb_ddl_permitted` is an
+exhaustive match: `Standalone` passes, the other five modes are refused. The
+same rule runs at DDL entry (`check_create_table_jsonb`,
+`check_alter_table_jsonb`, `check_create_type_jsonb`) and at apply (create and
+alter table and type, replicated or authed, and `apply_snapshot`). T-154b
+replaces the mode check with the ledger at these call sites.

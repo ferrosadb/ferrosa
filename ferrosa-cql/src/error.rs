@@ -308,9 +308,11 @@ impl From<ferrosa_schema::SchemaError> for CqlError {
             SchemaError::InvalidSchema(msg) => Self::ConfigError(msg),
             // T-154a: a jsonb placement refusal is InvalidRequest (0x2200),
             // naming the column and the rule in the message.
-            e @ (SchemaError::JsonbInKey { .. } | SchemaError::JsonbNesting { .. }) => {
-                Self::Invalid(e.to_string())
-            }
+            // T-300: jsonb DDL outside standalone is InvalidRequest too; the
+            // message names the mode and the D15a ledger requirement.
+            e @ (SchemaError::JsonbInKey { .. }
+            | SchemaError::JsonbNesting { .. }
+            | SchemaError::JsonbDdlRefused { .. }) => Self::Invalid(e.to_string()),
             _ => {
                 tracing::warn!("unmapped schema error variant: {err}");
                 Self::ServerError(format!("schema error: {err}"))

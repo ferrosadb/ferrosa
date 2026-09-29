@@ -13,12 +13,20 @@
 //! column and the rule. A column type string that cannot be parsed is also an
 //! error, never a skipped check (FMEA SCH-T154a-04). Column types are stored
 //! as strings, so this module carries its own tiny type-string reader.
+//!
+//! T-300 (D24): the interim mode gate. jsonb DDL is permitted on a standalone
+//! node only, until the D15a capability ledger lands (T-154b replaces
+//! [`jsonb_ddl_permitted`] with the ledger check at the same call sites). The
+//! `match` over `DeploymentMode` has no wildcard, so a new mode does not
+//! compile until it has a rule. No config key, env var or flag bypasses it.
 //! Last revised: 2026-09-28
-//! Last changed: New module (T-154a).
+//! Last changed: Added the standalone-only jsonb DDL gate (T-300).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrosa_common::cql_type::names::{check_jsonb_nesting, JSONB_MARSHAL_CLASS};
+use ferrosa_common::deployment_mode::DeploymentMode;
 use ferrosa_common::CqlType;
 
 use crate::error::SchemaError;
@@ -305,9 +313,213 @@ pub fn check_added_columns(
     Ok(())
 }
 
+/// The typed refusal: jsonb DDL on a node in `mode` (T-300, D24, D15a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JsonbDdlRefused {
+    pub mode: DeploymentMode,
+}
+
+impl std::fmt::Display for JsonbDdlRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "jsonb DDL is allowed on a standalone node only until the capability ledger \
+             (D15a) lands; this node is in {} mode",
+            self.mode
+        )
+    }
+}
+
+impl std::error::Error for JsonbDdlRefused {}
+
+/// The interim D24 rule. Exhaustive on purpose (SCH-T300-01): adding a
+/// `DeploymentMode` variant fails to compile here until someone decides it.
+pub fn jsonb_ddl_permitted(mode: DeploymentMode) -> Result<(), JsonbDdlRefused> {
+    match mode {
+        DeploymentMode::Standalone => Ok(()),
+        DeploymentMode::Pair
+        | DeploymentMode::Forming
+        | DeploymentMode::Cluster
+        | DeploymentMode::DegradedPair
+        | DeploymentMode::DegradedCluster => Err(JsonbDdlRefused { mode }),
+    }
+}
+
+/// Refusals so far, per mode: the source of `jsonb_ddl_refused_total{mode}`.
+static REFUSED: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Exhaustive slot for [`REFUSED`]; a new mode must be given one.
+fn mode_slot(mode: DeploymentMode) -> usize {
+    match mode {
+        DeploymentMode::Standalone => 0,
+        DeploymentMode::Pair => 1,
+        DeploymentMode::Forming => 2,
+        DeploymentMode::Cluster => 3,
+        DeploymentMode::DegradedPair => 4,
+        DeploymentMode::DegradedCluster => 5,
+    }
+}
+
+/// `jsonb_ddl_refused_total{mode}` for `mode`, since process start.
+pub fn jsonb_ddl_refused_total(mode: DeploymentMode) -> u64 {
+    REFUSED[mode_slot(mode)].load(Ordering::Relaxed)
+}
+
+/// Gate a statement on `subject` (a table, type or column) whose jsonb-ness
+/// is `has_jsonb`. One WARN and one counter tick per refusal (SCH-T300-02).
+fn gate(mode: DeploymentMode, subject: String, has_jsonb: bool) -> crate::Result<()> {
+    if !has_jsonb {
+        return Ok(());
+    }
+    let Err(refused) = jsonb_ddl_permitted(mode) else {
+        return Ok(());
+    };
+    REFUSED[mode_slot(refused.mode)].fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        mode = %refused.mode,
+        %subject,
+        "jsonb DDL refused: standalone only until the D15a capability ledger"
+    );
+    Err(SchemaError::JsonbDdlRefused {
+        mode: refused.mode,
+        subject,
+    })
+}
+
+/// True when any of `column_types` is or nests jsonb. An unparseable type is
+/// an error, never a skipped check (SCH-T300-03).
+fn any_jsonb(column_types: &[&str], keyspace: &str, types: &TypeMap) -> crate::Result<bool> {
+    for ty in column_types {
+        let node = parse(ty).map_err(|reason| {
+            SchemaError::InvalidSchema(format!(
+                "type '{ty}' cannot be checked for jsonb placement: {reason}"
+            ))
+        })?;
+        if node_contains_jsonb(&node, keyspace, types) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The one public gate, shared by the CQL and PG DDL paths: refuse when any of
+/// `column_types` (CQL type strings, e.g. `frozen<list<jsonb>>`, or UDT names
+/// resolved through `types`) is or nests jsonb and `mode` is not standalone.
+pub fn check_jsonb_ddl_allowed(
+    mode: DeploymentMode,
+    keyspace: &str,
+    column_types: &[&str],
+    types: &TypeMap,
+) -> crate::Result<()> {
+    if jsonb_ddl_permitted(mode).is_ok() {
+        return Ok(());
+    }
+    let has = any_jsonb(column_types, keyspace, types)?;
+    gate(mode, format!("column types in keyspace {keyspace}"), has)
+}
+
+/// Gate CREATE TABLE and every apply of a whole table (SCH-T300-02).
+pub fn check_table_ddl_allowed(
+    mode: DeploymentMode,
+    table: &TableMetadata,
+    types: &TypeMap,
+) -> crate::Result<()> {
+    if jsonb_ddl_permitted(mode).is_ok() {
+        return Ok(());
+    }
+    let tys: Vec<&str> = table
+        .columns
+        .values()
+        .map(|c| c.column_type.as_str())
+        .collect();
+    let has = any_jsonb(&tys, &table.keyspace, types)?;
+    gate(
+        mode,
+        format!("table {}.{}", table.keyspace, table.name),
+        has,
+    )
+}
+
+/// Gate ALTER TABLE ADD (SCH-T300-02).
+pub fn check_added_columns_ddl_allowed(
+    mode: DeploymentMode,
+    table: &TableMetadata,
+    added: &[ColumnMetadata],
+    types: &TypeMap,
+) -> crate::Result<()> {
+    if jsonb_ddl_permitted(mode).is_ok() {
+        return Ok(());
+    }
+    let tys: Vec<&str> = added.iter().map(|c| c.column_type.as_str()).collect();
+    let has = any_jsonb(&tys, &table.keyspace, types)?;
+    gate(
+        mode,
+        format!("ALTER TABLE {}.{} ADD", table.keyspace, table.name),
+        has,
+    )
+}
+
+/// Gate CREATE TYPE and ALTER TYPE ADD: a field that is or nests jsonb
+/// (SCH-T300-04).
+pub fn check_udt_fields_ddl_allowed(
+    mode: DeploymentMode,
+    keyspace: &str,
+    name: &str,
+    fields: &[(String, CqlType)],
+) -> crate::Result<()> {
+    if jsonb_ddl_permitted(mode).is_ok() {
+        return Ok(());
+    }
+    let has = fields.iter().any(|(_, t)| cql_contains_jsonb(t));
+    gate(mode, format!("type {keyspace}.{name}"), has)
+}
+
+/// `keyspace.table` of every non-system table that holds jsonb, directly or
+/// through a UDT: what the leaving-standalone refusal names (SCH-T300-05).
+pub fn tables_with_jsonb<'a>(
+    tables: impl IntoIterator<Item = &'a TableMetadata>,
+    types: &TypeMap,
+) -> crate::Result<Vec<String>> {
+    let mut named = Vec::new();
+    for table in tables.into_iter().filter(|t| !t.is_system) {
+        let tys: Vec<&str> = table
+            .columns
+            .values()
+            .map(|c| c.column_type.as_str())
+            .collect();
+        if any_jsonb(&tys, &table.keyspace, types)? {
+            named.push(format!("{}.{}", table.keyspace, table.name));
+        }
+    }
+    Ok(named)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jsonb_ddl_permitted_only_standalone_unit() {
+        assert!(jsonb_ddl_permitted(DeploymentMode::Standalone).is_ok());
+        for mode in [
+            DeploymentMode::Pair,
+            DeploymentMode::Forming,
+            DeploymentMode::Cluster,
+            DeploymentMode::DegradedPair,
+            DeploymentMode::DegradedCluster,
+        ] {
+            let e = jsonb_ddl_permitted(mode).expect_err("refused");
+            assert_eq!(e.mode, mode);
+            assert!(e.to_string().contains("D15a"));
+        }
+    }
 
     #[test]
     fn reader_parses_nested_generics_and_dimension() {

@@ -2056,6 +2056,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         registry.clone(),
     );
 
+    // T-300 (D24, D15a): jsonb columns are allowed on a standalone node only
+    // until the capability ledger lands. A node that will not stay standalone
+    // (seeds configured, or a former cluster member) and whose persisted
+    // schema holds jsonb must not start: FATAL, naming the tables. There is
+    // no flag to bypass this.
+    if let Err(refused) = mode_controller.check_startup_jsonb() {
+        tracing::error!(%refused, "FATAL: persisted schema holds jsonb columns outside standalone mode");
+        return Err(refused.into());
+    }
+
     // OpenRaft starts only after the controller exists. Install supervision
     // now so a panic can atomically close readiness and CQL data admission
     // while the process remains responsive for diagnosis.

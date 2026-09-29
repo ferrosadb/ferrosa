@@ -63,3 +63,14 @@ aspirations.
 | SCH-T154a-03 | A replicated or reloaded schema (`apply_snapshot`, Raft apply, disk load) carries a jsonb key | A bad schema loaded silently, or its bad table skipped | 9 | 2 | 2 | 36 | `apply_snapshot` checks the whole snapshot before applying any of it and returns the typed error; the Raft apply already surfaces `create_table_internal` errors loudly. |
 | SCH-T154a-04 | A column type string the checker cannot read is treated as clean | The rule silently not applied | 8 | 2 | 2 | 32 | An unparseable type is `SchemaError::InvalidSchema`, never skipped. |
 | SCH-T154a-05 | ALTER TYPE ADD FIELD jsonb on a UDT a key already uses | jsonb enters a key through the UDT (D21) | 8 | 2 | 3 | 48 | `alter_type_add_field` re-checks every key column against the changed type map and refuses; a jsonb-nesting field type is refused too. |
+
+## T-300 interim jsonb DDL gate (D24, D15a, FM-23)
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| SCH-T300-01 | A new `DeploymentMode` is added and silently permits jsonb DDL | jsonb replicated without the capability ledger | 9 | 2 | 1 | 18 | `jsonb_ddl_permitted` and `mode_slot` are exhaustive matches with no wildcard: a new mode does not compile until decided. |
+| SCH-T300-02 | jsonb DDL reaches a non-standalone node by a path that skips the entry check (replicated apply, Raft apply, authed and internal create/alter, snapshot apply) | A node without the ledger holds jsonb | 9 | 3 | 2 | 54 | The gate runs at entry (`check_create_table_jsonb`, `check_alter_table_jsonb`, `check_create_type_jsonb`) and again in `create_table[_internal]`, `alter_table[_internal]`, `create_type_internal`, `alter_type_add_field` and `apply_snapshot` (whole snapshot, tables and types, before any of it applies). One WARN and one `jsonb_ddl_refused_total{mode}` tick per refusal. `tests/jsonb_ddl_gate.rs`. |
+| SCH-T300-03 | An unparseable column type is treated as not-jsonb by the gate | The gate silently not applied | 8 | 2 | 2 | 32 | `any_jsonb` returns `InvalidSchema`; never skipped. |
+| SCH-T300-04 | A UDT field that is or nests jsonb, or a column typed by such a UDT, slips past | Nested jsonb outside standalone | 8 | 2 | 2 | 32 | `check_udt_fields_ddl_allowed` on CREATE TYPE / ALTER TYPE ADD; column types resolve UDTs through the type map. |
+| SCH-T300-05 | A node leaves standalone while jsonb columns exist | Cluster with jsonb and no ledger | 9 | 2 | 2 | 36 | `tables_with_jsonb` names the tables; the cluster controller refuses the transition and the process refuses to start (see ferrosa-cluster). |
+| SCH-T300-06 | The scan for jsonb tables fails and is read as "none" | Departure allowed with jsonb present | 9 | 1 | 2 | 18 | `tables_with_jsonb` returns the error; the controller treats it as a refusal (fail closed). |

@@ -3634,3 +3634,158 @@ async fn an_inbound_peer_is_registered_in_the_raft_node_map() {
          is 'registration pending' forever: {map:?}"
     );
 }
+
+// ---- T-300: leaving standalone is refused while jsonb columns exist ----
+
+fn jsonb_test_table(name: &str, ty: &str) -> ferrosa_schema::TableMetadata {
+    use ferrosa_schema::{ClusteringOrder, ColumnKind, ColumnMetadata, TableMetadata, TableParams};
+    let col = |n: &str, kind: ColumnKind, t: &str| ColumnMetadata {
+        name: n.to_string(),
+        kind,
+        position: 0,
+        column_type: t.to_string(),
+        clustering_order: ClusteringOrder::None,
+        mask: None,
+    };
+    let mut columns = indexmap::IndexMap::new();
+    columns.insert("pk".to_string(), col("pk", ColumnKind::PartitionKey, "int"));
+    columns.insert("v".to_string(), col("v", ColumnKind::Regular, ty));
+    TableMetadata {
+        keyspace: "jk".to_string(),
+        name: name.to_string(),
+        id: Uuid::new_v4(),
+        columns,
+        partition_key: vec!["pk".to_string()],
+        clustering_key: vec![],
+        params: TableParams::default(),
+        flags: std::collections::HashSet::new(),
+        extensions: HashMap::new(),
+        is_system: false,
+    }
+}
+
+fn jsonb_controller(
+    net_config: NetConfig,
+) -> (Arc<ModeController>, Arc<Schema>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = test_schema();
+    schema
+        .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+            name: "jk".to_string(),
+            durable_writes: true,
+            replication: ferrosa_schema::ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: HashMap::from([("replication_factor".into(), "1".into())]),
+            },
+        })
+        .unwrap();
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        Arc::new(net_config),
+        Uuid::new_v4(),
+        test_storage(dir.path()),
+        schema.clone(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    (controller, schema, dir)
+}
+
+fn jsonb_refusing(controller: &ModeController) -> bool {
+    controller
+        .jsonb_gate_refusing
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[test]
+fn leaving_standalone_refused_while_jsonb_exists() {
+    let (controller, schema, _dir) = jsonb_controller(NetConfig::default());
+    schema
+        .create_table_internal(jsonb_test_table("plain", "int"))
+        .unwrap();
+    // No jsonb: the check passes and the transition proceeds.
+    assert!(controller
+        .check_leaving_standalone(DeploymentMode::Pair)
+        .is_ok());
+    schema
+        .create_table_internal(jsonb_test_table("docs", "jsonb"))
+        .unwrap();
+    for target in [DeploymentMode::Pair, DeploymentMode::Cluster] {
+        let refused = controller
+            .check_leaving_standalone(target)
+            .expect_err("refused while jsonb exists");
+        let text = refused.to_string();
+        assert!(text.contains("jk.docs") && text.contains("D15a"), "{text}");
+        assert!(!text.contains("jk.plain"), "{text}");
+        assert!(!controller.try_transition_mode(target), "{target}");
+        assert_eq!(controller.mode(), DeploymentMode::Standalone);
+    }
+    // The entry guards refuse before touching any write path: the refusal
+    // flag is set by the guard, which runs before the peer-manager check.
+    let peer: SocketAddr = "127.0.0.1:7100".parse().unwrap();
+    for entry in 0..3 {
+        controller
+            .jsonb_gate_refusing
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        match entry {
+            0 => controller.transition_to_pair(Uuid::new_v4(), peer, false),
+            1 => controller.transition_to_cluster(vec![(Uuid::new_v4(), peer)]),
+            _ => controller.transition_to_forming(vec![(Uuid::new_v4(), peer)]),
+        }
+        assert!(
+            jsonb_refusing(&controller),
+            "entry {entry} must consult the gate"
+        );
+        assert_eq!(controller.mode(), DeploymentMode::Standalone);
+    }
+}
+
+#[test]
+fn leaving_standalone_proceeds_without_jsonb_and_the_edge_recovers() {
+    let (controller, schema, _dir) = jsonb_controller(NetConfig::default());
+    schema
+        .create_table_internal(jsonb_test_table("docs", "jsonb"))
+        .unwrap();
+    assert!(!controller.try_transition_mode(DeploymentMode::Pair));
+    assert!(jsonb_refusing(&controller));
+    schema.drop_table_internal("jk", "docs").unwrap();
+    assert!(controller.try_transition_mode(DeploymentMode::Pair));
+    assert!(!jsonb_refusing(&controller), "recovery clears the edge");
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+}
+
+#[test]
+fn startup_with_jsonb_outside_standalone_is_refused_naming_tables() {
+    // Seeds configured: the node will leave standalone.
+    let seeded = NetConfig {
+        seeds: vec!["127.0.0.1:7000".parse().unwrap()],
+        ..NetConfig::default()
+    };
+    let (controller, schema, _dir) = jsonb_controller(seeded);
+    controller.check_startup_jsonb().expect("no jsonb yet");
+    schema
+        .create_table_internal(jsonb_test_table("docs", "list<jsonb>"))
+        .unwrap();
+    let refused = controller.check_startup_jsonb().expect_err("fatal");
+    assert!(refused.to_string().contains("jk.docs"), "{refused}");
+
+    // No seeds, standalone: fine even with jsonb.
+    let (alone, schema, _dir2) = jsonb_controller(NetConfig::default());
+    schema
+        .create_table_internal(jsonb_test_table("docs", "jsonb"))
+        .unwrap();
+    alone.check_startup_jsonb().expect("standalone with jsonb");
+    // A node that restarts as a former cluster member is not standalone.
+    alone.set_mode_for_test(DeploymentMode::DegradedCluster);
+    let refused = alone.check_startup_jsonb().expect_err("fatal");
+    assert!(refused.to_string().contains("jk.docs"), "{refused}");
+}
+
+#[test]
+fn schema_sees_every_controller_mode_change_at_once() {
+    let (controller, schema, _dir) = jsonb_controller(NetConfig::default());
+    assert!(controller.try_transition_mode(DeploymentMode::Pair));
+    let refused = schema
+        .create_table_internal(jsonb_test_table("late", "jsonb"))
+        .expect_err("a pair node refuses replicated jsonb DDL");
+    assert!(refused.to_string().contains("D15a"), "{refused}");
+}

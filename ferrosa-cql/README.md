@@ -346,3 +346,10 @@ jsonb has no CQL literal binding yet: `term_to_cql_value` refuses every literal 
 key and `set<jsonb>`, `map<jsonb, _>`, `vector<jsonb, n>` as InvalidRequest
 (0x2200), naming the column and the rule. The check runs before the direct,
 pair or Raft path sees the statement.
+
+### jsonb DDL is standalone-only for now (T-300)
+
+`CREATE TABLE`, `ALTER TABLE ADD`, `CREATE TYPE` and `ALTER TYPE ADD` that
+create or add a jsonb column or field (top level, nested, or through a UDT) are
+InvalidRequest (0x2200) on a node that is not standalone. The message names the
+mode and says the capability ledger (D15a) is required; there is no bypass.

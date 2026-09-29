@@ -264,6 +264,13 @@ early acknowledgement.
   reporting healthy on `/readyz`, so an unpinned stack can hand you a node that
   looks up but serves nothing.
 - `rebalance.rs` — token-skew rebalancing with data streaming.
+- `controller/jsonb_gate.rs` (T-300, D24) — while any table holds jsonb, a
+  standalone node may not move to Pair, Forming or Cluster: the transition entry
+  points and `try_transition_mode` refuse, naming the tables and the D15a
+  ledger. `check_startup_jsonb` lets `main` fail startup for a non-standalone or
+  seeded node whose schema holds jsonb. The controller's mode cell is shared
+  with `Schema`, so the schema's DDL gate always sees the live mode. No flag
+  bypasses it; T-154b replaces it with the ledger.
 
 ### Repair & hints (`repair/`, `hints/`)
 - `repair/merkle.rs` — depth-15 Merkle trees (32 768 leaves), content-aware

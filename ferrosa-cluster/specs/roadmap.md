@@ -11,6 +11,11 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
 
+- **Interim jsonb gate on leaving standalone (T-300, D24).** Transitions out of
+  standalone and non-standalone startup are refused while jsonb columns exist.
+  Follow-ups: show the refusal on `/readyz` (`jsonb_gate_refusing()` is the
+  hook); T-154b replaces the mode rule with the ledger and removes this gate.
+
 - **Wide-partition scan / write lane isolation (CL-17, t_82052066).** Remote
   unbounded partition pages now use `Lane::Bulk`, leaving `Lane::Data` for
   bounded reads and mutation fan-out. Unit tests pin the classification and a
