@@ -47,6 +47,9 @@ pub const AUDIT_CRATES: &[&str] = &[
     "ferrosa-schema",
     "ferrosa-view",
     "ferrosa-cdc",
+    // Parses and encodes documents up to the 256 MiB read ceiling and serves
+    // set-returning-function cursors, so it owns query-sized paths (jsonb D14).
+    "ferrosa-jsonb",
 ];
 
 /// Workspace members deliberately outside the audit, each paired with the
