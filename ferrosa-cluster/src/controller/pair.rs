@@ -178,8 +178,14 @@ impl ModeController {
             let pm = peer_manager.clone();
             let net_cfg = self.net_config.clone();
             let local_id = self.local_host_id;
-            let internode_port = self.net_config.bind_addr.port();
-            let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+            // Already the peer's internode address (`on_inbound_peer` passes
+            // its resolved reverse address). Never `peer_addr.ip()` + our own
+            // port: co-located nodes on distinct ports would dial themselves
+            // (t_7c01df7e).
+            let reverse_addr = peer_addr;
+            if !self.admit_dial_target(peer_host_id, reverse_addr) {
+                return;
+            }
             let raft_rt = self.raft_runtime.get().cloned();
             let data_rt = self.data_runtime.get().cloned();
             self.spawn_tracked(async move {

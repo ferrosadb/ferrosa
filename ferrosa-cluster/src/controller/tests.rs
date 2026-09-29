@@ -347,6 +347,237 @@ async fn second_peer_transitions_to_cluster() {
     assert_eq!(controller.mode(), DeploymentMode::Cluster);
 }
 
+/// A node listening where co-located node3 does in the t_7c01df7e layout.
+fn co_located_net_config() -> Arc<NetConfig> {
+    Arc::new(NetConfig {
+        bind_addr: "127.0.0.1:29200".parse().unwrap(),
+        broadcast_addr: "127.0.0.1:29200".parse().unwrap(),
+        ..NetConfig::default()
+    })
+}
+
+/// t_7c01df7e, pair path: an inbound peer that advertised its internode
+/// address is remembered -- and reverse-dialled -- at THAT address, not at the
+/// ephemeral source port it connected from, and not at its IP plus our port
+/// (which, co-located, is ourselves).
+#[tokio::test]
+async fn pair_mode_reaches_an_inbound_peer_at_its_advertised_internode_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let net_config = co_located_net_config();
+    let local_id = Uuid::from_u128(3);
+    let peer_id = Uuid::from_u128(1);
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net_config.clone(),
+        local_id,
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    let ephemeral: SocketAddr = "127.0.0.1:49171".parse().unwrap();
+    controller.on_inbound_peer((peer_id, ephemeral), None, Some("127.0.0.1:29000".into()));
+
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+    let pair_addr = controller
+        .pair_context
+        .lock()
+        .as_ref()
+        .map(|ctx| ctx.peer_addr)
+        .expect("pair context");
+    assert_eq!(pair_addr, "127.0.0.1:29000".parse::<SocketAddr>().unwrap());
+}
+
+/// t_7c01df7e, cluster path: forming the cluster keeps each peer's own
+/// internode port in the ring instead of rewriting every peer to ours.
+#[tokio::test]
+async fn cluster_formation_keeps_each_co_located_peers_own_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let net_config = co_located_net_config();
+    let local_id = Uuid::from_u128(3);
+    let (peer1_id, peer2_id) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig {
+            raft_data_dir: Some(dir.path().join("raft")),
+            ..ClusterConfig::default()
+        }),
+        net_config.clone(),
+        local_id,
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    controller.on_peer_connected((peer1_id, "127.0.0.1:29000".parse().unwrap()));
+    controller.on_peer_connected((peer2_id, "127.0.0.1:29100".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    let ring = controller.token_ring().expect("ring after formation");
+    for (peer, expected) in [(peer1_id, "127.0.0.1:29000"), (peer2_id, "127.0.0.1:29100")] {
+        let info = ring
+            .get_node(crate::raft::uuid_to_node_id(peer))
+            .unwrap_or_else(|| panic!("{peer} missing from the ring"));
+        assert_eq!(info.addr, expected, "{peer}");
+    }
+}
+
+/// A controller on 127.0.0.1:`own_port` with a peer manager, for the
+/// formation property tests below.
+fn co_located_controller(
+    dir: &std::path::Path,
+    own_port: u16,
+    local_id: Uuid,
+) -> Arc<ModeController> {
+    let addr: SocketAddr = format!("127.0.0.1:{own_port}").parse().unwrap();
+    let net_config = Arc::new(NetConfig {
+        bind_addr: addr,
+        broadcast_addr: addr,
+        ..NetConfig::default()
+    });
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig {
+            raft_data_dir: Some(dir.join("raft")),
+            ..ClusterConfig::default()
+        }),
+        net_config.clone(),
+        local_id,
+        test_storage(dir),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+    controller
+}
+
+/// Three distinct loopback ports, kept to 45000..46000 so a generated dial
+/// never reaches a real listener such as a native cluster on 17000.
+fn co_located_ports() -> impl Strategy<Value = (u16, u16, u16)> {
+    (45000u16..46000, 45000u16..46000, 45000u16..46000)
+        .prop_filter("distinct ports", |(a, b, c)| a != b && b != c && a != c)
+}
+
+fn on_runtime<F: std::future::Future<Output = ()>>(f: F) {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(8))]
+
+    /// Pair path (t_7c01df7e): over generated co-located layouts, an inbound
+    /// peer that advertised its internode address is reverse-dialled THERE --
+    /// never at its ephemeral source port, never at its IP plus our port.
+    #[test]
+    fn pair_formation_dials_the_advertised_address_on_any_co_located_layout(
+        (own_port, peer_port, ephemeral) in co_located_ports(),
+    ) {
+        on_runtime(async move {
+            let dir = tempfile::tempdir().unwrap();
+            let peer = Uuid::from_u128(1);
+            let controller = co_located_controller(dir.path(), own_port, Uuid::from_u128(3));
+            let advertised: SocketAddr = format!("127.0.0.1:{peer_port}").parse().unwrap();
+            controller.on_inbound_peer(
+                (peer, format!("127.0.0.1:{ephemeral}").parse().unwrap()),
+                None,
+                Some(advertised.to_string()),
+            );
+            assert_eq!(controller.mode(), DeploymentMode::Pair);
+            assert_eq!(controller.dial_target(peer), Some(advertised));
+        });
+    }
+
+    /// Cluster path (t_7c01df7e): over generated co-located layouts, forming
+    /// the cluster reverse-dials and records every peer at its own port.
+    #[test]
+    fn cluster_formation_dials_each_peer_at_its_own_port_on_any_co_located_layout(
+        (own_port, p1_port, p2_port) in co_located_ports(),
+    ) {
+        on_runtime(async move {
+            let dir = tempfile::tempdir().unwrap();
+            let controller = co_located_controller(dir.path(), own_port, Uuid::from_u128(3));
+            let peers = [
+                (Uuid::from_u128(1), format!("127.0.0.1:{p1_port}").parse::<SocketAddr>().unwrap()),
+                (Uuid::from_u128(2), format!("127.0.0.1:{p2_port}").parse::<SocketAddr>().unwrap()),
+            ];
+            for peer in peers {
+                controller.on_peer_connected(peer);
+            }
+            assert_eq!(controller.mode(), DeploymentMode::Cluster);
+            let ring = controller.token_ring().expect("ring after formation");
+            for (peer, addr) in peers {
+                assert_eq!(controller.dial_target(peer), Some(addr), "{peer} dial");
+                let info = ring.get_node(crate::raft::uuid_to_node_id(peer)).expect("in ring");
+                assert_eq!(info.addr, addr.to_string(), "{peer} ring");
+            }
+        });
+    }
+
+    /// Invite path (t_7c01df7e): over generated co-located layouts, a
+    /// `ClusterInvite` naming a peer makes this node dial that peer's own
+    /// address, through the real handler.
+    #[test]
+    fn invite_handler_dials_the_invited_address_on_any_co_located_layout(
+        (own_port, peer_port, initiator_port) in co_located_ports(),
+    ) {
+        on_runtime(async move {
+            let dir = tempfile::tempdir().unwrap();
+            let local = Uuid::from_u128(3);
+            let controller = co_located_controller(dir.path(), own_port, local);
+            // Already a cluster member, so the invite only dials its peers and
+            // does not also start a cluster transition -- whose own reverse
+            // dials would record the peer too and hide a wrong invite dial.
+            controller.mode.store(Arc::new(DeploymentMode::Cluster));
+            let pm = controller.peer_manager.load().as_ref().clone().expect("peer manager");
+            let handler = super::cluster::ClusterInviteHandler::new(
+                local,
+                pm,
+                controller.net_config.clone(),
+                Arc::downgrade(&controller),
+            );
+            let peer = Uuid::from_u128(1);
+            let invited: SocketAddr = format!("127.0.0.1:{peer_port}").parse().unwrap();
+            let initiator = Uuid::from_u128(2);
+            let from_addr: SocketAddr = format!("127.0.0.1:{initiator_port}").parse().unwrap();
+            handler
+                .handle(
+                    (initiator, from_addr),
+                    Message::ClusterInvite { initiator, peers: vec![(peer, invited)] },
+                )
+                .await;
+            assert_eq!(controller.dial_target(peer), Some(invited));
+        });
+    }
+}
+
+/// A formation path that computes our own address for another peer is
+/// refused at the one place every dial passes through.
+#[test]
+fn a_dial_to_our_own_address_on_another_peers_behalf_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = co_located_controller(dir.path(), 45999, Uuid::from_u128(3));
+    let own: SocketAddr = "127.0.0.1:45999".parse().unwrap();
+    assert!(!controller.admit_dial_target(Uuid::from_u128(1), own));
+    assert_eq!(controller.dial_target(Uuid::from_u128(1)), None);
+    assert!(controller.admit_dial_target(Uuid::from_u128(1), "127.0.0.1:45000".parse().unwrap()));
+}
+
 #[test]
 fn connected_peers_tracked_and_cleared() {
     let dir = tempfile::tempdir().unwrap();
@@ -451,56 +682,43 @@ async fn raft_initializes_on_third_peer() {
     assert_eq!(controller.mode(), DeploymentMode::Cluster);
 }
 
-#[tokio::test]
-async fn transition_to_cluster_normalizes_ephemeral_peer_ports_before_seeding_ring() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let storage = test_storage(dir.path());
-    let schema = test_schema();
-    let config = Arc::new(ClusterConfig {
-        raft_data_dir: Some(dir.path().join("raft")),
-        ..ClusterConfig::default()
-    });
-    let net_config = Arc::new(NetConfig::default());
-    let local_id = Uuid::new_v4();
-    let peer1_id = Uuid::new_v4();
-    let peer2_id = Uuid::new_v4();
-
-    let registry = Arc::new(HandlerRegistry::new());
-    let (controller, _handles) = ModeController::new(
-        config,
-        net_config.clone(),
-        local_id,
-        storage,
-        schema,
-        registry,
+/// The one place an ephemeral port reached cluster formation: a
+/// `ClusterInvite`'s initiator was recorded at the RPC sender's address,
+/// whose port is the source port of its connection. It used to be repaired by
+/// rewriting EVERY peer to its IP plus our port inside `transition_to_cluster`,
+/// which is also what put co-located peers at our own address (t_7c01df7e).
+/// The initiator is now resolved where it enters.
+#[test]
+fn invite_initiator_is_recorded_at_its_known_internode_address() {
+    let observed: SocketAddr = "10.89.1.53:50318".parse().unwrap();
+    assert_eq!(
+        super::cluster::plan_invite_initiator_addr(Some("10.89.1.53:17000"), None, observed, 17000),
+        ("10.89.1.53:17000".parse().unwrap(), false)
     );
+    assert_eq!(
+        super::cluster::plan_invite_initiator_addr(
+            Some("127.0.0.1:29000"),
+            None,
+            "127.0.0.1:49171".parse().unwrap(),
+            29200,
+        ),
+        ("127.0.0.1:29000".parse().unwrap(), false),
+        "co-located: the known address, never ours"
+    );
+}
 
-    let pm = Arc::new(PeerManager::new(
-        net_config.clone(),
-        local_id,
-        controller.clone(),
-    ));
-    controller.set_peer_manager(pm);
-
-    controller.transition_to_cluster(vec![
-        (peer1_id, "10.89.1.53:50318".parse().unwrap()),
-        (peer2_id, "10.89.1.54:50319".parse().unwrap()),
-    ]);
-
-    let ring = controller
-        .token_ring()
-        .expect("cluster transition should publish a token ring snapshot");
-
-    let peer1 = ring
-        .get_node(uuid_to_node_id(peer1_id))
-        .expect("peer1 should be seeded into the initial ring");
-    let peer2 = ring
-        .get_node(uuid_to_node_id(peer2_id))
-        .expect("peer2 should be seeded into the initial ring");
-
-    assert_eq!(peer1.addr, "10.89.1.53:17000");
-    assert_eq!(peer2.addr, "10.89.1.54:17000");
+#[test]
+fn invite_initiator_falls_back_to_its_advertised_address_then_to_our_port_loudly() {
+    let observed: SocketAddr = "127.0.0.1:49171".parse().unwrap();
+    assert_eq!(
+        super::cluster::plan_invite_initiator_addr(None, Some("127.0.0.1:29000"), observed, 29200),
+        ("127.0.0.1:29000".parse().unwrap(), false)
+    );
+    // Nothing known: the old assumption, flagged so the caller warns.
+    assert_eq!(
+        super::cluster::plan_invite_initiator_addr(None, None, observed, 29200),
+        ("127.0.0.1:29200".parse().unwrap(), true)
+    );
 }
 
 #[test]
@@ -651,17 +869,99 @@ fn reconnect_invite_plan_returns_none_when_no_peer_addresses_available() {
     );
 }
 
+/// t_7c01df7e: co-located nodes listen on different internode ports. An
+/// invite naming node1 at 127.0.0.1:29000, received by node3 listening on
+/// :29200, must dial :29000. Rebuilding the address from node3's own port
+/// dialled node3 itself and filed that pool under node1's host id, so a range
+/// read "to node1" landed on node3's own handler, its reply to node3's own id
+/// failed "unknown peer", and the read idled out after 30 s.
+#[test]
+fn cluster_invite_dials_the_peers_own_port_not_ours() {
+    let node3 = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+    let node1 = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+
+    let plan = super::cluster::plan_invite_peer_connection(
+        node3,
+        node1,
+        "127.0.0.1:29000".parse().unwrap(),
+        None,
+        false,
+    );
+
+    assert_eq!(
+        plan,
+        super::cluster::InvitePeerConnectionPlan::Connect {
+            reverse_addr: "127.0.0.1:29000".parse().unwrap(),
+            previous_addr: None,
+        }
+    );
+}
+
+/// Cross-host peers that share one internode port (the container layout the
+/// old port substitution was written for) still dial the peer's own host, not
+/// ours: no regression for the case that used to work.
+#[test]
+fn cluster_invite_dials_a_cross_host_peer_on_the_shared_port() {
+    let local = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+    let peer = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+    let invited: std::net::SocketAddr = "10.89.1.14:7000".parse().unwrap();
+
+    let plan = super::cluster::plan_invite_peer_connection(local, peer, invited, None, false);
+
+    assert_eq!(
+        plan,
+        super::cluster::InvitePeerConnectionPlan::Connect {
+            reverse_addr: invited,
+            previous_addr: None,
+        }
+    );
+}
+
+/// One node's internode endpoint for the property below: loopback or any
+/// IPv4 address, any unprivileged port.
+fn invite_layout_endpoint() -> impl Strategy<Value = std::net::SocketAddr> {
+    (
+        prop_oneof![Just([127u8, 0, 0, 1]), any::<[u8; 4]>()],
+        1024u16..=65535,
+    )
+        .prop_map(|(ip, port)| std::net::SocketAddr::from((ip, port)))
+}
+
+proptest! {
+    /// Over generated layouts -- same host or not, same port or not -- a plan
+    /// to reach a DIFFERENT host targets exactly the address the invite named,
+    /// and so never the receiving node's own internode address unless the
+    /// peer really is at that address.
+    #[test]
+    fn cluster_invite_never_plans_a_dial_to_our_own_address_for_another_peer(
+        own in invite_layout_endpoint(),
+        invited in invite_layout_endpoint(),
+    ) {
+        let local = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let peer = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let plan = super::cluster::plan_invite_peer_connection(local, peer, invited, None, false);
+        match plan {
+            super::cluster::InvitePeerConnectionPlan::Connect { reverse_addr, .. } => {
+                prop_assert_eq!(reverse_addr, invited);
+                if invited != own {
+                    prop_assert_ne!(reverse_addr, own);
+                }
+            }
+            other => prop_assert!(false, "expected a connection plan, got {:?}", other),
+        }
+    }
+}
+
 #[test]
 fn cluster_invite_keeps_live_peer_when_payload_advertises_older_address() {
     let local = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
     let peer = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
-    let stale_invite_addr = "10.89.1.14:9042".parse().unwrap();
+    let stale_invite_addr = "10.89.1.14:7000".parse().unwrap();
 
     let plan = super::cluster::plan_invite_peer_connection(
         local,
         peer,
         stale_invite_addr,
-        7000,
         Some("10.89.1.17:7000"),
         true,
     );

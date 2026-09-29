@@ -248,6 +248,12 @@ pub struct ModeController {
     /// `CLUSTER_RECONNECT_INVITE_COOLDOWN` as delivery so a vanished peer is
     /// retried at most once per cooldown instead of unboundedly.
     pub(super) recent_invite_connects: Mutex<BTreeMap<Uuid, std::time::Instant>>,
+    /// The address each formation path last chose to dial for a peer (the
+    /// invite handler, the pair reverse dial, the pair -> cluster reverse
+    /// dials). Every one goes through [`Self::admit_dial_target`], which is
+    /// where a dial to our own address on another peer's behalf is refused
+    /// (t_7c01df7e). Bounded by `MAX_CONNECTED_PEERS`.
+    pub(super) dial_targets: Mutex<BTreeMap<Uuid, SocketAddr>>,
     /// Tracks all spawned background tasks. Replaces fire-and-forget spawns
     /// so panics are detected and tasks can be cancelled on shutdown.
     pub(super) background_tasks: Mutex<tokio::task::JoinSet<()>>,
@@ -441,6 +447,7 @@ impl ModeController {
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
             recent_invite_connects: Mutex::new(BTreeMap::new()),
+            dial_targets: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
@@ -559,6 +566,7 @@ impl ModeController {
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
             recent_invite_connects: Mutex::new(BTreeMap::new()),
+            dial_targets: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
@@ -628,6 +636,7 @@ impl ModeController {
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
             recent_invite_connects: Mutex::new(BTreeMap::new()),
+            dial_targets: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
@@ -978,6 +987,40 @@ impl ModeController {
             "operator override: setting mode outside the state machine"
         );
         self.mode.store(Arc::new(target));
+    }
+
+    /// Admit `addr` as the address to dial for `peer`, or refuse it.
+    ///
+    /// Refused when it is this node's own internode address and `peer` is
+    /// not this node: that connection would reach ourselves and be filed
+    /// under the peer's host id, so a request "to the peer" lands on our own
+    /// handler and its reply to our own id fails `unknown peer`
+    /// (t_7c01df7e). Logged at ERROR, because it means a formation path
+    /// computed a wrong address.
+    pub(super) fn admit_dial_target(&self, peer: Uuid, addr: SocketAddr) -> bool {
+        let own = [self.net_config.bind_addr, self.net_config.broadcast_addr];
+        if peer != self.local_host_id && own.contains(&addr) {
+            tracing::error!(
+                %peer,
+                %addr,
+                "refusing to dial our own internode address on another peer's behalf"
+            );
+            return false;
+        }
+        let mut targets = self.dial_targets.lock();
+        if targets.len() >= MAX_CONNECTED_PEERS && !targets.contains_key(&peer) {
+            if let Some(oldest) = targets.keys().next().copied() {
+                targets.remove(&oldest);
+            }
+        }
+        targets.insert(peer, addr);
+        true
+    }
+
+    /// The address a formation path last admitted for `peer`.
+    #[cfg(test)]
+    pub(super) fn dial_target(&self, peer: Uuid) -> Option<SocketAddr> {
+        self.dial_targets.lock().get(&peer).copied()
     }
 
     pub(super) fn try_transition_mode(&self, target: DeploymentMode) -> bool {
