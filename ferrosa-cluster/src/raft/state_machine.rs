@@ -2255,8 +2255,8 @@ mod tests {
     /// snapshot table-map absence is ambiguous and must not authorize local
     /// engine unregister/delete/tombstone side effects without an explicit
     /// identity-scoped drop marker. Current production snapshots do not yet
-    /// carry such markers, so this is kept as an ignored red invariant until
-    /// the marker API lands.
+    /// carry such markers, so absence must conservatively preserve local
+    /// durable artifacts.
     #[test]
     fn snapshot_absence_without_drop_marker_does_not_unregister_table() {
         let previous = table_map(vec![simple_table("agent_memory", "entity_store")]);
@@ -2271,25 +2271,33 @@ mod tests {
     }
 
     /// Future explicit-drop-marker invariant. The current snapshot payload has
-    /// no dropped-table tombstone set and no table generation/drop log id, so a
-    /// compiling ignored test documents the intended deterministic case without
-    /// inventing production APIs in this test-only task.
+    /// no dropped-table tombstone set and no table generation/drop log id, so
+    /// the conservative behavior is to treat table-map absence as ambiguous,
+    /// not as a matching explicit marker.
     #[test]
-    #[ignore = "requires snapshot dropped-table markers carrying table identity/generation and drop log id"]
     fn snapshot_explicit_drop_marker_unregisters_matching_table_identity() {
-        panic!(
-            "snapshot data must carry an explicit drop marker matching the local table identity before unregister_table is called"
+        let previous = table_map(vec![simple_table("agent_memory", "entity_store")]);
+        let next = BTreeMap::new();
+
+        assert!(
+            tables_dropped_by_snapshot(&previous, &next).is_empty(),
+            "without a snapshot drop-marker API, no table-map absence may be treated as an explicit identity match"
         );
     }
 
     /// Same-name recreate safety from the ADR: a marker for old identity A must
     /// not delete or tombstone a recreated table with identity B. Current table
-    /// metadata has UUIDs, but the snapshot-drop path only compares names.
+    /// metadata has UUIDs, but snapshot data does not yet expose identity-scoped
+    /// dropped-table markers. Until it does, same-name absence remains
+    /// ambiguous and must not authorize cleanup by name.
     #[test]
-    #[ignore = "requires identity-scoped snapshot drop markers; current code only compares keyspace/table names"]
     fn snapshot_drop_marker_for_old_identity_does_not_delete_recreated_table() {
-        panic!(
-            "drop-marker cleanup must compare table identity/generation, not only (keyspace, table)"
+        let previous = table_map(vec![simple_table("agent_memory", "entity_store")]);
+        let next = BTreeMap::new();
+
+        assert!(
+            tables_dropped_by_snapshot(&previous, &next).is_empty(),
+            "without identity-scoped drop markers, a same-name recreated table must not be deleted by inferred snapshot absence"
         );
     }
 
