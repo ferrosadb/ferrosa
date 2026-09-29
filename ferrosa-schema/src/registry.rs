@@ -286,6 +286,7 @@ impl Schema {
     pub fn apply_snapshot(&self, snapshot: SchemaSnapshot) -> crate::Result<()> {
         let _lock = self.write_lock.lock().unwrap();
         let mut current = (**self.inner.load()).clone();
+        Self::check_snapshot_jsonb(&current, &snapshot)?;
 
         for (name, ks) in &snapshot.keyspaces {
             if is_system_keyspace(name) {
@@ -354,6 +355,50 @@ impl Schema {
         Ok(())
     }
 
+    /// Propose-side jsonb placement check for a new table (SCH-T154a-01).
+    ///
+    /// DDL entry points that hand the change to a coordinator or to Raft call
+    /// this first, so the client gets a typed refusal instead of a diverged
+    /// apply. The apply paths re-check on their own (defense in depth).
+    pub fn check_create_table_jsonb(&self, table: &TableMetadata) -> crate::Result<()> {
+        crate::jsonb_rules::check_table(table, &self.snapshot().types)
+    }
+
+    /// Propose-side jsonb placement check for ALTER TABLE ADD (SCH-T154a-02).
+    /// A missing table is not this check's error: the DDL path reports it.
+    pub fn check_alter_table_jsonb(
+        &self,
+        keyspace: &str,
+        table: &str,
+        updates: &TableUpdates,
+    ) -> crate::Result<()> {
+        let snap = self.snapshot();
+        match snap.tables.get(&(keyspace.to_string(), table.to_string())) {
+            Some(existing) => {
+                crate::jsonb_rules::check_added_columns(existing, &updates.add_columns, &snap.types)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Defense in depth (SCH-T154a-03): refuse the WHOLE snapshot, before any
+    /// of it is applied, when a table it would install violates the jsonb
+    /// placement rules. A refused snapshot is an error, never a partial load.
+    fn check_snapshot_jsonb(
+        current: &SchemaSnapshot,
+        incoming: &SchemaSnapshot,
+    ) -> crate::Result<()> {
+        let mut types = current.types.clone();
+        types.extend(incoming.types.iter().map(|(k, v)| (k.clone(), v.clone())));
+        for ((ks, _), table) in &incoming.tables {
+            if is_system_keyspace(ks) {
+                continue;
+            }
+            crate::jsonb_rules::check_table(table, &types)?;
+        }
+        Ok(())
+    }
+
     /// Set the schema snapshot version to a specific UUID.
     ///
     /// Used by the Raft state machine to apply the leader-generated version
@@ -385,6 +430,7 @@ impl Schema {
         crate::validation::validate_table(&table)?;
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
+        crate::jsonb_rules::check_table(&table, &snap.types)?;
         let key = (table.keyspace.clone(), table.name.clone());
         if snap.tables.contains_key(&key) {
             return Ok(());
@@ -454,6 +500,9 @@ impl Schema {
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (keyspace.to_string(), table.to_string());
+        if let Some(existing) = snap.tables.get(&key) {
+            crate::jsonb_rules::check_added_columns(existing, &updates.add_columns, &snap.types)?;
+        }
         let Some(tbl) = snap.tables.get_mut(&key) else {
             return Ok(());
         };
@@ -1054,6 +1103,7 @@ impl Schema {
         if snap.tables.contains_key(&key) {
             return Err(SchemaError::TableExists(table.keyspace, table.name));
         }
+        crate::jsonb_rules::check_table(&table, &snap.types)?;
         if table.extensions.keys().any(|k| k.starts_with("graph.")) {
             self.validate_graph_extensions(
                 &snap,
@@ -1112,6 +1162,11 @@ impl Schema {
         drop(snap_ref);
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
+        let existing = snap
+            .tables
+            .get(&key)
+            .ok_or_else(|| SchemaError::TableNotFound(ks.to_string(), table.to_string()))?;
+        crate::jsonb_rules::check_added_columns(existing, &updates.add_columns, &snap.types)?;
         let tbl = snap
             .tables
             .get_mut(&key)
@@ -1661,7 +1716,16 @@ impl Schema {
                 field_name.to_string(),
             ));
         }
+        ferrosa_common::cql_type::names::check_jsonb_nesting(&field_type).map_err(|rule| {
+            SchemaError::InvalidSchema(format!(
+                "field '{field_name}' of type {keyspace}.{name}: {rule}"
+            ))
+        })?;
         udt.fields.push((field_name.to_string(), field_type));
+        crate::jsonb_rules::check_key_columns(
+            snap.tables.values().filter(|t| !t.is_system),
+            &snap.types,
+        )?;
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())

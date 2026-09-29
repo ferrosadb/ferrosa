@@ -346,6 +346,38 @@ async fn pg_ddl_create_table_jsonb_is_refused_until_the_engine_type_exists() {
         .contains_key(&("public".to_string(), "j".to_string())));
 }
 
+/// T-154a (D3): jsonb in a PRIMARY KEY column is refused with `42P16`
+/// (invalid_table_definition) naming the column. Postgres accepts it; the
+/// divergence is documented (D3). Nothing is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_ddl_create_table_jsonb_primary_key_is_invalid_table_definition() {
+    let fx = start().await;
+    let statements = [
+        "CREATE TABLE k (doc jsonb PRIMARY KEY)",
+        "CREATE TABLE k (id int, doc jsonb, PRIMARY KEY (id, doc))",
+        "CREATE TABLE k (doc jsonb, v int, PRIMARY KEY (doc))",
+    ];
+    for sql in statements {
+        let error = fx
+            .client
+            .batch_execute(sql)
+            .await
+            .expect_err("jsonb key is refused");
+        let db = error.as_db_error().expect("db error");
+        assert_eq!(db.code().code(), "42P16", "{sql}: {}", db.message());
+        assert!(
+            db.message().contains("\"doc\""),
+            "names the column: {}",
+            db.message()
+        );
+    }
+    assert!(!fx
+        .schema
+        .snapshot()
+        .tables
+        .contains_key(&("public".to_string(), "k".to_string())));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_ddl_create_table_named_refusals_survive_end_to_end() {
     let fx = start().await;

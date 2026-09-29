@@ -80,3 +80,9 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 |---|---|---|---|---|---|---|---|
 | CQL-T150-01 | jsonb literal reported as a generic type mismatch, or CONTAINS silently false | Client cannot tell "unsupported" from "wrong type" | 5 | 3 | 2 | 30 | Guard at the top of `term_to_cql_value`; explicit error in the CONTAINS path. Tests: `jsonb_literals_are_a_typed_refusal_not_a_type_mismatch`. |
 | CQL-T150-02 | jsonb cell sent under type id 0x0000 with no class name | Malformed RESULT frame | 8 | 2 | 2 | 32 | `encode_type` reports varchar (D6a); cells carry JSON text. Test: `jsonb_is_reported_as_varchar_with_text_cells_d6a`. Known gap: a jsonb nested in a collection cell still carries its canonical bytes (T-170). |
+
+## T-154a jsonb placement refusal
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| CQL-T154a-01 | A jsonb placement refusal surfaces as ConfigError (0x2300) or ServerError | Client cannot tell a bad statement from a server fault | 5 | 3 | 2 | 30 | `From<SchemaError>` maps `JsonbInKey` / `JsonbNesting` to `Invalid` (0x2200) naming column and rule; `route_create_table` / `route_alter_table` check before any DDL path. |

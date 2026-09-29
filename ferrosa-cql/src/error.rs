@@ -306,6 +306,11 @@ impl From<ferrosa_schema::SchemaError> for CqlError {
                 Self::Invalid(format!("role cycle detected involving: {r}"))
             }
             SchemaError::InvalidSchema(msg) => Self::ConfigError(msg),
+            // T-154a: a jsonb placement refusal is InvalidRequest (0x2200),
+            // naming the column and the rule in the message.
+            e @ (SchemaError::JsonbInKey { .. } | SchemaError::JsonbNesting { .. }) => {
+                Self::Invalid(e.to_string())
+            }
             _ => {
                 tracing::warn!("unmapped schema error variant: {err}");
                 Self::ServerError(format!("schema error: {err}"))

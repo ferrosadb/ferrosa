@@ -53,3 +53,13 @@ aspirations.
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
 |---|---|---|---|---|---|---|---|
 | SCH-T150-01 | New CqlValue variant unhandled in initcond rendering | Compile error only | 2 | 1 | 1 | 2 | Named arm; the exhaustive match forced it. |
+
+## T-154a jsonb placement rules
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| SCH-T154a-01 | jsonb (or a type holding jsonb) accepted in a partition or clustering key on CREATE TABLE | Key bytes with no stable jsonb order (D3, FM-77) | 9 | 3 | 2 | 54 | `jsonb_rules::check_table` on `create_table`, `create_table_internal`, and the propose-side `check_create_table_jsonb`; recursive through frozen collections, tuples and UDTs. `tests/jsonb_key_rules.rs`. |
+| SCH-T154a-02 | ALTER TABLE ADD slips in set/map-key/vector of jsonb or a key-kind jsonb column | Same, after the table exists (FM-79) | 8 | 3 | 2 | 48 | `check_added_columns` in `alter_table`, `alter_table_internal`, `check_alter_table_jsonb`. A refused ALTER changes nothing. |
+| SCH-T154a-03 | A replicated or reloaded schema (`apply_snapshot`, Raft apply, disk load) carries a jsonb key | A bad schema loaded silently, or its bad table skipped | 9 | 2 | 2 | 36 | `apply_snapshot` checks the whole snapshot before applying any of it and returns the typed error; the Raft apply already surfaces `create_table_internal` errors loudly. |
+| SCH-T154a-04 | A column type string the checker cannot read is treated as clean | The rule silently not applied | 8 | 2 | 2 | 32 | An unparseable type is `SchemaError::InvalidSchema`, never skipped. |
+| SCH-T154a-05 | ALTER TYPE ADD FIELD jsonb on a UDT a key already uses | jsonb enters a key through the UDT (D21) | 8 | 2 | 3 | 48 | `alter_type_add_field` re-checks every key column against the changed type map and refuses; a jsonb-nesting field type is refused too. |

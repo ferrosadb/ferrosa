@@ -38,7 +38,16 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
   **plus** `*_internal` variants that bypass auth/audit for Raft/pair-mode
   replication. Both `drop_table` and `drop_table_internal` cascade over the
   dropped table's `SchemaSnapshot.indexes` entries (t_ae06e925).
-  `apply_snapshot` bulk-loads a snapshot (skips system keyspaces).
+  `apply_snapshot` bulk-loads a snapshot (skips system keyspaces) and
+  refuses the whole snapshot, before applying any of it, when a table breaks
+  the jsonb placement rules.
+- **jsonb placement rules** ([`jsonb_rules.rs`](src/jsonb_rules.rs), T-154a,
+  D3/D21) — jsonb is refused in partition and clustering keys (through
+  frozen collections, tuples and UDTs) and as a set element, map key or
+  vector element. One check serves `create_table[_internal]`,
+  `alter_table[_internal]`, `alter_type_add_field`, `apply_snapshot` and the
+  propose-side `check_create_table_jsonb` / `check_alter_table_jsonb`. Errors
+  are `SchemaError::JsonbInKey` and `SchemaError::JsonbNesting`.
 - **Auth / RBAC** ([`auth/`](src/auth)) — `AuthContext`, `RoleMetadata`,
   Cassandra-style `Permission` (9 variants) and `Resource` hierarchy
   (`AllKeyspaces > Keyspace > Table`, `AllRoles > Role`),

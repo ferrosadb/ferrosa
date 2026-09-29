@@ -10292,6 +10292,10 @@ async fn route_create_table(
         is_system: false,
     };
 
+    // T-154a: refuse jsonb in key positions before any path (direct, pair or
+    // Raft) sees the statement.
+    state.schema.check_create_table_jsonb(&table_meta)?;
+
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
@@ -10553,6 +10557,11 @@ async fn route_alter_table(
         drop_columns: s.drop_columns.clone(),
         extensions,
     };
+
+    // T-154a: refuse forbidden jsonb before any path sees the statement.
+    state
+        .schema
+        .check_alter_table_jsonb(ks, &s.table, &updates)?;
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
@@ -20582,6 +20591,106 @@ mod tests {
             "frozen<UDT> in list must parse, got: {:?}",
             stmt.err()
         );
+    }
+
+    /// T-154a: run `cql` (parse + route) in keyspace `ks` and return the error.
+    async fn jsonb_ddl_error(state: &SharedState, cql: &str) -> CqlError {
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let stmt = match crate::parser::parse(cql) {
+            Ok(stmt) => stmt,
+            Err(e) => return e,
+        };
+        match route(state, &ctx_ks, stmt).await {
+            Err(e) => e,
+            Ok(_) => panic!("jsonb placement must be refused: {cql}"),
+        }
+    }
+
+    async fn jsonb_ddl_setup() -> (SharedState, tempfile::TempDir) {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        (state, dir)
+    }
+
+    /// T-154a: CQL CREATE TABLE refuses jsonb in a partition or clustering
+    /// key, nested or not, as InvalidRequest (0x2200) naming column and rule.
+    #[tokio::test]
+    async fn create_table_refuses_jsonb_in_key_as_invalid_request() {
+        let (state, _dir) = jsonb_ddl_setup().await;
+        let cases = [
+            "CREATE TABLE ks.a (doc jsonb PRIMARY KEY, v int)",
+            "CREATE TABLE ks.b (k int, doc jsonb, PRIMARY KEY (k, doc))",
+            "CREATE TABLE ks.c (doc frozen<list<jsonb>> PRIMARY KEY, v int)",
+            "CREATE TABLE ks.d (k int, doc frozen<tuple<int, jsonb>>, PRIMARY KEY (k, doc))",
+        ];
+        for cql in cases {
+            let err = jsonb_ddl_error(&state, cql).await;
+            assert_eq!(err.error_code(), 0x2200, "{cql}: {err}");
+            let msg = err.to_string();
+            assert!(msg.contains("doc") && msg.contains("jsonb"), "{cql}: {msg}");
+        }
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.ok (k int PRIMARY KEY, doc jsonb)").unwrap();
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        route(&state, &ctx_ks, stmt)
+            .await
+            .expect("jsonb in a regular column is allowed");
+    }
+
+    /// T-154a: CQL ALTER TABLE ADD refuses set/map-key/vector of jsonb.
+    #[tokio::test]
+    async fn alter_table_add_refuses_forbidden_jsonb_as_invalid_request() {
+        let (state, _dir) = jsonb_ddl_setup().await;
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY)").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+        let cases = [
+            "ALTER TABLE ks.t ADD s set<jsonb>",
+            "ALTER TABLE ks.t ADD s map<jsonb, int>",
+            "ALTER TABLE ks.t ADD s vector<jsonb, 3>",
+        ];
+        for cql in cases {
+            let err = jsonb_ddl_error(&state, cql).await;
+            assert_eq!(err.error_code(), 0x2200, "{cql}: {err}");
+            assert!(err.to_string().contains("jsonb"), "{cql}: {err}");
+        }
     }
 
     /// Temporal uses CLUSTERING ORDER BY in table definition.

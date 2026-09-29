@@ -339,3 +339,10 @@ for older storage/cluster errors and logs when it is used.
 ## jsonb (T-150)
 
 jsonb has no CQL literal binding yet: `term_to_cql_value` refuses every literal into a jsonb target with a "not yet supported (T-170/T-171)" error, and `CONTAINS` over `list<jsonb>` errors instead of matching nothing. Results follow D6a: the wire type is varchar and the cell is the JSON text; `toJson` prints the document. LWT `IF` orders jsonb by D18 (T-150).
+
+### jsonb placement (T-154a)
+
+`CREATE TABLE` and `ALTER TABLE ADD` refuse jsonb in a partition or clustering
+key and `set<jsonb>`, `map<jsonb, _>`, `vector<jsonb, n>` as InvalidRequest
+(0x2200), naming the column and the rule. The check runs before the direct,
+pair or Raft path sees the statement.

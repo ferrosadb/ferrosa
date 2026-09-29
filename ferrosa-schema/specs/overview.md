@@ -106,3 +106,10 @@ A mid-layer crate: depends only on `ferrosa-common`, `ferrosa-index`,
 ## jsonb (T-150)
 
 `system_schema.aggregates` initcond rendering lists `CqlValue::Jsonb` with the other non-literal values (T-150). No schema behaviour changed.
+
+## jsonb placement rules (T-154a)
+
+`jsonb_rules.rs` reads each column's type string with a small recursive reader
+and refuses jsonb in key columns (any depth, UDTs resolved through the snapshot's
+type map) and the D21 nestings. Every schema-mutating entry point calls it, and
+`apply_snapshot` checks the whole snapshot before applying anything.

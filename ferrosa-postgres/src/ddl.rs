@@ -9,7 +9,7 @@
 //! no `pg_types` mapping is `42704`, `json`/`jsonb` is `0A000` until the engine
 //! type exists (T-150), and nothing is stored under a guessed type.
 //! Last revised: 2026-09-28
-//! Last changed: New module (T-132a).
+//! Last changed: jsonb refused in PRIMARY KEY columns, 42P16 (T-154a).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -115,6 +115,9 @@ pub(crate) async fn execute_create_table(
         Ok(table) => table,
         Err(refusal) => return vec![refusal],
     };
+    if let Err(error) = env.schema.check_create_table_jsonb(&table) {
+        return vec![schema_refusal(&error)];
+    }
     match executor.create_table(table).await {
         Ok(()) => complete(),
         // A concurrent CREATE can win between the check above and the apply.
@@ -159,6 +162,7 @@ pub(crate) fn plan_create_table(
             "CREATE TABLE without a PRIMARY KEY is not supported",
         ));
     };
+    refuse_jsonb_primary_key(stmt)?;
     let mut columns = IndexMap::new();
     for def in &stmt.columns {
         let column_type = cql_type_string(def)?;
@@ -196,6 +200,37 @@ pub(crate) fn plan_create_table(
         extensions: HashMap::new(),
         is_system: false,
     })
+}
+
+/// D3 (PG-T154a-01): jsonb cannot be in a key. Postgres accepts
+/// `doc jsonb PRIMARY KEY`; ferrosa keeps jsonb out of key bytes, so the plan
+/// is refused with `42P16` naming the column, before the general jsonb refusal
+/// (which lifts with T-300) can answer a less specific `0A000`.
+fn refuse_jsonb_primary_key(stmt: &CreateTableStmt) -> Result<(), BackendMessage> {
+    let key_jsonb = stmt.columns.iter().find(|def| {
+        matches!(def.ty, PgType::Json | PgType::Jsonb) && stmt.primary_key.contains(&def.name)
+    });
+    match key_jsonb {
+        Some(def) => Err(error_response(
+            "42P16",
+            &format!(
+                "column \"{}\" is jsonb and cannot be in the PRIMARY KEY: jsonb is allowed in non-key columns only",
+                def.name
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Map a schema-registry jsonb refusal (the propose-side check, PG-T154a-02)
+/// to its SQLSTATE: `42P16` for a key, `0A000` for a forbidden nesting.
+fn schema_refusal(error: &ferrosa_schema::SchemaError) -> BackendMessage {
+    use ferrosa_schema::SchemaError;
+    let code = match error {
+        SchemaError::JsonbInKey { .. } => "42P16",
+        _ => "0A000",
+    };
+    error_response(code, &error.to_string())
 }
 
 /// The CQL type string stored for `def`, through the one PG-name map (D10).

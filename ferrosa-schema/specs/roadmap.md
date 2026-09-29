@@ -64,3 +64,9 @@ exist in the source — the gaps below come from code review, not grep.
 ## jsonb (T-150)
 
 Done: type threading. Remaining: None for T-150.
+
+## T-154a follow-ups
+
+- T-154b: the `ferrosa.jsonb.v1` capability gate at propose and apply.
+- ALTER ... TYPE to or from jsonb is not applied by any path yet (the CQL router
+  rejects ALTER TYPE outright), so no rule exists for it here.
