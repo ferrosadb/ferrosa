@@ -22,6 +22,7 @@
 | `ferrosa-sparql` | SPARQL 1.1 endpoint (Query + Update, RDF*, property paths) | ferrosa-cluster, ferrosa-common, ferrosa-index, ferrosa-schema, ferrosa-sstable, ferrosa-storage | [README](../ferrosa-sparql/README.md) · [specs](../ferrosa-sparql/specs/) |
 | `ferrosa-sql` | Bespoke relational engine (D3, no DataFusion) backing the Postgres front-end | ferrosa-storage (external merge sort for the blocking operators' spill) | [README](../ferrosa-sql/README.md) · [specs](../ferrosa-sql/specs/) |
 | `ferrosa-jsonb` | jsonb value model — tunable ingest `Limits`, compiled read `HardCeilings`, typed errors (leaf crate, arrow-free) | none (bytes, num-bigint, thiserror) | [README](../ferrosa-jsonb/README.md) · [specs](../ferrosa-jsonb/specs/) |
+| `ferrosa-jsonb-conformance` | Dev-only, `publish = false`: differential oracle of ferrosa-jsonb against arrow-rs `parquet-variant` (tests only, no `[lib]`, no consumers; standalone workspace excluded from the root, see its README) | none (dev: ferrosa-jsonb, parquet-variant =60.0.0, proptest) | [README](../ferrosa-jsonb-conformance/README.md) · [specs](../ferrosa-jsonb-conformance/specs/) |
 | `ferrosa-udf` | User-defined functions — Wasmtime sandbox, fuel/epoch limits, AssemblyScript | ferrosa-common | [README](../ferrosa-udf/README.md) · [specs](../ferrosa-udf/specs/) |
 | `ferrosa-row-bridge` | The single canonical CQL row codec shared by both front-ends (D10) | ferrosa-common, ferrosa-schema, ferrosa-sstable | [README](../ferrosa-row-bridge/README.md) · [specs](../ferrosa-row-bridge/specs/) |
 

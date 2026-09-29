@@ -1,0 +1,24 @@
+[package]
+name = "ferrosa-jsonb-conformance"
+description = "Dev-only differential conformance of ferrosa-jsonb against arrow-rs parquet-variant (D5a: arrow stays out of ferrosa-jsonb)"
+# Not inherited from the root workspace (this crate is outside it); 0.0.0 keeps
+# the release automation's version bump out of a crate that is never published.
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/ferrosadb/ferrosa"
+publish = false
+
+# A workspace of its own (excluded from the root one). parquet-variant 60 needs
+# chrono >= 0.4.40, and the root lock's arrow-arith 53 (ferrosa-flight) does not
+# compile against it (`d.quarter()` is ambiguous), so a shared lock is impossible
+# until ferrosa-flight moves off arrow 53. Own lock, own target dir.
+[workspace]
+
+# No [lib] and no consumers: this crate exists only for its `tests/`. The
+# arrow-rs crates appear here, as dev-dependencies, and nowhere in the
+# production dependency graph.
+[dev-dependencies]
+ferrosa-jsonb = { path = "../ferrosa-jsonb" }
+parquet-variant = "=60.0.0"
+proptest = "1"
