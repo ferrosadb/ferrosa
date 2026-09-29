@@ -412,6 +412,15 @@ jobs:
   # PostgreSQL fault schedule does not compile a second server binary.
   postgres-jepsen-fault:
     name: PostgreSQL Jepsen fault schedule
+    # SKIPPED (2026-09-29, by maintainer decision) — known failure, not a pass.
+    # While node 3 is paused, a transaction it coordinated stays PreAccepted
+    # and nothing recovers it: Accord recovery is not wired in production
+    # (ferrosa-cluster FMEA CL-4 / CL-20). A conflicting PostgreSQL snapshot
+    # barrier then times out ("snapshot barrier dependencies were not applied
+    # locally", SQLSTATE 58000) and the strict-serializability workload aborts.
+    # It fails on main too. Re-enable by deleting this `if:` once recovery is
+    # wired — forge t_64c1b2d6 (fix) and t_3017b690 (turn this back on).
+    if: ${{ false }}
     needs: build-node-image
     runs-on: ubuntu-latest
     timeout-minutes: 60

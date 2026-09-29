@@ -8,6 +8,7 @@ pub mod config;
 pub mod manager;
 pub mod pending_log;
 pub mod replay;
+pub mod throttle;
 
 pub use config::{validate_s3_bucket, ObjectStoreConfig};
 pub use manager::{
