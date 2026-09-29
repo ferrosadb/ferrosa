@@ -587,3 +587,133 @@ fn a_partition_delete_survives_its_own_flush() {
 
     engine.shutdown().unwrap();
 }
+
+fn count_present(engine: &StorageEngine, table_id: &TableId, keys: &[DecoratedKey]) -> usize {
+    keys.iter()
+        .filter(|key| engine.read(table_id, key).unwrap().is_some())
+        .count()
+}
+
+#[test]
+fn restart_does_not_reduce_durable_state_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let table_a = TableId::new("durable", "table_a");
+    let table_b = TableId::new("durable", "table_b");
+    let keys_a: Vec<_> = (0..8).map(|i| make_key(&format!("a_{i}"))).collect();
+    let keys_b: Vec<_> = (0..5).map(|i| make_key(&format!("b_{i}"))).collect();
+
+    {
+        let engine = StorageEngine::new(test_engine_config(dir.path()), None).unwrap();
+        engine
+            .register_table(test_schema("durable", "table_a"))
+            .unwrap();
+        engine
+            .register_table(test_schema("durable", "table_b"))
+            .unwrap();
+        for (i, key) in keys_a.iter().enumerate() {
+            engine
+                .write(
+                    &table_a,
+                    key,
+                    make_row(b"a", 1000 + i as i64),
+                    1000 + i as i64,
+                )
+                .unwrap();
+        }
+        for (i, key) in keys_b.iter().enumerate() {
+            engine
+                .write(
+                    &table_b,
+                    key,
+                    make_row(b"b", 2000 + i as i64),
+                    2000 + i as i64,
+                )
+                .unwrap();
+        }
+        engine.flush(&table_a).unwrap();
+        engine.flush(&table_b).unwrap();
+
+        assert_eq!(count_present(&engine, &table_a, &keys_a), keys_a.len());
+        assert_eq!(count_present(&engine, &table_b, &keys_b), keys_b.len());
+    }
+
+    let (engine, pending) = StorageEngine::open(test_engine_config(dir.path()), None).unwrap();
+    engine
+        .register_table(test_schema("durable", "table_a"))
+        .unwrap();
+    engine
+        .register_table(test_schema("durable", "table_b"))
+        .unwrap();
+    engine.replay_mutations(pending).unwrap();
+
+    let after_a = count_present(&engine, &table_a, &keys_a);
+    let after_b = count_present(&engine, &table_b, &keys_b);
+    assert!(
+        after_a >= keys_a.len(),
+        "restart reduced table_a durable row count: before={}, after={after_a}",
+        keys_a.len()
+    );
+    assert!(
+        after_b >= keys_b.len(),
+        "restart reduced table_b durable row count: before={}, after={after_b}",
+        keys_b.len()
+    );
+    assert!(
+        after_a + after_b >= keys_a.len() + keys_b.len(),
+        "aggregate durable row count regressed across restart"
+    );
+}
+
+#[test]
+fn count_monotonicity_across_restart_cycles() {
+    let dir = tempfile::tempdir().unwrap();
+    let table_id = TableId::new("durable", "monotonic");
+    let mut keys = Vec::new();
+    let mut previous_count = 0usize;
+
+    for cycle in 0..3 {
+        {
+            let (engine, pending) = if cycle == 0 {
+                (
+                    StorageEngine::new(test_engine_config(dir.path()), None).unwrap(),
+                    Vec::new(),
+                )
+            } else {
+                StorageEngine::open(test_engine_config(dir.path()), None).unwrap()
+            };
+            engine
+                .register_table(test_schema("durable", "monotonic"))
+                .unwrap();
+            engine.replay_mutations(pending).unwrap();
+
+            for i in 0..4 {
+                let key = make_key(&format!("cycle_{cycle}_key_{i}"));
+                let ts = 1000 + (cycle * 10 + i) as i64;
+                engine
+                    .write(&table_id, &key, make_row(b"v", ts), ts)
+                    .unwrap();
+                keys.push(key);
+            }
+            engine.flush(&table_id).unwrap();
+
+            let count = count_present(&engine, &table_id, &keys);
+            assert!(
+                count >= previous_count,
+                "count regressed before restart in cycle {cycle}: {previous_count} -> {count}"
+            );
+            previous_count = count;
+        }
+
+        let (engine, pending) = StorageEngine::open(test_engine_config(dir.path()), None).unwrap();
+        engine
+            .register_table(test_schema("durable", "monotonic"))
+            .unwrap();
+        engine.replay_mutations(pending).unwrap();
+        let count = count_present(&engine, &table_id, &keys);
+        assert!(
+            count >= previous_count,
+            "count regressed after restart in cycle {cycle}: {previous_count} -> {count}"
+        );
+        previous_count = count;
+    }
+}

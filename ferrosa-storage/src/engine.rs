@@ -26474,6 +26474,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn degraded_index_layer_returns_error_not_empty_count() {
+        use ferrosa_index::{IndexKey, IndexType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        engine.register_table(test_schema()).unwrap();
+        engine
+            .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+            .unwrap();
+        assert_eq!(
+            collect_index_results(
+                &engine,
+                &table_id,
+                "val_idx",
+                &IndexKey(b"indexed".to_vec()),
+            )
+            .unwrap()
+            .len(),
+            1,
+            "precondition: healthy index answers the row"
+        );
+
+        engine.drop_index(&table_id, "val_idx").unwrap();
+
+        let degraded = collect_index_results(
+            &engine,
+            &table_id,
+            "val_idx",
+            &IndexKey(b"indexed".to_vec()),
+        );
+        assert!(
+            degraded.is_err(),
+            "a missing/degraded index layer must fail loudly; it must not return Ok(empty) indistinguishable from a genuine zero-count result"
+        );
+    }
+
     /// Replaying an already-applied CREATE INDEX must preserve the active
     /// memtable postings. Schema-event delivery is at-least-once, and replacing
     /// the index map here would make a just-written phonetic row disappear
@@ -26806,6 +26848,195 @@ mod tests {
         assert!(
             engine.read_persisted_indexes().unwrap().is_empty(),
             "system_schema.indexes must hold no live rows for the dropped table"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Raft snapshot drop-marker API; absence alone must be refused/quarantined before engine unregister_table"]
+    fn snapshot_absent_indexed_table_preserves_sstables_and_index_rows_without_marker() {
+        panic!(
+            "installing a snapshot that omits a local indexed table but carries no matching explicit drop marker must leave SSTables and system_schema.indexes rows intact"
+        );
+    }
+
+    #[test]
+    fn snapshot_explicit_drop_cascades_indexes_and_sstables() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        let table_dir = dir.path().join("sstables").join(table_id.to_string());
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "test_table",
+            "val_idx",
+            IndexType::BTree,
+        );
+        engine
+            .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+            .unwrap();
+        engine.flush(&table_id).unwrap();
+
+        assert!(table_dir.exists(), "precondition: table SSTable dir exists");
+        assert_eq!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .filter(|row| row.keyspace_name == "test_ks" && row.table_name == "test_table")
+                .count(),
+            1,
+            "precondition: persisted index row exists"
+        );
+
+        engine.unregister_table(&table_id).unwrap();
+
+        assert!(
+            !table_dir.exists(),
+            "a real explicit drop must remove the old table SSTable directory"
+        );
+        assert!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .all(|row| row.keyspace_name != "test_ks" || row.table_name != "test_table"),
+            "a real explicit drop must tombstone the table's system_schema.indexes rows"
+        );
+        assert!(
+            !engine.declares_index(&table_id, "val_idx"),
+            "a real explicit drop must remove live declared/registered index state"
+        );
+    }
+
+    #[test]
+    fn restart_after_ambiguous_snapshot_preserves_declared_persisted_registered_index_sets() {
+        use ferrosa_index::IndexType;
+        use std::collections::BTreeSet;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        let schema_declared: BTreeSet<String> = ["val_idx".to_string()].into_iter().collect();
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_system_tables().unwrap();
+            persist_index_row(
+                &engine,
+                "test_ks",
+                "test_table",
+                "val_idx",
+                IndexType::BTree,
+            );
+            engine
+                .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+                .unwrap();
+            engine
+                .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+                .unwrap();
+            engine.flush(&table_id).unwrap();
+            engine
+                .flush(&TableId::new("system_schema", "indexes"))
+                .unwrap();
+        }
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        engine.replay_mutations(pending).unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
+
+        let persisted: BTreeSet<String> = engine
+            .read_persisted_indexes()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.keyspace_name == "test_ks" && row.table_name == "test_table")
+            .map(|row| row.index_name)
+            .collect();
+        let declared_by_engine: BTreeSet<String> = schema_declared
+            .iter()
+            .filter(|name| engine.declares_index(&table_id, name))
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            persisted, schema_declared,
+            "persisted system_schema.indexes rows must match schema-declared indexes"
+        );
+        assert_eq!(
+            declared_by_engine, schema_declared,
+            "engine-declared/registered indexes must match schema-declared indexes"
+        );
+        assert_eq!(
+            outcome.restored,
+            schema_declared.len(),
+            "reload outcome must prove persisted index rows were restored, not silently empty"
+        );
+        assert_eq!(outcome.skipped, 0);
+    }
+
+    #[test]
+    fn restart_after_real_drop_has_no_orphaned_index_rows() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_system_tables().unwrap();
+            persist_index_row(
+                &engine,
+                "test_ks",
+                "test_table",
+                "val_idx",
+                IndexType::BTree,
+            );
+            engine
+                .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+                .unwrap();
+            engine.unregister_table(&table_id).unwrap();
+        }
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        assert!(
+            !pending.is_empty(),
+            "test must replay both index registration and explicit-drop tombstone mutations"
+        );
+        engine.replay_mutations(pending).unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
+
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.restored, 0);
+        assert!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .all(|row| row.keyspace_name != "test_ks" || row.table_name != "test_table"),
+            "real drop must leave no orphaned persisted index rows after restart"
+        );
+        assert!(
+            !engine.declares_index(&table_id, "val_idx"),
+            "real drop must leave no registered index declaration after restart"
         );
     }
 

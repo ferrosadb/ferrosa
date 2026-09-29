@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c63efd696a40efe883ac32c75de4ac8a1b8840aa9b5d34e046c269c87927ad2e # shrinks to (previous, incoming) = ([GeneratedTableIdentity { name: GeneratedTableName { keyspace: "agent_memory", table: "entity_store" }, generation: 0 }], [])
+cc e121cc0d447ce1b55d0f53c644499e640832d7290dd04011e2e77ce2a426b126 # shrinks to (new_identity, stale_marker, snapshot_log_index) = (GeneratedTableIdentity { name: GeneratedTableName { keyspace: "agent_memory", table: "entity_store" }, generation: 0 }, GeneratedDropMarker { identity: GeneratedTableIdentity { name: GeneratedTableName { keyspace: "agent_memory", table: "entity_store" }, generation: 1 }, drop_log_index: 0 }, 0)
+cc 66d020fd2b2bbf94068f10497fad4f2f0d682a2bedff1dab4d4b137317032ada # shrinks to (previous, incoming, markers, persisted_indexes, snapshot_log_index) = ([GeneratedTableIdentity { name: GeneratedTableName { keyspace: "agent_memory", table: "entity_store" }, generation: 0 }], [], [], [GeneratedIndexDeclaration { table: GeneratedTableIdentity { name: GeneratedTableName { keyspace: "agent_memory", table: "entity_store" }, generation: 0 }, index: "idx_by_id" }], 0)
+cc 299f5324a83a6132128027d6e088d1fce38f705f82e104768525b525bc921fc4 # shrinks to (previous, incoming, markers, snapshot_log_index) = ([GeneratedTableIdentity { name: GeneratedTableName { keyspace: "agent_memory", table: "entity_store" }, generation: 0 }], [], [], 0)
