@@ -73,7 +73,7 @@ fn should_refresh_peer_pool(err: &str) -> bool {
     err.contains("unknown peer")
         || err.contains("no connection pool")
         || err.contains("lane is reconnecting")
-        || err.contains("lane permanently failed")
+        || err.contains("lane actor shut down")
 }
 
 impl ClusterCoordinator {
@@ -984,7 +984,7 @@ mod tests {
             "lane is reconnecting; retry later"
         ));
         assert!(should_refresh_peer_pool(
-            "lane permanently failed after max reconnection attempts"
+            "lane actor shut down (connection replaced or closed)"
         ));
     }
 

@@ -39,7 +39,7 @@ pub enum LaneOutcome {
 /// If a lane's TCP connection drops, the actor's alive watcher triggers a
 /// background reconnect task.  While reconnecting, `send`/`fire` return
 /// [`crate::error::NetError::Reconnecting`].  After all attempts are exhausted the lane
-/// moves to `Failed` and callers receive [`crate::error::NetError::LaneFailed`].
+/// goes `Dormant`; only a retired pool answers [`crate::error::NetError::LaneShutdown`].
 pub struct PriorityPool {
     peer_host_id: Uuid,
     /// Resolved socket address from the initial connection.
@@ -270,7 +270,8 @@ impl PriorityPool {
     /// Send a request/response message on the given lane.
     ///
     /// Returns `Err(NetError::Reconnecting)` while the lane is reconnecting,
-    /// or `Err(NetError::LaneFailed)` once all retries are exhausted.
+    /// or `Err(NetError::LaneShutdown)` if this pool's actors have exited (the pool
+    /// was retired; resolve the peer's current pool again).
     pub async fn send(&self, msg: Message, lane: Lane) -> Result<Message> {
         self.handle(lane).send(msg, None).await
     }
