@@ -46,7 +46,7 @@ exclude = ["ferrosa-jsonb-conformance"]
 # `sprint-03-engine-prevote` acceptance tests in ferrosa-cluster depend on
 # it. Fork README and rationale:
 #   https://github.com/ferrosadb/openraft/blob/main/README-FERROSADB.md
-openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "af87fa60bab5256cac6c08d09f84379e40636294" }
+openraft = { git = "https://github.com/ferrosadb/openraft.git", rev = "ecb9efa3" }
 
 # Keep line-table debug info in release builds so container crashes produce a readable backtrace
 # without bloating the binary to full DWARF. Required for gdb backtraces inside the runtime image.

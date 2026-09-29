@@ -252,6 +252,8 @@ fn main() {
         compaction_upload_workers: 4,
         compaction_upload_queue_depth: 16,
         delete_workers: 2,
+        max_requests_per_second: None,
+        max_concurrent_requests: None,
     });
 
     let config = StorageEngineConfig {

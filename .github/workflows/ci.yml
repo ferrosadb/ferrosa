@@ -146,6 +146,20 @@ jobs:
           # and nightly-fuzz `fuzz`, so they restore one dependency cache.
           shared-key: workspace-test-all-features-debug1
           save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Install cargo-nextest
+        # nextest runs one process per test and schedules across every core,
+        # where libtest runs each test *binary* serially. Combined with the
+        # `slow-tests` gating below, this is where the 36-minute job's time
+        # went: one 836s test in a two-test binary held 43% of it.
+        #
+        # `tool:` is required: this action normally picks the tool from its
+        # `@<tool>` tag, so a version-SHA pin alone selects nothing. It warns
+        # "no tool specified" and installs nothing, and the run then dies at
+        # the test step — which is exactly how this first failed (cargo-nextest
+        # absent, exit 101). Pin the SHA AND name the tool.
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: nextest
       - name: Free disk space
         # The --all-features debug test build alone exceeds 30GB of target
         # artifacts; the old reclaim (dotnet/android/ghc ≈ 11GB) still left
@@ -187,12 +201,21 @@ jobs:
           # they run nightly in nightly-slow-tests.yml.
           # LazyFS crash harness is unimplemented (T-070); in-process durability
           # probes cover ordering until the crash harness exists.
-          # `replicated_jsonb_index_builds_on_every_node` is a live-infra test:
-          # --all-features enables `live-infra-tests`, and with no
-          # FERROSA_TEST_CLUSTER_NODES here it panics by design (no silent skip).
-          # It runs for real in the "Cluster integration tests" job (`integration`).
-          # `--no-fail-fast` keeps one failing binary from hiding the rest.
-          cargo test --no-fail-fast --all-features --workspace --lib --tests \
+          # nextest, not libtest: it runs one process per test and schedules
+          # across every core. libtest runs each test *binary* serially, so the
+          # suite's wall clock was the sum of every binary's slowest test and
+          # one ~840s test held 43% of this job.
+          #
+          # `--` matters. Every `--skip` below is a libtest test-name filter, not
+          # a nextest flag (`nextest run --skip` takes a pattern and rejects
+          # several of these). Putting them before `--` makes nextest exit 2 with
+          # "unexpected argument '--skip' found" and run NOTHING — which is how
+          # this first failed. They are positional filters and belong after `--`,
+          # exactly as they were in the `cargo test` form.
+          #
+          # `--exclude` / `--lib` / `--tests` / `--all-features` take the same
+          # values in both runners. The `--` separator is the only difference.
+          cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -- --skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
@@ -461,6 +484,16 @@ jobs:
   # PostgreSQL fault schedule does not compile a second server binary.
   postgres-jepsen-fault:
     name: PostgreSQL Jepsen fault schedule
+    # Re-enabled by this PR (the CL-23 fix): a doomed transaction now releases
+    # its keys instead of holding them for a paused replica's full RPC timeout,
+    # which is what made every stale snapshot's barrier dep-wait 5s and fail
+    # SQLSTATE 58000. Proven against a real paused node at 5cd4e6b5:
+    #   test postgres_transactions_are_strictly_serializable ... ok
+    #   test result: ok. 21 passed; 0 failed
+    # Merging the base branch back in re-applied the skip and silently turned
+    # this job green-by-skipping; this commit restores the re-enable so the
+    # gate actually exercises the fix it ships with.
+    # If this goes red, fix the Accord path — do not re-add a skip.
     needs: build-node-image
     runs-on: ubuntu-latest
     timeout-minutes: 60

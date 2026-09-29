@@ -47,10 +47,15 @@ def step(workflow: str, name: str) -> str:
 
 
 def cargo_commands(step_text: str) -> list[str]:
-    """Every `cargo test ...` invocation in the step, line continuations joined."""
+    """Every cargo test invocation in the step, line continuations joined.
+
+    Matches both `cargo test ...` and `cargo nextest run ...`: the PR test job
+    runs nextest for its cross-core scheduling, the nightly still runs libtest,
+    and both are "the cargo test command" for the purposes of this contract.
+    """
     lines = [l for l in step_text.splitlines() if not l.strip().startswith("#")]
     joined = re.sub(r"\\\n\s*", " ", "\n".join(lines))
-    return [m.group(0) for m in re.finditer(r"cargo test[^\n]*", joined)]
+    return [m.group(0) for m in re.finditer(r"cargo (?:nextest run|test)[^\n]*", joined)]
 
 
 def cargo_command(step_text: str) -> str:

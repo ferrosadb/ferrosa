@@ -271,11 +271,30 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   warning. With it, a missing or invalid S3 configuration, a local `file://`
   backend, or a failed bucket check stops startup with an error naming the switch.
   A value that is not a boolean is an error, not "off".
+  **Request throttling (`upload/throttle.rs`):** every path shares one object
+  store, wrapped in `ThrottledStore`. `FERROSA_S3_MAX_REQUESTS_PER_SECOND` paces
+  requests evenly (no burst) and `FERROSA_S3_MAX_CONCURRENT_REQUESTS` caps them
+  in flight (`object_store::limit::LimitStore`); unset means unlimited, and a
+  non-positive or non-integer value stops startup naming the variable. A request
+  answered `429 Too Many Requests` is retried with exponential backoff (10
+  attempts, 250 ms doubling to 30 s) — `object_store` retries only 5xx — and the
+  log reports the start and end of a throttling episode, not every 429. Set both
+  when recovering from Cloudflare R2.
 - **Local cache** (`cache.rs`) — LRU eviction with manifest-pinned entries that
   are never evicted. With the local `file://` backend the cache is constructed
   durable (`new_with_durability`): the local disk *is* the store of record, so
   `evict_if_needed` is a no-op — evicting a flushed SSTable would drop its only
   durable copy.
+- **Uploaded-SSTable cache eviction** (`enforce_uploaded_sstable_cache_limit`) —
+  under disk pressure or over `local_cache_max_bytes`, deletes the local copy of
+  manifest-listed SSTables, oldest first. Before deleting, it writes and fsyncs a
+  `<gen>.evicted` marker; the engine constructors restore every marked generation
+  from S3 before any table registers (`restore_evicted_sstables`), because
+  generation discovery reads local files only. Only marked generations are
+  restored: a manifest entry without a marker may be a compacted-away input, and
+  restoring it would resurrect purged rows. Retiring a generation
+  (`delete_sstable_files`) removes its marker. System keyspaces are never
+  evicted. See FMEA ST-38.
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
