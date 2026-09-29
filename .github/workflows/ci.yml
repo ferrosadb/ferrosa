@@ -438,6 +438,10 @@ jobs:
 
   # Reuses the node image artifact from build-node-image so this live
   # PostgreSQL fault schedule does not compile a second server binary.
+  #
+  # NOTE: disabling this job for its known failure (Accord recovery not wired;
+  # FMEA CL-4/CL-20) is deliberately NOT part of this PR — it rides a separate
+  # follow-on PR so this branch stays scoped to the test-runner speedup.
   postgres-jepsen-fault:
     name: PostgreSQL Jepsen fault schedule
     needs: build-node-image
