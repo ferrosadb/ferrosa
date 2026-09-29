@@ -591,6 +591,8 @@ mod tests {
             compaction_upload_workers: 1,
             compaction_upload_queue_depth: 16,
             delete_workers: 1,
+            max_requests_per_second: None,
+            max_concurrent_requests: None,
         };
         let storage_config = StorageEngineConfig {
             commit_log: CommitLogConfig {

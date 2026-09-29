@@ -1651,20 +1651,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Register existing tables with the storage engine so reads work.
         let snap = schema.snapshot();
-
-        // Registration finds SSTables on local disk only. Bring back every
-        // manifest-listed SSTable the uploaded-cache evictor removed first,
-        // or it silently leaves its table (the 2026-09-29 memory-cluster
-        // loss: 371 SSTables, all still in S3). Failing here is deliberate —
-        // serving a table without them is the data loss.
-        let user_tables: Vec<ferrosa_storage::TableId> = snap
-            .tables
-            .values()
-            .filter(|t| !ferrosa_schema::is_system_keyspace(&t.keyspace))
-            .map(|t| ferrosa_storage::TableId::new(&t.keyspace, &t.name))
-            .collect();
-        storage.restore_evicted_sstables(&user_tables).await?;
-
         for ((_ks, _tbl), table_meta) in &snap.tables {
             if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
                 continue;

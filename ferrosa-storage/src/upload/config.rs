@@ -48,6 +48,13 @@ pub struct ObjectStoreConfig {
     pub compaction_upload_queue_depth: usize,
     /// Number of concurrent delete workers.
     pub delete_workers: usize,
+    /// Client-side cap on object-store requests per second
+    /// (`FERROSA_S3_MAX_REQUESTS_PER_SECOND`); `None` is unpaced. Keeps
+    /// recovery from R2 under the bucket's rate limit.
+    pub max_requests_per_second: Option<u32>,
+    /// Client-side cap on object-store requests in flight
+    /// (`FERROSA_S3_MAX_CONCURRENT_REQUESTS`); `None` is uncapped.
+    pub max_concurrent_requests: Option<usize>,
 }
 
 impl ObjectStoreConfig {
@@ -72,6 +79,18 @@ impl ObjectStoreConfig {
                 .filter(|&v| v > 0)
                 .unwrap_or(upload_queue_depth);
         let delete_workers = Self::workers_from_env("FERROSA_S3_DELETE_WORKERS", 2);
+        let max_requests_per_second = parse_request_limit(
+            "FERROSA_S3_MAX_REQUESTS_PER_SECOND",
+            std::env::var("FERROSA_S3_MAX_REQUESTS_PER_SECOND")
+                .ok()
+                .as_deref(),
+        )?;
+        let max_concurrent_requests = parse_request_limit(
+            "FERROSA_S3_MAX_CONCURRENT_REQUESTS",
+            std::env::var("FERROSA_S3_MAX_CONCURRENT_REQUESTS")
+                .ok()
+                .as_deref(),
+        )?;
 
         // Local file:// backend takes precedence when its path is set.
         if let Ok(local_path) = std::env::var("FERROSA_LOCAL_STORE_PATH") {
@@ -90,6 +109,8 @@ impl ObjectStoreConfig {
                     compaction_upload_workers,
                     compaction_upload_queue_depth,
                     delete_workers,
+                    max_requests_per_second,
+                    max_concurrent_requests,
                 });
             }
         }
@@ -130,6 +151,8 @@ impl ObjectStoreConfig {
             compaction_upload_workers,
             compaction_upload_queue_depth,
             delete_workers,
+            max_requests_per_second,
+            max_concurrent_requests,
         })
     }
 
@@ -193,7 +216,25 @@ impl ObjectStoreConfig {
             ferrosa_common::Error::InvalidFormat(format!("failed to build S3 client: {e}"))
         })?;
 
-        Ok(Box::new(store))
+        // Every path shares this one store, so the caps here bound uploads,
+        // deletes, rehydration and restore together. 429 retry is always on:
+        // object_store does not retry client errors.
+        let store: std::sync::Arc<dyn ObjectStore> = match self.max_concurrent_requests {
+            Some(max) => std::sync::Arc::new(object_store::limit::LimitStore::new(store, max)),
+            None => std::sync::Arc::new(store),
+        };
+        if self.max_requests_per_second.is_some() || self.max_concurrent_requests.is_some() {
+            tracing::info!(
+                max_requests_per_second = ?self.max_requests_per_second,
+                max_concurrent_requests = ?self.max_concurrent_requests,
+                "object store requests are throttled"
+            );
+        }
+        Ok(Box::new(super::throttle::ThrottledStore::new(
+            store,
+            self.max_requests_per_second,
+            super::throttle::RateLimitRetry::default(),
+        )))
     }
 
     /// Creates a test config pointing to an in-memory store.
@@ -213,6 +254,8 @@ impl ObjectStoreConfig {
             compaction_upload_workers: 4,
             compaction_upload_queue_depth: 16,
             delete_workers: 2,
+            max_requests_per_second: None,
+            max_concurrent_requests: None,
         }
     }
 }
@@ -318,6 +361,26 @@ pub async fn enforce_bucket_access(
             );
             Ok(vec![reason.to_string()])
         }
+    }
+}
+
+/// Parse an optional positive request limit from environment variable `name`.
+///
+/// Unset or empty means no limit. Anything else must be a positive integer:
+/// a typo silently meaning "unthrottled" is the setting that gets the bucket
+/// rate-limited during recovery, so it is rejected, naming the variable.
+pub fn parse_request_limit<T>(name: &str, value: Option<&str>) -> ferrosa_common::Result<Option<T>>
+where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.parse::<T>() {
+        Ok(limit) if limit > T::default() => Ok(Some(limit)),
+        _ => Err(ferrosa_common::Error::InvalidFormat(format!(
+            "{name} must be a positive integer, got {raw:?}"
+        ))),
     }
 }
 
@@ -437,6 +500,41 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn a_request_limit_is_off_when_unset_and_positive_when_set() {
+        assert_eq!(parse_request_limit::<u32>("X", None).unwrap(), None);
+        assert_eq!(parse_request_limit::<u32>("X", Some("")).unwrap(), None);
+        assert_eq!(
+            parse_request_limit::<u32>("X", Some("25")).unwrap(),
+            Some(25)
+        );
+    }
+
+    /// A typo in a throttle must not silently mean "unthrottled" — that is
+    /// exactly the setting that gets the bucket rate-limited during recovery.
+    #[test]
+    fn an_invalid_request_limit_is_rejected_naming_the_variable() {
+        for bad in ["0", "-1", "fast", "2.5"] {
+            let err = parse_request_limit::<u32>("FERROSA_S3_MAX_REQUESTS_PER_SECOND", Some(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("FERROSA_S3_MAX_REQUESTS_PER_SECOND"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_s3_store_is_throttled_and_concurrency_capped() {
+        let mut cfg = ObjectStoreConfig::test_config();
+        cfg.max_requests_per_second = Some(20);
+        cfg.max_concurrent_requests = Some(4);
+        let store = cfg.build_object_store().unwrap().to_string();
+        assert!(store.starts_with("ThrottledStore("), "{store}");
+        assert!(store.contains("LimitStore(4"), "{store}");
     }
 
     #[test]
