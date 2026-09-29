@@ -84,7 +84,22 @@ duplicate key's value until the object closes, then returns it; the exact size i
 checked again before the output is allocated.
 
 Byte equality implies value equality, not the reverse (`1.0` and `1` differ in bytes).
-Value equality arrives with the reader (T-103 on).
+Value equality arrives with the reader (T-105 on).
+
+## Validator and reader (T-104)
+
+`reader.rs` holds `Meta` (dictionary), `Head` (container header and tables) and the
+public `JsonbRef`, `ValueRef`, `ObjectRef`, `ArrayRef` views; `validate.rs` holds the
+`Walker`. `validate_cell` checks size, envelope, metadata, then walks the value with a
+frame stack: each frame is one open container with a cursor and the previous field
+id. A container is checked when opened (offset 0 is zero, offset n equals the child
+region, `is_large` iff count > 255, minimal offset and id widths); each child is
+checked when visited (ids strictly ascending and in range, offsets monotone and in
+bounds, scalar at its canonical kind). A bitset over dictionary ids proves every key
+is used (C3). Numbers decode through the same `decode_number` the reader uses and
+must report the kind their header claims, so the canonical kind rule lives in one
+place (`Number::kind`). Bigdecimal digit caps compare bit length to `10^(131072 +
+scale)` and build the exact power only within one bit of the boundary.
 
 ## Streaming parser (T-103)
 

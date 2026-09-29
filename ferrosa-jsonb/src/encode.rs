@@ -38,6 +38,10 @@ const SHORT_STRING_MAX: usize = 63;
 const LARGE_COUNT: usize = 255;
 /// Variant metadata header: version 1 with `sorted_strings` set (C2).
 const META_HEADER_BASE: u8 = 0x01 | 0x10;
+/// `offset_size_minus_one` sits in bits 6-7 of the metadata header and bit 5 is
+/// reserved (Parquet VariantEncoding.md). T-102 shifted by 5, which the T-104
+/// validator exposed.
+const META_OFFSET_SHIFT: u8 = 6;
 
 fn misuse(reason: &'static str) -> JsonbError {
     JsonbError::BuilderMisuse { reason }
@@ -132,12 +136,35 @@ pub(crate) fn write_number(out: &mut Vec<u8>, n: &Number) -> Result<(), JsonbErr
 }
 
 /// The sorted, unique key dictionary of a value (C3).
-fn dictionary(nodes: &[Node]) -> Vec<&str> {
+/// Which arena nodes the value rooted at `root` reaches. A duplicate key that
+/// lost (D6b) leaves its subtree in the arena, unreachable: its keys must not
+/// enter the dictionary (C3) nor its size the total.
+fn reachable(nodes: &[Node], root: usize) -> Result<Vec<bool>, JsonbError> {
+    let mut seen = vec![false; nodes.len()];
+    let mut stack = vec![root];
+    while let Some(idx) = stack.pop() {
+        let slot = seen.get_mut(idx).ok_or(misuse("node index out of range"))?;
+        *slot = true;
+        match &nodes
+            .get(idx)
+            .ok_or(misuse("node index out of range"))?
+            .kind
+        {
+            Kind::Object(entries) => stack.extend(entries.iter().map(|e| e.child)),
+            Kind::Array(items) => stack.extend(items.iter().copied()),
+            Kind::Scalar { .. } => {}
+        }
+    }
+    Ok(seen)
+}
+
+fn dictionary<'a>(nodes: &'a [Node], live: &[bool]) -> Vec<&'a str> {
     let mut keys: Vec<&str> = nodes
         .iter()
-        .filter_map(|n| match &n.kind {
-            Kind::Object(entries) => Some(entries.iter().map(|e| e.key.as_str())),
-            Kind::Scalar { .. } | Kind::Array(_) => None,
+        .zip(live)
+        .filter_map(|(n, live)| match &n.kind {
+            Kind::Object(entries) if *live => Some(entries.iter().map(|e| e.key.as_str())),
+            Kind::Object(_) | Kind::Scalar { .. } | Kind::Array(_) => None,
         })
         .flatten()
         .collect();
@@ -153,7 +180,7 @@ fn metadata_shape(dict: &[&str]) -> (usize, usize) {
 
 fn write_metadata(out: &mut Vec<u8>, dict: &[&str]) {
     let (key_bytes, w) = metadata_shape(dict);
-    out.push(META_HEADER_BASE | (((w - 1) as u8) << 5));
+    out.push(META_HEADER_BASE | (((w - 1) as u8) << META_OFFSET_SHIFT));
     write_le(out, dict.len(), w);
     let mut offset = 0usize;
     write_le(out, offset, w);
@@ -236,9 +263,12 @@ fn layout(node: &Node, sizes: &[usize], dict: &[&str]) -> Result<Layout, JsonbEr
 
 /// Encoded size of every node, computed children-first: a child always has a
 /// higher arena index than its parent, so a reverse scan needs no stack.
-fn node_sizes(nodes: &[Node], dict: &[&str]) -> Result<Vec<usize>, JsonbError> {
+fn node_sizes(nodes: &[Node], dict: &[&str], live: &[bool]) -> Result<Vec<usize>, JsonbError> {
     let mut sizes = vec![0usize; nodes.len()];
     for (idx, node) in nodes.iter().enumerate().rev() {
+        if !live.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
         let size = match &node.kind {
             Kind::Scalar { len, .. } => *len,
             Kind::Object(_) => {
@@ -362,8 +392,9 @@ pub(crate) fn encode_tree(
     root: usize,
     limits: &Limits,
 ) -> Result<Vec<u8>, JsonbError> {
-    let dict = dictionary(nodes);
-    let sizes = node_sizes(nodes, &dict)?;
+    let live = reachable(nodes, root)?;
+    let dict = dictionary(nodes, &live);
+    let sizes = node_sizes(nodes, &dict, &live)?;
     let (key_bytes, w) = metadata_shape(&dict);
     let meta_len = 1 + w * (dict.len() + 2) + key_bytes;
     let root_size = *sizes.get(root).ok_or(misuse("root size missing"))?;

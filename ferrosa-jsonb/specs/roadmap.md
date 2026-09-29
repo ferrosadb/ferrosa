@@ -18,7 +18,9 @@ last_updated: 2026-09-28
 
 ## Next
 
-- Validator and reader (T-104), print, export.
+- T-104 done (validator, checked reader, fuzz target). Open: run the `validate`
+  fuzz target for a soak (needs `cargo fuzz`); validate-time cost of the UTF-8 pass
+  is paid again on `as_str` (measure before caching); print (T-105), export.
 - T-103 done (streaming parser). Open: a counting-allocator peak-allocation test for
   `WORKING_SET_MULTIPLE` (the crate forbids `unsafe`, which a `GlobalAlloc` needs, so
   it must live in a separate dev crate); adapter wiring of `DuplicateKeyObserver`

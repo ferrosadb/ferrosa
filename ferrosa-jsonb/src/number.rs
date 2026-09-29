@@ -105,7 +105,7 @@ impl Number {
     }
 
     /// Canonical smallest representation for `(unscaled, scale)`.
-    fn from_bigint(unscaled: BigInt, scale: u16) -> Number {
+    pub(crate) fn from_bigint(unscaled: BigInt, scale: u16) -> Number {
         if scale == 0 {
             if let Ok(v) = i64::try_from(&unscaled) {
                 return Number(Repr::I64(v));
@@ -114,6 +114,14 @@ impl Number {
         match i128::try_from(&unscaled) {
             Ok(v) => Number(Repr::I128 { unscaled: v, scale }),
             Err(_) => Number(Repr::Big { unscaled, scale }),
+        }
+    }
+
+    /// The canonical representation of an `i128` unscaled value (T-104).
+    pub(crate) fn from_i128(unscaled: i128, scale: u16) -> Number {
+        match i64::try_from(unscaled) {
+            Ok(v) if scale == 0 => Number(Repr::I64(v)),
+            Ok(_) | Err(_) => Number(Repr::I128 { unscaled, scale }),
         }
     }
 

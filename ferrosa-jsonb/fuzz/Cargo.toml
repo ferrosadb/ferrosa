@@ -15,6 +15,12 @@ ferrosa-jsonb = { path = ".." }
 [workspace]
 
 [[bin]]
+name = "validate"
+path = "fuzz_targets/validate.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "parse_text"
 path = "fuzz_targets/parse_text.rs"
 test = false

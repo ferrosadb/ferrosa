@@ -49,6 +49,48 @@ pub enum JsonbError {
     /// The builder was driven out of order (T-102): `reason` names the misuse.
     #[error("jsonb builder misuse: {reason}")]
     BuilderMisuse { reason: &'static str },
+    /// The first byte of a stored cell is not a known envelope (T-104, FM-07).
+    #[error("jsonb cell has unknown envelope byte {byte:#04x}")]
+    UnknownEnvelope { byte: u8 },
+    /// A stored cell is malformed or not canonical (T-104, JB-T1).
+    #[error("jsonb cell is invalid: {reason}")]
+    InvalidEncoding { reason: EncodingFault },
+    /// A reader accessor was applied to a value of another kind (T-104).
+    #[error("jsonb value is not {expected}")]
+    WrongKind { expected: &'static str },
+}
+
+/// Why a stored cell failed validation (T-104). Every variant is a distinct
+/// structural fault; `NonCanonical` names the architecture rule (C1-C11) that a
+/// structurally sound cell breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum EncodingFault {
+    #[error("the cell ends before a required field")]
+    Truncated,
+    #[error("the metadata header is not Variant version 1 with sorted strings")]
+    BadMetadataHeader,
+    #[error("the dictionary is not strictly ascending by key bytes")]
+    DictionaryNotSorted,
+    #[error("an offset table is not monotone starting at zero")]
+    OffsetsNotMonotonic,
+    #[error("an offset or length reaches past its enclosing region")]
+    OffsetOutOfBounds,
+    #[error("a field id is not in the dictionary")]
+    FieldIdOutOfRange,
+    #[error("field ids are not strictly ascending")]
+    FieldsNotSorted,
+    #[error("primitive id {0} is not defined")]
+    UnknownPrimitive(u8),
+    #[error("primitive id {0} is excluded from jsonb (C10)")]
+    ExcludedPrimitive(u8),
+    #[error("a bigdecimal body is malformed")]
+    BadBigDecimal,
+    #[error("text is not valid UTF-8")]
+    InvalidUtf8,
+    #[error("bytes remain after the value")]
+    TrailingBytes,
+    #[error("breaks canonical rule {0}")]
+    NonCanonical(&'static str),
 }
 
 /// A limits configuration was refused at startup (D14b, D14d, FM-108).

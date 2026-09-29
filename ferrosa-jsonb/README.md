@@ -63,7 +63,36 @@ ferrosa-common ferrosa-jsonb` enforces it). Runtime dependencies are `bytes`,
 - Tests: `tests/parse.rs` (y/n corpus, depth, duplicates, 10 MiB proportionality,
   proptest determinism); fuzz target `fuzz/fuzz_targets/parse_text.rs`.
 
-Not yet implemented: the validator and reader, and text print.
+## Implemented (T-104)
+
+- `JsonbRef::validate(&[u8])` is the only way to get a reader and takes no `Limits`
+  (D14b): it checks `HardCeilings` only (256 MiB, depth 1000, D14a digit caps). It
+  accepts a cell iff the cell is canonical: envelope (`UnknownEnvelope { byte }`
+  for 0xF2, 0x01, 0x00 and every other byte), metadata header and widths, sorted
+  unique UTF-8 dictionary with every key used (C3), monotone in-bounds contiguous
+  offsets, ascending in-range field ids, minimal widths and `is_large`, defined
+  primitives (C10 ids are `ExcludedPrimitive`), smallest numeric kind (C9),
+  bigdecimal layout, short vs long strings (C7), and no trailing bytes.
+  Faults are `InvalidEncoding { reason: EncodingFault }`.
+- The walk is iterative with a frame stack capped at 1000 (a 256 KiB thread
+  validates depth 1000) and allocates nothing from a claimed count: every table is
+  checked against the bytes that hold it before it is read, and the only sized
+  allocation is a dictionary bitset bounded by the metadata bytes already checked.
+- Reader: `JsonbRef::root`, `ValueRef::{kind, as_bool, as_str, as_number,
+  as_object, as_array}`, `ObjectRef::{len, get, iter}` (binary search over the
+  sorted field ids), `ArrayRef::{len, get, iter}`. All access is `slice::get` or
+  checked arithmetic and returns `Result`; strings borrow from the cell. A wrong
+  kind is `WrongKind`, never a guess.
+- Two T-102 defects found by the validator and fixed here: the metadata
+  `offset_size_minus_one` was written at bit 5 instead of bits 6-7 (Variant spec;
+  affects dictionaries over 255 bytes or keys), and keys of a duplicate that lost
+  (D6b) stayed in the dictionary (breaks C3). Seven golden cases were re-blessed;
+  nothing was released on the old bytes.
+- Tests: `tests/validate.rs` (every golden value validates and rebuilds
+  byte-for-byte through the reader; a mutation corpus; hostile hand-built cells;
+  depth on 256 KiB; proptest). Fuzz target `fuzz/fuzz_targets/validate.rs`.
+
+Not yet implemented: text print (T-105) and export.
 
 ## Safety
 
