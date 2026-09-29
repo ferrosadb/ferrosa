@@ -445,7 +445,7 @@ impl SledLogStore {
     /// (seen in CI) heavy parallel I/O making `flock` momentarily return
     /// `Resource temporarily unavailable` even on a fresh dir. Failing the open
     /// on such a transient is wrong, so we retry with exponential backoff
-    /// bounded by [`LockRetryPolicy::DEFAULT`]. A **genuinely** held lock (a
+    /// bounded by `LockRetryPolicy::DEFAULT`. A **genuinely** held lock (a
     /// live node already running on this dir) is held for the node's whole
     /// lifetime, so a real dual-open conflict still surfaces the error.
     pub fn new(path: &Path) -> Result<Self, sled::Error> {
@@ -462,7 +462,7 @@ impl SledLogStore {
 
     /// [`Self::new`] for synchronous code that may run on an async worker.
     ///
-    /// The lock retry `thread::sleep`s for up to [`LockRetryPolicy::DEFAULT`]'s
+    /// The lock retry `thread::sleep`s for up to `LockRetryPolicy::DEFAULT`'s
     /// budget. On a multi-thread runtime this wraps the open in
     /// `block_in_place`, which hands the worker's queued tasks to another
     /// thread so keepalives and heartbeats are not starved (the CQL keepalive
@@ -496,7 +496,7 @@ impl SledLogStore {
     }
 
     /// Open a sled `Db` at `path`, retrying through **transient** directory-lock
-    /// contention with exponential backoff under [`LockRetryPolicy::DEFAULT`]
+    /// contention with exponential backoff under `LockRetryPolicy::DEFAULT`
     /// (10 ms doubling to 250 ms, bounded by a 10 s total budget).
     ///
     /// The single transient-lock retry primitive: used by [`Self::new`] and the
