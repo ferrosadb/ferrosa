@@ -30,6 +30,7 @@ ferrosa-session = { path = "../ferrosa-session" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-udf = { path = "../ferrosa-udf" }
+ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 dashmap = "6"
 futures = "0.3"
 inferno = { version = "0.12", default-features = false, features = ["nameattr"] }

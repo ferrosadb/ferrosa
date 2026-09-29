@@ -169,8 +169,12 @@ flat under tight cgroups; override at process startup with `_RJEM_MALLOC_CONF`.
 | `FERROSA_SELFHEAL_ENABLED` | self-heal quarantine controller (default on) |
 | `FERROSA_FLUSH_INTERVAL_SECS`, `FERROSA_URGENT_*` | maintenance-loop cadences |
 
-See `ferrosa.example.toml` for the file form (`[cql] [internode] [storage] [s3]
-[graph] [web]`).
+`[jsonb]` sets the jsonb ingest limits (TOML over `FERROSA_JSONB_*` env). Startup
+validates them against their hard ceilings and the commit-log segment size and
+exits with a FATAL message naming the key on a violation.
+
+See `ferrosa.example.toml` for the file form (`[cql] [udf] [jsonb] [internode]
+[storage] [s3] [graph] [web]`).
 
 ## Dependencies
 
@@ -178,7 +182,7 @@ See `ferrosa.example.toml` for the file form (`[cql] [internode] [storage] [s3]
 `ferrosa-cdc`, `ferrosa-cluster`, `ferrosa-common`, `ferrosa-cql`,
 `ferrosa-flight`, `ferrosa-graph`, `ferrosa-net`, `ferrosa-postgres`,
 `ferrosa-schema`, `ferrosa-session`, `ferrosa-sparql`, `ferrosa-storage`,
-`ferrosa-udf`.
+`ferrosa-udf`, `ferrosa-jsonb`.
 
 **Called by**: **NONE** — it is the top-level binary.
 

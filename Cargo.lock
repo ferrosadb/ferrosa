@@ -2255,6 +2255,7 @@ dependencies = [
  "ferrosa-cql",
  "ferrosa-flight",
  "ferrosa-graph",
+ "ferrosa-jsonb",
  "ferrosa-net",
  "ferrosa-postgres",
  "ferrosa-sched",

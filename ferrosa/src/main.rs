@@ -149,6 +149,89 @@ fn resolve_udf_sandbox_config(config: &toml::Value) -> Result<ferrosa_udf::Sandb
     Ok(sandbox)
 }
 
+/// Keys accepted under `[jsonb]`; anything else is refused so a typo cannot
+/// silently leave a limit at its default.
+const JSONB_KEYS: [&str; 8] = [
+    "max_input_bytes",
+    "max_encoded_bytes",
+    "max_nesting_depth",
+    "max_key_list_length",
+    "max_index_terms_per_doc",
+    "max_path_len",
+    "path_step_budget",
+    "duplicate_keys",
+];
+
+fn jsonb_toml_u64(table: &toml::value::Table, key: &str) -> Result<Option<u64>, String> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::Integer(n)) => u64::try_from(*n)
+            .map(Some)
+            .map_err(|_| format!("[jsonb] {key} = {n} must not be negative")),
+        Some(other) => Err(format!("[jsonb] {key} = {other} must be an integer")),
+    }
+}
+
+fn jsonb_limits_config(config: &toml::Value) -> Result<ferrosa_jsonb::LimitsConfig, String> {
+    let Some(section) = config.get("jsonb") else {
+        return Ok(ferrosa_jsonb::LimitsConfig::default());
+    };
+    let table = section
+        .as_table()
+        .ok_or_else(|| format!("[jsonb] must be a table, got {section}"))?;
+    if let Some(bad) = table.keys().find(|k| !JSONB_KEYS.contains(&k.as_str())) {
+        return Err(format!(
+            "[jsonb] unknown key {bad:?}; valid keys: {JSONB_KEYS:?}"
+        ));
+    }
+    let duplicate_keys = match table.get("duplicate_keys") {
+        None => None,
+        Some(toml::Value::String(s)) if s == "last_wins" => {
+            Some(ferrosa_jsonb::DuplicateKeyPolicy::LastWins)
+        }
+        Some(toml::Value::String(s)) if s == "error" => {
+            Some(ferrosa_jsonb::DuplicateKeyPolicy::Error)
+        }
+        Some(other) => {
+            return Err(format!(
+                "[jsonb] duplicate_keys = {other} must be \"last_wins\" or \"error\""
+            ))
+        }
+    };
+    Ok(ferrosa_jsonb::LimitsConfig {
+        max_input_bytes: jsonb_toml_u64(table, "max_input_bytes")?,
+        max_encoded_bytes: jsonb_toml_u64(table, "max_encoded_bytes")?,
+        max_nesting_depth: jsonb_toml_u64(table, "max_nesting_depth")?,
+        max_key_list_length: jsonb_toml_u64(table, "max_key_list_length")?,
+        max_index_terms_per_doc: jsonb_toml_u64(table, "max_index_terms_per_doc")?,
+        max_path_len: jsonb_toml_u64(table, "max_path_len")?,
+        path_step_budget: jsonb_toml_u64(table, "path_step_budget")?,
+        duplicate_keys,
+    })
+}
+
+/// Resolve `[jsonb]` limits: TOML overrides `FERROSA_JSONB_*` env, which
+/// overrides defaults. `write_path_max` is the effective commit-log segment
+/// size. The error names the key, the value and the bound it broke; the caller
+/// exits loud.
+fn resolve_jsonb_limits_with_env(
+    config: &toml::Value,
+    env: &dyn Fn(&str) -> Option<String>,
+    write_path_max: u64,
+) -> Result<ferrosa_jsonb::Limits, String> {
+    let cfg = jsonb_limits_config(config)?;
+    ferrosa_jsonb::Limits::from_config_with_env(&cfg, env, write_path_max)
+        .map_err(|e| format!("[jsonb] {e}"))
+}
+
+fn resolve_jsonb_limits(
+    config: &toml::Value,
+    write_path_max: u64,
+) -> Result<ferrosa_jsonb::Limits, String> {
+    let env = |k: &str| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned());
+    resolve_jsonb_limits_with_env(config, &env, write_path_max)
+}
+
 const DEFAULT_WEB_BIND: &str = "127.0.0.1:9090";
 const DEFAULT_CQL_BIND: &str = "127.0.0.1:9042";
 const DEFAULT_GRAPH_HTTP_BIND: &str = "127.0.0.1:7474";
@@ -1409,6 +1492,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // operator's authoritative choice (TOML or env); set on config.
         storage_config.auth_enabled = toml_auth;
     }
+    // `[jsonb]` limits are validated against the effective commit-log segment
+    // size (D14d): a document that cannot fit one segment must not be accepted.
+    let jsonb_limits =
+        match resolve_jsonb_limits(&file_config, storage_config.commit_log.segment_size as u64) {
+            Ok(limits) => limits,
+            Err(e) => {
+                eprintln!("FATAL: invalid [jsonb] configuration: {e}");
+                std::process::exit(1);
+            }
+        };
+    tracing::info!(?jsonb_limits, "jsonb limits");
     let storage_auth_warn = storage_config.auth_warn;
     // Capture auth enablement before the config is consumed by `new`/`open`.
     // Used below to gate the seed-role bootstrap and the 5-minute
@@ -2725,6 +2819,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shared_state.ddl_path.clone(),
             ))),
         });
+        // The validated jsonb limits reach the PG front end here. QueryContext
+        // has no jsonb field yet (ferrosa-postgres does not depend on
+        // ferrosa-jsonb); the first jsonb consumer adds it and takes this copy.
+        let pg_jsonb_limits = jsonb_limits;
+        tracing::debug!(
+            ?pg_jsonb_limits,
+            "jsonb limits available to postgres startup"
+        );
         let pg_status = listener_status.clone();
         runtimes.background.spawn(async move {
             match tokio::net::TcpListener::bind(pg_bind).await {
@@ -3191,6 +3293,105 @@ mod tests {
         assert!(resolve_udf_sandbox_config(&udf_toml("0")).is_err());
         assert!(resolve_udf_sandbox_config(&udf_toml("99999999999999")).is_err());
         assert!(resolve_udf_sandbox_config(&udf_toml("\"lots\"")).is_err());
+    }
+
+    const SEGMENT_32_MIB: u64 = 32 * 1024 * 1024;
+
+    fn jsonb_toml(body: &str) -> toml::Value {
+        format!("[jsonb]\n{body}\n").parse().unwrap()
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn jsonb_defaults_are_accepted() {
+        let l = resolve_jsonb_limits_with_env(&empty_config(), &no_env, SEGMENT_32_MIB).unwrap();
+        assert_eq!(l.max_input_bytes, 10 * 1024 * 1024);
+        assert_eq!(l.max_depth, 1000);
+    }
+
+    #[test]
+    fn jsonb_rejects_input_above_segment_size() {
+        let cfg = jsonb_toml("max_input_bytes = 8388608");
+        let err = resolve_jsonb_limits_with_env(&cfg, &no_env, 4 * 1024 * 1024).unwrap_err();
+        assert!(err.contains("max_input_bytes"), "{err}");
+        assert!(err.contains("8388608"), "{err}");
+    }
+
+    #[test]
+    fn jsonb_rejects_value_above_256_mib_ceiling() {
+        let cfg = jsonb_toml("max_input_bytes = 268435457");
+        let err = resolve_jsonb_limits_with_env(&cfg, &no_env, 1024 * 1024 * 1024).unwrap_err();
+        assert!(err.contains("max_input_bytes"), "{err}");
+        assert!(err.contains("268435456"), "{err}");
+    }
+
+    #[test]
+    fn jsonb_toml_overrides_env() {
+        let env = |k: &str| (k == "FERROSA_JSONB_MAX_INPUT_BYTES").then(|| "2097152".to_string());
+        let cfg = jsonb_toml("max_input_bytes = 4194304");
+        let l = resolve_jsonb_limits_with_env(&cfg, &env, SEGMENT_32_MIB).unwrap();
+        assert_eq!(l.max_input_bytes, 4_194_304);
+        let l = resolve_jsonb_limits_with_env(&empty_config(), &env, SEGMENT_32_MIB).unwrap();
+        assert_eq!(l.max_input_bytes, 2_097_152);
+    }
+
+    #[test]
+    fn jsonb_maps_every_toml_key() {
+        let cfg = jsonb_toml(
+            "max_input_bytes = 1000\nmax_encoded_bytes = 2000\nmax_nesting_depth = 30\n\
+             max_key_list_length = 40\nmax_index_terms_per_doc = 50\nmax_path_len = 60\n\
+             path_step_budget = 70\nduplicate_keys = \"error\"",
+        );
+        let l = resolve_jsonb_limits_with_env(&cfg, &no_env, SEGMENT_32_MIB).unwrap();
+        assert_eq!(
+            (
+                l.max_input_bytes,
+                l.max_encoded_bytes,
+                l.max_depth,
+                l.max_key_list
+            ),
+            (1000, 2000, 30, 40)
+        );
+        assert_eq!(
+            (
+                l.max_index_terms_per_doc,
+                l.max_path_len,
+                l.path_step_budget
+            ),
+            (50, 60, 70)
+        );
+        assert_eq!(l.duplicate_keys, ferrosa_jsonb::DuplicateKeyPolicy::Error);
+    }
+
+    #[test]
+    fn jsonb_rejects_bad_types_and_policy() {
+        assert!(resolve_jsonb_limits_with_env(
+            &jsonb_toml("max_depth_typo = 1"),
+            &no_env,
+            SEGMENT_32_MIB
+        )
+        .is_err());
+        assert!(resolve_jsonb_limits_with_env(
+            &jsonb_toml("max_input_bytes = \"big\""),
+            &no_env,
+            SEGMENT_32_MIB
+        )
+        .is_err());
+        assert!(resolve_jsonb_limits_with_env(
+            &jsonb_toml("max_input_bytes = -1"),
+            &no_env,
+            SEGMENT_32_MIB
+        )
+        .is_err());
+        assert!(resolve_jsonb_limits_with_env(
+            &jsonb_toml("duplicate_keys = \"first\""),
+            &no_env,
+            SEGMENT_32_MIB
+        )
+        .is_err());
     }
 
     fn empty_config() -> toml::Value {
