@@ -341,6 +341,16 @@ impl From<ferrosa_row_bridge::RowBridgeError> for CqlError {
     }
 }
 
+/// `CqlError` reaches `corrupt_cell` only from key-component decodes, where the
+/// error has already been flattened to `Invalid`; it keeps no typed jsonb fault.
+/// Jsonb key columns are meant to be rejected by the schema rules (not enforced
+/// by T-151), so this path should not see one.
+impl ferrosa_row_bridge::HasJsonbFault for CqlError {
+    fn fault(&self) -> Option<&ferrosa_row_bridge::JsonbFault> {
+        None
+    }
+}
+
 /// A corrupt stored cell is a server-side data fault, not a client mistake:
 /// it maps to a server error (0x0000), never to a row with a NULL.
 impl From<ferrosa_row_bridge::RowDecodeError> for CqlError {

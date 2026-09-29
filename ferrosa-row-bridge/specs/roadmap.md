@@ -47,4 +47,4 @@ dependency/usage review.
 
 ## jsonb (T-150)
 
-Done: type threading. Remaining: T-151: `CorruptJsonb` typed variant on the cell codec.
+Done: type threading. T-151 done: typed `JsonbFault` (corrupt vs unknown envelope) on the cell codec and `RowDecodeError`. Remaining: PG read path mapping of `RowDecodeError` (FMEA RB-T151-05).

@@ -52,3 +52,13 @@ severities are high.
 |---|---|---|---|---|---|---|---|
 | RB-T150-01 | Corrupt stored jsonb cell decoded as a value or as NULL | Silent data loss or a bad document | 9 | 2 | 2 | 36 | `decode_value` validates and returns `corrupt jsonb cell: ...`; the row path wraps it in `RowDecodeError`. Test: `corrupt_jsonb_cell_is_a_typed_error_not_null`. |
 | RB-T150-02 | Forbidden jsonb nesting accepted by the type parser | A set/map-key of jsonb reaches storage | 8 | 2 | 2 | 32 | `reject_forbidden_jsonb` runs after both parse entry points. Test: `parse_rejects_set_map_key_and_vector_of_jsonb`. |
+
+## T-151 typed jsonb faults
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| RB-T151-01 | Byte-corrupted jsonb cell returned as a value or NULL | Silent data loss | 9 | 2 | 2 | 36 | One `JsonbValue::from_bytes` per cell; refusal is `JsonbFault::CorruptJsonb`, counted by `corrupt_jsonb_count()`. Tests: `rowbridge_jsonb_corrupt_cell_is_error`, `corrupt_jsonb_cells_fail_select_with_typed_fault` (ferrosa-cql). |
+| RB-T151-02 | Cell written by a newer codec (unknown envelope byte) read as corrupt or NULL during a rolling upgrade | Misdiagnosis or silent loss (FM-07) | 8 | 3 | 2 | 48 | Distinct `JsonbFault::UnknownEnvelope`. Test: `mixed_version_read_of_future_envelope_is_error_not_null`. |
+| RB-T151-03 | Fault flattened to text inside a collection, tuple or UDT | Nested corruption loses its type | 6 | 3 | 3 | 54 | `AssembleError.jsonb` and `HasJsonbFault` carry it to `RowDecodeError`. Tests: `nested_jsonb_corruption_keeps_the_typed_fault`, `corrupt_jsonb_cells_fail_the_read_with_the_typed_fault`. |
+| RB-T151-04 | `From<RowBridgeError> for CqlError` maps a jsonb fault to a client error (0x2200) on a path that calls `decode_value` outside the row bridge | Client sees a request error for a server data fault | 5 | 3 | 5 | 75 | Open: no such path known; key-component decodes in the `ferrosa-cql` bridge keep no fault. |
+| RB-T151-05 | `ferrosa-postgres` does not map `RowDecodeError` to a typed server error | PG SELECT of a corrupt cell may surface a generic error | 5 | 3 | 5 | 75 | Open: not verified in this packet. |

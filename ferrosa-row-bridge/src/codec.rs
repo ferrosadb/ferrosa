@@ -15,7 +15,7 @@ use num_bigint::BigInt;
 pub use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::Schema;
 
-use crate::RowBridgeError;
+use crate::{JsonbFault, RowBridgeError};
 
 /// Encode a [`CqlValue`] as CQL wire-format bytes (no length prefix).
 pub fn encode_value(value: &CqlValue) -> Vec<u8> {
@@ -117,6 +117,24 @@ pub fn encode_value(value: &CqlValue) -> Vec<u8> {
         CqlValue::Jsonb(j) => j.as_bytes().to_vec(),
         CqlValue::Null => vec![],
     }
+}
+
+/// Validate a top-level jsonb cell exactly once (`JsonbValue::from_bytes`) and
+/// classify a refusal: an unknown envelope byte is distinct from corruption.
+fn decode_jsonb(bytes: &[u8]) -> Result<CqlValue, RowBridgeError> {
+    use ferrosa_jsonb::JsonbError;
+    let len = bytes.len();
+    ferrosa_jsonb::JsonbValue::from_bytes(bytes.to_vec())
+        .map(CqlValue::Jsonb)
+        .map_err(|e| match e {
+            JsonbError::UnknownEnvelope { byte } => {
+                RowBridgeError::jsonb(JsonbFault::UnknownEnvelope { byte, len })
+            }
+            other => RowBridgeError::jsonb(JsonbFault::CorruptJsonb {
+                reason: other.to_string(),
+                len,
+            }),
+        })
 }
 
 /// Decode a [`CqlValue`] from CQL wire-format bytes given its type.
@@ -354,9 +372,7 @@ pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<CqlValue, RowBri
         }
         // A stored cell is never trusted: validate it (D4, D14b). A corrupt
         // cell is an error, not NULL (RB-Tcf7ca2cc, RB-T150-01).
-        CqlType::Jsonb => ferrosa_jsonb::JsonbValue::from_bytes(bytes.to_vec())
-            .map(CqlValue::Jsonb)
-            .map_err(|e| RowBridgeError::invalid(format!("corrupt jsonb cell: {e}"))),
+        CqlType::Jsonb => decode_jsonb(bytes),
     }
 }
 
@@ -750,11 +766,84 @@ mod duration_vint_tests {
         round_trip(&udt, &v);
     }
 
+    /// RB-T151-01: every byte-level mutation of a valid cell is refused with a
+    /// typed fault, never a value. Cell width is preserved by flipping bits and
+    /// shortened by truncation.
+    #[test]
+    fn rowbridge_jsonb_corrupt_cell_is_error() {
+        let valid = encode_value(&jsonb(r#"{"a":[1,"xyz",null],"b":{"c":true}}"#));
+        let before = crate::corrupt_jsonb_count();
+        let mut refused = 0u64;
+        for cut in 0..valid.len() {
+            let err = decode_value(&CqlType::Jsonb, &valid[..cut]).unwrap_err();
+            assert!(err.jsonb_fault().is_some(), "truncated to {cut}: {err}");
+            refused += 1;
+        }
+        for i in 0..valid.len() {
+            let mut m = valid.clone();
+            m[i] ^= 0xff;
+            match decode_value(&CqlType::Jsonb, &m) {
+                Err(err) => {
+                    assert!(err.jsonb_fault().is_some(), "flip {i}: {err}");
+                    refused += 1;
+                }
+                // A flip inside a string payload leaves a valid, different cell.
+                Ok(CqlValue::Jsonb(j)) => assert_ne!(j.as_bytes(), valid.as_slice()),
+                Ok(other) => panic!("flip {i} decoded as {other:?}"),
+            }
+        }
+        assert!(crate::corrupt_jsonb_count() >= before + refused);
+    }
+
+    /// RB-T151-02 (FM-07): an envelope byte from a future codec version is its
+    /// own typed error, distinct from corruption.
+    #[test]
+    fn mixed_version_read_of_future_envelope_is_error_not_null() {
+        let mut cell = encode_value(&jsonb("[1]"));
+        cell[0] = 0xF2;
+        let err = decode_value(&CqlType::Jsonb, &cell).unwrap_err();
+        assert_eq!(
+            err.jsonb_fault(),
+            Some(&crate::JsonbFault::UnknownEnvelope {
+                byte: 0xF2,
+                len: cell.len()
+            })
+        );
+        assert!(err.to_string().contains("unknown envelope"), "{err}");
+        let corrupt = decode_value(&CqlType::Jsonb, &[]).unwrap_err();
+        assert!(matches!(
+            corrupt.jsonb_fault(),
+            Some(crate::JsonbFault::CorruptJsonb { len: 0, .. })
+        ));
+    }
+
+    /// RB-T151-03: corruption nested in a list, map, tuple or UDT keeps the
+    /// typed fault instead of collapsing to a string.
+    #[test]
+    fn nested_jsonb_corruption_keeps_the_typed_fault() {
+        let bad = [0xffu8, 0xff, 0xff];
+        let mut list = 1i32.to_be_bytes().to_vec();
+        list.extend_from_slice(&(bad.len() as i32).to_be_bytes());
+        list.extend_from_slice(&bad);
+        let list_ty = CqlType::List(Box::new(CqlType::Jsonb));
+        assert!(decode_value(&list_ty, &list)
+            .unwrap_err()
+            .jsonb_fault()
+            .is_some());
+        let tup_ty = CqlType::Tuple(vec![CqlType::Jsonb]);
+        let mut tup = (bad.len() as i32).to_be_bytes().to_vec();
+        tup.extend_from_slice(&bad);
+        assert!(decode_value(&tup_ty, &tup)
+            .unwrap_err()
+            .jsonb_fault()
+            .is_some());
+    }
+
     #[test]
     fn corrupt_jsonb_cell_is_a_typed_error_not_null() {
         for bad in [&[][..], &[0xff, 0xff, 0xff][..], b"{\"a\":1}"] {
             let err = decode_value(&CqlType::Jsonb, bad).unwrap_err();
-            assert!(err.to_string().contains("corrupt jsonb"), "{err}");
+            assert!(err.jsonb_fault().is_some(), "{err}");
         }
         // A corrupt element inside a collection fails the whole decode.
         let mut buf = 1i32.to_be_bytes().to_vec();

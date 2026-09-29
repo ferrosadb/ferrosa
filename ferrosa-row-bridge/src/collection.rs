@@ -201,6 +201,8 @@ pub fn build_collection_cells(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssembleError {
     pub reason: String,
+    /// Typed jsonb fault when a jsonb cell (top level or nested) caused this.
+    pub jsonb: Option<crate::JsonbFault>,
 }
 
 /// Reconcile a legacy whole-value blob's synthetic per-element cells (`blob_cells`)
@@ -272,11 +274,13 @@ pub fn assemble_collection(
     let live = || cells.iter().copied().filter(|c| c.value.is_some());
     let decode = |ty: &CqlType, bytes: &[u8]| -> Result<CqlValue, AssembleError> {
         decode_value(ty, bytes).map_err(|e| AssembleError {
+            jsonb: e.jsonb_fault().cloned(),
             reason: format!("decode element: {e}"),
         })
     };
     fn path_of(c: &CellValue) -> Result<&[u8], AssembleError> {
         c.path.as_deref().ok_or_else(|| AssembleError {
+            jsonb: None,
             reason: "complex column cell is missing its path".into(),
         })
     }
@@ -311,6 +315,7 @@ pub fn assemble_collection(
             let mut keyed: Vec<(ListOrderKey, CqlValue)> = live()
                 .map(|c| {
                     let key = list_order_key(path_of(c)?).ok_or_else(|| AssembleError {
+                        jsonb: None,
                         reason: "list cell path is not a 16-byte TimeUUID".into(),
                     })?;
                     Ok((
@@ -323,6 +328,7 @@ pub fn assemble_collection(
             Ok(CqlValue::List(keyed.into_iter().map(|(_, v)| v).collect()))
         }
         other => Err(AssembleError {
+            jsonb: None,
             reason: format!("not a collection column type: {other:?}"),
         }),
     }
@@ -340,10 +346,12 @@ pub fn assemble_udt(
     let mut values: Vec<Option<CqlValue>> = vec![None; fields.len()];
     for c in live {
         let path = c.path.as_deref().ok_or_else(|| AssembleError {
+            jsonb: None,
             reason: "UDT field cell is missing its path".into(),
         })?;
         if path.len() != 2 {
             return Err(AssembleError {
+                jsonb: None,
                 reason: format!(
                     "UDT field cell path is not a 2-byte position (len {})",
                     path.len()
@@ -352,6 +360,7 @@ pub fn assemble_udt(
         }
         let pos = u16::from_be_bytes([path[0], path[1]]) as usize;
         let (_, field_ty) = fields.get(pos).ok_or_else(|| AssembleError {
+            jsonb: None,
             reason: format!(
                 "UDT field position {pos} out of range ({} fields)",
                 fields.len()
@@ -360,6 +369,7 @@ pub fn assemble_udt(
         let value =
             decode_value(field_ty, c.value.as_deref().unwrap_or_default()).map_err(|e| {
                 AssembleError {
+                    jsonb: e.jsonb_fault().cloned(),
                     reason: format!("decode UDT field {pos}: {e}"),
                 }
             })?;
@@ -430,10 +440,14 @@ pub fn assemble_column_cells(
                 match &blob.value {
                     Some(bytes) => {
                         let decoded = decode_value(col_type, bytes).map_err(|e| AssembleError {
+                            jsonb: e.jsonb_fault().cloned(),
                             reason: format!("decode whole-value collection blob: {e}"),
                         })?;
                         build_collection_cells(CollectionOp::Add, &decoded, blob.timestamp)
-                            .map_err(|e| AssembleError { reason: e.reason })?
+                            .map_err(|e| AssembleError {
+                                jsonb: None,
+                                reason: e.reason,
+                            })?
                     }
                     None => Vec::new(),
                 }
@@ -485,6 +499,7 @@ pub fn assemble_column_cells(
         Some(bytes) => decode_value(col_type, bytes).map(Some).map_err(|e| {
             CORRUPT_ELEMENT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             AssembleError {
+                jsonb: e.jsonb_fault().cloned(),
                 reason: format!(
                     "decode simple cell ({} bytes) as {col_type:?}: {e}",
                     bytes.len()

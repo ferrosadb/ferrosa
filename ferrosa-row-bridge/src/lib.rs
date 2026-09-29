@@ -38,13 +38,82 @@ pub mod row;
 /// re-export boundary, mapping it back to `CqlError::Invalid` so callers see the
 /// identical error.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RowBridgeError(pub String);
+pub struct RowBridgeError(pub String, Option<JsonbFault>);
+
+/// Why a stored jsonb cell was refused on read (T-151, FM-07, FM-90). The two
+/// variants are distinct on purpose: an unknown envelope byte is most likely a
+/// newer codec version than this node understands (mixed-version cluster), not
+/// bit rot, and an operator responds to it differently. Both fail the read;
+/// neither is ever presented as NULL, text or a blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonbFault {
+    /// The cell is malformed or not canonical. `reason` is the validator's
+    /// message and `len` the cell length in bytes.
+    CorruptJsonb { reason: String, len: usize },
+    /// The first byte is not a known envelope version.
+    UnknownEnvelope { byte: u8, len: usize },
+}
+
+impl std::fmt::Display for JsonbFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JsonbFault::CorruptJsonb { reason, len } => {
+                write!(f, "corrupt jsonb cell ({len} bytes): {reason}")
+            }
+            JsonbFault::UnknownEnvelope { byte, len } => write!(
+                f,
+                "jsonb cell ({len} bytes) has unknown envelope byte {byte:#04x}: \
+                 written by a newer codec version?"
+            ),
+        }
+    }
+}
+
+/// An error that may carry a typed jsonb fault, so a caller that wraps it in a
+/// [`RowDecodeError`] can keep the fault instead of flattening it to text.
+pub trait HasJsonbFault {
+    /// The typed fault, if a jsonb cell caused the error.
+    fn fault(&self) -> Option<&JsonbFault>;
+}
+
+impl HasJsonbFault for RowBridgeError {
+    fn fault(&self) -> Option<&JsonbFault> {
+        self.jsonb_fault()
+    }
+}
+
+impl HasJsonbFault for collection::AssembleError {
+    fn fault(&self) -> Option<&JsonbFault> {
+        self.jsonb.as_ref()
+    }
+}
+
+static CORRUPT_JSONB_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total jsonb cells refused on read since process start (M10). Monotonic;
+/// intended for a metrics exporter.
+pub fn corrupt_jsonb_count() -> u64 {
+    CORRUPT_JSONB_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 impl RowBridgeError {
     /// Construct an invalid-input error with the given message. Mirrors the
     /// `CqlError::Invalid(msg)` construction in the original code.
     pub fn invalid(msg: impl Into<String>) -> Self {
-        RowBridgeError(msg.into())
+        RowBridgeError(msg.into(), None)
+    }
+
+    /// A refused jsonb cell. Counts the refusal (M10) and logs it, since the
+    /// read that hits it fails.
+    pub fn jsonb(fault: JsonbFault) -> Self {
+        CORRUPT_JSONB_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(%fault, "refusing jsonb cell");
+        RowBridgeError(fault.to_string(), Some(fault))
+    }
+
+    /// The typed jsonb fault, when this error came from a jsonb cell.
+    pub fn jsonb_fault(&self) -> Option<&JsonbFault> {
+        self.1.as_ref()
     }
 
     /// The error message (the inner `String`).
@@ -74,6 +143,8 @@ pub struct RowDecodeError {
     column: String,
     partition_key: Vec<u8>,
     reason: String,
+    /// Boxed to keep `Result<_, RowDecodeError>` small (clippy `result_large_err`).
+    jsonb: Option<Box<JsonbFault>>,
 }
 
 impl RowDecodeError {
@@ -84,7 +155,20 @@ impl RowDecodeError {
             column: column.into(),
             partition_key: partition_key.to_vec(),
             reason: reason.into(),
+            jsonb: None,
         }
+    }
+
+    /// Attach the typed jsonb fault behind this error (`None` leaves it unset).
+    #[must_use]
+    pub fn with_jsonb_fault(mut self, fault: Option<JsonbFault>) -> Self {
+        self.jsonb = fault.map(Box::new);
+        self
+    }
+
+    /// The typed jsonb fault, when the failing cell was jsonb (T-151).
+    pub fn jsonb_fault(&self) -> Option<&JsonbFault> {
+        self.jsonb.as_deref()
     }
 
     /// Attach the table name (`keyspace.table`) if none is set yet. The

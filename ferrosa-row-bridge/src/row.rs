@@ -294,7 +294,11 @@ fn decode_key_component(
     let (Some(ty), Some(bytes)) = (context.column_types.get(col_idx), bytes) else {
         return Ok(());
     };
-    let val = decode_value(ty, bytes).map_err(|e| context.corrupt(col_idx, e))?;
+    let val = decode_value(ty, bytes).map_err(|e| {
+        context
+            .corrupt(col_idx, &e)
+            .with_jsonb_fault(e.jsonb_fault().cloned())
+    })?;
     output_row[col_idx] = Some(val);
     Ok(())
 }
@@ -353,7 +357,9 @@ fn decode_output_row(
                 error = %e,
                 "corrupt cell: failing the read",
             );
-            context.corrupt(table_idx, e)
+            context
+                .corrupt(table_idx, &e)
+                .with_jsonb_fault(e.jsonb.clone())
         })?;
     }
 
@@ -510,7 +516,7 @@ pub fn build_decorated_key(
     _pk_types: &[CqlType],
 ) -> Result<DecoratedKey, RowBridgeError> {
     if pk_values.is_empty() {
-        return Err(RowBridgeError(
+        return Err(RowBridgeError::invalid(
             "partition key must have at least one column".to_string(),
         ));
     }
@@ -521,7 +527,7 @@ pub fn build_decorated_key(
         for val in pk_values {
             let encoded = encode_value(val);
             let len = u16::try_from(encoded.len())
-                .map_err(|_| RowBridgeError("partition key component too large".to_string()))?;
+                .map_err(|_| RowBridgeError::invalid("partition key component too large"))?;
             buf.extend_from_slice(&len.to_be_bytes());
             buf.extend_from_slice(&encoded);
             buf.push(0x00);
@@ -802,6 +808,39 @@ mod tests {
         );
         assert!(err.to_string().contains("column v"), "{err}");
         assert_eq!(err.in_table("ks.t").table(), Some("ks.t"));
+    }
+
+    /// RB-T151-04: a corrupt jsonb cell (simple, or inside a collection) fails
+    /// the read carrying the typed fault and the column; never NULL.
+    #[test]
+    fn corrupt_jsonb_cells_fail_the_read_with_the_typed_fault() {
+        let bad = vec![0xf2u8, 1, 2];
+        let mut list = 1i32.to_be_bytes().to_vec();
+        list.extend_from_slice(&(bad.len() as i32).to_be_bytes());
+        list.extend_from_slice(&bad);
+        let cases = [
+            (CqlType::Jsonb, bad.clone()),
+            (CqlType::List(Box::new(CqlType::Jsonb)), list),
+        ];
+        for (ty, bytes) in cases {
+            let partition = single_row_partition(vec![(0, CellValue::live(bytes, 100))]);
+            let err = partition_to_rows(
+                &partition,
+                &["id".into(), "v".into()],
+                &[CqlType::Int, ty.clone()],
+                &[0],
+                &[],
+            )
+            .unwrap_err();
+            assert_eq!(err.column(), "v", "{ty:?}");
+            assert!(
+                matches!(
+                    err.jsonb_fault(),
+                    Some(crate::JsonbFault::UnknownEnvelope { byte: 0xf2, .. })
+                ),
+                "{ty:?}: {err}"
+            );
+        }
     }
 
     /// The streaming visitor stops at the corrupt row and reports the error.

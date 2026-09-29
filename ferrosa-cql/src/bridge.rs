@@ -1206,7 +1206,7 @@ fn corrupt_cell(
     column_names: &[String],
     table_idx: usize,
     key: &ferrosa_common::DecoratedKey,
-    reason: impl std::fmt::Display,
+    reason: impl std::fmt::Display + ferrosa_row_bridge::HasJsonbFault,
 ) -> RowDecodeError {
     let column = column_names
         .get(table_idx)
@@ -1214,6 +1214,7 @@ fn corrupt_cell(
         .unwrap_or("?");
     tracing::error!(column, error = %reason, "corrupt cell: failing the read");
     RowDecodeError::new(column, key.key.as_bytes(), reason.to_string())
+        .with_jsonb_fault(reason.fault().cloned())
 }
 
 // ---------------------------------------------------------------------------

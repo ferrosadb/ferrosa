@@ -18141,6 +18141,72 @@ mod tests {
         }
     }
 
+    /// T-151 (FM-07, FM-90): jsonb cells corrupted at the storage level are
+    /// refused by SELECT with a typed `CorruptCell` server error, never a NULL.
+    /// The unknown envelope is its own fault; a nested jsonb corrupts the same way.
+    #[tokio::test]
+    async fn corrupt_jsonb_cells_fail_select_with_typed_fault() {
+        use ferrosa_row_bridge::JsonbFault;
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE cj_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE cj_ks.t (id int PRIMARY KEY, v jsonb, l list<jsonb>)",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let mut nested = 1i32.to_be_bytes().to_vec();
+        nested.extend_from_slice(&3i32.to_be_bytes());
+        nested.extend_from_slice(&[0xf2, 0, 0]);
+        // Storage columns sort by name: l = 0, v = 1.
+        // (id, storage column, bytes, expected unknown-envelope?)
+        let cases: [(i32, u16, Vec<u8>, bool); 4] = [
+            (1, 1, vec![0xf2, 1, 2, 3], true),
+            (2, 1, vec![], false),
+            (3, 1, b"{\"a\":1}".to_vec(), true),
+            (4, 0, nested, true),
+        ];
+        for (id, col, bytes, unknown) in cases {
+            let key = bridge::build_decorated_key(&[CqlValue::Int(id)], &[CqlType::Int]).unwrap();
+            let row = ferrosa_sstable::Row {
+                clustering: vec![],
+                cells: vec![(col, ferrosa_common::CellValue::live(bytes, 5_000_000))],
+                deletion: ferrosa_sstable::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::LivenessInfo::with_timestamp(5_000_000),
+            };
+            let tid = TableId::new("cj_ks", "t");
+            state.engine.write(&tid, &key, row, 5_000_000).unwrap();
+
+            let cql = format!("SELECT * FROM cj_ks.t WHERE id = {id}");
+            let stmt = crate::parser::parse(&cql).unwrap();
+            let err = match route(&state, &ctx, stmt).await {
+                Err(e) => e,
+                Ok(_) => panic!("{cql}: a corrupt jsonb cell must fail the read, not return NULL"),
+            };
+            let CqlError::CorruptCell(inner) = &err else {
+                panic!("{cql}: expected CorruptCell, got {err:?}");
+            };
+            assert_eq!(inner.table(), Some("cj_ks.t"), "{cql}");
+            assert_eq!(err.error_code(), 0x0000, "server error, not a client error");
+            match inner.jsonb_fault() {
+                Some(JsonbFault::UnknownEnvelope { .. }) => assert!(unknown, "{cql}"),
+                Some(JsonbFault::CorruptJsonb { .. }) => assert!(!unknown, "{cql}"),
+                None => panic!("{cql}: no typed jsonb fault: {inner}"),
+            }
+        }
+    }
+
     /// An uncorrupted read of the same table is unchanged.
     #[tokio::test]
     async fn uncorrupted_row_in_same_table_still_reads() {

@@ -102,3 +102,5 @@ gap — see [specs/fmea.md](specs/fmea.md) and [specs/roadmap.md](specs/roadmap.
 ## jsonb (T-150)
 
 `encode_value` writes the canonical jsonb cell bytes; `decode_value` validates them (`JsonbValue::from_bytes`) and a corrupt cell is an error, never NULL. jsonb nests in list, map value, tuple and UDT (D21). `parse_cql_type*` accept `jsonb` and refuse `set<jsonb>`, `map<jsonb, _>` and `vector<jsonb, _>` at parse (T-150).
+
+Refusals are typed (T-151): `decode_value` validates once and returns a `RowBridgeError` carrying a `JsonbFault`, either `CorruptJsonb { reason, len }` or `UnknownEnvelope { byte, len }` (a future codec version, distinct from corruption). The fault survives collection/UDT nesting through `AssembleError` into `RowDecodeError::jsonb_fault()` (column from `column()`, table from `in_table`), and reaches clients as `CqlError::CorruptCell`, never NULL. `corrupt_jsonb_count()` counts refusals (M10).
