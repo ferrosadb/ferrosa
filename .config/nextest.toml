@@ -1,0 +1,98 @@
+# cargo-nextest configuration for the Ferrosa workspace.
+#
+# Why nextest: libtest runs each test *binary* serially and threads within a
+# binary, so the wall clock is the sum of every binary's slowest test. A single
+# pathological test therefore stalls the whole run even on an 18-core machine.
+# nextest runs every test in its own process and schedules across all cores,
+# which is what makes per-test timing visible and the slow tail parallel.
+#
+# Usage:
+#   cargo nextest run --all-features --workspace
+#   cargo nextest run -p ferrosa-storage
+#
+# `cargo test` remains correct for anything nextest cannot express; both may be
+# used. CI and scripts/pre-push-tests.sh prefer nextest when it is installed.
+
+[store]
+# Reuse the same target dir layout as cargo so nextest and cargo test share
+# build artifacts instead of building the workspace twice.
+dir = "target/nextest"
+
+[test-groups]
+# Tests that assert ABSOLUTE wall-clock or memory bounds measure the machine,
+# not the code. Under nextest's default full parallelism they contend with other
+# tests and flake; this group pins them to a single slot so their budgets stay
+# meaningful while everything else still runs wide.
+timing-sensitive = { max-threads = 1 }
+
+# Tests that invoke a heavy compiler (AssemblyScript's `asc`, loom's model
+# checker) in-process. These are CORRECTNESS tests, not perf tests, but their
+# runtime is dominated by CPU-bound compilation, so running several at once
+# starves them all.
+#
+# This is a real regression the nextest conversion introduced: libtest threads
+# within a binary but runs one binary at a time, so these five asc tests ran
+# ~3.4s each in the old CI. nextest's cross-binary parallelism put ~18 debug
+# test processes on a 4-vCPU runner, and they were observed at 37-42s each on
+# an 18-core box — far past the old per-binary serialization. On the 4-core
+# runner that overshoot became a 240s timeout and failed the job.
+#
+# Serializing them restores their true cost. They are ~7s total in release and
+# ~125-240s in debug; a single slot is far cheaper than the timeout they caused.
+compile-bound = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# The sidecar memory-bound tests arm a global-allocator hook and write 64k
+# postings one at a time. They are correctness-critical (they police the
+# "heap must not grow with the index" budget) but they are the single largest
+# cost in the suite, so they get the serial slot and a generous timeout rather
+# than being deleted or ignored.
+filter = "binary(sidecar_memory_bound)"
+test-group = "timing-sensitive"
+# 900s: the observed cost is ~840s in a debug build. A regression that doubles
+# it should fail loudly rather than hang the run.
+slow-timeout = { period = "900s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+# Tests asserting absolute wall-clock bounds (accord perf) measure contention.
+# Keep them off the wide parallel run; they are already skipped on PR CI.
+filter = "test(/accord::perf/)"
+test-group = "timing-sensitive"
+slow-timeout = { period = "300s", terminate-after = 1 }
+
+# ── compile-bound: AssemblyScript UDF tests ────────────────────────────────
+# `ferrosa-udf`'s asc/component tests each boot the `asc` compiler and build a
+# wasm component in-process. Measured standalone in debug: ~126s for the
+# heaviest, ~37s under contention. Five of these running concurrently on a
+# 4-vCPU runner is what produced the 240s timeouts.
+[[profile.default.overrides]]
+# NOTE: nextest matches binary *names* with underscores (`ferrosa_udf`), not the
+# package/hyphen form (`ferrosa-udf`); the hyphen form is rejected outright with
+# "operator didn't match any binary names" and fails config parsing for the
+# whole file.
+filter = "binary(ferrosa_udf)"
+test-group = "compile-bound"
+# 600s in debug, and the budget is per-test not per-suite. A genuine hang
+# still gets caught; a slow-but-correct compile does not get guillotined.
+slow-timeout = { period = "600s", terminate-after = 1 }
+
+# ── compile-bound: loom model checker ──────────────────────────────────────
+# `pump_loom` explores thread interleavings; the depth-2 model alone is ~126s
+# in a debug build (and ~10s in release — the crate's docs say to run it
+# release). It is a correctness proof, so it must not be skipped; it just must
+# not share cores with 17 other test processes.
+[[profile.default.overrides]]
+filter = "binary(pump_loom)"
+test-group = "compile-bound"
+slow-timeout = { period = "600s", terminate-after = 1 }
+
+[profile.default]
+# A test that hangs must not hang CI. This is a backstop, not a budget: normal
+# tests finish in milliseconds, and the overrides above carry the real limits.
+# Sized against the slowest legitimate non-overridden test measured in CI
+# (158.7s: ferrosa-cluster range-scan paging), with headroom.
+slow-timeout = { period = "300s", terminate-after = 2 }
+# Report the slowest tests so the next pathological one is found by data, not
+# by someone noticing a 45-minute run.
+final-status-level = "slow"
+fail-fast = false
