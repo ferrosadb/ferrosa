@@ -460,6 +460,31 @@ impl SledLogStore {
         })
     }
 
+    /// [`Self::new`] for synchronous code that may run on an async worker.
+    ///
+    /// The lock retry `thread::sleep`s for up to [`LockRetryPolicy::DEFAULT`]'s
+    /// budget. On a multi-thread runtime this wraps the open in
+    /// `block_in_place`, which hands the worker's queued tasks to another
+    /// thread so keepalives and heartbeats are not starved (the CQL keepalive
+    /// starvation class). A current-thread runtime cannot offload; there the
+    /// open blocks the runtime for the wait, which is logged. Outside any
+    /// runtime it is a plain [`Self::new`].
+    pub fn new_off_worker(path: &Path) -> Result<Self, sled::Error> {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        match Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| Self::new(path)),
+            Ok(RuntimeFlavor::CurrentThread) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "raft log store open on a current-thread runtime cannot leave the worker; \\
+                     a contended lock will block this runtime for the retry budget"
+                );
+                Self::new(path)
+            }
+            Ok(_) | Err(_) => Self::new(path),
+        }
+    }
+
     /// Share this store's durable-applied watermark with the state machine.
     ///
     /// The state machine raises it after each fsynced snapshot; this store
@@ -2282,6 +2307,55 @@ mod tests {
         CONTENTION_HOOK.with(|h| *h.borrow_mut() = None);
         releaser.join().expect("releaser thread");
         result
+    }
+
+    /// A contended open must not starve the async worker: on a runtime with a
+    /// SINGLE worker, a concurrent task keeps ticking while `new_off_worker`
+    /// retries under a held lock. The holder is released only after the ticker
+    /// advanced with the open in flight, so a blocking open would starve the
+    /// ticker and this test would time out (CL-T2c1678cb).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn new_off_worker_keeps_the_runtime_responsive_during_a_contended_open() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        seed_store(dir.path(), 1..=3, &[]).await;
+        let holder = SledLogStore::new(dir.path()).expect("hold the directory lock");
+        let opening = std::sync::Arc::new(AtomicBool::new(false));
+        let ticks = std::sync::Arc::new(AtomicU32::new(0));
+
+        let (o, t) = (opening.clone(), ticks.clone());
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                if o.load(Ordering::SeqCst) {
+                    t.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let path = dir.path().to_path_buf();
+        let o = opening.clone();
+        let open = tokio::spawn(async move {
+            o.store(true, Ordering::SeqCst);
+            SledLogStore::new_off_worker(&path)
+        });
+
+        // Bounded wait for ticker progress made while the open is in flight.
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while ticks.load(Ordering::SeqCst) < 20 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("ticker must progress while the open retries: worker was starved");
+        assert!(!open.is_finished(), "open must still be retrying");
+        ticker.abort();
+        drop(holder);
+
+        let store = open
+            .await
+            .expect("open task joined")
+            .expect("open must succeed once the holder is released");
+        drop(store);
     }
 
     /// A live peer that never releases must still surface a typed lock error
