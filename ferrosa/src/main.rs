@@ -60,6 +60,7 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 mod cql_broadcast;
 mod listener_status;
+mod listener_tls;
 mod log_rotation;
 mod repair_wiring;
 mod runtime;
@@ -173,7 +174,10 @@ fn parse_listener_port(label: &str, env_key: &str, value: &str) -> u16 {
     }
 }
 
-fn resolve_web_config(file_config: &toml::Value) -> web::WebConfig {
+fn resolve_web_config(
+    file_config: &toml::Value,
+    tls: &listener_tls::ListenerTlsConfig,
+) -> web::WebConfig {
     let web_bind = config_val(
         "FERROSA_WEB_BIND",
         file_config,
@@ -183,10 +187,16 @@ fn resolve_web_config(file_config: &toml::Value) -> web::WebConfig {
     );
     web::WebConfig {
         bind_addr: parse_bind_addr("web console", "FERROSA_WEB_BIND", &web_bind),
+        tls_cert_path: tls.cert.clone(),
+        tls_key_path: tls.key.clone(),
+        require_tls: tls.require_tls,
     }
 }
 
-fn resolve_graph_http_config(file_config: &toml::Value) -> ferrosa_graph::http::GraphHttpConfig {
+fn resolve_graph_http_config(
+    file_config: &toml::Value,
+    tls: &listener_tls::ListenerTlsConfig,
+) -> ferrosa_graph::http::GraphHttpConfig {
     let graph_bind = config_val(
         "FERROSA_GRAPH_BIND",
         file_config,
@@ -195,17 +205,23 @@ fn resolve_graph_http_config(file_config: &toml::Value) -> ferrosa_graph::http::
         DEFAULT_GRAPH_HTTP_BIND,
     );
     ferrosa_graph::http::GraphHttpConfig {
-        require_tls: false,
+        tls_cert_path: tls.cert.clone(),
+        tls_key_path: tls.key.clone(),
+        require_tls: tls.require_tls,
         bind_addr: parse_bind_addr("graph HTTP", "FERROSA_GRAPH_BIND", &graph_bind),
         ..ferrosa_graph::http::GraphHttpConfig::default()
     }
 }
 
+/// Bolt shares `[graph] tls_cert/tls_key/require_tls` with graph HTTP (one
+/// graph host, one certificate). A bad certificate stops startup with the
+/// listener named rather than leaving Bolt in plaintext.
 fn resolve_graph_bolt_config(
     file_config: &toml::Value,
     graph_http_bind: std::net::SocketAddr,
     auth_disabled: bool,
-) -> ferrosa_graph::bolt::server::BoltConfig {
+    tls: &listener_tls::ListenerTlsConfig,
+) -> Result<ferrosa_graph::bolt::server::BoltConfig, String> {
     let bolt_port = parse_listener_port(
         "Bolt",
         "FERROSA_BOLT_PORT",
@@ -218,12 +234,22 @@ fn resolve_graph_bolt_config(
         ),
     );
     let bind_addr = std::net::SocketAddr::new(graph_http_bind.ip(), bolt_port);
+    let tls_config = ferrosa_net::tls::optional_server_config(
+        "Bolt",
+        tls.cert.as_deref(),
+        tls.key.as_deref(),
+        tls.require_tls,
+        &[],
+    )
+    .map_err(|e| e.to_string())?;
 
-    ferrosa_graph::bolt::server::BoltConfig {
+    Ok(ferrosa_graph::bolt::server::BoltConfig {
         bind_addr,
         auth_disabled,
+        tls: tls_config,
+        require_tls: tls.require_tls,
         ..ferrosa_graph::bolt::server::BoltConfig::default()
-    }
+    })
 }
 
 /// Resolve the SPARQL listener with the same explicit opt-in remote exposure
@@ -278,16 +304,20 @@ fn resolve_postgres_bind(file_config: &toml::Value) -> std::net::SocketAddr {
 /// Precedence is **TOML wins** over env (see [`config_val`]): the base
 /// `NetConfig::from_env()` seeds each field from `FERROSA_INTERNODE_*`, then
 /// this helper overwrites any field the config file sets, so a committed TOML
-/// is authoritative. Parse failures are logged but never fatal — a malformed
-/// `[internode].bind` leaves the env/default value in place rather than
-/// crashing startup.
+/// is authoritative. A malformed `[internode].bind`/`broadcast` is logged at
+/// WARN and leaves the env/default value in place. A malformed
+/// `[internode].require_tls` is an `Err`: a typo must never quietly turn the
+/// TLS requirement off (t_d5d122ba).
+///
+/// TLS keys: `tls_cert`, `tls_key`, `tls_ca`, `require_tls` (env fallback
+/// `FERROSA_INTERNODE_TLS_CERT` / `_TLS_KEY` / `_TLS_CA` / `_REQUIRE_TLS`).
 fn apply_internode_toml_overrides(
     cfg: &mut ferrosa_net::config::NetConfig,
     file_config: &toml::Value,
-) {
+) -> Result<(), String> {
     let internode = match file_config.get("internode") {
         Some(t) => t,
-        None => return,
+        None => return Ok(()),
     };
 
     if let Some(v) = internode.get("bind").and_then(|v| v.as_str()) {
@@ -311,6 +341,31 @@ fn apply_internode_toml_overrides(
     if let Some(v) = internode.get("psk").and_then(|v| v.as_str()) {
         cfg.psk = Some(v.to_string());
     }
+    let path = |key: &str| {
+        internode
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .map(String::from)
+    };
+    if let Some(v) = path("tls_cert") {
+        cfg.tls_cert_path = Some(v);
+    }
+    if let Some(v) = path("tls_key") {
+        cfg.tls_key_path = Some(v);
+    }
+    if let Some(v) = path("tls_ca") {
+        cfg.tls_ca_path = Some(v);
+    }
+    if let Some(v) = internode.get("require_tls") {
+        let raw = v
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| v.to_string());
+        cfg.require_tls = listener_tls::parse_bool_setting(&raw)
+            .map_err(|e| format!("invalid [internode] require_tls: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Resolve the graph-enabled flag honouring TOML when the env var is unset.
@@ -360,24 +415,243 @@ where
     true
 }
 
-/// Resolve the auth-enabled flag honouring TOML when the env var is unset.
-///
-/// BUG-006: `[cql] auth_enabled = true` in TOML was silently ignored;
-/// only `FERROSA_AUTH_ENABLED=true` activated the authenticator. Returns
-/// `Some(true|false)` when the operator made an explicit choice in
-/// either place, `None` when they did not (so downstream resolution can
-/// fall back to the storage default).
+/// Every client listener's TLS settings plus whether each optional listener is
+/// enabled, resolved before anything binds so the production gate sees the
+/// whole node (t_d5d122ba).
+struct ListenerTlsInputs {
+    cql: listener_tls::ListenerTlsConfig,
+    postgres: listener_tls::ListenerTlsConfig,
+    graph: listener_tls::ListenerTlsConfig,
+    sparql: listener_tls::ListenerTlsConfig,
+    web: listener_tls::ListenerTlsConfig,
+    /// `[flight] tls_cert/tls_key/require_tls` (env `FERROSA_FLIGHT_*`).
+    flight: listener_tls::ListenerTlsConfig,
+    graph_enabled: bool,
+    sparql_enabled: bool,
+    /// `None` when the binary was built without the `flight` feature.
+    flight_enabled: Option<bool>,
+}
+
+impl ListenerTlsInputs {
+    /// Resolve every listener's TLS from its own section, falling back to the
+    /// node-wide `[tls]` certificate and requirement (`node`).
+    fn resolve(file_config: &toml::Value, node: &listener_tls::NodeTls) -> Self {
+        let tls = |section, prefix| {
+            listener_tls::resolve_listener_tls_or_exit(file_config, section, prefix, node)
+        };
+        #[cfg(feature = "flight")]
+        let flight_enabled = Some(resolve_flight_enabled_or_exit(file_config));
+        #[cfg(not(feature = "flight"))]
+        let flight_enabled = None;
+        Self {
+            cql: tls("cql", "CQL"),
+            postgres: tls("postgres", "POSTGRES"),
+            graph: tls("graph", "GRAPH"),
+            sparql: tls("sparql", "SPARQL"),
+            web: tls("web", "WEB"),
+            flight: tls("flight", "FLIGHT"),
+            graph_enabled: resolve_graph_enabled(file_config, |k| std::env::var(k).ok()),
+            sparql_enabled: resolve_sparql_enabled(file_config, |k| std::env::var(k).ok()),
+            flight_enabled,
+        }
+    }
+
+    /// Load every configured certificate/key once, before anything binds, so a
+    /// bad path or a half-configured listener stops startup naming the listener
+    /// instead of surfacing later as a background listener failure.
+    fn validate(&self) -> Result<(), String> {
+        let checks: [(&str, &listener_tls::ListenerTlsConfig, bool); 6] = [
+            ("CQL", &self.cql, true),
+            ("PostgreSQL", &self.postgres, true),
+            ("graph HTTP / Bolt", &self.graph, self.graph_enabled),
+            ("SPARQL", &self.sparql, self.sparql_enabled),
+            ("web console", &self.web, true),
+            (
+                "Arrow Flight",
+                &self.flight,
+                self.flight_enabled == Some(true),
+            ),
+        ];
+        for (listener, cfg, enabled) in checks {
+            // A disabled listener's require_tls is not enforced, but a
+            // certificate it names must still load: the graph stub serves it.
+            let require = enabled && cfg.require_tls;
+            ferrosa_net::tls::optional_server_config(
+                listener,
+                cfg.cert.as_deref(),
+                cfg.key.as_deref(),
+                require,
+                &[],
+            )
+            .map_err(|e| format!("{listener} listener TLS: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// The production-gate view of every listener this node may bind.
+    ///
+    /// Per listener: CQL, PostgreSQL, graph HTTP, Bolt, SPARQL and the web
+    /// console all support TLS and must require it when enabled, and so does
+    /// Arrow Flight (t_58db6320) when the binary has the `flight` feature and
+    /// `[flight] enabled` is on. CQL, PostgreSQL and the web console are
+    /// always enabled. With the graph engine disabled the graph HTTP port
+    /// serves only a fixed 503 remediation stub (no data, no auth) and Bolt
+    /// does not bind, so neither is gated then; the stub still uses TLS when a
+    /// `[graph]` certificate is configured.
+    fn postures(&self) -> Vec<ferrosa_schema::startup::ListenerTls> {
+        use ferrosa_schema::startup::ListenerTls;
+        let tls = |listener, enabled, cfg: &listener_tls::ListenerTlsConfig, key| ListenerTls {
+            listener,
+            enabled,
+            tls_supported: true,
+            require_tls: cfg.require_tls,
+            config_key: key,
+        };
+        let mut listeners = vec![
+            tls("CQL", true, &self.cql, "[cql] require_tls"),
+            tls("PostgreSQL", true, &self.postgres, "[postgres] require_tls"),
+            tls(
+                "graph HTTP",
+                self.graph_enabled,
+                &self.graph,
+                "[graph] require_tls",
+            ),
+            tls(
+                "Bolt",
+                self.graph_enabled,
+                &self.graph,
+                "[graph] require_tls",
+            ),
+            tls(
+                "SPARQL",
+                self.sparql_enabled,
+                &self.sparql,
+                "[sparql] require_tls",
+            ),
+            tls("web console", true, &self.web, "[web] require_tls"),
+        ];
+        if let Some(enabled) = self.flight_enabled {
+            listeners.push(tls(
+                "Arrow Flight",
+                enabled,
+                &self.flight,
+                "[flight] require_tls",
+            ));
+        }
+        listeners
+    }
+}
+
+/// `[flight] enabled` (env `FERROSA_FLIGHT_ENABLED`), default on. Production
+/// mode requires an enabled Flight listener to require TLS
+/// (`[flight] tls_cert/tls_key/require_tls`), like every other listener.
+#[cfg(any(feature = "flight", test))]
+fn resolve_flight_enabled(file_config: &toml::Value) -> Result<bool, String> {
+    match config_val_opt("FERROSA_FLIGHT_ENABLED", file_config, "flight", "enabled")
+        .filter(|v| !v.trim().is_empty())
+    {
+        None => Ok(true),
+        Some(raw) => listener_tls::parse_bool_setting(&raw)
+            .map_err(|e| format!("invalid [flight] enabled / FERROSA_FLIGHT_ENABLED: {e}")),
+    }
+}
+
+/// Build the Flight service from `FERROSA_FLIGHT_SIGNING_KEY` (ephemeral key
+/// with a WARN when unset), `FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS` (comma list)
+/// and `FERROSA_FLIGHT_TOKEN_TTL_SECS` (default 3600; a non-integer value is
+/// fatal rather than silently replaced by the default).
+#[cfg(feature = "flight")]
+fn build_flight_service(
+    state: std::sync::Arc<ferrosa_cql::router::SharedState>,
+) -> ferrosa_flight::service::FerrosaFlight {
+    let signing_key = match std::env::var("FERROSA_FLIGHT_SIGNING_KEY") {
+        Ok(k) if !k.is_empty() => k.into_bytes(),
+        _ => {
+            tracing::warn!(
+                "FERROSA_FLIGHT_SIGNING_KEY unset — using an ephemeral Flight token \
+                 key; bearer tokens will not survive a restart or work across nodes. \
+                 Set FERROSA_FLIGHT_SIGNING_KEY for stable auth."
+            );
+            uuid::Uuid::new_v4().into_bytes().to_vec()
+        }
+    };
+    let previous_keys: Vec<Vec<u8>> = std::env::var("FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS")
+        .ok()
+        .into_iter()
+        .flat_map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let token_ttl_secs = parse_flight_token_ttl(
+        std::env::var("FERROSA_FLIGHT_TOKEN_TTL_SECS").ok(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("FATAL: {error}");
+        std::process::exit(1);
+    });
+    let mut service = ferrosa_flight::service::FerrosaFlight::new(state, signing_key)
+        .with_token_ttl(token_ttl_secs);
+    if !previous_keys.is_empty() {
+        service = service.with_previous_keys(previous_keys);
+    }
+    service
+}
+
+/// The Flight port advertised for remote replicas: `FERROSA_FLIGHT_PORT` when
+/// set (a typo is an error, not a fallback), otherwise the port this node binds
+/// (`[flight] bind`), assuming every node binds the same Flight port.
+#[cfg(feature = "flight")]
+fn resolve_flight_advertised_port(
+    env: Option<String>,
+    bind: std::net::SocketAddr,
+) -> Result<u16, String> {
+    match env.as_deref().filter(|v| !v.trim().is_empty()) {
+        Some(raw) => ferrosa_flight::service::parse_flight_port(raw),
+        None => Ok(bind.port()),
+    }
+}
+
+/// `FERROSA_FLIGHT_TOKEN_TTL_SECS`: unset/empty → 3600; otherwise a positive
+/// integer. A typo used to fall back to 3600 silently.
+#[cfg(any(feature = "flight", test))]
+fn parse_flight_token_ttl(raw: Option<String>) -> Result<u64, String> {
+    match raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(3600),
+        Some(v) => match v.parse::<u64>() {
+            Ok(secs) if secs > 0 => Ok(secs),
+            _ => Err(format!(
+                "invalid FERROSA_FLIGHT_TOKEN_TTL_SECS {v:?}: expected a positive integer (seconds)"
+            )),
+        },
+    }
+}
+
+#[cfg(feature = "flight")]
+fn resolve_flight_enabled_or_exit(file_config: &toml::Value) -> bool {
+    resolve_flight_enabled(file_config).unwrap_or_else(|error| {
+        eprintln!("FATAL: {error}");
+        std::process::exit(1);
+    })
+}
+
 /// Production deployment gate (FMEA epic). In production mode (`FERROSA_MODE=
 /// production`), refuses startup when an operator-fixable security requirement
-/// is unmet — authentication disabled (`t_87a50318`), CQL TLS not required
-/// (`t_27bf4674`), or the default superuser password. Weaknesses whose config is
-/// not operator-configurable yet (the hardcoded permissive password policy and
-/// env secrets provider) only WARN — see `ProductionViolation::blocks_startup`.
-/// No-op in development mode. Calls `exit(1)` rather than returning so the gate
-/// cannot be accidentally bypassed by a `?` further up.
+/// is unmet — authentication disabled (`t_87a50318`), an enabled client
+/// listener that does not require TLS or has no TLS at all (`t_27bf4674`,
+/// `t_d5d122ba`), internode traffic not required to be TLS, or the default
+/// superuser password. Each refusal names the listener and the config key.
+/// Weaknesses whose config is not operator-configurable yet (the hardcoded
+/// permissive password policy and env secrets provider) only WARN — see
+/// `ProductionViolation::blocks_startup`. No-op in development mode. Runs
+/// before any listener (internode included) binds. Calls `exit(1)` rather than
+/// returning so the gate cannot be accidentally bypassed by a `?` further up.
 fn enforce_production_requirements(
     auth_enabled: bool,
-    cql_require_tls: bool,
+    listeners: &ListenerTlsInputs,
+    internode_require_tls: bool,
     has_superuser_password: bool,
 ) {
     use ferrosa_schema::startup::{
@@ -386,7 +660,8 @@ fn enforce_production_requirements(
     let violations = validate_production_requirements(&ProductionCheckConfig {
         mode: DeploymentMode::from_env(),
         auth_enabled,
-        cql_require_tls,
+        listeners: listeners.postures(),
+        internode_require_tls,
         has_superuser_password,
         // The schema is hardcoded to a permissive policy + env secrets (see the
         // SchemaConfig in main); report them truthfully so the WARN fires, but
@@ -406,9 +681,10 @@ fn enforce_production_requirements(
             eprintln!("  - {b}");
         }
         eprintln!(
-            "Remediate the above (e.g. [cql] auth_enabled = true, [cql] require_tls = true, \
-             change the default superuser password), or run a development node (unset \
-             FERROSA_MODE=production)."
+            "Remediate the above (e.g. [cql] auth_enabled = true; one certificate for every \
+             listener and internode with [tls] cert, key, ca and require = true, or per \
+             listener <section> require_tls = true with tls_cert/tls_key; change the default \
+             superuser password), or run a development node (unset FERROSA_MODE=production)."
         );
         std::process::exit(1);
     }
@@ -1133,9 +1409,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ferrosa_storage::engine::log_cql_auth_state(storage_auth_enabled, auth_source);
     ferrosa_storage::engine::log_auth_warn_state(storage_auth_enabled, storage_auth_warn);
 
-    // SEC (FMEA epic): the production deployment gate (auth, CQL TLS, default
-    // superuser password, …) runs as `enforce_production_requirements` once the
-    // CQL TLS config is resolved below — it needs `cql_require_tls` and `schema`.
+    // SEC (FMEA epic): the production deployment gate (auth, listener +
+    // internode TLS, default superuser password, …) runs as
+    // `enforce_production_requirements` once the internode config is resolved
+    // below, before any listener binds.
 
     let storage_upload_threads = std::env::var("FERROSA_STORAGE_UPLOAD_THREADS")
         .ok()
@@ -1573,8 +1850,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Seed the base from `FERROSA_INTERNODE_*`, then let the config file win:
     // `internode.bind`, `internode.broadcast`, etc. in ferrosa.toml override
     // the env-derived defaults (TOML-wins precedence).
-    apply_internode_toml_overrides(&mut net_config_mut, &file_config);
+    if let Err(error) = apply_internode_toml_overrides(&mut net_config_mut, &file_config) {
+        eprintln!("FATAL: {error}");
+        std::process::exit(1);
+    }
+    // Node-wide `[tls]` (FERROSA_TLS_*): one certificate for every listener
+    // and internode; anything a section sets itself wins.
+    let node_tls = listener_tls::resolve_node_tls_or_exit(&file_config);
+    listener_tls::apply_node_tls_to_internode(
+        &mut net_config_mut,
+        &node_tls,
+        listener_tls::internode_require_is_explicit(&file_config),
+    );
     let net_config = Arc::new(net_config_mut);
+
+    // SEC (FMEA epic: t_87a50318 auth, t_27bf4674 + t_d5d122ba TLS): refuse to
+    // start a production node that fails an operator-fixable security
+    // requirement. Every listener's TLS settings are resolved here so the gate
+    // runs before ANY listener binds — the internode RPC server included.
+    // No-op in development mode.
+    let listener_tls_inputs = ListenerTlsInputs::resolve(&file_config, &node_tls);
+    if let Err(error) = listener_tls_inputs.validate() {
+        eprintln!("FATAL: {error}");
+        std::process::exit(1);
+    }
+    enforce_production_requirements(
+        storage_auth_enabled,
+        &listener_tls_inputs,
+        net_config.require_tls,
+        !ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema),
+    );
 
     // Build handler registry — shared between RPC server and ModeController.
     // Catch-up handler is always available; pair write/role-swap handlers are
@@ -1730,24 +2035,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         s == "true" || s == "1"
     });
-    let cql_tls_cert = config_val("FERROSA_CQL_TLS_CERT", &file_config, "cql", "tls_cert", "");
-    let cql_tls_key = config_val("FERROSA_CQL_TLS_KEY", &file_config, "cql", "tls_key", "");
-    let cql_require_tls = config_val(
-        "FERROSA_CQL_REQUIRE_TLS",
-        &file_config,
-        "cql",
-        "require_tls",
-        "false",
-    );
-
-    // SEC (FMEA epic: t_87a50318 auth + t_27bf4674 TLS): refuse to start a
-    // production node that fails an operator-fixable security requirement. Runs
-    // before any listener binds. No-op in development mode.
-    enforce_production_requirements(
-        storage_auth_enabled,
-        cql_require_tls == "true" || cql_require_tls == "1",
-        !ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema),
-    );
+    // `[cql] tls_cert/tls_key/require_tls` were resolved (strictly) with every
+    // other listener's TLS settings before the production gate above.
+    let cql_tls = listener_tls_inputs.cql.clone();
     let cql_max_connections: usize = config_val(
         "FERROSA_CQL_MAX_CONNECTIONS",
         &file_config,
@@ -1772,17 +2062,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         max_connections: cql_max_connections,
         max_connections_per_ip: cql_max_connections_per_ip,
-        tls_cert_path: if cql_tls_cert.is_empty() {
-            None
-        } else {
-            Some(cql_tls_cert)
-        },
-        tls_key_path: if cql_tls_key.is_empty() {
-            None
-        } else {
-            Some(cql_tls_key)
-        },
-        require_tls: cql_require_tls == "true" || cql_require_tls == "1",
+        tls_cert_path: cql_tls.cert,
+        tls_key_path: cql_tls.key,
+        require_tls: cql_tls.require_tls,
         ..ferrosa_cql::server::ServerConfig::default()
     };
     // Determine the advertised CQL address+port for system.local.
@@ -2046,58 +2328,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
 
-    // 9c. Arrow Flight (gRPC) query endpoint — port 8815, behind the `flight`
-    // feature. Auth is enforced per-RPC (signed bearer tokens); only
-    // anonymous-safe because every read RPC requires a verified token.
-    #[cfg(feature = "flight")]
-    {
-        let flight_addr = resolve_flight_bind(&file_config);
-        {
-            let signing_key = match std::env::var("FERROSA_FLIGHT_SIGNING_KEY") {
-                Ok(k) if !k.is_empty() => k.into_bytes(),
-                _ => {
-                    tracing::warn!(
-                        "FERROSA_FLIGHT_SIGNING_KEY unset — using an ephemeral Flight token \
-                             key; bearer tokens will not survive a restart or work across nodes. \
-                             Set FERROSA_FLIGHT_SIGNING_KEY for stable auth."
-                    );
-                    uuid::Uuid::new_v4().into_bytes().to_vec()
-                }
-            };
-            let previous_keys: Vec<Vec<u8>> = std::env::var("FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS")
-                .ok()
-                .into_iter()
-                .flat_map(|v| {
-                    v.split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.as_bytes().to_vec())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let token_ttl_secs: u64 = std::env::var("FERROSA_FLIGHT_TOKEN_TTL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3600);
-            let mut service =
-                ferrosa_flight::service::FerrosaFlight::new(flight_state, signing_key)
-                    .with_token_ttl(token_ttl_secs);
-            if !previous_keys.is_empty() {
-                service = service.with_previous_keys(previous_keys);
-            }
-            runtimes.background.spawn(async move {
-                if let Err(e) = ferrosa_flight::server::serve_service(flight_addr, service).await {
-                    tracing::error!(error = %e, "Arrow Flight server exited");
-                }
-            });
-            tracing::info!(%flight_addr, "Arrow Flight server listening");
-        }
-    }
-
     // Health of the listeners that start in background tasks (graph HTTP, Bolt,
     // SPARQL, Postgres). A bind failure used to be one ERROR line while `/readyz`
     // kept answering 200; each listener now records itself here, and `/readyz` and
     // `/metrics` report it.
     let listener_status = std::sync::Arc::new(crate::listener_status::ListenerStatus::default());
+
+    // 9c. Arrow Flight (gRPC) query endpoint — port 8815, behind the `flight`
+    // feature. Auth is enforced per-RPC (signed bearer tokens); only
+    // anonymous-safe because every read RPC requires a verified token. TLS from
+    // `[flight] tls_cert/tls_key/require_tls` (t_58db6320), built through
+    // ferrosa_net::tls like every other listener.
+    #[cfg(feature = "flight")]
+    {
+        let flight_addr = resolve_flight_bind(&file_config);
+        // `[flight] enabled = false` (FERROSA_FLIGHT_ENABLED=false) keeps the
+        // port closed.
+        if listener_tls_inputs.flight_enabled != Some(true) {
+            tracing::info!("Arrow Flight server disabled ([flight] enabled = false)");
+        } else {
+            // A certificate means the port serves TLS only, so replica
+            // locations in GetFlightInfo are advertised as grpc+tls://.
+            let serves_tls = listener_tls_inputs.flight.cert.is_some();
+            // Remote replica locations use this node's Flight port unless
+            // FERROSA_FLIGHT_PORT says otherwise (nodes share one port).
+            let advertised_port = resolve_flight_advertised_port(
+                std::env::var(ferrosa_flight::service::ENV_FLIGHT_PORT).ok(),
+                flight_addr,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("FATAL: {error}");
+                std::process::exit(1);
+            });
+            let service = build_flight_service(flight_state)
+                .with_tls_locations(serves_tls)
+                .with_flight_port(advertised_port);
+            let flight_tls = ferrosa_flight::server::FlightTlsConfig {
+                cert_path: listener_tls_inputs.flight.cert.clone(),
+                key_path: listener_tls_inputs.flight.key.clone(),
+                require_tls: listener_tls_inputs.flight.require_tls,
+            };
+            listener_status.mark_up("flight");
+            let flight_status = listener_status.clone();
+            runtimes.background.spawn(async move {
+                let result =
+                    ferrosa_flight::server::serve_service(flight_addr, service, &flight_tls).await;
+                let reason = match result {
+                    Ok(()) => "Arrow Flight server exited".to_string(),
+                    Err(e) => e.to_string(),
+                };
+                tracing::error!(%flight_addr, error = %reason, "Arrow Flight server stopped");
+                flight_status.mark_failed("flight", reason);
+            });
+        }
+    }
 
     // 9b. Web observability console — reuse the same registry as the CQL router.
     let web_state = web::WebAppState {
@@ -2112,14 +2396,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // `[web] bind` is authoritative over FERROSA_WEB_BIND, then the loopback
     // default. The resolved address is the one passed to the listener.
-    let web_config = resolve_web_config(&file_config);
+    let web_config = resolve_web_config(&file_config, &listener_tls_inputs.web);
     tracing::info!(bind_addr = %web_config.bind_addr, "web console bind configured");
     let web_addr = web::start_web_server(&web_config, web_state).await?;
     tracing::info!(%web_addr, "web console listening");
 
     // 10. Graph engine — FERROSA_GRAPH_ENABLED env var, then [graph] enabled
     // in ferrosa.toml. BUG-006: prior code only checked the env var.
-    let graph_enabled = resolve_graph_enabled(&file_config, |k| std::env::var(k).ok());
+    let graph_enabled = listener_tls_inputs.graph_enabled;
 
     // Create a shutdown watch channel for services that need graceful shutdown
     // notification (e.g. the Bolt server).
@@ -2217,7 +2501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `[graph] bind` is authoritative over FERROSA_GRAPH_BIND, then the
     // loopback default. Bolt shares its host and resolves its port separately.
-    let graph_http_config = resolve_graph_http_config(&file_config);
+    let graph_http_config = resolve_graph_http_config(&file_config, &listener_tls_inputs.graph);
 
     if graph_enabled {
         let graph_config = ferrosa_graph::engine::GraphConfig {
@@ -2268,8 +2552,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 10b. Bolt server — `[graph] bolt_port` uses the same configured host
         // as graph HTTP, so one explicit graph bind controls both listeners.
-        let bolt_config =
-            resolve_graph_bolt_config(&file_config, graph_config.http.bind_addr, auth_disabled);
+        let bolt_config = match resolve_graph_bolt_config(
+            &file_config,
+            graph_config.http.bind_addr,
+            auth_disabled,
+            &listener_tls_inputs.graph,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!(
+                    "FATAL: Bolt listener TLS: {error}\n\
+                     Set [graph] tls_cert and tls_key (or FERROSA_GRAPH_TLS_CERT / \
+                     FERROSA_GRAPH_TLS_KEY) to readable PEM files."
+                );
+                std::process::exit(1);
+            }
+        };
         tracing::info!(
             graph_http_bind = %graph_config.http.bind_addr,
             bolt_bind = %bolt_config.bind_addr,
@@ -2313,7 +2611,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 11. SPARQL endpoint — on by default (t_acc3c7fd); env wins over TOML.
-    let sparql_enabled = resolve_sparql_enabled(&file_config, |k| std::env::var(k).ok());
+    let sparql_enabled = listener_tls_inputs.sparql_enabled;
 
     if sparql_enabled {
         let sparql_bind = resolve_sparql_bind(&file_config);
@@ -2335,6 +2633,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let sparql_config = ferrosa_sparql::http::SparqlHttpConfig {
             bind_addr: sparql_bind,
+            tls_cert_path: listener_tls_inputs.sparql.cert.clone(),
+            tls_key_path: listener_tls_inputs.sparql.key.clone(),
+            require_tls: listener_tls_inputs.sparql.require_tls,
         };
 
         listener_status.mark_up("sparql");
@@ -2354,11 +2655,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 11b. Postgres wire-protocol listener (port 5432). Authenticates real roles
-    // via the shared schema's SCRAM verifiers (D4); shares storage/schema with
-    // the other front-ends. Query execution is a fail-loud stub until the
-    // relational engine (ferrosa-sql) is wired in (M1).
+    // via the shared schema's SCRAM verifiers (D4) through the shared
+    // failed-login limiter, authorizes every statement with the CQL permission
+    // model, and negotiates TLS from `[postgres] tls_cert/tls_key/require_tls`
+    // (t_e1c819ad).
     {
         let pg_bind = resolve_postgres_bind(&file_config);
+        let pg_tls_config = &listener_tls_inputs.postgres;
+        let pg_tls = match ferrosa_postgres::PgTls::from_pem(
+            pg_tls_config.cert.as_deref(),
+            pg_tls_config.key.as_deref(),
+            pg_tls_config.require_tls,
+        ) {
+            Ok(tls) => tls,
+            Err(error) => {
+                eprintln!(
+                    "FATAL: PostgreSQL listener TLS: {error}\n\
+                     Set [postgres] tls_cert and tls_key (or FERROSA_POSTGRES_TLS_CERT / \
+                     FERROSA_POSTGRES_TLS_KEY) to readable PEM files."
+                );
+                std::process::exit(1);
+            }
+        };
         let pg_store =
             std::sync::Arc::new(ferrosa_postgres::SchemaVerifierStore::new(schema.clone()));
         let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
@@ -2375,7 +2693,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pg_status.mark_up("postgres");
                     tracing::info!(%pg_bind, "Postgres server listening");
                     if let Err(e) =
-                        ferrosa_postgres::server::serve(listener, pg_store, query_ctx).await
+                        ferrosa_postgres::server::serve(listener, pg_store, query_ctx, pg_tls).await
                     {
                         tracing::error!(%e, "Postgres server failed");
                         pg_status.mark_failed("postgres", &e);
@@ -3158,7 +3476,7 @@ mod tests {
         let mut cfg = ferrosa_net::config::NetConfig::default();
         let toml: toml::Value =
             toml::from_str("[internode]\nbind = \"127.0.0.1:18001\"\n").unwrap();
-        apply_internode_toml_overrides(&mut cfg, &toml);
+        apply_internode_toml_overrides(&mut cfg, &toml).unwrap();
         assert_eq!(cfg.bind_addr, "127.0.0.1:18001".parse().unwrap());
     }
 
@@ -3174,7 +3492,7 @@ mod tests {
         };
         let toml: toml::Value =
             toml::from_str("[internode]\nbind = \"127.0.0.1:18002\"\n").unwrap();
-        apply_internode_toml_overrides(&mut cfg, &toml);
+        apply_internode_toml_overrides(&mut cfg, &toml).unwrap();
         assert_eq!(cfg.bind_addr, "127.0.0.1:18002".parse().unwrap());
     }
 
@@ -3192,7 +3510,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        apply_internode_toml_overrides(&mut cfg, &toml);
+        apply_internode_toml_overrides(&mut cfg, &toml).unwrap();
         assert_eq!(cfg.bind_addr, "127.0.0.1:18003".parse().unwrap());
         assert_eq!(cfg.broadcast_addr, "10.0.0.1:18003".parse().unwrap());
         assert_eq!(cfg.internode_broadcast.as_deref(), Some("10.0.0.1:18003"));
@@ -3206,7 +3524,7 @@ mod tests {
         let mut cfg = ferrosa_net::config::NetConfig::default();
         let default_bind = cfg.bind_addr;
         let toml: toml::Value = toml::from_str("[internode]\nbind = \"not-an-addr\"\n").unwrap();
-        apply_internode_toml_overrides(&mut cfg, &toml);
+        apply_internode_toml_overrides(&mut cfg, &toml).unwrap();
         assert_eq!(cfg.bind_addr, default_bind);
     }
 
@@ -3736,21 +4054,27 @@ mod tests {
 
         // Default when neither source sets it.
         assert_eq!(
-            resolve_web_config(&empty_config()).bind_addr.to_string(),
+            resolve_web_config(&empty_config(), &listener_tls::ListenerTlsConfig::default())
+                .bind_addr
+                .to_string(),
             DEFAULT_WEB_BIND
         );
 
         // Env var is the fallback when the config file is silent.
         std::env::set_var("FERROSA_WEB_BIND", "127.0.0.1:8080");
         assert_eq!(
-            resolve_web_config(&empty_config()).bind_addr.to_string(),
+            resolve_web_config(&empty_config(), &listener_tls::ListenerTlsConfig::default())
+                .bind_addr
+                .to_string(),
             "127.0.0.1:8080"
         );
 
         // Config file wins over the env var.
         let cfg: toml::Value = toml::from_str("[web]\nbind = \"127.0.0.1:19091\"\n").unwrap();
         assert_eq!(
-            resolve_web_config(&cfg).bind_addr.to_string(),
+            resolve_web_config(&cfg, &listener_tls::ListenerTlsConfig::default())
+                .bind_addr
+                .to_string(),
             "127.0.0.1:19091",
             "config file [web] bind must win over FERROSA_WEB_BIND"
         );
@@ -3764,16 +4088,29 @@ mod tests {
         std::env::remove_var("FERROSA_GRAPH_BIND");
         std::env::remove_var("FERROSA_BOLT_PORT");
 
-        let default_http = resolve_graph_http_config(&empty_config());
-        let default_bolt =
-            resolve_graph_bolt_config(&empty_config(), default_http.bind_addr, false);
+        let default_http =
+            resolve_graph_http_config(&empty_config(), &listener_tls::ListenerTlsConfig::default());
+        let default_bolt = resolve_graph_bolt_config(
+            &empty_config(),
+            default_http.bind_addr,
+            false,
+            &listener_tls::ListenerTlsConfig::default(),
+        )
+        .unwrap();
         assert_eq!(default_http.bind_addr.to_string(), DEFAULT_GRAPH_HTTP_BIND);
         assert_eq!(default_bolt.bind_addr.to_string(), "127.0.0.1:7687");
 
         std::env::set_var("FERROSA_GRAPH_BIND", "127.0.0.1:17474");
         std::env::set_var("FERROSA_BOLT_PORT", "17687");
-        let env_http = resolve_graph_http_config(&empty_config());
-        let env_bolt = resolve_graph_bolt_config(&empty_config(), env_http.bind_addr, false);
+        let env_http =
+            resolve_graph_http_config(&empty_config(), &listener_tls::ListenerTlsConfig::default());
+        let env_bolt = resolve_graph_bolt_config(
+            &empty_config(),
+            env_http.bind_addr,
+            false,
+            &listener_tls::ListenerTlsConfig::default(),
+        )
+        .unwrap();
         assert_eq!(env_http.bind_addr.to_string(), "127.0.0.1:17474");
         assert_eq!(env_bolt.bind_addr.to_string(), "127.0.0.1:17687");
 
@@ -3785,8 +4122,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let toml_http = resolve_graph_http_config(&config);
-        let toml_bolt = resolve_graph_bolt_config(&config, toml_http.bind_addr, false);
+        let toml_http =
+            resolve_graph_http_config(&config, &listener_tls::ListenerTlsConfig::default());
+        let toml_bolt = resolve_graph_bolt_config(
+            &config,
+            toml_http.bind_addr,
+            false,
+            &listener_tls::ListenerTlsConfig::default(),
+        )
+        .unwrap();
         assert_eq!(toml_http.bind_addr.to_string(), "127.0.0.1:27474");
         assert_eq!(toml_bolt.bind_addr.to_string(), "127.0.0.1:27687");
 
@@ -4075,5 +4419,351 @@ mod tests {
             vec!["alpha:7000".to_string(), "gamma:7000".to_string()],
             "remaining seeds must preserve original order"
         );
+    }
+
+    // ── t_d5d122ba: production mode requires TLS on every enabled listener ──
+
+    fn tls_required() -> listener_tls::ListenerTlsConfig {
+        listener_tls::ListenerTlsConfig {
+            cert: Some("/certs/node.crt".into()),
+            key: Some("/certs/node.key".into()),
+            require_tls: true,
+        }
+    }
+
+    fn all_listeners_require_tls() -> ListenerTlsInputs {
+        ListenerTlsInputs {
+            cql: tls_required(),
+            postgres: tls_required(),
+            graph: tls_required(),
+            sparql: tls_required(),
+            web: tls_required(),
+            flight: tls_required(),
+            graph_enabled: true,
+            sparql_enabled: true,
+            flight_enabled: Some(true),
+        }
+    }
+
+    fn production_violations(
+        inputs: &ListenerTlsInputs,
+        internode_require_tls: bool,
+    ) -> Vec<ferrosa_schema::startup::ProductionViolation> {
+        use ferrosa_schema::startup::{
+            validate_production_requirements, DeploymentMode, ProductionCheckConfig,
+        };
+        validate_production_requirements(&ProductionCheckConfig {
+            mode: DeploymentMode::Production,
+            password_policy: ferrosa_schema::PasswordPolicy::iso27001(),
+            has_superuser_password: true,
+            secrets_provider_type: "aws-secrets-manager".into(), // pragma: allowlist secret
+            s3_allow_http: false,
+            auth_enabled: true,
+            listeners: inputs.postures(),
+            internode_require_tls,
+        })
+    }
+
+    #[test]
+    fn production_passes_when_every_listener_and_internode_require_tls() {
+        let violations = production_violations(&all_listeners_require_tls(), true);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// Each listener the binary starts, turned to plaintext on its own, is
+    /// refused by name with the key that fixes it.
+    #[test]
+    fn production_refuses_each_enabled_listener_that_does_not_require_tls() {
+        type Edit = fn(&mut ListenerTlsInputs);
+        let cases: [(&str, &str, Edit); 6] = [
+            ("CQL", "[cql] require_tls", |i| i.cql.require_tls = false),
+            ("PostgreSQL", "[postgres] require_tls", |i| {
+                i.postgres.require_tls = false
+            }),
+            ("graph HTTP", "[graph] require_tls", |i| {
+                i.graph.require_tls = false
+            }),
+            ("Bolt", "[graph] require_tls", |i| {
+                i.graph.require_tls = false
+            }),
+            ("SPARQL", "[sparql] require_tls", |i| {
+                i.sparql.require_tls = false
+            }),
+            ("web console", "[web] require_tls", |i| {
+                i.web.require_tls = false
+            }),
+        ];
+        for (listener, key, edit) in cases {
+            let mut inputs = all_listeners_require_tls();
+            edit(&mut inputs);
+            let messages: Vec<String> = production_violations(&inputs, true)
+                .iter()
+                .filter(|v| v.blocks_startup())
+                .map(|v| v.to_string())
+                .collect();
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains(&format!("the {listener} listener")) && m.contains(key)),
+                "{listener}: expected a blocking refusal naming {key}, got {messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_allows_disabled_graph_and_sparql_without_tls() {
+        let mut inputs = all_listeners_require_tls();
+        inputs.graph = listener_tls::ListenerTlsConfig::default();
+        inputs.sparql = listener_tls::ListenerTlsConfig::default();
+        inputs.graph_enabled = false;
+        inputs.sparql_enabled = false;
+        let violations = production_violations(&inputs, true);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// t_58db6320: Flight has TLS now, so production applies the same rule
+    /// as every other listener: enabled Flight must require TLS, and the
+    /// refusal names `[flight] require_tls`, `tls_cert` and `tls_key`.
+    #[test]
+    fn production_refuses_an_enabled_flight_listener_that_does_not_require_tls() {
+        let mut inputs = all_listeners_require_tls();
+        inputs.flight = listener_tls::ListenerTlsConfig::default();
+        let messages: Vec<String> = production_violations(&inputs, true)
+            .iter()
+            .filter(|v| v.blocks_startup())
+            .map(|v| v.to_string())
+            .collect();
+        let [message] = messages.as_slice() else {
+            panic!("expected exactly the Flight refusal, got {messages:?}");
+        };
+        for key in [
+            "the Arrow Flight listener",
+            "[flight] require_tls",
+            "[flight] tls_cert",
+            "[flight] tls_key",
+        ] {
+            assert!(message.contains(key), "missing {key:?}: {message}");
+        }
+        assert!(
+            !message.contains("enabled = false"),
+            "Flight has TLS; the remedy is TLS, not disabling it: {message}"
+        );
+
+        // Disabled Flight needs no TLS.
+        inputs.flight_enabled = Some(false);
+        assert!(production_violations(&inputs, true).is_empty());
+        // A build without the flight feature has no Flight listener at all.
+        inputs.flight_enabled = None;
+        assert!(production_violations(&inputs, true).is_empty());
+    }
+
+    #[test]
+    fn production_accepts_an_enabled_flight_listener_that_requires_tls() {
+        let inputs = all_listeners_require_tls();
+        assert_eq!(inputs.flight_enabled, Some(true));
+        let violations = production_violations(&inputs, true);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// One node-wide `[tls]` certificate with `require = true` satisfies the
+    /// production gate for every listener, Flight included, and internode.
+    #[test]
+    fn one_node_wide_certificate_satisfies_the_production_gate() {
+        let toml: toml::Value = "[tls]\ncert = \"/n.crt\"\nkey = \"/n.key\"\n\
+                                 ca = \"/ca.crt\"\nrequire = true\n"
+            .parse()
+            .unwrap();
+        let node = listener_tls::resolve_node_tls(&toml).unwrap();
+        let mut inputs = ListenerTlsInputs::resolve(&toml, &node);
+        inputs.graph_enabled = true;
+        inputs.sparql_enabled = true;
+        inputs.flight_enabled = Some(true);
+        let expected = listener_tls::ListenerTlsConfig {
+            cert: Some("/n.crt".into()),
+            key: Some("/n.key".into()),
+            require_tls: true,
+        };
+        let all = [
+            &inputs.cql,
+            &inputs.postgres,
+            &inputs.graph,
+            &inputs.sparql,
+            &inputs.web,
+            &inputs.flight,
+        ];
+        assert!(all.iter().all(|c| **c == expected), "{all:?}");
+
+        let mut net = ferrosa_net::config::NetConfig::default();
+        apply_internode_toml_overrides(&mut net, &toml).unwrap();
+        listener_tls::apply_node_tls_to_internode(
+            &mut net,
+            &node,
+            listener_tls::internode_require_is_explicit(&toml),
+        );
+        let violations = production_violations(&inputs, net.require_tls);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(net.tls_ca_path.as_deref(), Some("/ca.crt"));
+
+        // A listener that opts out explicitly is still refused by name.
+        let opt_out: toml::Value = "[tls]\ncert = \"/n.crt\"\nkey = \"/n.key\"\n\
+                                    require = true\n[flight]\nrequire_tls = false\n"
+            .parse()
+            .unwrap();
+        let mut inputs = ListenerTlsInputs::resolve(&opt_out, &node);
+        inputs.flight_enabled = Some(true);
+        let messages: Vec<String> = production_violations(&inputs, true)
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains("[flight] require_tls")),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn flight_tls_keys_come_from_the_flight_section() {
+        let toml: toml::Value = "[flight]\ntls_cert = \"/f.crt\"\ntls_key = \"/f.key\"\n\
+                                 require_tls = true\n"
+            .parse()
+            .unwrap();
+        let inputs = ListenerTlsInputs::resolve(&toml, &listener_tls::NodeTls::default());
+        assert_eq!(
+            inputs.flight,
+            listener_tls::ListenerTlsConfig {
+                cert: Some("/f.crt".into()),
+                key: Some("/f.key".into()),
+                require_tls: true,
+            }
+        );
+    }
+
+    #[test]
+    fn flight_tls_validation_names_flight_when_enabled_and_ignores_it_when_disabled() {
+        let mut inputs = all_listeners_require_tls();
+        for cfg in [
+            &mut inputs.cql,
+            &mut inputs.postgres,
+            &mut inputs.graph,
+            &mut inputs.sparql,
+            &mut inputs.web,
+        ] {
+            *cfg = listener_tls::ListenerTlsConfig::default();
+        }
+        inputs.flight = listener_tls::ListenerTlsConfig {
+            cert: None,
+            key: None,
+            require_tls: true,
+        };
+        let err = inputs
+            .validate()
+            .expect_err("enabled Flight with require_tls and no certificate must stop startup");
+        assert!(err.contains("Arrow Flight"), "{err}");
+
+        inputs.flight_enabled = Some(false);
+        inputs
+            .validate()
+            .expect("a disabled Flight listener's require_tls is not enforced");
+    }
+
+    #[test]
+    fn production_refuses_internode_without_required_tls() {
+        let messages: Vec<String> = production_violations(&all_listeners_require_tls(), false)
+            .iter()
+            .filter(|v| v.blocks_startup())
+            .map(|v| v.to_string())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("[internode] require_tls")),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn internode_tls_keys_come_from_toml_and_require_tls_is_strict() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let toml: toml::Value = "[internode]\ntls_cert = \"/c.pem\"\ntls_key = \"/k.pem\"\n\
+                                 tls_ca = \"/ca.pem\"\nrequire_tls = true\n"
+            .parse()
+            .unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml).unwrap();
+        assert_eq!(cfg.tls_cert_path.as_deref(), Some("/c.pem"));
+        assert_eq!(cfg.tls_key_path.as_deref(), Some("/k.pem"));
+        assert_eq!(cfg.tls_ca_path.as_deref(), Some("/ca.pem"));
+        assert!(cfg.require_tls);
+
+        let typo: toml::Value = "[internode]\nrequire_tls = \"ture\"\n".parse().unwrap();
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let err = apply_internode_toml_overrides(&mut cfg, &typo)
+            .expect_err("a typo must not read as require_tls = false");
+        assert!(err.contains("[internode] require_tls"), "{err}");
+    }
+
+    #[test]
+    fn listener_tls_validation_names_the_listener_whose_certificate_is_missing() {
+        let mut inputs = all_listeners_require_tls();
+        // Every other listener: plaintext, not required (validation passes).
+        for cfg in [
+            &mut inputs.cql,
+            &mut inputs.postgres,
+            &mut inputs.graph,
+            &mut inputs.web,
+        ] {
+            *cfg = listener_tls::ListenerTlsConfig::default();
+        }
+        inputs.sparql.cert = Some("/nonexistent/sparql.crt".into());
+        let err = inputs
+            .validate()
+            .expect_err("a missing certificate must stop startup");
+        assert!(
+            err.contains("SPARQL") && err.contains("/nonexistent/sparql.crt"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn flight_enabled_defaults_on_and_parses_strictly() {
+        assert_eq!(resolve_flight_enabled(&empty_config()), Ok(true));
+        let off: toml::Value = "[flight]\nenabled = false\n".parse().unwrap();
+        assert_eq!(resolve_flight_enabled(&off), Ok(false));
+        let typo: toml::Value = "[flight]\nenabled = \"flase\"\n".parse().unwrap();
+        assert!(resolve_flight_enabled(&typo).is_err());
+    }
+
+    #[cfg(feature = "flight")]
+    #[test]
+    fn flight_advertised_port_follows_the_bind_port_unless_overridden() {
+        let bind: std::net::SocketAddr = "0.0.0.0:28815".parse().unwrap();
+        assert_eq!(resolve_flight_advertised_port(None, bind), Ok(28815));
+        assert_eq!(
+            resolve_flight_advertised_port(Some(String::new()), bind),
+            Ok(28815)
+        );
+        assert_eq!(
+            resolve_flight_advertised_port(Some("9815".into()), bind),
+            Ok(9815)
+        );
+        for bad in ["port", "0", "70000"] {
+            let err = resolve_flight_advertised_port(Some(bad.into()), bind).unwrap_err();
+            assert!(err.contains("FERROSA_FLIGHT_PORT"), "{err}");
+        }
+        assert_eq!(
+            resolve_flight_bind(&empty_config()).port(),
+            ferrosa_flight::service::DEFAULT_FLIGHT_PORT,
+            "the library default must match the binary's default bind port"
+        );
+    }
+
+    #[test]
+    fn flight_token_ttl_defaults_and_rejects_typos() {
+        assert_eq!(parse_flight_token_ttl(None), Ok(3600));
+        assert_eq!(parse_flight_token_ttl(Some(String::new())), Ok(3600));
+        assert_eq!(parse_flight_token_ttl(Some("600".into())), Ok(600));
+        for bad in ["1h", "-5", "0"] {
+            let err = parse_flight_token_ttl(Some(bad.into())).unwrap_err();
+            assert!(err.contains("FERROSA_FLIGHT_TOKEN_TTL_SECS"), "{err}");
+        }
     }
 }

@@ -26,9 +26,31 @@ impl SchemaVerifierStore {
     }
 }
 
+/// Logins go through the schema's shared per-user rate limiter (the one
+/// `Schema::authenticate` uses for CQL), so a lockout earned on either protocol
+/// applies to both. The limiter is per node and in memory, keyed by username.
 impl VerifierStore for SchemaVerifierStore {
     fn verifier(&self, user: &str) -> Option<ScramVerifier> {
         self.schema.scram_credential(user).map(|c| (&c).into())
+    }
+
+    fn admit(&self, user: &str) -> Result<(), String> {
+        self.schema.check_login_rate_limit(user).map_err(|error| {
+            tracing::warn!(%user, %error, "PostgreSQL login refused by the failed-login limiter");
+            error.to_string()
+        })
+    }
+
+    fn record_failure(&self, user: &str) {
+        tracing::info!(%user, "PostgreSQL login failed");
+        self.schema.record_login_failure(user);
+    }
+
+    fn record_success(&self, user: &str) -> Result<ferrosa_schema::AuthContext, String> {
+        self.schema.complete_login(user).map_err(|error| {
+            tracing::warn!(%user, %error, "PostgreSQL login refused after proof verification");
+            error.to_string()
+        })
     }
 }
 

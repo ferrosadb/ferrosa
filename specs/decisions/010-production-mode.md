@@ -47,3 +47,15 @@ A `validate_production_requirements()` function runs at startup and returns a ty
 |---------|--------|---------|
 | `FERROSA_MODE` | `development`, `production` | `development` |
 | `FERROSA_ALLOW_UNENCRYPTED_DISK` | `true`, `false` | `false` |
+
+## Amendment 2026-09-28 (t_d5d122ba): TLS on every listener
+
+The gate now covers every client listener, not only CQL. `ProductionCheckConfig`
+carries a `ListenerTls` posture per listener the binary may bind (CQL,
+PostgreSQL, graph HTTP, Bolt, SPARQL, web console, and Arrow Flight in `flight`
+builds). An enabled listener that does not require TLS, or an enabled listener
+with no TLS implementation (Flight), blocks startup; each refusal names the
+listener and the key to set. A disabled listener is fine. Internode TLS is now
+enforced as **one-way server TLS** (`[internode] require_tls`); the "internode
+mutual TLS" requirement above remains open and is tracked as t_b6c820f4. Production refuses before any
+listener binds, the internode RPC server included.

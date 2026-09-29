@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-flight
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-09-28
 ---
 
 # ferrosa-flight — Roadmap
@@ -33,10 +33,6 @@ filling stubs.
   Time64, lists, maps, structs, intervals, decimal-as-text) cannot be written
   back via `DoPut`. Extend the decoder to match the forward coverage so a
   `DoGet` → `DoPut` round-trip works for the full type set.
-- **TLS for the convenience server (FMEA FL-7).** Document clearly that
-  `server::serve` is plaintext and production must wrap `flight_service` with
-  TLS; optionally add a `serve_tls` helper so the common case is secure by
-  default.
 - **`FixedSizeBinary(16)` for `uuid`/`timeuuid`.** The forward path emits UUIDs
   as canonical text (`cql_type_to_arrow` notes this is a refinement target);
   fixed-size binary is the more Arrow-native, compact representation.

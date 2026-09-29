@@ -60,8 +60,11 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   equality.
 - **Binary `numeric`** result/param encoding (FMEA PG-7), removing the
   text-bytes fallback.
-- **TLS on the wire + real query cancellation** (FMEA PG-8) — handle
-  `SSLRequest` instead of declining; mint a real `BackendKeyData` cancel key.
+- **Real query cancellation** (FMEA PG-8) — mint a real `BackendKeyData`
+  cancel key. (TLS on the wire, statement authorization and the shared
+  failed-login limiter landed in t_e1c819ad.)
+- **Mutual TLS** — client-certificate authentication for the PG listener
+  (tracked with the internode mTLS work, t_b6c820f4).
 - **Harden the SCRAM unknown-role oracle** — run the exchange against a dummy
   verifier so `UnknownRole` is not a user-enumeration signal (threat-model note
   in `handshake.rs`).

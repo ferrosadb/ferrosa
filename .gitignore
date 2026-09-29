@@ -31,3 +31,7 @@ tests/ferrosa.deb
 tests/ferrosa
 target-linux/
 examples/build/
+
+# Throwaway TLS certificates for docker-compose.secure.yml
+# (scripts/gen-compose-test-certs.sh, t_3422ae92). Never commit keys.
+/.compose-tls/

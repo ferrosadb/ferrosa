@@ -187,3 +187,62 @@ async fn multi_range_topology_returns_endpoint_per_range() {
         }
     }
 }
+
+/// t_58db6320: a TLS Flight listener must advertise `grpc+tls://` for remote
+/// replicas, or a client following the location dials plaintext and fails.
+#[tokio::test]
+async fn remote_locations_use_the_tls_scheme_when_flight_serves_tls() {
+    let (state, _dir) = seeded_state().await;
+    let mut ring = TokenRing::new();
+    ring.add_node(1, ring_node("10.0.0.1:7000"));
+    ring.add_node(2, ring_node("10.0.0.2:7000"));
+    ring.add_node(3, ring_node("10.0.0.3:7000"));
+    ring.assign_tokens(1, &[0]);
+    ring.assign_tokens(2, &[100]);
+    ring.assign_tokens(3, &[200]);
+    state.core.mode_controller.set_token_ring(Arc::new(ring));
+
+    async fn locations(svc: FerrosaFlight) -> Vec<String> {
+        let info = svc
+            .get_flight_info(bearer(
+                FlightDescriptor::new_cmd("SELECT id, name FROM ks.t"),
+                &superuser_token(),
+            ))
+            .await
+            .expect("get_flight_info ok")
+            .into_inner();
+        info.endpoint
+            .into_iter()
+            .flat_map(|ep| ep.location.into_iter().map(|l| l.uri))
+            .collect()
+    }
+
+    let tls =
+        locations(FerrosaFlight::new(Arc::clone(&state), KEY.to_vec()).with_tls_locations(true))
+            .await;
+    assert!(!tls.is_empty(), "remote replicas are advertised");
+    assert!(
+        tls.iter().all(|uri| uri.starts_with("grpc+tls://10.0.0.")),
+        "TLS listener advertises grpc+tls: {tls:?}"
+    );
+
+    let plain = locations(FerrosaFlight::new(Arc::clone(&state), KEY.to_vec())).await;
+    assert!(!plain.is_empty(), "remote replicas are advertised");
+    // The default advertised port is the port the binary binds by default
+    // (8815). It was 50051, which nothing listens on.
+    assert!(
+        plain.iter().all(|uri| uri.ends_with(":8815")),
+        "default advertised Flight port must match the default bind port: {plain:?}"
+    );
+    let custom =
+        locations(FerrosaFlight::new(Arc::clone(&state), KEY.to_vec()).with_flight_port(18815))
+            .await;
+    assert!(
+        custom.iter().all(|uri| uri.ends_with(":18815")),
+        "with_flight_port overrides the default: {custom:?}"
+    );
+    assert!(
+        plain.iter().all(|uri| uri.starts_with("grpc://10.0.0.")),
+        "plaintext listener advertises grpc: {plain:?}"
+    );
+}

@@ -9,16 +9,36 @@
 //! socket (harness layer H1). The connection/transport layer wires this to the
 //! codec and the real `ferrosa-schema` role store later.
 
+use ferrosa_schema::AuthContext;
+
 use crate::messages::{BackendMessage, StartupMessage};
 use crate::scram::{self, ScramServerFirst, ScramVerifier};
 
 /// The only mechanism offered/accepted in v1 (channel binding is Q4-deferred).
 const MECHANISM: &str = "SCRAM-SHA-256";
 
-/// Supplies the stored SCRAM verifier for a role (D4). Backed later by
-/// `ferrosa-schema`'s role store; abstracted so the handshake stays pure.
+/// Supplies the stored SCRAM verifier for a role (D4) and gates logins through
+/// the failed-login limiter. Backed by `ferrosa-schema`'s role store
+/// ([`crate::SchemaVerifierStore`]); abstracted so the handshake stays pure.
+///
+/// The limiter hooks have no default implementations on purpose: a store that
+/// forgot them would silently bypass the lockout.
 pub trait VerifierStore {
+    /// The stored SCRAM verifier for `user`, or `None` when the role does not
+    /// exist or has no verifier.
     fn verifier(&self, user: &str) -> Option<ScramVerifier>;
+
+    /// Admission gate, consulted before any verifier work. `Err` carries the
+    /// operator-facing reason the login is refused (backoff / lockout).
+    fn admit(&self, user: &str) -> Result<(), String>;
+
+    /// Record a failed login (unknown role or bad proof) against `user`.
+    fn record_failure(&self, user: &str);
+
+    /// Record a verified login and return the session's authorization
+    /// context. `Err` refuses the login even though the proof verified (e.g.
+    /// the role cannot log in).
+    fn record_success(&self, user: &str) -> Result<AuthContext, String>;
 }
 
 /// A handshake failure (fail loud — never authenticate on doubt).
@@ -28,6 +48,10 @@ pub enum HandshakeError {
     MissingUser,
     /// The named role has no SCRAM verifier (cannot authenticate over Postgres).
     UnknownRole,
+    /// The failed-login limiter refused the attempt (backoff or lockout).
+    Throttled(String),
+    /// The proof verified but the role store refused the login.
+    LoginRefused(String),
     /// Client offered a mechanism we do not support.
     UnsupportedMechanism,
     /// A message arrived out of order for the current phase.
@@ -39,13 +63,15 @@ pub enum HandshakeError {
 enum Phase {
     Start,
     AwaitingInitial {
+        user: String,
         verifier: ScramVerifier,
     },
     AwaitingFinal {
+        user: String,
         verifier: ScramVerifier,
         ctx: ScramServerFirst,
     },
-    Authenticated,
+    Authenticated(AuthContext),
     Failed,
 }
 
@@ -69,7 +95,15 @@ impl<'a, S: VerifierStore> Handshake<'a, S> {
 
     /// Whether the client has successfully authenticated.
     pub fn is_authenticated(&self) -> bool {
-        matches!(self.phase, Phase::Authenticated)
+        matches!(self.phase, Phase::Authenticated(_))
+    }
+
+    /// The authenticated session's authorization context, once authenticated.
+    pub fn auth_context(&self) -> Option<&AuthContext> {
+        match &self.phase {
+            Phase::Authenticated(auth) => Some(auth),
+            _ => None,
+        }
     }
 
     /// Handle the StartupMessage: resolve the role and offer SASL.
@@ -82,14 +116,21 @@ impl<'a, S: VerifierStore> Handshake<'a, S> {
             return Err(HandshakeError::UnexpectedMessage);
         }
         let user = startup.get("user").ok_or(HandshakeError::MissingUser)?;
+        // The shared failed-login limiter is consulted before any verifier
+        // work, exactly as the CQL path checks it before hashing.
+        self.store.admit(user).map_err(HandshakeError::Throttled)?;
         // NOTE: returning UnknownRole here is a user-enumeration oracle; a
         // hardened version runs the exchange against a dummy verifier. Tracked
         // as a follow-up (threat-model).
-        let verifier = self
-            .store
-            .verifier(user)
-            .ok_or(HandshakeError::UnknownRole)?;
-        self.phase = Phase::AwaitingInitial { verifier };
+        let Some(verifier) = self.store.verifier(user) else {
+            // An unknown role counts as a failed login, as it does over CQL.
+            self.store.record_failure(user);
+            return Err(HandshakeError::UnknownRole);
+        };
+        self.phase = Phase::AwaitingInitial {
+            user: user.to_string(),
+            verifier,
+        };
         Ok(vec![BackendMessage::AuthenticationSasl {
             mechanisms: vec![MECHANISM.to_string()],
         }])
@@ -98,7 +139,7 @@ impl<'a, S: VerifierStore> Handshake<'a, S> {
     /// Handle a SASL payload (SASLInitialResponse first, then SASLResponse).
     pub fn on_sasl(&mut self, data: &[u8]) -> Result<Vec<BackendMessage>, HandshakeError> {
         match std::mem::replace(&mut self.phase, Phase::Failed) {
-            Phase::AwaitingInitial { verifier } => {
+            Phase::AwaitingInitial { user, verifier } => {
                 let (mechanism, client_first) = parse_sasl_initial(data)?;
                 if mechanism != MECHANISM {
                     return Err(HandshakeError::UnsupportedMechanism);
@@ -108,16 +149,38 @@ impl<'a, S: VerifierStore> Handshake<'a, S> {
                 let cont = BackendMessage::AuthenticationSaslContinue {
                     data: ctx.server_first.clone().into_bytes(),
                 };
-                self.phase = Phase::AwaitingFinal { verifier, ctx };
+                self.phase = Phase::AwaitingFinal {
+                    user,
+                    verifier,
+                    ctx,
+                };
                 Ok(vec![cont])
             }
-            Phase::AwaitingFinal { verifier, ctx } => {
-                let client_final = std::str::from_utf8(data).map_err(|_| {
-                    HandshakeError::Scram(scram::ScramError::Malformed("client-final not UTF-8"))
-                })?;
-                let server_final = scram::verify_client_final(&ctx, client_final, &verifier)
-                    .map_err(HandshakeError::Scram)?;
-                self.phase = Phase::Authenticated;
+            Phase::AwaitingFinal {
+                user,
+                verifier,
+                ctx,
+            } => {
+                let proof = std::str::from_utf8(data)
+                    .map_err(|_| scram::ScramError::Malformed("client-final not UTF-8"))
+                    .and_then(|client_final| {
+                        scram::verify_client_final(&ctx, client_final, &verifier)
+                    });
+                let server_final = match proof {
+                    Ok(server_final) => server_final,
+                    Err(error) => {
+                        // Every proof that does not verify counts toward the
+                        // shared lockout — a brute-force attempt has to reach
+                        // this point to learn anything.
+                        self.store.record_failure(&user);
+                        return Err(HandshakeError::Scram(error));
+                    }
+                };
+                let auth = self
+                    .store
+                    .record_success(&user)
+                    .map_err(HandshakeError::LoginRefused)?;
+                self.phase = Phase::Authenticated(auth);
                 // The connection layer appends ParameterStatus + BackendKeyData
                 // + ReadyForQuery once authentication completes.
                 Ok(vec![
@@ -132,7 +195,7 @@ impl<'a, S: VerifierStore> Handshake<'a, S> {
     }
 }
 
-/// Parse a SASLInitialResponse body: `mechanism\0` + i32(len) + client-first[len].
+/// Parse a SASLInitialResponse body: `mechanism\0` + `i32(len)` + `client-first[len]`.
 fn parse_sasl_initial(data: &[u8]) -> Result<(String, String), HandshakeError> {
     let malformed = |why: &'static str| HandshakeError::Scram(scram::ScramError::Malformed(why));
     let nul = data
@@ -174,10 +237,31 @@ mod tests {
     struct MockStore {
         user: String,
         verifier: ScramVerifier,
+        failures: std::cell::Cell<u32>,
+        successes: std::cell::Cell<u32>,
+        locked: bool,
     }
     impl VerifierStore for MockStore {
         fn verifier(&self, user: &str) -> Option<ScramVerifier> {
             (user == self.user).then(|| self.verifier.clone())
+        }
+        fn admit(&self, _user: &str) -> Result<(), String> {
+            if self.locked {
+                Err("locked out".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn record_failure(&self, _user: &str) {
+            self.failures.set(self.failures.get() + 1);
+        }
+        fn record_success(&self, user: &str) -> Result<AuthContext, String> {
+            self.successes.set(self.successes.get() + 1);
+            Ok(AuthContext {
+                role: user.to_string(),
+                is_superuser: false,
+                must_change_password: false,
+            })
         }
     }
 
@@ -186,6 +270,9 @@ mod tests {
         MockStore {
             user: "user".into(),
             verifier: ScramVerifier::from_password(password, &salt, 4096),
+            failures: std::cell::Cell::new(0),
+            successes: std::cell::Cell::new(0),
+            locked: false,
         }
     }
 
@@ -240,6 +327,9 @@ mod tests {
             ]
         );
         assert!(hs.is_authenticated());
+        assert_eq!(s.successes.get(), 1, "a verified login is recorded");
+        assert_eq!(s.failures.get(), 0);
+        assert_eq!(hs.auth_context().map(|a| a.role.as_str()), Some("user"));
     }
 
     #[test]
@@ -250,6 +340,19 @@ mod tests {
             hs.on_startup(&startup("nobody")),
             Err(HandshakeError::UnknownRole)
         );
+        assert_eq!(s.failures.get(), 1, "an unknown role counts as a failure");
+    }
+
+    #[test]
+    fn locked_out_user_is_refused_before_any_exchange() {
+        let mut s = store("pencil");
+        s.locked = true;
+        let mut hs = Handshake::new(&s, SERVER_NONCE);
+        assert_eq!(
+            hs.on_startup(&startup("user")),
+            Err(HandshakeError::Throttled("locked out".into()))
+        );
+        assert!(!hs.is_authenticated());
     }
 
     #[test]
@@ -274,6 +377,8 @@ mod tests {
             Err(HandshakeError::Scram(scram::ScramError::ProofMismatch))
         );
         assert!(!hs.is_authenticated());
+        assert_eq!(s.failures.get(), 1, "a bad proof counts as a failure");
+        assert_eq!(s.successes.get(), 0);
     }
 
     #[test]

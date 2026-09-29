@@ -12,7 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends capnproto \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
-RUN cargo build --release -p ferrosa -p ferrosa-ctl
+# Default features, like CI's shared image. For the secure-compose smoke, which
+# probes Arrow Flight, build with --build-arg FERROSA_FEATURES=ferrosa/flight.
+ARG FERROSA_FEATURES=""
+RUN cargo build --release -p ferrosa -p ferrosa-ctl \
+    ${FERROSA_FEATURES:+--features "$FERROSA_FEATURES"}
 
 FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 RUN apt-get update && apt-get install -y --no-install-recommends \

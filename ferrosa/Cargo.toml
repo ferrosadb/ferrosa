@@ -11,6 +11,9 @@ path = "src/main.rs"
 [dependencies]
 arc-swap = "1.7"
 axum = { version = "0.8", features = ["ws"] }
+# HTTPS for the web console (t_d5d122ba). TLS configs come from
+# ferrosa-net::tls, so the provider-less feature is used.
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-cluster = { path = "../ferrosa-cluster" }
@@ -101,6 +104,9 @@ ferrosa-storage = { path = "../ferrosa-storage", features = ["test-support"] }
 # are checked against the ordering choose_pair_role elects on.
 serde_yaml = "0.9"
 serial_test = "3"
+rcgen = "0.14"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.26"

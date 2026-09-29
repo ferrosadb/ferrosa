@@ -43,11 +43,58 @@ apply when neither source sets the listener.
 | Internode RPC | `0.0.0.0:17000` | `ferrosa-net` | bind: `FERROSA_INTERNODE_BIND` / `[internode].bind`; advertised endpoint: `FERROSA_INTERNODE_BROADCAST` / `[internode].broadcast`. The exact advertised host/port is preserved for peer handshakes, including same-host clusters whose nodes use different ports. Note **17000**, not Cassandra's 7000 (BUG-001: 7000 collides with macOS ControlCenter). |
 | CQL native v5 | `127.0.0.1:9042` | `ferrosa-cql` | `FERROSA_CQL_BIND` / `[cql].bind` |
 | Postgres wire | `127.0.0.1:5432` | `ferrosa-postgres` | `FERROSA_POSTGRES_BIND` / `[postgres].bind` — always started; query execution is a fail-loud stub until the relational engine lands |
-| Arrow Flight (gRPC) | `127.0.0.1:8815` | `ferrosa-flight` | **`--features flight`** + `FERROSA_FLIGHT_BIND` / `[flight].bind`; per-RPC signed bearer tokens |
+| Arrow Flight (gRPC) | `127.0.0.1:8815` | `ferrosa-flight` | **`--features flight`** (in release `full` builds) + `FERROSA_FLIGHT_BIND` / `[flight].bind`; `[flight] enabled` (default on); per-RPC signed bearer tokens; TLS from `[flight] tls_cert/tls_key/require_tls` |
 | Graph HTTP | `127.0.0.1:7474` | `ferrosa-graph` | only if graph enabled; `FERROSA_GRAPH_BIND` / `[graph].bind` |
 | Bolt v5 | `127.0.0.1:7687` | `ferrosa-graph` | only if graph enabled; `FERROSA_BOLT_PORT` / `[graph].bolt_port`; uses the host resolved for Graph HTTP |
 | SPARQL HTTP | `127.0.0.1:8080` | `ferrosa-sparql` | enabled by default; `FERROSA_SPARQL_BIND` / `[sparql].bind` |
 | Web console + `/metrics` | `127.0.0.1:9090` | this crate (`web/`) | `FERROSA_WEB_BIND` / `[web].bind`. `/readyz` and `/health`: when `FERROSA_EXPECTED_CLUSTER_SIZE` is set they return 503 `waiting_for: declared_topology` until that topology is met (the same gate CQL uses). They also return 503 `waiting_for: listeners` while a background client listener (graph HTTP, Bolt, SPARQL, Postgres) has failed to bind or exited; `ferrosa_listener_up{listener="…"}` on `/metrics` is 1/0 for each. A bind failure there used to be one ERROR log line while the node kept probing ready |
+
+### TLS and production mode (t_d5d122ba)
+
+**One certificate for the whole node.** `[tls]` (env `FERROSA_TLS_*`) sets a
+single certificate that every listener and internode use unless they set their
+own, so a typical node needs only:
+
+```toml
+[tls]
+cert    = "/etc/ferrosa/tls/node.crt"   # FERROSA_TLS_CERT
+key     = "/etc/ferrosa/tls/node.key"   # FERROSA_TLS_KEY
+ca      = "/etc/ferrosa/tls/ca.crt"     # FERROSA_TLS_CA (internode peer verification)
+require = true                          # FERROSA_TLS_REQUIRE: every listener + internode refuse plaintext
+```
+
+That satisfies the production gate for every listener (Arrow Flight included)
+and internode. The certificate needs the SANs clients use for each port
+(internode verifies the peer IP). A section's own keys override `[tls]`: its
+`tls_cert`/`tls_key` pair (taken as a pair, never mixed with the `[tls]` key),
+and its `require_tls` (so `[sparql] require_tls = false` opts one listener out
+— and production then refuses it by name).
+
+Every client listener can also take TLS from its own section with the same three keys
+(TOML wins; env fallback `FERROSA_<PREFIX>_TLS_CERT` / `_TLS_KEY` /
+`_REQUIRE_TLS`): `[cql]`, `[postgres]`, `[graph]` (graph HTTP **and** Bolt),
+`[sparql]`, `[web]`, `[flight]` (Arrow Flight, `flight` builds) — `tls_cert`,
+`tls_key`, `require_tls`. Internode uses
+`[internode] tls_cert/tls_key/tls_ca/require_tls` (env `FERROSA_INTERNODE_*`).
+A non-boolean `require_tls` stops startup; every configured certificate is
+loaded once before anything binds, so a bad path names its listener.
+All TLS configs are built by `ferrosa_net::tls` with one crypto provider.
+
+`FERROSA_MODE=production` refuses to start (exit 1, before any listener binds)
+unless every **enabled** listener requires TLS and `[internode] require_tls =
+true`. Per listener: CQL, PostgreSQL, graph HTTP, Bolt, SPARQL and the web
+console have TLS and must require it; SPARQL and graph/Bolt are exempt only
+when disabled (`[sparql] enabled = false`, `[graph] enabled = false` — the graph
+HTTP port then serves only a fixed 503 stub, over TLS if a certificate is set).
+Arrow Flight (t_58db6320) follows the same rule: an enabled Flight listener
+must set `[flight] require_tls = true` with `[flight] tls_cert` / `tls_key`
+(env `FERROSA_FLIGHT_TLS_CERT` / `_TLS_KEY` / `_REQUIRE_TLS`). It serves gRPC
+over TLS with ALPN `h2`, terminated with tokio-rustls on a config from
+`ferrosa_net::tls` (not tonic's own TLS), and advertises replica locations as
+`grpc+tls://`. Release `full` builds no longer need `[flight] enabled = false`
+to start in production; that key now only turns the port off. Mutual TLS is not
+required yet (t_b6c820f4). With `[web] require_tls`, `/readyz` and `/metrics` are HTTPS too.
+
 
 ## Startup order (`main`)
 
@@ -65,15 +112,16 @@ cluster view, the `SharedState` before the CQL/Flight servers). See
 6. **Schema** — `Schema::new` (composes audit sinks); apply the preflighted local snapshot or use S3 bootstrap/fresh startup; replay pending commit-log mutations; restore roles before seeding only missing defaults; then reconstruct secondary indexes, UDTs, UDFs, and role permissions from the system tables.
 7. **ModeController** — `ClusterConfig`/`NetConfig` (with TOML overrides, BUG-006); preserve `[internode].broadcast` as both the resolved local address and the raw peer-handshake advertisement; build the `HandlerRegistry` (ping, pair-catchup, mutation/truncate forward, three repair handlers); construct controller in standalone mode.
 8. **PeerManager** — wire as `ModeController`'s `PeerEventListener`; start the heartbeat loop; spawn the self-heal controller with a **live** peer-health probe.
-9. **Internode RPC** (`:17000`) — `RpcServer::start_and_get_addr`.
-10. **CQL server** (`:9042`) — build `SharedState` (`SessionCore` + Accord HLC + prepared cache + observability trackers + virtual tables) and `start_background`.
-11. **Arrow Flight** (`:8815`, `flight` feature) — signing key from `FERROSA_FLIGHT_SIGNING_KEY` (ephemeral if unset — warns).
-12. **Web console** (`:9090`).
-13. **Automatic repair** — self-heal controller with verified-replica cluster view + quarantine→refill trigger; periodic anti-entropy scheduler.
-14. **Graph** (HTTP `:7474` + Bolt `:7687`) if enabled; **Postgres** (`:5432`); **SPARQL** (`:8080`) if enabled.
-15. **Seeds** — background connect to `FERROSA_SEED` peers with exponential backoff.
-16. **Maintenance loop** — periodic + urgent flush, compaction polling, commit-log GC, schema persist (local + S3).
-17. **Shutdown** — `SIGINT`/`SIGTERM` → 30 s graceful drain: stop cluster tasks → drain internode → flush memtables → persist schema (local + S3).
+9. **Production gate** — resolve every listener's TLS settings, load each configured certificate, and run `enforce_production_requirements` (auth, listener + internode TLS, default admin password); exit 1 on a blocking violation.
+10. **Internode RPC** (`:17000`) — `RpcServer::start_and_get_addr`.
+11. **CQL server** (`:9042`) — build `SharedState` (`SessionCore` + Accord HLC + prepared cache + observability trackers + virtual tables) and `start_background`.
+12. **Arrow Flight** (`:8815`, `flight` feature, after the listener-status registry so a bind or TLS failure shows in `/readyz` as `flight`) — signing key from `FERROSA_FLIGHT_SIGNING_KEY` (ephemeral if unset — warns); `FERROSA_FLIGHT_TOKEN_TTL_SECS` must be a positive integer (a typo is fatal, it used to fall back to 3600 silently); TLS when `[flight] tls_cert/tls_key` are set.
+13. **Web console** (`:9090`).
+14. **Automatic repair** — self-heal controller with verified-replica cluster view + quarantine→refill trigger; periodic anti-entropy scheduler.
+15. **Graph** (HTTP `:7474` + Bolt `:7687`) if enabled; **Postgres** (`:5432`); **SPARQL** (`:8080`) if enabled.
+16. **Seeds** — background connect to `FERROSA_SEED` peers with exponential backoff.
+17. **Maintenance loop** — periodic + urgent flush, compaction polling, commit-log GC, schema persist (local + S3).
+18. **Shutdown** — `SIGINT`/`SIGTERM` → 30 s graceful drain: stop cluster tasks → drain internode → flush memtables → persist schema (local + S3).
 
 ## How the subsystems compose
 
@@ -115,7 +163,8 @@ flat under tight cgroups; override at process startup with `_RJEM_MALLOC_CONF`.
 | `FERROSA_AUTH_DISABLED` | **deprecated** direct override — honored with a warning |
 | `FERROSA_SEED` | comma-separated seed peers (`host:port`, DNS-resolved) |
 | `FERROSA_GRAPH_ENABLED` / `FERROSA_SPARQL_ENABLED` | enable graph (HTTP+Bolt) / SPARQL front-ends |
-| `FERROSA_FLIGHT_BIND` / `FERROSA_FLIGHT_SIGNING_KEY` / `FERROSA_FLIGHT_TOKEN_TTL_SECS` | Flight endpoint (when `flight` feature is built) |
+| `FERROSA_TLS_CERT` / `_KEY` / `_CA` / `FERROSA_TLS_REQUIRE` | node-wide certificate for every listener + internode (`[tls]`), overridden per section |
+| `FERROSA_FLIGHT_BIND` / `FERROSA_FLIGHT_ENABLED` / `FERROSA_FLIGHT_SIGNING_KEY` / `FERROSA_FLIGHT_TOKEN_TTL_SECS` / `FERROSA_FLIGHT_PORT` / `FERROSA_FLIGHT_TLS_CERT` / `_TLS_KEY` / `_REQUIRE_TLS` | Flight endpoint (when `flight` feature is built); `FERROSA_FLIGHT_PORT` is the port advertised for remote replicas, default the node's own `[flight] bind` port |
 | `FERROSA_TELEMETRY_ENABLED` | install the OTel tracing layer (when `otel` feature is built) |
 | `FERROSA_SELFHEAL_ENABLED` | self-heal quarantine controller (default on) |
 | `FERROSA_FLUSH_INTERVAL_SECS`, `FERROSA_URGENT_*` | maintenance-loop cadences |

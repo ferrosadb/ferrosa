@@ -234,50 +234,20 @@ impl CqlServer {
 
     /// Build a TLS acceptor from cert/key paths if configured.
     fn build_tls_acceptor(&self) -> Result<Option<TlsAcceptor>, CqlError> {
-        match (&self.config.tls_cert_path, &self.config.tls_key_path) {
-            (Some(cert_path), Some(key_path)) => {
-                let cert_file = std::fs::File::open(cert_path).map_err(|e| {
-                    CqlError::ServerError(format!("failed to open TLS cert {cert_path}: {e}"))
-                })?;
-                let key_file = std::fs::File::open(key_path).map_err(|e| {
-                    CqlError::ServerError(format!("failed to open TLS key {key_path}: {e}"))
-                })?;
-
-                let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| {
-                        CqlError::ServerError(format!("failed to parse TLS certs: {e}"))
-                    })?;
-
-                let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
-                    .map_err(|e| CqlError::ServerError(format!("failed to parse TLS key: {e}")))?
-                    .ok_or_else(|| {
-                        CqlError::ServerError("no private key found in TLS key file".into())
-                    })?;
-
-                let provider = rustls::crypto::ring::default_provider();
-                let config = rustls::ServerConfig::builder_with_provider(provider.into())
-                    .with_safe_default_protocol_versions()
-                    .map_err(|e| CqlError::ServerError(format!("TLS protocol error: {e}")))?
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)
-                    .map_err(|e| CqlError::ServerError(format!("TLS config error: {e}")))?;
-
-                info!("TLS enabled for CQL connections");
-                Ok(Some(TlsAcceptor::from(Arc::new(config))))
-            }
-            (None, None) => {
-                if self.config.require_tls {
-                    return Err(CqlError::ServerError(
-                        "require_tls is true but no tls_cert_path/tls_key_path configured".into(),
-                    ));
-                }
-                Ok(None)
-            }
-            _ => Err(CqlError::ServerError(
-                "both tls_cert_path and tls_key_path must be set (or neither)".into(),
-            )),
+        // The provider and PEM loading live in ferrosa-net so every listener
+        // shares one crypto-provider decision.
+        let server_config = ferrosa_net::tls::optional_server_config(
+            "CQL",
+            self.config.tls_cert_path.as_deref(),
+            self.config.tls_key_path.as_deref(),
+            self.config.require_tls,
+            &[],
+        )
+        .map_err(|e| CqlError::ServerError(e.to_string()))?;
+        if server_config.is_some() {
+            info!("TLS enabled for CQL connections");
         }
+        Ok(server_config.map(TlsAcceptor::from))
     }
 
     /// Start the server in the background. Returns the bound address.

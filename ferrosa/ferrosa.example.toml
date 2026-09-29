@@ -2,6 +2,16 @@
 # Config-file values override environment variables.
 # Copy to /etc/ferrosa/ferrosa.toml or specify with FERROSA_CONFIG env var.
 
+# One certificate for every listener and internode (overridden by any
+# section's own tls_cert/tls_key/require_tls). Env FERROSA_TLS_CERT / _KEY /
+# _CA / FERROSA_TLS_REQUIRE. With require = true (and auth) production mode
+# is satisfied.
+[tls]
+# cert = "/etc/ferrosa/tls/node.crt"
+# key = "/etc/ferrosa/tls/node.key"
+# ca = "/etc/ferrosa/tls/ca.crt"
+# require = false
+
 [cql]
 bind = "127.0.0.1:9042"
 auth_disabled = false
@@ -17,6 +27,11 @@ bind = "127.0.0.1:17000"
 # seed = "192.168.1.2:17000"
 cluster_name = "ferrosa"
 # psk = "shared-secret-key"
+# One-way server TLS; required when FERROSA_MODE=production.
+# tls_cert = "/etc/ferrosa/tls/node.crt"
+# tls_key = "/etc/ferrosa/tls/node.key"
+# require_tls = false
+# tls_ca = "/etc/ferrosa/tls/ca.crt"
 
 [storage]
 data_dir = "/var/lib/ferrosa"
@@ -39,20 +54,42 @@ memtable_num_shards = 64
 # All standard endpoints are ON by default and bind to localhost. To expose an
 # endpoint to a LAN or cluster, explicitly set its bind address to a non-loopback
 # value and configure authentication before doing so.
+#
+# FERROSA_MODE=production refuses to start unless every ENABLED listener and
+# internode require TLS — [tls] require = true with cert/key does it once.
 
 [graph]
 enabled = true                    # graph HTTP (7474) + Bolt (7687); set false to disable
 bind = "127.0.0.1:7474"
+# Shared by graph HTTP and Bolt.
+# tls_cert = "/etc/ferrosa/tls/server.crt"
+# tls_key = "/etc/ferrosa/tls/server.key"
+# require_tls = false
 
 [sparql]
 enabled = true                    # SPARQL 1.1 endpoint (8080); set false to disable
 bind = "127.0.0.1:8080"
+# tls_cert = "/etc/ferrosa/tls/server.crt"
+# tls_key = "/etc/ferrosa/tls/server.key"
+# require_tls = false
 
 [web]
 bind = "127.0.0.1:9090"
+# tls_cert = "/etc/ferrosa/tls/server.crt"
+# tls_key = "/etc/ferrosa/tls/server.key"
+# require_tls = false
 
 [postgres]
 bind = "127.0.0.1:5432"
+# tls_cert = "/etc/ferrosa/tls/server.crt"
+# tls_key = "/etc/ferrosa/tls/server.key"
+# require_tls = false
 
 [flight]
+# Arrow Flight gRPC (8815), only in builds with the `flight` feature (release
+# `full` builds). TLS is served with ALPN h2; gRPC clients connect with https://.
 bind = "127.0.0.1:8815"
+# enabled = true
+# tls_cert = "/etc/ferrosa/tls/server.crt"
+# tls_key = "/etc/ferrosa/tls/server.key"
+# require_tls = false

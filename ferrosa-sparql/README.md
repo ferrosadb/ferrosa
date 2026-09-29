@@ -10,7 +10,10 @@
 plans the algebra into storage operations against ferrosa's `rdf_triples` table
 (`((graph, subject), predicate, object)`), executes them via the cluster write
 path, and serializes results with hand-written JSON / XML / N-Triples / Turtle
-encoders. The HTTP surface implements the SPARQL 1.1 Protocol over `axum`.
+encoders. The HTTP surface implements the SPARQL 1.1 Protocol over `axum`, and
+serves HTTPS only when `SparqlHttpConfig` carries a certificate (`[sparql]
+tls_cert/tls_key`); `require_tls` without one refuses to start (t_d5d122ba). The
+rustls config comes from `ferrosa_net::tls`, the process's single crypto provider.
 
 Its model is **one RDF graph per keyspace**: the `graph` partition-key component
 is the keyspace name, and there is exactly one `rdf_triples` table per keyspace.
@@ -133,9 +136,10 @@ case the scan runs to completion under the bound instead. `ASK` is planned with
   (the storage row shapes it reads and writes).
 - **`ferrosa-index`** — `IndexKey` for the `rdf_triples_object_idx` ObjectScan.
 - **`ferrosa-schema`** — `Schema` carried in `AppState`.
+- **`ferrosa-net`** — `tls::optional_server_config` builds the HTTPS config.
 
 External: `spargebra`, `sparesults`, `oxrdf` (all with `sparql-12`/`rdf-12`),
-`axum`, `tokio`, `futures` (`StreamExt` over the partition stream), `tower-http`,
+`axum`, `axum-server` (`tls-rustls-no-provider`), `tokio`, `futures` (`StreamExt` over the partition stream), `tower-http`,
 `serde`/`serde_json`, `serde_urlencoded`, `base64` (declared, currently unused),
 `uuid`, `tracing`.
 

@@ -17,8 +17,9 @@ use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::authz;
 use crate::codec::{self, CodecError};
-use crate::connection::{ConnError, Connection};
+use crate::connection::{ConnError, Connection, TlsPolicy};
 use crate::extended::{self, PreparedKind, Session};
 use crate::handshake::{HandshakeError, VerifierStore};
 use crate::messages::{BackendMessage, FrontendMessage};
@@ -54,8 +55,139 @@ fn sqlstate(err: &ConnError) -> &'static str {
     match err {
         ConnError::Handshake(HandshakeError::Scram(_))
         | ConnError::Handshake(HandshakeError::UnknownRole) => "28P01", // invalid_password
-        ConnError::Handshake(_) => "28000", // invalid_authorization
-        ConnError::Codec(_) | ConnError::Unexpected(_) => "08P01", // protocol_violation
+        ConnError::Handshake(_) | ConnError::TlsRequired => "28000", // invalid_authorization
+        ConnError::Codec(_) | ConnError::Unexpected(_) => "08P01",   // protocol_violation
+    }
+}
+
+/// Operator-facing text for a fatal connection error. Refusals name their
+/// reason so a client log says why the connection was closed.
+fn fatal_message(err: &ConnError) -> String {
+    match err {
+        ConnError::Handshake(HandshakeError::Throttled(reason)) => {
+            format!("login throttled for this role (failed-login limiter): {reason}")
+        }
+        ConnError::Handshake(HandshakeError::LoginRefused(reason)) => {
+            format!("login refused: {reason}")
+        }
+        ConnError::TlsRequired => "TLS is required: this server refuses unencrypted \
+             connections ([postgres] require_tls = true); connect with sslmode=require"
+            .to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// TLS for the PostgreSQL listener: an acceptor when a certificate is
+/// configured, and whether a client must negotiate TLS before its
+/// StartupMessage.
+///
+/// Built through `ferrosa_net::tls`, the same machinery (and the single crypto
+/// provider) the CQL and internode listeners use.
+#[derive(Clone)]
+pub struct PgTls {
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    require: bool,
+}
+
+impl PgTls {
+    /// Plaintext listener: `SSLRequest` is declined with `N`.
+    pub fn plaintext() -> Self {
+        Self {
+            acceptor: None,
+            require: false,
+        }
+    }
+
+    /// Build from `[postgres] tls_cert` / `tls_key` / `require_tls`.
+    ///
+    /// `require` without a certificate, or only one of cert/key, is an error —
+    /// never a silent fall back to plaintext.
+    pub fn from_pem(
+        cert_path: Option<&str>,
+        key_path: Option<&str>,
+        require: bool,
+    ) -> Result<Self, String> {
+        let config =
+            ferrosa_net::tls::optional_server_config("postgres", cert_path, key_path, require, &[])
+                .map_err(|e| e.to_string())?;
+        Ok(Self {
+            acceptor: config.map(tokio_rustls::TlsAcceptor::from),
+            require,
+        })
+    }
+
+    /// Whether TLS is offered to clients (a certificate is configured).
+    pub fn offers_tls(&self) -> bool {
+        self.acceptor.is_some()
+    }
+
+    /// Whether clients must negotiate TLS.
+    pub fn requires_tls(&self) -> bool {
+        self.require
+    }
+
+    fn policy(&self) -> TlsPolicy {
+        TlsPolicy {
+            offer: self.acceptor.is_some(),
+            require: self.require,
+        }
+    }
+}
+
+/// How the startup phase ended.
+enum StartupOutcome {
+    /// Authenticated; the session is at `ReadyForQuery`.
+    Ready,
+    /// `S` was sent; the caller must run the TLS handshake.
+    TlsUpgrade,
+    /// The client left or a fatal error was already reported to it.
+    Closed,
+}
+
+/// Upper bound on the server-side TLS handshake, as for CQL.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Drive `conn` over `stream` through startup (+ SCRAM) until it is ready,
+/// asks for a TLS upgrade, or closes.
+async fn drive_startup<St, S>(
+    stream: &mut St,
+    conn: &mut Connection<'_, S>,
+    buf: &mut [u8],
+) -> std::io::Result<StartupOutcome>
+where
+    St: AsyncRead + AsyncWrite + Unpin,
+    S: VerifierStore,
+{
+    loop {
+        let n = stream.read(buf).await?;
+        if n == 0 {
+            return Ok(StartupOutcome::Closed); // client closed before authenticating
+        }
+        match conn.on_bytes(&buf[..n]) {
+            Ok(out) => {
+                if !out.is_empty() {
+                    stream.write_all(&out).await?;
+                }
+                if conn.is_closed() {
+                    return Ok(StartupOutcome::Closed);
+                }
+                if conn.tls_upgrade_pending() {
+                    return Ok(StartupOutcome::TlsUpgrade);
+                }
+                if conn.is_ready() {
+                    return Ok(StartupOutcome::Ready);
+                }
+            }
+            Err(e) => {
+                tracing::info!(error = ?e, "PostgreSQL connection refused during startup");
+                if let Err(write_error) =
+                    write_fatal(stream, sqlstate(&e), &fatal_message(&e)).await
+                {
+                    tracing::debug!(%write_error, "could not send PostgreSQL startup error response");
+                }
+                return Ok(StartupOutcome::Closed);
+            }
+        }
     }
 }
 
@@ -83,48 +215,80 @@ pub async fn handle_connection<St, S>(
     mut stream: St,
     store: Arc<S>,
     ctx: Arc<QueryContext>,
+    tls: &PgTls,
 ) -> std::io::Result<()>
 where
     St: AsyncRead + AsyncWrite + Unpin,
     S: VerifierStore,
 {
-    let mut conn = Connection::new(&*store, random_server_nonce());
+    let mut conn = Connection::new(&*store, random_server_nonce(), tls.policy());
     let mut buf = [0u8; 8192];
 
-    // ── Phase 1: handshake (startup + SCRAM) until ReadyForQuery ──────────────
-    loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(()); // client closed before authenticating
-        }
-        match conn.on_bytes(&buf[..n]) {
-            Ok(out) => {
-                if !out.is_empty() {
-                    stream.write_all(&out).await?;
-                }
-                if conn.is_closed() {
-                    return Ok(());
-                }
-                if conn.is_ready() {
-                    break;
-                }
+    // ── Phase 1: startup (+ optional TLS upgrade) + SCRAM until ReadyForQuery ─
+    match drive_startup(&mut stream, &mut conn, &mut buf).await? {
+        StartupOutcome::Closed => Ok(()),
+        StartupOutcome::Ready => serve_authenticated(stream, conn, &ctx, &mut buf).await,
+        StartupOutcome::TlsUpgrade => {
+            let Some(acceptor) = &tls.acceptor else {
+                // The policy only offers TLS when an acceptor exists, so this
+                // is a wiring bug, not a client error.
+                return Err(std::io::Error::other(
+                    "PostgreSQL connection asked for a TLS upgrade with no acceptor configured",
+                ));
+            };
+            let mut tls_stream =
+                match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(tls_stream)) => tls_stream,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "PostgreSQL TLS handshake failed");
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        tracing::warn!("PostgreSQL TLS handshake timed out");
+                        return Ok(());
+                    }
+                };
+            if let Err(error) = conn.on_tls_established() {
+                return Err(std::io::Error::other(format!(
+                    "PostgreSQL TLS state machine out of step: {error:?}"
+                )));
             }
-            Err(e) => {
-                if let Err(write_error) =
-                    write_fatal(&mut stream, sqlstate(&e), &format!("{e:?}")).await
-                {
-                    tracing::debug!(%write_error, "could not send PostgreSQL startup error response");
+            match drive_startup(&mut tls_stream, &mut conn, &mut buf).await? {
+                StartupOutcome::Closed => Ok(()),
+                StartupOutcome::Ready => {
+                    serve_authenticated(tls_stream, conn, &ctx, &mut buf).await
                 }
-                return Ok(());
+                // The connection refuses a second SSLRequest itself, so a
+                // second upgrade request cannot get here.
+                StartupOutcome::TlsUpgrade => Err(std::io::Error::other(
+                    "PostgreSQL connection asked for a second TLS upgrade",
+                )),
             }
         }
     }
+}
 
-    // ── Phase 2: query loop ───────────────────────────────────────────────────
+/// Phase 2: the post-auth query loop, run as the authenticated role.
+async fn serve_authenticated<St, S>(
+    mut stream: St,
+    mut conn: Connection<'_, S>,
+    ctx: &QueryContext,
+    buf: &mut [u8],
+) -> std::io::Result<()>
+where
+    St: AsyncRead + AsyncWrite + Unpin,
+    S: VerifierStore,
+{
+    let Some(auth) = conn.auth_context().cloned() else {
+        // Ready without an authenticated role would run queries unauthorized.
+        return Err(std::io::Error::other(
+            "PostgreSQL session reached ReadyForQuery without an authenticated role",
+        ));
+    };
     // Seed the frame buffer with any bytes the client pipelined in the same
     // segment as the SASL final response (so a pipelined first query is not lost).
     let mut frames = conn.take_inbuf();
-    query_loop(&mut stream, &mut frames, &ctx, &mut buf).await
+    query_loop(&mut stream, &mut frames, ctx, auth, buf).await
 }
 
 /// Frame and serve queries — both the **simple** (`Q`) and **extended**
@@ -137,12 +301,13 @@ async fn query_loop<St>(
     stream: &mut St,
     frames: &mut BytesMut,
     ctx: &QueryContext,
+    auth: ferrosa_schema::AuthContext,
     read_buf: &mut [u8],
 ) -> std::io::Result<()>
 where
     St: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut session = Session::new();
+    let mut session = Session::new(auth);
     loop {
         match codec::read_frontend(frames) {
             Ok(Some(msg)) => {
@@ -348,6 +513,16 @@ async fn execute_simple_inner(
             "25P02",
             "current transaction is aborted, commands ignored until end of transaction block",
         )];
+    }
+
+    // t_e1c819ad: authorize against the role before anything touches storage.
+    if let Err(denied) = authz::authorize(
+        &ctx.schema,
+        session.auth(),
+        &authz::statement_permissions(&stmt, &ctx.default_schema),
+    ) {
+        session.mark_txn_failed();
+        return vec![denied];
     }
 
     match stmt {
@@ -717,6 +892,15 @@ async fn describe(
             };
             let parsed = stmt.parsed.clone();
             let declared = stmt.param_oids.clone();
+            // Describe resolves the referenced tables' columns; a role that may
+            // not run the statement learns nothing about those tables either.
+            if let Err(denied) = authz::authorize(
+                &ctx.schema,
+                session.auth(),
+                &authz::prepared_permissions(&parsed, &ctx.default_schema),
+            ) {
+                return vec![session.fail(denied)];
+            }
             match parsed {
                 PreparedKind::Select(select) => {
                     // ParameterDescription: a driver (e.g. tokio-postgres) relies
@@ -829,6 +1013,13 @@ async fn describe(
                 ))];
             };
             let parsed = stmt.parsed.clone();
+            if let Err(denied) = authz::authorize(
+                &ctx.schema,
+                session.auth(),
+                &authz::prepared_permissions(&parsed, &ctx.default_schema),
+            ) {
+                return vec![session.fail(denied)];
+            }
             match parsed {
                 PreparedKind::Select(select) => {
                     match describe_columns(ctx, session, &select).await {
@@ -1002,6 +1193,16 @@ async fn execute_portal_inner(
         ))];
     };
     let parsed = stmt.parsed.clone();
+
+    // t_e1c819ad: authorize the portal's statement before it executes.
+    if let Err(denied) = authz::authorize(
+        &ctx.schema,
+        session.auth(),
+        &authz::prepared_permissions(&parsed, &ctx.default_schema),
+    ) {
+        session.mark_txn_failed();
+        return vec![session.fail(denied)];
+    }
 
     if let Some(error) = expired_transaction_error(ctx, session) {
         session.mark_txn_failed();
@@ -1208,10 +1409,17 @@ pub async fn serve<S>(
     listener: TcpListener,
     store: Arc<S>,
     ctx: Arc<QueryContext>,
+    tls: PgTls,
 ) -> std::io::Result<()>
 where
     S: VerifierStore + Send + Sync + 'static,
 {
+    tracing::info!(
+        offers_tls = tls.offers_tls(),
+        requires_tls = tls.requires_tls(),
+        "PostgreSQL listener TLS posture"
+    );
+    let tls = Arc::new(tls);
     let _snapshot_reaper = crate::mvcc::MvccManager::spawn_snapshot_reaper(ctx.mvcc.clone());
     if let Some(committer) = &ctx.accord_committer {
         committer
@@ -1222,8 +1430,9 @@ where
         let (stream, peer) = listener.accept().await?;
         let store = Arc::clone(&store);
         let ctx = Arc::clone(&ctx);
+        let tls = Arc::clone(&tls);
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, store, ctx).await {
+            if let Err(error) = handle_connection(stream, store, ctx, &tls).await {
                 tracing::warn!(%peer, %error, "PostgreSQL connection ended with an I/O error");
             }
         });
@@ -1424,7 +1633,7 @@ mod txn_atomicity_tests {
         // BEGIN; INSERT (buffered); ROLLBACK ⇒ the row was never applied.
         // Contrast: an autocommit INSERT IS applied.
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
 
         let m = execute_simple(&ctx, &mut session, "BEGIN").await;
         assert!(matches!(&m[..], [BackendMessage::CommandComplete { tag }] if tag == "BEGIN"));
@@ -1476,7 +1685,7 @@ mod txn_atomicity_tests {
     async fn commit_uses_postgres_mvcc_without_accord() {
         // PostgreSQL owns its MVCC commit path in standalone and cluster modes.
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
 
         execute_simple(&ctx, &mut session, "BEGIN").await;
         execute_simple(
@@ -1508,7 +1717,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn commit_applies_postgres_write_set() {
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
 
         execute_simple(&ctx, &mut session, "BEGIN").await;
         execute_simple(
@@ -1538,7 +1747,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn multi_row_snapshots_hide_partial_replica_apply() {
         let (_dir, ctx) = make_ctx().await;
-        let mut seed = Session::new();
+        let mut seed = Session::new(superuser());
         for (key, value) in [("row-a", "before-a"), ("row-b", "before-b")] {
             let insert = format!("INSERT INTO kv (k, v) VALUES ('{key}', '{value}')");
             execute_simple(&ctx, &mut seed, &insert).await;
@@ -1546,7 +1755,7 @@ mod txn_atomicity_tests {
 
         let before_ts = ferrosa_common::accord::Timestamp::synthetic(19);
         let commit_ts = ferrosa_common::accord::Timestamp::synthetic(20);
-        let mut writer = Session::new();
+        let mut writer = Session::new(superuser());
         writer.begin_txn(
             Some(ferrosa_sql::IsolationLevel::Serializable),
             ctx.mvcc.snapshot_with_cluster_ts(before_ts),
@@ -1653,7 +1862,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn committed_transaction_survives_restart_and_uncommitted_buffer_does_not() {
         let (dir, ctx) = make_ctx().await;
-        let mut committed = Session::new();
+        let mut committed = Session::new(superuser());
         execute_simple(&ctx, &mut committed, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         execute_simple(
             &ctx,
@@ -1667,7 +1876,7 @@ mod txn_atomicity_tests {
             "the transaction must commit before restart: {commit:?}"
         );
 
-        let mut abandoned = Session::new();
+        let mut abandoned = Session::new(superuser());
         execute_simple(&ctx, &mut abandoned, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         execute_simple(
             &ctx,
@@ -1693,7 +1902,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn failed_storage_preflight_rejects_the_entire_postgres_write_set() {
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
         execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         execute_simple(
             &ctx,
@@ -1728,7 +1937,7 @@ mod txn_atomicity_tests {
         // A statement that errors inside a txn poisons it; subsequent DML hits
         // 25P02; COMMIT is treated as ROLLBACK and nothing is applied.
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
 
         execute_simple(&ctx, &mut session, "BEGIN").await;
         // A bad INSERT (missing PK column) errors and poisons the txn.
@@ -1765,7 +1974,7 @@ mod txn_atomicity_tests {
     async fn select_inside_txn_still_works() {
         // A read inside a transaction is served normally (it does not buffer).
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
         execute_simple(&ctx, &mut session, "BEGIN").await;
         let m = execute_simple(&ctx, &mut session, "SELECT 1").await;
         assert!(
@@ -1780,8 +1989,8 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn transaction_reads_keep_the_begin_snapshot_after_a_concurrent_commit() {
         let (_dir, ctx) = make_ctx().await;
-        let mut reader = Session::new();
-        let mut writer = Session::new();
+        let mut reader = Session::new(superuser());
+        let mut writer = Session::new(superuser());
 
         let inserted = execute_simple(
             &ctx,
@@ -1846,8 +2055,8 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn expired_transaction_rejects_followup_read_instead_of_using_current_rows() {
         let (_dir, ctx) = make_ctx().await;
-        let mut reader = Session::new();
-        let mut writer = Session::new();
+        let mut reader = Session::new(superuser());
+        let mut writer = Session::new(superuser());
 
         execute_simple(
             &ctx,
@@ -1883,7 +2092,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn expired_read_only_transaction_cannot_commit_successfully() {
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
         execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         assert_eq!(ctx.mvcc.expire_all_snapshots_for_test(), 1);
 
@@ -1900,7 +2109,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn expired_transaction_rejects_extended_protocol_dml_before_buffering() {
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
         execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         assert_eq!(ctx.mvcc.expire_all_snapshots_for_test(), 1);
 
@@ -1938,7 +2147,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn serializable_transaction_reads_its_own_buffered_insert() {
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
         execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         execute_simple(
             &ctx,
@@ -1964,15 +2173,15 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn transaction_reads_its_own_update_and_delete_but_rollback_hides_them() {
         let (_dir, ctx) = make_ctx().await;
-        let mut seed = Session::new();
+        let mut seed = Session::new(superuser());
         execute_simple(
             &ctx,
             &mut seed,
             "INSERT INTO kv (k, v) VALUES ('own-update', 'old')",
         )
         .await;
-        let mut writer = Session::new();
-        let mut observer = Session::new();
+        let mut writer = Session::new(superuser());
+        let mut observer = Session::new(superuser());
         execute_simple(&ctx, &mut writer, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         execute_simple(
             &ctx,
@@ -2011,7 +2220,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn serializable_read_write_skew_is_rejected_at_commit() {
         let (_dir, ctx) = make_ctx().await;
-        let mut seed = Session::new();
+        let mut seed = Session::new(superuser());
         execute_simple(
             &ctx,
             &mut seed,
@@ -2025,8 +2234,8 @@ mod txn_atomicity_tests {
         )
         .await;
 
-        let mut first = Session::new();
-        let mut second = Session::new();
+        let mut first = Session::new(superuser());
+        let mut second = Session::new(superuser());
         execute_simple(&ctx, &mut first, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         execute_simple(&ctx, &mut second, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         execute_simple(&ctx, &mut first, "SELECT v FROM kv WHERE k = 'right'").await;
@@ -2053,7 +2262,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn serializable_predicate_read_detects_a_phantom_insert() {
         let (_dir, ctx) = make_ctx().await;
-        let mut seed = Session::new();
+        let mut seed = Session::new(superuser());
         execute_simple(
             &ctx,
             &mut seed,
@@ -2061,8 +2270,8 @@ mod txn_atomicity_tests {
         )
         .await;
 
-        let mut reader = Session::new();
-        let mut inserter = Session::new();
+        let mut reader = Session::new(superuser());
+        let mut inserter = Session::new(superuser());
         execute_simple(&ctx, &mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'missing'").await;
         execute_simple(&ctx, &mut inserter, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
@@ -2093,7 +2302,7 @@ mod txn_atomicity_tests {
     #[tokio::test]
     async fn extended_protocol_select_uses_serializable_snapshot() {
         let (_dir, ctx) = make_ctx().await;
-        let mut writer = Session::new();
+        let mut writer = Session::new(superuser());
         execute_simple(
             &ctx,
             &mut writer,
@@ -2101,7 +2310,7 @@ mod txn_atomicity_tests {
         )
         .await;
 
-        let mut reader = Session::new();
+        let mut reader = Session::new(superuser());
         execute_simple(&ctx, &mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
         reader.on_parse(
             "read".to_string(),

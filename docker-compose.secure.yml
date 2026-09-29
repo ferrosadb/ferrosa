@@ -1,13 +1,31 @@
 ##############################################################################
-# SECURE OVERLAY — enable CQL auth with production-mode credentials          #
+# SECURE OVERLAY — production mode: auth on, TLS on every listener           #
 #                                                                            #
 # Usage:                                                                     #
+#   scripts/gen-compose-test-certs.sh      # throwaway test CA + node certs  #
 #   FERROSA_SEED_ADMIN_PASSWORD='<strong-password>' \                        #
 #     docker compose -f docker-compose.yml -f docker-compose.secure.yml up   #
 #                                                                            #
 # This overlay clears the dev-only FERROSA_AUTH_DISABLED flag, enables       #
-# auth, and switches the binary to FERROSA_MODE=production:                  #
+# auth, and switches the binary to FERROSA_MODE=production. Production mode  #
+# refuses to start unless every enabled client listener (CQL, PostgreSQL,    #
+# graph HTTP, Bolt, SPARQL, web console, Arrow Flight) requires TLS and      #
+# internode traffic is TLS (t_d5d122ba, t_58db6320), so this overlay also:   #
 #                                                                            #
+#   - mounts .compose-tls/nodeN (from scripts/gen-compose-test-certs.sh)     #
+#     read-only at /etc/ferrosa/tls in each node,                            #
+#   - sets ONE node-wide certificate (FERROSA_TLS_CERT/KEY/CA/REQUIRE) that  #
+#     covers every listener and internode,                                   #
+#   - publishes Arrow Flight (8815) on node1 for the TLS probe,              #
+#   - pins each node to 172.28.77.10N on a fixed subnet: internode TLS        #
+#     verifies the peer's IP address, and the test certificates carry those  #
+#     IPs as SANs,                                                           #
+#   - probes /readyz over HTTPS.                                             #
+#                                                                            #
+# The certificates are THROWAWAY test certificates. A real deployment        #
+# mounts certificates from its own PKI at the same paths.                    #
+#                                                                            #
+# Credentials:                                                               #
 #   - If FERROSA_SEED_ADMIN_PASSWORD is set, ferrosa_admin is seeded with    #
 #     that password on first bootstrap.                                      #
 #   - If it is unset, a cryptographically random password is generated and   #
@@ -18,26 +36,70 @@
 #                                                                            #
 # Seeding only happens when the roles do not exist yet; restarting an        #
 # already-bootstrapped cluster never changes or reveals passwords.           #
+#                                                                            #
+# Clients: cqlsh --ssl with SSL_CERTFILE=.compose-tls/ca.crt, psql with      #
+# sslmode=verify-full sslrootcert=.compose-tls/ca.crt, curl --cacert.        #
 ##############################################################################
+
+x-ferrosa-secure-env: &ferrosa-secure-env
+  FERROSA_AUTH_DISABLED: ""     # clear the dev-only flag
+  FERROSA_AUTH_ENABLED: "true"
+  FERROSA_MODE: "production"
+  FERROSA_SEED_ADMIN_PASSWORD: "${FERROSA_SEED_ADMIN_PASSWORD:-}"
+  # ONE node-wide certificate ([tls] / FERROSA_TLS_*) covers every client
+  # listener (CQL, PostgreSQL, graph HTTP + Bolt, SPARQL, web console, Arrow
+  # Flight) and internode; REQUIRE makes each of them refuse plaintext. A
+  # listener's own FERROSA_<LISTENER>_TLS_* would override it; none is set.
+  FERROSA_TLS_CERT: /etc/ferrosa/tls/node.crt
+  FERROSA_TLS_KEY: /etc/ferrosa/tls/node.key
+  FERROSA_TLS_CA: /etc/ferrosa/tls/ca.crt       # internode peer verification
+  FERROSA_TLS_REQUIRE: "true"
+  # Arrow Flight binds only in `flight`/`full` builds; reachable on the
+  # compose network and published on node1 for scripts/flight-tls-probe.sh.
+  FERROSA_FLIGHT_BIND: "0.0.0.0:8815"
+
+x-ferrosa-secure-healthcheck: &ferrosa-secure-healthcheck
+  test: ["CMD", "curl", "-sf", "--cacert", "/etc/ferrosa/tls/ca.crt", "https://127.0.0.1:9090/readyz"]
+  interval: 10s
+  timeout: 5s
+  retries: 30
+  start_period: 30s
 
 services:
   node1:
     environment:
-      FERROSA_AUTH_DISABLED: ""     # clear the dev-only flag
-      FERROSA_AUTH_ENABLED: "true"
-      FERROSA_MODE: "production"
-      FERROSA_SEED_ADMIN_PASSWORD: "${FERROSA_SEED_ADMIN_PASSWORD:-}"
+      <<: *ferrosa-secure-env
+    volumes:
+      - ./.compose-tls/node1:/etc/ferrosa/tls:ro
+    ports:
+      - "8815:8815"   # Arrow Flight over TLS (flight builds)
+    networks:
+      default:
+        ipv4_address: 172.28.77.101
+    healthcheck: *ferrosa-secure-healthcheck
 
   node2:
     environment:
-      FERROSA_AUTH_DISABLED: ""
-      FERROSA_AUTH_ENABLED: "true"
-      FERROSA_MODE: "production"
-      FERROSA_SEED_ADMIN_PASSWORD: "${FERROSA_SEED_ADMIN_PASSWORD:-}"
+      <<: *ferrosa-secure-env
+    volumes:
+      - ./.compose-tls/node2:/etc/ferrosa/tls:ro
+    networks:
+      default:
+        ipv4_address: 172.28.77.102
+    healthcheck: *ferrosa-secure-healthcheck
 
   node3:
     environment:
-      FERROSA_AUTH_DISABLED: ""
-      FERROSA_AUTH_ENABLED: "true"
-      FERROSA_MODE: "production"
-      FERROSA_SEED_ADMIN_PASSWORD: "${FERROSA_SEED_ADMIN_PASSWORD:-}"
+      <<: *ferrosa-secure-env
+    volumes:
+      - ./.compose-tls/node3:/etc/ferrosa/tls:ro
+    networks:
+      default:
+        ipv4_address: 172.28.77.103
+    healthcheck: *ferrosa-secure-healthcheck
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.77.0/24

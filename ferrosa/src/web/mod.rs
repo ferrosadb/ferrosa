@@ -47,12 +47,23 @@ use ferrosa_storage::StorageEngine;
 pub struct WebConfig {
     /// Address to bind the HTTP server on. Default: `127.0.0.1:9090`.
     pub bind_addr: SocketAddr,
+    /// PEM certificate chain (`[web] tls_cert`). With `tls_key_path` the
+    /// console, `/api`, `/admin`, `/metrics` and `/readyz` are HTTPS only
+    /// (t_d5d122ba).
+    pub tls_cert_path: Option<String>,
+    /// PEM private key (`[web] tls_key`).
+    pub tls_key_path: Option<String>,
+    /// Refuse to start without a certificate (`[web] require_tls`).
+    pub require_tls: bool,
 }
 
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:9090".parse().expect("hardcoded addr is valid"),
+            tls_cert_path: None,
+            tls_key_path: None,
+            require_tls: false,
         }
     }
 }
@@ -134,13 +145,136 @@ pub async fn start_web_server(
     config: &WebConfig,
     state: WebAppState,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    let router = build_router(state);
+    serve_router(config, build_router(state)).await
+}
+
+/// Bind and serve `router` in a background task, over TLS when a certificate
+/// is configured. The TLS config comes from the shared `ferrosa_net::tls`
+/// builder (one crypto provider for every listener); `require_tls` without a
+/// certificate, or only one of cert/key, fails here, before anything binds.
+async fn serve_router(
+    config: &WebConfig,
+    router: Router,
+) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let tls = ferrosa_net::tls::optional_server_config(
+        "web console",
+        config.tls_cert_path.as_deref(),
+        config.tls_key_path.as_deref(),
+        config.require_tls,
+        ferrosa_net::tls::HTTP_ALPN,
+    )?;
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     let addr = listener.local_addr()?;
-    ferrosa_common::task_pool::TaskPool::current("web-server").spawn(async move {
-        if let Err(e) = axum::serve(listener, router).await {
-            tracing::error!(%e, "web server error");
+    let pool = ferrosa_common::task_pool::TaskPool::current("web-server");
+    match tls {
+        Some(tls) => {
+            let server = axum_server::from_tcp_rustls(
+                listener.into_std()?,
+                axum_server::tls_rustls::RustlsConfig::from_config(tls),
+            )?;
+            tracing::info!(%addr, "web console serving HTTPS");
+            pool.spawn(async move {
+                if let Err(e) = server.serve(router.into_make_service()).await {
+                    tracing::error!(%e, "web server error");
+                }
+            });
         }
-    });
+        None => {
+            pool.spawn(async move {
+                if let Err(e) = axum::serve(listener, router).await {
+                    tracing::error!(%e, "web server error");
+                }
+            });
+        }
+    }
     Ok(addr)
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn self_signed() -> (
+        tempfile::TempDir,
+        WebConfig,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, certified.cert.pem()).unwrap();
+        std::fs::write(&key, certified.signing_key.serialize_pem()).unwrap();
+        let config = WebConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            tls_cert_path: Some(cert.to_str().unwrap().into()),
+            tls_key_path: Some(key.to_str().unwrap().into()),
+            require_tls: true,
+        };
+        (dir, config, certified.cert.der().clone())
+    }
+
+    /// t_d5d122ba: with a certificate the console (incl. `/readyz`) is HTTPS
+    /// only; plaintext gets no HTTP response.
+    #[tokio::test]
+    async fn web_console_serves_https_when_a_certificate_is_configured() {
+        let (_dir, config, der) = self_signed();
+        let app = Router::new().route("/readyz", get(|| async { "ready" }));
+        let addr = serve_router(&config, app)
+            .await
+            .expect("web console starts");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let client =
+            rustls::ClientConfig::builder_with_provider(ferrosa_net::tls::crypto_provider())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await
+            .expect("TLS handshake with the web console");
+        tls.write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+
+        let mut plain = tokio::net::TcpStream::connect(addr).await.unwrap();
+        plain
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            plain.read_to_end(&mut buf),
+        )
+        .await;
+        assert!(
+            !String::from_utf8_lossy(&buf).starts_with("HTTP/"),
+            "plaintext must not be served on a TLS port (read {read:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_tls_without_a_certificate_refuses_to_start() {
+        let config = WebConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            require_tls: true,
+            ..WebConfig::default()
+        };
+        let err = serve_router(&config, Router::new())
+            .await
+            .expect_err("require_tls with no certificate must not serve plaintext");
+        assert!(err.to_string().contains("web console"), "{err}");
+    }
 }

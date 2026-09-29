@@ -1022,42 +1022,57 @@ pub async fn start_graph_http(
     config: &GraphHttpConfig,
     state: AppState,
 ) -> crate::error::Result<()> {
-    // T11: Check TLS requirements.
-    if config.require_tls && (config.tls_cert_path.is_none() || config.tls_key_path.is_none()) {
-        return Err(GraphError::Internal(
-            "require_tls is true but tls_cert_path or tls_key_path is not configured".to_string(),
-        ));
-    }
-
     let app = build_router(state)
         .layer(CatchPanicLayer::new())
         .layer(RequestBodyLimitLayer::new(config.max_request_body_bytes));
+    serve_graph_router(config, app, "graph HTTP server").await
+}
 
-    if let (Some(cert_path), Some(key_path)) = (&config.tls_cert_path, &config.tls_key_path) {
-        // TLS mode
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
-            .await
-            .map_err(|e| GraphError::Internal(format!("TLS configuration error: {e}")))?;
+/// Resolve the graph HTTP TLS config through the shared `ferrosa_net::tls`
+/// builder (one crypto provider for every listener).
+///
+/// T11: `require_tls` without a certificate, or only one of cert/key, is an
+/// error — never a silent plaintext fallback.
+pub fn graph_tls_config(
+    config: &GraphHttpConfig,
+) -> crate::error::Result<Option<Arc<rustls::ServerConfig>>> {
+    ferrosa_net::tls::optional_server_config(
+        "graph HTTP",
+        config.tls_cert_path.as_deref(),
+        config.tls_key_path.as_deref(),
+        config.require_tls,
+        ferrosa_net::tls::HTTP_ALPN,
+    )
+    .map_err(|e| GraphError::Internal(format!("TLS configuration error: {e}")))
+}
 
-        tracing::info!(addr = %config.bind_addr, "starting graph HTTP server with TLS");
-
-        axum_server::bind_rustls(config.bind_addr, tls_config)
+/// Bind `config.bind_addr` and serve `app`, over TLS when configured.
+async fn serve_graph_router(
+    config: &GraphHttpConfig,
+    app: Router,
+    what: &'static str,
+) -> crate::error::Result<()> {
+    match graph_tls_config(config)? {
+        Some(tls) => {
+            tracing::info!(addr = %config.bind_addr, "starting {what} with TLS");
+            axum_server::bind_rustls(
+                config.bind_addr,
+                axum_server::tls_rustls::RustlsConfig::from_config(tls),
+            )
             .serve(app.into_make_service())
             .await
             .map_err(|e| GraphError::Internal(format!("HTTP server error: {e}")))?;
-    } else {
-        // Plain HTTP mode
-        tracing::info!(addr = %config.bind_addr, "starting graph HTTP server (plain)");
-
-        let listener = tokio::net::TcpListener::bind(config.bind_addr)
-            .await
-            .map_err(|e| GraphError::Internal(format!("bind error: {e}")))?;
-
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| GraphError::Internal(format!("HTTP server error: {e}")))?;
+        }
+        None => {
+            tracing::info!(addr = %config.bind_addr, "starting {what} (plain)");
+            let listener = tokio::net::TcpListener::bind(config.bind_addr)
+                .await
+                .map_err(|e| GraphError::Internal(format!("bind error: {e}")))?;
+            axum::serve(listener, app)
+                .await
+                .map_err(|e| GraphError::Internal(format!("HTTP server error: {e}")))?;
+        }
     }
-
     Ok(())
 }
 
@@ -1089,21 +1104,17 @@ pub fn build_disabled_router() -> Router {
 
 /// Start a thin HTTP listener that responds to every request with a clear
 /// "graph engine disabled" error + remediation, used when the graph engine is
-/// not enabled. Mirrors [`start_graph_http`]'s plain-HTTP bind.
+/// not enabled. Uses the same bind and TLS settings as [`start_graph_http`],
+/// so a TLS-configured node serves the stub over TLS too.
 pub async fn start_graph_disabled_http(config: &GraphHttpConfig) -> crate::error::Result<()> {
     let app =
         build_disabled_router().layer(RequestBodyLimitLayer::new(config.max_request_body_bytes));
-    let listener = tokio::net::TcpListener::bind(config.bind_addr)
-        .await
-        .map_err(|e| GraphError::Internal(format!("bind error: {e}")))?;
-    tracing::info!(
-        addr = %config.bind_addr,
-        "graph engine disabled — serving disabled-engine responses on the graph HTTP port"
-    );
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| GraphError::Internal(format!("HTTP server error: {e}")))?;
-    Ok(())
+    serve_graph_router(
+        config,
+        app,
+        "graph disabled-engine stub (serves only a 503 remediation message)",
+    )
+    .await
 }
 
 #[cfg(test)]

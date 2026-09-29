@@ -49,9 +49,22 @@ struct OneRole {
     verifier: ScramVerifier,
 }
 
+/// A single superuser login with no limiter: these tests exercise the query
+/// engine, not authorization (see `security_live.rs` for that).
 impl VerifierStore for OneRole {
     fn verifier(&self, user: &str) -> Option<ScramVerifier> {
         (user == self.user).then(|| self.verifier.clone())
+    }
+    fn admit(&self, _user: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn record_failure(&self, _user: &str) {}
+    fn record_success(&self, user: &str) -> Result<AuthContext, String> {
+        Ok(AuthContext {
+            role: user.to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        })
     }
 }
 
@@ -317,7 +330,12 @@ async fn m1_join_returns_rows_to_a_real_driver() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    tokio::spawn(server::serve(
+        listener,
+        dev_store(),
+        ctx,
+        server::PgTls::plaintext(),
+    ));
 
     let client = connect(port).await;
 
@@ -403,7 +421,12 @@ async fn extended_query_error_recovers_after_sync() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    tokio::spawn(server::serve(
+        listener,
+        dev_store(),
+        ctx,
+        server::PgTls::plaintext(),
+    ));
     let client = connect(port).await;
 
     // Unknown table via the extended (parameterized) path ⇒ undefined_table.
@@ -446,7 +469,12 @@ async fn extended_parameterized_join_over_a_real_driver() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    tokio::spawn(server::serve(
+        listener,
+        dev_store(),
+        ctx,
+        server::PgTls::plaintext(),
+    ));
     let client = connect(port).await;
 
     // alice (id=1) has two orders: oid 10 and 11. `$1` is a binary int4 param,
@@ -497,7 +525,12 @@ async fn group_by_order_by_limit_over_a_real_driver() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    tokio::spawn(server::serve(
+        listener,
+        dev_store(),
+        ctx,
+        server::PgTls::plaintext(),
+    ));
     let client = connect(port).await;
 
     let collect = |msgs: Vec<tokio_postgres::SimpleQueryMessage>| {
@@ -558,7 +591,12 @@ async fn where_having_distinct_over_a_real_driver() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    tokio::spawn(server::serve(
+        listener,
+        dev_store(),
+        ctx,
+        server::PgTls::plaintext(),
+    ));
     let client = connect(port).await;
 
     let collect = |msgs: Vec<tokio_postgres::SimpleQueryMessage>| {
@@ -661,7 +699,12 @@ async fn dml_client_with_committer(
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    tokio::spawn(server::serve(
+        listener,
+        dev_store(),
+        ctx,
+        server::PgTls::plaintext(),
+    ));
     (
         connect(port).await,
         connect(port).await,
@@ -732,7 +775,12 @@ async fn dml_client_with_local_accord() -> (
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    tokio::spawn(server::serve(
+        listener,
+        dev_store(),
+        ctx,
+        server::PgTls::plaintext(),
+    ));
     (connect(port).await, connect(port).await, dir)
 }
 
@@ -850,7 +898,12 @@ async fn dml_clients_on_two_accord_nodes() -> (
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(server::serve(listener, dev_store(), ctx));
+        tokio::spawn(server::serve(
+            listener,
+            dev_store(),
+            ctx,
+            server::PgTls::plaintext(),
+        ));
         connect(port).await
     }
 

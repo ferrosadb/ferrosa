@@ -26,12 +26,22 @@ use crate::engine::SparqlEngine;
 #[derive(Debug, Clone)]
 pub struct SparqlHttpConfig {
     pub bind_addr: SocketAddr,
+    /// PEM certificate chain (`[sparql] tls_cert`). With `tls_key_path`,
+    /// the endpoint serves HTTPS only (t_d5d122ba).
+    pub tls_cert_path: Option<String>,
+    /// PEM private key (`[sparql] tls_key`).
+    pub tls_key_path: Option<String>,
+    /// Refuse to start without a certificate (`[sparql] require_tls`).
+    pub require_tls: bool,
 }
 
 impl Default for SparqlHttpConfig {
     fn default() -> Self {
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            tls_cert_path: None,
+            tls_key_path: None,
+            require_tls: false,
         }
     }
 }
@@ -46,11 +56,38 @@ pub struct AppState {
 
 /// Start the SPARQL HTTP server.
 pub async fn start_sparql_http(config: &SparqlHttpConfig, state: AppState) -> std::io::Result<()> {
-    let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
-    tracing::info!(addr = %config.bind_addr, "SPARQL HTTP server listening");
-    axum::serve(listener, app).await?;
-    Ok(())
+    serve_app(config, build_router(state)).await
+}
+
+/// Bind `config.bind_addr` and serve `app` — over TLS when a certificate is
+/// configured, built by the shared `ferrosa_net::tls` builder (one crypto
+/// provider for every listener). `require_tls` without a certificate, or only
+/// one of cert/key, is an error rather than a plaintext fallback.
+async fn serve_app(config: &SparqlHttpConfig, app: Router) -> std::io::Result<()> {
+    let tls = ferrosa_net::tls::optional_server_config(
+        "SPARQL",
+        config.tls_cert_path.as_deref(),
+        config.tls_key_path.as_deref(),
+        config.require_tls,
+        ferrosa_net::tls::HTTP_ALPN,
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
+    match tls {
+        Some(tls) => {
+            tracing::info!(addr = %config.bind_addr, "SPARQL HTTPS server listening");
+            axum_server::bind_rustls(
+                config.bind_addr,
+                axum_server::tls_rustls::RustlsConfig::from_config(tls),
+            )
+            .serve(app.into_make_service())
+            .await
+        }
+        None => {
+            let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
+            tracing::info!(addr = %config.bind_addr, "SPARQL HTTP server listening (plain)");
+            axum::serve(listener, app).await
+        }
+    }
 }
 
 /// Maximum query body size: 1 MiB. Prevents DoS via oversized requests (BUG-S17).
@@ -401,5 +438,98 @@ mod auth_tests {
             authorize_keyspace(&schema, &unprivileged, "rdf", Permission::Select).is_err(),
             "an unprivileged role with no grant must be denied"
         );
+    }
+
+    fn free_addr() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    async fn connect_retry(addr: SocketAddr) -> tokio::net::TcpStream {
+        for _ in 0..100 {
+            if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                return stream;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("listener at {addr} never came up");
+    }
+
+    /// t_d5d122ba: with a certificate configured the endpoint speaks HTTPS
+    /// only; a plaintext request gets no HTTP response.
+    #[tokio::test]
+    async fn serves_https_when_a_certificate_is_configured() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, certified.cert.pem()).unwrap();
+        std::fs::write(&key, certified.signing_key.serialize_pem()).unwrap();
+        let config = SparqlHttpConfig {
+            bind_addr: free_addr(),
+            tls_cert_path: Some(cert.to_str().unwrap().into()),
+            tls_key_path: Some(key.to_str().unwrap().into()),
+            require_tls: true,
+        };
+        let addr = config.bind_addr;
+        let app = Router::new().route("/sparql/health", get(|| async { "ok" }));
+        tokio::spawn(async move { serve_app(&config, app).await });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let client =
+            rustls::ClientConfig::builder_with_provider(ferrosa_net::tls::crypto_provider())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                connect_retry(addr).await,
+            )
+            .await
+            .expect("TLS handshake with SPARQL");
+        tls.write_all(
+            b"GET /sparql/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+
+        let mut plain = connect_retry(addr).await;
+        plain
+            .write_all(b"GET /sparql/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            plain.read_to_end(&mut buf),
+        )
+        .await;
+        assert!(
+            !String::from_utf8_lossy(&buf).starts_with("HTTP/"),
+            "plaintext must not be served on a TLS port (read {read:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_tls_without_a_certificate_refuses_to_start() {
+        let config = SparqlHttpConfig {
+            bind_addr: free_addr(),
+            require_tls: true,
+            ..SparqlHttpConfig::default()
+        };
+        let err = serve_app(&config, Router::new())
+            .await
+            .expect_err("require_tls with no certificate must not serve plaintext");
+        assert!(err.to_string().contains("SPARQL"), "{err}");
     }
 }

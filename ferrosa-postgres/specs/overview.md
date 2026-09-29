@@ -47,7 +47,8 @@ Postgres drivers speak to ferrosa. Its boundary is deliberately narrow:
 | `scram` (`src/scram.rs`) | ~281 | SCRAM-SHA-256 primitives: `ScramVerifier`, `server_first`, `verify_client_final` |
 | `handshake` (`src/handshake.rs`) | ~299 | Sans-IO SCRAM phase machine + `VerifierStore` trait |
 | `store` (`src/store.rs`) | ~170 | `SchemaVerifierStore`: bridge the handshake to the live `ferrosa-schema` role store |
-| `connection` (`src/connection.rs`) | ~337 | Sans-IO `Connection`: startup/SSL/SASL → `Ready`; `take_inbuf` for pipelined first query |
+| `connection` (`src/connection.rs`) | ~520 | Sans-IO `Connection`: startup/`SSLRequest` (`TlsPolicy`)/SASL → `Ready`; `take_inbuf` for pipelined first query |
+| `authz` (`src/authz.rs`) | ~180 | Statement → required `(Permission, Resource)`; `authorize` via `Schema::check_permission`, `42501` on denial |
 | `extended` (`src/extended.rs`) | ~453 | Per-connection `Session`: Parse/Bind/Close/Sync, prepared statements + portals, txn `I`/`T`/`E` |
 | `query` (`src/query.rs`) | ~1927 | `execute_query`, DML (INSERT/UPDATE/DELETE), value codecs (text+binary), SQLSTATE mapping, `load_catalog` |
 | `storage_provider` (`src/storage_provider.rs`) | ~758 | `load_table`: bounded async-to-sync streaming provider; `cql_to_value`; R15 guard |
@@ -61,10 +62,14 @@ Postgres drivers speak to ferrosa. Its boundary is deliberately narrow:
 TCP accept (server::serve)
   → handle_connection
      Phase 1: Connection::on_bytes drives startup + SCRAM until ReadyForQuery
-       SSLRequest        → 'N' (TLS declined; not wired)
-       Startup           → AuthenticationSASL (SCRAM-SHA-256)
-       SASLInitial/Final → AuthenticationOk + ParameterStatus* + BackendKeyData + ReadyForQuery
-     Phase 2: query_loop frames Q / Parse / Bind / Describe / Execute / Sync / Close / Terminate
+       SSLRequest        → 'S' + rustls handshake (PgTls configured) | 'N' (no cert)
+       Startup           → FATAL 28000 if require_tls and no TLS
+                         → limiter admit (FATAL 28000 "login throttled") → AuthenticationSASL
+       SASLInitial/Final → bad proof: record_failure, FATAL 28P01
+                         → complete_login (NOLOGIN refused) → AuthenticationOk + … + ReadyForQuery
+     Phase 2: query_loop (as the authenticated AuthContext) frames Q / Parse / Bind /
+       Describe / Execute / Sync / Close / Terminate; authz::authorize before any
+       statement touches storage (42501 on denial)
 ```
 
 Note: the sans-IO `connection::Connection` also contains a minimal `Ready`-phase

@@ -494,9 +494,22 @@ struct OneRole {
     verifier: ScramVerifier,
 }
 
+/// A single superuser login with no limiter: the oracle compares query results,
+/// not authorization.
 impl VerifierStore for OneRole {
     fn verifier(&self, user: &str) -> Option<ScramVerifier> {
         (user == self.user).then(|| self.verifier.clone())
+    }
+    fn admit(&self, _user: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn record_failure(&self, _user: &str) {}
+    fn record_success(&self, user: &str) -> Result<AuthContext, String> {
+        Ok(AuthContext {
+            role: user.to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        })
     }
 }
 
@@ -1050,7 +1063,12 @@ async fn start_ferrosa() -> (tokio_postgres::Client, tempfile::TempDir) {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    tokio::spawn(server::serve(
+        listener,
+        dev_store(),
+        ctx,
+        server::PgTls::plaintext(),
+    ));
 
     let (client, connection) = Config::new()
         .host("127.0.0.1")
