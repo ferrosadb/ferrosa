@@ -65,39 +65,71 @@ else
   # (telemetry instrumentation, skiplist-memtable) whose tests require
   # running clusters, containers, or FERROSA_TEST_* env vars and panic
   # without them.  CI runs the full feature matrix with infrastructure.
-  #
-  # Exclude main.rs binary entry points from coverage — startup code
-  # only exercisable via full integration tests (covered in CI).
   echo ""
-  if command -v cargo-llvm-cov &> /dev/null; then
-    echo "=== Running cargo llvm-cov$CARGO_ARGS ==="
-    # Skip: S3/container-gated tests, flaky tracing subscriber tests.
-    # Capture exit code so we always echo output before failing.
-    set +e
-    COV_OUTPUT=$(cargo llvm-cov $CARGO_ARGS --lib --summary-only \
-      --ignore-filename-regex '(^|/)main\.rs$' \
-      -- --skip cassandra_reads_compacted --skip compaction_end_to_end 2>&1)
-    COV_RC=$?
-    set -e
-    echo "$COV_OUTPUT"
-    if [ "$COV_RC" -ne 0 ]; then
-      echo "FAIL: cargo llvm-cov exited with code $COV_RC"
-      exit 1
-    fi
-    # Check 80% coverage threshold (matches CI)
-    COVERAGE=$(echo "$COV_OUTPUT" | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
-    if [ -n "$COVERAGE" ]; then
-      THRESHOLD=80
-      if [ "$(echo "$COVERAGE < $THRESHOLD" | bc -l 2>/dev/null || echo 0)" -eq 1 ]; then
-        echo "FAIL: Line coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
-        exit 1
-      fi
-      echo "Coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
-    fi
+
+  # ── Test the changed crates ───────────────────────────────────────────
+  # Prefer nextest: it runs one process per test and schedules across all
+  # cores, where libtest runs each test *binary* serially. On this workspace
+  # that is the difference between the suite's wall clock being the sum of
+  # every binary's slowest test and it being bounded by the slowest single
+  # test. Same tests, same assertions — only the scheduler differs.
+  SKIP_ARGS=(--skip cassandra_reads_compacted --skip compaction_end_to_end)
+  if command -v cargo-nextest &> /dev/null; then
+    echo "=== Running cargo nextest$CARGO_ARGS ==="
+    # `--lib` matches the pre-existing scope: lib targets of the affected
+    # crates. Integration and doc tests are CI's job.
+    cargo nextest run $CARGO_ARGS --lib "${SKIP_ARGS[@]}"
   else
     echo "=== Running cargo test$CARGO_ARGS ==="
-    echo "(install cargo-llvm-cov for coverage: cargo install cargo-llvm-cov)"
-    cargo test $CARGO_ARGS --lib -- --skip cassandra_reads_compacted --skip compaction_end_to_end
+    echo "(install cargo-nextest for a parallel run: cargo install cargo-nextest --locked)"
+    cargo test $CARGO_ARGS --lib -- "${SKIP_ARGS[@]}"
+  fi
+
+  # ── Coverage (opt-in) ─────────────────────────────────────────────────
+  # Coverage is a quality signal, not a correctness gate, and llvm-cov
+  # rebuilds every instrumented target — on this workspace it is the single
+  # biggest cost on the ship path. It is therefore NOT part of the default
+  # pre-push run. Request it explicitly:
+  #
+  #   FERROSA_PREPUSH_COVERAGE=1 git push
+  #
+  # and it runs on the same changed-crate scope, so it stays proportional to
+  # the diff instead of instrumenting all 52 crates.
+  if [ "${FERROSA_PREPUSH_COVERAGE:-0}" = "1" ]; then
+    echo ""
+    if command -v cargo-llvm-cov &> /dev/null; then
+      echo "=== Running cargo llvm-cov$CARGO_ARGS (FERROSA_PREPUSH_COVERAGE=1) ==="
+      # Exclude main.rs binary entry points from coverage — startup code
+      # only exercisable via full integration tests (covered in CI).
+      # Capture exit code so we always echo output before failing.
+      set +e
+      COV_OUTPUT=$(cargo llvm-cov $CARGO_ARGS --lib --summary-only \
+        --ignore-filename-regex '(^|/)main\.rs$' \
+        -- "${SKIP_ARGS[@]}" 2>&1)
+      COV_RC=$?
+      set -e
+      echo "$COV_OUTPUT"
+      if [ "$COV_RC" -ne 0 ]; then
+        echo "FAIL: cargo llvm-cov exited with code $COV_RC"
+        exit 1
+      fi
+      # Check 80% coverage threshold (matches CI)
+      COVERAGE=$(echo "$COV_OUTPUT" | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
+      if [ -n "$COVERAGE" ]; then
+        THRESHOLD=80
+        if [ "$(echo "$COVERAGE < $THRESHOLD" | bc -l 2>/dev/null || echo 0)" -eq 1 ]; then
+          echo "FAIL: Line coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+          exit 1
+        fi
+        echo "Coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
+      fi
+    else
+      echo "FERROSA_PREPUSH_COVERAGE=1 but cargo-llvm-cov is not installed; skipping."
+      echo "(install with: cargo install cargo-llvm-cov)"
+    fi
+  else
+    echo ""
+    echo "Coverage skipped (opt in with FERROSA_PREPUSH_COVERAGE=1)."
   fi
 fi
 

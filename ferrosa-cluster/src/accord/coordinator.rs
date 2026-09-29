@@ -1493,21 +1493,22 @@ impl AccordCoordinatorDriver {
                 };
                 let Some(result) = result else { break };
                 response_count += 1;
-                if phase_error.is_some() {
-                    continue;
-                }
                 match result {
                     (_peer_id, Ok(Message::AccordPreAcceptOK(b))) if !b.is_empty() => {
                         let ok: PreAcceptOkPayload = match bincode::deserialize(&b) {
                             Ok(ok) => ok,
                             Err(error) => {
                                 phase_error = Some(AccordDriverError::Codec(error.to_string()));
-                                continue;
+                                break;
                             }
                         };
                         if ok.snapshot_stale {
+                            // The round is doomed. Stop here rather than wait on
+                            // the rest of the fan-out: a paused replica would
+                            // hold this dead txn registered on the live ones for
+                            // its whole RPC timeout (see below).
                             phase_error = Some(AccordDriverError::SnapshotStale);
-                            continue;
+                            break;
                         }
                         if snapshot_marker_replicas
                             .as_ref()
@@ -1581,8 +1582,20 @@ impl AccordCoordinatorDriver {
             }
 
             if let Some(error) = phase_error {
-                // Drain already-sent PreAccepts before no-write finalization so
-                // no late registration can race with its cleanup.
+                // Return now; the caller finalizes this txn as a no-write on
+                // every replica at once. This used to drain every outstanding
+                // PreAccept first, so that no late registration could race the
+                // cleanup — and a paused replica made that drain last its full
+                // 10 s RPC timeout, keeping the dead txn registered on the live
+                // replicas. PostgreSQL snapshot barriers on its keys dep-waited
+                // 5 s and failed (Jepsen fault schedule, 2026-09-29). The drain
+                // now runs in the background instead, and finalizes each replica
+                // whose PreAccept lands after this return.
+                tokio::spawn(finalize_late_preaccept_registrations(
+                    response_rx,
+                    Arc::clone(&self.peers),
+                    txn_id,
+                ));
                 return Err(error);
             }
 
@@ -2472,6 +2485,51 @@ impl AccordCoordinatorDriver {
 // ===========================================================================
 // Tests
 // ===========================================================================
+
+/// Drain the PreAccept fan-out of a transaction that already failed and
+/// no-write-finalize every replica whose PreAccept registered it late.
+///
+/// The coordinator returns as soon as the round is doomed, and its caller
+/// finalizes every replica at once. A PreAccept still in flight can land on a
+/// slow replica AFTER that finalize and register the txn there again, which
+/// would leave it a pending conflict forever (FMEA CL-20). Each such late
+/// registration answers here, so it gets its own finalize.
+async fn finalize_late_preaccept_registrations(
+    mut responses: tokio::sync::mpsc::Receiver<(uuid::Uuid, ferrosa_net::error::Result<Message>)>,
+    peers: Arc<dyn crate::accord::transport::AccordTransport>,
+    txn_id: TxnId,
+) {
+    use crate::accord::wire::ApplyPayload;
+    let payload = ApplyPayload {
+        txn_id,
+        result_data: Vec::new(),
+    };
+    let msg = match bincode::serialize(&payload) {
+        Ok(bytes) => Message::AccordApply(Bytes::from(bytes)),
+        Err(e) => {
+            tracing::error!(txn_id = ?txn_id, error = %e, "accord: encode late no-write finalize failed");
+            return;
+        }
+    };
+    while let Some((peer, result)) = responses.recv().await {
+        let registered = matches!(&result, Ok(Message::AccordPreAcceptOK(b)) if !b.is_empty());
+        if !registered {
+            continue;
+        }
+        let undelivered =
+            deliver_no_write_finalize(&peers, vec![peer], &msg, txn_id, NO_WRITE_FINALIZE_RETRY)
+                .await;
+        if !undelivered.is_empty() {
+            tracing::error!(
+                txn_id = ?txn_id,
+                peer = %peer,
+                "accord: a late PreAccept registered a failed transaction and its no-write \
+                 finalize never reached the replica; reads and snapshot barriers on its keys \
+                 there will dep-wait and abstain until it is recovered"
+            );
+        }
+    }
+}
 
 /// How hard the no-write finalize tries to reach each replica.
 #[derive(Debug, Clone, Copy)]
@@ -4675,6 +4733,176 @@ mod tests {
         assert!(
             transport.accept_targets.lock().is_empty(),
             "the driver must keep collecting marker votes after the deadline"
+        );
+    }
+
+    /// `stale_peer` vetoes the PostgreSQL snapshot at once; `slow_peer` answers
+    /// PreAcceptOK only after `slow_delay` (a paused node). Records when each
+    /// replica's PreAccept answered and when each received an Apply.
+    struct PausedPeerTransport {
+        stale_peer: uuid::Uuid,
+        slow_peer: uuid::Uuid,
+        slow_delay: std::time::Duration,
+        events: parking_lot::Mutex<Vec<(&'static str, uuid::Uuid, std::time::Instant)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for PausedPeerTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            use crate::accord::wire::{PreAcceptOkPayload, PreAcceptV2Payload};
+            match msg {
+                Message::AccordPreAcceptV2(bytes) => {
+                    let payload: PreAcceptV2Payload = bincode::deserialize(&bytes).unwrap();
+                    if host_id == self.slow_peer {
+                        tokio::time::sleep(self.slow_delay).await;
+                    }
+                    self.events
+                        .lock()
+                        .push(("preaccept_ok", host_id, std::time::Instant::now()));
+                    let response = PreAcceptOkPayload {
+                        from: node_id_of(host_id),
+                        t: payload.t0,
+                        deps: Vec::new(),
+                        snapshot_stale: host_id == self.stale_peer,
+                    };
+                    Ok(Message::AccordPreAcceptOK(Bytes::from(
+                        bincode::serialize(&response).unwrap(),
+                    )))
+                }
+                Message::AccordApply(_) => {
+                    self.events
+                        .lock()
+                        .push(("apply", host_id, std::time::Instant::now()));
+                    Ok(Message::AccordApplyOK(Bytes::new()))
+                }
+                _ => Ok(Message::AccordApplyOK(Bytes::new())),
+            }
+        }
+    }
+
+    fn paused_peer_driver(
+        transport: Arc<PausedPeerTransport>,
+        local_state: crate::accord::handlers::AccordState,
+        self_host: uuid::Uuid,
+    ) -> AccordCoordinatorDriver {
+        let clock = HybridLogicalClock::new(node_id_of(self_host), 0);
+        let marker_key = ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY;
+        AccordCoordinatorDriver::new_multi_with_transport(
+            node_id_of(self_host),
+            vec![self_host, transport.stale_peer, transport.slow_peer],
+            transport.clone(),
+            false,
+            &clock,
+            vec![
+                (b"k".to_vec(), b"m".to_vec()),
+                (marker_key.to_vec(), b"marker".to_vec()),
+            ],
+        )
+        .with_local_accord_state(local_state)
+        .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()))
+        .with_preaccept_fast_path_timeout(std::time::Duration::from_millis(10))
+        .with_postgres_snapshot(make_ts(500))
+    }
+
+    /// The PostgreSQL Jepsen fault schedule failure (2026-09-29).
+    ///
+    /// With node 3 paused, a transaction whose snapshot one live replica had
+    /// already rejected as stale was doomed at once, but its coordinator kept
+    /// draining PreAccept responses until node 3's RPC timed out 10 s later.
+    /// All that time the dead transaction stayed registered as a conflict, so
+    /// every PostgreSQL snapshot barrier on its keys dep-waited 5 s and failed
+    /// "dependencies were not applied locally". A doomed transaction must fail
+    /// and release its keys at once, not wait on a paused replica.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_doomed_transaction_releases_its_keys_without_waiting_on_a_paused_replica() {
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let self_host = uuid::Uuid::from_u128((0xC0DE_u128 << 64) | 0xC0DE);
+        let transport = Arc::new(PausedPeerTransport {
+            stale_peer: uuid::Uuid::from_u128((0x1111_u128 << 64) | 0x1111),
+            slow_peer: uuid::Uuid::from_u128((0x3333_u128 << 64) | 0x3333),
+            slow_delay: std::time::Duration::from_secs(3),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            AccordStateMachine::new(node_id_of(self_host), Arc::new(MockSyncWriter::new())),
+        ));
+        let mut driver = paused_peer_driver(transport.clone(), local_state.clone(), self_host);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            driver.run_transaction(),
+        )
+        .await
+        .expect("a doomed transaction must not wait for the paused replica's RPC to time out");
+
+        assert!(
+            matches!(result, Err(AccordDriverError::SnapshotStale)),
+            "{result:?}"
+        );
+        assert!(
+            local_state
+                .lock()
+                .unapplied_conflicts_before(b"k", &make_ts(u64::MAX / 2))
+                .is_empty(),
+            "the failed transaction must no longer block conflicting barriers here"
+        );
+    }
+
+    /// The guard the old drain provided, kept after returning early: a slow
+    /// replica that registers the doomed transaction AFTER the coordinator
+    /// gave up still receives a no-write finalize, so the late registration
+    /// cannot poison its keys (FMEA CL-20).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_preaccept_registration_is_finalized_after_an_early_abort() {
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let self_host = uuid::Uuid::from_u128((0xC0DE_u128 << 64) | 0xC0DE);
+        let slow_peer = uuid::Uuid::from_u128((0x3333_u128 << 64) | 0x3333);
+        let transport = Arc::new(PausedPeerTransport {
+            stale_peer: uuid::Uuid::from_u128((0x1111_u128 << 64) | 0x1111),
+            slow_peer,
+            slow_delay: std::time::Duration::from_millis(300),
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            AccordStateMachine::new(node_id_of(self_host), Arc::new(MockSyncWriter::new())),
+        ));
+        let mut driver = paused_peer_driver(transport.clone(), local_state, self_host);
+
+        let result = driver.run_transaction().await;
+        assert!(
+            matches!(result, Err(AccordDriverError::SnapshotStale)),
+            "{result:?}"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let finalized_after_late_registration = loop {
+            let events = transport.events.lock().clone();
+            let late_ok = events
+                .iter()
+                .find(|(kind, peer, _)| *kind == "preaccept_ok" && *peer == slow_peer)
+                .map(|(_, _, at)| *at);
+            let found = late_ok.is_some_and(|registered| {
+                events.iter().any(|(kind, peer, at)| {
+                    *kind == "apply" && *peer == slow_peer && *at >= registered
+                })
+            });
+            if found || std::time::Instant::now() >= deadline {
+                break found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            finalized_after_late_registration,
+            "the slow replica registered the txn late and must be finalized after that"
         );
     }
 
