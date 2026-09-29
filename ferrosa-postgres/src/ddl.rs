@@ -81,16 +81,6 @@ fn complete() -> Vec<BackendMessage> {
     }]
 }
 
-/// The DDL permission check (`CREATE` on the target keyspace) belongs here.
-///
-/// PostgreSQL statement authorization is not merged yet (PR #465); until it
-/// is, no PostgreSQL statement is authorized per role, DML included, so this
-/// permits. It is the single call point `execute_create_table` goes through, so
-/// that PR replaces this body and nothing else.
-fn authorize_create_table(_keyspace: &str) -> Result<(), BackendMessage> {
-    Ok(())
-}
-
 /// Execute `CREATE TABLE [IF NOT EXISTS]` (FMEA PG-T132a-01..05).
 ///
 /// Reply is `CREATE TABLE` on success and on `IF NOT EXISTS` over an existing
@@ -112,10 +102,9 @@ pub(crate) async fn execute_create_table(
             "CREATE TABLE is not available: this server has no schema-change path",
         );
     };
+    // Authorization (CREATE on the keyspace) already ran at dispatch in
+    // `authz::statement_permissions`, before this function is reached.
     let keyspace = stmt.name.schema.as_deref().unwrap_or(env.default_schema);
-    if let Err(denied) = authorize_create_table(keyspace) {
-        return vec![denied];
-    }
     if !env.schema.snapshot().keyspaces.contains_key(keyspace) {
         return refuse("3F000", &format!("schema \"{keyspace}\" does not exist"));
     }

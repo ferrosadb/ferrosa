@@ -558,7 +558,7 @@ async fn execute_simple_inner<O: ReplySink>(
         &authz::statement_permissions(&stmt, &ctx.default_schema),
     ) {
         session.mark_txn_failed();
-        return vec![denied];
+        return Ok(vec![denied]);
     }
 
     match stmt {
@@ -1796,7 +1796,7 @@ mod txn_atomicity_tests {
     async fn simple_select_streams_rows_in_bounded_batches() {
         const TOTAL: usize = 200;
         let (_dir, ctx) = make_ctx().await;
-        let mut session = Session::new();
+        let mut session = Session::new(superuser());
         for i in 0..TOTAL {
             let sql = format!("INSERT INTO kv (k, v) VALUES ('k{i:04}', 'v')");
             let reply = execute_simple(&ctx, &mut session, &sql).await;

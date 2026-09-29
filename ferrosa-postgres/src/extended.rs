@@ -121,6 +121,7 @@ impl Session {
             txn_snapshot: None,
             txn_read_tables: HashSet::new(),
             txn_writes: Vec::new(),
+            streams: HashMap::new(),
         }
     }
 
@@ -563,7 +564,7 @@ mod tests {
     /// Bind one parameter and return the ErrorResponse SQLSTATE, asserting the
     /// portal was not created and the session is in the error state.
     fn bind_error_code(oid: i32, format: i16, value: &[u8]) -> String {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![oid]);
         let response = s.on_bind(
             "p".into(),
@@ -679,7 +680,7 @@ mod tests {
     /// `Close` on a portal releases its suspended query.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_releases_a_suspended_portals_query() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.park_stream("p".into(), running_query().await);
         assert_eq!(s.suspended_portals(), 1);
         s.on_close(b'P', "p");
@@ -690,7 +691,7 @@ mod tests {
     /// Rebinding a portal name replaces it, and its suspended query with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rebind_releases_a_suspended_portals_query() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users", vec![]);
         s.on_bind("p".into(), "st".into(), &[], &[], vec![]);
         s.park_stream("p".into(), running_query().await);
@@ -702,7 +703,7 @@ mod tests {
     /// suspended portals; inside one they survive until closed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sync_releases_suspended_portals_only_outside_a_transaction() {
-        let mut s = Session::new();
+        let mut s = Session::new(test_auth());
         s.park_stream("p".into(), running_query().await);
         s.begin_txn(None, crate::mvcc::MvccManager::default().snapshot());
         s.on_sync();

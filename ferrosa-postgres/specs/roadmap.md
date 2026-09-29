@@ -72,8 +72,7 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 - **DDL follow-ups to T-132a** — `DROP`/`ALTER TABLE` (T-132b); DDL through the
   extended protocol (`Parse` refuses it); `NoticeResponse` so `IF NOT EXISTS`
   can emit the PG NOTICE; `timestamptz` (no `pg_types` entry, refused `42704`);
-  enforcing `varchar(n)` / `numeric(p,s)`; per-role `CREATE` authorization
-  (`ddl::authorize_create_table`, after PR #465); cluster-mode jsonb DDL gate
+  enforcing `varchar(n)` / `numeric(p,s)`; cluster-mode jsonb DDL gate
   (T-300).
 
 ## Later

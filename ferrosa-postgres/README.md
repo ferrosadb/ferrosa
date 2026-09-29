@@ -189,8 +189,8 @@ and precision are not enforced. An existing table is `42P07`, or a success
 under `IF NOT EXISTS` with no NOTICE (there is no `NoticeResponse`). A missing
 keyspace is `3F000`; DDL in a transaction block is `25001`; a context without a
 `ddl` executor refuses `0A000`. Unsupported clauses keep their `0A000` names.
-`ddl::authorize_create_table` is the call point for the DDL permission check
-(PR #465). `DROP`/`ALTER` are T-132b; extended-protocol `Parse` of DDL is refused.
+`CREATE TABLE` requires `CREATE` on the target keyspace, checked at dispatch
+in `authz::statement_permissions` before the executor reads the schema (42501). `DROP`/`ALTER` are T-132b; extended-protocol `Parse` of DDL is refused.
 
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +

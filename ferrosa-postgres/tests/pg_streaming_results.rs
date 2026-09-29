@@ -98,9 +98,22 @@ const ROWS: usize = 768;
 
 struct OneRole(ScramVerifier);
 
+/// A single superuser login with no limiter (PR #465 added the limiter
+/// methods; `security_live.rs` covers the schema-backed store).
 impl VerifierStore for OneRole {
     fn verifier(&self, user: &str) -> Option<ScramVerifier> {
         (user == "ferrosa_user").then(|| self.0.clone())
+    }
+    fn admit(&self, _user: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn record_failure(&self, _user: &str) {}
+    fn record_success(&self, user: &str) -> Result<ferrosa_schema::AuthContext, String> {
+        Ok(ferrosa_schema::AuthContext {
+            role: user.to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        })
     }
 }
 
@@ -269,7 +282,12 @@ async fn start() -> (tokio_postgres::Client, tempfile::TempDir) {
         b"ferrosa-dev-salt",
         4096,
     )));
-    tokio::spawn(server::serve(listener, store, ctx));
+    tokio::spawn(server::serve(
+        listener,
+        store,
+        ctx,
+        server::PgTls::plaintext(),
+    ));
     let (client, connection) = Config::new()
         .host("127.0.0.1")
         .port(port)
