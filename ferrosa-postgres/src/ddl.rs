@@ -292,6 +292,7 @@ fn cql_type_name(ty: &CqlType) -> Option<&'static str> {
         CqlType::Smallint => Some("smallint"),
         CqlType::Tinyint => Some("tinyint"),
         CqlType::Duration => Some("duration"),
+        CqlType::Jsonb => Some("jsonb"),
         CqlType::List(_)
         | CqlType::Map(_, _)
         | CqlType::Set(_)
