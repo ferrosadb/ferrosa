@@ -201,6 +201,10 @@ jobs:
   postgres-oracle:
     name: Differential Oracle (vs PostgreSQL)
     runs-on: ubuntu-latest
+    env:
+      # Our digest-pinned mirror, not Docker Hub. The harness must use the
+      # same reference the pre-pull warms, or it pulls upstream again.
+      FERROSA_POSTGRES_IMAGE: downloads.ferrosa.ai/postgres@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
@@ -213,7 +217,7 @@ jobs:
       - name: Verify docker is available
         run: docker --version
       - name: Pre-pull postgres:16
-        run: docker pull postgres:16
+        run: scripts/pull-images.sh "$FERROSA_POSTGRES_IMAGE"
       - name: Run differential oracle (corpus + restricted-query + DML)
         env:
           FERROSA_TEST_CONTAINERS: "1"
@@ -453,6 +457,11 @@ jobs:
     needs: build-node-image
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Our digest-pinned mirror, not Docker Hub. `cqlsh` runs from this image
+      # in two steps below; pulling it upstream made the job depend on a
+      # registry we do not control.
+      FERROSA_CASSANDRA_IMAGE: downloads.ferrosa.ai/cassandra@sha256:8819d1b7877ee6621751a761cc163332e9c3eaf671c8ef672f7c77a7c5bff05f
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
@@ -521,13 +530,13 @@ jobs:
           echo "PostgreSQL Jepsen cluster formed: all three nodes report the expected Normal ring"
       - name: Replicate PostgreSQL roles to all nodes
         run: |
-          docker run --rm --network host cassandra:5.0 cqlsh 127.0.0.1 49042 \
+          scripts/pull-images.sh "$FERROSA_CASSANDRA_IMAGE"
+          docker run --rm --network host "$FERROSA_CASSANDRA_IMAGE" cqlsh 127.0.0.1 49042 \
             -e "ALTER KEYSPACE system_auth WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};"
       - name: Create the test CQL role
         run: |
-          docker pull cassandra:5.0
           for attempt in $(seq 1 60); do
-            if docker run --rm --network host cassandra:5.0 cqlsh 127.0.0.1 49042 \
+            if docker run --rm --network host "$FERROSA_CASSANDRA_IMAGE" cqlsh 127.0.0.1 49042 \
               -e "CREATE ROLE ferrosa_pg_jepsen WITH PASSWORD = 'ferrosa-jepsen-test' AND LOGIN = true AND SUPERUSER = true;"; then
               exit 0
             fi
@@ -657,6 +666,11 @@ jobs:
       # docker-compose.yml defaults to upstream rustfs:latest (arm64 dev
       # machines); CI uses our digest-pinned amd64 mirror.
       FERROSA_RUSTFS_IMAGE: downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d
+      # The `cqlsh` client this job runs over TLS, and the pair to
+      # FERROSA_CASSANDRA_IMAGE used by the pre-pull step. Both point at our
+      # digest-pinned mirror rather than Docker Hub.
+      FERROSA_CQLSH_IMAGE: downloads.ferrosa.ai/cassandra@sha256:8819d1b7877ee6621751a761cc163332e9c3eaf671c8ef672f7c77a7c5bff05f
+      FERROSA_CASSANDRA_IMAGE: downloads.ferrosa.ai/cassandra@sha256:8819d1b7877ee6621751a761cc163332e9c3eaf671c8ef672f7c77a7c5bff05f
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Download the node image built earlier in CI
@@ -692,7 +706,7 @@ jobs:
       - name: Pre-pull service and client images
         run: |
           set -euo pipefail
-          for img in "$FERROSA_RUSTFS_IMAGE" cassandra:5.0 \
+          for img in "$FERROSA_RUSTFS_IMAGE" "$FERROSA_CASSANDRA_IMAGE" \
             "downloads.ferrosa.ai/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc" \
             "downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed"; do
             for attempt in 1 2 3; do
@@ -799,7 +813,19 @@ jobs:
                 FERROSA_S3_ACCESS_KEY_ID: "ferrosa_ci_access_key"
                 FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa_ci_secret_key"  # pragma: allowlist secret
           CEOF
-          docker compose -f /tmp/docker-compose.ci.yml up -d
+          # Bounded retry: `up -d` pulls rustfs and aws-cli from
+          # downloads.ferrosa.ai, and our own origin can hiccup -- on
+          # 2026-09-29 a manifest read against it was reset mid-transfer and
+          # this step failed the job with no retry. Only the pull is flaky,
+          # so `up` is re-run rather than the whole step.
+          for attempt in 1 2 3 4; do
+            if docker compose -f /tmp/docker-compose.ci.yml up -d; then
+              break
+            fi
+            [ "$attempt" = 4 ] && { echo "::error::compose up failed after 4 attempts"; exit 1; }
+            echo "compose up attempt $attempt failed (likely an image pull); retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
 
       - name: Install cqlsh
         run: pip install cqlsh

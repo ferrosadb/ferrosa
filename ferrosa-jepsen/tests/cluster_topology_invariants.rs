@@ -45,6 +45,18 @@ use std::time::Duration;
 /// `scripts/test-cluster-up-ci.sh`).
 const CLUSTER_HOSTS: &[&str] = &["127.0.0.1:9042", "127.0.0.1:9043", "127.0.0.1:9044"];
 
+/// The `cqlsh` image: `$FERROSA_CASSANDRA_IMAGE` if set, else the upstream tag.
+///
+/// CI points this at our digest-pinned mirror on downloads.ferrosa.ai so a
+/// Docker Hub outage cannot fail the job; the default keeps a local run
+/// working with the image most developers already have.
+fn cqlsh_image() -> String {
+    std::env::var("FERROSA_CASSANDRA_IMAGE")
+        .ok()
+        .filter(|img| !img.trim().is_empty())
+        .unwrap_or_else(|| "cassandra:5.0".to_string())
+}
+
 /// Helper: spawn `cqlsh` against `host:port` and capture `key=value`
 /// pairs from a single-row `SELECT host_id, broadcast_address, tokens
 /// FROM system.local`.  Returns `None` if cqlsh isn't installed or the
@@ -56,7 +68,7 @@ fn query_local(host: SocketAddr) -> Option<NodeIdentity> {
             "--rm",
             "--network",
             "host",
-            "cassandra:5.0",
+            &cqlsh_image(),
             "cqlsh",
             "--no-color",
             &host.ip().to_string(),
