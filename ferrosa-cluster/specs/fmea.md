@@ -70,3 +70,12 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
   `recovery_scenarios` (13), `proptests`, `repair_fuzz` (7).
 - **Missing:** external Jepsen/Knossos/Elle history checking (CL-1).
 - `inbound_peer_reverse_address_{prefers_advertised_nonuniform_port,falls_back_when_advertisement_is_unusable}` (CL-16).
+- **CL-T2c1678cb** (sled log-store open vs a still-releasing holder): dropping a
+  sled `Db` flushes and joins threads, which under heavy I/O outlasted the old
+  fixed 10 x 50 ms budget, so a restart-under-load open failed `WouldBlock`.
+  Mitigation: exponential backoff (10 ms to 250 ms) under a 10 s wall-clock budget;
+  logs first contention, recovered, or gave up with the waited duration; a
+  never-released lock still fails typed after the budget. Tests
+  `{new,open_offline}_retries_through_a_transient_lock` release the holder only
+  after a `#[cfg(test)]` contention hook fires (no sleeps);
+  `a_never_released_lock_fails_typed_after_the_budget` covers the live-peer case.
