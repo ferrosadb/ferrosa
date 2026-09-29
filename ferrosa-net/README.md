@@ -62,7 +62,10 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   (`connect_with_retry_cancelable`); after `MAX_RECONNECT_ATTEMPTS` it counts an exhaustion, and after
   `DORMANT_AFTER_EXHAUSTIONS` it goes `Dormant`, probing once per
   `DORMANT_PROBE_INTERVAL`. Reconnects re-resolve the peer's advertised hostname
-  so container IP churn is handled automatically.
+  so container IP churn is handled automatically. `NetError::LaneShutdown`
+  means a pool's actors have exited (peer connection replaced); it is not
+  reconnect exhaustion. `PeerManager` re-issues a request once on the current
+  pool when the one it resolved was replaced mid-request.
 - **RPC server + handler registry** (`rpc`) — `RpcServer` accepts inbound
   connections, runs the acceptor handshake, and dispatches frames through a
   thread-safe `HandlerRegistry` (`MsgType` → `Arc<dyn RpcHandler>`) that supports

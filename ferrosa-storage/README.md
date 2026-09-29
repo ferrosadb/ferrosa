@@ -293,8 +293,12 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   generation discovery reads local files only. Only marked generations are
   restored: a manifest entry without a marker may be a compacted-away input, and
   restoring it would resurrect purged rows. Retiring a generation
-  (`delete_sstable_files`) removes its marker. System keyspaces are never
-  evicted. See FMEA ST-38.
+  (`delete_sstable_files`) removes its marker. A live reader that reopens a
+  marked generation between eviction and restart rehydrates it from S3 first
+  (`flush::rehydrate_if_evicted`, called by `open_file_sstable` and
+  `open_sstable_from_dir`) and then clears the marker; an unmarked missing
+  generation still fails to open so the read path's view-retry fires. System
+  keyspaces are never evicted. See FMEA ST-38.
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —

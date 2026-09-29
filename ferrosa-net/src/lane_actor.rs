@@ -205,7 +205,11 @@ impl LaneHandle {
         // Reserve a slot in the channel — cancel-safe because dropping the
         // permit before calling `permit.send()` simply releases the slot.
         let started = Instant::now();
-        let permit = self.tx.reserve().await.map_err(|_| NetError::LaneFailed)?;
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| NetError::LaneShutdown)?;
         metrics::record_lane_queue_wait(self.lane, started.elapsed());
         let capacity = self.tx.max_capacity();
         metrics::observe_lane_queue(
@@ -219,7 +223,7 @@ impl LaneHandle {
             reply: reply_tx,
         });
 
-        reply_rx.await.map_err(|_| NetError::LaneFailed)?
+        reply_rx.await.map_err(|_| NetError::LaneShutdown)?
     }
 
     /// Fire-and-forget a message through the lane actor.
@@ -234,7 +238,11 @@ impl LaneHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
 
         let started = Instant::now();
-        let permit = self.tx.reserve().await.map_err(|_| NetError::LaneFailed)?;
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| NetError::LaneShutdown)?;
         metrics::record_lane_queue_wait(self.lane, started.elapsed());
         let capacity = self.tx.max_capacity();
         metrics::observe_lane_queue(
@@ -248,7 +256,7 @@ impl LaneHandle {
             reply: reply_tx,
         });
 
-        reply_rx.await.map_err(|_| NetError::LaneFailed)?
+        reply_rx.await.map_err(|_| NetError::LaneShutdown)?
     }
 
     /// Attempt to swap in a new RPC client (best-effort, non-blocking).
@@ -288,9 +296,13 @@ impl LaneHandle {
     /// Query the current lane status.
     pub async fn query_status(&self) -> Result<LaneStatusReport> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let permit = self.tx.reserve().await.map_err(|_| NetError::LaneFailed)?;
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| NetError::LaneShutdown)?;
         permit.send(LaneCommand::QueryStatus { reply: reply_tx });
-        reply_rx.await.map_err(|_| NetError::LaneFailed)
+        reply_rx.await.map_err(|_| NetError::LaneShutdown)
     }
 
     /// Request a graceful shutdown of the actor loop.
@@ -1071,8 +1083,8 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(result, Err(NetError::LaneFailed)),
-            "expected LaneFailed after shutdown, got {result:?}"
+            matches!(result, Err(NetError::LaneShutdown)),
+            "expected LaneShutdown after shutdown, got {result:?}"
         );
     }
 
