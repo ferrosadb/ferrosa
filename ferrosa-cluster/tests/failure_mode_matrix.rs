@@ -820,46 +820,59 @@ async fn s_27_voluntary_leadership_transfer() {
     // W4.14's decommission path and the openraft fork's
     // `tests/elect/t12_pre_vote_basic`.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
-    let leader_id = cluster.leader_node().node_id;
+    let leader_id = cluster.require_leader(Duration::from_secs(5)).await;
     // Find a different voter.
     let target = {
-        let m = cluster.leader_node().metrics();
+        let leader = cluster
+            .raft_for_node_id(leader_id)
+            .expect("the elected leader is a cluster node");
+        let m = leader.metrics().borrow().clone();
         let voters: Vec<u64> = m.membership_config.membership().voter_ids().collect();
         voters.into_iter().find(|&v| v != leader_id).unwrap()
     };
+
+    // A voluntary transfer opens a window in which NO node reports a leader:
+    // the old leader has stepped down and the target has not yet won. The
+    // loop must wait that window out. It used to fall back to `leader_node()`,
+    // which panics "no leader currently elected" exactly then (t_314d0c6b).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut last_error = None;
+    let mut last_error: Option<String> = None;
+    let mut attempts = 0u32;
     while tokio::time::Instant::now() < deadline {
-        let source = cluster
-            .current_leader_id()
-            .and_then(|leader_id| cluster.raft_for_node_id(leader_id))
-            .unwrap_or_else(|| cluster.leader_node().raft.clone());
-        match source.trigger().transfer_to(target).await {
-            Ok(()) => break,
-            Err(e) => {
-                last_error = Some(format!("{e:?}"));
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-        if cluster
-            .nodes()
-            .iter()
-            .any(|n| n.metrics().current_leader == Some(target))
-        {
+        if cluster.majority_leader_id() == Some(target) {
             break;
         }
+        let Some(source) = cluster
+            .current_leader_id()
+            .and_then(|leader| cluster.raft_for_node_id(leader))
+        else {
+            last_error = Some("no leader reported (transfer in progress)".to_owned());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        attempts += 1;
+        if let Err(e) = source.trigger().transfer_to(target).await {
+            last_error = Some(format!("{e:?}"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let pred = || {
-        cluster.leader_node().metrics().current_leader == Some(target)
-            || cluster
-                .nodes()
-                .iter()
-                .any(|n| n.metrics().current_leader == Some(target))
-    };
+
+    // Leadership moved to the INTENDED node, as a majority sees it, in
+    // bounded time.
+    let transferred = wait_until(
+        || cluster.majority_leader_id() == Some(target),
+        Duration::from_secs(10),
+    )
+    .await;
+    let seen: Vec<(u64, Option<u64>)> = cluster
+        .nodes()
+        .iter()
+        .map(|n| (n.node_id, n.metrics().current_leader))
+        .collect();
     assert!(
-        wait_until(pred, Duration::from_secs(10)).await,
-        "target must become leader after transfer; last transfer error: {last_error:?}"
+        transferred,
+        "leadership did not move from {leader_id} to {target}: attempts={attempts}, \
+         last transfer error: {last_error:?}, (node, leader it reports): {seen:?}"
     );
     cluster.shutdown().await;
 }
