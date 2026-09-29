@@ -63,7 +63,9 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   (T-021, `compaction-cancel-safety.md`).
 - **Test generators** — behind the `test-generators` feature: proptest
   strategies (`arb_cell_value`, `arb_cell`, `arb_partition_key`,
-  `arb_decorated_key`) shared across crates.
+  `arb_decorated_key`) shared across crates, plus shrink-friendly generated
+  DDL/snapshot table identities, drop markers, and index declarations for
+  durable-state properties.
 
 ## How it works
 
