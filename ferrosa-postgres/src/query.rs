@@ -59,45 +59,11 @@ pub(crate) fn error_response(sqlstate: &str, message: &str) -> BackendMessage {
     }
 }
 
-/// The Postgres type OID for a relational [`ColumnType`].
-///
-/// `Int -> 23` (int4), `BigInt -> 20` (int8), `Text -> 25` (text), `Bool -> 16` (bool),
-/// `Float -> 701` (float8), `Uuid -> 2950` (uuid), `Bytea -> 17` (bytea),
-/// `Timestamp -> 1114` (timestamp without tz), `Date -> 1082` (date),
-/// `Time -> 1083` (time without tz), `Inet -> 869` (inet),
-/// `Numeric -> 1700` (numeric).
+/// The Postgres type OID for a relational [`ColumnType`], from the one
+/// [`crate::pg_types`] map (`Float -> 701`, `Numeric -> 1700`, ...).
 pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
-    match ty {
-        ColumnType::Int => 23,
-        ColumnType::BigInt => 20,
-        ColumnType::Text => 25,
-        ColumnType::Bool => 16,
-        ColumnType::Float => 701,
-        ColumnType::Uuid => 2950,
-        ColumnType::Bytea => 17,
-        ColumnType::Timestamp => 1114,
-        ColumnType::Date => 1082,
-        ColumnType::Time => 1083,
-        ColumnType::Inet => 869,
-        ColumnType::Numeric => 1700,
-    }
-}
-
-/// The on-wire fixed size for a column type (`-1` for variable-length text /
-/// bytea / inet / numeric). `Uuid` is a fixed 16 bytes; `Timestamp`/`Time` are
-/// 8-byte integers and `Date` is a 4-byte integer (matching the binary encodings
-/// in [`encode_value`]).
-fn column_type_size(ty: ColumnType) -> i16 {
-    match ty {
-        ColumnType::Int => 4,
-        ColumnType::BigInt => 8,
-        ColumnType::Bool => 1,
-        ColumnType::Float => 8,
-        ColumnType::Uuid => 16,
-        ColumnType::Timestamp | ColumnType::Time => 8,
-        ColumnType::Date => 4,
-        ColumnType::Text | ColumnType::Bytea | ColumnType::Inet | ColumnType::Numeric => -1,
-    }
+    // Every minted OID is below 2^31 (asserted by the pg_types tests).
+    i32::try_from(crate::pg_types::for_column_type(ty).oid).unwrap_or(i32::MAX)
 }
 
 /// Render a [`SqlValue`] to its Postgres **text-format** column bytes, or `None`
@@ -637,7 +603,7 @@ fn be_int(raw: &[u8], width: usize) -> Option<i64> {
 /// `1` binary) for a column of declared `col_type`, or `None` for SQL NULL.
 ///
 /// The binary encoding is kept consistent with the OID/size advertised in
-/// `column_type_oid` / `column_type_size`: `ColumnType::Int` ⇒ int4 (OID 23,
+/// `column_type_oid` and `pg_types` `typlen`: `ColumnType::Int` ⇒ int4 (OID 23,
 /// 4 bytes), so an `Int` always emits a 4-byte big-endian `i32`; an out-of-range
 /// value returns an error rather than being truncated. `Float` ⇒
 /// float8 (OID 701, 8 bytes).
@@ -746,7 +712,7 @@ pub(crate) fn row_description_fields(
         .map(|(i, col)| FieldDescription {
             name: col.name.clone(),
             type_oid: column_type_oid(col.ty),
-            type_size: column_type_size(col.ty),
+            type_size: crate::pg_types::for_column_type(col.ty).typlen,
             format_code: result_format_for(result_formats, i),
         })
         .collect()
@@ -1506,7 +1472,7 @@ fn build_insert_returning(
                 .map_err(|e| error_response("42704", &e.to_string()))?;
         columns.push(Column::new(
             name.clone(),
-            cql_type_to_column_type(&cql_type),
+            crate::pg_types::pg_type_of(&cql_type).column_type,
         ));
         row.push(sql_values.get(name).cloned().unwrap_or(SqlValue::Null));
     }
@@ -1637,11 +1603,11 @@ fn infer_dml_param_oids(
             continue; // a non-zero client-declared OID already won
         }
         if let Some(col_meta) = meta.columns.get(*col_name) {
-            if let Ok(cql_type) =
-                ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
-            {
-                oids[idx] = column_type_oid(cql_type_to_column_type(&cql_type));
-            }
+            // An unresolvable column type is refused, not left as an
+            // unspecified (0) parameter OID.
+            let pg = crate::pg_types::pg_type_of_column(&col_meta.column_type, ks, schema)
+                .map_err(|e| error_response("42704", &e.to_string()))?;
+            oids[idx] = column_type_oid(pg.column_type);
         }
     }
     Ok(oids)
@@ -1741,38 +1707,10 @@ pub(crate) fn describe_insert_returning(
                 .map_err(|e| error_response("42704", &e.to_string()))?;
         columns.push(Column::new(
             name.clone(),
-            cql_type_to_column_type(&cql_type),
+            crate::pg_types::pg_type_of(&cql_type).column_type,
         ));
     }
     Ok(Some(columns))
-}
-
-/// Map a [`CqlType`] to the relational [`ColumnType`] used for the Postgres
-/// RowDescription OID/size. Mirrors `storage_provider`'s column typing; unmapped
-/// CQL types default to `Text` (their text rendering is always valid).
-fn cql_type_to_column_type(ty: &CqlType) -> ColumnType {
-    match ty {
-        CqlType::Int | CqlType::Smallint | CqlType::Tinyint => ColumnType::Int,
-        CqlType::Bigint | CqlType::Counter => ColumnType::BigInt,
-        CqlType::Boolean => ColumnType::Bool,
-        CqlType::Float | CqlType::Double => ColumnType::Float,
-        CqlType::Uuid | CqlType::Timeuuid => ColumnType::Uuid,
-        CqlType::Blob => ColumnType::Bytea,
-        CqlType::Timestamp => ColumnType::Timestamp,
-        CqlType::Date => ColumnType::Date,
-        CqlType::Time => ColumnType::Time,
-        CqlType::Inet => ColumnType::Inet,
-        CqlType::Decimal | CqlType::Varint => ColumnType::Numeric,
-        CqlType::Ascii
-        | CqlType::Varchar
-        | CqlType::Duration
-        | CqlType::List(_)
-        | CqlType::Map(_, _)
-        | CqlType::Set(_)
-        | CqlType::Tuple(_)
-        | CqlType::Udt { .. }
-        | CqlType::Vector(_, _) => ColumnType::Text,
-    }
 }
 
 /// Render a DML `RETURNING` result into backend messages: an optional leading
@@ -2415,6 +2353,11 @@ mod tests {
         assert!(!err.message.contains("s3cr3t"), "{}", err.message);
     }
 
+    /// `typlen` for a column type, from the one `pg_types` map.
+    fn column_type_size(ty: ColumnType) -> i16 {
+        crate::pg_types::for_column_type(ty).typlen
+    }
+
     #[test]
     fn column_type_oids_match_postgres_builtins() {
         assert_eq!(column_type_oid(ColumnType::Int), 23);
@@ -2425,7 +2368,7 @@ mod tests {
 
     #[test]
     fn cql_bigint_columns_use_postgres_int8_on_the_wire() {
-        let ty = cql_type_to_column_type(&CqlType::Bigint);
+        let ty = crate::pg_types::pg_type_of(&CqlType::Bigint).column_type;
         assert_eq!(column_type_oid(ty), 20);
         assert_eq!(column_type_size(ty), 8);
         let value = i64::from(i32::MAX) + 1;

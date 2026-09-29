@@ -20,6 +20,7 @@ pub mod extended;
 pub mod handshake;
 pub mod messages;
 mod mvcc;
+pub mod pg_types;
 pub mod query;
 pub(crate) mod result_stream;
 pub mod scram;

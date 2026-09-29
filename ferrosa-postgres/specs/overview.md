@@ -102,6 +102,18 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
 
 ## Type model & wire parity
 
+One module, `pg_types`, maps every `CqlType` to a `PgType { oid, typname, typlen,
+column_type, binary, text_rendered }` through an exhaustive match (T-023). It
+replaced `catalog::type_oid`/`type_name`, `storage_provider::engine_column_type`
+and `query::cql_type_to_column_type`/`column_type_size`. CQL `float` and `double`
+both map to `float8` (701): the engine's one float column carries an `f64`
+(this fixed the drift of board task t_cd417149, where the storage provider typed
+them `text`). Collections, tuples, vectors, UDTs and `duration` are named arms
+that map to `text` with `text_rendered` set. A stored type string that does not
+resolve is a `PgTypeError` (catalog projection, parameter inference), never a
+silent `text`. `jsonb` (3802), `json` (114) and `jsonpath` (4072) are reserved
+as constants; the `CqlType` variant lands with type threading (T-161a).
+
 `query` renders/parses each `ferrosa_sql::Value` to/from its exact Postgres text
 form and (for most) the binary form, with OIDs/sizes advertised in
 `RowDescription`: `Int→int4(23)`, `Text→text(25)`, `Bool→bool(16)`,

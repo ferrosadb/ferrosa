@@ -75,6 +75,8 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   support (FMEA PG-4) — widen `ferrosa_sql::Value` and the
   `cql_to_value`/`value_to_cql` bridges. Until then, scans fail explicitly when
   they encounter one of these values.
+- **jsonb slot in `pg_types`** (T-161a): add the `CqlType` arm and `ALL_PG_TYPES`
+  entry for OID 3802 once type threading lands; constants are already reserved.
 - **Exact float/numeric text-format parity** with Postgres (FMEA PG-9).
 - **Real affected-row counts** for `UPDATE`/`DELETE` (FMEA PG-10) — read-before-
   write so the count reflects matches rather than always reporting `1`.

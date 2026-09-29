@@ -103,7 +103,7 @@ use std::sync::{Arc, Mutex};
 
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema, TableMetadata};
-use ferrosa_sql::{Column, ColumnType, RelSchema, Row, TableProvider, Value};
+use ferrosa_sql::{Column, RelSchema, Row, TableProvider, Value};
 use ferrosa_storage::{StorageEngine, TableId};
 use futures::{FutureExt, StreamExt};
 use tokio::runtime::Handle;
@@ -191,58 +191,17 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// Map a CQL column-type string to the engine's [`ColumnType`].
+/// Build the engine [`RelSchema`] from a table's column names and resolved types,
+/// in declared order.
 ///
-/// The CQL integral family collapses to `Int`, the textual family to `Text`;
-/// `uuid`/`timeuuid` map to `Uuid` and `blob`/`bytes` to `Bytea` so a column's
-/// declared schema type agrees with the [`cql_to_value`] value type (and hence
-/// the advertised RowDescription OID). Anything the engine can't yet model (and
-/// any unknown type) defaults to `Text` — the most permissive textual
-/// representation — consistent with `catalog::type_oid`'s text fallback.
-fn engine_column_type(cql_type: &str) -> ColumnType {
-    match normalize_type_head(cql_type).as_str() {
-        "int" | "smallint" | "tinyint" => ColumnType::Int,
-        "bigint" | "counter" => ColumnType::BigInt,
-        "boolean" | "bool" => ColumnType::Bool,
-        "text" | "varchar" | "ascii" => ColumnType::Text,
-        "uuid" | "timeuuid" => ColumnType::Uuid,
-        "blob" | "bytes" => ColumnType::Bytea,
-        // Temporal / network / arbitrary-precision now map to widened engine
-        // types (exact Postgres text). `varint` is an arbitrary-precision integer
-        // ⇒ numeric (so a value outside i64 range is not silently lost).
-        "timestamp" | "datetime" => ColumnType::Timestamp,
-        "date" => ColumnType::Date,
-        "time" => ColumnType::Time,
-        "inet" => ColumnType::Inet,
-        "decimal" | "varint" => ColumnType::Numeric,
-        // Unknown / not-yet-modelled types default to Text (documented fallback).
-        _ => ColumnType::Text,
-    }
-}
-
-/// Lower-case a CQL type name, strip an outer `frozen<...>`, and take the head
-/// identifier before any `<` (so `map<text,text>` -> `map`). Mirrors
-/// `catalog::normalize_type_name`.
-fn normalize_type_head(column_type: &str) -> String {
-    let lower = column_type.trim().to_ascii_lowercase();
-    let unwrapped = lower
-        .strip_prefix("frozen<")
-        .and_then(|rest| rest.strip_suffix('>'))
-        .unwrap_or(&lower);
-    unwrapped
-        .split('<')
-        .next()
-        .unwrap_or(unwrapped)
-        .trim()
-        .to_string()
-}
-
-/// Build the engine [`RelSchema`] from a table's columns in declared order.
-fn rel_schema_for(meta: &TableMetadata) -> RelSchema {
-    let columns = meta
-        .columns
-        .values()
-        .map(|col| Column::new(col.name.clone(), engine_column_type(&col.column_type)))
+/// Each column's engine type comes from [`crate::pg_types::pg_type_of`], the same
+/// map the catalog and RowDescription use, so the three cannot drift.
+fn rel_schema_for(col_names: &[String], col_types: &[CqlType]) -> RelSchema {
+    debug_assert_eq!(col_names.len(), col_types.len());
+    let columns = col_names
+        .iter()
+        .zip(col_types)
+        .map(|(name, ty)| Column::new(name.clone(), crate::pg_types::pg_type_of(ty).column_type))
         .collect();
     RelSchema::new(columns)
 }
@@ -576,8 +535,6 @@ pub(crate) async fn load_table_with_overlay(
             table: table.to_string(),
         })?;
 
-    let rel_schema = rel_schema_for(meta);
-
     // Column context for the canonical CQL decomposition, in declared order.
     let col_names: Vec<String> = meta.columns.keys().cloned().collect();
     let col_types = meta
@@ -586,6 +543,7 @@ pub(crate) async fn load_table_with_overlay(
         .map(|c| ferrosa_row_bridge::parse_cql_type_in_keyspace(&c.column_type, keyspace, schema))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| LoadError::Storage(format!("failed to resolve column type: {e}")))?;
+    let rel_schema = rel_schema_for(&col_names, &col_types);
     let pk_idx = pk_indices(meta);
     let ck_idx = ck_indices(meta);
     let storage_to_table = storage_to_table_indices(meta);
@@ -790,6 +748,7 @@ pub(crate) fn read_row_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrosa_sql::ColumnType;
 
     fn cql_to_value(value: &CqlValue) -> Value {
         super::cql_to_value(value).expect("test value should be representable")
@@ -925,26 +884,17 @@ mod tests {
     }
 
     #[test]
-    fn engine_column_type_maps_families() {
-        assert_eq!(engine_column_type("int"), ColumnType::Int);
-        assert_eq!(engine_column_type("bigint"), ColumnType::BigInt);
-        assert_eq!(engine_column_type("counter"), ColumnType::BigInt);
-        assert_eq!(engine_column_type("text"), ColumnType::Text);
-        assert_eq!(engine_column_type("ASCII"), ColumnType::Text);
-        assert_eq!(engine_column_type("boolean"), ColumnType::Bool);
-        // uuid / timeuuid / blob now map to the widened engine types.
-        assert_eq!(engine_column_type("uuid"), ColumnType::Uuid);
-        assert_eq!(engine_column_type("timeuuid"), ColumnType::Uuid);
-        assert_eq!(engine_column_type("blob"), ColumnType::Bytea);
-        // Temporal / network / arbitrary-precision map to the new engine types.
-        assert_eq!(engine_column_type("timestamp"), ColumnType::Timestamp);
-        assert_eq!(engine_column_type("date"), ColumnType::Date);
-        assert_eq!(engine_column_type("time"), ColumnType::Time);
-        assert_eq!(engine_column_type("inet"), ColumnType::Inet);
-        assert_eq!(engine_column_type("decimal"), ColumnType::Numeric);
-        assert_eq!(engine_column_type("varint"), ColumnType::Numeric);
-        // Unknown / not-yet-modelled -> Text fallback.
-        assert_eq!(engine_column_type("map<text, text>"), ColumnType::Text);
+    fn rel_schema_uses_the_pg_types_map_for_every_cql_type() {
+        use crate::pg_types::pg_type_of;
+        use ferrosa_common::cql_type::names::SCALAR_TYPES;
+        let types: Vec<CqlType> = SCALAR_TYPES.to_vec();
+        let names: Vec<String> = (0..types.len()).map(|i| format!("c{i}")).collect();
+        let rel = rel_schema_for(&names, &types);
+        let cols: Vec<&Column> = rel.columns.iter().collect();
+        assert_eq!(cols.len(), types.len());
+        for (col, ty) in cols.iter().zip(&types) {
+            assert_eq!(col.ty, pg_type_of(ty).column_type, "{ty:?}");
+        }
     }
 
     #[test]
