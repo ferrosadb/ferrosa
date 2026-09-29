@@ -2685,6 +2685,13 @@ impl StorageEngine {
             );
         }
 
+        // Evicted SSTables must be back on disk before ANY table registers —
+        // user tables right below, system tables (system_schema.indexes,
+        // system_auth.roles, ...) later in startup. Registration discovers
+        // generations from local files only; on 2026-09-29 an eviction under
+        // disk pressure plus a restart emptied system_schema.indexes and most
+        // agent_memory tables on all three memory-cluster nodes.
+        engine.restore_evicted_sstables_blocking()?;
         engine.load_local_schema_if_present()?;
         Ok(engine)
     }
@@ -2953,6 +2960,16 @@ impl StorageEngine {
         let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
+        // Evicted SSTables must be back on disk before the tables below are
+        // registered; see `restore_evicted_sstables`. This is the constructor
+        // a node with commit-log segments starts through.
+        Self::restore_evicted_sstables_blocking_in(
+            &config.data_dir,
+            object_store
+                .as_ref()
+                .zip(config.object_store.as_ref())
+                .map(|(store, os_config)| (Arc::clone(store), os_config.prefix.clone())),
+        )?;
         if let Some(schemas) = Self::load_local_table_schemas(&config.data_dir)? {
             for schema in schemas {
                 let table_id = TableId::new(&schema.keyspace, &schema.table);
@@ -11378,8 +11395,48 @@ impl StorageEngine {
             .sum()
     }
 
-    /// Deletes all on-disk component files for an SSTable generation.
+    /// Path of the marker recording that the uploaded-cache evictor removed
+    /// generation `gen`'s local copy while S3 still holds it.
+    ///
+    /// The marker is the only thing that tells "evicted, restore it" apart
+    /// from "compacted away, leave it gone": both are listed in the manifest
+    /// and absent on disk. `<gen>.evicted` never matches generation discovery
+    /// (`*-Data.db` files and numeric directories) or the `<gen>-` sweep.
+    fn evicted_marker_path(table_dir: &std::path::Path, gen: &str) -> std::path::PathBuf {
+        table_dir.join(format!("{gen}.evicted"))
+    }
+
+    /// Durably record that `gen` is about to be evicted. Written and fsynced,
+    /// with its directory entry, BEFORE any component is deleted, so a crash
+    /// between the two can never lose track of an evicted SSTable.
+    fn record_eviction(table_dir: &std::path::Path, gen: &str) -> std::io::Result<()> {
+        let marker = Self::evicted_marker_path(table_dir, gen);
+        std::fs::File::create(&marker)?.sync_all()?;
+        std::fs::File::open(table_dir)?.sync_all()
+    }
+
+    /// Deletes all on-disk files for an SSTable generation that is leaving the
+    /// table for good (compaction retirement, truncation), including any
+    /// eviction marker: a retired generation must never be restored.
     fn delete_sstable_files(table_dir: &std::path::Path, gen: &str) -> u64 {
+        let reclaimed = Self::delete_sstable_components(table_dir, gen);
+        let marker = Self::evicted_marker_path(table_dir, gen);
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::error!(
+                marker = %marker.display(),
+                error = %e,
+                "delete_sstable_files: could not remove the eviction marker of a retired \
+                 SSTable; a restart would restore it from S3 and resurrect its rows"
+            ),
+        }
+        reclaimed
+    }
+
+    /// Deletes all on-disk component files for an SSTable generation, leaving
+    /// any eviction marker in place.
+    fn delete_sstable_components(table_dir: &std::path::Path, gen: &str) -> u64 {
         let suffixes = [
             "Data.db",
             "Partitions.db",
@@ -11736,6 +11793,13 @@ impl StorageEngine {
 
         let mut entries = Vec::new();
         for (table_id, manifest_entries) in &manifest.sstables {
+            // System keyspaces (system_schema, system_auth, graph adjacency)
+            // are read at startup to register indexes and seed auth, before
+            // anything is restored from S3. Evicting them emptied
+            // system_schema.indexes cluster-wide on 2026-09-29.
+            if table_id.starts_with("system") {
+                continue;
+            }
             let table_dir = self.config.data_dir.join("sstables").join(table_id);
             for entry in manifest_entries {
                 if pending.contains(&(table_id.clone(), entry.id.clone())) {
@@ -11814,7 +11878,19 @@ impl StorageEngine {
                 break;
             }
 
-            let reclaimed = Self::delete_sstable_files(&table_dir, &sstable_id);
+            // Record the eviction durably first; without the record a restart
+            // cannot tell this SSTable from a compacted-away one and would
+            // leave it out of its table. No record, no eviction.
+            if let Err(e) = Self::record_eviction(&table_dir, &sstable_id) {
+                tracing::error!(
+                    table = table_id,
+                    sstable = sstable_id,
+                    error = %e,
+                    "s3-sync: could not durably record eviction; keeping the local copy"
+                );
+                continue;
+            }
+            let reclaimed = Self::delete_sstable_components(&table_dir, &sstable_id);
             total_bytes = total_bytes.saturating_sub(size);
             projected_available = projected_available.saturating_add(reclaimed);
             evicted += 1;
@@ -12101,6 +12177,139 @@ impl StorageEngine {
         }
     }
 
+    /// Restore, before the tables are registered, every manifest-listed
+    /// SSTable whose local copy is missing — typically one the uploaded-cache
+    /// evictor deleted under disk pressure.
+    ///
+    /// Table registration discovers generations from local `*-Data.db` files
+    /// only, so without this an evicted SSTable silently leaves its table on
+    /// the next restart even though S3 and the manifest still hold it. On the
+    /// live ferrosa-memory cluster that hid 371 SSTables at once. Returns the
+    /// number of generations restored. Without S3 there is nothing to
+    /// restore. A failure is returned, never swallowed: starting to serve a
+    /// table without its evicted SSTables is the data-loss this prevents.
+    ///
+    /// Only generations carrying an eviction marker are restored. A manifest
+    /// entry without one may be a compacted-away input the manifest has not
+    /// dropped yet; restoring it would resurrect the rows its compaction
+    /// purged. Covers every table directory, system keyspaces included, so it
+    /// must run before any table is registered.
+    pub async fn restore_evicted_sstables(&self) -> ferrosa_common::Result<usize> {
+        Self::restore_evicted_sstables_in(&self.config.data_dir, self.resolve_store_and_prefix())
+            .await
+    }
+
+    /// [`Self::restore_evicted_sstables`] for a data directory and object
+    /// store, before any engine exists. `open` needs this: it registers
+    /// tables while it is still assembling the engine.
+    async fn restore_evicted_sstables_in(
+        data_dir: &std::path::Path,
+        store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
+    ) -> ferrosa_common::Result<usize> {
+        let evicted = Self::evicted_generations(&data_dir.join("sstables"));
+        if evicted.is_empty() {
+            return Ok(0);
+        }
+        let (store, prefix) = store.ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "{} evicted SSTable table(s) need restoring from S3, but S3 is not configured",
+                evicted.len()
+            ))
+        })?;
+        let (manifest, _version) = crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+        let mut restored = 0usize;
+        for (dir_name, gens) in evicted {
+            let Some((keyspace, table)) = dir_name.split_once('.') else {
+                continue;
+            };
+            let table_id = TableId::new(keyspace, table);
+            let mut marked = crate::manifest::Manifest::new();
+            for entry in manifest.sstables.get(&dir_name).into_iter().flatten() {
+                if gens.contains(&entry.id) {
+                    marked.add_sstable(&dir_name, entry.clone());
+                }
+            }
+            restored +=
+                Self::download_sstables_into(data_dir, &store, &prefix, &table_id, &marked).await?;
+
+            let table_dir = data_dir.join("sstables").join(&dir_name);
+            for gen in &gens {
+                if Self::generation_component_path(&table_dir, gen, "Data.db").is_some() {
+                    if let Err(e) = std::fs::remove_file(Self::evicted_marker_path(&table_dir, gen))
+                    {
+                        tracing::warn!(table = %dir_name, sstable = %gen, error = %e, "storage-engine: restored an evicted SSTable but could not clear its marker");
+                    }
+                } else {
+                    tracing::error!(
+                        table = %dir_name,
+                        sstable = %gen,
+                        "storage-engine: evicted SSTable could not be restored from S3 (not in the manifest or its objects are missing); its rows are NOT being served. Marker kept for the next attempt"
+                    );
+                }
+            }
+        }
+        if restored > 0 {
+            tracing::warn!(
+                restored,
+                "storage-engine: restored evicted SSTables from S3 before registering tables"
+            );
+        }
+        Ok(restored)
+    }
+
+    /// [`Self::restore_evicted_sstables`] called from the synchronous
+    /// constructors. Blocks only when an eviction marker exists, so an engine
+    /// with nothing to restore never enters a nested runtime.
+    fn restore_evicted_sstables_blocking(&self) -> ferrosa_common::Result<usize> {
+        Self::restore_evicted_sstables_blocking_in(
+            &self.config.data_dir,
+            self.resolve_store_and_prefix(),
+        )
+    }
+
+    fn restore_evicted_sstables_blocking_in(
+        data_dir: &std::path::Path,
+        store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
+    ) -> ferrosa_common::Result<usize> {
+        if Self::evicted_generations(&data_dir.join("sstables")).is_empty() {
+            return Ok(0);
+        }
+        Self::block_on_rehydration(Self::restore_evicted_sstables_in(data_dir, store))
+    }
+
+    /// `(table dir name, evicted generation ids)` for every table directory
+    /// holding eviction markers.
+    fn evicted_generations(
+        sstables_dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut out = std::collections::BTreeMap::new();
+        for table in std::fs::read_dir(sstables_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let Some(dir_name) = table.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            for entry in std::fs::read_dir(table.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let name = entry.file_name();
+                let Some(gen) = name.to_str().and_then(|n| n.strip_suffix(".evicted")) else {
+                    continue;
+                };
+                if gen.parse::<u64>().is_ok() {
+                    out.entry(dir_name.clone())
+                        .or_insert_with(std::collections::BTreeSet::new)
+                        .insert(gen.to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// Download SSTables from S3 to local disk for a specific table.
     ///
     /// Uses the manifest to know which SSTables exist, then downloads
@@ -12117,18 +12326,28 @@ impl StorageEngine {
         let (store, prefix) = self
             .resolve_store_and_prefix()
             .ok_or_else(|| ferrosa_common::Error::InvalidFormat("S3 not configured".into()))?;
+        if manifest.sstables.contains_key(&table_id.to_string()) {
+            self.update_s3_manifest_stats(manifest);
+        }
+        Self::download_sstables_into(&self.config.data_dir, &store, &prefix, table_id, manifest)
+            .await
+    }
 
+    /// [`Self::download_sstables_from_s3`] for a data directory and object
+    /// store, usable before the engine exists.
+    async fn download_sstables_into(
+        data_dir: &std::path::Path,
+        store: &Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+        table_id: &TableId,
+        manifest: &crate::manifest::Manifest,
+    ) -> ferrosa_common::Result<usize> {
         let entries = match manifest.sstables.get(&table_id.to_string()) {
             Some(e) => e,
             None => return Ok(0),
         };
-        self.update_s3_manifest_stats(manifest);
 
-        let table_dir = self
-            .config
-            .data_dir
-            .join("sstables")
-            .join(table_id.to_string());
+        let table_dir = data_dir.join("sstables").join(table_id.to_string());
         std::fs::create_dir_all(&table_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create table dir: {e}"))
         })?;
@@ -12158,7 +12377,7 @@ impl StorageEngine {
                 if let Some(local_dir) = Self::generation_dir_for(&table_dir, &entry.id) {
                     Self::pull_index_artifacts(
                         store.as_ref(),
-                        &prefix,
+                        prefix,
                         &hex,
                         &table_id.to_string(),
                         &entry.id,
@@ -12187,7 +12406,7 @@ impl StorageEngine {
             // other entries. If none are restorable, fail closed below.
             for component in &required_components {
                 let s3_path = crate::upload::manager::sstable_object_key(
-                    &prefix,
+                    prefix,
                     &hex,
                     &table_id.to_string(),
                     &entry.id,
@@ -12195,10 +12414,16 @@ impl StorageEngine {
                 );
                 let local_path = staging_dir.join(format!("{}-{component}", entry.id));
 
-                if Self::download_sstable_component_to_path(store.as_ref(), &s3_path, &local_path)
-                    .await?
-                    .is_none()
-                {
+                let fetched =
+                    Self::download_sstable_component_to_path(store.as_ref(), &s3_path, &local_path)
+                        .await;
+                if fetched.is_err() {
+                    // A half-written component must not outlive the failure.
+                    if let Err(e) = tokio::fs::remove_dir_all(&staging_dir).await {
+                        tracing::warn!(dir = %staging_dir.display(), error = %e, "could not remove SSTable download staging after a failed download");
+                    }
+                }
+                if fetched?.is_none() {
                     let _ = tokio::fs::remove_dir_all(&staging_dir).await;
                     if local_incomplete {
                         Self::quarantine_incomplete_generation(&table_dir, &entry.id);
@@ -12216,7 +12441,7 @@ impl StorageEngine {
             // Optional components: stream when present, skip on NotFound.
             for component in &optional_components {
                 let s3_path = crate::upload::manager::sstable_object_key(
-                    &prefix,
+                    prefix,
                     &hex,
                     &table_id.to_string(),
                     &entry.id,
@@ -12224,10 +12449,16 @@ impl StorageEngine {
                 );
                 let local_path = staging_dir.join(format!("{}-{component}", entry.id));
 
-                if Self::download_sstable_component_to_path(store.as_ref(), &s3_path, &local_path)
-                    .await?
-                    .is_none()
-                {
+                let fetched =
+                    Self::download_sstable_component_to_path(store.as_ref(), &s3_path, &local_path)
+                        .await;
+                if fetched.is_err() {
+                    // A half-written component must not outlive the failure.
+                    if let Err(e) = tokio::fs::remove_dir_all(&staging_dir).await {
+                        tracing::warn!(dir = %staging_dir.display(), error = %e, "could not remove SSTable download staging after a failed download");
+                    }
+                }
+                if fetched?.is_none() {
                     tracing::debug!(
                         sstable = entry.id,
                         component,
@@ -12238,7 +12469,7 @@ impl StorageEngine {
 
             if let Err(e) = Self::pull_index_artifacts(
                 store.as_ref(),
-                &prefix,
+                prefix,
                 &hex,
                 &table_id.to_string(),
                 &entry.id,
@@ -12395,7 +12626,38 @@ impl StorageEngine {
         ))
     }
 
+    /// Download one component, retrying the whole object when a request or
+    /// its body fails partway. A 100 MB `Data.db` from R2 dropped mid-body
+    /// ("error decoding response body") and failed a node's entire restore
+    /// on 2026-09-29. Each retry starts a fresh request and truncates the
+    /// file, so a partial body is never kept. `NotFound` is not retried.
     async fn download_sstable_component_to_path(
+        store: &dyn object_store::ObjectStore,
+        s3_path: &object_store::path::Path,
+        local_path: &std::path::Path,
+    ) -> ferrosa_common::Result<Option<u64>> {
+        const ATTEMPTS: u32 = 5;
+        let mut backoff = std::time::Duration::from_millis(500);
+        let mut attempt = 1;
+        loop {
+            match Self::download_sstable_component_once(store, s3_path, local_path).await {
+                Err(e) if attempt < ATTEMPTS => {
+                    tracing::warn!(
+                        path = %s3_path,
+                        attempt,
+                        error = %e,
+                        "SSTable component download failed; retrying the whole object"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn download_sstable_component_once(
         store: &dyn object_store::ObjectStore,
         s3_path: &object_store::path::Path,
         local_path: &std::path::Path,
@@ -13060,7 +13322,7 @@ impl StorageEngine {
         let pump_sample_total_ns = (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free()
             * 1_000_000_000.0) as u64;
 
-        Ok(Self {
+        let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
             write_admission: WriteAdmissionSettings::from_env(),
@@ -13106,7 +13368,11 @@ impl StorageEngine {
             s3_manifest_stats: RwLock::new(HashMap::new()),
             reader_pool,
             upload_store_override: Some((store, prefix)),
-        })
+        };
+        // Mirror the production constructor: a restart restores evicted
+        // SSTables before any table can register.
+        engine.restore_evicted_sstables_blocking()?;
+        Ok(engine)
     }
 
     /// Test helper: uploads the engine's current SSTable inventory to the
@@ -14406,6 +14672,53 @@ mod tests {
             table_dir.join("3-Data.db").exists(),
             "unmanifested local SSTables must not be evicted"
         );
+    }
+
+    /// On 2026-09-29 disk pressure evicted `system_schema.indexes`,
+    /// `system_schema.tables`/`columns`/`keyspaces` and `system_auth.roles`
+    /// SSTables on every memory-cluster node. Startup reads those tables
+    /// to register indexes and seed auth; after the restart
+    /// `system_schema.indexes` read as empty, every secondary index went
+    /// unregistered, and indexed reads were refused cluster-wide. System
+    /// tables are tiny and needed before anything else — never evict them.
+    #[test]
+    fn uploaded_cache_eviction_never_evicts_system_keyspace_sstables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.local_cache_max_bytes = 1;
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let mut manifest = crate::manifest::Manifest::new();
+        let mut system_dirs = Vec::new();
+        for table in ["system_schema.indexes", "system_auth.roles"] {
+            let table_dir = dir.path().join("sstables").join(table);
+            std::fs::create_dir_all(&table_dir).unwrap();
+            std::fs::write(table_dir.join("1-Data.db"), vec![1u8; 80]).unwrap();
+            manifest.add_sstable(
+                table,
+                crate::manifest::ManifestEntry {
+                    id: "1".to_string(),
+                    size: 80,
+                    min_token: i64::MIN,
+                    max_token: i64::MAX,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+            system_dirs.push(table_dir);
+        }
+
+        engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        for table_dir in system_dirs {
+            assert!(
+                table_dir.join("1-Data.db").exists(),
+                "{} must never be evicted",
+                table_dir.display()
+            );
+        }
     }
 
     #[test]
@@ -27261,6 +27574,415 @@ mod tests {
         }
 
         (dir, engine, store, prefix, tid)
+    }
+
+    /// Build an S3-backed engine over `dir` whose uploaded-SSTable cache is
+    /// one byte, so every sync evicts what it uploaded, exactly as disk
+    /// pressure did on the live cluster.
+    fn evicting_s3_engine(
+        dir: &std::path::Path,
+        store: &Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+    ) -> StorageEngine {
+        let mut config = StorageEngineConfig::test_config(dir);
+        config.local_cache_max_bytes = 1;
+        config.object_store = Some(crate::upload::ObjectStoreConfig {
+            prefix: prefix.to_string(),
+            ..crate::upload::ObjectStoreConfig::test_config()
+        });
+        StorageEngine::new_with_upload_store(
+            config,
+            Arc::clone(store),
+            prefix.to_string(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap()
+    }
+
+    /// Data loss on the live ferrosa-memory cluster, 2026-09-29.
+    ///
+    /// Under disk pressure the uploaded-cache evictor deleted the local copy
+    /// of 371 SSTables whose only remaining copy was in S3 (all still listed
+    /// in the manifest). The next restart discovered generations by listing
+    /// `*-Data.db` on local disk only, so every evicted SSTable silently left
+    /// its table: `document_chunks` went from 17 SSTables (1.46 GB) to 0 and
+    /// every node reported an order of magnitude fewer rows. Nothing was
+    /// deleted from S3; the engine simply stopped looking there.
+    ///
+    /// A restart must serve every row the manifest says it holds, whether or
+    /// not its SSTable is still in the local cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_of_an_evicted_sstable_are_readable_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "test-evicted-restart";
+        let tid = table_id();
+        let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+
+        {
+            let engine = evicting_s3_engine(dir.path(), &store, prefix);
+            engine.register_table(test_schema()).unwrap();
+            for key in &keys {
+                engine
+                    .write(&tid, &make_key(key), make_row(b"v", 1000), 1000)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            assert!(engine.sync_sstables_to_s3().await.unwrap() >= 1);
+            let table_dir = engine.table_sstable_dir(&tid);
+            assert!(
+                StorageEngine::list_generations_in_dir(&table_dir).is_empty(),
+                "precondition: the sync evicted the uploaded SSTable's local copy"
+            );
+            assert!(
+                !StorageEngine::evicted_generations(&dir.path().join("sstables")).is_empty(),
+                "the eviction is durably recorded, so a restart knows to restore it"
+            );
+            engine.shutdown().unwrap();
+        }
+
+        // Restart: a fresh engine over the same data dir and bucket.
+        let engine = evicting_s3_engine(dir.path(), &store, prefix);
+        engine.register_table(test_schema()).unwrap();
+
+        for key in &keys {
+            assert!(
+                engine.read(&tid, &make_key(key)).unwrap().is_some(),
+                "row {key} of an evicted SSTable must survive a restart"
+            );
+        }
+        engine.shutdown().unwrap();
+    }
+
+    /// An evicted SSTable can still be compacted (execution rehydrates its
+    /// inputs). When compaction then retires it, its eviction marker must go
+    /// with it, or the next restart restores a compacted-away input and
+    /// resurrects the rows the compaction purged.
+    #[test]
+    fn retiring_an_evicted_generation_clears_its_eviction_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("42-Data.db"), b"x").unwrap();
+        StorageEngine::record_eviction(&table_dir, "42").unwrap();
+
+        StorageEngine::delete_sstable_files(&table_dir, "42");
+
+        assert!(
+            StorageEngine::evicted_generations(&dir.path().join("sstables")).is_empty(),
+            "a retired generation must not keep an eviction marker"
+        );
+    }
+
+    /// The same loss through the crash-recovery constructor.
+    ///
+    /// A node with commit-log segments starts through `StorageEngine::open`,
+    /// not `new`, and `open` registers tables before the engine exists. The
+    /// first live recovery (2026-09-29) restored node3 (no segments, `new`)
+    /// while node1 and node2 (`open`) came up serving their tables without
+    /// a single evicted SSTable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_of_an_evicted_sstable_survive_a_restart_through_commit_log_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = tempfile::tempdir().unwrap();
+        let prefix = "test-evicted-open";
+        let tid = table_id();
+        let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+
+        {
+            let store: Arc<dyn object_store::ObjectStore> = Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(bucket.path()).unwrap(),
+            );
+            let engine = evicting_s3_engine(dir.path(), &store, prefix);
+            engine.register_table(test_schema()).unwrap();
+            for key in &keys {
+                engine
+                    .write(&tid, &make_key(key), make_row(b"v", 1000), 1000)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            assert!(engine.sync_sstables_to_s3().await.unwrap() >= 1);
+            assert!(
+                StorageEngine::list_generations_in_dir(&engine.table_sstable_dir(&tid)).is_empty(),
+                "precondition: the sync evicted the uploaded SSTable's local copy"
+            );
+            engine.shutdown().unwrap();
+        }
+
+        // Restart through the crash-recovery constructor, against the same
+        // bucket (a file:// backend over the directory engine one wrote to).
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.object_store = Some(crate::upload::ObjectStoreConfig {
+            local_path: Some(bucket.path().to_path_buf()),
+            prefix: prefix.to_string(),
+            ..crate::upload::ObjectStoreConfig::test_config()
+        });
+        let (engine, _mutations) =
+            StorageEngine::open(config, Some(&tokio::runtime::Handle::current())).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        for key in &keys {
+            assert!(
+                engine.read(&tid, &make_key(key)).unwrap().is_some(),
+                "row {key} of an evicted SSTable must survive a restart through open()"
+            );
+        }
+        engine.shutdown().unwrap();
+    }
+
+    /// Serves from memory, but the first `drops` GETs send half the body and
+    /// then fail — how an R2 download of a 100 MB Data.db died mid-stream
+    /// ("error decoding response body") during the 2026-09-29 recovery.
+    #[derive(Debug)]
+    struct MidStreamDropStore {
+        inner: object_store::memory::InMemory,
+        drops: std::sync::atomic::AtomicU32,
+    }
+
+    impl std::fmt::Display for MidStreamDropStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "MidStreamDropStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for MidStreamDropStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let result = self.inner.get_opts(location, options).await?;
+            let drop_this = self
+                .drops
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok();
+            if !drop_this {
+                return Ok(result);
+            }
+            let meta = result.meta.clone();
+            let range = result.range.clone();
+            let attributes = result.attributes.clone();
+            let body = result.bytes().await?;
+            let half = body.slice(0..body.len() / 2);
+            let stream = futures::stream::iter(vec![
+                Ok(half),
+                Err(object_store::Error::Generic {
+                    store: "S3",
+                    source: "error decoding response body".into(),
+                }),
+            ]);
+            Ok(object_store::GetResult {
+                payload: object_store::GetResultPayload::Stream(Box::pin(stream)),
+                meta,
+                range,
+                attributes,
+            })
+        }
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// A download whose body dies mid-stream is retried from the start, and
+    /// the file ends up whole — not truncated, not a failed restore.
+    #[tokio::test]
+    async fn a_component_download_that_drops_mid_stream_is_retried_whole() {
+        let store = MidStreamDropStore {
+            inner: object_store::memory::InMemory::new(),
+            drops: std::sync::atomic::AtomicU32::new(0),
+        };
+        let path = object_store::path::Path::from("p/ab/ks.t/7/7-Data.db");
+        let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        object_store::ObjectStore::put(&store, &path, object_store::PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        store.drops.store(2, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("7-Data.db");
+
+        let written = StorageEngine::download_sstable_component_to_path(&store, &path, &local)
+            .await
+            .expect("a transient mid-stream failure must be retried, not fail the restore");
+
+        assert_eq!(written, Some(body.len() as u64));
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            body,
+            "the file must be whole"
+        );
+    }
+
+    /// A generation whose download fails for good leaves no staging
+    /// directory behind: node1's failed restore left a `.download-*`
+    /// directory holding a half-written Data.db.
+    #[tokio::test]
+    async fn a_failed_generation_download_removes_its_staging_directory() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(MidStreamDropStore {
+            inner: object_store::memory::InMemory::new(),
+            drops: std::sync::atomic::AtomicU32::new(u32::MAX),
+        });
+        let prefix = "p";
+        let tid = table_id();
+        let table = tid.to_string();
+        let gen = "1790000000000009";
+        let hex = crate::upload::manager::hex_prefix_for(gen);
+        for component in ["Data.db", "Partitions.db", "Rows.db"] {
+            let key =
+                crate::upload::manager::sstable_object_key(prefix, &hex, &table, gen, component);
+            store
+                .put(&key, object_store::PutPayload::from(vec![7u8; 64]))
+                .await
+                .unwrap();
+        }
+        let mut manifest = crate::manifest::Manifest::new();
+        manifest.add_sstable(
+            &table,
+            crate::manifest::ManifestEntry {
+                id: gen.to_string(),
+                size: 64,
+                min_token: i64::MIN,
+                max_token: i64::MAX,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
+        let dir = tempfile::tempdir().unwrap();
+
+        let result =
+            StorageEngine::download_sstables_into(dir.path(), &store, prefix, &tid, &manifest)
+                .await;
+
+        assert!(
+            result.is_err(),
+            "a download that never succeeds is an error"
+        );
+        let table_dir = dir.path().join("sstables").join(&table);
+        let leftovers: Vec<_> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".download-"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+    }
+
+    /// Restore must bring back only what the evictor removed.
+    ///
+    /// The manifest drops a compaction's inputs only after the local swap,
+    /// and a timed-out upload confirmation or a pending-upload replay ("adding
+    /// SSTable to manifest without input cleanup") can leave a compacted-away
+    /// input listed there indefinitely. Such an input is "in the manifest,
+    /// absent locally" exactly like an evicted SSTable. Restoring it would
+    /// resurrect every row its compaction purged, so a generation nobody
+    /// evicted must stay gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_does_not_restore_a_manifest_entry_that_was_never_evicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "test-stale-compacted-input";
+        let tid = table_id();
+        let table_id_str = tid.to_string();
+
+        // A stale manifest entry for a compacted-away input: its objects are
+        // still in S3, it is still listed, and it is not on local disk.
+        let stale = "1790000000000001";
+        let hex = crate::upload::manager::hex_prefix_for(stale);
+        for (component, bytes) in [
+            ("Data.db", b"data".as_slice()),
+            ("Partitions.db", b"partitions".as_slice()),
+            ("Rows.db", b"rows".as_slice()),
+        ] {
+            let path = crate::upload::manager::sstable_object_key(
+                prefix,
+                &hex,
+                &table_id_str,
+                stale,
+                component,
+            );
+            store
+                .put(
+                    &path,
+                    object_store::PutPayload::from(bytes::Bytes::copy_from_slice(bytes)),
+                )
+                .await
+                .unwrap();
+        }
+        let mut manifest = crate::manifest::Manifest::new();
+        manifest.add_sstable(
+            &table_id_str,
+            crate::manifest::ManifestEntry {
+                id: stale.to_string(),
+                size: 4,
+                min_token: i64::MIN,
+                max_token: i64::MAX,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
+        manifest
+            .save_without_cas(store.as_ref(), prefix)
+            .await
+            .unwrap();
+
+        // Restart: a fresh engine over the same data dir and bucket.
+        let engine = evicting_s3_engine(dir.path(), &store, prefix);
+
+        let table_dir = dir.path().join("sstables").join(&table_id_str);
+        assert!(
+            StorageEngine::generation_component_path(&table_dir, stale, "Data.db").is_none(),
+            "a generation that was never evicted must not be restored: it may be a \
+             compacted-away input whose purged rows would come back"
+        );
+        engine.shutdown().unwrap();
     }
 
     /// t_7ac6b0e3: a sidecar built after its generation is already in S3 (a

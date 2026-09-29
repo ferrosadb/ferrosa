@@ -440,14 +440,18 @@ jobs:
   # PostgreSQL fault schedule does not compile a second server binary.
   postgres-jepsen-fault:
     name: PostgreSQL Jepsen fault schedule
-    # DISABLED 2026-09-29 (user instruction): the JepsenSQL / PostgreSQL
-    # strict-serializable schedule is broken and was failing the PR gate.
-    # Re-enable by deleting this `if:` line once the schedule is fixed —
-    # the job body below is unchanged and still correct.
+    # SKIPPED (2026-09-29, by maintainer decision) — known failure, not a pass.
+    # While node 3 is paused, a transaction it coordinated stays PreAccepted
+    # and nothing recovers it: Accord recovery is not wired in production
+    # (ferrosa-cluster FMEA CL-4 / CL-20). A conflicting PostgreSQL snapshot
+    # barrier then times out ("snapshot barrier dependencies were not applied
+    # locally", SQLSTATE 58000) and the strict-serializability workload aborts.
+    # It fails on main too. Re-enable by deleting this `if:` once recovery is
+    # wired — forge t_64c1b2d6 (fix) and t_3017b690 (turn this back on).
     #
-    # The test itself (ferrosa-jepsen/tests/postgres_strict_serializable.rs)
-    # is NOT deleted or ignored, so it still compiles under `--all-features`
-    # and can be run by hand:
+    # The test (ferrosa-jepsen/tests/postgres_strict_serializable.rs) is not
+    # deleted or #[ignore]d, so it still compiles under --all-features and can
+    # be run by hand:
     #   cargo test -p ferrosa-jepsen --all-features --test postgres_strict_serializable
     if: ${{ false }}
     needs: build-node-image
