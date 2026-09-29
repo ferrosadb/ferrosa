@@ -375,7 +375,6 @@ impl RemoteBackend {
 /// defaults to an unfiltered build). The predicate value bytes are already in
 /// storage encoding, so the round-trip is type-system independent.
 fn build_request_body(job: &IndexBuildJob, resolver: &S3PathResolver) -> serde_json::Value {
-
     // No `s3_prefix`: the builder derives every S3 key and local path from its
     // own configuration plus these validated identifiers (JB-T3).
     let mut body = serde_json::json!({
