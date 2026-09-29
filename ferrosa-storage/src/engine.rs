@@ -26851,11 +26851,99 @@ mod tests {
         );
     }
 
+    /// The conservative guard's storage-side predicate.
+    ///
+    /// `FerrosStateMachine::table_has_local_artifacts` is what refuses an
+    /// ambiguous snapshot absence (a table in local state, absent from the
+    /// incoming snapshot, with no explicit identity-matching drop marker). It
+    /// delegates entirely to the three engine queries asserted here, so this
+    /// test pins the contract the guard depends on: each signal must be TRUE
+    /// for a table that holds durable data, and FALSE once it is genuinely
+    /// gone.
+    ///
+    /// Both directions matter. If this predicate ever answers `false` for a
+    /// data-bearing table, the guard silently stops protecting it and the
+    /// snapshot-drop cascade deletes live SSTables and index registrations —
+    /// the exact P0. If it answers `true` for an absent table, the guard
+    /// deadlocks a real drop.
+    ///
+    /// Non-vacuous by construction: the second half drives the real
+    /// `unregister_table` (the destructive path guarded against) and asserts
+    /// the predicate flips, so a predicate that always returned `true` fails
+    /// here.
     #[test]
-    #[ignore = "requires Raft snapshot drop-marker API; absence alone must be refused/quarantined before engine unregister_table"]
-    fn snapshot_absent_indexed_table_preserves_sstables_and_index_rows_without_marker() {
-        panic!(
-            "installing a snapshot that omits a local indexed table but carries no matching explicit drop marker must leave SSTables and system_schema.indexes rows intact"
+    fn table_has_local_artifacts_predicate_tracks_durable_state() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        let table_dir = dir.path().join("sstables").join(table_id.to_string());
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "test_table",
+            "val_idx",
+            IndexType::BTree,
+        );
+        engine
+            .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+            .unwrap();
+        engine.flush(&table_id).unwrap();
+        engine
+            .flush(&TableId::new("system_schema", "indexes"))
+            .unwrap();
+
+        // --- direction 1: a live, data-bearing table must be seen as durable
+        // so the Raft guard refuses ambiguous absence instead of unregistering.
+        assert!(
+            engine.sstable_count(&table_id) > 0,
+            "guard signal: a flushed table must report live SSTables"
+        );
+        assert!(
+            !StorageEngine::list_generations_in_dir(&engine.table_sstable_dir(&table_id))
+                .is_empty(),
+            "guard signal: the on-disk generation list must be non-empty \
+             (survives a restart where in-memory state is rebuilt)"
+        );
+        assert!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .any(|row| row.keyspace_name == "test_ks"
+                    && row.table_name == "test_table"
+                    && row.index_name == "val_idx"),
+            "guard signal: the persisted index registration must be present"
+        );
+
+        // --- direction 2: after a REAL drop the same signals must clear, or
+        // the guard would refuse every legitimate DROP TABLE forever.
+        engine.unregister_table(&table_id).unwrap();
+
+        assert_eq!(
+            engine.sstable_count(&table_id),
+            0,
+            "after a real drop the guard must no longer see live SSTables"
+        );
+        assert!(
+            !table_dir.exists(),
+            "after a real drop the SSTable directory is gone"
+        );
+        assert!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .all(|row| row.keyspace_name != "test_ks" || row.table_name != "test_table"),
+            "after a real drop no persisted index registration for the table may remain"
         );
     }
 
