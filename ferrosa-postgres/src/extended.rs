@@ -606,10 +606,10 @@ mod tests {
         assert_eq!(bind_error_code(2950, 1, &[0; 3]), "22P03");
         assert_eq!(bind_error_code(1114, 1, &[0; 4]), "22P03");
         // jsonb / json are mapped since T-161a: bad JSON is 22P02 (text and
-        // binary), a bad version byte is 22P03.
+        // binary), a bad version byte is XX000 (PostgreSQL's own code).
         assert_eq!(bind_error_code(3802, 0, b"{"), "22P02");
         assert_eq!(bind_error_code(3802, 1, b"\x01{"), "22P02");
-        assert_eq!(bind_error_code(3802, 1, b"\x02{}"), "22P03");
+        assert_eq!(bind_error_code(3802, 1, b"\x02{}"), "XX000");
         assert_eq!(bind_error_code(114, 1, b"{"), "22P02");
         // An unmapped OID is refused at Bind, in both formats.
         assert_eq!(bind_error_code(4072, 0, b"$"), "42704");

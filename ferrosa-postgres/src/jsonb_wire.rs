@@ -10,7 +10,8 @@
 //!
 //! - text format: the JSON text. Output uses `TextStyle::PgText` (D26).
 //! - binary format (`jsonb_send`/`jsonb_recv`): one version byte `0x01`, then
-//!   the same text. Any other version byte is `22P03`.
+//!   the same text. Any other version byte is `XX000` and an empty value is
+//!   `08P01`, exactly what PostgreSQL 16 answers (T-301 oracle).
 //! - `json` (OID 114) parameters are accepted and stored as jsonb (D11). The
 //!   binary form of `json` has no version byte (`json_recv` is plain text).
 //!
@@ -19,7 +20,9 @@
 //! | code    | cause |
 //! |---------|-------|
 //! | `22P02` | text is not valid JSON or not UTF-8 (offset given, input never echoed) |
-//! | `22P03` | binary value with a missing or unknown version byte |
+//! | `22P05` | a `\u0000` escape: a Postgres text value cannot hold a NUL (T-301) |
+//! | `XX000` | binary value with an unknown version byte (PG's `jsonb_recv` uses `elog`; matched byte for byte, T-301) |
+//! | `08P01` | binary value with no version byte (PG: insufficient data left in message) |
 //! | `22030` | duplicate key under the strict `DuplicateKeyPolicy::Error` |
 //! | `54000` | input over a configured limit, or output over the print budget |
 //! | `XX001` | a stored cell failed validation (corruption) |
@@ -30,8 +33,8 @@
 //! stored data unreadable.
 
 use ferrosa_jsonb::{
-    parse_text_observed, print_to_string, DuplicateKeyObserver, JsonbError, JsonbValue, Limits,
-    LimitsConfig, PrintError, TextStyle,
+    parse_text_observed_with, print_to_string, DuplicateKeyObserver, JsonbError, JsonbValue,
+    Limits, LimitsConfig, NulPolicy, PrintError, TextStyle,
 };
 
 /// The version byte a binary jsonb value starts with (`jsonb_send`).
@@ -117,6 +120,12 @@ fn input_error(error: &JsonbError) -> WireError {
                 "invalid input syntax for type jsonb: malformed number at byte offset {offset}"
             ),
         ),
+        JsonbError::NulEscape { offset } => (
+            "22P05",
+            format!(
+                "unsupported Unicode escape sequence: \\u0000 cannot be converted to text at byte offset {offset}"
+            ),
+        ),
         JsonbError::NonFiniteNumber => (
             "22P02",
             "invalid input syntax for type jsonb: non-finite number".to_string(),
@@ -153,7 +162,7 @@ pub(crate) fn parse_text_input(
     limits: &Limits,
     edge: InputEdge,
 ) -> Result<JsonbValue, WireError> {
-    let encoded = parse_text_observed(raw, limits, edge.name(), &EdgeLog)
+    let encoded = parse_text_observed_with(raw, limits, edge.name(), &EdgeLog, NulPolicy::Reject)
         .map_err(|error| input_error(&error))?;
     JsonbValue::from_encoded(encoded).map_err(|error| input_error(&error))
 }
@@ -162,13 +171,17 @@ pub(crate) fn parse_text_input(
 pub(crate) fn parse_binary_input(raw: &[u8], limits: &Limits) -> Result<JsonbValue, WireError> {
     match raw.split_first() {
         Some((&BINARY_VERSION, text)) => parse_text_input(text, limits, InputEdge::Parameter),
+        // PostgreSQL 16 raises both from `jsonb_recv` (`elog(ERROR)` and the
+        // message-buffer underflow), so its SQLSTATEs are XX000 and 08P01. The
+        // differential oracle compares them; ferrosa matches rather than
+        // inventing a friendlier code the reference does not give.
         Some((&version, _)) => Err(WireError::new(
-            "22P03",
+            "XX000",
             format!("unsupported jsonb version number {version}"),
         )),
         None => Err(WireError::new(
-            "22P03",
-            "invalid binary jsonb: missing version byte".to_string(),
+            "08P01",
+            "insufficient data left in message: missing jsonb version byte".to_string(),
         )),
     }
 }
@@ -234,11 +247,11 @@ mod tests {
         let limits = test_limits();
         assert_eq!(
             parse_binary_input(&[], &limits).unwrap_err().sqlstate,
-            "22P03"
+            "08P01"
         );
         assert_eq!(
             parse_binary_input(b"\x02{}", &limits).unwrap_err().sqlstate,
-            "22P03"
+            "XX000"
         );
         assert!(parse_binary_input(b"\x01{}", &limits).is_ok());
         let err = parse_text_input(b"{\"k\": SECRET}", &limits, InputEdge::Parameter).unwrap_err();

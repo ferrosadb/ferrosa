@@ -43,6 +43,12 @@ pub enum JsonbError {
     /// The text is not valid UTF-8; `offset` is the first bad byte (T-103).
     #[error("jsonb text is not valid UTF-8 at byte offset {offset}")]
     InvalidUtf8 { offset: usize },
+    /// A `\u0000` escape under `NulPolicy::Reject`: the target cannot hold a NUL
+    /// (Postgres `text`, `22P05`). `offset` is the backslash of the escape.
+    #[error(
+        "jsonb text has a \\u0000 escape at byte offset {offset}, which the target cannot store"
+    )]
+    NulEscape { offset: usize },
     /// The node-wide in-flight parse budget cannot admit the request (JB-D5).
     #[error("jsonb in-flight budget refused {requested} bytes (budget {max})")]
     InflightBudgetExceeded { requested: usize, max: usize },

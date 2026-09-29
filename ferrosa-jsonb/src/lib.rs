@@ -39,5 +39,6 @@ pub use limits::{
 };
 pub use number::{Number, NumberKind};
 pub use parse::{
-    parse_text, parse_text_observed, DuplicateKeyObserver, InflightBudget, InflightPermit,
+    parse_text, parse_text_observed, parse_text_observed_with, parse_text_with,
+    DuplicateKeyObserver, InflightBudget, InflightPermit, NulPolicy,
 };

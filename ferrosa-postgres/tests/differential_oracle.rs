@@ -66,6 +66,10 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
 use uuid::Uuid;
 
+// The jsonb acceptance corpus and clients shared with `jsonb_slice.rs` (T-301).
+#[path = "common/jsonb_corpus.rs"]
+mod jsonb_corpus;
+
 // ════════════════════════════════════════════════════════════════════════════
 // Source-of-truth corpus data
 //
@@ -1594,4 +1598,212 @@ async fn differential_oracle_dml_agrees() {
         "after_delete_all",
     )
     .await;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// jsonb: DDL, INSERT and SELECT against postgres:16, byte for byte (T-301, D24,
+// D26, D2a, D6b). The float tolerance above does not apply here.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A deliberate, documented difference from Postgres 16. Each entry names the
+/// case label (a prefix of the report line), and why ferrosa differs. The test
+/// asserts the case still differs, so a stale entry fails instead of hiding a
+/// regression. Empty when ferrosa and Postgres agree on every case.
+const NAMED_DIVERGENCES: &[(&str, &str)] = &[];
+
+fn clip(text: &str) -> String {
+    text.chars().take(160).collect()
+}
+
+/// Both servers get the same DDL over the wire.
+async fn jsonb_pair() -> (PgContainer, tokio_postgres::Client, jsonb_corpus::FerrosaPg) {
+    require_containers();
+    let pg = PgContainer::start().await;
+    let pg_client = pg.connect().await;
+    let fe = jsonb_corpus::start_ferrosa_pg().await;
+    for (name, client) in [("postgres", &pg_client), ("ferrosa", &fe.client)] {
+        client
+            .batch_execute(jsonb_corpus::CREATE_TABLE)
+            .await
+            .unwrap_or_else(|e| panic!("{name} refused the jsonb DDL: {e}"));
+    }
+    (pg, pg_client, fe)
+}
+
+/// Run one corpus on both servers and return every disagreement, plus every
+/// place Postgres itself differs from the corpus expectation (a stale corpus).
+async fn compare_corpus(
+    pg: &tokio_postgres::Client,
+    fe: &tokio_postgres::Client,
+    cases: &[jsonb_corpus::Case],
+) -> (Vec<String>, Vec<String>) {
+    use jsonb_corpus::{binary_of, Expect, Outcome, Server, PATHS};
+    let pg_runs = jsonb_corpus::run_corpus(pg, Server::Postgres, cases)
+        .await
+        .expect("postgres corpus run");
+    let fe_runs = jsonb_corpus::run_corpus(fe, Server::Ferrosa, cases)
+        .await
+        .expect("ferrosa corpus run");
+    assert_eq!(pg_runs.len(), fe_runs.len());
+    let (mut differ, mut stale) = (Vec::new(), Vec::new());
+    let pairs = pg_runs.chunks(PATHS.len()).zip(fe_runs.chunks(PATHS.len()));
+    for (case, (p_chunk, f_chunk)) in cases.iter().zip(pairs) {
+        let want = match &case.expect {
+            Expect::Text(t) => Outcome::Stored {
+                text: t.clone(),
+                binary: binary_of(t),
+            },
+            Expect::Err(code) => Outcome::Refused((*code).to_string()),
+        };
+        for ((label, via, p), (_, _, f)) in p_chunk.iter().zip(f_chunk.iter()) {
+            if *p != want {
+                stale.push(format!(
+                    "[{label} / {via:?}] postgres gave {}, corpus expects {}",
+                    clip(&format!("{p:?}")),
+                    clip(&format!("{want:?}"))
+                ));
+            }
+            if p != f {
+                differ.push(format!(
+                    "[{label} / {via:?}] input {:?}\n    pg {}\n    fe {}",
+                    clip(&case.input),
+                    clip(&format!("{p:?}")),
+                    clip(&format!("{f:?}"))
+                ));
+            }
+        }
+    }
+    (differ, stale)
+}
+
+/// Drop the named divergences from `differ`, after checking each still holds.
+fn apply_named_divergences(differ: Vec<String>) -> Vec<String> {
+    let mut unexplained = differ;
+    for (label, reason) in NAMED_DIVERGENCES {
+        let before = unexplained.len();
+        unexplained.retain(|d| !d.starts_with(&format!("[{label} /")));
+        assert!(
+            unexplained.len() < before,
+            "named divergence `{label}` ({reason}) no longer differs: remove it"
+        );
+    }
+    unexplained
+}
+
+/// The whole valid and invalid corpus, all three input paths, text and binary
+/// results, against postgres:16 (`SELECT doc::text` there, `SELECT doc` here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn differential_oracle_jsonb_corpus_agrees() {
+    let (_pg, pg_client, fe) = jsonb_pair().await;
+    let mut cases = jsonb_corpus::valid_corpus();
+    cases.extend(jsonb_corpus::invalid_corpus());
+    let (differ, stale) = compare_corpus(&pg_client, &fe.client, &cases).await;
+    eprintln!(
+        "[oracle] jsonb corpus: {} cases x {} paths, {} differ, {} stale",
+        cases.len(),
+        jsonb_corpus::PATHS.len(),
+        differ.len(),
+        stale.len()
+    );
+    assert!(
+        stale.is_empty(),
+        "the corpus expectation disagrees with real postgres:16:\n{}",
+        stale.join("\n")
+    );
+    let unexplained = apply_named_divergences(differ);
+    assert!(
+        unexplained.is_empty(),
+        "{} ferrosa/postgres differences:\n{}",
+        unexplained.len(),
+        unexplained.join("\n")
+    );
+}
+
+/// Postgres's `SELECT doc` in text format is `doc::text`, so the D26 text form
+/// is what a stock client sees, not only what a cast prints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn differential_oracle_jsonb_plain_select_equals_cast_on_postgres() {
+    let (_pg, pg_client, _fe) = jsonb_pair().await;
+    pg_client
+        .batch_execute(r#"INSERT INTO t (id, doc) VALUES (1, '{"aa":2,"b":1.10}')"#)
+        .await
+        .expect("insert");
+    let plain = pg_client
+        .simple_query("SELECT doc FROM t WHERE id = 1")
+        .await
+        .expect("plain");
+    let cast = pg_client
+        .simple_query("SELECT doc::text FROM t WHERE id = 1")
+        .await
+        .expect("cast");
+    let cell = |m: &[SimpleQueryMessage]| {
+        m.iter().find_map(|x| match x {
+            SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+            _ => None,
+        })
+    };
+    assert_eq!(cell(&plain), cell(&cast));
+    assert_eq!(cell(&plain).as_deref(), Some(r#"{"b": 1.10, "aa": 2}"#));
+}
+
+/// Binary-format parameters with a version byte other than 1, or none at all:
+/// the same SQLSTATE on both servers, and no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn differential_oracle_jsonb_bad_binary_version_agrees() {
+    let (_pg, pg_client, fe) = jsonb_pair().await;
+    let mut inputs = Vec::new();
+    for version in [0u8, 2, 3, 255] {
+        inputs.push((
+            format!("version {version}"),
+            jsonb_corpus::Raw::binary(version, "{}"),
+        ));
+    }
+    inputs.push((
+        "no version byte".to_string(),
+        jsonb_corpus::Raw::binary_bytes(Vec::new()),
+    ));
+    let mut problems = Vec::new();
+    for (label, raw) in &inputs {
+        let mut codes = Vec::new();
+        for client in [&pg_client, &fe.client] {
+            let stmt = client
+                .prepare("INSERT INTO t (id, doc) VALUES ($1, $2)")
+                .await
+                .expect("prepare");
+            let error = client
+                .execute(&stmt, &[&1i32, raw])
+                .await
+                .expect_err("a bad binary jsonb is refused");
+            codes.push(jsonb_corpus::code_of(&error));
+        }
+        eprintln!(
+            "[oracle] {label}: postgres {} ferrosa {}",
+            codes[0], codes[1]
+        );
+        if codes[0] != codes[1] {
+            problems.push(format!("[{label}] pg {} fe {}", codes[0], codes[1]));
+        }
+        let constant = if label.starts_with("version") {
+            jsonb_corpus::BAD_VERSION_SQLSTATE
+        } else {
+            jsonb_corpus::MISSING_VERSION_SQLSTATE
+        };
+        if codes[0] != constant {
+            problems.push(format!(
+                "[{label}] postgres gave {}, the corpus constant says {constant}",
+                codes[0]
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    for (name, client) in [("postgres", &pg_client), ("ferrosa", &fe.client)] {
+        let rows = client
+            .simple_query("SELECT id FROM t")
+            .await
+            .expect("count");
+        assert!(
+            !rows.iter().any(|m| matches!(m, SimpleQueryMessage::Row(_))),
+            "{name} kept a row from a refused write"
+        );
+    }
 }

@@ -91,9 +91,29 @@ fn syntax(offset: usize, reason: &'static str) -> JsonbError {
 /// Parse JSON text into canonical jsonb bytes. The duplicate-key count is in
 /// the result.
 pub fn parse_text(input: &[u8], limits: &Limits) -> Result<Encoded, JsonbError> {
+    parse_text_with(input, limits, NulPolicy::Allow)
+}
+
+/// Whether a `\u0000` escape may appear in a string or key.
+///
+/// JSON allows it, so the core accepts it. A Postgres `text` value cannot hold a
+/// NUL, so the Postgres adapter parses with [`NulPolicy::Reject`] and refuses it
+/// the way Postgres 16 does (`22P05`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NulPolicy {
+    Allow,
+    Reject,
+}
+
+/// [`parse_text`] under an explicit [`NulPolicy`].
+pub fn parse_text_with(
+    input: &[u8],
+    limits: &Limits,
+    nul: NulPolicy,
+) -> Result<Encoded, JsonbError> {
     limits.check_input_len(input.len())?;
     prescan_depth(input, limits)?;
-    Parser::new(input, limits).run()
+    Parser::new(input, limits, nul).run()
 }
 
 /// [`parse_text`], reporting dropped duplicate keys to `observer` under `edge`.
@@ -103,7 +123,18 @@ pub fn parse_text_observed(
     edge: &str,
     observer: &dyn DuplicateKeyObserver,
 ) -> Result<Encoded, JsonbError> {
-    let out = parse_text(input, limits)?;
+    parse_text_observed_with(input, limits, edge, observer, NulPolicy::Allow)
+}
+
+/// [`parse_text_observed`] under an explicit [`NulPolicy`].
+pub fn parse_text_observed_with(
+    input: &[u8],
+    limits: &Limits,
+    edge: &str,
+    observer: &dyn DuplicateKeyObserver,
+    nul: NulPolicy,
+) -> Result<Encoded, JsonbError> {
+    let out = parse_text_with(input, limits, nul)?;
     if out.duplicate_keys_dropped > 0 {
         observer.duplicate_keys_dropped(edge, out.duplicate_keys_dropped);
     }
@@ -155,15 +186,17 @@ struct Parser<'a> {
     pos: usize,
     builder: JsonbBuilder,
     frames: Vec<Frame>,
+    nul: NulPolicy,
 }
 
 impl<'a> Parser<'a> {
-    fn new(s: &'a [u8], limits: &Limits) -> Parser<'a> {
+    fn new(s: &'a [u8], limits: &Limits, nul: NulPolicy) -> Parser<'a> {
         Parser {
             s,
             pos: 0,
             builder: JsonbBuilder::new(*limits),
             frames: Vec::new(),
+            nul,
         }
     }
 
@@ -490,6 +523,9 @@ impl<'a> Parser<'a> {
                 0x10000 + ((first - 0xD800) << 10) + (low - 0xDC00)
             }
             0xDC00..=0xDFFF => return Err(syntax(at, "lone surrogate in \\u escape")),
+            0 if self.nul == NulPolicy::Reject => {
+                return Err(JsonbError::NulEscape { offset: at });
+            }
             other => other,
         };
         char::from_u32(code).ok_or(syntax(at, "invalid code point in \\u escape"))

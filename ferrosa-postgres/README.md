@@ -272,6 +272,14 @@ infrastructure, plus integration tests:
   runs a fixed corpus + DML against BOTH real PostgreSQL 16 (container) and
   ferrosa over the same data and asserts agreement. Gated; panics with setup
   instructions if `FERROSA_TEST_CONTAINERS=1` is unset (never a silent skip).
+  Also holds the jsonb differential (T-301): `differential_oracle_jsonb_corpus_agrees`
+  (80 documents x literal / text `$1` / binary `$1`, read back in text and binary
+  format, byte for byte against `SELECT doc::text` on postgres:16),
+  `differential_oracle_jsonb_bad_binary_version_agrees` and
+  `differential_oracle_jsonb_plain_select_equals_cast_on_postgres`.
+- `tests/jsonb_slice.rs` (4) — the same corpus (`tests/common/jsonb_corpus.rs`)
+  through the in-process server with `tokio-postgres`, no infrastructure, against
+  PostgreSQL 16's recorded output.
 
 ```bash
 cargo test -p ferrosa-postgres                       # unit + in-process integration
@@ -301,4 +309,18 @@ refused with `42P16` naming the column. Postgres accepts it; ferrosa keeps
 jsonb out of key bytes (D3). The schema registry's own check runs again before
 the change is handed to the DDL path.
 
-`CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802, typlen -1, `binary: true`; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is `jsonb_wire` (T-161a): text format is the PostgreSQL 16 jsonb text (`TextStyle::PgText`, D26; `{"aa":2,"b":1}` prints `{"b": 1, "aa": 2}`, scale kept); binary format is `0x01` then that text (`jsonb_send`). `render_value` never returns NULL for a jsonb value: a corrupt cell is `XX001`, an over-budget print `54000`, and jsonpath/`text[]` are `0A000` (T-161b). Input is parsed with `ferrosa_jsonb::parse_text_observed` under `QueryContext::jsonb_limits` (resolved from `[jsonb]` in `ferrosa/src/main.rs`, no default): a parameter declared 3802 or 114 (or bound to a jsonb column after `Describe`) is parsed in `decode_param_checked`; an untyped string literal or a text-declared parameter bound to a jsonb column is parsed in `value_to_cql`. SQLSTATEs: `22P02` invalid JSON (byte offset, input never echoed), `22P03` bad or missing binary version byte, `22030` duplicate key under the strict policy, `54000` over a limit, `XX001` corrupt stored cell. Duplicate keys resolve last-wins and are logged as a `jsonb_duplicate_keys_dropped` edge line (D6b). DDL: `jsonb` and `json` create a CQL `jsonb` column (`json` is stored as jsonb, D11); `ddl::check_jsonb_ddl_allowed` is the always-Ok call point T-300 fills in. An unspecified-OID binary-format parameter is decoded as text: clients get 3802 from `Describe`, and a raw Bind without one fails 22P02 rather than writing.
+`CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802, typlen -1, `binary: true`; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is `jsonb_wire` (T-161a): text format is the PostgreSQL 16 jsonb text (`TextStyle::PgText`, D26; `{"aa":2,"b":1}` prints `{"b": 1, "aa": 2}`, scale kept); binary format is `0x01` then that text (`jsonb_send`). `render_value` never returns NULL for a jsonb value: a corrupt cell is `XX001`, an over-budget print `54000`, and jsonpath/`text[]` are `0A000` (T-161b). Input is parsed with `ferrosa_jsonb::parse_text_observed` under `QueryContext::jsonb_limits` (resolved from `[jsonb]` in `ferrosa/src/main.rs`, no default): a parameter declared 3802 or 114 (or bound to a jsonb column after `Describe`) is parsed in `decode_param_checked`; an untyped string literal or a text-declared parameter bound to a jsonb column is parsed in `value_to_cql`. SQLSTATEs: `22P02` invalid JSON (byte offset, input never echoed), `22P05` a `\u0000` escape (a PG text value cannot hold NUL; `NulPolicy::Reject`), `XX000` unknown binary version byte and `08P01` no version byte (both what PostgreSQL 16 answers), `22030` duplicate key under the strict policy, `54000` over a limit, `XX001` corrupt stored cell. Duplicate keys resolve last-wins and are logged as a `jsonb_duplicate_keys_dropped` edge line (D6b). DDL: `jsonb` and `json` create a CQL `jsonb` column (`json` is stored as jsonb, D11); `ddl::check_jsonb_ddl_allowed` is the always-Ok call point T-300 fills in. An unspecified-OID binary-format parameter is decoded as text: clients get 3802 from `Describe`, and a raw Bind without one fails 22P02 rather than writing.
+
+### Slice acceptance evidence (T-301)
+
+Acceptance for the PG-first slice (D24): `CREATE TABLE ... jsonb` through PG DDL;
+`INSERT` by literal, text `$1` and binary `$1`; `SELECT` in text and binary
+format. `tests/jsonb_slice.rs` runs without infrastructure. The differential
+oracle sends the identical statements to a postgres:16 container and to ferrosa
+and compares byte for byte (`SELECT doc::text` there, `SELECT doc` here) with no
+tolerance. Live run (podman, `FERROSA_TEST_CONTAINERS=1`): 80 corpus cases x 3
+paths = 240 runs, 0 differences, 0 stale expectations. The oracle found two
+differences, both fixed: a `\u0000` escape was accepted (Postgres: `22P05`), and
+a bad binary version byte answered `22P03` (Postgres: `XX000`; `08P01` for an
+empty value). There are no named divergences: `NAMED_DIVERGENCES` in the oracle is
+empty and fails if an entry stops differing.

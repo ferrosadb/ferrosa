@@ -58,6 +58,9 @@ ferrosa-common ferrosa-jsonb` enforces it). Runtime dependencies are `bytes`,
 - Duplicate keys (D6b): last wins; `parse_text_observed(.., edge, &dyn
   DuplicateKeyObserver)` reports the count once per document for the metric and edge
   log line. Under `DuplicateKeyPolicy::Error`: `DuplicateKey { path }` (`$.a[0]`).
+- `NulPolicy` (T-301): `\u0000` is valid JSON, so `parse_text` allows it. A target that
+  cannot store a NUL (the Postgres text type) calls `parse_text_with` /
+  `parse_text_observed_with` with `NulPolicy::Reject` and gets `NulEscape { offset }`.
 - `InflightBudget` / `InflightPermit`: node-wide in-flight byte budget for adapters
   (JB-D5); `InflightBudget::working_set(n)` is `WORKING_SET_MULTIPLE` (32) times `n`.
 - Tests: `tests/parse.rs` (y/n corpus, depth, duplicates, 10 MiB proportionality,

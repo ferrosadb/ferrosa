@@ -360,14 +360,14 @@ async fn pg_jsonb_wire_version_byte_rules() {
     want.extend_from_slice(br#"{"b": 1, "aa": 2}"#);
     assert_eq!(out.0, want);
 
-    // Any other version is 22P03 and writes nothing (FM-41).
+    // Any other version is XX000, as in PostgreSQL 16, and writes nothing (FM-41).
     for version in [0u8, 2, 255] {
         let error = fx
             .client
             .execute(&stmt, &[&9i32, &Raw::binary(version, "{}")])
             .await
             .expect_err("a bad version byte is refused");
-        assert_eq!(code_of(&error), "22P03", "version {version}");
+        assert_eq!(code_of(&error), "XX000", "version {version}");
     }
     // An empty binary value has no version byte at all.
     let empty = Raw {
@@ -379,7 +379,7 @@ async fn pg_jsonb_wire_version_byte_rules() {
         .execute(&stmt, &[&9i32, &empty])
         .await
         .expect_err("an empty binary jsonb is refused");
-    assert_eq!(code_of(&error), "22P03");
+    assert_eq!(code_of(&error), "08P01");
     assert_eq!(row_count(&fx).await, 1, "the refused writes left no row");
 }
 

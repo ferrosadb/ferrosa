@@ -5,8 +5,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use ferrosa_jsonb::{
-    parse_text, parse_text_observed, DuplicateKeyObserver, DuplicateKeyPolicy, InflightBudget,
-    JsonbError, Limits, LimitsConfig,
+    parse_text, parse_text_observed, parse_text_with, DuplicateKeyObserver, DuplicateKeyPolicy,
+    InflightBudget, JsonbError, Limits, LimitsConfig, NulPolicy,
 };
 use proptest::prelude::*;
 use std::sync::Mutex;
@@ -351,4 +351,25 @@ proptest! {
         prop_assert_eq!(&a.bytes, &b.bytes);
         prop_assert_eq!(&a.bytes, &c.bytes);
     }
+}
+
+/// T-301: JSON allows `\u0000`, so the core accepts it; a target that cannot
+/// store a NUL (Postgres `text`) asks for `NulPolicy::Reject` and gets a typed
+/// error at the backslash of the escape, in strings and in keys.
+#[test]
+fn jsonb_parse_nul_escape_is_allowed_by_default_and_rejected_on_request() {
+    for text in [r#""a\u0000b""#, r#"{"k\u0000":1}"#, r#"["x",["\u0000"]]"#] {
+        parse_text(text.as_bytes(), &defaults()).expect("the core accepts a NUL escape");
+        parse_text_with(text.as_bytes(), &defaults(), NulPolicy::Allow).expect("explicit allow");
+        let err = parse_text_with(text.as_bytes(), &defaults(), NulPolicy::Reject)
+            .expect_err("reject refuses a NUL escape");
+        let at = text.find("\\u0000").expect("the escape is in the text");
+        assert_eq!(err, JsonbError::NulEscape { offset: at }, "{text}");
+    }
+    // A backslash-escaped backslash followed by `u0000` is text, not an escape.
+    parse_text_with(br#""\\u0000""#, &defaults(), NulPolicy::Reject)
+        .expect("an escaped backslash is not a NUL escape");
+    // Every other code point, including U+0001, is unaffected.
+    parse_text_with(br#""\u0001\u00e9""#, &defaults(), NulPolicy::Reject)
+        .expect("other escapes pass");
 }
