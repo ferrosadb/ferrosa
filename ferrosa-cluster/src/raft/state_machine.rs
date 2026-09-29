@@ -641,13 +641,42 @@ impl FerrosStateMachine {
         let data: SnapshotData = bincode::deserialize(&bytes)
             .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
 
+        let dropped = tables_dropped_by_snapshot(&self.state.tables, &data.state.tables);
         self.state = data.state;
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         self.current_snapshot = Some((meta, bytes));
         self.sync_ring();
         self.sync_schema_and_engine_from_state("Raft snapshot");
+        self.unregister_tables_dropped_by_snapshot(&dropped);
         Ok(())
+    }
+
+    /// Unregister tables a snapshot dropped, exactly as `RaftOp::DropTable`
+    /// would have had this node applied it: releases the table in the engine
+    /// and deletes its local SSTable directory.
+    ///
+    /// Only tables the PREVIOUS Raft state held are candidates, so tables the
+    /// engine registered outside Raft DDL (graph adjacency, the PostgreSQL
+    /// gateway's KV table) are never touched.
+    fn unregister_tables_dropped_by_snapshot(&self, dropped: &[(String, String)]) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        for (keyspace, table) in dropped {
+            let tid = TableId::new(keyspace, table);
+            match engine.unregister_table(&tid) {
+                Ok(()) => tracing::info!(
+                    table = %tid,
+                    "Raft snapshot: unregistered a table dropped while this node was behind"
+                ),
+                Err(e) => tracing::error!(
+                    %e, table = %tid,
+                    "Raft snapshot: unregister of a dropped table failed — its local SSTables remain \
+                     and a recreated table of the same name would read them"
+                ),
+            }
+        }
     }
 
     fn sync_schema_and_engine_from_state(&self, context: &'static str) {
@@ -1996,6 +2025,19 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
 // ---------------------------------------------------------------------------
 
 /// Convert an error into an `AnyError` for openraft storage errors.
+/// Non-system tables `previous` held that `next` does not: what a snapshot
+/// dropped relative to this node's last state.
+fn tables_dropped_by_snapshot(
+    previous: &BTreeMap<(String, String), TableMetadata>,
+    next: &BTreeMap<(String, String), TableMetadata>,
+) -> Vec<(String, String)> {
+    previous
+        .keys()
+        .filter(|key| !next.contains_key(*key) && !key.0.starts_with("system"))
+        .cloned()
+        .collect()
+}
+
 fn to_any_error(e: impl std::error::Error + Send + Sync + 'static) -> openraft::AnyError {
     openraft::AnyError::new(&e)
 }
@@ -3843,6 +3885,107 @@ mod tests {
             memtable_num_shards: 64,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
+    }
+
+    /// A node that missed a DROP learns the schema from a snapshot. The sync
+    /// registered every table in the snapshot but never unregistered one the
+    /// snapshot no longer had, so the dropped table stayed live in the engine,
+    /// and after a restart its SSTable directory was orphaned for good (found
+    /// 2026-09-28: 640-760 dropped-table generations per live node). A
+    /// recreated table of the same name would have inherited the old files.
+    #[tokio::test]
+    async fn snapshot_install_unregisters_a_table_dropped_while_this_node_lagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let mut lagging = FerrosStateMachine::with_side_effects(
+            Arc::new(test_schema_instance()),
+            Arc::clone(&engine),
+        );
+        lagging
+            .apply(vec![
+                make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("lag_ks"))),
+                make_entry(
+                    1,
+                    2,
+                    RaftOp::CreateTable(Box::new(simple_table("lag_ks", "keep"))),
+                ),
+                make_entry(
+                    1,
+                    3,
+                    RaftOp::CreateTable(Box::new(simple_table("lag_ks", "gone"))),
+                ),
+            ])
+            .await
+            .unwrap();
+        let gone = TableId::new("lag_ks", "gone");
+        let gone_dir = dir.path().join("sstables").join(gone.to_string());
+        assert!(engine.table_schema(&gone).is_some() && gone_dir.exists());
+
+        // The leader dropped `gone` while this node was away.
+        let mut leader = FerrosStateMachine::new();
+        leader
+            .apply(vec![
+                make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("lag_ks"))),
+                make_entry(
+                    1,
+                    2,
+                    RaftOp::CreateTable(Box::new(simple_table("lag_ks", "keep"))),
+                ),
+                make_entry(
+                    1,
+                    3,
+                    RaftOp::CreateTable(Box::new(simple_table("lag_ks", "gone"))),
+                ),
+                make_entry(
+                    1,
+                    4,
+                    RaftOp::DropTable {
+                        keyspace: "lag_ks".into(),
+                        table: "gone".into(),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        let system_dirs: Vec<String> = std::fs::read_dir(dir.path().join("sstables"))
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("system"))
+            .collect();
+        assert!(
+            !system_dirs.is_empty(),
+            "the engine registered system tables"
+        );
+        let snapshot = leader.build_snapshot().await.unwrap();
+        lagging
+            .install_snapshot(
+                &snapshot.meta,
+                Box::new(Cursor::new(snapshot.snapshot.into_inner())),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            engine.table_schema(&gone).is_none(),
+            "a table the snapshot no longer has must be unregistered from the engine"
+        );
+        assert!(
+            !gone_dir.exists(),
+            "and its SSTable directory removed, as DROP does"
+        );
+        assert!(
+            engine
+                .table_schema(&TableId::new("lag_ks", "keep"))
+                .is_some(),
+            "tables the snapshot still has are untouched"
+        );
+        for name in &system_dirs {
+            assert!(
+                dir.path().join("sstables").join(name).exists(),
+                "system table {name} must never be swept"
+            );
+        }
     }
 
     /// W1.7 — `apply_command` returns `RaftResponse::Error` instead of

@@ -724,10 +724,40 @@ impl RpcHandler for PairSchemaSyncHandler {
             }
         }
 
+        // Tables this node's schema held that the snapshot no longer does:
+        // DROPs this peer missed. Only schema-owned tables are candidates, so
+        // engine-internal registrations (graph adjacency, the PostgreSQL KV
+        // table) are never touched.
+        let dropped: Vec<(String, String)> = self
+            .schema
+            .snapshot()
+            .tables
+            .keys()
+            .filter(|key| !snapshot.tables.contains_key(*key) && !is_system_keyspace(&key.0))
+            .cloned()
+            .collect();
+
         // Apply snapshot to schema registry.
         if let Err(e) = self.schema.apply_snapshot(snapshot) {
             tracing::error!("failed to apply schema snapshot: {e}");
             return None;
+        }
+
+        // Finish those DROPs as `DropTable` would have: release the table in
+        // the engine and delete its local SSTable directory.
+        for (keyspace, table) in dropped {
+            let tid = ferrosa_storage::TableId::new(&keyspace, &table);
+            match self.engine.unregister_table(&tid) {
+                Ok(()) => tracing::info!(
+                    table = %tid,
+                    "schema sync: unregistered a table dropped while this peer was behind"
+                ),
+                Err(e) => tracing::error!(
+                    %e, table = %tid,
+                    "schema sync: unregister of a dropped table failed — its local SSTables remain \
+                     and a recreated table of the same name would read them"
+                ),
+            }
         }
 
         Some(Message::PairDdlAck(Bytes::new()))
@@ -842,6 +872,98 @@ mod tests {
         );
         assert!(replicated.can_login);
         assert!(!replicated.is_superuser);
+    }
+
+    fn pair_test_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
+        use ferrosa_storage::engine::StorageEngineConfig;
+        use ferrosa_storage::{CommitLogConfig, CompactionConfig};
+        Arc::new(
+            StorageEngine::new(
+                StorageEngineConfig {
+                    commit_log: CommitLogConfig {
+                        log_dir: dir.to_path_buf(),
+                        checkpoint_dir: dir.to_path_buf(),
+                        archive: None,
+                        ..CommitLogConfig::default()
+                    },
+                    compaction: CompactionConfig::from_env(dir.join("compaction")),
+                    object_store: None,
+                    local_cache_max_bytes: 1024 * 1024,
+                    local_disk_free_reserve_bytes: 0,
+                    flush_threshold_bytes: 4096,
+                    memtable_backpressure_bytes: u64::MAX,
+                    flush_max_age_secs: 5,
+                    data_dir: dir.to_path_buf(),
+                    index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+                    auth_enabled: false,
+                    auth_warn: false,
+                    write_verify: false,
+                    max_pending_replay_mutations_without_schema: 1024,
+                    memtable_num_shards: 64,
+                },
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn wire_with(tables: Vec<TableMetadata>) -> WireSchemaSnapshot {
+        let ks = test_keyspace();
+        WireSchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces: [(ks.name.clone(), ks)].into_iter().collect(),
+            tables: tables
+                .into_iter()
+                .map(|t| ((t.keyspace.clone(), t.name.clone()), t))
+                .collect(),
+            indexes: vec![],
+            roles: HashMap::new(),
+            grants: HashMap::new(),
+            types: vec![],
+            functions: vec![],
+            aggregates: vec![],
+        }
+    }
+
+    /// Pair-mode catch-up applies a whole schema snapshot. It registered the
+    /// snapshot's tables but never unregistered one the snapshot dropped, so a
+    /// peer that missed a DROP kept the table live in its engine and, after a
+    /// restart, orphaned its SSTable directory (2026-09-28).
+    #[tokio::test]
+    async fn pair_schema_sync_unregisters_a_table_the_snapshot_dropped() {
+        use ferrosa_storage::TableId;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = pair_test_engine(dir.path());
+        let schema = test_replication_schema();
+        let handler = PairSchemaSyncHandler::new(Arc::clone(&schema), Arc::clone(&engine));
+        let keep = test_table();
+        let mut gone = test_table();
+        gone.name = "gone_tbl".to_string();
+        gone.id = Uuid::new_v4();
+        let peer = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+
+        let first = serde_json::to_vec(&wire_with(vec![keep.clone(), gone.clone()])).unwrap();
+        assert!(handler
+            .handle(peer, Message::PairSchemaSync(Bytes::from(first)))
+            .await
+            .is_some());
+        let gone_id = TableId::new("test_ks", "gone_tbl");
+        let gone_dir = dir.path().join("sstables").join(gone_id.to_string());
+        assert!(engine.table_schema(&gone_id).is_some() && gone_dir.exists());
+
+        let second = serde_json::to_vec(&wire_with(vec![keep])).unwrap();
+        assert!(handler
+            .handle(peer, Message::PairSchemaSync(Bytes::from(second)))
+            .await
+            .is_some());
+        assert!(
+            engine.table_schema(&gone_id).is_none(),
+            "dropped table unregistered"
+        );
+        assert!(!gone_dir.exists(), "and its SSTable directory removed");
+        assert!(engine
+            .table_schema(&TableId::new("test_ks", "test_tbl"))
+            .is_some());
     }
 
     fn test_replication_schema() -> Arc<ferrosa_schema::Schema> {
