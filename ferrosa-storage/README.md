@@ -318,7 +318,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   DROP INDEX choke point for live storage state: it removes the table store's
   memtable/vector metadata, sidecar read guards, and the tracker entry
   immediately, before restart; tracker cleanup is still idempotent when the
-  table is not registered in this engine process. Re-registering an already
+  table is not registered in this engine process.
+  Because `unregister_table` also deletes the table's SSTable directory, cluster
+  snapshot install must only reach it for explicit drops, not for table-map
+  absence alone; the Raft state machine now enforces that guard before calling
+  this storage cleanup primitive. Re-registering an already
   loaded table with index declarations merges any missing declarations into the
   existing store, keeping disk-loaded sidecars readable after local-schema
   boot preload. The registry-owned `schema.json` is a discriminated, bounded,

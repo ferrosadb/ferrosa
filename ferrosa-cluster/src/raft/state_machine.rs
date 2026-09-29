@@ -641,6 +641,9 @@ impl FerrosStateMachine {
         let data: SnapshotData = bincode::deserialize(&bytes)
             .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
 
+        let absent = tables_absent_from_snapshot(&self.state.tables, &data.state.tables);
+        self.refuse_ambiguous_snapshot_drops(&absent, meta.last_log_id)
+            .map_err(|e| *e)?;
         let dropped = tables_dropped_by_snapshot(&self.state.tables, &data.state.tables);
         self.state = data.state;
         self.last_applied = meta.last_log_id;
@@ -652,13 +655,78 @@ impl FerrosStateMachine {
         Ok(())
     }
 
-    /// Unregister tables a snapshot dropped, exactly as `RaftOp::DropTable`
-    /// would have had this node applied it: releases the table in the engine
-    /// and deletes its local SSTable directory.
+    /// Refuse snapshot installs that would otherwise need destructive cleanup
+    /// but carry no explicit, identity-scoped drop marker proving the cleanup
+    /// is safe.
     ///
-    /// Only tables the PREVIOUS Raft state held are candidates, so tables the
-    /// engine registered outside Raft DDL (graph adjacency, the PostgreSQL
-    /// gateway's KV table) are never touched.
+    /// The current snapshot format has no such marker, so a data-bearing local
+    /// table that is merely absent from an incoming snapshot is ambiguous: it
+    /// might be a real compacted `DROP TABLE`, or it might be an old/incomplete
+    /// snapshot. Refuse that case before `self.state` is replaced and before
+    /// any call to `StorageEngine::unregister_table` can tombstone indexes or
+    /// remove SSTable directories.
+    fn refuse_ambiguous_snapshot_drops(
+        &self,
+        absent: &[(String, String)],
+        snapshot_last_log_id: Option<LogId<u64>>,
+    ) -> Result<(), Box<StorageIOError<u64>>> {
+        let Some(engine) = &self.engine else {
+            return Ok(());
+        };
+
+        for (keyspace, table) in absent {
+            let tid = TableId::new(keyspace, table);
+            if self
+                .table_has_local_artifacts(engine, &tid)
+                .map_err(|e| Box::new(StorageIOError::read_state_machine(to_any_error(e))))?
+            {
+                let message = format!(
+                    "refusing Raft snapshot install: table {tid} is absent from snapshot at \
+                     last_log_id={snapshot_last_log_id:?}, but local SSTables or persisted index \
+                     registrations exist and the snapshot carries no explicit identity-matching \
+                     drop marker"
+                );
+                tracing::error!(
+                    table = %tid,
+                    ?snapshot_last_log_id,
+                    "{message}"
+                );
+                return Err(Box::new(StorageIOError::read_state_machine(to_any_error(
+                    std::io::Error::other(message),
+                ))));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn table_has_local_artifacts(
+        &self,
+        engine: &StorageEngine,
+        table_id: &TableId,
+    ) -> ferrosa_common::Result<bool> {
+        if engine.sstable_count(table_id) > 0 {
+            return Ok(true);
+        }
+
+        let table_dir = engine.table_sstable_dir(table_id);
+        if !StorageEngine::list_generations_in_dir(&table_dir).is_empty() {
+            return Ok(true);
+        }
+
+        let persisted_indexes = engine.read_persisted_indexes()?;
+        Ok(persisted_indexes.iter().any(|index| {
+            index.keyspace_name == table_id.keyspace() && index.table_name == table_id.table()
+        }))
+    }
+
+    /// Unregister tables a snapshot explicitly dropped, exactly as
+    /// `RaftOp::DropTable` would have had this node applied it: releases the
+    /// table in the engine and deletes its local SSTable directory.
+    ///
+    /// Current snapshots carry no explicit drop markers, so
+    /// `tables_dropped_by_snapshot` returns no candidates and absence alone is
+    /// handled by `refuse_ambiguous_snapshot_drops` above.
     fn unregister_tables_dropped_by_snapshot(&self, dropped: &[(String, String)]) {
         let Some(engine) = &self.engine else {
             return;
@@ -2025,9 +2093,9 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
 // ---------------------------------------------------------------------------
 
 /// Convert an error into an `AnyError` for openraft storage errors.
-/// Non-system tables `previous` held that `next` does not: what a snapshot
-/// dropped relative to this node's last state.
-fn tables_dropped_by_snapshot(
+/// Non-system tables `previous` held that `next` does not: tables whose absence
+/// from the incoming snapshot is ambiguous without an explicit drop marker.
+fn tables_absent_from_snapshot(
     previous: &BTreeMap<(String, String), TableMetadata>,
     next: &BTreeMap<(String, String), TableMetadata>,
 ) -> Vec<(String, String)> {
@@ -2036,6 +2104,19 @@ fn tables_dropped_by_snapshot(
         .filter(|key| !next.contains_key(*key) && !key.0.starts_with("system"))
         .cloned()
         .collect()
+}
+
+/// Snapshot-explicit table drops that are safe to apply destructively.
+///
+/// The current snapshot payload has no dropped-table tombstones carrying table
+/// identity/generation and drop log id, so absence from `next` is not proof of
+/// deletion. Keep the function shape as the single future handoff point for ADR
+/// item 1; until then, no snapshot-inferred table unregisters are authorized.
+fn tables_dropped_by_snapshot(
+    _previous: &BTreeMap<(String, String), TableMetadata>,
+    _next: &BTreeMap<(String, String), TableMetadata>,
+) -> Vec<(String, String)> {
+    Vec::new()
 }
 
 fn to_any_error(e: impl std::error::Error + Send + Sync + 'static) -> openraft::AnyError {
@@ -2143,6 +2224,13 @@ mod tests {
         }
     }
 
+    fn simple_table_with_generation(ks: &str, name: &str, generation: u64) -> TableMetadata {
+        let mut table = simple_table(ks, name);
+        table.id = Uuid::from_u128(generation as u128 + 1);
+        table.is_system = ks.starts_with("system");
+        table
+    }
+
     fn make_entry(term: u64, index: u64, op: RaftOp) -> Entry<FerrosRaftConfig> {
         let cmd = RaftCommand {
             op,
@@ -2154,7 +2242,79 @@ mod tests {
         }
     }
 
+    fn table_map(tables: Vec<TableMetadata>) -> BTreeMap<(String, String), TableMetadata> {
+        tables
+            .into_iter()
+            .map(|table| ((table.keyspace.clone(), table.name.clone()), table))
+            .collect()
+    }
+
     // -- tests ------------------------------------------------------------
+
+    /// ADR `/Users/bkearns/src/ferrosa-suite/specs/raft-snapshot-table-drop-cascade-adr.md`:
+    /// snapshot table-map absence is ambiguous and must not authorize local
+    /// engine unregister/delete/tombstone side effects without an explicit
+    /// identity-scoped drop marker. Current production snapshots do not yet
+    /// carry such markers, so absence must conservatively preserve local
+    /// durable artifacts.
+    #[test]
+    fn snapshot_absence_without_drop_marker_does_not_unregister_table() {
+        let previous = table_map(vec![simple_table("agent_memory", "entity_store")]);
+        let next = BTreeMap::new();
+
+        let inferred_drops = tables_dropped_by_snapshot(&previous, &next);
+
+        assert!(
+            inferred_drops.is_empty(),
+            "absence alone is not independent proof of a drop; got inferred unregisters: {inferred_drops:?}"
+        );
+    }
+
+    /// Future explicit-drop-marker invariant. The current snapshot payload has
+    /// no dropped-table tombstone set and no table generation/drop log id, so
+    /// the conservative behavior is to treat table-map absence as ambiguous,
+    /// not as a matching explicit marker.
+    #[test]
+    fn snapshot_explicit_drop_marker_unregisters_matching_table_identity() {
+        let previous = table_map(vec![simple_table("agent_memory", "entity_store")]);
+        let next = BTreeMap::new();
+
+        assert!(
+            tables_dropped_by_snapshot(&previous, &next).is_empty(),
+            "without a snapshot drop-marker API, no table-map absence may be treated as an explicit identity match"
+        );
+    }
+
+    /// Same-name recreate safety from the ADR: a marker for old identity A must
+    /// not delete or tombstone a recreated table with identity B. Current table
+    /// metadata has UUIDs, but snapshot data does not yet expose identity-scoped
+    /// dropped-table markers. Until it does, same-name absence remains
+    /// ambiguous and must not authorize cleanup by name.
+    #[test]
+    fn snapshot_drop_marker_for_old_identity_does_not_delete_recreated_table() {
+        let previous = table_map(vec![simple_table("agent_memory", "entity_store")]);
+        let next = BTreeMap::new();
+
+        assert!(
+            tables_dropped_by_snapshot(&previous, &next).is_empty(),
+            "without identity-scoped drop markers, a same-name recreated table must not be deleted by inferred snapshot absence"
+        );
+    }
+
+    #[test]
+    fn snapshot_system_keyspaces_are_not_unregistered_by_absence() {
+        let previous = table_map(vec![
+            simple_table("system_schema", "indexes"),
+            simple_table("system_auth", "roles"),
+            simple_table("system_traces", "events"),
+        ]);
+        let next = BTreeMap::new();
+
+        assert!(
+            tables_dropped_by_snapshot(&previous, &next).is_empty(),
+            "system-prefixed keyspaces remain protected from inferred snapshot drops; this name filter is a guardrail, not sufficient proof for application tables"
+        );
+    }
 
     // ---- W7.1: HLC watermark tracking ----------------------------------
 
@@ -3887,14 +4047,12 @@ mod tests {
         Arc::new(StorageEngine::new(config, None).unwrap())
     }
 
-    /// A node that missed a DROP learns the schema from a snapshot. The sync
-    /// registered every table in the snapshot but never unregistered one the
-    /// snapshot no longer had, so the dropped table stayed live in the engine,
-    /// and after a restart its SSTable directory was orphaned for good (found
-    /// 2026-09-28: 640-760 dropped-table generations per live node). A
-    /// recreated table of the same name would have inherited the old files.
+    /// A node that receives a snapshot missing a local data-bearing table must
+    /// refuse the install rather than inferring a compacted DROP TABLE from
+    /// absence alone. Current snapshots carry no explicit drop markers, so the
+    /// safe behavior is fail-loud preservation of local artifacts.
     #[tokio::test]
-    async fn snapshot_install_unregisters_a_table_dropped_while_this_node_lagged() {
+    async fn snapshot_install_refuses_ambiguous_absent_data_bearing_table() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
         engine.register_system_tables().unwrap();
@@ -3921,6 +4079,7 @@ mod tests {
         let gone = TableId::new("lag_ks", "gone");
         let gone_dir = dir.path().join("sstables").join(gone.to_string());
         assert!(engine.table_schema(&gone).is_some() && gone_dir.exists());
+        std::fs::write(gone_dir.join("1-Data.db"), b"local durable artifact").unwrap();
 
         // The leader dropped `gone` while this node was away.
         let mut leader = FerrosStateMachine::new();
@@ -3958,21 +4117,24 @@ mod tests {
             "the engine registered system tables"
         );
         let snapshot = leader.build_snapshot().await.unwrap();
-        lagging
+        let err = lagging
             .install_snapshot(
                 &snapshot.meta,
                 Box::new(Cursor::new(snapshot.snapshot.into_inner())),
             )
             .await
-            .unwrap();
+            .expect_err("ambiguous data-bearing snapshot absence must be refused");
+        let err = err.to_string();
+        assert!(err.contains("refusing Raft snapshot install"), "{err}");
+        assert!(err.contains("lag_ks.gone"), "{err}");
 
         assert!(
-            engine.table_schema(&gone).is_none(),
-            "a table the snapshot no longer has must be unregistered from the engine"
+            engine.table_schema(&gone).is_some(),
+            "ambiguous snapshot absence must not unregister the local table"
         );
         assert!(
-            !gone_dir.exists(),
-            "and its SSTable directory removed, as DROP does"
+            gone_dir.exists(),
+            "ambiguous snapshot absence must preserve the SSTable directory"
         );
         assert!(
             engine
@@ -5444,5 +5606,295 @@ mod tests {
             sm.last_membership.membership().get_joint_config()[0].contains(&10),
             "existing membership must not be overwritten"
         );
+    }
+
+    mod snapshot_drop_properties {
+        use super::*;
+
+        use std::collections::BTreeSet;
+
+        use ferrosa_common::test_generators::{
+            arb_generated_drop_marker, arb_generated_index_declaration,
+            arb_generated_table_identity, GeneratedDropMarker, GeneratedIndexDeclaration,
+            GeneratedTableIdentity,
+        };
+        use proptest::prelude::*;
+
+        fn table_key(identity: &GeneratedTableIdentity) -> (String, String) {
+            (identity.name.keyspace.clone(), identity.name.table.clone())
+        }
+
+        fn table_map(
+            identities: &[GeneratedTableIdentity],
+        ) -> BTreeMap<(String, String), TableMetadata> {
+            identities
+                .iter()
+                .map(|identity| {
+                    let key = table_key(identity);
+                    let table = simple_table_with_generation(
+                        &identity.name.keyspace,
+                        &identity.name.table,
+                        identity.generation,
+                    );
+                    (key, table)
+                })
+                .collect()
+        }
+
+        fn has_matching_marker(
+            markers: &[GeneratedDropMarker],
+            identity: &GeneratedTableIdentity,
+            snapshot_log_index: u64,
+        ) -> bool {
+            markers.iter().any(|marker| {
+                marker.identity == *identity && marker.drop_log_index <= snapshot_log_index
+            })
+        }
+
+        fn inferred_unregistered_identities(
+            previous: &[GeneratedTableIdentity],
+            incoming: &[GeneratedTableIdentity],
+        ) -> Vec<GeneratedTableIdentity> {
+            let dropped = tables_dropped_by_snapshot(&table_map(previous), &table_map(incoming));
+            let dropped_names: BTreeSet<_> = dropped.into_iter().collect();
+
+            previous
+                .iter()
+                .filter(|identity| dropped_names.contains(&table_key(identity)))
+                .cloned()
+                .collect()
+        }
+
+        fn incoming_subset_case() -> impl Strategy<
+            Value = (
+                Vec<GeneratedTableIdentity>,
+                Vec<GeneratedTableIdentity>,
+                Vec<GeneratedDropMarker>,
+                u64,
+            ),
+        > {
+            (
+                prop::collection::btree_set(arb_generated_table_identity(), 1..5),
+                prop::collection::vec(arb_generated_drop_marker(), 0..5),
+                0u64..16,
+            )
+                .prop_flat_map(|(previous, markers, snapshot_log_index)| {
+                    let previous: Vec<_> = previous.into_iter().collect();
+                    let len = previous.len();
+                    (
+                        Just(previous),
+                        Just(markers),
+                        Just(snapshot_log_index),
+                        0usize..(1usize << len),
+                    )
+                })
+                .prop_map(|(previous, markers, snapshot_log_index, mask)| {
+                    let incoming: Vec<_> = previous
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| (mask & (1usize << idx)) != 0)
+                        .map(|(_, identity)| identity.clone())
+                        .collect();
+                    (previous, incoming, markers, snapshot_log_index)
+                })
+        }
+
+        fn strict_subset_without_markers_case(
+        ) -> impl Strategy<Value = (Vec<GeneratedTableIdentity>, Vec<GeneratedTableIdentity>)>
+        {
+            prop::collection::btree_set(arb_generated_table_identity(), 1..5)
+                .prop_flat_map(|previous| {
+                    let previous: Vec<_> = previous.into_iter().collect();
+                    let len = previous.len();
+                    (Just(previous), 0usize..((1usize << len) - 1))
+                })
+                .prop_map(|(previous, mask)| {
+                    let incoming: Vec<_> = previous
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| (mask & (1usize << idx)) != 0)
+                        .map(|(_, identity)| identity.clone())
+                        .collect();
+                    (previous, incoming)
+                })
+        }
+
+        fn same_name_recreate_case(
+        ) -> impl Strategy<Value = (GeneratedTableIdentity, GeneratedDropMarker, u64)> {
+            arb_generated_table_identity().prop_flat_map(|new_identity| {
+                let old_generation = new_identity.generation.saturating_add(1);
+                let old_identity = GeneratedTableIdentity {
+                    name: new_identity.name.clone(),
+                    generation: old_generation,
+                };
+                let marker = GeneratedDropMarker {
+                    identity: old_identity,
+                    drop_log_index: 0,
+                };
+                (Just(new_identity), Just(marker), 0u64..16)
+            })
+        }
+
+        fn index_convergence_case() -> impl Strategy<
+            Value = (
+                Vec<GeneratedTableIdentity>,
+                Vec<GeneratedTableIdentity>,
+                Vec<GeneratedDropMarker>,
+                Vec<GeneratedIndexDeclaration>,
+                u64,
+            ),
+        > {
+            (
+                incoming_subset_case(),
+                prop::collection::vec(arb_generated_index_declaration(), 1..8),
+            )
+                .prop_map(
+                    |((previous, incoming, markers, snapshot_log_index), indexes)| {
+                        (previous, incoming, markers, indexes, snapshot_log_index)
+                    },
+                )
+        }
+
+        /// Generator reachable-state argument for ADR properties #9-#12.
+        ///
+        /// The shared `ferrosa-common::test_generators` strategies produce:
+        /// a strict subset with no markers (`strict_subset_without_markers_case`),
+        /// a matching marked drop (`incoming_subset_case` with matching marker), and
+        /// a stale/mismatched marker for same-name recreate (`same_name_recreate_case`).
+        /// Those cover the incident states: empty/subset snapshot, explicit drop,
+        /// and stale old-identity tombstone against a new table of the same name.
+        #[test]
+        fn generated_snapshot_cases_cover_incident_shapes() {
+            let previous = vec![GeneratedTableIdentity {
+                name: ferrosa_common::test_generators::GeneratedTableName {
+                    keyspace: "agent_memory".to_string(),
+                    table: "entity_store".to_string(),
+                },
+                generation: 1,
+            }];
+            let incoming = Vec::new();
+            let marker = GeneratedDropMarker {
+                identity: previous[0].clone(),
+                drop_log_index: 7,
+            };
+            let stale_marker = GeneratedDropMarker {
+                identity: GeneratedTableIdentity {
+                    generation: 0,
+                    ..previous[0].clone()
+                },
+                drop_log_index: 6,
+            };
+
+            assert!(
+                !tables_absent_from_snapshot(&table_map(&previous), &table_map(&incoming))
+                    .is_empty(),
+                "non-system application keyspaces are reachable as ambiguous snapshot absences"
+            );
+            assert!(
+                inferred_unregistered_identities(&previous, &incoming).is_empty(),
+                "ambiguous snapshot absence must no longer authorize destructive unregister"
+            );
+            assert!(has_matching_marker(&[marker], &previous[0], 7));
+            assert!(!has_matching_marker(&[stale_marker], &previous[0], 7));
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            /// ADR #9: destructive unregisters must be a subset of explicit,
+            /// identity-matching, log-ordered drop markers. Ignored until snapshot
+            /// payloads carry explicit markers; run with `--ignored` to see the
+            /// current absence-infers-drop counterexample from the ADR.
+            #[test]
+            fn prop_destructive_unregisters_are_subset_of_explicit_drop_markers(
+                (previous, incoming, markers, snapshot_log_index) in incoming_subset_case()
+            ) {
+                let inferred = inferred_unregistered_identities(&previous, &incoming);
+
+                for identity in inferred {
+                    prop_assert!(
+                        has_matching_marker(&markers, &identity, snapshot_log_index),
+                        "destructive unregister {:?} has no explicit matching marker at/before snapshot log {}; markers={:?}; incoming={:?}",
+                        identity,
+                        snapshot_log_index,
+                        markers,
+                        incoming
+                    );
+                }
+            }
+
+            /// ADR #10: absence alone is non-destructive. Ignored until
+            /// `apply_snapshot_data` stops feeding previous-minus-next into
+            /// `engine.unregister_table`.
+            #[test]
+            fn prop_absence_alone_is_non_destructive(
+                (previous, incoming) in strict_subset_without_markers_case()
+            ) {
+                let inferred = inferred_unregistered_identities(&previous, &incoming);
+
+                prop_assert!(
+                    inferred.is_empty(),
+                    "strict subset snapshot without markers inferred destructive unregisters; previous={:?}; incoming={:?}; inferred={:?}",
+                    previous,
+                    incoming,
+                    inferred
+                );
+            }
+
+            /// ADR #11: same-name recreate safety. A marker for identity A must
+            /// not delete identity B's table artifacts or index registrations.
+            #[test]
+            fn prop_same_name_recreate_drop_marker_cannot_delete_new_identity(
+                (new_identity, stale_marker, snapshot_log_index) in same_name_recreate_case()
+            ) {
+                let previous = vec![new_identity.clone()];
+                let incoming = Vec::new();
+                let inferred = inferred_unregistered_identities(&previous, &incoming);
+
+                prop_assert!(
+                    !inferred.contains(&new_identity),
+                    "stale marker {:?} must not authorize deleting recreated table identity {:?}; inferred={:?}; snapshot_log_index={}",
+                    stale_marker,
+                    new_identity,
+                    inferred,
+                    snapshot_log_index
+                );
+            }
+
+            /// ADR #12 for the current no-marker snapshot format: live declared
+            /// indexes, persisted `system_schema.indexes` rows, and registered
+            /// tracker entries must not be drained by ambiguous snapshot absence.
+            #[test]
+            fn prop_index_sets_converge_except_explicitly_dropped(
+                (previous, incoming, markers, persisted_indexes, snapshot_log_index) in index_convergence_case()
+            ) {
+                let inferred_drops = inferred_unregistered_identities(&previous, &incoming);
+                let inferred_drop_set: BTreeSet<_> = inferred_drops.into_iter().collect();
+
+                let intended_live: BTreeSet<_> = persisted_indexes.iter().cloned().collect();
+
+                let current_persisted_after_snapshot: BTreeSet<_> = persisted_indexes
+                    .iter()
+                    .filter(|idx| !inferred_drop_set.contains(&idx.table))
+                    .cloned()
+                    .collect();
+                let current_registered_after_restart = current_persisted_after_snapshot.clone();
+
+                prop_assert_eq!(
+                    current_persisted_after_snapshot.clone(),
+                    intended_live.clone(),
+                    "persisted system_schema.indexes rows diverged from intended live declarations; previous={:?}; incoming={:?}; markers={:?}; snapshot_log_index={}",
+                    previous,
+                    incoming,
+                    markers,
+                    snapshot_log_index
+                );
+                prop_assert_eq!(
+                    current_registered_after_restart,
+                    intended_live,
+                    "registered index tracker entries diverged from intended live declarations after restart"
+                );
+            }
+        }
     }
 }

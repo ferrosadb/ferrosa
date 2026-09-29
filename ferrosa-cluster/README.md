@@ -75,6 +75,13 @@ early acknowledgement.
   `ddl_path` apply, and all three delegate to
   `StorageEngine::register_index_in_engine` — the resolver the restart reload
   uses — so the wiring cannot drift between the paths again.
+  Snapshot install no longer treats `previous - next` as authority to unregister
+  local tables. A table that is absent from an incoming snapshot is considered
+  ambiguous until snapshots carry explicit identity-scoped drop markers; if the
+  local engine still has SSTables or persisted `system_schema.indexes` rows for
+  such a table, install fails loud before `engine.unregister_table` can tombstone
+  indexes or remove SSTables. Plain `RaftOp::DropTable` still uses the normal
+  destructive cleanup path.
 - `SystemTableLoader` reconstructs durable schema/auth state during cold
   start. Persisted `system_auth.roles` rows replace fresh-process bootstrap
   roles before missing seed roles are created, so rotated hashes survive both
