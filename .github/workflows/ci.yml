@@ -438,18 +438,12 @@ jobs:
 
   # Reuses the node image artifact from build-node-image so this live
   # PostgreSQL fault schedule does not compile a second server binary.
+  #
+  # NOTE: disabling this job for its known failure (Accord recovery not wired;
+  # FMEA CL-4/CL-20) is deliberately NOT part of this PR — it rides a separate
+  # follow-on PR so this branch stays scoped to the test-runner speedup.
   postgres-jepsen-fault:
     name: PostgreSQL Jepsen fault schedule
-    # DISABLED 2026-09-29 (user instruction): the JepsenSQL / PostgreSQL
-    # strict-serializable schedule is broken and was failing the PR gate.
-    # Re-enable by deleting this `if:` line once the schedule is fixed —
-    # the job body below is unchanged and still correct.
-    #
-    # The test itself (ferrosa-jepsen/tests/postgres_strict_serializable.rs)
-    # is NOT deleted or ignored, so it still compiles under `--all-features`
-    # and can be run by hand:
-    #   cargo test -p ferrosa-jepsen --all-features --test postgres_strict_serializable
-    if: ${{ false }}
     needs: build-node-image
     runs-on: ubuntu-latest
     timeout-minutes: 60
