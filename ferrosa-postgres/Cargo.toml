@@ -64,6 +64,7 @@ indexmap = "2"
 live-infra-tests = []
 
 [dev-dependencies]
+ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 indexmap = { version = "2", features = ["serde"] }
 proptest = "1"
 uuid = { version = "1", features = ["v4"] }

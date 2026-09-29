@@ -99,4 +99,4 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## jsonb (T-150)
 
-Done: type threading. Remaining: T-160: `Value::Jsonb`; T-161a: OID 3802 codec.
+Done: type threading (T-150); engine `Value::Jsonb` and the storage mapping (T-160). Remaining: T-161a: OID 3802 text/binary codec, jsonb input parsing, DDL name `jsonb` in `cql_type_for_pg_name`.

@@ -288,6 +288,6 @@ FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-postgres \
 
 Public marketing page: `docs/database/postgres.html` (ferrosadb.com).
 
-## jsonb (T-150)
+## jsonb (T-150, T-160)
 
-`CqlType::Jsonb` has a named arm in `pg_types::column_type_of` that advertises `text`; reading or writing a jsonb value is refused (`0A000` on write, a conversion error on read) until T-160 adds the SQL value and T-161a the wire codec (T-150).
+`CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is T-161a: `query::encode_value` refuses jsonb, jsonpath and `text[]` values in both formats, and binding anything but a jsonb value to a jsonb column is `0A000`.

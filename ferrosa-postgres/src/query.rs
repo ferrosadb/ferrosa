@@ -110,6 +110,10 @@ fn render_value(value: &SqlValue) -> Option<Vec<u8>> {
         SqlValue::Numeric { unscaled, scale } => {
             Some(render_numeric_text(unscaled, *scale).into_bytes())
         }
+        // Not renderable until the T-161a wire codec. `encode_value`, the only
+        // caller, refuses these before reaching here (PG-T160-1); a caller that
+        // skips it gets SQL NULL, so keep this the sole call site.
+        SqlValue::Jsonb(_) | SqlValue::JsonPath(_) | SqlValue::TextArray(_) => None,
     }
 }
 
@@ -612,6 +616,13 @@ pub fn encode_value(
     col_type: ColumnType,
     v: &SqlValue,
 ) -> Result<Option<Vec<u8>>, String> {
+    // No wire codec for these until T-161a (PG-T160-1): refuse in BOTH formats
+    // rather than emit bytes a driver could misdecode.
+    if let SqlValue::Jsonb(_) | SqlValue::JsonPath(_) | SqlValue::TextArray(_) = v {
+        return Err(format!(
+            "result format for {col_type:?} is not supported yet (jsonb wire codec is T-161a)"
+        ));
+    }
     if format != 1 {
         return Ok(render_value(v)); // text format: reuse the existing renderer
     }
@@ -651,6 +662,9 @@ pub fn encode_value(
         // statement instead of returning data the driver may misdecode.
         SqlValue::Numeric { .. } => {
             return Err("binary result format for numeric is not supported".to_string());
+        }
+        SqlValue::Jsonb(_) | SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
+            return Err(format!("no binary codec for {col_type:?} (T-161a)"));
         }
     })
 }
@@ -1220,7 +1234,7 @@ fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, B
 /// driven by the target column's [`CqlType`]. The inverse of
 /// `storage_provider::cql_to_value`; `Null` maps to a tombstone for any type,
 /// and a type mismatch fails loud (`42804`) rather than silently coercing.
-fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, BackendMessage> {
+pub(crate) fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, BackendMessage> {
     if matches!(value, SqlValue::Null) {
         return Ok(CqlValue::Null);
     }
@@ -1259,13 +1273,14 @@ fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, BackendMessa
         (CqlType::Varint, SqlValue::Numeric { unscaled, scale }) if *scale == 0 => {
             CqlValue::Varint(unscaled.clone())
         }
-        // No SQL jsonb value until T-160 (PG-T150-02): an explicit refusal.
-        (CqlType::Jsonb, _) => {
-            return Err(error_response(
-                "0A000",
-                "jsonb columns are not yet supported over PostgreSQL (T-160)",
-            ))
-        }
+        // T-160: a validated jsonb value binds to a jsonb column as its cell.
+        (CqlType::Jsonb, SqlValue::Jsonb(doc)) => CqlValue::Jsonb(doc.clone()),
+        // Any other value for a jsonb column is a type mismatch, refused (the
+        // text -> jsonb parse is T-161a).
+        (CqlType::Jsonb, _) => return Err(error_response(
+            "0A000",
+            "only a jsonb value can be bound to a jsonb column (text and binary input are T-161a)",
+        )),
         (CqlType::Ascii, _)
         | (CqlType::Bigint, _)
         | (CqlType::Blob, _)
@@ -2117,6 +2132,9 @@ fn value_column_type(v: &SqlValue) -> ColumnType {
         SqlValue::Date(_) => ColumnType::Date,
         SqlValue::Time(_) => ColumnType::Time,
         SqlValue::Inet(_) => ColumnType::Inet,
+        SqlValue::Jsonb(_) => ColumnType::Jsonb,
+        SqlValue::JsonPath(_) => ColumnType::JsonPath,
+        SqlValue::TextArray(_) => ColumnType::TextArray,
     }
 }
 

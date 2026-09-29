@@ -105,5 +105,7 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
 |---|---|---|---|---|---|---|---|
-| PG-T150-01 | jsonb value shown as SQL NULL or text | Silent wrong data | 9 | 2 | 2 | 36 | `cql_to_value` returns an error for `Jsonb`. Scans propagate it as a query error. |
-| PG-T150-02 | jsonb INSERT coerced through a type mismatch or a guess | Wrong stored value | 8 | 2 | 2 | 32 | `value_to_cql` has an explicit `(Jsonb, _)` arm returning `0A000`. |
+| PG-T150-01 | jsonb value shown as SQL NULL or text | Silent wrong data | 9 | 2 | 2 | 36 | Superseded by PG-T160-1: `cql_to_value` now returns `Value::Jsonb`; the wire refusal moved to `encode_value`. |
+| PG-T150-02 | jsonb INSERT coerced through a type mismatch or a guess | Wrong stored value | 8 | 2 | 2 | 32 | `value_to_cql` binds only `(Jsonb, Value::Jsonb)`; the `(Jsonb, _)` arm returns `0A000`. |
+| PG-T160-1 | jsonb, jsonpath or `text[]` value reaches the wire before the T-161a codec and is sent as SQL NULL or as bytes a driver misdecodes | Silent wrong data | 9 | 2 | 2 | 36 | `encode_value` refuses these variants in both formats before `render_value`, whose deferred arm is unreachable through it. Tested in `pg_types` (`binary: false`) and `encode_value`. Removed by T-161a. |
+| PG-T160-2 | jsonb cell altered crossing the storage boundary (re-parse, scale loss) | Silent wrong data | 8 | 2 | 2 | 32 | Cell bytes move unchanged in both directions. `storage_provider_round_trips_a_jsonb_cell` asserts byte identity. |

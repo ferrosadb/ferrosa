@@ -24,14 +24,14 @@
 //! rendering. This is designed and documented, not a fallback. A type string
 //! that cannot be resolved at all is a [`PgTypeError`], never silently `text`.
 //!
-//! # JSONB slot (T-161a, not yet wired)
+//! # JSONB (T-160 engine type, T-161a wire codec)
 //!
-//! `jsonb` (OID 3802), `json` (114) and `jsonpath` (4072) are reserved by
-//! [`PG_OID_JSONB`], [`PG_OID_JSON`] and [`PG_OID_JSONPATH`]. There is no
-//! engine column type yet (`Value::Jsonb` is T-160, the wire codec T-161a).
-//! `CqlType::Jsonb` (T-150) has a named arm in `column_type_of` that advertises
-//! `text`; values are refused by the storage provider until T-160. When T-160
-//! lands, retarget that arm and add the entry to [`ALL_PG_TYPES`].
+//! `jsonb` (OID 3802), `json` (114), `jsonpath` (4072) and `text[]` (1009) are
+//! engine column types ([`ColumnType::Jsonb`] and friends) with entries in
+//! [`ALL_PG_TYPES`]. `CqlType::Jsonb` maps to `jsonb`. The wire codec is not
+//! implemented (T-161a): the entries are `binary: false` and
+//! `query::encode_value` refuses these values loudly in both formats.
+//! `cql_type_for_pg_name` still refuses the name `jsonb` (DDL is T-131).
 
 use std::fmt;
 
@@ -39,11 +39,11 @@ use ferrosa_common::cql_type::CqlType;
 use ferrosa_schema::Schema;
 use ferrosa_sql::ColumnType;
 
-/// Postgres OID of `json` (reserved for D11, not yet mapped).
+/// Postgres OID of `json` (D11: stored as jsonb).
 pub const PG_OID_JSON: u32 = 114;
-/// Postgres OID of `jsonb` (reserved for D11, not yet mapped).
+/// Postgres OID of `jsonb` (D11).
 pub const PG_OID_JSONB: u32 = 3802;
-/// Postgres OID of `jsonpath` (reserved for D11, not yet mapped).
+/// Postgres OID of `jsonpath` (D11).
 pub const PG_OID_JSONPATH: u32 = 4072;
 
 /// One Postgres type as ferrosa advertises it.
@@ -111,7 +111,7 @@ const fn entry(
 
 /// Every engine-backed Postgres type ferrosa advertises, one row per
 /// `ColumnType`. Kept in step with [`for_column_type`] by a unit test.
-pub const ALL_PG_TYPES: [PgType; 12] = [
+pub const ALL_PG_TYPES: [PgType; 16] = [
     entry(23, "int4", 4, ColumnType::Int, true),
     entry(20, "int8", 8, ColumnType::BigInt, true),
     entry(25, "text", -1, ColumnType::Text, true),
@@ -125,6 +125,13 @@ pub const ALL_PG_TYPES: [PgType; 12] = [
     entry(869, "inet", -1, ColumnType::Inet, true),
     // Binary numeric is not implemented: the encoder refuses it.
     entry(1700, "numeric", -1, ColumnType::Numeric, false),
+    // T-160: the engine carries jsonb, json (stored as jsonb, D11), jsonpath and
+    // text[]. The wire codec is T-161a, so `binary` is false and
+    // `query::encode_value` refuses these values in both formats (PG-T160-1).
+    entry(PG_OID_JSONB, "jsonb", -1, ColumnType::Jsonb, false),
+    entry(PG_OID_JSON, "json", -1, ColumnType::Json, false),
+    entry(PG_OID_JSONPATH, "jsonpath", -1, ColumnType::JsonPath, false),
+    entry(1009, "_text", -1, ColumnType::TextArray, false),
 ];
 
 /// The Postgres type for an engine relational column type.
@@ -142,6 +149,10 @@ pub fn for_column_type(ty: ColumnType) -> PgType {
         ColumnType::Time => 9,
         ColumnType::Inet => 10,
         ColumnType::Numeric => 11,
+        ColumnType::Jsonb => 12,
+        ColumnType::Json => 13,
+        ColumnType::JsonPath => 14,
+        ColumnType::TextArray => 15,
     };
     ALL_PG_TYPES[idx]
 }
@@ -169,11 +180,9 @@ fn column_type_of(t: &CqlType) -> (ColumnType, bool) {
         | CqlType::Tuple(_)
         | CqlType::Udt { .. }
         | CqlType::Vector(_, _) => (ColumnType::Text, true),
-        // Designed interim (T-150): the engine has no jsonb column type until
-        // T-160, so jsonb is advertised as text. Values are NOT delivered
-        // (`storage_provider::cql_to_value` refuses them, PG-T150-01); OID 3802
-        // is wired by T-161a.
-        CqlType::Jsonb => (ColumnType::Text, true),
+        // T-160: a native engine column type (OID 3802). The wire codec is
+        // T-161a; until then `query::encode_value` refuses jsonb values.
+        CqlType::Jsonb => (ColumnType::Jsonb, false),
     }
 }
 
@@ -275,6 +284,12 @@ mod tests {
             let pg = pg_type_of(&t);
             // Exactly one entry per engine type, reachable by OID.
             assert_eq!(by_oid(pg.oid).map(|p| p.column_type), Some(pg.column_type));
+            if t == CqlType::Jsonb {
+                // DDL name resolution for jsonb is T-131; the type name is
+                // still refused by `cql_type_for_pg_name`.
+                assert_eq!((pg.oid, pg.typname), (PG_OID_JSONB, "jsonb"));
+                continue;
+            }
             // The mapped name resolves back to a CqlType with the same PgType.
             let back = cql_type_for_pg_name(pg.typname).expect("typname resolves");
             let again = pg_type_of(&back);
@@ -292,11 +307,10 @@ mod tests {
         }
         let oids: std::collections::HashSet<u32> = ALL_PG_TYPES.iter().map(|e| e.oid).collect();
         assert_eq!(oids.len(), ALL_PG_TYPES.len(), "OIDs are unique");
-        for reserved in [PG_OID_JSON, PG_OID_JSONB, PG_OID_JSONPATH] {
-            assert!(
-                by_oid(reserved).is_none(),
-                "{reserved} is reserved for jsonb"
-            );
+        for oid in [PG_OID_JSON, PG_OID_JSONB, PG_OID_JSONPATH, 1009] {
+            let e = by_oid(oid).expect("T-160 engine type");
+            // No wire codec until T-161a: never advertise a binary format.
+            assert!(!e.binary, "{}", e.typname);
         }
     }
 
@@ -304,10 +318,12 @@ mod tests {
     fn composites_are_named_text_rendered_arms() {
         for t in every_cql_type() {
             let pg = pg_type_of(&t);
-            // jsonb is a scalar name but has no engine column type until T-160,
-            // so it takes the text-rendered arm (`column_type_of`).
-            let composite =
-                !SCALAR_TYPES.contains(&t) || t == CqlType::Duration || t == CqlType::Jsonb;
+            // jsonb is a native engine type since T-160 (not text-rendered).
+            let composite = !SCALAR_TYPES.contains(&t) || t == CqlType::Duration;
+            if t == CqlType::Jsonb {
+                assert!(!pg.text_rendered);
+                continue;
+            }
             assert_eq!(pg.text_rendered, composite, "{t:?}");
             if composite {
                 assert_eq!((pg.oid, pg.column_type), (25, ColumnType::Text));

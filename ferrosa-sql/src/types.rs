@@ -59,6 +59,18 @@ pub enum Value {
         unscaled: BigInt,
         scale: i32,
     },
+    /// A validated jsonb document (OID 3802, D11). Never raw bytes: the only
+    /// ways to obtain a [`ferrosa_jsonb::JsonbValue`] validate the cell.
+    /// `Eq`/`Hash`/`Ord` are by VALUE (D2a, D18), so `1` and `1.0` inside a
+    /// document are one group / DISTINCT / join key. Serde is base64 in the
+    /// JSON spill records and VALIDATES on read (FM-21).
+    Jsonb(ferrosa_jsonb::JsonbValue),
+    /// A jsonpath (OID 4072), held as its text until the path parser lands
+    /// (T-162). Compared and hashed by that text.
+    JsonPath(String),
+    /// `text[]` (OID 1009), value-only: no column of this type is stored.
+    /// Elements may be NULL.
+    TextArray(Vec<Option<String>>),
 }
 
 impl Value {
@@ -122,7 +134,31 @@ impl Value {
                     scale: sb,
                 },
             ) => Some(cmp_numeric(ua, *sa, ub, *sb)),
-            _ => None,
+            // jsonb: the one total D18 order. Never UNKNOWN for a jsonb pair
+            // and never Equal by fallback (FM-44); Equal means value-equal.
+            (Value::Jsonb(a), Value::Jsonb(b)) => Some(a.cmp(b)),
+            (Value::JsonPath(a), Value::JsonPath(b)) => Some(a.cmp(b)),
+            (Value::TextArray(a), Value::TextArray(b)) => Some(a.cmp(b)),
+            // Cross-type and NULL are UNKNOWN. Listed by first operand so a new
+            // `Value` variant is a compile error here, not a silent UNKNOWN.
+            (
+                Value::Null
+                | Value::Int(_)
+                | Value::Text(_)
+                | Value::Bool(_)
+                | Value::Float(_)
+                | Value::Uuid(_)
+                | Value::Bytea(_)
+                | Value::Timestamp(_)
+                | Value::Date(_)
+                | Value::Time(_)
+                | Value::Inet(_)
+                | Value::Numeric { .. }
+                | Value::Jsonb(_)
+                | Value::JsonPath(_)
+                | Value::TextArray(_),
+                _,
+            ) => None,
         }
     }
 }
@@ -184,6 +220,15 @@ pub enum ColumnType {
     Time,
     Inet,
     Numeric,
+    /// `jsonb` (OID 3802).
+    Jsonb,
+    /// `json` (OID 114). Stored as jsonb (D11); a distinct type so the wire
+    /// layer can advertise the OID the client asked for.
+    Json,
+    /// `jsonpath` (OID 4072).
+    JsonPath,
+    /// `text[]` (OID 1009); value-only.
+    TextArray,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

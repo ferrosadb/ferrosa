@@ -39,6 +39,14 @@ in-memory table in tests and by Ferrosa storage in production.
   `jsonb`, D11). Double-quoted identifiers are supported. Refused by name with
   `ParseError::UnsupportedClause`: `FOREIGN KEY`/`REFERENCES`, `CHECK`,
   `SERIAL` types, `DEFAULT`, a schema other than `public`, `UNIQUE`.
+- jsonb values (T-160): `Value::Jsonb(ferrosa_jsonb::JsonbValue)`, plus
+  `Value::JsonPath(String)` (text until the path parser, T-162) and
+  `Value::TextArray`; `ColumnType` gains `Jsonb`, `Json`, `JsonPath`, `TextArray`.
+  Equality, hashing, GROUP BY, DISTINCT and hash-join keys use jsonb value
+  equality (`1` == `1.0`); `sql_cmp` and `spill::canonical_cmp` use the D18
+  order. Spill records carry the validated cell (base64 in JSON, validated on
+  read) and `row_bytes` counts the real cell bytes. Operators, casts, SRFs and
+  parsing jsonb literals are later packets.
 - Transaction / session statements **parsed** (not executed here): `BEGIN`/`START`,
   `COMMIT`/`END`, `ROLLBACK`/`ABORT`, `SET`, `RESET`.
 - WHERE/HAVING boolean expressions: `AND` / `OR` / `NOT` with parentheses and

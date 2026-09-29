@@ -24,6 +24,9 @@ ferrosa-storage = { path = "../ferrosa-storage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+# `Value::Jsonb` holds the validated `JsonbValue` (T-160, D2a): value Eq/Hash/Ord
+# and validating serde come from that type.
+ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 
 [dev-dependencies]
 tempfile = "3"

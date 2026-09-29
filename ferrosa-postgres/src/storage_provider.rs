@@ -161,10 +161,9 @@ pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
         | CqlValue::Vector(_) => {
             return Err(format!("unsupported CQL value for PostgreSQL: {v:?}"))
         }
-        // No SQL jsonb value until T-160; refuse rather than show NULL (PG-T150-01).
-        CqlValue::Jsonb(_) => {
-            return Err("jsonb values are not yet supported over PostgreSQL (T-160)".to_string())
-        }
+        // The validated cell moves across unchanged (T-160): no re-parse, no
+        // text detour, so a scale variant like `1.0` keeps its bytes.
+        CqlValue::Jsonb(doc) => Value::Jsonb(doc.clone()),
     })
 }
 
@@ -753,6 +752,33 @@ pub(crate) fn read_row_image(
 mod tests {
     use super::*;
     use ferrosa_sql::ColumnType;
+
+    fn jsonb_cell(text: &str) -> ferrosa_jsonb::JsonbValue {
+        use ferrosa_jsonb::{parse_text, JsonbValue, Limits, LimitsConfig};
+        let limits = Limits::from_config_with_env(&LimitsConfig::default(), &|_| None, 64 << 20)
+            .expect("default limits");
+        let enc = parse_text(text.as_bytes(), &limits).expect("valid json");
+        JsonbValue::from_encoded(enc).expect("valid cell")
+    }
+
+    /// PG-T160-2: a jsonb cell crosses the storage boundary byte-for-byte in
+    /// both directions, keeping scale variants (`1.0`) intact.
+    #[test]
+    fn storage_provider_round_trips_a_jsonb_cell() {
+        let doc = jsonb_cell(r#"{"a":[1.0,{"b":12345678901234567890.5e300}],"s":"x"}"#);
+        let cql = CqlValue::Jsonb(doc.clone());
+        let sql = super::cql_to_value(&cql).expect("jsonb is representable");
+        match &sql {
+            Value::Jsonb(got) => assert_eq!(got.as_bytes(), doc.as_bytes()),
+            other => panic!("expected Value::Jsonb, got {other:?}"),
+        }
+        match crate::query::value_to_cql(&sql, &CqlType::Jsonb) {
+            Ok(back) => assert_eq!(back, cql),
+            Err(_) => panic!("a jsonb value must bind to a jsonb column"),
+        }
+        // A non-jsonb value for a jsonb column is refused, never coerced.
+        assert!(crate::query::value_to_cql(&Value::Text("{}".into()), &CqlType::Jsonb).is_err());
+    }
 
     fn cql_to_value(value: &CqlValue) -> Value {
         super::cql_to_value(value).expect("test value should be representable")

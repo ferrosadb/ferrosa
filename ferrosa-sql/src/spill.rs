@@ -145,7 +145,24 @@ fn value_payload_bytes(v: &Value) -> usize {
         Value::Bytea(b) => b.len(),
         // A BigInt's magnitude is a Vec<u32>; four bytes per 32-bit limb.
         Value::Numeric { unscaled, .. } => unscaled.iter_u32_digits().count() * 4,
-        _ => 0,
+        // The real cell bytes (SQL-T160-1): counting a document as 0 would let
+        // a sort of large documents never reach the spill threshold.
+        Value::Jsonb(doc) => doc.as_bytes().len(),
+        Value::JsonPath(text) => text.len(),
+        // Element slots plus string bytes; a NULL element costs its slot only.
+        Value::TextArray(items) => items
+            .iter()
+            .map(|i| std::mem::size_of::<Option<String>>() + i.as_ref().map_or(0, String::len))
+            .sum(),
+        Value::Null
+        | Value::Int(_)
+        | Value::Bool(_)
+        | Value::Float(_)
+        | Value::Uuid(_)
+        | Value::Timestamp(_)
+        | Value::Date(_)
+        | Value::Time(_)
+        | Value::Inet(_) => 0,
     }
 }
 
@@ -195,6 +212,11 @@ pub fn canonical_cmp(a: &Value, b: &Value) -> Ordering {
                 scale: sy,
             },
         ) => ux.cmp(uy).then(sx.cmp(sy)),
+        // jsonb: D18 value order, whose Equal is value equality (`1` == `1.0`),
+        // matching `Value`'s `Eq`/`Hash` so groups and DISTINCT agree (D2a).
+        (Value::Jsonb(x), Value::Jsonb(y)) => x.cmp(y),
+        (Value::JsonPath(x), Value::JsonPath(y)) => x.cmp(y),
+        (Value::TextArray(x), Value::TextArray(y)) => x.cmp(y),
         // Unreachable: equal tags imply the same variant.
         _ => Ordering::Equal,
     }
@@ -215,6 +237,9 @@ fn type_tag(v: &Value) -> u8 {
         Value::Date(_) => 9,
         Value::Time(_) => 10,
         Value::Inet(_) => 11,
+        Value::Jsonb(_) => 12,
+        Value::JsonPath(_) => 13,
+        Value::TextArray(_) => 14,
     }
 }
 

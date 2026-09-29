@@ -36,6 +36,10 @@ toward the Postgres queries real clients send.
   are separate packets. The PG type map is a fourth string-to-type table and
   must converge with the existing three (research/type-threading-map.md).
 
+- **jsonb** (D11): T-160 added the value and column types (done). Next: the
+  wire codec (T-161a), jsonb literal parsing and casts, operators and SRFs
+  (T-162 onward), and a real `jsonpath` value in place of the text holder.
+
 - **Richer joins** (FMEA SQL-3): `LEFT`/`RIGHT`/`FULL` outer joins, a multi-table
   FROM / join list, and `ON` predicates beyond a single `a = b` (AND-of-equalities,
   inequality join conditions).

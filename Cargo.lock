@@ -2647,6 +2647,7 @@ dependencies = [
  "chrono",
  "ferrosa-cluster",
  "ferrosa-common",
+ "ferrosa-jsonb",
  "ferrosa-net",
  "ferrosa-row-bridge",
  "ferrosa-schema",
@@ -2781,6 +2782,7 @@ name = "ferrosa-sql"
 version = "0.22.0"
 dependencies = [
  "chrono",
+ "ferrosa-jsonb",
  "ferrosa-storage",
  "num-bigint",
  "ordered-float",
