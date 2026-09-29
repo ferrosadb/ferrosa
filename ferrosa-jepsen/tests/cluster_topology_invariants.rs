@@ -47,9 +47,10 @@ const CLUSTER_HOSTS: &[&str] = &["127.0.0.1:9042", "127.0.0.1:9043", "127.0.0.1:
 
 /// The `cqlsh` image: `$FERROSA_CASSANDRA_IMAGE` if set, else the upstream tag.
 ///
-/// CI points this at our digest-pinned mirror on downloads.ferrosa.ai so a
-/// Docker Hub outage cannot fail the job; the default keeps a local run
-/// working with the image most developers already have.
+/// The override exists so CI can redirect this to our own mirror without a
+/// code change; CI does not set it yet because that mirror is not published.
+/// The default keeps a local run working with the image most developers
+/// already have.
 fn cqlsh_image() -> String {
     std::env::var("FERROSA_CASSANDRA_IMAGE")
         .ok()

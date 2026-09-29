@@ -266,11 +266,14 @@ fn container_runtime() -> &'static str {
 /// The PostgreSQL image the oracle runs against: `$FERROSA_POSTGRES_IMAGE` if
 /// set, else the upstream tag.
 ///
-/// CI sets this to our own digest-pinned mirror on downloads.ferrosa.ai so a
-/// Docker Hub outage or connection reset cannot fail the job. The default
-/// keeps a local `cargo test` working with the image most developers already
-/// have, and mirrors the podman-vs-docker default in `container_runtime()`:
-/// prefer what the environment provides, fall back to the obvious value.
+/// The override exists so CI can point this at our own digest-pinned mirror on
+/// downloads.ferrosa.ai and stop depending on a registry we do not control --
+/// on 2026-09-29 a connection reset while pulling a manifest failed a CI job
+/// outright. CI does not set it yet because that mirror is pinned in the
+/// catalog sources but not published; until then both the pre-pull and this
+/// default resolve to upstream. The default also keeps a local `cargo test`
+/// working with the image most developers already have, mirroring the
+/// podman-vs-docker default in `container_runtime()`.
 fn postgres_image() -> String {
     match std::env::var("FERROSA_POSTGRES_IMAGE") {
         Ok(img) if !img.trim().is_empty() => img,
@@ -314,11 +317,11 @@ impl PgContainer {
     /// Launch the pinned PostgreSQL image, publish 5432 to an ephemeral host
     /// port, discover that port, and poll-connect until the server is ready.
     ///
-    /// The image reference comes from `FERROSA_POSTGRES_IMAGE` so CI can point
-    /// it at our digest-pinned mirror on downloads.ferrosa.ai instead of
-    /// reaching upstream Docker Hub. A bare `postgres:16` here makes the job
-    /// depend on a registry we do not control: on 2026-09-29 a connection
-    /// reset while pulling a manifest failed a CI job outright.
+    /// The image reference comes from `FERROSA_POSTGRES_IMAGE` (see
+    /// `postgres_image`), so CI can redirect it to our own mirror without a
+    /// code change. Running a bare `postgres:16` makes the job depend on a
+    /// registry we do not control: on 2026-09-29 a connection reset while
+    /// pulling a manifest failed a CI job outright.
     async fn start() -> PgContainer {
         let runtime = container_runtime();
         let image = postgres_image();
