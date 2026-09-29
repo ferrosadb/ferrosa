@@ -333,7 +333,13 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
                                     continue;
                                 }
                             }
-                            _ => continue,
+                            DataType::Text
+                            | DataType::Boolean
+                            | DataType::Uuid
+                            | DataType::Inet
+                            | DataType::Timestamp
+                            | DataType::Blob
+                            | DataType::Duration => continue,
                         };
 
                         let metric_name = format!("ferrosa_{table_name}_{}", col.name);

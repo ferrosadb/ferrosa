@@ -249,7 +249,32 @@ fn prepare_order_by_execution(
 fn vector_bits_from_term(term: &Term, target_type: &CqlType) -> Result<Vec<u32>, CqlError> {
     match bridge::term_to_cql_value(term, target_type)? {
         CqlValue::Vector(bits) => Ok(bits),
-        other => Err(CqlError::Invalid(format!(
+        other @ (CqlValue::Null
+        | CqlValue::Ascii(_)
+        | CqlValue::Bigint(_)
+        | CqlValue::Blob(_)
+        | CqlValue::Boolean(_)
+        | CqlValue::Counter(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Double(_)
+        | CqlValue::Float(_)
+        | CqlValue::Int(_)
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Text(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Timeuuid(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Smallint(_)
+        | CqlValue::Tinyint(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Udt(_)) => Err(CqlError::Invalid(format!(
             "ANN query value must resolve to vector, got {other:?}"
         ))),
     }
@@ -2098,7 +2123,32 @@ fn eval_to_timestamp(timeuuid: &CqlValue) -> Result<CqlValue, CqlError> {
             let millis = (uuid_ts - crate::bridge::UUID_EPOCH_OFFSET) / 10_000;
             Ok(CqlValue::Timestamp(millis as i64))
         }
-        _ => Err(CqlError::Invalid(
+        CqlValue::Null
+        | CqlValue::Ascii(_)
+        | CqlValue::Bigint(_)
+        | CqlValue::Blob(_)
+        | CqlValue::Boolean(_)
+        | CqlValue::Counter(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Double(_)
+        | CqlValue::Float(_)
+        | CqlValue::Int(_)
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Text(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Smallint(_)
+        | CqlValue::Tinyint(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Vector(_)
+        | CqlValue::Udt(_) => Err(CqlError::Invalid(
             "toTimestamp requires a timeuuid argument".into(),
         )),
     }
@@ -4923,15 +4973,95 @@ fn row_geo_point(row: &[Option<CqlValue>], col_idx: usize) -> Option<(f64, f64)>
         Some(Some(CqlValue::Tuple(elems))) if elems.len() == 2 => {
             let lat = match elems[0] {
                 Some(CqlValue::Double(bits)) => f64::from_bits(bits),
-                _ => return None,
+                None
+                | Some(CqlValue::Null)
+                | Some(CqlValue::Ascii(_))
+                | Some(CqlValue::Bigint(_))
+                | Some(CqlValue::Blob(_))
+                | Some(CqlValue::Boolean(_))
+                | Some(CqlValue::Counter(_))
+                | Some(CqlValue::Decimal { .. })
+                | Some(CqlValue::Float(_))
+                | Some(CqlValue::Int(_))
+                | Some(CqlValue::Timestamp(_))
+                | Some(CqlValue::Uuid(_))
+                | Some(CqlValue::Text(_))
+                | Some(CqlValue::Varint(_))
+                | Some(CqlValue::Timeuuid(_))
+                | Some(CqlValue::Inet(_))
+                | Some(CqlValue::Date(_))
+                | Some(CqlValue::Time(_))
+                | Some(CqlValue::Smallint(_))
+                | Some(CqlValue::Tinyint(_))
+                | Some(CqlValue::Duration { .. })
+                | Some(CqlValue::List(_))
+                | Some(CqlValue::Set(_))
+                | Some(CqlValue::Map(_))
+                | Some(CqlValue::Tuple(_))
+                | Some(CqlValue::Vector(_))
+                | Some(CqlValue::Udt(_)) => return None,
             };
             let lon = match elems[1] {
                 Some(CqlValue::Double(bits)) => f64::from_bits(bits),
-                _ => return None,
+                None
+                | Some(CqlValue::Null)
+                | Some(CqlValue::Ascii(_))
+                | Some(CqlValue::Bigint(_))
+                | Some(CqlValue::Blob(_))
+                | Some(CqlValue::Boolean(_))
+                | Some(CqlValue::Counter(_))
+                | Some(CqlValue::Decimal { .. })
+                | Some(CqlValue::Float(_))
+                | Some(CqlValue::Int(_))
+                | Some(CqlValue::Timestamp(_))
+                | Some(CqlValue::Uuid(_))
+                | Some(CqlValue::Text(_))
+                | Some(CqlValue::Varint(_))
+                | Some(CqlValue::Timeuuid(_))
+                | Some(CqlValue::Inet(_))
+                | Some(CqlValue::Date(_))
+                | Some(CqlValue::Time(_))
+                | Some(CqlValue::Smallint(_))
+                | Some(CqlValue::Tinyint(_))
+                | Some(CqlValue::Duration { .. })
+                | Some(CqlValue::List(_))
+                | Some(CqlValue::Set(_))
+                | Some(CqlValue::Map(_))
+                | Some(CqlValue::Tuple(_))
+                | Some(CqlValue::Vector(_))
+                | Some(CqlValue::Udt(_)) => return None,
             };
             Some((lat, lon))
         }
-        _ => None,
+        None
+        | Some(None)
+        | Some(Some(CqlValue::Tuple(_))) // guard `elems.len() == 2` failed
+        | Some(Some(CqlValue::Null))
+        | Some(Some(CqlValue::Ascii(_)))
+        | Some(Some(CqlValue::Bigint(_)))
+        | Some(Some(CqlValue::Blob(_)))
+        | Some(Some(CqlValue::Boolean(_)))
+        | Some(Some(CqlValue::Counter(_)))
+        | Some(Some(CqlValue::Decimal { .. }))
+        | Some(Some(CqlValue::Double(_)))
+        | Some(Some(CqlValue::Float(_)))
+        | Some(Some(CqlValue::Int(_)))
+        | Some(Some(CqlValue::Timestamp(_)))
+        | Some(Some(CqlValue::Uuid(_)))
+        | Some(Some(CqlValue::Text(_)))
+        | Some(Some(CqlValue::Varint(_)))
+        | Some(Some(CqlValue::Timeuuid(_)))
+        | Some(Some(CqlValue::Inet(_)))
+        | Some(Some(CqlValue::Date(_)))
+        | Some(Some(CqlValue::Time(_)))
+        | Some(Some(CqlValue::Smallint(_)))
+        | Some(Some(CqlValue::Tinyint(_)))
+        | Some(Some(CqlValue::Duration { .. }))
+        | Some(Some(CqlValue::List(_)))
+        | Some(Some(CqlValue::Set(_)))
+        | Some(Some(CqlValue::Map(_)))
+        | Some(Some(CqlValue::Vector(_)))
+        | Some(Some(CqlValue::Udt(_))) => None,
     }
 }
 
@@ -7552,8 +7682,9 @@ fn cell_to_cql_value(
             CqlValue::Timestamp(ms)
         }
         DataType::Blob => CqlValue::Blob(bytes.clone()),
-        // DataType is #[non_exhaustive]; treat unknown as blob.
-        _ => CqlValue::Blob(bytes.clone()),
+        // Duration has no virtual-cell decoder yet; it is surfaced as a blob
+        // (pre-existing silent fallback, tracked as a fail-loud follow-up).
+        DataType::Duration => CqlValue::Blob(bytes.clone()),
     }))
 }
 
@@ -7626,7 +7757,32 @@ fn encode_virtual_rows_streaming(
                     Some(ferrosa_schema::WireType::SetText) => {
                         Ok(decode_list_text_cell(cell).map(|value| match value {
                             CqlValue::List(items) => CqlValue::Set(items),
-                            other => other,
+                            other @ (CqlValue::Null
+                            | CqlValue::Ascii(_)
+                            | CqlValue::Bigint(_)
+                            | CqlValue::Blob(_)
+                            | CqlValue::Boolean(_)
+                            | CqlValue::Counter(_)
+                            | CqlValue::Decimal { .. }
+                            | CqlValue::Double(_)
+                            | CqlValue::Float(_)
+                            | CqlValue::Int(_)
+                            | CqlValue::Timestamp(_)
+                            | CqlValue::Uuid(_)
+                            | CqlValue::Text(_)
+                            | CqlValue::Varint(_)
+                            | CqlValue::Timeuuid(_)
+                            | CqlValue::Inet(_)
+                            | CqlValue::Date(_)
+                            | CqlValue::Time(_)
+                            | CqlValue::Smallint(_)
+                            | CqlValue::Tinyint(_)
+                            | CqlValue::Duration { .. }
+                            | CqlValue::Set(_)
+                            | CqlValue::Map(_)
+                            | CqlValue::Tuple(_)
+                            | CqlValue::Vector(_)
+                            | CqlValue::Udt(_)) => other,
                         }))
                     }
                     None => cell_to_cql_value(cell, &col.data_type),
@@ -8684,7 +8840,32 @@ async fn route_update(
             // A Sub on a map removes keys given as a set; other ops use the column type.
             let rhs_type = match (&cql_type, is_add) {
                 (CqlType::Map(k, _), false) => CqlType::Set(k.clone()),
-                _ => cql_type.clone(),
+                (CqlType::Ascii, _)
+                | (CqlType::Bigint, _)
+                | (CqlType::Blob, _)
+                | (CqlType::Boolean, _)
+                | (CqlType::Counter, _)
+                | (CqlType::Decimal, _)
+                | (CqlType::Double, _)
+                | (CqlType::Float, _)
+                | (CqlType::Int, _)
+                | (CqlType::Timestamp, _)
+                | (CqlType::Uuid, _)
+                | (CqlType::Varchar, _)
+                | (CqlType::Varint, _)
+                | (CqlType::Timeuuid, _)
+                | (CqlType::Inet, _)
+                | (CqlType::Date, _)
+                | (CqlType::Time, _)
+                | (CqlType::Smallint, _)
+                | (CqlType::Tinyint, _)
+                | (CqlType::Duration, _)
+                | (CqlType::List(_), _)
+                | (CqlType::Map(_, _), _)
+                | (CqlType::Set(_), _)
+                | (CqlType::Tuple(_), _)
+                | (CqlType::Udt { .. }, _)
+                | (CqlType::Vector(_, _), _) => cql_type.clone(),
             };
             if let Ok(rhs) = bridge::term_to_cql_value(value, &rhs_type) {
                 if let Ok(cells) =
@@ -8735,7 +8916,32 @@ async fn route_update(
                                 .and_then(|v| v.as_ref())
                                 .and_then(|v| match v {
                                     CqlValue::Counter(c) => Some(*c),
-                                    _ => None,
+                                    CqlValue::Null
+                                    | CqlValue::Ascii(_)
+                                    | CqlValue::Bigint(_)
+                                    | CqlValue::Blob(_)
+                                    | CqlValue::Boolean(_)
+                                    | CqlValue::Decimal { .. }
+                                    | CqlValue::Double(_)
+                                    | CqlValue::Float(_)
+                                    | CqlValue::Int(_)
+                                    | CqlValue::Timestamp(_)
+                                    | CqlValue::Uuid(_)
+                                    | CqlValue::Text(_)
+                                    | CqlValue::Varint(_)
+                                    | CqlValue::Timeuuid(_)
+                                    | CqlValue::Inet(_)
+                                    | CqlValue::Date(_)
+                                    | CqlValue::Time(_)
+                                    | CqlValue::Smallint(_)
+                                    | CqlValue::Tinyint(_)
+                                    | CqlValue::Duration { .. }
+                                    | CqlValue::List(_)
+                                    | CqlValue::Set(_)
+                                    | CqlValue::Map(_)
+                                    | CqlValue::Tuple(_)
+                                    | CqlValue::Vector(_)
+                                    | CqlValue::Udt(_) => None,
                                 })
                                 .unwrap_or(0);
                             (column.as_str(), CqlValue::Counter(current + n))
@@ -8745,7 +8951,31 @@ async fn route_update(
                             ));
                         }
                     }
-                    _ => {
+                    CqlType::Ascii
+                    | CqlType::Bigint
+                    | CqlType::Blob
+                    | CqlType::Boolean
+                    | CqlType::Decimal
+                    | CqlType::Double
+                    | CqlType::Float
+                    | CqlType::Int
+                    | CqlType::Timestamp
+                    | CqlType::Uuid
+                    | CqlType::Varchar
+                    | CqlType::Varint
+                    | CqlType::Timeuuid
+                    | CqlType::Inet
+                    | CqlType::Date
+                    | CqlType::Time
+                    | CqlType::Smallint
+                    | CqlType::Tinyint
+                    | CqlType::Duration
+                    | CqlType::List(_)
+                    | CqlType::Map(_, _)
+                    | CqlType::Set(_)
+                    | CqlType::Tuple(_)
+                    | CqlType::Udt { .. }
+                    | CqlType::Vector(_, _) => {
                         let new_val = bridge::term_to_cql_value(value, &cql_type)?;
                         let col_table_idx = table_meta
                             .columns
@@ -8781,7 +9011,32 @@ async fn route_update(
                                 .and_then(|v| v.as_ref())
                                 .and_then(|v| match v {
                                     CqlValue::Counter(c) => Some(*c),
-                                    _ => None,
+                                    CqlValue::Null
+                                    | CqlValue::Ascii(_)
+                                    | CqlValue::Bigint(_)
+                                    | CqlValue::Blob(_)
+                                    | CqlValue::Boolean(_)
+                                    | CqlValue::Decimal { .. }
+                                    | CqlValue::Double(_)
+                                    | CqlValue::Float(_)
+                                    | CqlValue::Int(_)
+                                    | CqlValue::Timestamp(_)
+                                    | CqlValue::Uuid(_)
+                                    | CqlValue::Text(_)
+                                    | CqlValue::Varint(_)
+                                    | CqlValue::Timeuuid(_)
+                                    | CqlValue::Inet(_)
+                                    | CqlValue::Date(_)
+                                    | CqlValue::Time(_)
+                                    | CqlValue::Smallint(_)
+                                    | CqlValue::Tinyint(_)
+                                    | CqlValue::Duration { .. }
+                                    | CqlValue::List(_)
+                                    | CqlValue::Set(_)
+                                    | CqlValue::Map(_)
+                                    | CqlValue::Tuple(_)
+                                    | CqlValue::Vector(_)
+                                    | CqlValue::Udt(_) => None,
                                 })
                                 .unwrap_or(0);
                             (column.as_str(), CqlValue::Counter(current - n))
@@ -8806,7 +9061,30 @@ async fn route_update(
                         let merged = collection_sub_map(existing, &keys_to_remove);
                         (column.as_str(), merged)
                     }
-                    _ => {
+                    CqlType::Ascii
+                    | CqlType::Bigint
+                    | CqlType::Blob
+                    | CqlType::Boolean
+                    | CqlType::Decimal
+                    | CqlType::Double
+                    | CqlType::Float
+                    | CqlType::Int
+                    | CqlType::Timestamp
+                    | CqlType::Uuid
+                    | CqlType::Varchar
+                    | CqlType::Varint
+                    | CqlType::Timeuuid
+                    | CqlType::Inet
+                    | CqlType::Date
+                    | CqlType::Time
+                    | CqlType::Smallint
+                    | CqlType::Tinyint
+                    | CqlType::Duration
+                    | CqlType::List(_)
+                    | CqlType::Set(_)
+                    | CqlType::Tuple(_)
+                    | CqlType::Udt { .. }
+                    | CqlType::Vector(_, _) => {
                         // Set/list subtraction: remove matching elements.
                         let to_remove = bridge::term_to_cql_value(value, &cql_type)?;
                         let col_table_idx = table_meta
@@ -8850,7 +9128,30 @@ async fn route_update(
                             "column '{column}': list index updates require a read-modify-write path"
                         )));
                     }
-                    _ => {
+                    CqlType::Ascii
+                    | CqlType::Bigint
+                    | CqlType::Blob
+                    | CqlType::Boolean
+                    | CqlType::Counter
+                    | CqlType::Decimal
+                    | CqlType::Double
+                    | CqlType::Float
+                    | CqlType::Int
+                    | CqlType::Timestamp
+                    | CqlType::Uuid
+                    | CqlType::Varchar
+                    | CqlType::Varint
+                    | CqlType::Timeuuid
+                    | CqlType::Inet
+                    | CqlType::Date
+                    | CqlType::Time
+                    | CqlType::Smallint
+                    | CqlType::Tinyint
+                    | CqlType::Duration
+                    | CqlType::Set(_)
+                    | CqlType::Tuple(_)
+                    | CqlType::Udt { .. }
+                    | CqlType::Vector(_, _) => {
                         return Err(CqlError::Invalid(format!(
                             "column '{column}' does not support element updates"
                         )));
@@ -8928,7 +9229,33 @@ fn collection_add(existing: Option<&CqlValue>, new_val: &CqlValue) -> CqlValue {
             CqlValue::Map(merged)
         }
         (None, _) => new_val.clone(),
-        _ => new_val.clone(),
+        (Some(CqlValue::Null), _)
+        | (Some(CqlValue::Ascii(_)), _)
+        | (Some(CqlValue::Bigint(_)), _)
+        | (Some(CqlValue::Blob(_)), _)
+        | (Some(CqlValue::Boolean(_)), _)
+        | (Some(CqlValue::Counter(_)), _)
+        | (Some(CqlValue::Decimal { .. }), _)
+        | (Some(CqlValue::Double(_)), _)
+        | (Some(CqlValue::Float(_)), _)
+        | (Some(CqlValue::Int(_)), _)
+        | (Some(CqlValue::Timestamp(_)), _)
+        | (Some(CqlValue::Uuid(_)), _)
+        | (Some(CqlValue::Text(_)), _)
+        | (Some(CqlValue::Varint(_)), _)
+        | (Some(CqlValue::Timeuuid(_)), _)
+        | (Some(CqlValue::Inet(_)), _)
+        | (Some(CqlValue::Date(_)), _)
+        | (Some(CqlValue::Time(_)), _)
+        | (Some(CqlValue::Smallint(_)), _)
+        | (Some(CqlValue::Tinyint(_)), _)
+        | (Some(CqlValue::Duration { .. }), _)
+        | (Some(CqlValue::List(_)), _)
+        | (Some(CqlValue::Set(_)), _)
+        | (Some(CqlValue::Map(_)), _)
+        | (Some(CqlValue::Tuple(_)), _)
+        | (Some(CqlValue::Vector(_)), _)
+        | (Some(CqlValue::Udt(_)), _) => new_val.clone(),
     }
 }
 
@@ -10426,7 +10753,21 @@ fn filter_value_to_term(value: &str, cql_type: &CqlType) -> Result<Term, CqlErro
         }
         // Text, inet, timestamps-as-strings, uuid, blob, dates, etc. all accept
         // a string literal and parse it in `term_to_cql_value`.
-        _ => Ok(Term::StringLiteral(value.to_string())),
+        CqlType::Ascii
+        | CqlType::Blob
+        | CqlType::Uuid
+        | CqlType::Varchar
+        | CqlType::Timeuuid
+        | CqlType::Inet
+        | CqlType::Date
+        | CqlType::Time
+        | CqlType::Duration
+        | CqlType::List(_)
+        | CqlType::Map(_, _)
+        | CqlType::Set(_)
+        | CqlType::Tuple(_)
+        | CqlType::Udt { .. }
+        | CqlType::Vector(_, _) => Ok(Term::StringLiteral(value.to_string())),
     }
 }
 
@@ -12065,7 +12406,31 @@ fn build_column_info(
                                     // non-decimal types; close enough for now).
                                     match arg_type {
                                         CqlType::Float => CqlType::Float,
-                                        _ => CqlType::Double,
+                                        CqlType::Ascii
+                                        | CqlType::Bigint
+                                        | CqlType::Blob
+                                        | CqlType::Boolean
+                                        | CqlType::Counter
+                                        | CqlType::Decimal
+                                        | CqlType::Double
+                                        | CqlType::Int
+                                        | CqlType::Timestamp
+                                        | CqlType::Uuid
+                                        | CqlType::Varchar
+                                        | CqlType::Varint
+                                        | CqlType::Timeuuid
+                                        | CqlType::Inet
+                                        | CqlType::Date
+                                        | CqlType::Time
+                                        | CqlType::Smallint
+                                        | CqlType::Tinyint
+                                        | CqlType::Duration
+                                        | CqlType::List(_)
+                                        | CqlType::Map(_, _)
+                                        | CqlType::Set(_)
+                                        | CqlType::Tuple(_)
+                                        | CqlType::Udt { .. }
+                                        | CqlType::Vector(_, _) => CqlType::Double,
                                     }
                                 } else {
                                     // min, max, sum return the same type as the column.
@@ -12729,7 +13094,29 @@ fn evaluate_where_predicates(
             let element_type = match &cql_type {
                 CqlType::List(inner) | CqlType::Set(inner) => (**inner).clone(),
                 CqlType::Map(_, val_type) => (**val_type).clone(),
-                _ => return Ok(false),
+                CqlType::Ascii
+                | CqlType::Bigint
+                | CqlType::Blob
+                | CqlType::Boolean
+                | CqlType::Counter
+                | CqlType::Decimal
+                | CqlType::Double
+                | CqlType::Float
+                | CqlType::Int
+                | CqlType::Timestamp
+                | CqlType::Uuid
+                | CqlType::Varchar
+                | CqlType::Varint
+                | CqlType::Timeuuid
+                | CqlType::Inet
+                | CqlType::Date
+                | CqlType::Time
+                | CqlType::Smallint
+                | CqlType::Tinyint
+                | CqlType::Duration
+                | CqlType::Tuple(_)
+                | CqlType::Udt { .. }
+                | CqlType::Vector(_, _) => return Ok(false),
             };
             let needle = match bridge::term_to_cql_value(&wc.value, &element_type) {
                 Ok(v) => v,
@@ -12738,7 +13125,30 @@ fn evaluate_where_predicates(
             let found = match actual {
                 CqlValue::List(items) | CqlValue::Set(items) => items.contains(&needle),
                 CqlValue::Map(entries) => entries.iter().any(|(_, v)| *v == needle),
-                _ => false,
+                CqlValue::Null
+                | CqlValue::Ascii(_)
+                | CqlValue::Bigint(_)
+                | CqlValue::Blob(_)
+                | CqlValue::Boolean(_)
+                | CqlValue::Counter(_)
+                | CqlValue::Decimal { .. }
+                | CqlValue::Double(_)
+                | CqlValue::Float(_)
+                | CqlValue::Int(_)
+                | CqlValue::Timestamp(_)
+                | CqlValue::Uuid(_)
+                | CqlValue::Text(_)
+                | CqlValue::Varint(_)
+                | CqlValue::Timeuuid(_)
+                | CqlValue::Inet(_)
+                | CqlValue::Date(_)
+                | CqlValue::Time(_)
+                | CqlValue::Smallint(_)
+                | CqlValue::Tinyint(_)
+                | CqlValue::Duration { .. }
+                | CqlValue::Tuple(_)
+                | CqlValue::Vector(_)
+                | CqlValue::Udt(_) => false,
             };
             if !found {
                 return Ok(false);
@@ -12748,7 +13158,31 @@ fn evaluate_where_predicates(
         if wc.op == ComparisonOp::ContainsKey {
             let key_type = match &cql_type {
                 CqlType::Map(key_type, _) => (**key_type).clone(),
-                _ => return Ok(false),
+                CqlType::Ascii
+                | CqlType::Bigint
+                | CqlType::Blob
+                | CqlType::Boolean
+                | CqlType::Counter
+                | CqlType::Decimal
+                | CqlType::Double
+                | CqlType::Float
+                | CqlType::Int
+                | CqlType::Timestamp
+                | CqlType::Uuid
+                | CqlType::Varchar
+                | CqlType::Varint
+                | CqlType::Timeuuid
+                | CqlType::Inet
+                | CqlType::Date
+                | CqlType::Time
+                | CqlType::Smallint
+                | CqlType::Tinyint
+                | CqlType::Duration
+                | CqlType::List(_)
+                | CqlType::Set(_)
+                | CqlType::Tuple(_)
+                | CqlType::Udt { .. }
+                | CqlType::Vector(_, _) => return Ok(false),
             };
             let needle = match bridge::term_to_cql_value(&wc.value, &key_type) {
                 Ok(v) => v,
@@ -12756,7 +13190,32 @@ fn evaluate_where_predicates(
             };
             let found = match actual {
                 CqlValue::Map(entries) => entries.iter().any(|(k, _)| *k == needle),
-                _ => false,
+                CqlValue::Null
+                | CqlValue::Ascii(_)
+                | CqlValue::Bigint(_)
+                | CqlValue::Blob(_)
+                | CqlValue::Boolean(_)
+                | CqlValue::Counter(_)
+                | CqlValue::Decimal { .. }
+                | CqlValue::Double(_)
+                | CqlValue::Float(_)
+                | CqlValue::Int(_)
+                | CqlValue::Timestamp(_)
+                | CqlValue::Uuid(_)
+                | CqlValue::Text(_)
+                | CqlValue::Varint(_)
+                | CqlValue::Timeuuid(_)
+                | CqlValue::Inet(_)
+                | CqlValue::Date(_)
+                | CqlValue::Time(_)
+                | CqlValue::Smallint(_)
+                | CqlValue::Tinyint(_)
+                | CqlValue::Duration { .. }
+                | CqlValue::List(_)
+                | CqlValue::Set(_)
+                | CqlValue::Tuple(_)
+                | CqlValue::Vector(_)
+                | CqlValue::Udt(_) => false,
             };
             if !found {
                 return Ok(false);
@@ -12797,7 +13256,33 @@ fn evaluate_where_predicates(
                 // (e.g., "John Smith" matches "Jon Smyth").
                 match (actual, &expected) {
                     (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
-                    _ => *actual == expected,
+                    (CqlValue::Null, _)
+                    | (CqlValue::Ascii(_), _)
+                    | (CqlValue::Bigint(_), _)
+                    | (CqlValue::Blob(_), _)
+                    | (CqlValue::Boolean(_), _)
+                    | (CqlValue::Counter(_), _)
+                    | (CqlValue::Decimal { .. }, _)
+                    | (CqlValue::Double(_), _)
+                    | (CqlValue::Float(_), _)
+                    | (CqlValue::Int(_), _)
+                    | (CqlValue::Timestamp(_), _)
+                    | (CqlValue::Uuid(_), _)
+                    | (CqlValue::Text(_), _)
+                    | (CqlValue::Varint(_), _)
+                    | (CqlValue::Timeuuid(_), _)
+                    | (CqlValue::Inet(_), _)
+                    | (CqlValue::Date(_), _)
+                    | (CqlValue::Time(_), _)
+                    | (CqlValue::Smallint(_), _)
+                    | (CqlValue::Tinyint(_), _)
+                    | (CqlValue::Duration { .. }, _)
+                    | (CqlValue::List(_), _)
+                    | (CqlValue::Set(_), _)
+                    | (CqlValue::Map(_), _)
+                    | (CqlValue::Tuple(_), _)
+                    | (CqlValue::Vector(_), _)
+                    | (CqlValue::Udt(_), _) => *actual == expected,
                 }
             }
             ComparisonOp::Eq => *actual == expected,
@@ -12808,11 +13293,63 @@ fn evaluate_where_predicates(
             ComparisonOp::Le => *actual <= expected,
             ComparisonOp::SoundsLike => match (actual, &expected) {
                 (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
-                _ => false,
+                (CqlValue::Null, _)
+                | (CqlValue::Ascii(_), _)
+                | (CqlValue::Bigint(_), _)
+                | (CqlValue::Blob(_), _)
+                | (CqlValue::Boolean(_), _)
+                | (CqlValue::Counter(_), _)
+                | (CqlValue::Decimal { .. }, _)
+                | (CqlValue::Double(_), _)
+                | (CqlValue::Float(_), _)
+                | (CqlValue::Int(_), _)
+                | (CqlValue::Timestamp(_), _)
+                | (CqlValue::Uuid(_), _)
+                | (CqlValue::Text(_), _)
+                | (CqlValue::Varint(_), _)
+                | (CqlValue::Timeuuid(_), _)
+                | (CqlValue::Inet(_), _)
+                | (CqlValue::Date(_), _)
+                | (CqlValue::Time(_), _)
+                | (CqlValue::Smallint(_), _)
+                | (CqlValue::Tinyint(_), _)
+                | (CqlValue::Duration { .. }, _)
+                | (CqlValue::List(_), _)
+                | (CqlValue::Set(_), _)
+                | (CqlValue::Map(_), _)
+                | (CqlValue::Tuple(_), _)
+                | (CqlValue::Vector(_), _)
+                | (CqlValue::Udt(_), _) => false,
             },
             ComparisonOp::Like => match (actual, &expected) {
                 (CqlValue::Text(a), CqlValue::Text(b)) => like_match(a, b),
-                _ => false,
+                (CqlValue::Null, _)
+                | (CqlValue::Ascii(_), _)
+                | (CqlValue::Bigint(_), _)
+                | (CqlValue::Blob(_), _)
+                | (CqlValue::Boolean(_), _)
+                | (CqlValue::Counter(_), _)
+                | (CqlValue::Decimal { .. }, _)
+                | (CqlValue::Double(_), _)
+                | (CqlValue::Float(_), _)
+                | (CqlValue::Int(_), _)
+                | (CqlValue::Timestamp(_), _)
+                | (CqlValue::Uuid(_), _)
+                | (CqlValue::Text(_), _)
+                | (CqlValue::Varint(_), _)
+                | (CqlValue::Timeuuid(_), _)
+                | (CqlValue::Inet(_), _)
+                | (CqlValue::Date(_), _)
+                | (CqlValue::Time(_), _)
+                | (CqlValue::Smallint(_), _)
+                | (CqlValue::Tinyint(_), _)
+                | (CqlValue::Duration { .. }, _)
+                | (CqlValue::List(_), _)
+                | (CqlValue::Set(_), _)
+                | (CqlValue::Map(_), _)
+                | (CqlValue::Tuple(_), _)
+                | (CqlValue::Vector(_), _)
+                | (CqlValue::Udt(_), _) => false,
             },
             ComparisonOp::In => unreachable!("IN handled above"),
             ComparisonOp::Contains | ComparisonOp::ContainsKey => {
@@ -13293,7 +13830,26 @@ fn cql_value_to_f64(val: &CqlValue) -> Option<f64> {
         CqlValue::Float(bits) => Some(f64::from(f32::from_bits(*bits))),
         CqlValue::Double(bits) => Some(f64::from_bits(*bits)),
         CqlValue::Counter(v) => Some(*v as f64),
-        _ => None,
+        CqlValue::Null
+        | CqlValue::Ascii(_)
+        | CqlValue::Blob(_)
+        | CqlValue::Boolean(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Text(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Timeuuid(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Vector(_)
+        | CqlValue::Udt(_) => None,
     }
 }
 
@@ -13313,7 +13869,26 @@ fn f64_to_cql_aggregate(val: f64, col_type: &CqlType) -> CqlValue {
         CqlType::Bigint | CqlType::Counter => CqlValue::Bigint(val as i64),
         CqlType::Float => CqlValue::Float((val as f32).to_bits()),
         // Default to Double for any other numeric or unknown type.
-        _ => CqlValue::Double(val.to_bits()),
+        CqlType::Ascii
+        | CqlType::Blob
+        | CqlType::Boolean
+        | CqlType::Decimal
+        | CqlType::Double
+        | CqlType::Timestamp
+        | CqlType::Uuid
+        | CqlType::Varchar
+        | CqlType::Varint
+        | CqlType::Timeuuid
+        | CqlType::Inet
+        | CqlType::Date
+        | CqlType::Time
+        | CqlType::Duration
+        | CqlType::List(_)
+        | CqlType::Map(_, _)
+        | CqlType::Set(_)
+        | CqlType::Tuple(_)
+        | CqlType::Udt { .. }
+        | CqlType::Vector(_, _) => CqlValue::Double(val.to_bits()),
     }
 }
 

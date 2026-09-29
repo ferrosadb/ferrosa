@@ -1252,7 +1252,32 @@ fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, BackendMessa
         (CqlType::Varint, SqlValue::Numeric { unscaled, scale }) if *scale == 0 => {
             CqlValue::Varint(unscaled.clone())
         }
-        _ => {
+        (CqlType::Ascii, _)
+        | (CqlType::Bigint, _)
+        | (CqlType::Blob, _)
+        | (CqlType::Boolean, _)
+        | (CqlType::Counter, _)
+        | (CqlType::Decimal, _)
+        | (CqlType::Double, _)
+        | (CqlType::Float, _)
+        | (CqlType::Int, _)
+        | (CqlType::Timestamp, _)
+        | (CqlType::Uuid, _)
+        | (CqlType::Varchar, _)
+        | (CqlType::Varint, _)
+        | (CqlType::Timeuuid, _)
+        | (CqlType::Inet, _)
+        | (CqlType::Date, _)
+        | (CqlType::Time, _)
+        | (CqlType::Smallint, _)
+        | (CqlType::Tinyint, _)
+        | (CqlType::Duration, _)
+        | (CqlType::List(_), _)
+        | (CqlType::Map(_, _), _)
+        | (CqlType::Set(_), _)
+        | (CqlType::Tuple(_), _)
+        | (CqlType::Udt { .. }, _)
+        | (CqlType::Vector(_, _), _) => {
             return Err(error_response(
                 "42804",
                 &format!("value does not match column type {ty:?}"),
@@ -1732,7 +1757,15 @@ fn cql_type_to_column_type(ty: &CqlType) -> ColumnType {
         CqlType::Time => ColumnType::Time,
         CqlType::Inet => ColumnType::Inet,
         CqlType::Decimal | CqlType::Varint => ColumnType::Numeric,
-        _ => ColumnType::Text,
+        CqlType::Ascii
+        | CqlType::Varchar
+        | CqlType::Duration
+        | CqlType::List(_)
+        | CqlType::Map(_, _)
+        | CqlType::Set(_)
+        | CqlType::Tuple(_)
+        | CqlType::Udt { .. }
+        | CqlType::Vector(_, _) => ColumnType::Text,
     }
 }
 

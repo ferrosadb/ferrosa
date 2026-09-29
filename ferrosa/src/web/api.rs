@@ -794,7 +794,10 @@ pub(crate) fn virtual_table_to_json(registry: &VirtualTableRegistry, table_name:
                                 }
                             }
                             DataType::Boolean => Value::Bool(!bytes.is_empty() && bytes[0] != 0),
-                            _ => Value::String("<binary>".to_string()),
+                            DataType::Uuid
+                            | DataType::Inet
+                            | DataType::Blob
+                            | DataType::Duration => Value::String("<binary>".to_string()),
                         };
                         obj.insert(col.name.clone(), val);
                     } else {

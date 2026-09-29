@@ -2846,7 +2846,28 @@ fn raw_bytes_to_term(cql_type: &CqlType, bytes: &[u8]) -> Term {
             Term::BlobLiteral(bytes.to_vec())
         }
         // All other types: decode to a typed CqlValue, then convert to Term.
-        _ => match decode_value(cql_type, bytes) {
+        CqlType::Ascii
+        | CqlType::Bigint
+        | CqlType::Blob
+        | CqlType::Boolean
+        | CqlType::Counter
+        | CqlType::Decimal
+        | CqlType::Double
+        | CqlType::Float
+        | CqlType::Int
+        | CqlType::Timestamp
+        | CqlType::Uuid
+        | CqlType::Varchar
+        | CqlType::Varint
+        | CqlType::Timeuuid
+        | CqlType::Inet
+        | CqlType::Date
+        | CqlType::Time
+        | CqlType::Smallint
+        | CqlType::Tinyint
+        | CqlType::Duration
+        | CqlType::Tuple(_)
+        | CqlType::Udt { .. } => match decode_value(cql_type, bytes) {
             Ok(cql_value) => cql_value_to_term(&cql_value),
             Err(_) => Term::BlobLiteral(bytes.to_vec()),
         },

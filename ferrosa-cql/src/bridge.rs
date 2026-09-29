@@ -140,7 +140,22 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     unscaled: BigInt::from(*n),
                 })
             }
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Ascii
+            | CqlType::Blob
+            | CqlType::Boolean
+            | CqlType::Uuid
+            | CqlType::Varchar
+            | CqlType::Timeuuid
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Duration
+            | CqlType::List(_)
+            | CqlType::Map(_, _)
+            | CqlType::Set(_)
+            | CqlType::Tuple(_)
+            | CqlType::Udt { .. }
+            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got integer literal",
                 cql_type_name(target)
             ))),
@@ -173,7 +188,29 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 };
                 Ok(CqlValue::Decimal { scale, unscaled })
             }
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Ascii
+            | CqlType::Bigint
+            | CqlType::Blob
+            | CqlType::Boolean
+            | CqlType::Counter
+            | CqlType::Int
+            | CqlType::Timestamp
+            | CqlType::Uuid
+            | CqlType::Varchar
+            | CqlType::Varint
+            | CqlType::Timeuuid
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::Duration
+            | CqlType::List(_)
+            | CqlType::Map(_, _)
+            | CqlType::Set(_)
+            | CqlType::Tuple(_)
+            | CqlType::Udt { .. }
+            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got float literal",
                 cql_type_name(target)
             ))),
@@ -243,7 +280,26 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     .unwrap_or(0);
                 Ok(CqlValue::Time(nanos))
             }
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Bigint
+            | CqlType::Blob
+            | CqlType::Boolean
+            | CqlType::Counter
+            | CqlType::Decimal
+            | CqlType::Double
+            | CqlType::Float
+            | CqlType::Int
+            | CqlType::Uuid
+            | CqlType::Varint
+            | CqlType::Timeuuid
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::Duration
+            | CqlType::List(_)
+            | CqlType::Map(_, _)
+            | CqlType::Set(_)
+            | CqlType::Tuple(_)
+            | CqlType::Udt { .. }
+            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got string literal",
                 cql_type_name(target)
             ))),
@@ -251,7 +307,31 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
 
         Term::BoolLiteral(b) => match target {
             CqlType::Boolean => Ok(CqlValue::Boolean(*b)),
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Ascii
+            | CqlType::Bigint
+            | CqlType::Blob
+            | CqlType::Counter
+            | CqlType::Decimal
+            | CqlType::Double
+            | CqlType::Float
+            | CqlType::Int
+            | CqlType::Timestamp
+            | CqlType::Uuid
+            | CqlType::Varchar
+            | CqlType::Varint
+            | CqlType::Timeuuid
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::Duration
+            | CqlType::List(_)
+            | CqlType::Map(_, _)
+            | CqlType::Set(_)
+            | CqlType::Tuple(_)
+            | CqlType::Udt { .. }
+            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got boolean literal",
                 cql_type_name(target)
             ))),
@@ -260,7 +340,30 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
         Term::UuidLiteral(u) => match target {
             CqlType::Uuid => Ok(CqlValue::Uuid(*u)),
             CqlType::Timeuuid => Ok(CqlValue::Timeuuid(*u)),
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Ascii
+            | CqlType::Bigint
+            | CqlType::Blob
+            | CqlType::Boolean
+            | CqlType::Counter
+            | CqlType::Decimal
+            | CqlType::Double
+            | CqlType::Float
+            | CqlType::Int
+            | CqlType::Timestamp
+            | CqlType::Varchar
+            | CqlType::Varint
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::Duration
+            | CqlType::List(_)
+            | CqlType::Map(_, _)
+            | CqlType::Set(_)
+            | CqlType::Tuple(_)
+            | CqlType::Udt { .. }
+            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got uuid literal",
                 cql_type_name(target)
             ))),
@@ -312,7 +415,31 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             // remaining scalar types arrive as raw CQL-serialized bytes. Decode
             // them against the target type rather than rejecting them as an
             // opaque blob — this is what lets drivers bind list/set/map values.
-            _ => crate::types::decode_value(target, b),
+            // The first line lists the variants whose guarded arms above did
+            // not match (wrong byte length).
+            CqlType::Bigint
+            | CqlType::Boolean
+            | CqlType::Double
+            | CqlType::Float
+            | CqlType::Int
+            | CqlType::Timestamp
+            | CqlType::Uuid
+            | CqlType::Timeuuid
+            | CqlType::Vector(_, _)
+            | CqlType::Counter
+            | CqlType::Decimal
+            | CqlType::Varint
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::Duration
+            | CqlType::List(_)
+            | CqlType::Map(_, _)
+            | CqlType::Set(_)
+            | CqlType::Tuple(_)
+            | CqlType::Udt { .. } => crate::types::decode_value(target, b),
         },
 
         Term::ListLiteral(items) => match target {
@@ -346,7 +473,30 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 }
                 Ok(CqlValue::Vector(bits))
             }
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Ascii
+            | CqlType::Bigint
+            | CqlType::Blob
+            | CqlType::Boolean
+            | CqlType::Counter
+            | CqlType::Decimal
+            | CqlType::Double
+            | CqlType::Float
+            | CqlType::Int
+            | CqlType::Timestamp
+            | CqlType::Uuid
+            | CqlType::Varchar
+            | CqlType::Varint
+            | CqlType::Timeuuid
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::Duration
+            | CqlType::Map(_, _)
+            | CqlType::Set(_)
+            | CqlType::Tuple(_)
+            | CqlType::Udt { .. } => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got list literal",
                 cql_type_name(target)
             ))),
@@ -360,7 +510,31 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     .collect();
                 Ok(CqlValue::Set(converted?))
             }
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Ascii
+            | CqlType::Bigint
+            | CqlType::Blob
+            | CqlType::Boolean
+            | CqlType::Counter
+            | CqlType::Decimal
+            | CqlType::Double
+            | CqlType::Float
+            | CqlType::Int
+            | CqlType::Timestamp
+            | CqlType::Uuid
+            | CqlType::Varchar
+            | CqlType::Varint
+            | CqlType::Timeuuid
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::Duration
+            | CqlType::List(_)
+            | CqlType::Map(_, _)
+            | CqlType::Tuple(_)
+            | CqlType::Udt { .. }
+            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got set literal",
                 cql_type_name(target)
             ))),
@@ -405,7 +579,30 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             // target column type. We do the same: an empty MapLiteral coerces to an
             // empty set when the target is a set type.
             CqlType::Set(_) if pairs.is_empty() => Ok(CqlValue::Set(Vec::new())),
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Set(_)
+            | CqlType::Ascii
+            | CqlType::Bigint
+            | CqlType::Blob
+            | CqlType::Boolean
+            | CqlType::Counter
+            | CqlType::Decimal
+            | CqlType::Double
+            | CqlType::Float
+            | CqlType::Int
+            | CqlType::Timestamp
+            | CqlType::Uuid
+            | CqlType::Varchar
+            | CqlType::Varint
+            | CqlType::Timeuuid
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::Duration
+            | CqlType::List(_)
+            | CqlType::Tuple(_)
+            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got map literal",
                 cql_type_name(target)
             ))),
@@ -423,7 +620,31 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 }
                 Ok(CqlValue::Tuple(elements))
             }
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Ascii
+            | CqlType::Bigint
+            | CqlType::Blob
+            | CqlType::Boolean
+            | CqlType::Counter
+            | CqlType::Decimal
+            | CqlType::Double
+            | CqlType::Float
+            | CqlType::Int
+            | CqlType::Timestamp
+            | CqlType::Uuid
+            | CqlType::Varchar
+            | CqlType::Varint
+            | CqlType::Timeuuid
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::Duration
+            | CqlType::List(_)
+            | CqlType::Map(_, _)
+            | CqlType::Set(_)
+            | CqlType::Udt { .. }
+            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got tuple literal",
                 cql_type_name(target)
             ))),
@@ -454,7 +675,7 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     // specs/in-process/bug-memtable-flush-wedge-truncated-
                     // timeuuid-from-now-function.md.
                     CqlType::Timeuuid => Ok(eval_now()),
-                    _ => Err(CqlError::Invalid(format!(
+                    CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Timestamp | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Inet | CqlType::Date | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                         "type mismatch: now() returns timeuuid, but column expects {}",
                         cql_type_name(target)
                     ))),
@@ -463,7 +684,7 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     CqlType::Timestamp => {
                         Ok(CqlValue::Timestamp(chrono::Utc::now().timestamp_millis()))
                     }
-                    _ => Err(CqlError::Invalid(format!(
+                    CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Timeuuid | CqlType::Inet | CqlType::Date | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                         "type mismatch: currenttimestamp() returns timestamp, but column expects {}",
                         cql_type_name(target)
                     ))),
@@ -488,7 +709,7 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                             let millis = (uuid_ts - UUID_EPOCH_OFFSET) / 10_000;
                             Ok(CqlValue::Timestamp(millis as i64))
                         }
-                        _ => Err(CqlError::Invalid(
+                        CqlValue::Null | CqlValue::Ascii(_) | CqlValue::Bigint(_) | CqlValue::Blob(_) | CqlValue::Boolean(_) | CqlValue::Counter(_) | CqlValue::Decimal { .. } | CqlValue::Double(_) | CqlValue::Float(_) | CqlValue::Int(_) | CqlValue::Timestamp(_) | CqlValue::Uuid(_) | CqlValue::Text(_) | CqlValue::Varint(_) | CqlValue::Inet(_) | CqlValue::Date(_) | CqlValue::Time(_) | CqlValue::Smallint(_) | CqlValue::Tinyint(_) | CqlValue::Duration { .. } | CqlValue::List(_) | CqlValue::Set(_) | CqlValue::Map(_) | CqlValue::Tuple(_) | CqlValue::Vector(_) | CqlValue::Udt(_) => Err(CqlError::Invalid(
                             "toTimestamp requires a timeuuid argument".into(),
                         )),
                     }
@@ -499,7 +720,7 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 }
                 "currentdate" | "current_date" if args.is_empty() => match target {
                     CqlType::Date => Ok(CqlValue::Date(today_cql_date())),
-                    _ => Err(CqlError::Invalid(format!(
+                    CqlType::Ascii | CqlType::Bigint | CqlType::Blob | CqlType::Boolean | CqlType::Counter | CqlType::Decimal | CqlType::Double | CqlType::Float | CqlType::Int | CqlType::Timestamp | CqlType::Uuid | CqlType::Varchar | CqlType::Varint | CqlType::Timeuuid | CqlType::Inet | CqlType::Time | CqlType::Smallint | CqlType::Tinyint | CqlType::Duration | CqlType::List(_) | CqlType::Map(_, _) | CqlType::Set(_) | CqlType::Tuple(_) | CqlType::Udt { .. } | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                         "type mismatch: currentDate() returns date, but column expects {}",
                         cql_type_name(target)
                     ))),
@@ -521,7 +742,31 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 days: *days,
                 nanos: *nanos,
             }),
-            _ => Err(CqlError::Invalid(format!(
+            CqlType::Ascii
+            | CqlType::Bigint
+            | CqlType::Blob
+            | CqlType::Boolean
+            | CqlType::Counter
+            | CqlType::Decimal
+            | CqlType::Double
+            | CqlType::Float
+            | CqlType::Int
+            | CqlType::Timestamp
+            | CqlType::Uuid
+            | CqlType::Varchar
+            | CqlType::Varint
+            | CqlType::Timeuuid
+            | CqlType::Inet
+            | CqlType::Date
+            | CqlType::Time
+            | CqlType::Smallint
+            | CqlType::Tinyint
+            | CqlType::List(_)
+            | CqlType::Map(_, _)
+            | CqlType::Set(_)
+            | CqlType::Tuple(_)
+            | CqlType::Udt { .. }
+            | CqlType::Vector(_, _) => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got a duration literal",
                 cql_type_name(target)
             ))),
@@ -545,7 +790,34 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     days,
                     nanos,
                 },
-                _ => return Err(CqlError::Invalid("expected a duration offset".into())),
+                CqlValue::Null
+                | CqlValue::Ascii(_)
+                | CqlValue::Bigint(_)
+                | CqlValue::Blob(_)
+                | CqlValue::Boolean(_)
+                | CqlValue::Counter(_)
+                | CqlValue::Decimal { .. }
+                | CqlValue::Double(_)
+                | CqlValue::Float(_)
+                | CqlValue::Int(_)
+                | CqlValue::Timestamp(_)
+                | CqlValue::Uuid(_)
+                | CqlValue::Text(_)
+                | CqlValue::Varint(_)
+                | CqlValue::Timeuuid(_)
+                | CqlValue::Inet(_)
+                | CqlValue::Date(_)
+                | CqlValue::Time(_)
+                | CqlValue::Smallint(_)
+                | CqlValue::Tinyint(_)
+                | CqlValue::List(_)
+                | CqlValue::Set(_)
+                | CqlValue::Map(_)
+                | CqlValue::Tuple(_)
+                | CqlValue::Vector(_)
+                | CqlValue::Udt(_) => {
+                    return Err(CqlError::Invalid("expected a duration offset".into()))
+                }
             };
             match base_val {
                 CqlValue::Timestamp(ms) => {
@@ -556,7 +828,31 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 CqlValue::Date(d) => crate::duration::apply_to_date_days(d, dur, *subtract)
                     .map(CqlValue::Date)
                     .ok_or_else(|| CqlError::Invalid("date arithmetic overflow".into())),
-                _ => Err(CqlError::Invalid(
+                CqlValue::Null
+                | CqlValue::Ascii(_)
+                | CqlValue::Bigint(_)
+                | CqlValue::Blob(_)
+                | CqlValue::Boolean(_)
+                | CqlValue::Counter(_)
+                | CqlValue::Decimal { .. }
+                | CqlValue::Double(_)
+                | CqlValue::Float(_)
+                | CqlValue::Int(_)
+                | CqlValue::Uuid(_)
+                | CqlValue::Text(_)
+                | CqlValue::Varint(_)
+                | CqlValue::Timeuuid(_)
+                | CqlValue::Inet(_)
+                | CqlValue::Time(_)
+                | CqlValue::Smallint(_)
+                | CqlValue::Tinyint(_)
+                | CqlValue::Duration { .. }
+                | CqlValue::List(_)
+                | CqlValue::Set(_)
+                | CqlValue::Map(_)
+                | CqlValue::Tuple(_)
+                | CqlValue::Vector(_)
+                | CqlValue::Udt(_) => Err(CqlError::Invalid(
                     "temporal arithmetic requires a date or timestamp base".into(),
                 )),
             }
@@ -1150,7 +1446,31 @@ pub fn cql_value_to_json(value: &CqlValue) -> String {
 fn cql_value_to_json_key(value: &CqlValue) -> String {
     match value {
         CqlValue::Ascii(s) | CqlValue::Text(s) => json_escape_string(s),
-        other => {
+        other @ (CqlValue::Null
+        | CqlValue::Bigint(_)
+        | CqlValue::Blob(_)
+        | CqlValue::Boolean(_)
+        | CqlValue::Counter(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Double(_)
+        | CqlValue::Float(_)
+        | CqlValue::Int(_)
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Timeuuid(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Smallint(_)
+        | CqlValue::Tinyint(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Vector(_)
+        | CqlValue::Udt(_)) => {
             let rendered = cql_value_to_json(other);
             if rendered.starts_with('"') && rendered.ends_with('"') {
                 rendered

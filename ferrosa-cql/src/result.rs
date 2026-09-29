@@ -409,7 +409,30 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
             let elem_class = match elem.as_ref() {
                 CqlType::Float => "org.apache.cassandra.db.marshal.FloatType",
                 CqlType::Double => "org.apache.cassandra.db.marshal.DoubleType",
-                _ => "org.apache.cassandra.db.marshal.FloatType",
+                CqlType::Ascii
+                | CqlType::Bigint
+                | CqlType::Blob
+                | CqlType::Boolean
+                | CqlType::Counter
+                | CqlType::Decimal
+                | CqlType::Int
+                | CqlType::Timestamp
+                | CqlType::Uuid
+                | CqlType::Varchar
+                | CqlType::Varint
+                | CqlType::Timeuuid
+                | CqlType::Inet
+                | CqlType::Date
+                | CqlType::Time
+                | CqlType::Smallint
+                | CqlType::Tinyint
+                | CqlType::Duration
+                | CqlType::List(_)
+                | CqlType::Map(_, _)
+                | CqlType::Set(_)
+                | CqlType::Tuple(_)
+                | CqlType::Udt { .. }
+                | CqlType::Vector(_, _) => "org.apache.cassandra.db.marshal.FloatType",
             };
             let class_name =
                 format!("org.apache.cassandra.db.marshal.VectorType({elem_class}, {dim})");
@@ -429,7 +452,26 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
             }
         }
         // All simple types: type_id alone is sufficient.
-        _ => {}
+        CqlType::Ascii
+        | CqlType::Bigint
+        | CqlType::Blob
+        | CqlType::Boolean
+        | CqlType::Counter
+        | CqlType::Decimal
+        | CqlType::Double
+        | CqlType::Float
+        | CqlType::Int
+        | CqlType::Timestamp
+        | CqlType::Uuid
+        | CqlType::Varchar
+        | CqlType::Varint
+        | CqlType::Timeuuid
+        | CqlType::Inet
+        | CqlType::Date
+        | CqlType::Time
+        | CqlType::Smallint
+        | CqlType::Tinyint
+        | CqlType::Duration => {}
     }
 }
 
@@ -506,7 +548,15 @@ fn encode_cell_value(buf: &mut BytesMut, value: &CqlValue) {
             buf.put_i8(*n);
         }
         CqlValue::Null => buf.put_i32(-1),
-        _ => {
+        CqlValue::Decimal { .. }
+        | CqlValue::Varint(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Vector(_)
+        | CqlValue::Udt(_) => {
             let bytes = encode_value(value);
             buf.put_i32(bytes.len() as i32);
             buf.put_slice(&bytes);

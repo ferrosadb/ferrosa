@@ -141,7 +141,22 @@ fn cql_value_to_literal(val: &CqlValue) -> String {
                 .collect();
             format!("({})", inner.join(", "))
         }
-        _ => format!("{val:?}"),
+        CqlValue::Blob(_)
+        | CqlValue::Counter(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Timeuuid(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Vector(_)
+        | CqlValue::Udt(_) => format!("{val:?}"),
     }
 }
 
