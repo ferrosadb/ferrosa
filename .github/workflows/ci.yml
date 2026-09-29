@@ -440,21 +440,16 @@ jobs:
   # PostgreSQL fault schedule does not compile a second server binary.
   postgres-jepsen-fault:
     name: PostgreSQL Jepsen fault schedule
-    # SKIPPED (2026-09-29, by maintainer decision) — known failure, not a pass.
-    # While node 3 is paused, a transaction it coordinated stays PreAccepted
-    # and nothing recovers it: Accord recovery is not wired in production
-    # (ferrosa-cluster FMEA CL-4 / CL-20). A conflicting PostgreSQL snapshot
-    # barrier then times out ("snapshot barrier dependencies were not applied
-    # locally", SQLSTATE 58000) and the strict-serializability workload aborts.
-    # It fails on main too. Re-enable by deleting this `if:` once recovery is
-    # wired — forge t_64c1b2d6 (fix) and t_3017b690 (turn this back on).
-    #
-    # This skip matches main (landed via #468). PR #470 is stacked on this
-    # branch and does the real work: it fixes the Accord path AND deletes this
-    # `if:`, so the job runs and proves the fix against a real paused node.
-    # Do not "helpfully" re-enable it here — that is 470's job, and its re-enable
-    # is the evidence that its fix works.
-    if: ${{ false }}
+    # Re-enabled by this PR (the CL-23 fix): a doomed transaction now releases
+    # its keys instead of holding them for a paused replica's full RPC timeout,
+    # which is what made every stale snapshot's barrier dep-wait 5s and fail
+    # SQLSTATE 58000. Proven against a real paused node at 5cd4e6b5:
+    #   test postgres_transactions_are_strictly_serializable ... ok
+    #   test result: ok. 21 passed; 0 failed
+    # Merging the base branch back in re-applied the skip and silently turned
+    # this job green-by-skipping; this commit restores the re-enable so the
+    # gate actually exercises the fix it ships with.
+    # If this goes red, fix the Accord path — do not re-add a skip.
     needs: build-node-image
     runs-on: ubuntu-latest
     timeout-minutes: 60
