@@ -5,10 +5,13 @@ use std::fmt;
 use crate::ast::{
     AggArg, ColumnRef, DeleteStmt, Expr, InsertStmt, IsolationLevel, Join, Operand, OrderItem,
     Projection, Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement, TableRef,
-    Term, UpdateStmt,
+    Term, UnsupportedClause, UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
+
+#[path = "parser_ddl.rs"]
+mod ddl;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
@@ -21,6 +24,18 @@ pub enum ParseError {
     UnexpectedEnd,
     /// A lexing error (bad character, unterminated string).
     BadToken(String),
+    /// A DDL clause outside the supported subset (D10), named.
+    UnsupportedClause(UnsupportedClause),
+    /// A column type name that is not in the PG type map.
+    UnknownType(String),
+    /// `CREATE TABLE` declares the same column twice.
+    DuplicateColumn(String),
+    /// `CREATE TABLE` declares more than one primary key.
+    MultiplePrimaryKeys,
+    /// `CREATE TABLE` declares no primary key.
+    MissingPrimaryKey,
+    /// The primary key names a column the table does not define.
+    UnknownPrimaryKeyColumn(String),
 }
 
 impl fmt::Display for ParseError {
@@ -31,6 +46,16 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnexpectedEnd => write!(f, "unexpected end of statement"),
             ParseError::BadToken(t) => write!(f, "bad token: {t}"),
+            ParseError::UnsupportedClause(c) => {
+                write!(f, "{} is not supported in CREATE TABLE (D10)", c.name())
+            }
+            ParseError::UnknownType(t) => write!(f, "unknown column type `{t}`"),
+            ParseError::DuplicateColumn(c) => write!(f, "column `{c}` is declared twice"),
+            ParseError::MultiplePrimaryKeys => write!(f, "multiple primary keys defined"),
+            ParseError::MissingPrimaryKey => write!(f, "table has no PRIMARY KEY"),
+            ParseError::UnknownPrimaryKeyColumn(c) => {
+                write!(f, "primary key column `{c}` is not defined")
+            }
         }
     }
 }
@@ -128,7 +153,7 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
 /// front-end can give them real semantics — they are not silently accepted.
 pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let toks = lex(trimmed)?;
+    let toks = lex_statement(trimmed)?;
     let mut p = Parser { toks, pos: 0 };
     match p.peek() {
         Some(Tok::Select) => {
@@ -152,6 +177,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "INSERT" => p.parse_insert(),
             "UPDATE" => p.parse_update(),
             "DELETE" => p.parse_delete(),
+            "CREATE" => p.parse_create(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),
@@ -187,6 +213,11 @@ enum Tok {
     Not,
     Distinct,
     Ident(String),
+    /// A `"double quoted"` identifier: never a keyword, case preserved.
+    QuotedIdent(String),
+    /// A character the lexer has no token for; produced only by the lenient
+    /// `CREATE` lexing pass (see `lex_statement`).
+    Other(char),
     Int(i64),
     Float(f64),
     Str(String),
@@ -205,7 +236,25 @@ enum Tok {
     Ge,
 }
 
+/// Lex a top-level statement. A `CREATE` statement is lexed leniently on a
+/// second attempt: an expression operator (`DEFAULT 1 + 1`) is not a token
+/// this lexer knows, and failing on it would hide the clause the parser refuses
+/// by name (D10). The lenient tokens (`Tok::Other`) never parse as anything, so
+/// they can only surface as a named refusal or an `Unexpected` error.
+fn lex_statement(sql: &str) -> Result<Vec<Tok>, ParseError> {
+    match lex_mode(sql, false) {
+        Err(first) if sql.trim_start().to_ascii_uppercase().starts_with("CREATE") => {
+            lex_mode(sql, true).map_err(|_| first)
+        }
+        result => result,
+    }
+}
+
 fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
+    lex_mode(sql, false)
+}
+
+fn lex_mode(sql: &str, lenient: bool) -> Result<Vec<Tok>, ParseError> {
     let chars: Vec<char> = sql.chars().collect();
     let mut toks = Vec::new();
     let mut i = 0;
@@ -275,6 +324,11 @@ fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
                     .parse::<usize>()
                     .map_err(|_| ParseError::BadToken(format!("${digits}")))?;
                 toks.push(Tok::Param(n));
+            }
+            '"' => {
+                let (name, next) = lex_quoted_ident(&chars, i)?;
+                toks.push(Tok::QuotedIdent(name));
+                i = next;
             }
             '\'' => {
                 let mut s = String::new();
@@ -359,10 +413,42 @@ fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
                     _ => Tok::Ident(word),
                 });
             }
+            other if lenient => {
+                toks.push(Tok::Other(other));
+                i += 1;
+            }
             other => return Err(ParseError::BadToken(other.to_string())),
         }
     }
     Ok(toks)
+}
+
+/// Lex a `"quoted identifier"` starting at the opening quote `start`; `""` is
+/// an escaped quote. Returns the name and the index after the closing quote.
+fn lex_quoted_ident(chars: &[char], start: usize) -> Result<(String, usize), ParseError> {
+    let mut name = String::new();
+    let mut i = start + 1;
+    loop {
+        match chars.get(i) {
+            None => {
+                return Err(ParseError::BadToken(
+                    "unterminated quoted identifier".into(),
+                ))
+            }
+            Some('"') if chars.get(i + 1) == Some(&'"') => {
+                name.push('"');
+                i += 2;
+            }
+            Some('"') if name.is_empty() => {
+                return Err(ParseError::BadToken("zero-length quoted identifier".into()))
+            }
+            Some('"') => return Ok((name, i + 1)),
+            Some(&ch) => {
+                name.push(ch);
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Whether an identifier names an aggregate function (used to decide whether a
@@ -417,7 +503,7 @@ impl Parser {
 
     fn ident(&mut self) -> Result<String, ParseError> {
         match self.next() {
-            Some(Tok::Ident(s)) => Ok(s),
+            Some(Tok::Ident(s) | Tok::QuotedIdent(s)) => Ok(s),
             Some(t) => Err(ParseError::Unexpected {
                 expected: "identifier",
                 found: format!("{t:?}"),
@@ -1945,5 +2031,276 @@ mod tests {
             parse_statement("RESET ALL").unwrap(),
             Statement::Reset { name: "ALL".into() }
         );
+    }
+
+    // ---- T-130: PG CREATE TABLE subset -------------------------------------
+
+    fn create(sql: &str) -> crate::ast::CreateTableStmt {
+        match parse_statement(sql) {
+            Ok(Statement::CreateTable(c)) => *c,
+            other => panic!("expected CreateTable for `{sql}`, got {other:?}"),
+        }
+    }
+
+    fn refused(sql: &str) -> UnsupportedClause {
+        match parse_statement(sql) {
+            Err(ParseError::UnsupportedClause(c)) => c,
+            other => panic!("expected UnsupportedClause for `{sql}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_ddl_parse_create_table_ecto_subset() {
+        use crate::ast::PgType;
+        let c = create(
+            r#"CREATE TABLE IF NOT EXISTS "users" ("id" uuid, "name" varchar(255) NOT NULL, "doc" jsonb, "n" numeric(10,2), "at" timestamp(0) NOT NULL, "big" bigint, "f" double precision, PRIMARY KEY ("id"))"#,
+        );
+        assert!(c.if_not_exists);
+        assert_eq!(c.name.table, "users");
+        assert_eq!(c.name.schema, None);
+        assert_eq!(c.primary_key, vec!["id".to_string()]);
+        let cols: Vec<(&str, PgType, bool)> = c
+            .columns
+            .iter()
+            .map(|d| (d.name.as_str(), d.ty, d.not_null))
+            .collect();
+        let numeric = PgType::Numeric {
+            precision: Some(10),
+            scale: Some(2),
+        };
+        assert_eq!(
+            cols,
+            vec![
+                ("id", PgType::Uuid, true),
+                ("name", PgType::Varchar(Some(255)), true),
+                ("doc", PgType::Jsonb, false),
+                ("n", numeric, false),
+                ("at", PgType::Timestamp, true),
+                ("big", PgType::BigInt, false),
+                ("f", PgType::DoublePrecision, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_table_slice_statement_inline_pk() {
+        let c = create("CREATE TABLE t (id int PRIMARY KEY, doc jsonb)");
+        assert!(!c.if_not_exists);
+        assert_eq!(c.primary_key, vec!["id".to_string()]);
+        assert!(c.columns[0].primary_key && c.columns[0].not_null);
+        assert!(!c.columns[1].primary_key);
+    }
+
+    #[test]
+    fn create_table_composite_pk_keeps_declaration_order() {
+        let c = create(
+            "CREATE TABLE public.t (a int, b text, c int, CONSTRAINT t_pkey PRIMARY KEY (b, a))",
+        );
+        assert_eq!(c.primary_key, vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(c.name.schema.as_deref(), Some("public"));
+        assert!(c.columns[0].primary_key && c.columns[1].primary_key && !c.columns[2].primary_key);
+    }
+
+    #[test]
+    fn json_parses_and_is_stored_as_jsonb() {
+        use crate::ast::PgType;
+        let c = create("CREATE TABLE t (id int PRIMARY KEY, a json, b JSONB)");
+        assert_eq!(c.columns[1].ty, PgType::Json);
+        assert_eq!(c.columns[1].ty.storage(), PgType::Jsonb);
+        assert_eq!(c.columns[2].ty, PgType::Jsonb);
+    }
+
+    #[test]
+    fn timestamp_and_alias_type_spellings() {
+        use crate::ast::PgType;
+        let c = create(
+            "CREATE TABLE t (a timestamp with time zone, b timestamp without time zone, c timestamptz, d character varying(10), e int4, f bool, g time, h decimal, i real, k smallint, PRIMARY KEY (e))",
+        );
+        let tys: Vec<PgType> = c.columns.iter().map(|d| d.ty).collect();
+        let bare_numeric = PgType::Numeric {
+            precision: None,
+            scale: None,
+        };
+        assert_eq!(
+            tys,
+            vec![
+                PgType::TimestampTz,
+                PgType::Timestamp,
+                PgType::TimestampTz,
+                PgType::Varchar(Some(10)),
+                PgType::Integer,
+                PgType::Boolean,
+                PgType::Time,
+                bare_numeric,
+                PgType::Real,
+                PgType::SmallInt,
+            ]
+        );
+    }
+
+    #[test]
+    fn pg_ddl_out_of_scope_clause_named_in_error() {
+        // Each clause fails with a typed error whose message names it (D10);
+        // the per-clause tests below pin the exact variant.
+        let cases = [
+            (
+                "CREATE TABLE t (id int, o int, PRIMARY KEY (id), FOREIGN KEY (o) REFERENCES p (id))",
+                "FOREIGN KEY",
+            ),
+            (
+                "CREATE TABLE t (id int PRIMARY KEY, n int, CHECK (n > 0))",
+                "CHECK",
+            ),
+            ("CREATE TABLE t (id serial PRIMARY KEY)", "SERIAL"),
+            (
+                "CREATE TABLE t (id int PRIMARY KEY, n int DEFAULT 1 + 1)",
+                "DEFAULT",
+            ),
+            ("CREATE TABLE other.t (id int PRIMARY KEY)", "schema"),
+        ];
+        for (sql, clause) in cases {
+            let err = parse_statement(sql).expect_err(sql);
+            assert!(
+                matches!(err, ParseError::UnsupportedClause(_)),
+                "{sql}: {err:?}"
+            );
+            assert!(err.to_string().contains(clause), "{err}");
+        }
+    }
+
+    #[test]
+    fn foreign_key_table_constraint_is_refused_by_name() {
+        assert_eq!(
+            refused(
+                "CREATE TABLE t (id int, o int, PRIMARY KEY (id), FOREIGN KEY (o) REFERENCES p (id))"
+            ),
+            UnsupportedClause::ForeignKey
+        );
+    }
+
+    #[test]
+    fn foreign_key_column_references_is_refused_by_name() {
+        assert_eq!(
+            refused("CREATE TABLE t (id int PRIMARY KEY, o int REFERENCES p (id))"),
+            UnsupportedClause::ForeignKey
+        );
+    }
+
+    #[test]
+    fn check_table_and_column_are_refused_by_name() {
+        assert_eq!(
+            refused("CREATE TABLE t (id int PRIMARY KEY, n int, CHECK (n > 0))"),
+            UnsupportedClause::Check
+        );
+        assert_eq!(
+            refused("CREATE TABLE t (id int PRIMARY KEY, n int CHECK (n > 0))"),
+            UnsupportedClause::Check
+        );
+        assert_eq!(
+            refused("CREATE TABLE t (id int PRIMARY KEY, n int, CONSTRAINT c CHECK (n > 0))"),
+            UnsupportedClause::Check
+        );
+    }
+
+    #[test]
+    fn serial_types_are_refused_by_name() {
+        for ty in ["serial", "bigserial", "smallserial"] {
+            assert_eq!(
+                refused(&format!("CREATE TABLE t (id {ty} PRIMARY KEY)")),
+                UnsupportedClause::Serial,
+                "{ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_expression_is_refused_by_name() {
+        assert_eq!(
+            refused("CREATE TABLE t (id int PRIMARY KEY, at timestamp DEFAULT now())"),
+            UnsupportedClause::DefaultExpr
+        );
+        assert_eq!(
+            refused("CREATE TABLE t (id int PRIMARY KEY, n int DEFAULT 0)"),
+            UnsupportedClause::DefaultExpr
+        );
+    }
+
+    #[test]
+    fn foreign_schema_is_refused_by_name() {
+        assert_eq!(
+            refused("CREATE TABLE other.t (id int PRIMARY KEY)"),
+            UnsupportedClause::ForeignSchema
+        );
+    }
+
+    #[test]
+    fn unique_is_refused_by_name() {
+        assert_eq!(
+            refused("CREATE TABLE t (id int PRIMARY KEY, u int UNIQUE)"),
+            UnsupportedClause::Unique
+        );
+        assert_eq!(
+            refused("CREATE TABLE t (id int PRIMARY KEY, u int, UNIQUE (u))"),
+            UnsupportedClause::Unique
+        );
+    }
+
+    #[test]
+    fn create_table_structural_errors_are_typed() {
+        let cases: [(&str, ParseError); 7] = [
+            ("CREATE TABLE t (a int)", ParseError::MissingPrimaryKey),
+            (
+                "CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)",
+                ParseError::MultiplePrimaryKeys,
+            ),
+            (
+                "CREATE TABLE t (a int PRIMARY KEY, PRIMARY KEY (a))",
+                ParseError::MultiplePrimaryKeys,
+            ),
+            (
+                "CREATE TABLE t (a int, a text, PRIMARY KEY (a))",
+                ParseError::DuplicateColumn("a".into()),
+            ),
+            (
+                "CREATE TABLE t (a int, PRIMARY KEY (z))",
+                ParseError::UnknownPrimaryKeyColumn("z".into()),
+            ),
+            (
+                "CREATE TABLE t (a wibble PRIMARY KEY)",
+                ParseError::UnknownType("wibble".into()),
+            ),
+            (
+                "CREATE TABLE t (a time with time zone PRIMARY KEY)",
+                ParseError::UnknownType("time with time zone".into()),
+            ),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(parse_statement(sql), Err(want), "{sql}");
+        }
+    }
+
+    #[test]
+    fn create_table_malformed_input_fails_loud() {
+        let bad = [
+            "CREATE TABLE",
+            "CREATE TABLE t",
+            "CREATE TABLE t (",
+            "CREATE TABLE t ()",
+            "CREATE TABLE t (a int PRIMARY KEY",
+            "CREATE TABLE t (a int PRIMARY KEY) extra",
+            "CREATE INDEX i ON t (a)",
+            "CREATE TABLE t (a varchar(x) PRIMARY KEY)",
+            "CREATE TABLE \"t (a int PRIMARY KEY)",
+        ];
+        for sql in bad {
+            assert!(parse_statement(sql).is_err(), "should reject `{sql}`");
+        }
+    }
+
+    #[test]
+    fn quoted_identifiers_preserve_case_and_are_never_keywords() {
+        let c = create(r#"CREATE TABLE "Users" ("Id" int, "primary" text, PRIMARY KEY ("Id"))"#);
+        assert_eq!(c.name.table, "Users");
+        assert_eq!(c.columns[1].name, "primary");
     }
 }

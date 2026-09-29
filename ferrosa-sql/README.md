@@ -30,6 +30,15 @@ in-memory table in tests and by Ferrosa storage in production.
   `SELECT $1`, `SELECT TRUE`.
 - DML (single-row, key-equality WHERE): `INSERT INTO t (cols) VALUES (...)`,
   `UPDATE t SET ... WHERE k = v [AND ...]`, `DELETE FROM t WHERE k = v [AND ...]`.
+- PG DDL (T-130, D10), **parsed only** (no execution or schema creation yet; the
+  Postgres front end answers `0A000`): `CREATE TABLE [IF NOT EXISTS] [public.]t
+  (col type [NOT NULL | PRIMARY KEY], ..., [CONSTRAINT n] PRIMARY KEY (a, b))`
+  into `Statement::CreateTable`. Types: smallint/int/bigint, real/double
+  precision, numeric(p,s), boolean, text, varchar(n), bytea, uuid, date, time,
+  timestamp[tz], inet, `jsonb`, `json` (`PgType::storage()` maps `json` to
+  `jsonb`, D11). Double-quoted identifiers are supported. Refused by name with
+  `ParseError::UnsupportedClause`: `FOREIGN KEY`/`REFERENCES`, `CHECK`,
+  `SERIAL` types, `DEFAULT`, a schema other than `public`, `UNIQUE`.
 - Transaction / session statements **parsed** (not executed here): `BEGIN`/`START`,
   `COMMIT`/`END`, `ROLLBACK`/`ABORT`, `SET`, `RESET`.
 - WHERE/HAVING boolean expressions: `AND` / `OR` / `NOT` with parentheses and

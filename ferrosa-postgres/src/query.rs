@@ -981,6 +981,12 @@ async fn execute_statement(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
+        // DDL parses (T-130) but nothing executes it yet (T-132a). Fail loud
+        // rather than report a CREATE TABLE that created nothing.
+        Statement::CreateTable(_) => vec![error_response(
+            "0A000",
+            "CREATE TABLE is parsed but not yet executable",
+        )],
         // DML: single-row INSERT / UPDATE / DELETE. The simple-query path has no
         // bound parameters (`&[]`); a `$N` in simple SQL is therefore a fail-loud
         // error (no value to bind). With `txn = Some(buffer)` (an open

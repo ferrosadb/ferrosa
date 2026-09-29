@@ -31,6 +31,11 @@ toward the Postgres queries real clients send.
 
 ## Next
 
+- **PG DDL execution** (D10): T-130 parses `CREATE TABLE`; T-132a creates the
+  schema. `DROP TABLE`, `ALTER TABLE ADD/DROP COLUMN` and `CREATE/DROP INDEX`
+  are separate packets. The PG type map is a fourth string-to-type table and
+  must converge with the existing three (research/type-threading-map.md).
+
 - **Richer joins** (FMEA SQL-3): `LEFT`/`RIGHT`/`FULL` outer joins, a multi-table
   FROM / join list, and `ON` predicates beyond a single `a = b` (AND-of-equalities,
   inequality join conditions).
