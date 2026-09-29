@@ -15,6 +15,7 @@ pub mod encode;
 pub mod error;
 pub mod limits;
 pub mod number;
+pub mod parse;
 
 pub use builder::{Encoded, JsonbBuilder};
 pub use encode::{BIGDECIMAL_PRIMITIVE_ID, ENVELOPE};
@@ -25,3 +26,6 @@ pub use limits::{
     HARD_MAX_DIGITS_AFTER_POINT, HARD_MAX_DIGITS_BEFORE_POINT, HARD_MAX_ENCODED_BYTES,
 };
 pub use number::{Number, NumberKind};
+pub use parse::{
+    parse_text, parse_text_observed, DuplicateKeyObserver, InflightBudget, InflightPermit,
+};

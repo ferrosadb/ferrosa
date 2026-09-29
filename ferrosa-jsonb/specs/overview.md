@@ -86,6 +86,18 @@ checked again before the output is allocated.
 Byte equality implies value equality, not the reverse (`1.0` and `1` differ in bytes).
 Value equality arrives with the reader (T-103 on).
 
+## Streaming parser (T-103)
+
+`parse_text` (parse.rs) checks input size, runs `prescan_depth` (a one-pass bracket
+counter that ignores strings and escapes), then a `Parser` drives `JsonbBuilder` with
+an explicit `Frame` stack: no recursion, so nesting costs heap not stack. A string is
+scanned as runs between delimiters and each run is validated as UTF-8 (a multi-byte
+character never holds an ASCII delimiter). `\u` pairs join; a lone surrogate is an
+error at its backslash. Numbers are scanned strictly (no leading zeros, digits around
+`.`, exponent digits) and handed to `Number::parse_lexeme` as a lexeme. The builder
+resolves duplicates; the parser rewrites its `DuplicateKey` with the object's path.
+Working set: input + O(depth) frames + arena, documented as at most 32x input.
+
 ## Incremental enforcement
 
 `Limits::check_*` and `HardCeilings::check_*` are pure comparisons meant to be

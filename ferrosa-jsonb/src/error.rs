@@ -34,8 +34,18 @@ pub enum JsonbError {
     #[error("jsonb key list has {len} keys, above the limit of {max}")]
     KeyListTooLong { len: usize, max: usize },
     /// A duplicate object key under `DuplicateKeyPolicy::Error` (D6b).
-    #[error("jsonb object has a duplicate key")]
-    DuplicateKey,
+    /// `path` names the object (`$`, `$.a[0]`); the builder alone leaves it empty.
+    #[error("jsonb object at {path:?} has a duplicate key")]
+    DuplicateKey { path: String },
+    /// The text is not RFC 8259 JSON; `offset` is the byte position (T-103).
+    #[error("jsonb text is not valid JSON at byte offset {offset}: {reason}")]
+    Syntax { offset: usize, reason: &'static str },
+    /// The text is not valid UTF-8; `offset` is the first bad byte (T-103).
+    #[error("jsonb text is not valid UTF-8 at byte offset {offset}")]
+    InvalidUtf8 { offset: usize },
+    /// The node-wide in-flight parse budget cannot admit the request (JB-D5).
+    #[error("jsonb in-flight budget refused {requested} bytes (budget {max})")]
+    InflightBudgetExceeded { requested: usize, max: usize },
     /// The builder was driven out of order (T-102): `reason` names the misuse.
     #[error("jsonb builder misuse: {reason}")]
     BuilderMisuse { reason: &'static str },

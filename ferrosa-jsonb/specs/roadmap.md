@@ -18,7 +18,11 @@ last_updated: 2026-09-28
 
 ## Next
 
-- Validator and reader (T-103), text parse (T-104), print, export.
+- Validator and reader (T-104), print, export.
+- T-103 done (streaming parser). Open: a counting-allocator peak-allocation test for
+  `WORKING_SET_MULTIPLE` (the crate forbids `unsafe`, which a `GlobalAlloc` needs, so
+  it must live in a separate dev crate); adapter wiring of `DuplicateKeyObserver`
+  to the metric and edge log line.
 
 ## Later
 

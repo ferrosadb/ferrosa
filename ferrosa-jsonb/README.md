@@ -47,7 +47,23 @@ ferrosa-common ferrosa-jsonb` enforces it). Runtime dependencies are `bytes`,
   values (`tests/golden/canonical_v1/corpus.txt`, `tests/golden_v1.rs`) and the
   primitive-table conformance test that pins id 63 as unassigned upstream.
 
-Not yet implemented: the validator and reader (T-103 on), text parse and print.
+## Implemented (T-103)
+
+- `parse_text(&[u8], &Limits) -> Result<Encoded, JsonbError>`: RFC 8259 text to
+  canonical jsonb. Order: input size, depth pre-scan (skips strings), iterative parse
+  (explicit frame stack; depth 1000 passes on a 256 KiB thread, 1001 is
+  `DepthExceeded`), lexeme to `Number::parse_lexeme`.
+- Faults are typed with a byte offset: `Syntax { offset, reason }` (lone surrogate,
+  BOM, NaN/Infinity, raw control character, trailing text), `InvalidUtf8 { offset }`.
+- Duplicate keys (D6b): last wins; `parse_text_observed(.., edge, &dyn
+  DuplicateKeyObserver)` reports the count once per document for the metric and edge
+  log line. Under `DuplicateKeyPolicy::Error`: `DuplicateKey { path }` (`$.a[0]`).
+- `InflightBudget` / `InflightPermit`: node-wide in-flight byte budget for adapters
+  (JB-D5); `InflightBudget::working_set(n)` is `WORKING_SET_MULTIPLE` (32) times `n`.
+- Tests: `tests/parse.rs` (y/n corpus, depth, duplicates, 10 MiB proportionality,
+  proptest determinism); fuzz target `fuzz/fuzz_targets/parse_text.rs`.
+
+Not yet implemented: the validator and reader, and text print.
 
 ## Safety
 

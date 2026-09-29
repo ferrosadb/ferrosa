@@ -253,7 +253,9 @@ impl JsonbBuilder {
             match out.last_mut() {
                 Some(prev) if prev.key == entry.key => {
                     if self.limits.duplicate_keys == DuplicateKeyPolicy::Error {
-                        return Err(JsonbError::DuplicateKey);
+                        return Err(JsonbError::DuplicateKey {
+                            path: String::new(),
+                        });
                     }
                     let give_back = OBJECT_ENTRY_FLOOR + self.subtree_floor(prev.child);
                     self.floor = self.floor.saturating_sub(give_back);
@@ -518,6 +520,11 @@ mod tests {
             b.key("a").unwrap();
             b.null().unwrap();
         }
-        assert_eq!(b.end_object().unwrap_err(), JsonbError::DuplicateKey);
+        assert_eq!(
+            b.end_object().unwrap_err(),
+            JsonbError::DuplicateKey {
+                path: String::new()
+            }
+        );
     }
 }
