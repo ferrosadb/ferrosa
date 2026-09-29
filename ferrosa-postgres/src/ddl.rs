@@ -7,7 +7,8 @@
 //! There is no second path: [`ClusterDdl`] is a thin adapter over `DdlPath`.
 //! Correctness: every refusal is a typed SQLSTATE naming the cause. A type with
 //! no `pg_types` mapping is `42704`; `json`/`jsonb` create a CQL `jsonb` column
-//! (T-161a; `json` is stored as jsonb, D11), gated by [`check_jsonb_ddl_allowed`]
+//! (T-161a; `json` is stored as jsonb, D11), gated by `Schema::check_create_table_jsonb` (T-154a key rules plus the T-300
+//! standalone-only rule)
 //! (T-300); nothing is stored under a guessed type.
 //! Last revised: 2026-09-28
 //! Last changed: jsonb refused in PRIMARY KEY columns, 42P16 (T-154a); T-161a lifted the
@@ -224,32 +225,32 @@ fn refuse_jsonb_primary_key(stmt: &CreateTableStmt) -> Result<(), BackendMessage
     }
 }
 
-/// Map a schema-registry jsonb refusal (the propose-side check, PG-T154a-02)
-/// to its SQLSTATE: `42P16` for a key, `0A000` for a forbidden nesting.
+/// Map a refusal from `Schema::check_create_table_jsonb` (the propose-side
+/// check: T-154a key placement plus the T-300 standalone-only gate) to its
+/// SQLSTATE (t_57fa8a9e).
 fn schema_refusal(error: &ferrosa_schema::SchemaError) -> BackendMessage {
     use ferrosa_schema::SchemaError;
     let code = match error {
         SchemaError::JsonbInKey { .. } => "42P16",
-        _ => "0A000",
+        // jsonb nesting that is never allowed, and jsonb DDL outside a
+        // standalone node until the D15a ledger (D24): both unsupported here.
+        SchemaError::JsonbNesting { .. } | SchemaError::JsonbDdlRefused { .. } => "0A000",
+        // A column type string we generated ourselves failed to parse.
+        SchemaError::InvalidSchema(_) => "XX000",
+        // `SchemaError` is `#[non_exhaustive]`, so a wildcard is mandatory here
+        // and a new variant cannot be caught at compile time. Nothing else is
+        // produced by `check_create_table_jsonb`; reaching this arm is an
+        // internal error, reported loudly as XX000, never as "unsupported".
+        other => {
+            tracing::error!(error = %other, "unexpected schema error from the jsonb DDL check");
+            "XX000"
+        }
     };
     error_response(code, &error.to_string())
 }
 
-/// The single call point for the jsonb DDL gate (D24, D15a).
-///
-/// Always `Ok` today. T-300 replaces the body with the standalone-vs-cluster
-/// check: jsonb DDL is allowed on single-node deployments and refused in
-/// cluster mode until the D15a capability ledger lands. The refusal is lifted
-/// by that gate, never by a flag. No mode check belongs anywhere else.
-pub fn check_jsonb_ddl_allowed() -> Result<(), BackendMessage> {
-    Ok(())
-}
-
 /// The CQL type string stored for `def`, through the one PG-name map (D10).
 fn cql_type_string(def: &ColumnDef) -> Result<&'static str, BackendMessage> {
-    if matches!(def.ty, PgType::Json | PgType::Jsonb) {
-        check_jsonb_ddl_allowed()?;
-    }
     let cql = cql_type_for_pg_name(pg_type_name(def.ty)).map_err(|e| match e {
         PgTypeError::UnknownPgTypeName(name) => error_response(
             "42704",

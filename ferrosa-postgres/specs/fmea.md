@@ -130,7 +130,7 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 | PG-T161a-04 | Limits substituted with a default in the PG front end | Operator-set limits silently ignored | 6 | 2 | 3 | 36 | `QueryContext::jsonb_limits` has no default; `main.rs` passes the resolved value. Constructors must name it (compile error otherwise). |
 | PG-T161a-05 | Duplicate keys dropped silently (D6b) | Data differs from input with no trace | 5 | 3 | 3 | 45 | `EdgeLog` writes a `jsonb_duplicate_keys_dropped` warn line per document. Test: `pg_jsonb_literal_and_text_param_round_trip` (last-wins). **Residual:** no counter in this crate. |
 | PG-T161a-06 | jsonb column missing from the catalog or reported with the wrong OID | Drivers pick the wrong codec | 6 | 2 | 2 | 24 | `pg_type_of_column` maps the column to 3802. Tests: `pg_type_and_pg_attribute_report_jsonb_3802`, `pg_jsonb_describe_reports_3802`. |
-| PG-T161a-07 | jsonb DDL allowed in cluster mode before the D15a ledger exists | Cluster nodes disagree about the type | 7 | 2 | 4 | 56 | Open: `ddl::check_jsonb_ddl_allowed` is the single call point and is always Ok until T-300. |
+| PG-T161a-07 | jsonb DDL allowed in cluster mode before the D15a ledger exists | Cluster nodes disagree about the type | 7 | 1 | 2 | 14 | Mitigated (T-300, t_57fa8a9e): `Schema::check_create_table_jsonb` refuses jsonb DDL off a standalone node with `0A000` before the executor, and schema apply re-checks. Test: `pg_ddl_create_table_jsonb_refused_off_standalone`. |
 
 ## T-301 jsonb slice acceptance
 
