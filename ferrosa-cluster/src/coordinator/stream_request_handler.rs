@@ -469,10 +469,18 @@ pub trait SinkFactory: Send + Sync {
 /// via `PeerManager::fire` on `Lane::Bulk`. Wire-side errors are
 /// logged and dropped — the coordinator's `IdleTimeoutWatchdog`
 /// surfaces stalled streams independently.
+///
+/// A request whose originator is this node cannot be answered over the
+/// network: `PeerManager` never holds an entry for the local host_id, so every
+/// chunk would fail with a bare "unknown peer". That state means a connection
+/// pooled under some other host_id actually looped back here (t_b78e8e9a; the
+/// dialer-side guard is `PeerManager::ensure_peer`'s identity check). The sink
+/// refuses to send and reports it once per request, naming the real cause.
 pub struct PeerFireSink {
     peers: Arc<PeerManager>,
     target: uuid::Uuid,
     request_id: u32,
+    self_target_reported: std::sync::atomic::AtomicBool,
 }
 
 impl PeerFireSink {
@@ -481,13 +489,36 @@ impl PeerFireSink {
             peers,
             target,
             request_id,
+            self_target_reported: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// True once this sink has refused to stream to the local node.
+    pub fn refused_self_target(&self) -> bool {
+        self.self_target_reported
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
 #[async_trait]
 impl ChunkSink for PeerFireSink {
     async fn send(&self, msg: Message) {
+        if self.target == self.peers.local_host_id() {
+            // Edge-report: one error per request, not one per chunk.
+            if !self
+                .self_target_reported
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                tracing::error!(
+                    request_id = self.request_id,
+                    target = %self.target,
+                    "range stream request originated from this node itself; refusing to stream \
+                     to the local host_id. A peer connection was pooled under another host_id \
+                     but reached this node (stale/looped-back peer address)"
+                );
+            }
+            return;
+        }
         if let Err(e) = self.peers.fire(self.target, msg, Lane::Bulk).await {
             tracing::warn!(
                 request_id = self.request_id,
@@ -600,6 +631,34 @@ mod tests {
     use uuid::Uuid;
 
     use crate::raft::handlers::{RangeReadStreamChunkPayload, RangeReadStreamDonePayload};
+
+    #[tokio::test]
+    async fn peer_fire_sink_refuses_to_stream_to_local_host() {
+        use ferrosa_net::config::NetConfig;
+        use ferrosa_net::peer::{PeerEventListener, PeerManager};
+        use ferrosa_net::rpc::handler::PeerId;
+
+        struct NoopListener;
+        impl PeerEventListener for NoopListener {
+            fn on_peer_connected(&self, _: PeerId) {}
+            fn on_peer_disconnected(&self, _: PeerId) {}
+            fn on_peer_suspected(&self, _: PeerId) {}
+            fn on_peer_recovered(&self, _: Uuid) {}
+            fn on_peer_failed(&self, _: Uuid) {}
+        }
+
+        let local = Uuid::new_v4();
+        let peers = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            local,
+            Arc::new(NoopListener),
+        ));
+        let sink = PeerFireSink::new(peers, local, 7);
+        assert!(!sink.refused_self_target());
+        sink.send(Message::RangeReadStreamCancel(Vec::new().into()))
+            .await;
+        assert!(sink.refused_self_target());
+    }
 
     fn make_partition(tag: u8) -> Partition {
         let key = DecoratedKey::new(PartitionKey::new(vec![tag]));

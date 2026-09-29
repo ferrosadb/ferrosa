@@ -342,6 +342,13 @@ early acknowledgement.
 - In-crate Jepsen-style tests: `jepsen_bank.rs`, `jepsen_nemesis.rs`,
   `recovery_scenarios.rs`, `proptests.rs` — all on the deterministic `TestCluster`.
 
+- **Peer identity is verified on connect.** `PeerManager::ensure_peer` rejects a
+  connection whose handshake host_id differs from the id the ring said lives at
+  that address (`peer identity mismatch`), so a stale or looped-back address can
+  never be pooled under another node's id. `PeerFireSink` (range-stream
+  replies) also refuses to stream to the local host_id with a specific error
+  instead of a bare "unknown peer" (t_b78e8e9a).
+
 ## Dependencies
 
 **Calls** (ferrosa crates this depends on):

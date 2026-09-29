@@ -110,6 +110,11 @@ impl PeerManager {
         self.data_runtime.get().cloned()
     }
 
+    /// This node's own host_id. Never present in the peer table by design.
+    pub fn local_host_id(&self) -> uuid::Uuid {
+        self.local_host_id
+    }
+
     fn now_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
@@ -244,6 +249,26 @@ impl PeerManager {
             data_runtime,
         )
         .await?;
+        // The handshake tells us who actually answered at `addr`. `host_id`
+        // came from the caller's topology view, which can be stale or wrong
+        // (a peer that has not registered yet, a re-resolved hostname that now
+        // points back at this node). Pooling the connection under the expected
+        // id would route X's requests to whoever owns the address; when that
+        // is this node, the stream handler sees `from == local` and its
+        // replies fail with "unknown peer: <local>" (t_b78e8e9a). Fail loud.
+        let answered_by = pool.peer_host_id();
+        if answered_by != host_id {
+            pool.shutdown().await;
+            let who = if answered_by == self.local_host_id {
+                "this node itself"
+            } else {
+                "a different host"
+            };
+            return Err(crate::error::NetError::Protocol(format!(
+                "peer identity mismatch: expected {host_id} at {addr} ({resolved}) but the \
+                 handshake was answered by {answered_by} ({who}); refusing to pool it"
+            )));
+        }
         self.add_peer((host_id, resolved), pool).await;
         Ok(())
     }
@@ -856,6 +881,42 @@ mod tests {
             )
             .await;
         assert!(result.is_err(), "fire to unknown peer should fail");
+    }
+
+    /// A ring entry whose address actually reaches a different node (stale
+    /// address, or one that loops back to the dialer) must not be pooled under
+    /// the expected host_id: requests addressed to X would be served by Y, and
+    /// Y's stream replies would target the dialer's own unregistered host_id
+    /// ("unknown peer: <self>", t_b78e8e9a).
+    #[tokio::test]
+    async fn ensure_peer_rejects_address_owned_by_another_host() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let pm = PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            Arc::new(TestListener::new()),
+        );
+        let expected = uuid::Uuid::new_v4();
+        let err = pm
+            .ensure_peer(expected, &addr.to_string())
+            .await
+            .expect_err("address is owned by a different host_id");
+
+        assert!(
+            err.to_string().contains("identity mismatch"),
+            "error must name the mismatch, got: {err}"
+        );
+        assert!(!pm.has_peer(expected), "mismatched pool must not be cached");
+        assert!(!pm.has_peer(server_id));
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
