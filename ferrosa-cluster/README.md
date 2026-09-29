@@ -75,6 +75,11 @@ early acknowledgement.
   `ddl_path` apply, and all three delegate to
   `StorageEngine::register_index_in_engine` — the resolver the restart reload
   uses — so the wiring cannot drift between the paths again.
+- `DdlPath::kind()` / `ModeController::ddl_path_kind()` name the live DDL path
+  (`direct`, `pair`, `cluster`, `forming`, `unavailable`). The mode reads
+  `cluster` from the start of `transition_to_cluster`, but DDL stays `direct`
+  until Raft has a leader, so readiness probes wait on `ddl_path == "cluster"`
+  (exposed on `/api/cluster/status`; CQL-T467ci-01).
 - `SystemTableLoader` reconstructs durable schema/auth state during cold
   start. Persisted `system_auth.roles` rows replace fresh-process bootstrap
   roles before missing seed roles are created, so rotated hashes survive both

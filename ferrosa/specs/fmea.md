@@ -49,6 +49,9 @@ own their own internal FMEAs.
   classification, hinted-handoff dir, schema persist/load, web auth bypass.
 - `/readyz` (un-authenticated) and `/metrics` on the web console.
 - Per-step structured WARN/ERROR logs across bootstrap, replay, and shutdown.
+- **CQL-T467ci-01:** `GET /api/cluster/status` reports `ddl_path` (`direct`, `pair`,
+  `cluster`, `forming`, `unavailable`) beside `mode`; `mode` leads it during the
+  transition to cluster. Pinned by `api_cluster_status_reports_the_live_ddl_path`.
 - `ferrosa-net` `default_bind_port_is_not_7000` guard (FE-6).
 - `apply_internode_toml_overrides_sets_other_fields` pins TOML broadcast
   propagation into the handshake advertisement (FE-10).

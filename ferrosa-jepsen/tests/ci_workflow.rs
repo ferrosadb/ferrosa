@@ -132,6 +132,23 @@ fn postgres_fault_workflow_waits_for_all_nodes_to_form_before_creating_role() {
     );
 }
 
+/// CQL-T467ci-01: `mode == "cluster"` and a Normal ring do not mean DDL is
+/// cluster-routed: the node keeps `DdlPath::Direct` until Raft has a leader,
+/// and `ALTER KEYSPACE system_auth` on that path is refused. The readiness wait
+/// must therefore also require the live DDL path to be `cluster`.
+#[test]
+fn postgres_fault_workflow_waits_for_cluster_ddl_path_before_system_auth_alter() {
+    let path = ci_yaml_path();
+    let yaml =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let readiness = step_body(&yaml, "Wait for PostgreSQL cluster formation");
+
+    assert!(
+        readiness.contains(".ddl_path == \"cluster\""),
+        "the wait must require every node's DDL path to be cluster; step was:\n{readiness}"
+    );
+}
+
 #[test]
 fn postgres_fault_workflow_replicates_system_auth_before_role_creation() {
     let path = ci_yaml_path();

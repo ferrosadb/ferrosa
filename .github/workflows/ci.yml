@@ -503,10 +503,13 @@ jobs:
               base_url="http://127.0.0.1:${web_port}"
               status=$(curl --connect-timeout 2 --max-time 5 -sf \
                 "${base_url}/api/cluster/status") || status=''
+              # `.mode` flips to "cluster" when formation starts, but DDL stays on
+              # the local Direct path until Raft has a leader; `ALTER KEYSPACE
+              # system_auth` on that path is refused. Wait for the DDL path too.
               if ! printf '%s' "$status" | jq -e --arg id "$expected_host_id" \
-                '.host_id == $id and .mode == "cluster"' >/dev/null; then
+                '.host_id == $id and .mode == "cluster" and .ddl_path == "cluster"' >/dev/null; then
                 all_ready=0
-                last_problem="node $expected_host_id has not entered cluster mode"
+                last_problem="node $expected_host_id has not entered cluster mode with cluster-routed DDL (status: ${status:-none})"
                 break
               fi
               ring=$(curl --connect-timeout 2 --max-time 5 -sf \

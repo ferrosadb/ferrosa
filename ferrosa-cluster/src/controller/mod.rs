@@ -701,6 +701,13 @@ impl ModeController {
         **self.mode.load()
     }
 
+    /// Name of the live DDL path (see [`DdlPath::kind`]). Lags [`Self::mode`]
+    /// during the transition to cluster mode; readiness probes that need
+    /// Raft-routed DDL must wait for `"cluster"`.
+    pub fn ddl_path_kind(&self) -> &'static str {
+        self.ddl_path.load().kind()
+    }
+
     /// Get current pair role, if in pair mode.
     pub fn role(&self) -> Option<PairRole> {
         let ctx = self.pair_context.lock();

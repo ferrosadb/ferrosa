@@ -97,3 +97,13 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
   (async-worker blocking is main's behavior at this budget, tracked on
   t_e67af7e7). Detection: `cluster_formation` timing, retry-edge logs.
   Residual: the double-open itself (t_e67af7e7).
+
+- **CQL-T467ci-01** (mode reads `cluster` while DDL is still `Direct`):
+  `transition_to_cluster` sets the mode first and keeps `DdlPath::Direct` until Raft
+  has a leader, so a probe on mode + ring alone can send DDL down the local path. There
+  `ALTER KEYSPACE system_auth` is refused (`SystemKeyspaceProtected`), which looks like
+  a permanent policy error. Detection: `DdlPath::kind()` / `ModeController::ddl_path_kind()`
+  are exposed as `ddl_path` on `/api/cluster/status`; the PostgreSQL Jepsen readiness wait
+  requires `ddl_path == "cluster"` and prints the last status on timeout. Test:
+  `ddl_path_kind_names_each_variant`. Open: whether the window widened on this branch is
+  not established from code alone; a timeout there names the real fault.
