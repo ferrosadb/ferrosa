@@ -103,6 +103,20 @@ jobs:
           # and nightly-fuzz `fuzz`, so they restore one dependency cache.
           shared-key: workspace-test-all-features-debug1
           save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Install cargo-nextest
+        # nextest runs one process per test and schedules across every core,
+        # where libtest runs each test *binary* serially. Combined with the
+        # `slow-tests` gating below, this is where the 36-minute job's time
+        # went: one 836s test in a two-test binary held 43% of it.
+        #
+        # `tool:` is required: this action normally picks the tool from its
+        # `@<tool>` tag, so a version-SHA pin alone selects nothing. It warns
+        # "no tool specified" and installs nothing, and the run then dies at
+        # the test step — which is exactly how this first failed (cargo-nextest
+        # absent, exit 101). Pin the SHA AND name the tool.
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: nextest
       - name: Free disk space
         # The --all-features debug test build alone exceeds 30GB of target
         # artifacts; the old reclaim (dotnet/android/ghc ≈ 11GB) still left
@@ -144,7 +158,21 @@ jobs:
           # they run nightly in nightly-slow-tests.yml.
           # LazyFS crash harness is unimplemented (T-070); in-process durability
           # probes cover ordering until the crash harness exists.
-          cargo test --all-features --workspace --lib --tests \
+          # nextest, not libtest: it runs one process per test and schedules
+          # across every core. libtest runs each test *binary* serially, so the
+          # suite's wall clock was the sum of every binary's slowest test and
+          # one ~840s test held 43% of this job.
+          #
+          # `--` matters. Every `--skip` below is a libtest test-name filter, not
+          # a nextest flag (`nextest run --skip` takes a pattern and rejects
+          # several of these). Putting them before `--` makes nextest exit 2 with
+          # "unexpected argument '--skip' found" and run NOTHING — which is how
+          # this first failed. They are positional filters and belong after `--`,
+          # exactly as they were in the `cargo test` form.
+          #
+          # `--exclude` / `--lib` / `--tests` / `--all-features` take the same
+          # values in both runners. The `--` separator is the only difference.
+          cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -- --skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
@@ -420,6 +448,12 @@ jobs:
     # locally", SQLSTATE 58000) and the strict-serializability workload aborts.
     # It fails on main too. Re-enable by deleting this `if:` once recovery is
     # wired — forge t_64c1b2d6 (fix) and t_3017b690 (turn this back on).
+    #
+    # This skip matches main (landed via #468). PR #470 is stacked on this
+    # branch and does the real work: it fixes the Accord path AND deletes this
+    # `if:`, so the job runs and proves the fix against a real paused node.
+    # Do not "helpfully" re-enable it here — that is 470's job, and its re-enable
+    # is the evidence that its fix works.
     if: ${{ false }}
     needs: build-node-image
     runs-on: ubuntu-latest

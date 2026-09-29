@@ -1,0 +1,6 @@
+case: idx_golden
+postings: 4000
+hot_key_postings: 2000
+sha256: 17804d516a622ff98b729555e132c7440bd9e55b576a7b42285488b892d7c9a0
+bytes: 294033
+---
