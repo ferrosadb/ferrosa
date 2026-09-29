@@ -190,7 +190,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("--disable-shared", script)
         self.assertIn("--disable-minidebuginfo", script)
         self.assertIn("--disable-zlibdebuginfo", script)
-        self.assertIn("cflags=-mno-outline-atomics", script)
+        self.assertIn("cflags=\"-O2 -mno-outline-atomics\"", script)
 
     def test_all_feature_test_workflows_install_host_libunwind(self):
         for workflow_path in (
