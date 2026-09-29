@@ -12,13 +12,20 @@
 
 pub mod builder;
 pub mod encode;
+mod eq_hash;
 pub mod error;
 pub mod limits;
 pub mod number;
+pub mod order;
 pub mod parse;
 pub mod print;
 pub mod reader;
+mod serde_impl;
 mod validate;
+pub mod value;
+
+pub use order::comparison_faults;
+pub use value::JsonbValue;
 
 pub use builder::{Encoded, JsonbBuilder};
 pub use encode::{BIGDECIMAL_PRIMITIVE_ID, ENVELOPE};

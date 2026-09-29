@@ -112,6 +112,23 @@ ferrosa-common ferrosa-jsonb` enforces it). Runtime dependencies are `bytes`,
   one allocation is the per-object `PgText` key sort.
 - Tests: `tests/print.rs`.
 
+## Implemented (T-106)
+
+- `JsonbValue`: an owned cell whose only constructors (`from_bytes`, `from_encoded`)
+  validate. `view()` gives the `JsonbRef`.
+- One total order (D18, D18a): kind rank Object > Array > Boolean > Number > String >
+  Null; objects by pair count, then (key, value) pairs in PostgreSQL key order
+  (shortest key first, then bytewise); arrays by length then element-wise; numbers by
+  exact value; strings bytewise. `Ord`, `PartialOrd`, `try_cmp` and `order::compare`.
+- `Eq` is value equality (`cmp == Equal`, byte fast path); `Hash` walks the
+  value-normalized form; `Debug` prints untruncated, injective, normalized text, so
+  `1`, `1.0` and a padded bigdecimal `1` compare, hash and print alike (D2a, FM-11).
+- Serde: padded base64 in human-readable formats, raw bytes otherwise;
+  `Deserialize` validates and refuses text longer than any valid cell.
+- All walks are iterative (depth 1000 on a 256 KiB thread). `comparison_faults()` counts
+  reader faults on a validated value (should stay 0).
+- Tests: `tests/order.rs`, `tests/serde.rs`.
+
 Not yet implemented: export, and an `io::Write` sink adapter.
 
 ## Safety

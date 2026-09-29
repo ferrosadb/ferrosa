@@ -16,6 +16,14 @@ last_updated: 2026-09-28
   segment size (`DEFAULT_SEGMENT_SIZE`, 32 MiB on main), and map the TOML section
   into `LimitsConfig`. Not done in T-100: the binary has no jsonb dependency yet.
 
+## T-106 open items
+
+- T-106 done (order, Eq, Hash, Debug, serde). Open: `JsonbValue::view()` revalidates the
+  cell on every compare, hash and print (a cached `Meta` would remove the second pass);
+  no comparison work budget (the walk is O(size) plus one sort per object);
+  `comparison_faults()` must be exported as a metric by the adapter; the PG order table is
+  from documentation, the live postgres:16 diff is T-301.
+
 ## Next
 
 - T-105 done (printers, output budget). Open: PgText is verified against documented

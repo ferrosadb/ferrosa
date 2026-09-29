@@ -126,6 +126,18 @@ one `escape_json` implementation for all styles. Numbers print through `Number`'
 `Display`, which is plain decimal with scale. The three text forms are frozen (they
 feed the D13a hash); a change needs a new golden version.
 
+## Order, equality, hash, Debug and serde (T-106)
+
+`order.rs` compares two `ValueRef`s with an explicit work stack of `Vals` and `Keys`
+items (children pushed reversed, so the first difference decides). Objects are sorted
+per comparison by (key length, key bytes) and compared key, value, key, value, as
+PostgreSQL does. `eq_hash.rs` builds `Eq` on the order, `Hash` on a tagged,
+length-prefixed walk using `Number`'s value-normalized hash, and `Debug` as
+`Jsonb(<text>)` with numbers in `value_normalized` form and strings `{:?}`-quoted.
+`serde_impl.rs` carries strict base64 or raw bytes and validates on read. Every
+`JsonbValue` method re-runs `JsonbRef::validate` (O(n)); caching the parsed metadata is
+a roadmap item.
+
 ## Incremental enforcement
 
 `Limits::check_*` and `HardCeilings::check_*` are pure comparisons meant to be
