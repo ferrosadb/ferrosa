@@ -2960,6 +2960,16 @@ impl StorageEngine {
         let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
+        // Evicted SSTables must be back on disk before the tables below are
+        // registered; see `restore_evicted_sstables`. This is the constructor
+        // a node with commit-log segments starts through.
+        Self::restore_evicted_sstables_blocking_in(
+            &config.data_dir,
+            object_store
+                .as_ref()
+                .zip(config.object_store.as_ref())
+                .map(|(store, os_config)| (Arc::clone(store), os_config.prefix.clone())),
+        )?;
         if let Some(schemas) = Self::load_local_table_schemas(&config.data_dir)? {
             for schema in schemas {
                 let table_id = TableId::new(&schema.keyspace, &schema.table);
@@ -12185,11 +12195,22 @@ impl StorageEngine {
     /// purged. Covers every table directory, system keyspaces included, so it
     /// must run before any table is registered.
     pub async fn restore_evicted_sstables(&self) -> ferrosa_common::Result<usize> {
-        let evicted = Self::evicted_generations(&self.config.data_dir.join("sstables"));
+        Self::restore_evicted_sstables_in(&self.config.data_dir, self.resolve_store_and_prefix())
+            .await
+    }
+
+    /// [`Self::restore_evicted_sstables`] for a data directory and object
+    /// store, before any engine exists. `open` needs this: it registers
+    /// tables while it is still assembling the engine.
+    async fn restore_evicted_sstables_in(
+        data_dir: &std::path::Path,
+        store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
+    ) -> ferrosa_common::Result<usize> {
+        let evicted = Self::evicted_generations(&data_dir.join("sstables"));
         if evicted.is_empty() {
             return Ok(0);
         }
-        let (store, prefix) = self.resolve_store_and_prefix().ok_or_else(|| {
+        let (store, prefix) = store.ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "{} evicted SSTable table(s) need restoring from S3, but S3 is not configured",
                 evicted.len()
@@ -12208,9 +12229,10 @@ impl StorageEngine {
                     marked.add_sstable(&dir_name, entry.clone());
                 }
             }
-            restored += self.download_sstables_from_s3(&table_id, &marked).await?;
+            restored +=
+                Self::download_sstables_into(data_dir, &store, &prefix, &table_id, &marked).await?;
 
-            let table_dir = self.config.data_dir.join("sstables").join(&dir_name);
+            let table_dir = data_dir.join("sstables").join(&dir_name);
             for gen in &gens {
                 if Self::generation_component_path(&table_dir, gen, "Data.db").is_some() {
                     if let Err(e) = std::fs::remove_file(Self::evicted_marker_path(&table_dir, gen))
@@ -12239,10 +12261,20 @@ impl StorageEngine {
     /// constructors. Blocks only when an eviction marker exists, so an engine
     /// with nothing to restore never enters a nested runtime.
     fn restore_evicted_sstables_blocking(&self) -> ferrosa_common::Result<usize> {
-        if Self::evicted_generations(&self.config.data_dir.join("sstables")).is_empty() {
+        Self::restore_evicted_sstables_blocking_in(
+            &self.config.data_dir,
+            self.resolve_store_and_prefix(),
+        )
+    }
+
+    fn restore_evicted_sstables_blocking_in(
+        data_dir: &std::path::Path,
+        store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
+    ) -> ferrosa_common::Result<usize> {
+        if Self::evicted_generations(&data_dir.join("sstables")).is_empty() {
             return Ok(0);
         }
-        Self::block_on_rehydration(self.restore_evicted_sstables())
+        Self::block_on_rehydration(Self::restore_evicted_sstables_in(data_dir, store))
     }
 
     /// `(table dir name, evicted generation ids)` for every table directory
@@ -12294,18 +12326,28 @@ impl StorageEngine {
         let (store, prefix) = self
             .resolve_store_and_prefix()
             .ok_or_else(|| ferrosa_common::Error::InvalidFormat("S3 not configured".into()))?;
+        if manifest.sstables.contains_key(&table_id.to_string()) {
+            self.update_s3_manifest_stats(manifest);
+        }
+        Self::download_sstables_into(&self.config.data_dir, &store, &prefix, table_id, manifest)
+            .await
+    }
 
+    /// [`Self::download_sstables_from_s3`] for a data directory and object
+    /// store, usable before the engine exists.
+    async fn download_sstables_into(
+        data_dir: &std::path::Path,
+        store: &Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+        table_id: &TableId,
+        manifest: &crate::manifest::Manifest,
+    ) -> ferrosa_common::Result<usize> {
         let entries = match manifest.sstables.get(&table_id.to_string()) {
             Some(e) => e,
             None => return Ok(0),
         };
-        self.update_s3_manifest_stats(manifest);
 
-        let table_dir = self
-            .config
-            .data_dir
-            .join("sstables")
-            .join(table_id.to_string());
+        let table_dir = data_dir.join("sstables").join(table_id.to_string());
         std::fs::create_dir_all(&table_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create table dir: {e}"))
         })?;
@@ -12335,7 +12377,7 @@ impl StorageEngine {
                 if let Some(local_dir) = Self::generation_dir_for(&table_dir, &entry.id) {
                     Self::pull_index_artifacts(
                         store.as_ref(),
-                        &prefix,
+                        prefix,
                         &hex,
                         &table_id.to_string(),
                         &entry.id,
@@ -12364,7 +12406,7 @@ impl StorageEngine {
             // other entries. If none are restorable, fail closed below.
             for component in &required_components {
                 let s3_path = crate::upload::manager::sstable_object_key(
-                    &prefix,
+                    prefix,
                     &hex,
                     &table_id.to_string(),
                     &entry.id,
@@ -12393,7 +12435,7 @@ impl StorageEngine {
             // Optional components: stream when present, skip on NotFound.
             for component in &optional_components {
                 let s3_path = crate::upload::manager::sstable_object_key(
-                    &prefix,
+                    prefix,
                     &hex,
                     &table_id.to_string(),
                     &entry.id,
@@ -12415,7 +12457,7 @@ impl StorageEngine {
 
             if let Err(e) = Self::pull_index_artifacts(
                 store.as_ref(),
-                &prefix,
+                prefix,
                 &hex,
                 &table_id.to_string(),
                 &entry.id,
@@ -27588,6 +27630,62 @@ mod tests {
             StorageEngine::evicted_generations(&dir.path().join("sstables")).is_empty(),
             "a retired generation must not keep an eviction marker"
         );
+    }
+
+    /// The same loss through the crash-recovery constructor.
+    ///
+    /// A node with commit-log segments starts through `StorageEngine::open`,
+    /// not `new`, and `open` registers tables before the engine exists. The
+    /// first live recovery (2026-09-29) restored node3 (no segments, `new`)
+    /// while node1 and node2 (`open`) came up serving their tables without
+    /// a single evicted SSTable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_of_an_evicted_sstable_survive_a_restart_through_commit_log_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = tempfile::tempdir().unwrap();
+        let prefix = "test-evicted-open";
+        let tid = table_id();
+        let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+
+        {
+            let store: Arc<dyn object_store::ObjectStore> = Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(bucket.path()).unwrap(),
+            );
+            let engine = evicting_s3_engine(dir.path(), &store, prefix);
+            engine.register_table(test_schema()).unwrap();
+            for key in &keys {
+                engine
+                    .write(&tid, &make_key(key), make_row(b"v", 1000), 1000)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            assert!(engine.sync_sstables_to_s3().await.unwrap() >= 1);
+            assert!(
+                StorageEngine::list_generations_in_dir(&engine.table_sstable_dir(&tid)).is_empty(),
+                "precondition: the sync evicted the uploaded SSTable's local copy"
+            );
+            engine.shutdown().unwrap();
+        }
+
+        // Restart through the crash-recovery constructor, against the same
+        // bucket (a file:// backend over the directory engine one wrote to).
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.object_store = Some(crate::upload::ObjectStoreConfig {
+            local_path: Some(bucket.path().to_path_buf()),
+            prefix: prefix.to_string(),
+            ..crate::upload::ObjectStoreConfig::test_config()
+        });
+        let (engine, _mutations) =
+            StorageEngine::open(config, Some(&tokio::runtime::Handle::current())).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        for key in &keys {
+            assert!(
+                engine.read(&tid, &make_key(key)).unwrap().is_some(),
+                "row {key} of an evicted SSTable must survive a restart through open()"
+            );
+        }
+        engine.shutdown().unwrap();
     }
 
     /// Restore must bring back only what the evictor removed.
