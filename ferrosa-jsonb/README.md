@@ -92,7 +92,27 @@ ferrosa-common ferrosa-jsonb` enforces it). Runtime dependencies are `bytes`,
   byte-for-byte through the reader; a mutation corpus; hostile hand-built cells;
   depth on 256 KiB; proptest). Fuzz target `fuzz/fuzz_targets/validate.rs`.
 
-Not yet implemented: text print (T-105) and export.
+## Implemented (T-105)
+
+- One printer, three frozen styles (`TextStyle`): `Canonical` (compact, keys
+  bytewise as stored, plain numbers with scale; D6, D2a), `PgText` (byte-identical to
+  PostgreSQL 16 jsonb output; D26) and `Normalized` (`Canonical` with trailing
+  fractional zeros stripped, so `1`, `1.0`, `1.00` print alike; the D13a RDF hash input
+  and the `Debug` text). All three are pinned by `tests/golden/text_v1/*.txt`.
+- `print_value(ValueRef, style, budget, &mut impl fmt::Write) -> Result<usize,
+  PrintError>` and `print_to_string`. The budget is checked before every write, so
+  output never exceeds it and is never truncated: `PrintError::BudgetExceeded { max }`
+  (`Sink` and `Jsonb(..)` are the other variants). A streaming sink may hold a prefix
+  after an error; `print_to_string` returns no text on error.
+- `PgText` rules: keys by byte length then bytewise; `": "` and `", "`; `{}` and `[]`
+  when empty; numbers plain decimal with scale (`1.10`, `-0` prints `0`, never an
+  exponent); strings escaped as PG `escape_json` (`\"` `\\` `\b` `\f` `\n` `\r` `\t`,
+  other C0 controls `\u00xx` lowercase, `/`, DEL and non-ASCII raw).
+- Iterative walk (explicit frame stack; depth 1000 prints on a 256 KiB thread). The
+  one allocation is the per-object `PgText` key sort.
+- Tests: `tests/print.rs`.
+
+Not yet implemented: export, and an `io::Write` sink adapter.
 
 ## Safety
 

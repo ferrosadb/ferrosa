@@ -16,11 +16,13 @@ pub mod error;
 pub mod limits;
 pub mod number;
 pub mod parse;
+pub mod print;
 pub mod reader;
 mod validate;
 
 pub use builder::{Encoded, JsonbBuilder};
 pub use encode::{BIGDECIMAL_PRIMITIVE_ID, ENVELOPE};
+pub use print::{print_to_string, print_value, PrintError, TextStyle};
 pub use reader::{ArrayIter, ArrayRef, JsonbRef, ObjectIter, ObjectRef, ValueKind, ValueRef};
 
 pub use error::{EncodingFault, JsonbError, LimitsError};

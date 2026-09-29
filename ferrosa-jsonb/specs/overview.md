@@ -113,6 +113,19 @@ error at its backslash. Numbers are scanned strictly (no leading zeros, digits a
 resolves duplicates; the parser rewrites its `DuplicateKey` with the object's path.
 Working set: input + O(depth) frames + arena, documented as at most 32x input.
 
+## Text printer (T-105)
+
+`print.rs` walks a `ValueRef` with an explicit `Frame` stack (array iterator, object
+iterator, or a sorted entry list). `Printer::emit` is the only write path: it checks
+`written + len <= budget` before writing, so an over-budget print fails with
+`BudgetExceeded` having written nothing past the budget. Styles differ in three
+places only: separators (`,`/`:` versus `, `/`: `), object key order (`PgText` sorts
+one object's entries by byte length then bytes, as `lengthCompareJsonbStringValue`
+does), and number text (`Normalized` prints `Number::value_normalized`). Strings use
+one `escape_json` implementation for all styles. Numbers print through `Number`'s
+`Display`, which is plain decimal with scale. The three text forms are frozen (they
+feed the D13a hash); a change needs a new golden version.
+
 ## Incremental enforcement
 
 `Limits::check_*` and `HardCeilings::check_*` are pure comparisons meant to be

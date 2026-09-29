@@ -159,6 +159,14 @@ impl Number {
         }
     }
 
+    /// This value with trailing fractional zeros removed (`1.10` becomes `1.1`,
+    /// `1.0` becomes `1`): the value-normalized form the D13a hash and `Debug`
+    /// text print (T-105). Equal numbers give identical results.
+    pub(crate) fn value_normalized(&self) -> Number {
+        let (u, s) = self.normalized();
+        Number::from_bigint(u, s)
+    }
+
     /// (unscaled, scale) with trailing zeros removed down to scale 0; for
     /// comparison and hashing only (D2a).
     fn normalized(&self) -> (BigInt, u16) {

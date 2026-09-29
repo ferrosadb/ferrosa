@@ -18,6 +18,10 @@ last_updated: 2026-09-28
 
 ## Next
 
+- T-105 done (printers, output budget). Open: PgText is verified against documented
+  PostgreSQL 16 behavior and the source rules, not yet a live postgres:16 differential
+  (T-301); an `io::Write` sink adapter; `PgText` key sort allocates one Vec per object.
+
 - T-104 done (validator, checked reader, fuzz target). Open: run the `validate`
   fuzz target for a soak (needs `cargo fuzz`); validate-time cost of the UTF-8 pass
   is paid again on `as_str` (measure before caching); print (T-105), export.
