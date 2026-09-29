@@ -1094,11 +1094,13 @@ impl AccordCoordinatorDriver {
     /// no-write finalize — it advances the txn to `Applied`, wakes dep-waiters,
     /// and GCs the conflict index WITHOUT writing any row.
     ///
-    /// Best-effort: this is a cleanup, not a correctness gate for THIS txn (which
-    /// is already aborting). Failures are logged, not propagated.
+    /// Not a correctness gate for THIS txn (which is already aborting), so the
+    /// caller does not wait for the remote half: the local replica is finalized
+    /// before returning, and the remote fan-out runs detached, retrying each
+    /// replica until it acks (see [`deliver_no_write_finalize`]).
     async fn finalize_no_write(&self) {
         self.finalize_no_write_locally().await;
-        self.no_write_fanout().await;
+        tokio::spawn(self.no_write_fanout());
     }
 
     /// Finalize the coordinator's own replica state machine as a no-write (its
@@ -1145,19 +1147,18 @@ impl AccordCoordinatorDriver {
                 }
             };
             let msg = Message::AccordApply(Bytes::from(bytes));
-
-            let futs: Vec<_> = remotes
-                .into_iter()
-                .map(|peer_id| {
-                    let peers = Arc::clone(&peers);
-                    let msg = msg.clone();
-                    async move { peers.send(peer_id, msg, Lane::Data).await }
-                })
-                .collect();
-            for result in futures::future::join_all(futs).await {
-                if let Err(e) = result {
-                    tracing::warn!(txn_id = ?txn_id, error = %e, "accord: no-write finalize RPC failed");
-                }
+            let undelivered =
+                deliver_no_write_finalize(&peers, remotes, &msg, txn_id, NO_WRITE_FINALIZE_RETRY)
+                    .await;
+            if !undelivered.is_empty() {
+                tracing::error!(
+                    txn_id = ?txn_id,
+                    replicas = ?undelivered,
+                    attempts = NO_WRITE_FINALIZE_RETRY.attempts,
+                    "accord: no-write finalize never reached these replicas; each keeps the \
+                     transaction as a pending conflict, so reads and snapshot barriers on its \
+                     keys there will dep-wait and abstain until it is recovered"
+                );
             }
         }
     }
@@ -2472,6 +2473,83 @@ impl AccordCoordinatorDriver {
 // Tests
 // ===========================================================================
 
+/// How hard the no-write finalize tries to reach each replica.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FinalizeRetry {
+    pub(crate) attempts: u32,
+    pub(crate) first_backoff: std::time::Duration,
+    pub(crate) max_backoff: std::time::Duration,
+}
+
+/// About 25 s in total: long enough to ride out a paused or overloaded
+/// replica, bounded so a dead one does not hold the task forever.
+pub(crate) const NO_WRITE_FINALIZE_RETRY: FinalizeRetry = FinalizeRetry {
+    attempts: 8,
+    first_backoff: std::time::Duration::from_millis(200),
+    max_backoff: std::time::Duration::from_secs(5),
+};
+
+/// Send the no-write finalize to every replica in `remotes`, retrying each
+/// one with capped exponential backoff until it acks or `retry.attempts` run
+/// out. Returns the replicas that never acked.
+///
+/// A replica that misses the finalize keeps the failed transaction as a
+/// pending conflict on its keys; every later read or snapshot barrier there
+/// dep-waits on it and abstains. It was sent once; on 2026-09-28 a timed-out
+/// send left a live replica blocked and failed a Jepsen snapshot barrier.
+///
+/// Logs the edges per replica: the first failure (with the peer) and a later
+/// recovery, not every attempt.
+pub(crate) async fn deliver_no_write_finalize(
+    peers: &Arc<dyn crate::accord::transport::AccordTransport>,
+    remotes: Vec<uuid::Uuid>,
+    msg: &Message,
+    txn_id: TxnId,
+    retry: FinalizeRetry,
+) -> Vec<uuid::Uuid> {
+    let per_replica = remotes.into_iter().map(|peer_id| {
+        let peers = Arc::clone(peers);
+        let msg = msg.clone();
+        async move {
+            let mut backoff = retry.first_backoff;
+            for attempt in 1..=retry.attempts {
+                match peers.send(peer_id, msg.clone(), Lane::Data).await {
+                    Ok(_) => {
+                        if attempt > 1 {
+                            // debug: per-transaction, and the hot-path log rule
+                            // (tests/consensus_logging_is_bounded.rs) forbids
+                            // INFO with a txn_id here.
+                            tracing::debug!(
+                                txn_id = ?txn_id, peer = %peer_id, attempt,
+                                "accord: no-write finalize reached the replica after retrying"
+                            );
+                        }
+                        return None;
+                    }
+                    Err(e) => {
+                        if attempt == 1 {
+                            tracing::warn!(
+                                txn_id = ?txn_id, peer = %peer_id, error = %e,
+                                "accord: no-write finalize RPC failed; retrying with backoff"
+                            );
+                        }
+                        if attempt < retry.attempts {
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(retry.max_backoff);
+                        }
+                    }
+                }
+            }
+            Some(peer_id)
+        }
+    });
+    futures::future::join_all(per_replica)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3762,6 +3840,98 @@ mod tests {
                 ))
             }
         }
+    }
+
+    /// Fails the first `fail_first[peer]` sends to each peer, then acks.
+    /// Counts every send per peer.
+    struct FlakyTransport {
+        fail_first: std::collections::HashMap<uuid::Uuid, usize>,
+        sends: std::sync::Mutex<std::collections::HashMap<uuid::Uuid, usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for FlakyTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            _msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            let attempt = {
+                let mut sends = self.sends.lock().unwrap();
+                let n = sends.entry(host_id).or_insert(0);
+                *n += 1;
+                *n
+            };
+            if attempt <= *self.fail_first.get(&host_id).unwrap_or(&0) {
+                Err(ferrosa_net::error::NetError::Timeout("flaky".into()))
+            } else {
+                Ok(Message::AccordApply(Bytes::new()))
+            }
+        }
+    }
+
+    fn flaky(fail_first: &[(u128, usize)]) -> Arc<FlakyTransport> {
+        Arc::new(FlakyTransport {
+            fail_first: fail_first
+                .iter()
+                .map(|&(p, n)| (uuid::Uuid::from_u128(p), n))
+                .collect(),
+            sends: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// 2026-09-28 Jepsen: a failed transaction's no-write finalize was sent
+    /// once; the send to a live replica timed out, and that replica kept the
+    /// transaction as a pending conflict until a later snapshot barrier on the
+    /// key waited 5 s and failed. A replica that fails is retried until it acks.
+    #[tokio::test(start_paused = true)]
+    async fn no_write_finalize_retries_a_replica_until_it_acks() {
+        let transport = flaky(&[(2, 3), (3, 0)]);
+        let peers: Arc<dyn AccordTransport> = transport.clone();
+        let undelivered = deliver_no_write_finalize(
+            &peers,
+            vec![uuid::Uuid::from_u128(2), uuid::Uuid::from_u128(3)],
+            &Message::AccordApply(Bytes::new()),
+            TxnId::new(1, make_ts(1)),
+            NO_WRITE_FINALIZE_RETRY,
+        )
+        .await;
+        assert!(
+            undelivered.is_empty(),
+            "every replica acked: {undelivered:?}"
+        );
+        let sends = transport.sends.lock().unwrap();
+        assert_eq!(
+            sends[&uuid::Uuid::from_u128(2)],
+            4,
+            "three failures, then the ack"
+        );
+        assert_eq!(
+            sends[&uuid::Uuid::from_u128(3)],
+            1,
+            "a healthy replica is sent once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_write_finalize_gives_up_after_bounded_attempts_and_names_the_replica() {
+        let transport = flaky(&[(2, usize::MAX)]);
+        let peers: Arc<dyn AccordTransport> = transport.clone();
+        let undelivered = deliver_no_write_finalize(
+            &peers,
+            vec![uuid::Uuid::from_u128(2)],
+            &Message::AccordApply(Bytes::new()),
+            TxnId::new(1, make_ts(1)),
+            NO_WRITE_FINALIZE_RETRY,
+        )
+        .await;
+        assert_eq!(undelivered, vec![uuid::Uuid::from_u128(2)]);
+        assert_eq!(
+            transport.sends.lock().unwrap()[&uuid::Uuid::from_u128(2)],
+            NO_WRITE_FINALIZE_RETRY.attempts as usize,
+            "attempts are bounded"
+        );
     }
 
     /// Driver whose coordinator is NOT one of the replicas (node_id 999 matches
