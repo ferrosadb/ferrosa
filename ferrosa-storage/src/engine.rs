@@ -8546,6 +8546,23 @@ impl StorageEngine {
         }))
     }
 
+    /// Whether `key` names so large a share of `table_id` that a scan is
+    /// cheaper than serving it through `index_name`. See
+    /// [`TableStore::index_key_is_unselective`]. An unregistered table is
+    /// `false`: the index path that follows reports it loudly.
+    pub fn index_key_is_unselective(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+    ) -> ferrosa_common::Result<bool> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.index_key_is_unselective(index_name, key),
+            None => Ok(false),
+        }
+    }
+
     /// Query by secondary index restricted to ONE partition (t_430c4188).
     ///
     /// Delegates to [`TableStore::read_by_index_in_partition`], which keeps
