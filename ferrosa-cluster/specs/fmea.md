@@ -78,9 +78,22 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
 - **CL-T2c1678cb** (sled log-store open vs a still-releasing holder): dropping a
   sled `Db` flushes and joins threads, which under heavy I/O outlasted the old
   fixed 10 x 50 ms budget, so a restart-under-load open failed `WouldBlock`.
-  Mitigation: exponential backoff (10 ms to 250 ms) under a 10 s wall-clock budget;
-  logs first contention, recovered, or gave up with the waited duration; a
-  never-released lock still fails typed after the budget. Tests
+  Mitigation: `LockRetryPolicy`; logs first contention, recovered, or gave up
+  with the waited duration; a never-released lock still fails typed after the
+  budget. Production uses main's budget (see CL-Tsledrevert); only tests get the
+  long exponential budget (`LockRetryPolicy::TEST_LONG`). Tests
   `{new,open_offline}_retries_through_a_transient_lock` release the holder only
   after a `#[cfg(test)]` contention hook fires (no sleeps);
   `a_never_released_lock_fails_typed_after_the_budget` covers the live-peer case.
+- **CL-Tsledrevert** (long production lock-retry budget stalls formation):
+  the 10 s exponential budget plus `SledLogStore::new_off_worker` made
+  `SledLogStore::new` block for the full budget on the raft dir that another
+  in-process handle really holds during formation (pre-existing double-open,
+  t_e67af7e7). Raft missed its leader window, DDL stayed Direct, and
+  `three_node_forms_when_seed_is_laggard` went from 1.4 s to 10.8 s.
+  Mitigation: `LockRetryPolicy::DEFAULT` is main's retry (10 attempts, 50 ms
+  apart); the long budget is `#[cfg(test)]`-only and reaches the opens through
+  `new_with_policy`/`open_offline_with_policy`; `new_off_worker` is removed
+  (async-worker blocking is main's behavior at this budget, tracked on
+  t_e67af7e7). Detection: `cluster_formation` timing, retry-edge logs.
+  Residual: the double-open itself (t_e67af7e7).

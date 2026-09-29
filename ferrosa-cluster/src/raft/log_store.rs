@@ -396,22 +396,39 @@ pub struct TruncateReport {
 
 /// Backoff schedule and total budget for the sled directory-lock retry.
 ///
-/// Exponential so a quick release is noticed fast while a slow one (a
-/// previous in-process `Db` still flushing and joining threads under heavy
-/// I/O) is not hammered; the budget is a wall-clock bound, not an attempt
-/// count.
+/// `DEFAULT` is exactly `origin/main`'s production retry: 10 attempts, a fixed
+/// 50 ms apart (about 450 ms of sleeping). Production must not wait longer:
+/// during cluster formation `SledLogStore::new` can hit a raft dir whose lock
+/// another in-process handle really holds (t_e67af7e7), and a long wait there
+/// makes Raft miss its leader window (CL-Tsledrevert). Tests that must
+/// outlast a slow release use the test-only `TEST_LONG` instead.
 #[derive(Debug, Clone, Copy)]
 struct LockRetryPolicy {
     initial: Duration,
     max_backoff: Duration,
+    /// Wall-clock cap on total waiting.
     budget: Duration,
+    /// Cap on open attempts, including the first.
+    max_attempts: u32,
 }
 
 impl LockRetryPolicy {
+    /// Main's retry: 10 attempts, fixed 50 ms interval.
     const DEFAULT: Self = Self {
+        initial: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(50),
+        budget: Duration::from_millis(500),
+        max_attempts: 10,
+    };
+
+    /// Test-only: exponential backoff under a 10 s budget, so event-synced
+    /// tests never race the budget under load. Never used by production.
+    #[cfg(test)]
+    const TEST_LONG: Self = Self {
         initial: Duration::from_millis(10),
         max_backoff: Duration::from_millis(250),
         budget: Duration::from_secs(10),
+        max_attempts: u32::MAX,
     };
 }
 
@@ -444,12 +461,17 @@ impl SledLogStore {
     /// on a millisecond-scale race — a just-exited handle still releasing, or
     /// (seen in CI) heavy parallel I/O making `flock` momentarily return
     /// `Resource temporarily unavailable` even on a fresh dir. Failing the open
-    /// on such a transient is wrong, so we retry with exponential backoff
-    /// bounded by `LockRetryPolicy::DEFAULT`. A **genuinely** held lock (a
+    /// on such a transient is wrong, so we retry under
+    /// `LockRetryPolicy::DEFAULT` (main's 10 attempts, 50 ms apart). A **genuinely** held lock (a
     /// live node already running on this dir) is held for the node's whole
     /// lifetime, so a real dual-open conflict still surfaces the error.
     pub fn new(path: &Path) -> Result<Self, sled::Error> {
-        let db = Self::open_sled_db_with_lock_retry(path)?;
+        Self::new_with_policy(path, LockRetryPolicy::DEFAULT)
+    }
+
+    /// [`Self::new`] under an explicit retry policy (the test seam).
+    fn new_with_policy(path: &Path, policy: LockRetryPolicy) -> Result<Self, sled::Error> {
+        let db = Self::open_sled_db_with_policy(path, policy)?;
         let log = db.open_tree("log")?;
         let meta = db.open_tree("meta")?;
         Ok(Self {
@@ -458,31 +480,6 @@ impl SledLogStore {
             meta,
             durable_applied: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
-    }
-
-    /// [`Self::new`] for synchronous code that may run on an async worker.
-    ///
-    /// The lock retry `thread::sleep`s for up to `LockRetryPolicy::DEFAULT`'s
-    /// budget. On a multi-thread runtime this wraps the open in
-    /// `block_in_place`, which hands the worker's queued tasks to another
-    /// thread so keepalives and heartbeats are not starved (the CQL keepalive
-    /// starvation class). A current-thread runtime cannot offload; there the
-    /// open blocks the runtime for the wait, which is logged. Outside any
-    /// runtime it is a plain [`Self::new`].
-    pub fn new_off_worker(path: &Path) -> Result<Self, sled::Error> {
-        use tokio::runtime::{Handle, RuntimeFlavor};
-        match Handle::try_current().map(|h| h.runtime_flavor()) {
-            Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| Self::new(path)),
-            Ok(RuntimeFlavor::CurrentThread) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "raft log store open on a current-thread runtime cannot leave the worker; \\
-                     a contended lock will block this runtime for the retry budget"
-                );
-                Self::new(path)
-            }
-            Ok(_) | Err(_) => Self::new(path),
-        }
     }
 
     /// Share this store's durable-applied watermark with the state machine.
@@ -496,8 +493,8 @@ impl SledLogStore {
     }
 
     /// Open a sled `Db` at `path`, retrying through **transient** directory-lock
-    /// contention with exponential backoff under `LockRetryPolicy::DEFAULT`
-    /// (10 ms doubling to 250 ms, bounded by a 10 s total budget).
+    /// contention under `LockRetryPolicy::DEFAULT` (10 attempts, 50 ms apart,
+    /// about 500 ms, as on `origin/main`).
     ///
     /// The single transient-lock retry primitive: used by [`Self::new`] and the
     /// offline tooling, and exposed (`pub`) for tools/tests that need the raw
@@ -505,7 +502,8 @@ impl SledLogStore {
     /// under heavy I/O can take seconds while the directory stays locked,
     /// hence the generous budget. A genuinely-held lock (a live node on this
     /// dir) outlasts any budget, so a real dual-open conflict still surfaces a
-    /// typed `WouldBlock` error carrying the waited duration.
+    /// typed `WouldBlock` error carrying the waited duration. The budget stays
+    /// short on purpose: see `LockRetryPolicy`.
     pub fn open_sled_db_with_lock_retry(path: &Path) -> Result<sled::Db, sled::Error> {
         Self::open_sled_db_with_policy(path, LockRetryPolicy::DEFAULT)
     }
@@ -550,7 +548,8 @@ impl SledLogStore {
             #[cfg(test)]
             notify_contention_hook(attempt);
             let waited = started.elapsed();
-            let Some(remaining) = policy.budget.checked_sub(waited).filter(|r| !r.is_zero()) else {
+            let remaining = policy.budget.checked_sub(waited).filter(|r| !r.is_zero());
+            let Some(remaining) = remaining.filter(|_| attempt < policy.max_attempts) else {
                 return Err(Self::lock_gave_up(path, attempt, waited, &err));
             };
             std::thread::sleep(backoff.min(remaining));
@@ -586,6 +585,12 @@ impl SledLogStore {
     /// named entry point for the offline tools.
     fn open_offline(path: &Path) -> Result<Self, sled::Error> {
         Self::new(path)
+    }
+
+    /// [`Self::open_offline`] under an explicit retry policy (test seam).
+    #[cfg(test)]
+    fn open_offline_with_policy(path: &Path, policy: LockRetryPolicy) -> Result<Self, sled::Error> {
+        Self::new_with_policy(path, policy)
     }
 
     /// True only for the transient "directory lock already held" condition,
@@ -2277,8 +2282,10 @@ mod tests {
         let holder = SledLogStore::new(dir.path()).expect("hold the directory lock");
         let path = dir.path().to_path_buf();
 
-        let store = open_after_contention_observed(holder, || SledLogStore::open_offline(&path))
-            .expect("open_offline must retry past the transient lock and succeed");
+        let store = open_after_contention_observed(holder, || {
+            SledLogStore::open_offline_with_policy(&path, LockRetryPolicy::TEST_LONG)
+        })
+        .expect("open_offline must retry past the transient lock and succeed");
         drop(store);
     }
 
@@ -2309,55 +2316,6 @@ mod tests {
         result
     }
 
-    /// A contended open must not starve the async worker: on a runtime with a
-    /// SINGLE worker, a concurrent task keeps ticking while `new_off_worker`
-    /// retries under a held lock. The holder is released only after the ticker
-    /// advanced with the open in flight, so a blocking open would starve the
-    /// ticker and this test would time out (CL-T2c1678cb).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn new_off_worker_keeps_the_runtime_responsive_during_a_contended_open() {
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-        let dir = tempfile::tempdir().unwrap();
-        seed_store(dir.path(), 1..=3, &[]).await;
-        let holder = SledLogStore::new(dir.path()).expect("hold the directory lock");
-        let opening = std::sync::Arc::new(AtomicBool::new(false));
-        let ticks = std::sync::Arc::new(AtomicU32::new(0));
-
-        let (o, t) = (opening.clone(), ticks.clone());
-        let ticker = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                if o.load(Ordering::SeqCst) {
-                    t.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-        });
-        let path = dir.path().to_path_buf();
-        let o = opening.clone();
-        let open = tokio::spawn(async move {
-            o.store(true, Ordering::SeqCst);
-            SledLogStore::new_off_worker(&path)
-        });
-
-        // Bounded wait for ticker progress made while the open is in flight.
-        tokio::time::timeout(Duration::from_secs(8), async {
-            while ticks.load(Ordering::SeqCst) < 20 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("ticker must progress while the open retries: worker was starved");
-        assert!(!open.is_finished(), "open must still be retrying");
-        ticker.abort();
-        drop(holder);
-
-        let store = open
-            .await
-            .expect("open task joined")
-            .expect("open must succeed once the holder is released");
-        drop(store);
-    }
-
     /// A live peer that never releases must still surface a typed lock error
     /// after the budget, carrying the waited duration (CL-T2c1678cb).
     #[tokio::test]
@@ -2369,6 +2327,7 @@ mod tests {
             initial: Duration::from_millis(5),
             max_backoff: Duration::from_millis(20),
             budget: Duration::from_millis(150),
+            max_attempts: u32::MAX,
         };
 
         let started = std::time::Instant::now();
@@ -2406,10 +2365,13 @@ mod tests {
         let holder = SledLogStore::new(dir.path()).expect("hold the directory lock");
         let path = dir.path().to_path_buf();
 
-        // Released only after contention was observed (CL-T2c1678cb: the old
-        // 120 ms sleep raced a 500 ms budget and lost under load).
-        let store = open_after_contention_observed(holder, || SledLogStore::new(&path))
-            .expect("new() must retry past the transient lock and succeed");
+        // Released only after contention was observed, under the test-only
+        // long budget (CL-T2c1678cb: the old 120 ms sleep raced a 500 ms
+        // budget and lost under load; production keeps the 500 ms budget).
+        let store = open_after_contention_observed(holder, || {
+            SledLogStore::new_with_policy(&path, LockRetryPolicy::TEST_LONG)
+        })
+        .expect("new() must retry past the transient lock and succeed");
         drop(store);
     }
 

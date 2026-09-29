@@ -953,7 +953,7 @@ impl ModeController {
             tracing::error!(%e, dir = %raft_dir.display(), "failed to create per-DC raft log dir");
             return;
         }
-        let mut log_store = match SledLogStore::new_off_worker(&raft_dir) {
+        let mut log_store = match SledLogStore::new(&raft_dir) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(%e, "failed to create Raft log store");
@@ -1013,7 +1013,7 @@ impl ModeController {
                                     backup = %backup.as_deref().unwrap_or(std::path::Path::new("<none>")).display(),
                                     "stranded Raft state moved aside; rebuilding from the leader"
                                 );
-                                match SledLogStore::new_off_worker(&raft_dir) {
+                                match SledLogStore::new(&raft_dir) {
                                     Ok(fresh) => {
                                         log_store = fresh;
                                         state_machine =
