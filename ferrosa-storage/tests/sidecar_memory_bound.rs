@@ -10,6 +10,27 @@
 //! file's size.
 //!
 //! Budgets are hard so a regression FAILS instead of OOM-ing the process.
+//!
+//! # Why one test here is `slow-tests`-gated
+//!
+//! `writing_a_sidecar_from_a_memtable_index_holds_a_bounded_heap` writes 64,000
+//! postings by hand while a global-allocator hook accounts every allocation.
+//! In a debug build that is ~840 seconds — measured on PR CI, where it was 43%
+//! of the whole `Test + Coverage` job, and it ran serially because libtest runs
+//! one test binary at a time. It is not deleted or `#[ignore]`d (ferrosa/CLAUDE.md
+//! forbids ignoring a test for being slow); it moves behind the `slow-tests`
+//! crate feature and runs nightly in nightly-slow-tests.yml, the same bargain
+//! the `mod slow` tests make.
+//!
+//! The nesting is load-bearing: nightly selects with `-- ::slow::`, and libtest
+//! names a test in an integration binary after its modules only (the file name
+//! is not part of the path). A top-level `mod slow` would name the test
+//! `slow::foo`, which does NOT contain `::slow::` and would never be selected —
+//! gating without re-running deletes the test. Nesting it one level deeper
+//! yields `sidecar::slow::foo`, which the nightly filter matches.
+//!
+//! The read-side test stays in the per-PR gate: ~0.35s, and it guards the
+//! mmap-vs-read decision, the cheaper half to regress.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -17,6 +38,10 @@ use std::ops::ControlFlow;
 
 use ferrosa_index::{IndexKey, RowPosition};
 use ferrosa_storage::index::sidecar::{SidecarReader, SidecarWriter};
+// Only the `slow-tests` writer test builds a memtable index; importing it
+// unconditionally leaves an unused import in the default build, which CI's
+// `clippy --all-targets -D warnings` rejects.
+#[cfg(feature = "slow-tests")]
 use ferrosa_storage::memtable::index::MemtableIndex;
 
 // --- peak-additional-heap tracker (scoped to this integration-test binary) ---
@@ -85,7 +110,22 @@ fn measure_peak<R>(f: impl FnOnce() -> R) -> (R, i64) {
 /// partitions) plus as many under other keys.
 fn write_sidecar(dir: &std::path::Path, n: usize) -> std::path::PathBuf {
     let path = dir.join(format!("7-idx_by_tenant-{n}.sidecar"));
-    let entries: Vec<(IndexKey, RowPosition)> = (0..n)
+    let entries: Vec<(IndexKey, RowPosition)> = fixture_entries(n);
+    SidecarWriter::write(&path, &entries).expect("write sidecar");
+    path
+}
+
+/// The postings both sidecar tests use: `n` under one hot key plus `n` spread
+/// over distinct keys — the shape a tenant-wide index has.
+///
+/// ONE definition, shared by the read-side test (which writes them to a file)
+/// and the write-side test (which inserts them into a memtable index). They
+/// used to build this independently and had already drifted: the file fixture
+/// zero-padded to 8 digits, the memtable fixture to 16. Two generators for one
+/// fixture means a change to the shape lands in one and not the other, and the
+/// pair of tests stops describing the same thing while still both passing.
+fn fixture_entries(n: usize) -> Vec<(IndexKey, RowPosition)> {
+    (0..n)
         .flat_map(|i| {
             let partition_key = format!("tenant-partition-key-{i:016}").into_bytes();
             [
@@ -97,7 +137,7 @@ fn write_sidecar(dir: &std::path::Path, n: usize) -> std::path::PathBuf {
                     },
                 ),
                 (
-                    IndexKey(format!("tenant-{i:08}").into_bytes()),
+                    IndexKey(format!("tenant-{i:016}").into_bytes()),
                     RowPosition {
                         partition_key,
                         clustering_key: Vec::new(),
@@ -105,9 +145,7 @@ fn write_sidecar(dir: &std::path::Path, n: usize) -> std::path::PathBuf {
                 ),
             ]
         })
-        .collect();
-    SidecarWriter::write(&path, &entries).expect("write sidecar");
-    path
+        .collect()
 }
 
 /// Open the sidecar and walk every posting of the hot key, returning how
@@ -157,32 +195,26 @@ fn opening_and_walking_a_sidecar_holds_a_bounded_heap_independent_of_its_size() 
 
 // ── Writing: the flush side must stream too ──────────────────────────────────
 
-/// A memtable index holding `n` postings under one hot key plus `n` spread
-/// over distinct keys — the shape a tenant-wide index has at flush time.
+/// A memtable index holding the same postings the file fixture uses — see
+/// [`fixture_entries`]. Sharing one generator is what keeps the read-side and
+/// write-side tests describing the same shape.
+///
+/// Gated with the test that uses it: in the default (non-`slow-tests`) build
+/// this helper has no caller, and CI's `clippy --all-targets -D warnings`
+/// rejects the dead code that would otherwise result.
+#[cfg(feature = "slow-tests")]
 fn memtable_index_with(n: usize) -> MemtableIndex {
     let index = MemtableIndex::new();
-    (0..n).for_each(|i| {
-        let partition_key = format!("tenant-partition-key-{i:016}").into_bytes();
-        index.insert(
-            IndexKey(b"tenant-hot".to_vec()),
-            RowPosition {
-                partition_key: partition_key.clone(),
-                clustering_key: Vec::new(),
-            },
-        );
-        index.insert(
-            IndexKey(format!("tenant-{i:016}").into_bytes()),
-            RowPosition {
-                partition_key,
-                clustering_key: Vec::new(),
-            },
-        );
-    });
+    for (key, position) in fixture_entries(n) {
+        index.insert(key, position);
+    }
     index
 }
 
 /// Hard budget for writing a sidecar out of a memtable index: one entry in
 /// flight plus the writer's own buffers, whatever the index holds.
+/// Gated with the test that asserts against it (see `memtable_index_with`).
+#[cfg(feature = "slow-tests")]
 const WRITE_BUDGET_BYTES: i64 = 256 * 1024;
 
 /// Flushing an index to its sidecar must not copy the index to do it.
@@ -195,36 +227,48 @@ const WRITE_BUDGET_BYTES: i64 = 256 * 1024;
 ///
 /// The tree is already in `(key, row)` order, which is exactly the order the
 /// sidecar wants, so the entries can go straight to disk one at a time.
-#[test]
-fn writing_a_sidecar_from_a_memtable_index_holds_a_bounded_heap() {
-    const SMALL_N: usize = 2_000;
-    const LARGE_N: usize = 64_000;
+///
+/// Gated behind `slow-tests`: see the module docs at the top of this file for
+/// why the nesting is `sidecar::slow` rather than a bare `mod slow`.
+#[cfg(feature = "slow-tests")]
+mod sidecar {
+    mod slow {
+        use super::super::*;
 
-    let dir = tempfile::tempdir().unwrap();
-    let small_index = memtable_index_with(SMALL_N);
-    let large_index = memtable_index_with(LARGE_N);
+        #[test]
+        fn writing_a_sidecar_from_a_memtable_index_holds_a_bounded_heap() {
+            const SMALL_N: usize = 2_000;
+            const LARGE_N: usize = 64_000;
 
-    let small_path = dir.path().join("9-idx_small.sidecar");
-    let large_path = dir.path().join("9-idx_large.sidecar");
+            let dir = tempfile::tempdir().unwrap();
+            let small_index = memtable_index_with(SMALL_N);
+            let large_index = memtable_index_with(LARGE_N);
 
-    let (small_written, small_peak) =
-        measure_peak(|| SidecarWriter::write_from_source(&small_path, &small_index.pin()).unwrap());
-    let (large_written, large_peak) =
-        measure_peak(|| SidecarWriter::write_from_source(&large_path, &large_index.pin()).unwrap());
+            let small_path = dir.path().join("9-idx_small.sidecar");
+            let large_path = dir.path().join("9-idx_large.sidecar");
 
-    assert_eq!(small_written, SMALL_N as u64 * 2, "every posting written");
-    assert_eq!(large_written, LARGE_N as u64 * 2, "every posting written");
-    assert!(
-        large_peak <= WRITE_BUDGET_BYTES,
-        "writing a {LARGE_N}-key index peaked at {large_peak} bytes of heap (budget \
-         {WRITE_BUDGET_BYTES}); the flush must stream its postings, not copy them"
-    );
-    assert!(
-        large_peak <= small_peak * 2 + 64 * 1024,
-        "write heap must not grow with the index: {SMALL_N} keys peaked at {small_peak} bytes, \
-         {LARGE_N} at {large_peak}"
-    );
+            let (small_written, small_peak) = measure_peak(|| {
+                SidecarWriter::write_from_source(&small_path, &small_index.pin()).unwrap()
+            });
+            let (large_written, large_peak) = measure_peak(|| {
+                SidecarWriter::write_from_source(&large_path, &large_index.pin()).unwrap()
+            });
 
-    // Streaming is only worth anything if the file is still correct.
-    assert_eq!(open_and_walk(&large_path), LARGE_N, "hot key round-trips");
+            assert_eq!(small_written, SMALL_N as u64 * 2, "every posting written");
+            assert_eq!(large_written, LARGE_N as u64 * 2, "every posting written");
+            assert!(
+                large_peak <= WRITE_BUDGET_BYTES,
+                "writing a {LARGE_N}-key index peaked at {large_peak} bytes of heap (budget \
+                 {WRITE_BUDGET_BYTES}); the flush must stream its postings, not copy them"
+            );
+            assert!(
+                large_peak <= small_peak * 2 + 64 * 1024,
+                "write heap must not grow with the index: {SMALL_N} keys peaked at {small_peak} bytes, \
+                 {LARGE_N} at {large_peak}"
+            );
+
+            // Streaming is only worth anything if the file is still correct.
+            assert_eq!(open_and_walk(&large_path), LARGE_N, "hot key round-trips");
+        }
+    }
 }

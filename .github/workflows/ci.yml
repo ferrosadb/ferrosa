@@ -103,6 +103,13 @@ jobs:
           # and nightly-fuzz `fuzz`, so they restore one dependency cache.
           shared-key: workspace-test-all-features-debug1
           save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Install cargo-nextest
+        # nextest runs one process per test and schedules across every core,
+        # where libtest runs each test *binary* serially. The suite's wall clock
+        # was therefore the sum of every binary's slowest test: a single
+        # ~840s test (sidecar_memory_bound) held 43% of this job on its own.
+        # Pinned like every other action in this file.
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
       - name: Free disk space
         # The --all-features debug test build alone exceeds 30GB of target
         # artifacts; the old reclaim (dotnet/android/ghc ≈ 11GB) still left
@@ -144,26 +151,35 @@ jobs:
           # they run nightly in nightly-slow-tests.yml.
           # LazyFS crash harness is unimplemented (T-070); in-process durability
           # probes cover ordering until the crash harness exists.
-          cargo test --all-features --workspace --lib --tests \
+          # nextest, not libtest: it runs one process per test and schedules
+          # across every core. libtest runs each test *binary* serially, so the
+          # suite's wall clock was the sum of every binary's slowest test and
+          # one ~840s test held 43% of this job. Same tests, same assertions,
+          # same selection flags — only the scheduler differs.
+          #
+          # Note: the `--skip` list below is a libtest-style pattern list and is
+          # accepted unchanged by `nextest run --skip`. `--exclude` and
+          # `--lib`/`--tests` have the same meaning in both.
+          cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -- --skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
-               --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
-               --skip dep_wait_ordering \
-               --skip lwt_batch_atomicity_all \
-               --skip clock_skew_large_preaccept \
-               --skip binary_ \
-               --skip concurrent_write --skip many_flushes \
-               --skip flush_2000 --skip single_writer --skip write_flush_compact \
-               --skip reads_never_panic_on_arbitrary_content \
-               --skip corrupt_sstable_bytes_never_panic_never_oom \
-               --skip peak_resident_readers_within_cap --skip streaming_equals_single_pass \
-               --skip bounded_fetch_reassembles_to_single_pass \
-               --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
-               --skip differential_oracle \
-               --skip fly_multi_node_streaming_scan \
-               --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
-               --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
-               --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
+            --skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
+            --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
+            --skip dep_wait_ordering \
+            --skip lwt_batch_atomicity_all \
+            --skip clock_skew_large_preaccept \
+            --skip binary_ \
+            --skip concurrent_write --skip many_flushes \
+            --skip flush_2000 --skip single_writer --skip write_flush_compact \
+            --skip reads_never_panic_on_arbitrary_content \
+            --skip corrupt_sstable_bytes_never_panic_never_oom \
+            --skip peak_resident_readers_within_cap --skip streaming_equals_single_pass \
+            --skip bounded_fetch_reassembles_to_single_pass \
+            --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
+            --skip differential_oracle \
+            --skip fly_multi_node_streaming_scan \
+            --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
+            --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
+            --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no
