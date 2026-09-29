@@ -139,7 +139,7 @@ impl ClusterCoordinator {
     /// answers at the wrong consistency.
     ///
     /// Fast path: when the local node provably owns every token range at the
-    /// configured consistency (`range_read_remotes` empty — e.g. CL=ONE with
+    /// configured consistency (`range_read_remotes` needs none — e.g. CL=ONE with
     /// the keyspace RF spanning the cluster), count locally via
     /// `StorageEngine::count_range`, which uses the metadata-only merger
     /// (`range_merger::merger_for_metadata_sources`) so cell payloads are
@@ -203,12 +203,11 @@ impl ClusterCoordinator {
         // (which fans out + dedups by token) sees every row.
         //
         // Reuse the same CL/RF fan-out decision the streaming range read uses.
-        // When `range_read_remotes` is empty the local node provably owns every
+        // When `range_read_remotes` needs none the local node provably owns every
         // token range at this CL, so the fast metadata path is exact. Otherwise
         // we MUST fan out across replicas and count the token-deduped result —
         // never the local subset.
-        let remotes = self.range_read_remotes(cl, self.default_rf);
-        if remotes.is_empty() {
+        if self.range_read_remotes(cl, self.default_rf).needed == 0 {
             return self
                 .storage
                 .count_range_matching(table_id, None, None, matches)
@@ -1192,6 +1191,19 @@ fn build_out_fragment(
 struct RemoteFanout {
     streams: Vec<ClusterPartitionStream>,
     fire_failures: usize,
+    /// The most recent fire error, so a refusal names its cause.
+    last_error: Option<String>,
+}
+
+/// The remote replicas a range scan may read, in ring order, and how many of
+/// them the consistency level needs beyond the local read.
+///
+/// `candidates` holds every remote, not only the first `needed`: when one
+/// cannot be reached the fan-out moves on to the next, so QUORUM with one of
+/// three RF=3 replicas down still reads from a live one (t_7c01df7e).
+struct RangeReadReplicas {
+    candidates: Vec<(uuid::Uuid, String)>,
+    needed: usize,
 }
 
 /// Per-replica windowed continuation forwarder (t_a0f922a3 mode 2).
@@ -1462,17 +1474,24 @@ impl ClusterCoordinator {
         )))
     }
 
+    /// Open a fragment stream to `replicas.needed` remotes, trying the
+    /// candidates in ring order and moving past any that cannot be fired to.
     async fn fan_out_remote_fragment_streams(
         &self,
         table_id: &TableId,
-        remotes: &[(uuid::Uuid, String)],
+        replicas: &RangeReadReplicas,
         projected_regular_ordinals: Option<&[u16]>,
         resume: Option<&ScanResume>,
+        window_chunks: u32,
     ) -> crate::error::Result<RemoteFanout> {
-        let mut streams: Vec<ClusterPartitionStream> = Vec::with_capacity(remotes.len());
+        let mut streams: Vec<ClusterPartitionStream> = Vec::with_capacity(replicas.needed);
         let mut fire_failures = 0usize;
+        let mut last_error = None;
 
-        for (host_id, _addr) in remotes {
+        for (host_id, _addr) in &replicas.candidates {
+            if streams.len() == replicas.needed {
+                break;
+            }
             match self
                 .spawn_replica_fragment_stream(
                     table_id,
@@ -1480,7 +1499,7 @@ impl ClusterCoordinator {
                     projected_regular_ordinals,
                     None,
                     resume,
-                    STREAM_WINDOW_CHUNKS,
+                    window_chunks,
                 )
                 .await
             {
@@ -1488,9 +1507,12 @@ impl ClusterCoordinator {
                 Err(e) => {
                     tracing::warn!(
                         peer = %host_id,
-                        "streaming range read: failed to fire request: {e}"
+                        needed = replicas.needed,
+                        candidates = replicas.candidates.len(),
+                        "streaming range read: failed to fire request, trying the next replica: {e}"
                     );
                     fire_failures += 1;
+                    last_error = Some(e.to_string());
                 }
             }
         }
@@ -1498,6 +1520,7 @@ impl ClusterCoordinator {
         Ok(RemoteFanout {
             streams,
             fire_failures,
+            last_error,
         })
     }
 }
@@ -1648,28 +1671,28 @@ impl ClusterCoordinator {
         .await
     }
 
-    /// Compute the CL-selected remote replica set for a range scan: the ordered
-    /// remote `(host_id, addr)` list truncated to the count
-    /// [`remote_count_for_cl`] demands beyond the local read.
+    /// Compute the remote replicas a range scan may read: every remote
+    /// `(host_id, addr)` in ring order, plus the count [`remote_count_for_cl`]
+    /// demands beyond the local read.
     fn range_read_remotes(
         &self,
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
-    ) -> Vec<(uuid::Uuid, String)> {
+    ) -> RangeReadReplicas {
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
         let local_id = self.local_node_id;
         let node_count = node_ids.len();
-        let all_remotes: Vec<(uuid::Uuid, String)> = node_ids
+        let candidates: Vec<(uuid::Uuid, String)> = node_ids
             .iter()
             .filter(|&&id| id != local_id)
             .filter_map(|&id| ring.get_node(id).map(|n| (n.host_id, n.addr.clone())))
             .collect();
         drop(ring);
 
-        let cl_remote_count =
-            remote_count_for_cl(cl, replication_factor, node_count, all_remotes.len());
-        all_remotes.into_iter().take(cl_remote_count).collect()
+        let needed = remote_count_for_cl(cl, replication_factor, node_count, candidates.len());
+        debug_assert!(needed <= candidates.len());
+        RangeReadReplicas { candidates, needed }
     }
 
     /// Drive the local resume-bounded fragmented stream + the CL-selected
@@ -1682,22 +1705,30 @@ impl ClusterCoordinator {
         table_id: &TableId,
         wanted: Option<Vec<u16>>,
         resume: Option<&ScanResume>,
-        remotes: &[(uuid::Uuid, String)],
+        replicas: &RangeReadReplicas,
     ) -> crate::error::Result<ClusterPartitionStream> {
         let fanout = self
-            .fan_out_remote_fragment_streams(table_id, remotes, wanted.as_deref(), resume)
+            .fan_out_remote_fragment_streams(
+                table_id,
+                replicas,
+                wanted.as_deref(),
+                resume,
+                STREAM_WINDOW_CHUNKS,
+            )
             .await?;
         if fanout.streams.is_empty() {
             return Err(ClusterError::Internal(format!(
-                "paged streaming range read: every replica fire failed ({} of {})",
+                "paged streaming range read: every replica fire failed ({} of {}): {}",
                 fanout.fire_failures,
-                remotes.len()
+                replicas.candidates.len(),
+                fanout.last_error.as_deref().unwrap_or("no replica tried")
             )));
         }
-        if fanout.fire_failures > 0 {
+        if fanout.streams.len() < replicas.needed {
             tracing::warn!(
                 failed = fanout.fire_failures,
                 succeeded = fanout.streams.len(),
+                needed = replicas.needed,
                 "paged streaming range read: partial fan-out — some replicas could not be reached"
             );
         }
@@ -1742,9 +1773,9 @@ impl ClusterCoordinator {
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
     ) -> crate::error::Result<ClusterPartitionStream> {
-        let remotes = self.range_read_remotes(cl, replication_factor);
+        let replicas = self.range_read_remotes(cl, replication_factor);
 
-        if remotes.is_empty() {
+        if replicas.needed == 0 {
             let stream: ClusterPartitionStream = Box::pin(
                 self.storage
                     .range_iter_fragmented(table_id, resume.map(|r| &r.key), None)
@@ -1753,7 +1784,7 @@ impl ClusterCoordinator {
             return Ok(crate::write_path::resume_filtered_stream(stream, resume));
         }
 
-        self.paged_multi_replica_stream(table_id, None, resume, &remotes)
+        self.paged_multi_replica_stream(table_id, None, resume, &replicas)
             .await
     }
 
@@ -1769,9 +1800,9 @@ impl ClusterCoordinator {
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
     ) -> crate::error::Result<ClusterPartitionStream> {
-        let remotes = self.range_read_remotes(cl, replication_factor);
+        let replicas = self.range_read_remotes(cl, replication_factor);
 
-        if remotes.is_empty() {
+        if replicas.needed == 0 {
             let stream: ClusterPartitionStream = Box::pin(
                 self.storage
                     .range_iter_projected_fragmented(table_id, wanted, resume.map(|r| &r.key), None)
@@ -1780,7 +1811,7 @@ impl ClusterCoordinator {
             return Ok(crate::write_path::resume_filtered_stream(stream, resume));
         }
 
-        self.paged_multi_replica_stream(table_id, Some(wanted), resume, &remotes)
+        self.paged_multi_replica_stream(table_id, Some(wanted), resume, &replicas)
             .await
     }
 
@@ -1875,26 +1906,8 @@ impl ClusterCoordinator {
         replication_factor: usize,
         projected_regular_ordinals: Option<Vec<u16>>,
     ) -> crate::error::Result<ClusterPartitionStream> {
-        let ring = self.ring.load();
-        let node_ids = ring.node_ids();
-        let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
-            .iter()
-            .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
-            .collect();
-        drop(ring);
-
-        let local_id = self.local_node_id;
-        let node_count = nodes.len();
-        let all_remotes: Vec<(uuid::Uuid, String)> = nodes
-            .iter()
-            .filter(|(id, _)| *id != local_id)
-            .filter_map(|(_, host)| host.clone())
-            .collect();
-        let cl_remote_count =
-            remote_count_for_cl(cl, replication_factor, node_count, all_remotes.len());
-        let remotes: Vec<(uuid::Uuid, String)> =
-            all_remotes.into_iter().take(cl_remote_count).collect();
-        let expected_done = remotes.len();
+        let replicas = self.range_read_remotes(cl, replication_factor);
+        let expected_done = replicas.needed;
 
         // Multiple remote replicas: token-aware N-way streaming merge of the
         // local fragmented stream + one fragment stream per remote replica.
@@ -1910,21 +1923,25 @@ impl ClusterCoordinator {
             let fanout = self
                 .fan_out_remote_fragment_streams(
                     table_id,
-                    &remotes,
+                    &replicas,
                     projected_regular_ordinals.as_deref(),
                     None,
+                    STREAM_WINDOW_CHUNKS,
                 )
                 .await?;
             if fanout.streams.is_empty() {
                 return Err(ClusterError::Internal(format!(
-                    "streaming range read: every replica fire failed ({} of {})",
-                    fanout.fire_failures, expected_done
+                    "streaming range read: every replica fire failed ({} of {}): {}",
+                    fanout.fire_failures,
+                    replicas.candidates.len(),
+                    fanout.last_error.as_deref().unwrap_or("no replica tried")
                 )));
             }
-            if fanout.fire_failures > 0 {
+            if fanout.streams.len() < expected_done {
                 tracing::warn!(
                     failed = fanout.fire_failures,
                     succeeded = fanout.streams.len(),
+                    needed = expected_done,
                     "streaming range read: partial fan-out — some replicas could not be reached"
                 );
             }
@@ -2007,9 +2024,6 @@ impl ClusterCoordinator {
             return Ok(stream);
         }
 
-        let (host_id, _addr) = remotes.first().ok_or_else(|| {
-            ClusterError::Internal("streaming range read: missing remote replica".into())
-        })?;
         // Windowed continuation applies to the unbounded fragment-merged shape
         // (`row_limit == 0`). The `row_limit > 0` shape targets bounded
         // specific partitions (LIMIT with partition-key equality), whose
@@ -2020,21 +2034,24 @@ impl ClusterCoordinator {
         } else {
             0
         };
-        let remote_stream = self
-            .spawn_replica_fragment_stream(
+        debug_assert_eq!(expected_done, 1);
+        let fanout = self
+            .fan_out_remote_fragment_streams(
                 table_id,
-                *host_id,
+                &replicas,
                 projected_regular_ordinals.as_deref(),
-                None,
                 None,
                 window_chunks,
             )
-            .await
-            .map_err(|e| {
-                ClusterError::Internal(format!(
-                    "streaming range read: remote replica fire failed ({host_id}): {e}"
-                ))
-            })?;
+            .await?;
+        let Some(remote_stream) = fanout.streams.into_iter().next() else {
+            return Err(ClusterError::Internal(format!(
+                "streaming range read: every replica fire failed ({} of {}): {}",
+                fanout.fire_failures,
+                replicas.candidates.len(),
+                fanout.last_error.as_deref().unwrap_or("no replica tried")
+            )));
+        };
 
         let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
         let storage = self.storage.clone();

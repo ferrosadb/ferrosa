@@ -1329,3 +1329,132 @@ fn multi_replica_paged_projected_scan_returns_all_rows_across_pages() {
         coord_srv.shutdown(Duration::from_millis(50)).await;
     });
 }
+
+/// Drain a coordinated scan, failing on any error or on a pull that stalls.
+async fn drain_partition_keys(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    what: &str,
+) -> Vec<Vec<u8>> {
+    let mut keys = Vec::new();
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await
+        .unwrap_or_else(|_| panic!("{what}: a pull stalled for 30s"))
+    {
+        let p = item.unwrap_or_else(|e| panic!("{what}: stream item failed: {e}"));
+        keys.push(p.key.key.as_bytes().to_vec());
+    }
+    keys
+}
+
+/// t_7c01df7e live finding: with one of three RF=3 replicas stopped, a QUORUM
+/// scan through a survivor failed "paged streaming range read: every replica
+/// fire failed (1 of 1)". QUORUM needs the local read plus ONE remote, and the
+/// coordinator picked that remote as the first node in ring order with no
+/// fallback — so when that node was the stopped one, the scan refused although
+/// a live replica could satisfy the consistency level.
+///
+/// Node2 is the first remote in ring order (the ring keys nodes by id), so it
+/// is the down one: a ring member the peer manager holds no connection to, as
+/// after the live node's process exited. Stopping a loopback `RpcServer` is
+/// not enough — its established connection keeps serving.
+#[test]
+fn quorum_scan_reads_from_a_live_replica_when_the_first_is_down() {
+    let _serial = serial_guard();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        const N: usize = 100;
+        let seed = |storage: &StorageEngine| seed_local(storage, N);
+        let dir_local = tempfile::tempdir().unwrap();
+        let dir3 = tempfile::tempdir().unwrap();
+        let storage = engine(dir_local.path());
+        seed(&storage);
+
+        let coord_id = uuid::Uuid::new_v4();
+        let down_id = uuid::Uuid::new_v4();
+        let r3_id = uuid::Uuid::new_v4();
+        let (srv3, addr3, back3) = spawn_storage_replica_seeded(r3_id, dir3.path(), &seed).await;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(1, ring_node(coord_id, "127.0.0.1:1"));
+        ring.add_node(2, ring_node(down_id, "127.0.0.1:2"));
+        ring.add_node(3, ring_node(r3_id, &addr3.to_string()));
+        ring.assign_tokens(1, &[i64::MIN]);
+        ring.assign_tokens(2, &[0]);
+        ring.assign_tokens(3, &[i64::MAX]);
+
+        let peers = Arc::new(PeerManager::new(
+            Arc::new(net_config()),
+            coord_id,
+            Arc::new(NoopListener),
+        ));
+        peers.ensure_peer(r3_id, &addr3.to_string()).await.unwrap();
+
+        let coordinator = Arc::new(ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            peers,
+            1,
+            storage,
+            3,
+            ConsistencyLevel::All,
+        ));
+        let frame_router = Arc::new(StreamFrameRouter::new(coordinator.stream_router()));
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::RangeReadStreamChunk, frame_router.clone());
+        registry.register(MsgType::RangeReadStreamHeartbeat, frame_router.clone());
+        registry.register(MsgType::RangeReadStreamDone, frame_router.clone());
+        let coord_srv = Arc::new(RpcServer::new(net_config(), coord_id, registry));
+        let coord_addr = coord_srv.start_and_get_addr().await.unwrap();
+        back3
+            .ensure_peer(coord_id, &coord_addr.to_string())
+            .await
+            .unwrap();
+        let wp = WritePath::cluster(coordinator);
+
+        let table_id = TableId::new(KS, TBL);
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 3,
+        };
+        let expected: std::collections::BTreeSet<Vec<u8>> =
+            (0..N).map(|i| format!("pk-{i:08}").into_bytes()).collect();
+
+        // Paged shape: the CQL `SELECT *` first page (the live failure), and
+        // the unpaged shape, which reads one remote alongside the local read.
+        // Both are opened before asserting so a red run reports each.
+        let paged = wp
+            .range_read_projected_stream_all_from(
+                &table_id,
+                vec![0],
+                None,
+                ConsistencyLevel::Quorum,
+                &strategy,
+            )
+            .await;
+        let unpaged = wp
+            .range_read_stream_all_with(&table_id, 0, ConsistencyLevel::Quorum, &strategy)
+            .await;
+        let refusals: Vec<String> = [("paged", &paged), ("unpaged", &unpaged)]
+            .iter()
+            .filter_map(|(what, r)| r.as_ref().err().map(|e| format!("{what}: {e}")))
+            .collect();
+        assert!(
+            refusals.is_empty(),
+            "QUORUM scans must read from the live replica, not refuse: {refusals:?}"
+        );
+
+        for (what, stream) in [("paged", paged), ("unpaged", unpaged)] {
+            let keys = drain_partition_keys(stream.unwrap(), what).await;
+            let got: std::collections::BTreeSet<Vec<u8>> = keys.iter().cloned().collect();
+            assert_eq!(got.len(), keys.len(), "{what} scan delivered duplicates");
+            assert_eq!(got, expected, "{what} scan lost or invented keys");
+        }
+
+        srv3.shutdown(Duration::from_millis(50)).await;
+        coord_srv.shutdown(Duration::from_millis(50)).await;
+        drop((dir_local, dir3));
+    });
+}
