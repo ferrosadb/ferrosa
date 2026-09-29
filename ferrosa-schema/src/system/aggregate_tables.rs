@@ -71,41 +71,7 @@ impl SystemSchemaAggregatesTable {
 /// Produces lowercase CQL type names matching Cassandra's `system_schema.aggregates`
 /// column format.
 fn cql_type_to_string(ty: &CqlType) -> String {
-    match ty {
-        CqlType::Ascii => "ascii".to_string(),
-        CqlType::Bigint => "bigint".to_string(),
-        CqlType::Blob => "blob".to_string(),
-        CqlType::Boolean => "boolean".to_string(),
-        CqlType::Counter => "counter".to_string(),
-        CqlType::Decimal => "decimal".to_string(),
-        CqlType::Double => "double".to_string(),
-        CqlType::Float => "float".to_string(),
-        CqlType::Int => "int".to_string(),
-        CqlType::Timestamp => "timestamp".to_string(),
-        CqlType::Uuid => "uuid".to_string(),
-        CqlType::Varchar => "text".to_string(),
-        CqlType::Varint => "varint".to_string(),
-        CqlType::Timeuuid => "timeuuid".to_string(),
-        CqlType::Inet => "inet".to_string(),
-        CqlType::Date => "date".to_string(),
-        CqlType::Time => "time".to_string(),
-        CqlType::Smallint => "smallint".to_string(),
-        CqlType::Tinyint => "tinyint".to_string(),
-        CqlType::Duration => "duration".to_string(),
-        CqlType::List(inner) => format!("list<{}>", cql_type_to_string(inner)),
-        CqlType::Set(inner) => format!("set<{}>", cql_type_to_string(inner)),
-        CqlType::Map(k, v) => {
-            format!("map<{}, {}>", cql_type_to_string(k), cql_type_to_string(v))
-        }
-        CqlType::Tuple(types) => {
-            let inner: Vec<String> = types.iter().map(cql_type_to_string).collect();
-            format!("tuple<{}>", inner.join(", "))
-        }
-        CqlType::Vector(elem, dim) => {
-            format!("vector<{}, {}>", cql_type_to_string(elem), dim)
-        }
-        CqlType::Udt { keyspace, name, .. } => format!("{keyspace}.{name}"),
-    }
+    ferrosa_common::cql_type::names::display_name(ty)
 }
 
 /// Serialize a list of strings into a JSON array representation.
@@ -222,6 +188,20 @@ mod tests {
     use crate::metadata::aggregate::UserAggregateMetadata;
     use ferrosa_common::CqlType;
     use ferrosa_common::CqlValue;
+
+    /// T-022: the aggregate stringifier resolves names via the registry.
+    #[test]
+    fn type_names_consumers_agree() {
+        use ferrosa_common::cql_type::names;
+        for ty in names::SCALAR_TYPES.iter() {
+            assert_eq!(cql_type_to_string(ty), names::scalar_name(ty).unwrap());
+        }
+        let nested = CqlType::Map(
+            Box::new(CqlType::Varchar),
+            Box::new(CqlType::List(Box::new(CqlType::Int))),
+        );
+        assert_eq!(cql_type_to_string(&nested), "map<text, list<int>>");
+    }
 
     fn empty_snapshot() -> Arc<ArcSwap<SchemaSnapshot>> {
         Arc::new(ArcSwap::new(Arc::new(SchemaSnapshot::new())))

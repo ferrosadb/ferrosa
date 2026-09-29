@@ -123,3 +123,5 @@ validation. Live gaps are tracked in [specs/fmea.md](specs/fmea.md).
 - [Data flow](specs/data-flow.md) — DDL apply + auth-check sequence
 </content>
 </invoke>
+
+> T-022: `cql_to_marshal_type` and the aggregate-table type stringifier delegate to `ferrosa_common::cql_type::names`.

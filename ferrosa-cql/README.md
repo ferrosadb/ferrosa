@@ -333,3 +333,5 @@ for older storage/cluster errors and logs when it is used.
 - [FMEA / known issues](specs/fmea.md) — failure modes + real gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
 - Topic reference: [`specs/reference/cql.md`](../specs/reference/cql.md)
+
+> T-022: `bridge::{resolve_builtin_type, cql_type_name, cql_type_display_name}` delegate to `ferrosa_common::cql_type::names`.

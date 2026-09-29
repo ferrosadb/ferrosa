@@ -4,6 +4,8 @@
 //! crates below `ferrosa-cql` in the dependency graph) can reference them
 //! without creating circular dependencies.
 
+pub mod names;
+
 use std::net::IpAddr;
 
 use num_bigint::BigInt;

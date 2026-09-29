@@ -96,3 +96,5 @@ gap — see [specs/fmea.md](specs/fmea.md) and [specs/roadmap.md](specs/roadmap.
 - [Architecture overview](specs/overview.md) — module map, invariants, data flow
 - [FMEA / known issues](specs/fmea.md) — failure modes + gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+> T-022: `TypeParser` resolves scalar names through `ferrosa_common::cql_type::names`; it keeps only the type grammar.

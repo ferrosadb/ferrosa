@@ -34,6 +34,11 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
 - **CQL type model** — `DataType` (scalar descriptor, exhaustive: not `#[non_exhaustive]`),
   `CqlType` (full type tree incl. List/Map/Set/Tuple/Udt/Vector, with protocol
   `type_id()`), and `CqlValue` (runtime value with manual IEEE-754-total `Ord`).
+- **CQL type-name registry** — `cql_type::names` is the single table mapping
+  scalar CQL names (and aliases such as `varchar`) to `CqlType`, canonical name
+  and Cassandra marshal class, plus `kind_name` / `display_name` stringifiers.
+  Every front-end resolves through it (T-022, FM-20); a new scalar is added in
+  one place (the exhaustive `entry` match plus `SCALAR_TYPES`).
 - **Errors** — `Error` (`#[non_exhaustive]`) + `Result`; notable typed variant
   `Error::CorruptSstable { gen, min_token, max_token }` with `corrupt_sstable()`
   / `corrupt_sstable_range()` for failover + targeted repair, and

@@ -39,3 +39,9 @@ severities are high.
 - `corrupt_simple_cell_fails_the_read` (RB-Tcf7ca2cc),
   `collection_corrupt_element_is_error_not_none` (RB-8) and the
   `corrupt_element_count()` counter.
+
+## T-022 type-name registry
+
+| ID | Failure mode | Effect | Detection | Mitigation |
+|----|--------------|--------|-----------|------------|
+| RB-T022-01 | `TypeParser::parse_type` keeps its own scalar switch | Drift from the CQL bridge and schema tables (FM-20) | `type_names_consumers_agree` in `ferrosa-cql` (exercises `parse_cql_type`) | Scalars resolve via `ferrosa_common::cql_type::names::scalar_from_name`; the parser keeps only the collection/tuple/vector/frozen/UDT grammar |

@@ -3,7 +3,7 @@
 //! Maps CQL type names to Cassandra marshal type class names and converts
 //! `TableMetadata` into `ferrosa_common::schema::TableSchema`.
 
-use ferrosa_common::cql_type::CqlType;
+use ferrosa_common::cql_type::names;
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 
 use crate::metadata::column::ColumnKind;
@@ -51,81 +51,13 @@ pub fn cql_to_marshal_type(cql_type: &str) -> String {
     // Scalar types. A name that is not a scalar (a UDT name, `tuple<..>`,
     // `vector<..>`) is returned as-is: it is not a marshal class this
     // function can name, so the caller sees the original text.
-    match scalar_from_name(trimmed)
+    match names::scalar_from_name(trimmed)
         .as_ref()
-        .and_then(scalar_marshal_class)
+        .and_then(names::scalar_marshal_class)
     {
         Some(class) => class.to_string(),
         None => trimmed.to_string(),
     }
-}
-
-/// Parse a scalar CQL type name (case-sensitive, as before) into a `CqlType`.
-///
-/// Returns `None` for anything that is not a scalar keyword.
-fn scalar_from_name(name: &str) -> Option<CqlType> {
-    Some(match name {
-        "text" | "varchar" => CqlType::Varchar,
-        "int" => CqlType::Int,
-        "bigint" => CqlType::Bigint,
-        "boolean" => CqlType::Boolean,
-        "float" => CqlType::Float,
-        "double" => CqlType::Double,
-        "blob" => CqlType::Blob,
-        "timestamp" => CqlType::Timestamp,
-        "uuid" => CqlType::Uuid,
-        "timeuuid" => CqlType::Timeuuid,
-        "inet" => CqlType::Inet,
-        "counter" => CqlType::Counter,
-        "ascii" => CqlType::Ascii,
-        "decimal" => CqlType::Decimal,
-        "varint" => CqlType::Varint,
-        "smallint" => CqlType::Smallint,
-        "tinyint" => CqlType::Tinyint,
-        "date" => CqlType::Date,
-        "time" => CqlType::Time,
-        "duration" => CqlType::Duration,
-        _ => return None,
-    })
-}
-
-/// Marshal class for a scalar `CqlType`.
-///
-/// Exhaustive over `CqlType`: a new variant must choose a marshal class (or
-/// explicitly join the non-scalar group) here, rather than falling through
-/// to a pass-through string (jsonb hazard H3, FM-19).
-fn scalar_marshal_class(t: &CqlType) -> Option<&'static str> {
-    let class = match t {
-        CqlType::Varchar => "org.apache.cassandra.db.marshal.UTF8Type",
-        CqlType::Int => "org.apache.cassandra.db.marshal.Int32Type",
-        CqlType::Bigint => "org.apache.cassandra.db.marshal.LongType",
-        CqlType::Boolean => "org.apache.cassandra.db.marshal.BooleanType",
-        CqlType::Float => "org.apache.cassandra.db.marshal.FloatType",
-        CqlType::Double => "org.apache.cassandra.db.marshal.DoubleType",
-        CqlType::Blob => "org.apache.cassandra.db.marshal.BytesType",
-        CqlType::Timestamp => "org.apache.cassandra.db.marshal.TimestampType",
-        CqlType::Uuid => "org.apache.cassandra.db.marshal.UUIDType",
-        CqlType::Timeuuid => "org.apache.cassandra.db.marshal.TimeUUIDType",
-        CqlType::Inet => "org.apache.cassandra.db.marshal.InetAddressType",
-        CqlType::Counter => "org.apache.cassandra.db.marshal.CounterColumnType",
-        CqlType::Ascii => "org.apache.cassandra.db.marshal.AsciiType",
-        CqlType::Decimal => "org.apache.cassandra.db.marshal.DecimalType",
-        CqlType::Varint => "org.apache.cassandra.db.marshal.IntegerType",
-        CqlType::Smallint => "org.apache.cassandra.db.marshal.ShortType",
-        CqlType::Tinyint => "org.apache.cassandra.db.marshal.ByteType",
-        CqlType::Date => "org.apache.cassandra.db.marshal.SimpleDateType",
-        CqlType::Time => "org.apache.cassandra.db.marshal.TimeType",
-        CqlType::Duration => "org.apache.cassandra.db.marshal.DurationType",
-        // Non-scalars are composed by the string wrappers in
-        // `cql_to_marshal_type` (or passed through as UDT/tuple/vector text).
-        CqlType::List(_)
-        | CqlType::Map(_, _)
-        | CqlType::Set(_)
-        | CqlType::Tuple(_)
-        | CqlType::Udt { .. }
-        | CqlType::Vector(_, _) => return None,
-    };
-    Some(class)
 }
 
 /// Strip a wrapper type prefix like `set<...>` and return the inner type.
@@ -333,6 +265,8 @@ mod tests {
     use super::*;
     use crate::metadata::column::{ClusteringOrder, ColumnMetadata};
     use crate::metadata::table::TableParams;
+    use ferrosa_common::cql_type::names::{scalar_from_name, scalar_marshal_class};
+    use ferrosa_common::cql_type::CqlType;
     use indexmap::IndexMap;
     use std::collections::{HashMap, HashSet};
 

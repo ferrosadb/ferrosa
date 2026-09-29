@@ -47,3 +47,11 @@ every crate above it — severities are correspondingly high.
 **Detection gaps:** no in-crate test forces the HLC clock-error path (FC-1), no
 exhaustive `CqlValue` ordering property test (FC-3), and no observability on the
 `TaskPool::current()` fallback (FC-5).
+
+## T-022 type-name registry
+
+| ID | Failure mode | Effect | Detection | Mitigation |
+|----|--------------|--------|-----------|------------|
+| COM-T022-01 | A scalar name is added to one front-end switch but not another (drift, FM-20) | Same column type parses in one path and errors or mis-marshals in another | `type_names_round_trip_every_scalar`, consumer-agreement tests in `ferrosa-cql` and `ferrosa-schema` | One registry in `cql_type::names`; every former switch delegates to it |
+| COM-T022-02 | A new `CqlType` variant is omitted from the registry | Variant has no name or marshal class | Exhaustive `entry` match (compile error); `SCALAR_TYPES` length asserted in the round-trip test | No `_ =>` arm on `CqlType` in the registry |
+| COM-T022-03 | Case-sensitivity mismatch between callers (`cql_to_marshal_type` is exact, parsers fold case) | `INT` marshals as pass-through text | `lookup_is_exact_and_ci_variant_folds_case` pins both behaviours | `scalar_from_name` exact, `scalar_from_name_ci` folded; callers keep prior behaviour (drift recorded, not fixed) |

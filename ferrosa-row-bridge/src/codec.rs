@@ -549,27 +549,11 @@ impl<'a> TypeParser<'a> {
         let ident = self.read_ident()?;
         let lower = ident.to_ascii_lowercase();
 
+        if let Some(scalar) = ferrosa_common::cql_type::names::scalar_from_name(&lower) {
+            return Ok(scalar);
+        }
+
         match lower.as_str() {
-            "text" | "varchar" => Ok(CqlType::Varchar),
-            "int" => Ok(CqlType::Int),
-            "bigint" => Ok(CqlType::Bigint),
-            "smallint" => Ok(CqlType::Smallint),
-            "tinyint" => Ok(CqlType::Tinyint),
-            "float" => Ok(CqlType::Float),
-            "double" => Ok(CqlType::Double),
-            "boolean" => Ok(CqlType::Boolean),
-            "blob" => Ok(CqlType::Blob),
-            "uuid" => Ok(CqlType::Uuid),
-            "timeuuid" => Ok(CqlType::Timeuuid),
-            "timestamp" => Ok(CqlType::Timestamp),
-            "inet" => Ok(CqlType::Inet),
-            "ascii" => Ok(CqlType::Ascii),
-            "counter" => Ok(CqlType::Counter),
-            "varint" => Ok(CqlType::Varint),
-            "decimal" => Ok(CqlType::Decimal),
-            "date" => Ok(CqlType::Date),
-            "time" => Ok(CqlType::Time),
-            "duration" => Ok(CqlType::Duration),
             "list" => {
                 self.skip_whitespace();
                 self.consume(b'<')?;

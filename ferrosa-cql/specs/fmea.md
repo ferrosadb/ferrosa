@@ -66,3 +66,10 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
   native `fts_match` results on a 3-node cluster.
 - Postgres differential oracle (in `ferrosa-postgres`) guards the shared codec.
 - Per-opcode CQL metrics + Prometheus endpoint surface error/overload rates.
+
+## T-022 type-name registry
+
+| ID | Failure mode | Effect | Detection | Mitigation |
+|----|--------------|--------|-----------|------------|
+| CQL-T022-01 | `bridge::resolve_builtin_type`, `cql_type_name`, `cql_type_display_name` keep private name tables | Drift from the row-bridge parser and schema converters (FM-20) | `bridge::tests::type_names_consumers_agree` | Thin delegates to `ferrosa_common::cql_type::names` (see COM-T022-01) |
+| CQL-T022-02 | `connection.rs` and `router.rs` function-argument type switches still hold their own scalar names | Not covered by T-022 | Known, out of scope | Follow-up: migrate to the registry |

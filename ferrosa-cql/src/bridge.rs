@@ -871,34 +871,7 @@ fn today_cql_date() -> u32 {
 
 /// Human-readable name for a CqlType (for error messages).
 fn cql_type_name(t: &CqlType) -> &'static str {
-    match t {
-        CqlType::Ascii => "ascii",
-        CqlType::Bigint => "bigint",
-        CqlType::Blob => "blob",
-        CqlType::Boolean => "boolean",
-        CqlType::Counter => "counter",
-        CqlType::Decimal => "decimal",
-        CqlType::Double => "double",
-        CqlType::Float => "float",
-        CqlType::Int => "int",
-        CqlType::Timestamp => "timestamp",
-        CqlType::Uuid => "uuid",
-        CqlType::Varchar => "text",
-        CqlType::Varint => "varint",
-        CqlType::Timeuuid => "timeuuid",
-        CqlType::Inet => "inet",
-        CqlType::Date => "date",
-        CqlType::Time => "time",
-        CqlType::Smallint => "smallint",
-        CqlType::Tinyint => "tinyint",
-        CqlType::Duration => "duration",
-        CqlType::List(_) => "list",
-        CqlType::Map(_, _) => "map",
-        CqlType::Set(_) => "set",
-        CqlType::Tuple(_) => "tuple",
-        CqlType::Vector(_, _) => "vector",
-        CqlType::Udt { .. } => "udt",
-    }
+    ferrosa_common::cql_type::names::kind_name(t)
 }
 
 /// CQL type display name suitable for `system_schema.types` `field_types`.
@@ -906,45 +879,7 @@ fn cql_type_name(t: &CqlType) -> &'static str {
 /// Produces lowercase CQL type names (e.g. `"text"`, `"int"`, `"list<text>"`,
 /// `"map<text, int>"`, `"ks.typename"`).
 pub fn cql_type_display_name(t: &CqlType) -> String {
-    match t {
-        CqlType::Ascii => "ascii".to_string(),
-        CqlType::Bigint => "bigint".to_string(),
-        CqlType::Blob => "blob".to_string(),
-        CqlType::Boolean => "boolean".to_string(),
-        CqlType::Counter => "counter".to_string(),
-        CqlType::Decimal => "decimal".to_string(),
-        CqlType::Double => "double".to_string(),
-        CqlType::Float => "float".to_string(),
-        CqlType::Int => "int".to_string(),
-        CqlType::Timestamp => "timestamp".to_string(),
-        CqlType::Uuid => "uuid".to_string(),
-        CqlType::Varchar => "text".to_string(),
-        CqlType::Varint => "varint".to_string(),
-        CqlType::Timeuuid => "timeuuid".to_string(),
-        CqlType::Inet => "inet".to_string(),
-        CqlType::Date => "date".to_string(),
-        CqlType::Time => "time".to_string(),
-        CqlType::Smallint => "smallint".to_string(),
-        CqlType::Tinyint => "tinyint".to_string(),
-        CqlType::Duration => "duration".to_string(),
-        CqlType::List(inner) => format!("list<{}>", cql_type_display_name(inner)),
-        CqlType::Set(inner) => format!("set<{}>", cql_type_display_name(inner)),
-        CqlType::Map(k, v) => {
-            format!(
-                "map<{}, {}>",
-                cql_type_display_name(k),
-                cql_type_display_name(v)
-            )
-        }
-        CqlType::Tuple(types) => {
-            let inner: Vec<String> = types.iter().map(cql_type_display_name).collect();
-            format!("tuple<{}>", inner.join(", "))
-        }
-        CqlType::Vector(elem, dim) => {
-            format!("vector<{}, {}>", cql_type_display_name(elem), dim)
-        }
-        CqlType::Udt { keyspace, name, .. } => format!("{keyspace}.{name}"),
-    }
+    ferrosa_common::cql_type::names::display_name(t)
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,29 +988,7 @@ pub fn resolve_type_name(
 
 /// Try to resolve a lowercase type name to a built-in CQL type.
 fn resolve_builtin_type(name: &str) -> Option<CqlType> {
-    match name {
-        "text" | "varchar" => Some(CqlType::Varchar),
-        "int" => Some(CqlType::Int),
-        "bigint" => Some(CqlType::Bigint),
-        "smallint" => Some(CqlType::Smallint),
-        "tinyint" => Some(CqlType::Tinyint),
-        "float" => Some(CqlType::Float),
-        "double" => Some(CqlType::Double),
-        "boolean" => Some(CqlType::Boolean),
-        "blob" => Some(CqlType::Blob),
-        "uuid" => Some(CqlType::Uuid),
-        "timeuuid" => Some(CqlType::Timeuuid),
-        "timestamp" => Some(CqlType::Timestamp),
-        "inet" => Some(CqlType::Inet),
-        "ascii" => Some(CqlType::Ascii),
-        "counter" => Some(CqlType::Counter),
-        "varint" => Some(CqlType::Varint),
-        "decimal" => Some(CqlType::Decimal),
-        "date" => Some(CqlType::Date),
-        "time" => Some(CqlType::Time),
-        "duration" => Some(CqlType::Duration),
-        _ => None,
-    }
+    ferrosa_common::cql_type::names::scalar_from_name(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -2489,6 +2402,45 @@ mod tests {
             })
             .unwrap();
         schema
+    }
+
+    /// T-022 / FM-20: every former call site resolves a scalar through the one
+    /// registry, so a name added there is recognised by all of them.
+    #[test]
+    fn type_names_consumers_agree() {
+        use ferrosa_common::cql_type::names;
+        let schema = test_schema_with_keyspace("ks");
+        for ty in names::SCALAR_TYPES.iter() {
+            let canonical = names::scalar_name(ty).unwrap();
+            let class = names::scalar_marshal_class(ty).unwrap();
+            let spellings =
+                std::iter::once(canonical).chain(names::scalar_aliases(ty).iter().copied());
+            for name in spellings {
+                let ast = CqlTypeName::Simple(name.to_string());
+                assert_eq!(
+                    resolve_type_name(&ast, "ks", &schema).unwrap(),
+                    *ty,
+                    "{name}"
+                );
+                assert_eq!(parse_cql_type(name).unwrap(), *ty, "{name}");
+                assert_eq!(
+                    parse_cql_type(&name.to_ascii_uppercase()).unwrap(),
+                    *ty,
+                    "{name} upper"
+                );
+                assert_eq!(
+                    ferrosa_schema::convert::cql_to_marshal_type(name),
+                    class,
+                    "{name}"
+                );
+            }
+            assert_eq!(cql_type_display_name(ty), canonical);
+            assert_eq!(cql_type_name(ty), canonical);
+        }
+        let probe = "not_a_registered_type";
+        assert!(resolve_type_name(&CqlTypeName::Simple(probe.into()), "ks", &schema).is_err());
+        assert!(parse_cql_type(probe).is_err());
+        assert_eq!(ferrosa_schema::convert::cql_to_marshal_type(probe), probe);
     }
 
     #[test]
