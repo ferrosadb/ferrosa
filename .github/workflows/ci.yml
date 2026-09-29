@@ -77,6 +77,29 @@ jobs:
         run: bash scripts/ci/guard-arrow-free.sh ferrosa-common ferrosa-jsonb
       - name: Guard tests (seeded bad trees must fail)
         run: bash tests/test_guard_ci_json.sh
+      - name: Excluded crates must have a CI job
+        run: bash scripts/ci/guard-excluded-crates-have-ci.sh
+
+  # ferrosa-jsonb-conformance is a standalone workspace (excluded from the root:
+  # its parquet-variant 60 needs a chrono that breaks the root's arrow 53), so no
+  # `--workspace` job reaches it. This job runs it by manifest; the
+  # guard-excluded-crates-have-ci.sh step in json-guards fails if it is dropped.
+  jsonb-conformance:
+    name: jsonb conformance oracle (clippy + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ferrosa-jsonb-conformance
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Clippy
+        run: cargo clippy --manifest-path ferrosa-jsonb-conformance/Cargo.toml --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        run: cargo test --manifest-path ferrosa-jsonb-conformance/Cargo.toml --all-features --locked
 
   clippy:
     name: Clippy
