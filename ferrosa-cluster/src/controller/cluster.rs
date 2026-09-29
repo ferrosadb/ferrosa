@@ -794,6 +794,19 @@ impl ModeController {
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
     pub(super) fn transition_to_cluster(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        // One transition per formation. A second one re-opens the sled Raft
+        // store the first transition's Raft holds: it waits out the lock
+        // retry and fails, or would run a second Raft beside the first.
+        // Callers hold `transition_guard`, so the mode read here cannot change
+        // before the swap below.
+        let current = self.mode();
+        if !current.can_transition_to(DeploymentMode::Cluster) {
+            tracing::error!(
+                %current,
+                "refusing to re-enter the cluster transition: this node is already {current}"
+            );
+            return;
+        }
         // T-300: no departure from standalone while jsonb columns exist.
         if !self.leaving_standalone_permitted(DeploymentMode::Cluster) {
             return;
@@ -1284,7 +1297,17 @@ impl ModeController {
         // Clear pair context — no longer in pair mode
         *self.pair_context.lock() = None;
 
-        self.try_transition_mode(DeploymentMode::Cluster);
+        // The checks at the top make a refusal here unreachable while callers
+        // hold `transition_guard`. If one happens anyway, stop before starting
+        // a Raft for a node the state machine did not move into Cluster.
+        if !self.try_transition_mode(DeploymentMode::Cluster) {
+            tracing::error!(
+                mode = %self.mode(),
+                "cluster transition refused after the write path was swapped; \
+                 not starting Raft (a caller entered without transition_guard)"
+            );
+            return;
+        }
 
         // Durably record that this node has been a cluster member, BEFORE
         // announcing the transition. On restart this is what stops the node
@@ -3156,7 +3179,21 @@ impl RpcHandler for ClusterInviteHandler {
                     }
                     all_peers.push((initiator, addr));
                 }
-                if all_peers.len() >= 2 {
+                // Decide and transition under `transition_guard`, as every
+                // other transition path does. Every receiver re-broadcasts the
+                // invite, so copies arrive concurrently; the await above lets
+                // two of them both see Pair here, and an unguarded second
+                // `transition_to_cluster` re-opens the Raft store the first
+                // holds. Re-read the mode under the guard: a copy that lost
+                // the race sees Cluster and stands down. No await below.
+                let _guard = ctrl.transition_guard.lock();
+                let mode = ctrl.mode();
+                if !matches!(mode, DeploymentMode::Pair | DeploymentMode::Standalone) {
+                    tracing::debug!(
+                        %mode,
+                        "cluster invite: another transition won the race; nothing to do"
+                    );
+                } else if all_peers.len() >= 2 {
                     tracing::info!(
                         peer_count = all_peers.len(),
                         "cluster invite: triggering cluster transition from {mode:?}"

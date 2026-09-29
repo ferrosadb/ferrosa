@@ -2777,6 +2777,141 @@ async fn cluster_invite_transition_registers_raft_handlers() {
     );
 }
 
+/// A pair-mode controller with a peer manager, for the invite-race tests.
+fn pair_mode_controller_for_invites(
+    dir: &std::path::Path,
+) -> (Arc<ModeController>, Arc<PeerManager>, Arc<NetConfig>, Uuid) {
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        test_storage(dir),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm.clone());
+    (controller, pm, net_config, local_id)
+}
+
+/// The ClusterInvite handler must decide and transition under
+/// `transition_guard`, like every other transition path.
+///
+/// Every invite receiver re-broadcasts the invite, so duplicates arrive
+/// concurrently (0.4 ms apart on a live cross-host run). The handler checked
+/// the mode, awaited the initiator's address, then called
+/// `transition_to_cluster` with no guard: two copies both saw Pair, the
+/// transition ran twice, the second re-opened the sled Raft store the first
+/// held, and after the lock retry gave up the node had no Raft at all. The
+/// seed-laggard formation test failed 12 of 24 runs under load that way.
+///
+/// Holding the guard here stands in for the other copy's transition: the
+/// handler must wait for it, then see its result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cluster_invite_transitions_only_under_the_transition_guard() {
+    use ferrosa_net::rpc::RpcHandler;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, pm, net_config, local_id) = pair_mode_controller_for_invites(dir.path());
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+    // Closed loopback ports: the handler's dials to the invited peers are
+    // refused at once, so it reaches its transition decision promptly.
+    controller.on_peer_connected((peer1_id, "127.0.0.1:2".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+
+    let handler =
+        cluster::ClusterInviteHandler::new(local_id, pm, net_config, Arc::downgrade(&controller));
+    let invite = ferrosa_net::message::Message::ClusterInvite {
+        initiator: peer1_id,
+        peers: vec![
+            (local_id, "127.0.0.1:1".parse().unwrap()),
+            (peer1_id, "127.0.0.1:2".parse().unwrap()),
+            (peer2_id, "127.0.0.1:3".parse().unwrap()),
+        ],
+    };
+
+    // The holder is an OS thread: a sync guard must not be held across the
+    // awaits below.
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder_ctrl = controller.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = holder_ctrl.transition_guard.lock();
+        locked_tx.send(()).expect("test is waiting for the lock");
+        release_rx.recv().expect("test releases the lock");
+    });
+    locked_rx.recv().expect("the holder thread took the guard");
+
+    let handling = tokio::spawn(async move {
+        handler
+            .handle((peer1_id, "127.0.0.1:2".parse().unwrap()), invite)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let mode_while_held = controller.mode();
+    release_tx.send(()).expect("the holder thread is waiting");
+    holder.join().expect("the holder thread panicked");
+    assert_eq!(
+        mode_while_held,
+        DeploymentMode::Pair,
+        "the invite handler transitioned while another transition held the guard"
+    );
+
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(30), handling)
+        .await
+        .expect("the invite handler must finish once the guard is free")
+        .expect("the invite handler task panicked");
+    assert!(reply.is_some(), "handler should reply with ack");
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+}
+
+/// A second `transition_to_cluster` on a node already in Cluster mode is
+/// refused at once instead of re-opening the Raft store.
+///
+/// The first transition's Raft owns the sled store. A second one used to open
+/// it again, wait out the lock retry (about 10 s), and fail -- or, had it
+/// succeeded, run a second Raft beside the first. Either way the node is
+/// broken, so re-entry is refused at the top, loudly.
+#[tokio::test]
+async fn a_second_cluster_transition_is_refused_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, _pm, _net_config, _local_id) = pair_mode_controller_for_invites(dir.path());
+    let peers = vec![
+        (Uuid::new_v4(), "127.0.0.1:7001".parse().unwrap()),
+        (Uuid::new_v4(), "127.0.0.2:7002".parse().unwrap()),
+    ];
+    controller.transition_to_cluster(peers.clone());
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+    let write_path = Arc::as_ptr(&controller.write_path.load_full());
+
+    let started = std::time::Instant::now();
+    controller.transition_to_cluster(peers);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the second transition must be refused at once, not re-open the Raft store \
+         (took {elapsed:?})"
+    );
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+    assert_eq!(
+        Arc::as_ptr(&controller.write_path.load_full()),
+        write_path,
+        "the refused transition must not replace the write path"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Progressive join: standalone → pair → cluster
 // -----------------------------------------------------------------------
