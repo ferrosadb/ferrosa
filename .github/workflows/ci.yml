@@ -187,7 +187,12 @@ jobs:
           # they run nightly in nightly-slow-tests.yml.
           # LazyFS crash harness is unimplemented (T-070); in-process durability
           # probes cover ordering until the crash harness exists.
-          cargo test --all-features --workspace --lib --tests \
+          # `replicated_jsonb_index_builds_on_every_node` is a live-infra test:
+          # --all-features enables `live-infra-tests`, and with no
+          # FERROSA_TEST_CLUSTER_NODES here it panics by design (no silent skip).
+          # It runs for real in the "Cluster integration tests" job (`integration`).
+          # `--no-fail-fast` keeps one failing binary from hiding the rest.
+          cargo test --no-fail-fast --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -- --skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
@@ -204,6 +209,7 @@ jobs:
                --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
                --skip differential_oracle \
                --skip fly_multi_node_streaming_scan \
+               --skip replicated_jsonb_index_builds_on_every_node \
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
                --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
@@ -950,6 +956,25 @@ jobs:
           cargo test --workspace --all-features \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -- --ignored
+      - name: Put cqlsh on PATH (docker, no host install)
+        # The live test shells out to `cqlsh <host> <port> -e <stmt>`. This
+        # wrapper forwards to the same cassandra:5.0 image the PostgreSQL
+        # Jepsen job uses; --network host reaches the published 9042-9044.
+        run: |
+          docker pull cassandra:5.0
+          printf '#!/bin/sh\nexec docker run --rm --network host cassandra:5.0 cqlsh "$@"\n' > cqlsh
+          sudo install -m 0755 cqlsh /usr/local/bin/cqlsh
+          rm cqlsh
+      - name: Run live-infra cluster test (replicated jsonb index)
+        # FERROSA_TEST_CLUSTER_NODES came from "Bring up cluster" via
+        # GITHUB_ENV (127.0.0.1:9042-9044). The Test + Coverage job skips this
+        # test by name (it has no cluster); this is where it runs. It panics if
+        # the variable is unset, so a wiring regression is loud.
+        run: |
+          # --all-features (not just live-infra-tests) keeps the build shared
+          # with the rest of this job's cache; it enables live-infra-tests.
+          cargo test --all-features -p ferrosa-cluster \
+            --test replicated_jsonb_index_live -- --nocapture
       - name: Collect cluster logs on failure
         if: failure()
         run: |
