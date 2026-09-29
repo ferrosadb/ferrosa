@@ -762,6 +762,25 @@ pub async fn execute_query(
     execute_query_with_mvcc(engine, schema, sql, default_schema, None, None, txn).await
 }
 
+/// The SQLSTATE a parse failure is reported with (FMEA PG-T132a-04).
+///
+/// Refused DDL clauses are `0A000` (feature not supported) and a missing key is
+/// too: ferrosa refuses those by name rather than accept a fake constraint.
+/// Definition errors carry their own class-42 codes.
+pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static str {
+    use ferrosa_sql::ParseError;
+    match error {
+        ParseError::UnsupportedClause(_) | ParseError::MissingPrimaryKey => "0A000",
+        ParseError::UnknownType(_) => "42704",
+        ParseError::DuplicateColumn(_) => "42701",
+        ParseError::MultiplePrimaryKeys => "42P16",
+        ParseError::UnknownPrimaryKeyColumn(_) => "42703",
+        ParseError::Unexpected { .. } | ParseError::UnexpectedEnd | ParseError::BadToken(_) => {
+            "42601"
+        }
+    }
+}
+
 /// Collecting form of [`execute_query_streaming`]: every message, rows included,
 /// gathered into one `Vec`. For tests and tools that want the whole reply as a
 /// value; the server never calls it, because gathering a `SELECT`'s rows here is
@@ -782,6 +801,7 @@ pub(crate) async fn execute_query_with_mvcc(
         default_schema,
         mvcc,
         snapshot,
+        ddl: None,
     };
     let tail = execute_query_streaming(env, sql, txn, &mut messages).await;
     match tail {
@@ -811,7 +831,12 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
 ) -> std::io::Result<Vec<BackendMessage>> {
     let stmt = match parse_statement(sql) {
         Ok(stmt) => stmt,
-        Err(e) => return Ok(vec![error_response("42601", &e.to_string())]),
+        Err(e) => {
+            return Ok(vec![error_response(
+                parse_error_sqlstate(&e),
+                &e.to_string(),
+            )])
+        }
     };
     let Statement::Select(select) = stmt else {
         return Ok(execute_statement(
@@ -820,6 +845,7 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
             stmt,
             env.default_schema,
             env.mvcc,
+            env.ddl,
             txn,
         )
         .await);
@@ -847,6 +873,7 @@ pub(crate) struct ReadEnv<'a> {
     pub(crate) default_schema: &'a str,
     pub(crate) mvcc: Option<&'a MvccManager>,
     pub(crate) snapshot: Option<&'a MvccSnapshot>,
+    pub(crate) ddl: Option<&'a dyn crate::ddl::DdlExecutor>,
 }
 
 /// Load `select`'s tables and start its executor on a blocking thread, ready to
@@ -918,6 +945,7 @@ async fn execute_statement(
     stmt: Statement,
     default_schema: &str,
     mvcc: Option<&MvccManager>,
+    ddl: Option<&dyn crate::ddl::DdlExecutor>,
     txn: Option<&mut Vec<PgWrite>>,
 ) -> Vec<BackendMessage> {
     match stmt {
@@ -947,12 +975,19 @@ async fn execute_statement(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
-        // DDL parses (T-130) but nothing executes it yet (T-132a). Fail loud
-        // rather than report a CREATE TABLE that created nothing.
-        Statement::CreateTable(_) => vec![error_response(
-            "0A000",
-            "CREATE TABLE is parsed but not yet executable",
-        )],
+        // DDL (T-132a): through the same schema-change path CQL DDL uses.
+        Statement::CreateTable(create) => {
+            crate::ddl::execute_create_table(
+                crate::ddl::DdlEnv {
+                    executor: ddl,
+                    schema,
+                    default_schema,
+                    in_txn: txn.is_some(),
+                },
+                &create,
+            )
+            .await
+        }
         // DML: single-row INSERT / UPDATE / DELETE. The simple-query path has no
         // bound parameters (`&[]`); a `$N` in simple SQL is therefore a fail-loud
         // error (no value to bind). With `txn = Some(buffer)` (an open

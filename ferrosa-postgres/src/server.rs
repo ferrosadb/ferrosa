@@ -41,6 +41,10 @@ pub struct QueryContext {
     /// owns snapshot/version validation; Accord supplies the cluster commit
     /// order and atomic write apply. CQL's transaction path is unchanged.
     pub accord_committer: Option<Arc<dyn ferrosa_storage::accord::TransactionCommitter>>,
+    /// Schema-change path for PostgreSQL DDL (`CREATE TABLE`). `None` means the
+    /// front-end has no DDL authority (unit-test contexts): DDL is then refused
+    /// with `0A000` rather than reported as done.
+    pub ddl: Option<Arc<dyn crate::ddl::DdlExecutor>>,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -528,7 +532,10 @@ async fn execute_simple_inner<O: ReplySink>(
         Ok(s) => s,
         Err(e) => {
             session.mark_txn_failed();
-            return Ok(vec![query::error_response("42601", &e.to_string())]);
+            return Ok(vec![query::error_response(
+                query::parse_error_sqlstate(&e),
+                &e.to_string(),
+            )]);
         }
     };
 
@@ -640,6 +647,7 @@ fn read_env<'a>(
         default_schema: &ctx.default_schema,
         mvcc: Some(&ctx.mvcc),
         snapshot: Some(snapshot),
+        ddl: ctx.ddl.as_deref(),
     }
 }
 
@@ -1723,6 +1731,7 @@ mod txn_atomicity_tests {
             default_schema: "public".to_string(),
             mvcc: Arc::new(MvccManager::default()),
             accord_committer: None,
+            ddl: None,
         }
     }
 

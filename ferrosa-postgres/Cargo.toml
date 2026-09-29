@@ -31,7 +31,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["net", "rt", "io-util", "macros", "sync"] }
 # Used by query.rs to render/parse the Postgres `uuid` type (OID 2950) carried
 # by `ferrosa_sql::Value::Uuid`, and by storage_provider for CqlValue::Uuid.
-uuid = "1"
+uuid = { version = "1", features = ["v4"] }
 # Calendar math for the temporal types: render `Value::Timestamp`/`Date`/`Time`
 # (Unix-epoch micros/days) into Postgres's exact text forms, and parse them back
 # in `decode_param`. `std` only — no wall-clock/`clock` feature needed.
@@ -46,6 +46,13 @@ serde_json = "1"
 # (one crypto provider for every listener, t_e1c819ad).
 ferrosa-net = { path = "../ferrosa-net" }
 tokio-rustls = "0.26"
+# DDL (T-132a): `CREATE TABLE` runs through the SAME `DdlPath` the CQL router
+# uses (direct / pair / Raft-replicated cluster), so there is one schema-change
+# path. `ClusterDdl` in `ddl.rs` is the only user of these three crates.
+ferrosa-cluster = { path = "../ferrosa-cluster" }
+arc-swap = "1.7"
+async-trait = "0.1"
+indexmap = "2"
 
 [features]
 # Opt-in gate for tests that require external infrastructure (a real
@@ -59,8 +66,6 @@ live-infra-tests = []
 [dev-dependencies]
 indexmap = { version = "2", features = ["serde"] }
 proptest = "1"
-async-trait = "0.1"
-ferrosa-cluster = { path = "../ferrosa-cluster" }
 uuid = { version = "1", features = ["v4"] }
 rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }

@@ -105,6 +105,7 @@ fn minimal_ctx() -> (Arc<QueryContext>, tempfile::TempDir) {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
+        ddl: None,
     });
     (ctx, dir)
 }

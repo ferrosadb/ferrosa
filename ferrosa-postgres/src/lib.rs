@@ -16,6 +16,7 @@ pub(crate) mod authz;
 pub mod catalog;
 pub mod codec;
 pub mod connection;
+pub mod ddl;
 pub mod extended;
 pub mod handshake;
 pub mod messages;
@@ -29,6 +30,7 @@ pub mod storage_provider;
 pub mod store;
 
 pub use connection::{ConnError, Connection, TlsPolicy};
+pub use ddl::{ClusterDdl, DdlExecutor};
 pub use handshake::{Handshake, HandshakeError, VerifierStore};
 pub use store::SchemaVerifierStore;
 

@@ -176,6 +176,22 @@ Cost of suspension: a suspended portal parks one `spawn_blocking` thread in a
 channel send until it resumes or is closed. The runtimes cap blocking threads,
 so many concurrently suspended portals consume that budget.
 
+**DDL (`CREATE TABLE [IF NOT EXISTS]`, T-132a).** Simple protocol only. The
+statement is planned into a `TableMetadata` (`ddl.rs`) and applied through the
+same `ferrosa_cluster::ddl_path::DdlPath` the CQL router uses, via `ClusterDdl`
+(direct when standalone, coordinator in pair mode, Raft-replicated in a
+cluster). Keys: one primary-key column is the partition key; a composite key is
+the first column as partition key and the rest as ascending clustering columns.
+Types go through `pg_types::cql_type_for_pg_name`; an unmapped type is `42704`
+naming it, `json`/`jsonb` is `0A000` until the engine type exists (T-150).
+`varchar(n)` and `numeric(p,s)` store as unbounded `text`/`decimal`: the length
+and precision are not enforced. An existing table is `42P07`, or a success
+under `IF NOT EXISTS` with no NOTICE (there is no `NoticeResponse`). A missing
+keyspace is `3F000`; DDL in a transaction block is `25001`; a context without a
+`ddl` executor refuses `0A000`. Unsupported clauses keep their `0A000` names.
+`ddl::authorize_create_table` is the call point for the DDL permission check
+(PR #465). `DROP`/`ALTER` are T-132b; extended-protocol `Parse` of DDL is refused.
+
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +
 `build_row`/`build_delete_row` (the SAME `ferrosa-row-bridge` encoder CQL uses) →

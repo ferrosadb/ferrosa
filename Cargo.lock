@@ -2637,6 +2637,7 @@ dependencies = [
 name = "ferrosa-postgres"
 version = "0.22.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64 0.22.1",
  "bytes",

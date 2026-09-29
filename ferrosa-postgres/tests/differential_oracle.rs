@@ -1059,6 +1059,7 @@ async fn start_ferrosa() -> (tokio_postgres::Client, tempfile::TempDir) {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
+        ddl: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

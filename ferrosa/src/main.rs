@@ -2719,6 +2719,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             default_schema: "public".into(),
             mvcc: std::sync::Arc::new(ferrosa_postgres::MvccManager::from_env()),
             accord_committer: shared_state.core.accord_transaction_committer(),
+            // The SAME swappable DDL path the CQL router uses (T-132a): PG
+            // `CREATE TABLE` is Raft-replicated in cluster mode like CQL DDL.
+            ddl: Some(std::sync::Arc::new(ferrosa_postgres::ClusterDdl::new(
+                shared_state.ddl_path.clone(),
+            ))),
         });
         let pg_status = listener_status.clone();
         runtimes.background.spawn(async move {

@@ -114,6 +114,14 @@ resolve is a `PgTypeError` (catalog projection, parameter inference), never a
 silent `text`. `jsonb` (3802), `json` (114) and `jsonpath` (4072) are reserved
 as constants; the `CqlType` variant lands with type threading (T-161a).
 
+**DDL.** `Statement::CreateTable` executes in `ddl.rs`: `plan_create_table`
+builds the `TableMetadata` (first key column = partition key, rest = ascending
+clustering columns; types via `cql_type_for_pg_name`), and `ClusterDdl` applies it
+through `ferrosa_cluster::ddl_path::DdlPath`, the path CQL DDL uses (Raft in
+cluster mode). `QueryContext.ddl` carries the executor into `ReadEnv`. Parse
+errors map to typed SQLSTATEs (`query::parse_error_sqlstate`). See FMEA
+`PG-T132a-*`.
+
 `query` renders/parses each `ferrosa_sql::Value` to/from its exact Postgres text
 form and (for most) the binary form, with OIDs/sizes advertised in
 `RowDescription`: `Int→int4(23)`, `Text→text(25)`, `Bool→bool(16)`,

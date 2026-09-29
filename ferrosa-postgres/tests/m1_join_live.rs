@@ -326,6 +326,7 @@ async fn m1_join_returns_rows_to_a_real_driver() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
+        ddl: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -417,6 +418,7 @@ async fn extended_query_error_recovers_after_sync() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
+        ddl: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -465,6 +467,7 @@ async fn extended_parameterized_join_over_a_real_driver() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
+        ddl: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -521,6 +524,7 @@ async fn group_by_order_by_limit_over_a_real_driver() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
+        ddl: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -587,6 +591,7 @@ async fn where_having_distinct_over_a_real_driver() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
+        ddl: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -696,6 +701,7 @@ async fn dml_client_with_committer(
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: query_committer,
+        ddl: None,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -772,6 +778,7 @@ async fn dml_client_with_local_accord() -> (
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: Some(query_committer),
+        ddl: None,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -895,6 +902,7 @@ async fn dml_clients_on_two_accord_nodes() -> (
             default_schema: "public".into(),
             mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
             accord_committer: Some(query_committer),
+            ddl: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
