@@ -12101,6 +12101,40 @@ impl StorageEngine {
         }
     }
 
+    /// Restore, before the tables are registered, every manifest-listed
+    /// SSTable whose local copy is missing — typically one the uploaded-cache
+    /// evictor deleted under disk pressure.
+    ///
+    /// Table registration discovers generations from local `*-Data.db` files
+    /// only, so without this an evicted SSTable silently leaves its table on
+    /// the next restart even though S3 and the manifest still hold it. On the
+    /// live ferrosa-memory cluster that hid 371 SSTables at once. Returns the
+    /// number of generations restored. Without S3 there is nothing to
+    /// restore. A failure is returned, never swallowed: starting to serve a
+    /// table without its evicted SSTables is the data-loss this prevents.
+    pub async fn restore_evicted_sstables(
+        &self,
+        table_ids: &[TableId],
+    ) -> ferrosa_common::Result<usize> {
+        let Some((store, prefix)) = self.resolve_store_and_prefix() else {
+            return Ok(0);
+        };
+        let (manifest, _version) = crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+        let mut restored = 0usize;
+        for table_id in table_ids {
+            let n = self.download_sstables_from_s3(table_id, &manifest).await?;
+            if n > 0 {
+                tracing::warn!(
+                    table = %table_id,
+                    restored = n,
+                    "storage-engine: restored manifest-listed SSTables missing from local disk (evicted from the uploaded cache)"
+                );
+            }
+            restored += n;
+        }
+        Ok(restored)
+    }
+
     /// Download SSTables from S3 to local disk for a specific table.
     ///
     /// Uses the manifest to know which SSTables exist, then downloads
@@ -27261,6 +27295,85 @@ mod tests {
         }
 
         (dir, engine, store, prefix, tid)
+    }
+
+    /// Build an S3-backed engine over `dir` whose uploaded-SSTable cache is
+    /// one byte, so every sync evicts what it uploaded, exactly as disk
+    /// pressure did on the live cluster.
+    fn evicting_s3_engine(
+        dir: &std::path::Path,
+        store: &Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+    ) -> StorageEngine {
+        let mut config = StorageEngineConfig::test_config(dir);
+        config.local_cache_max_bytes = 1;
+        config.object_store = Some(crate::upload::ObjectStoreConfig {
+            prefix: prefix.to_string(),
+            ..crate::upload::ObjectStoreConfig::test_config()
+        });
+        StorageEngine::new_with_upload_store(
+            config,
+            Arc::clone(store),
+            prefix.to_string(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap()
+    }
+
+    /// Data loss on the live ferrosa-memory cluster, 2026-09-29.
+    ///
+    /// Under disk pressure the uploaded-cache evictor deleted the local copy
+    /// of 371 SSTables whose only remaining copy was in S3 (all still listed
+    /// in the manifest). The next restart discovered generations by listing
+    /// `*-Data.db` on local disk only, so every evicted SSTable silently left
+    /// its table: `document_chunks` went from 17 SSTables (1.46 GB) to 0 and
+    /// every node reported an order of magnitude fewer rows. Nothing was
+    /// deleted from S3; the engine simply stopped looking there.
+    ///
+    /// A restart must serve every row the manifest says it holds, whether or
+    /// not its SSTable is still in the local cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_of_an_evicted_sstable_are_readable_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "test-evicted-restart";
+        let tid = table_id();
+        let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+
+        {
+            let engine = evicting_s3_engine(dir.path(), &store, prefix);
+            engine.register_table(test_schema()).unwrap();
+            for key in &keys {
+                engine
+                    .write(&tid, &make_key(key), make_row(b"v", 1000), 1000)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            assert!(engine.sync_sstables_to_s3().await.unwrap() >= 1);
+            let table_dir = engine.table_sstable_dir(&tid);
+            assert!(
+                StorageEngine::list_generations_in_dir(&table_dir).is_empty(),
+                "precondition: the sync evicted the uploaded SSTable's local copy"
+            );
+            engine.shutdown().unwrap();
+        }
+
+        let engine = evicting_s3_engine(dir.path(), &store, prefix);
+        let restored = engine
+            .restore_evicted_sstables(std::slice::from_ref(&tid))
+            .await
+            .unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        for key in &keys {
+            assert!(
+                engine.read(&tid, &make_key(key)).unwrap().is_some(),
+                "row {key} of an evicted SSTable must survive a restart"
+            );
+        }
+        assert_eq!(restored, 1, "the evicted generation is restored from S3");
+        engine.shutdown().unwrap();
     }
 
     /// t_7ac6b0e3: a sidecar built after its generation is already in S3 (a
