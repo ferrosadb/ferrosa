@@ -12414,10 +12414,16 @@ impl StorageEngine {
                 );
                 let local_path = staging_dir.join(format!("{}-{component}", entry.id));
 
-                if Self::download_sstable_component_to_path(store.as_ref(), &s3_path, &local_path)
-                    .await?
-                    .is_none()
-                {
+                let fetched =
+                    Self::download_sstable_component_to_path(store.as_ref(), &s3_path, &local_path)
+                        .await;
+                if fetched.is_err() {
+                    // A half-written component must not outlive the failure.
+                    if let Err(e) = tokio::fs::remove_dir_all(&staging_dir).await {
+                        tracing::warn!(dir = %staging_dir.display(), error = %e, "could not remove SSTable download staging after a failed download");
+                    }
+                }
+                if fetched?.is_none() {
                     let _ = tokio::fs::remove_dir_all(&staging_dir).await;
                     if local_incomplete {
                         Self::quarantine_incomplete_generation(&table_dir, &entry.id);
@@ -12443,10 +12449,16 @@ impl StorageEngine {
                 );
                 let local_path = staging_dir.join(format!("{}-{component}", entry.id));
 
-                if Self::download_sstable_component_to_path(store.as_ref(), &s3_path, &local_path)
-                    .await?
-                    .is_none()
-                {
+                let fetched =
+                    Self::download_sstable_component_to_path(store.as_ref(), &s3_path, &local_path)
+                        .await;
+                if fetched.is_err() {
+                    // A half-written component must not outlive the failure.
+                    if let Err(e) = tokio::fs::remove_dir_all(&staging_dir).await {
+                        tracing::warn!(dir = %staging_dir.display(), error = %e, "could not remove SSTable download staging after a failed download");
+                    }
+                }
+                if fetched?.is_none() {
                     tracing::debug!(
                         sstable = entry.id,
                         component,
@@ -12614,7 +12626,38 @@ impl StorageEngine {
         ))
     }
 
+    /// Download one component, retrying the whole object when a request or
+    /// its body fails partway. A 100 MB `Data.db` from R2 dropped mid-body
+    /// ("error decoding response body") and failed a node's entire restore
+    /// on 2026-09-29. Each retry starts a fresh request and truncates the
+    /// file, so a partial body is never kept. `NotFound` is not retried.
     async fn download_sstable_component_to_path(
+        store: &dyn object_store::ObjectStore,
+        s3_path: &object_store::path::Path,
+        local_path: &std::path::Path,
+    ) -> ferrosa_common::Result<Option<u64>> {
+        const ATTEMPTS: u32 = 5;
+        let mut backoff = std::time::Duration::from_millis(500);
+        let mut attempt = 1;
+        loop {
+            match Self::download_sstable_component_once(store, s3_path, local_path).await {
+                Err(e) if attempt < ATTEMPTS => {
+                    tracing::warn!(
+                        path = %s3_path,
+                        attempt,
+                        error = %e,
+                        "SSTable component download failed; retrying the whole object"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn download_sstable_component_once(
         store: &dyn object_store::ObjectStore,
         s3_path: &object_store::path::Path,
         local_path: &std::path::Path,
@@ -27686,6 +27729,189 @@ mod tests {
             );
         }
         engine.shutdown().unwrap();
+    }
+
+    /// Serves from memory, but the first `drops` GETs send half the body and
+    /// then fail — how an R2 download of a 100 MB Data.db died mid-stream
+    /// ("error decoding response body") during the 2026-09-29 recovery.
+    #[derive(Debug)]
+    struct MidStreamDropStore {
+        inner: object_store::memory::InMemory,
+        drops: std::sync::atomic::AtomicU32,
+    }
+
+    impl std::fmt::Display for MidStreamDropStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "MidStreamDropStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for MidStreamDropStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let result = self.inner.get_opts(location, options).await?;
+            let drop_this = self
+                .drops
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok();
+            if !drop_this {
+                return Ok(result);
+            }
+            let meta = result.meta.clone();
+            let range = result.range.clone();
+            let attributes = result.attributes.clone();
+            let body = result.bytes().await?;
+            let half = body.slice(0..body.len() / 2);
+            let stream = futures::stream::iter(vec![
+                Ok(half),
+                Err(object_store::Error::Generic {
+                    store: "S3",
+                    source: "error decoding response body".into(),
+                }),
+            ]);
+            Ok(object_store::GetResult {
+                payload: object_store::GetResultPayload::Stream(Box::pin(stream)),
+                meta,
+                range,
+                attributes,
+            })
+        }
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// A download whose body dies mid-stream is retried from the start, and
+    /// the file ends up whole — not truncated, not a failed restore.
+    #[tokio::test]
+    async fn a_component_download_that_drops_mid_stream_is_retried_whole() {
+        let store = MidStreamDropStore {
+            inner: object_store::memory::InMemory::new(),
+            drops: std::sync::atomic::AtomicU32::new(0),
+        };
+        let path = object_store::path::Path::from("p/ab/ks.t/7/7-Data.db");
+        let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        object_store::ObjectStore::put(&store, &path, object_store::PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        store.drops.store(2, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("7-Data.db");
+
+        let written = StorageEngine::download_sstable_component_to_path(&store, &path, &local)
+            .await
+            .expect("a transient mid-stream failure must be retried, not fail the restore");
+
+        assert_eq!(written, Some(body.len() as u64));
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            body,
+            "the file must be whole"
+        );
+    }
+
+    /// A generation whose download fails for good leaves no staging
+    /// directory behind: node1's failed restore left a `.download-*`
+    /// directory holding a half-written Data.db.
+    #[tokio::test]
+    async fn a_failed_generation_download_removes_its_staging_directory() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(MidStreamDropStore {
+            inner: object_store::memory::InMemory::new(),
+            drops: std::sync::atomic::AtomicU32::new(u32::MAX),
+        });
+        let prefix = "p";
+        let tid = table_id();
+        let table = tid.to_string();
+        let gen = "1790000000000009";
+        let hex = crate::upload::manager::hex_prefix_for(gen);
+        for component in ["Data.db", "Partitions.db", "Rows.db"] {
+            let key =
+                crate::upload::manager::sstable_object_key(prefix, &hex, &table, gen, component);
+            store
+                .put(&key, object_store::PutPayload::from(vec![7u8; 64]))
+                .await
+                .unwrap();
+        }
+        let mut manifest = crate::manifest::Manifest::new();
+        manifest.add_sstable(
+            &table,
+            crate::manifest::ManifestEntry {
+                id: gen.to_string(),
+                size: 64,
+                min_token: i64::MIN,
+                max_token: i64::MAX,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
+        let dir = tempfile::tempdir().unwrap();
+
+        let result =
+            StorageEngine::download_sstables_into(dir.path(), &store, prefix, &tid, &manifest)
+                .await;
+
+        assert!(
+            result.is_err(),
+            "a download that never succeeds is an error"
+        );
+        let table_dir = dir.path().join("sstables").join(&table);
+        let leftovers: Vec<_> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".download-"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
     }
 
     /// Restore must bring back only what the evictor removed.
