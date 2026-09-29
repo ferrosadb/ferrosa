@@ -1192,3 +1192,25 @@ rule = "cloned-stream-elements"
 reason = "t_a49d88c3 TRIAGED: BOUNDED: view_pk_values is per-row, bounded by view PK column count (schema arity)."
 owner = "storage"
 expires = "2026-10-01"
+
+# ---------------------------------------------------------------------------
+# jsonb (feat/jsonb, #467) — audited false positives. None bounds a result set.
+# ---------------------------------------------------------------------------
+
+[[allow]]
+path = "ferrosa-jsonb/src/limits.rs"
+rule = "server-side-result-cap"
+symbol = "DEFAULT_MAX_KEY_LIST"
+reason = "Input limit, not a result cap: the maximum number of keys ONE ?|/?& argument may carry (jsonb D14, POC cassandra.jsonb.max_key_list_length). Refusing oversize input is a typed error at ingest; no query result is bounded by it."
+owner = "bkearns"
+expires = "2027-07-01"
+
+
+
+[[allow]]
+path = "ferrosa-postgres/src/query.rs"
+rule = "stream-returns-vec"
+symbol = "execute_query_streaming"
+reason = "Rows stream to the ReplySink as the executor yields them (t_f348ba0b); the returned Vec holds only the bounded tail (CommandComplete or the terminating ErrorResponse)."
+owner = "bkearns"
+expires = "2027-07-01"

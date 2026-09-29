@@ -619,10 +619,17 @@ fn fixed_number(bytes: &[u8], id: u8) -> Result<Number, JsonbError> {
     Ok(Number::from_i128(le_i128(body), scale))
 }
 
-/// A minimal LEB128 `u64`; returns the value and the bytes used.
+/// Longest LEB128 encoding of a `u64`.
+const MAX_UVARINT_BYTES: usize = 10;
+
+/// A minimal LEB128 `u64`; returns the value and the bytes used. A varint with
+/// no terminator within [`MAX_UVARINT_BYTES`] is malformed.
 fn read_uvarint(b: &[u8]) -> Result<(u64, usize), JsonbError> {
     let mut v = 0u64;
-    for (i, byte) in b.iter().take(10).enumerate() {
+    for (i, byte) in b.iter().enumerate() {
+        if i >= MAX_UVARINT_BYTES {
+            return Err(fault(EncodingFault::BadBigDecimal));
+        }
         let low = u64::from(byte & 0x7F);
         if i == 9 && low > 1 {
             return Err(fault(EncodingFault::BadBigDecimal));

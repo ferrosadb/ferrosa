@@ -31,7 +31,7 @@ fn encode(bytes: &[u8]) -> String {
     for chunk in bytes.chunks(3) {
         let mut acc = 0u32;
         for i in 0..3 {
-            acc = (acc << 8) | u32::from(chunk.get(i).copied().unwrap_or(0));
+            acc = (acc << 8) | chunk.get(i).map_or(0, |b| u32::from(*b));
         }
         out.push(sextet(acc, 18));
         out.push(sextet(acc, 12));

@@ -6,7 +6,7 @@
 //! Last changed: Created; replaces the duplicated string switches (COM-T022-01).
 //!
 //! Adding a scalar type means editing exactly two places here: the exhaustive
-//! [`scalar_info`] match (a missing arm is a compile error) and
+//! `scalar_info` match (a missing arm is a compile error) and
 //! [`SCALAR_TYPES`] (guarded by the round-trip test). Grammar for collections,
 //! tuples, vectors and UDTs stays in the parsers; only names live here.
 
