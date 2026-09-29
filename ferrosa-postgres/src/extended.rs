@@ -331,7 +331,8 @@ impl Session {
     }
 
     /// Handle `Bind`: decode each parameter value against the prepared
-    /// statement's declared OIDs and store the portal. A missing prepared
+    /// statement's declared OIDs (jsonb parameters are parsed under
+    /// `jsonb_limits`, D14b) and store the portal. A missing prepared
     /// statement is a fail-loud error (26000, invalid_sql_statement_name); on
     /// success return `BindComplete`.
     #[allow(clippy::too_many_arguments)]
@@ -342,6 +343,7 @@ impl Session {
         param_formats: &[i16],
         param_values: &[Option<Vec<u8>>],
         result_formats: Vec<i16>,
+        jsonb_limits: &ferrosa_jsonb::Limits,
     ) -> BackendMessage {
         let Some(stmt) = self.statements.get(&stmt_name) else {
             self.error_pending = true;
@@ -372,7 +374,7 @@ impl Session {
                 let format = param_format_for(param_formats, i);
                 // A declared OID is matched positionally; unspecified ⇒ 0.
                 let oid = stmt.param_oids.get(i).copied().unwrap_or(0);
-                decode_param_checked(format, oid, bytes.as_deref())
+                decode_param_checked(format, oid, bytes.as_deref(), jsonb_limits)
             })
             .collect();
         let params = match params {
@@ -517,6 +519,7 @@ mod tests {
             &[1],          // binary param format
             &[Some(7i32.to_be_bytes().to_vec())],
             vec![1], // binary result format
+            &crate::jsonb_wire::test_limits(),
         );
         assert!(matches!(ack, BackendMessage::BindComplete));
         let portal = s.portal("").expect("portal stored");
@@ -528,7 +531,14 @@ mod tests {
     #[test]
     fn bind_missing_statement_fails_loud() {
         let mut s = Session::new(test_auth());
-        let resp = s.on_bind("".into(), "ghost".into(), &[], &[], vec![]);
+        let resp = s.on_bind(
+            "".into(),
+            "ghost".into(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         assert!(matches!(
             resp,
             BackendMessage::ErrorResponse { ref fields } if fields[1] == (b'C', "26000".to_string())
@@ -547,6 +557,7 @@ mod tests {
             &[0],
             &[Some(b"not-an-integer".to_vec())],
             vec![],
+            &crate::jsonb_wire::test_limits(),
         );
 
         assert!(matches!(
@@ -572,6 +583,7 @@ mod tests {
             &[format],
             &[Some(value.to_vec())],
             vec![],
+            &crate::jsonb_wire::test_limits(),
         );
         assert!(s.is_error_pending(), "oid {oid} format {format}");
         assert!(s.portal("p").is_none(), "oid {oid} format {format}");
@@ -593,9 +605,15 @@ mod tests {
         assert_eq!(bind_error_code(23, 1, &[1, 2]), "22P03");
         assert_eq!(bind_error_code(2950, 1, &[0; 3]), "22P03");
         assert_eq!(bind_error_code(1114, 1, &[0; 4]), "22P03");
+        // jsonb / json are mapped since T-161a: bad JSON is 22P02 (text and
+        // binary), a bad version byte is 22P03.
+        assert_eq!(bind_error_code(3802, 0, b"{"), "22P02");
+        assert_eq!(bind_error_code(3802, 1, b"\x01{"), "22P02");
+        assert_eq!(bind_error_code(3802, 1, b"\x02{}"), "22P03");
+        assert_eq!(bind_error_code(114, 1, b"{"), "22P02");
         // An unmapped OID is refused at Bind, in both formats.
-        assert_eq!(bind_error_code(3802, 0, b"{}"), "42704");
-        assert_eq!(bind_error_code(114, 1, b"{}"), "42704");
+        assert_eq!(bind_error_code(4072, 0, b"$"), "42704");
+        assert_eq!(bind_error_code(1184, 1, b"{}"), "42704");
     }
 
     #[test]
@@ -603,7 +621,14 @@ mod tests {
         let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
 
-        let response = s.on_bind("p".into(), "st".into(), &[1], &[Some(vec![1])], vec![]);
+        let response = s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[1],
+            &[Some(vec![1])],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
 
         assert!(matches!(
             response,
@@ -624,6 +649,7 @@ mod tests {
             &[0, 1],
             &[Some(b"7".to_vec())],
             vec![],
+            &crate::jsonb_wire::test_limits(),
         );
 
         assert!(matches!(
@@ -638,7 +664,14 @@ mod tests {
     fn close_removes_statement_and_portal() {
         let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users", vec![]);
-        s.on_bind("p".into(), "st".into(), &[], &[], vec![]);
+        s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         assert!(matches!(
             s.on_close(b'P', "p"),
             BackendMessage::CloseComplete
@@ -693,9 +726,23 @@ mod tests {
     async fn rebind_releases_a_suspended_portals_query() {
         let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users", vec![]);
-        s.on_bind("p".into(), "st".into(), &[], &[], vec![]);
+        s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         s.park_stream("p".into(), running_query().await);
-        s.on_bind("p".into(), "st".into(), &[], &[], vec![]);
+        s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         assert_eq!(s.suspended_portals(), 0);
     }
 

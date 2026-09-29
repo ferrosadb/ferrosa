@@ -45,6 +45,11 @@ pub struct QueryContext {
     /// front-end has no DDL authority (unit-test contexts): DDL is then refused
     /// with `0A000` rather than reported as done.
     pub ddl: Option<Arc<dyn crate::ddl::DdlExecutor>>,
+    /// Tunable jsonb ingest limits (D14b), resolved once at startup by the
+    /// binary from `[jsonb]` / env and passed in here. There is no default:
+    /// every constructor must supply the resolved value. They gate INSERT and
+    /// UPDATE input only; reads use the codec's fixed hard ceilings.
+    pub jsonb_limits: ferrosa_jsonb::Limits,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -393,6 +398,7 @@ where
                     &param_formats,
                     &param_values,
                     result_formats,
+                    &ctx.jsonb_limits,
                 )
                 .encode(&mut out);
         }
@@ -648,6 +654,22 @@ fn read_env<'a>(
         mvcc: Some(&ctx.mvcc),
         snapshot: Some(snapshot),
         ddl: ctx.ddl.as_deref(),
+        jsonb_limits: &ctx.jsonb_limits,
+    }
+}
+
+/// The storage and limits context for one extended-protocol DML statement.
+fn dml_context<'a>(
+    ctx: &'a QueryContext,
+    txn: Option<&'a mut Vec<crate::PgWrite>>,
+) -> query::DmlContext<'a> {
+    query::DmlContext {
+        engine: &ctx.engine,
+        mvcc: Some(&ctx.mvcc),
+        schema: &ctx.schema,
+        default_schema: &ctx.default_schema,
+        txn,
+        jsonb_limits: &ctx.jsonb_limits,
     }
 }
 
@@ -1424,13 +1446,7 @@ async fn execute_portal_inner(
                 None
             };
             let msgs = query::execute_insert(
-                query::DmlContext {
-                    engine: &ctx.engine,
-                    mvcc: Some(&ctx.mvcc),
-                    schema: &ctx.schema,
-                    default_schema: &ctx.default_schema,
-                    txn: transaction_writes,
-                },
+                dml_context(ctx, transaction_writes),
                 &ins,
                 &params,
                 returning_opts,
@@ -1439,57 +1455,21 @@ async fn execute_portal_inner(
             execute_dml(session, msgs)
         }
         PreparedKind::Update(upd) => {
-            let in_txn = session.in_txn();
-            let msgs = if in_txn {
-                query::execute_update(
-                    &ctx.engine,
-                    Some(&ctx.mvcc),
-                    &ctx.schema,
-                    &upd,
-                    &ctx.default_schema,
-                    &params,
-                    Some(session.txn_writes_mut()),
-                )
-                .await
+            let txn = if session.in_txn() {
+                Some(session.txn_writes_mut())
             } else {
-                query::execute_update(
-                    &ctx.engine,
-                    Some(&ctx.mvcc),
-                    &ctx.schema,
-                    &upd,
-                    &ctx.default_schema,
-                    &params,
-                    None,
-                )
-                .await
+                None
             };
+            let msgs = query::execute_update(dml_context(ctx, txn), &upd, &params).await;
             execute_dml(session, msgs)
         }
         PreparedKind::Delete(del) => {
-            let in_txn = session.in_txn();
-            let msgs = if in_txn {
-                query::execute_delete(
-                    &ctx.engine,
-                    Some(&ctx.mvcc),
-                    &ctx.schema,
-                    &del,
-                    &ctx.default_schema,
-                    &params,
-                    Some(session.txn_writes_mut()),
-                )
-                .await
+            let txn = if session.in_txn() {
+                Some(session.txn_writes_mut())
             } else {
-                query::execute_delete(
-                    &ctx.engine,
-                    Some(&ctx.mvcc),
-                    &ctx.schema,
-                    &del,
-                    &ctx.default_schema,
-                    &params,
-                    None,
-                )
-                .await
+                None
             };
+            let msgs = query::execute_delete(dml_context(ctx, txn), &del, &params).await;
             execute_dml(session, msgs)
         }
     }
@@ -1732,6 +1712,7 @@ mod txn_atomicity_tests {
             mvcc: Arc::new(MvccManager::default()),
             accord_committer: None,
             ddl: None,
+            jsonb_limits: crate::jsonb_wire::test_limits(),
         }
     }
 
@@ -1751,6 +1732,7 @@ mod txn_atomicity_tests {
             &ctx.schema,
             &format!("SELECT k FROM kv WHERE k = '{key}'"),
             &ctx.default_schema,
+            &ctx.jsonb_limits,
             None,
         )
         .await;
@@ -2016,12 +1998,8 @@ mod txn_atomicity_tests {
             snapshot: &crate::mvcc::MvccSnapshot,
         ) -> Vec<BackendMessage> {
             query::execute_query_with_mvcc(
-                &ctx.engine,
-                &ctx.schema,
+                read_env(ctx, snapshot),
                 "SELECT k, v FROM kv ORDER BY k",
-                &ctx.default_schema,
-                Some(&ctx.mvcc),
-                Some(snapshot),
                 None,
             )
             .await
@@ -2326,6 +2304,7 @@ mod txn_atomicity_tests {
                 &[],
                 &[Some(b"expired-write".to_vec())],
                 vec![],
+                &crate::jsonb_wire::test_limits()
             ),
             BackendMessage::BindComplete
         ));
@@ -2515,7 +2494,14 @@ mod txn_atomicity_tests {
             "SELECT v FROM kv WHERE k = 'extended-snapshot'",
             vec![],
         );
-        reader.on_bind("portal".to_string(), "read".to_string(), &[], &[], vec![]);
+        reader.on_bind(
+            "portal".to_string(),
+            "read".to_string(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         let first = execute_portal(&ctx, &mut reader, "portal").await;
         assert_eq!(read_first_text_column(&first).as_deref(), Some("before"));
 

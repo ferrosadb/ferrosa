@@ -45,7 +45,8 @@ use tokio::task::JoinHandle;
 
 use crate::messages::BackendMessage;
 use crate::query::{
-    check_scan_failure, encode_data_row, error_response, exec_error_response, ReplySink,
+    check_scan_failure, encode_data_row, encode_error_response, error_response,
+    exec_error_response, ReplySink,
 };
 use crate::storage_provider::ScanFailure;
 
@@ -338,7 +339,7 @@ impl ResultStream {
         for row in self.buffered.drain(..take) {
             match encode_data_row(&row, types, formats) {
                 Ok(message) => messages.push(message),
-                Err(error) => return (messages, Some(error_response("22003", &error))),
+                Err(error) => return (messages, Some(encode_error_response(&error))),
             }
         }
         (messages, None)

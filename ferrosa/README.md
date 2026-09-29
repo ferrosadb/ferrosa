@@ -171,7 +171,9 @@ flat under tight cgroups; override at process startup with `_RJEM_MALLOC_CONF`.
 
 `[jsonb]` sets the jsonb ingest limits (TOML over `FERROSA_JSONB_*` env). Startup
 validates them against their hard ceilings and the commit-log segment size and
-exits with a FATAL message naming the key on a violation.
+exits with a FATAL message naming the key on a violation. The resolved limits are
+passed to the Postgres front end (`QueryContext::jsonb_limits`, T-161a) and gate
+jsonb INSERT/UPDATE input there.
 
 See `ferrosa.example.toml` for the file form (`[cql] [udf] [jsonb] [internode]
 [storage] [s3] [graph] [web]`).

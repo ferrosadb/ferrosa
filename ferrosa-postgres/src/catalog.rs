@@ -494,6 +494,20 @@ mod tests {
         assert!(pairs.contains(&(25, "text")), "pg_type rows: {pairs:?}");
     }
 
+    /// PG-T161a-06: a jsonb column projects as OID 3802 in `pg_attribute` and
+    /// puts a `jsonb` row in `pg_type` (D11).
+    #[test]
+    fn pg_type_and_pg_attribute_report_jsonb_3802() {
+        let schema = schema_with_ks_tbl_extra(&[("doc", "jsonb")]);
+        assert_eq!(atttypid(&schema, "doc"), Value::Int(3802));
+        let rows = rows_of(&pg_type(&schema).expect("pg_type projects"));
+        assert!(
+            rows.iter()
+                .any(|r| r.get(0) == &Value::Int(3802) && r.get(1) == &Value::Text("jsonb".into())),
+            "pg_type has a jsonb row: {rows:?}"
+        );
+    }
+
     #[test]
     fn catalog_tables_exposes_all_four_relations() {
         let schema = schema_with_ks_tbl();

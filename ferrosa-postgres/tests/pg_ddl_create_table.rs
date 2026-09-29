@@ -142,6 +142,7 @@ async fn start_with(with_public: bool) -> Fixture {
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord_committer: None,
         ddl: Some(Arc::new(ClusterDdl::new(path))),
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -322,28 +323,22 @@ async fn pg_ddl_create_table_key_mapping_and_if_not_exists() {
     );
 }
 
+/// T-161a lifted the jsonb refusal: `jsonb` and `json` (stored as jsonb, D11)
+/// columns create a CQL `jsonb` column. Standalone-vs-cluster gating is T-300
+/// (`ddl::check_jsonb_ddl_allowed`), not tested here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_ddl_create_table_jsonb_is_refused_until_the_engine_type_exists() {
+async fn pg_ddl_create_table_jsonb_and_json_create_jsonb_columns() {
     let fx = start().await;
-    for ty in ["jsonb", "json"] {
-        let result = fx
-            .client
-            .batch_execute(&format!("CREATE TABLE j (id int PRIMARY KEY, doc {ty})"))
-            .await;
-        let error = result.expect_err("jsonb columns are refused");
-        let db = error.as_db_error().expect("db error");
-        assert_eq!(db.code().code(), "0A000");
-        assert!(
-            db.message().contains("jsonb"),
-            "names jsonb: {}",
-            db.message()
-        );
-    }
-    assert!(!fx
-        .schema
-        .snapshot()
-        .tables
-        .contains_key(&("public".to_string(), "j".to_string())));
+    fx.client
+        .batch_execute("CREATE TABLE j (id int PRIMARY KEY, a jsonb, b json)")
+        .await
+        .expect("jsonb and json columns are creatable");
+    let cols = columns_of(&fx.schema, "j");
+    let types: Vec<(&str, &str)> = cols
+        .iter()
+        .map(|(n, _, _, t)| (n.as_str(), t.as_str()))
+        .collect();
+    assert_eq!(types, vec![("id", "int"), ("a", "jsonb"), ("b", "jsonb")]);
 }
 
 /// T-154a (D3): jsonb in a PRIMARY KEY column is refused with `42P16`

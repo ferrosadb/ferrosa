@@ -772,12 +772,17 @@ mod tests {
             Value::Jsonb(got) => assert_eq!(got.as_bytes(), doc.as_bytes()),
             other => panic!("expected Value::Jsonb, got {other:?}"),
         }
-        match crate::query::value_to_cql(&sql, &CqlType::Jsonb) {
+        match crate::query::value_to_cql(&sql, &CqlType::Jsonb, &crate::jsonb_wire::test_limits()) {
             Ok(back) => assert_eq!(back, cql),
             Err(_) => panic!("a jsonb value must bind to a jsonb column"),
         }
-        // A non-jsonb value for a jsonb column is refused, never coerced.
-        assert!(crate::query::value_to_cql(&Value::Text("{}".into()), &CqlType::Jsonb).is_err());
+        // A non-jsonb, non-text value for a jsonb column is refused, never
+        // coerced. (Text is parsed and validated: T-161a.)
+        let limits = crate::jsonb_wire::test_limits();
+        assert!(crate::query::value_to_cql(&Value::Int(1), &CqlType::Jsonb, &limits).is_err());
+        assert!(
+            crate::query::value_to_cql(&Value::Text("{".into()), &CqlType::Jsonb, &limits).is_err()
+        );
     }
 
     fn cql_to_value(value: &CqlValue) -> Value {

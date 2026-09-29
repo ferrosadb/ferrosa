@@ -73,48 +73,113 @@ pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
 /// v1, with the non-finite cases mapped to Postgres's spellings: `NaN`,
 /// `Infinity`, `-Infinity`. Exact float text-format parity with Postgres is
 /// tracked as follow-up.
-fn render_value(value: &SqlValue) -> Option<Vec<u8>> {
-    match value {
-        SqlValue::Null => None,
-        SqlValue::Int(i) => Some(i.to_string().into_bytes()),
-        SqlValue::Text(s) => Some(s.clone().into_bytes()),
-        SqlValue::Bool(b) => Some(if *b { b"t".to_vec() } else { b"f".to_vec() }),
-        SqlValue::Float(of) => {
-            let f = of.0;
-            let s = if f.is_nan() {
-                "NaN".to_string()
-            } else if f.is_infinite() {
-                if f.is_sign_negative() {
-                    "-Infinity".to_string()
-                } else {
-                    "Infinity".to_string()
-                }
+///
+/// A value with no text rendering is a typed [`EncodeError`], never `None`: a
+/// `None` here would reach the client as SQL NULL.
+fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
+    let text = match value {
+        SqlValue::Null => return Ok(None),
+        SqlValue::Int(i) => i.to_string().into_bytes(),
+        SqlValue::Text(s) => s.clone().into_bytes(),
+        SqlValue::Bool(b) => {
+            if *b {
+                b"t".to_vec()
             } else {
-                format!("{f}")
-            };
-            Some(s.into_bytes())
+                b"f".to_vec()
+            }
         }
+        SqlValue::Float(of) => render_float_text(of.0).into_bytes(),
         // `uuid::Uuid`'s Display is the canonical lowercase hyphenated form,
         // which is exactly Postgres's uuid text output.
-        SqlValue::Uuid(u) => Some(u.to_string().into_bytes()),
+        SqlValue::Uuid(u) => u.to_string().into_bytes(),
         // Postgres bytea text output (default `hex` format): `\x` followed by
-        // lowercase hex of the bytes; empty bytea ⇒ just `\x`.
-        SqlValue::Bytea(bytes) => Some(bytea_hex_text(bytes)),
+        // lowercase hex of the bytes; empty bytea => just `\x`.
+        SqlValue::Bytea(bytes) => bytea_hex_text(bytes),
         // Temporal / network / numeric: exact Postgres text forms.
-        SqlValue::Timestamp(micros) => Some(render_timestamp_text(*micros).into_bytes()),
-        SqlValue::Date(days) => Some(render_date_text(*days).into_bytes()),
-        SqlValue::Time(micros) => Some(render_time_text(*micros).into_bytes()),
+        SqlValue::Timestamp(micros) => render_timestamp_text(*micros).into_bytes(),
+        SqlValue::Date(days) => render_date_text(*days).into_bytes(),
+        SqlValue::Time(micros) => render_time_text(*micros).into_bytes(),
         // `IpAddr`'s Display is the canonical IP string, exactly Postgres `inet`
         // text output for a plain host address.
-        SqlValue::Inet(ip) => Some(ip.to_string().into_bytes()),
-        SqlValue::Numeric { unscaled, scale } => {
-            Some(render_numeric_text(unscaled, *scale).into_bytes())
+        SqlValue::Inet(ip) => ip.to_string().into_bytes(),
+        SqlValue::Numeric { unscaled, scale } => render_numeric_text(unscaled, *scale).into_bytes(),
+        // PostgreSQL jsonb text (D26), or a typed error for a corrupt cell.
+        SqlValue::Jsonb(doc) => crate::jsonb_wire::render_text(doc)?,
+        SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
+            return Err(EncodeError::unsupported(
+                "result format for jsonpath and text[] values is not supported yet (T-161b)",
+            ))
         }
-        // Not renderable until the T-161a wire codec. `encode_value`, the only
-        // caller, refuses these before reaching here (PG-T160-1); a caller that
-        // skips it gets SQL NULL, so keep this the sole call site.
-        SqlValue::Jsonb(_) | SqlValue::JsonPath(_) | SqlValue::TextArray(_) => None,
+    };
+    Ok(Some(text))
+}
+
+/// Postgres text spelling of an `f64`: shortest round-trip form, with the
+/// non-finite cases as `NaN`, `Infinity`, `-Infinity`.
+fn render_float_text(f: f64) -> String {
+    if f.is_nan() {
+        "NaN".to_string()
+    } else if f.is_infinite() {
+        if f.is_sign_negative() {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        }
+    } else {
+        format!("{f}")
     }
+}
+
+/// A value that cannot be encoded in the requested wire format: the SQLSTATE and
+/// message of the `ErrorResponse` that replaces the row. Fail loud: the value is
+/// never sent as NULL or as bytes a driver could misdecode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeError {
+    /// SQLSTATE for the `ErrorResponse`.
+    pub sqlstate: &'static str,
+    /// Human-readable cause; never contains stored data.
+    pub message: String,
+}
+
+impl EncodeError {
+    /// A format the value has no encoding for (`0A000`).
+    fn unsupported(message: &str) -> Self {
+        Self {
+            sqlstate: "0A000",
+            message: message.to_string(),
+        }
+    }
+}
+
+/// A range or width failure (`22003`, numeric_value_out_of_range): the original
+/// meaning of every string-typed encode error.
+impl From<String> for EncodeError {
+    fn from(message: String) -> Self {
+        Self {
+            sqlstate: "22003",
+            message,
+        }
+    }
+}
+
+impl From<crate::jsonb_wire::WireError> for EncodeError {
+    fn from(error: crate::jsonb_wire::WireError) -> Self {
+        Self {
+            sqlstate: error.sqlstate,
+            message: error.message,
+        }
+    }
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.sqlstate, self.message)
+    }
+}
+
+/// The `ErrorResponse` for an [`EncodeError`], carrying its own SQLSTATE.
+pub(crate) fn encode_error_response(error: &EncodeError) -> BackendMessage {
+    error_response(error.sqlstate, &error.message)
 }
 
 /// Render a [`SqlValue::Timestamp`] (Unix-epoch microseconds, UTC) as Postgres
@@ -257,9 +322,13 @@ impl ParamError {
 
 /// Parameter type OIDs the decoder maps. Anything else (except `0`,
 /// unspecified) is refused rather than decoded as text.
-const SUPPORTED_PARAM_OIDS: [i32; 16] = [
-    16, 17, 19, 20, 21, 23, 25, 700, 701, 869, 1043, 1082, 1083, 1114, 1700, 2950,
+const SUPPORTED_PARAM_OIDS: [i32; 18] = [
+    16, 17, 19, 20, 21, 23, 25, 114, 700, 701, 869, 1043, 1082, 1083, 1114, 1700, 2950, 3802,
 ];
+
+/// `json` (D11: stored as jsonb) and `jsonb` parameter OIDs.
+const PARAM_OID_JSON: i32 = 114;
+const PARAM_OID_JSONB: i32 = 3802;
 
 /// Decode one bound parameter into a [`SqlValue`], failing loud.
 ///
@@ -267,10 +336,15 @@ const SUPPORTED_PARAM_OIDS: [i32; 16] = [
 /// the declared type OID (`0` = unspecified, treated as UTF-8 text). `bytes`
 /// is `None` for SQL NULL. A value that does not parse, a malformed binary
 /// value, and an OID with no mapping are all errors: none becomes NULL or text.
+///
+/// `jsonb_limits` gates jsonb (3802) and json (114) input only (D14b): those
+/// parameters are parsed here into a validated [`SqlValue::Jsonb`]. Text bound
+/// to a jsonb column under any other OID is parsed later, in [`value_to_cql`].
 pub(crate) fn decode_param_checked(
     format: i16,
     type_oid: i32,
     bytes: Option<&[u8]>,
+    jsonb_limits: &ferrosa_jsonb::Limits,
 ) -> Result<SqlValue, ParamError> {
     let Some(raw) = bytes else {
         return Ok(SqlValue::Null);
@@ -287,11 +361,36 @@ pub(crate) fn decode_param_checked(
             format!("parameter type OID {type_oid} is not supported"),
         ));
     }
+    if matches!(type_oid, PARAM_OID_JSON | PARAM_OID_JSONB) {
+        return decode_param_jsonb(format, type_oid, raw, jsonb_limits);
+    }
     if format == 1 {
         decode_param_binary(type_oid, raw)
     } else {
         decode_param_text(type_oid, raw)
     }
+}
+
+/// jsonb / json parameter: parse under the configured limits (D14b).
+///
+/// Text format is the JSON text. Binary `jsonb` is a `0x01` version byte then the
+/// text (`jsonb_recv`); binary `json` is the bare text (`json_recv`). The
+/// [`crate::jsonb_wire`] errors carry the SQLSTATE and never echo the input.
+fn decode_param_jsonb(
+    format: i16,
+    type_oid: i32,
+    raw: &[u8],
+    limits: &ferrosa_jsonb::Limits,
+) -> Result<SqlValue, ParamError> {
+    use crate::jsonb_wire::{parse_binary_input, parse_text_input, InputEdge};
+    let parsed = if format == 1 && type_oid == PARAM_OID_JSONB {
+        parse_binary_input(raw, limits)
+    } else {
+        parse_text_input(raw, limits, InputEdge::Parameter)
+    };
+    parsed
+        .map(SqlValue::Jsonb)
+        .map_err(|e| ParamError::new(e.sqlstate, e.message))
 }
 
 /// Text-format parameter decode: parse the UTF-8 string per the declared OID.
@@ -615,16 +714,9 @@ pub fn encode_value(
     format: i16,
     col_type: ColumnType,
     v: &SqlValue,
-) -> Result<Option<Vec<u8>>, String> {
-    // No wire codec for these until T-161a (PG-T160-1): refuse in BOTH formats
-    // rather than emit bytes a driver could misdecode.
-    if let SqlValue::Jsonb(_) | SqlValue::JsonPath(_) | SqlValue::TextArray(_) = v {
-        return Err(format!(
-            "result format for {col_type:?} is not supported yet (jsonb wire codec is T-161a)"
-        ));
-    }
+) -> Result<Option<Vec<u8>>, EncodeError> {
     if format != 1 {
-        return Ok(render_value(v)); // text format: reuse the existing renderer
+        return render_value(v); // text format: reuse the existing renderer
     }
     Ok(match v {
         SqlValue::Null => None,
@@ -661,10 +753,16 @@ pub fn encode_value(
         // contract. Until numeric binary encoding is implemented, fail the
         // statement instead of returning data the driver may misdecode.
         SqlValue::Numeric { .. } => {
-            return Err("binary result format for numeric is not supported".to_string());
+            return Err("binary result format for numeric is not supported"
+                .to_string()
+                .into());
         }
-        SqlValue::Jsonb(_) | SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
-            return Err(format!("no binary codec for {col_type:?} (T-161a)"));
+        // jsonb_send: version byte 0x01 then the PostgreSQL text form (D11, D26).
+        SqlValue::Jsonb(doc) => Some(crate::jsonb_wire::render_binary(doc)?),
+        SqlValue::JsonPath(_) | SqlValue::TextArray(_) => {
+            return Err(EncodeError::unsupported(&format!(
+                "no binary codec for {col_type:?} (T-161b)"
+            )));
         }
     })
 }
@@ -752,7 +850,7 @@ fn render_result(result: QueryResult, result_formats: &[i16]) -> Vec<BackendMess
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(columns) => columns,
-            Err(error) => return vec![error_response("22003", &error)],
+            Err(error) => return vec![encode_error_response(&error)],
         };
         out.push(BackendMessage::DataRow { columns });
     }
@@ -771,9 +869,19 @@ pub async fn execute_query(
     schema: &Schema,
     sql: &str,
     default_schema: &str,
+    jsonb_limits: &ferrosa_jsonb::Limits,
     txn: Option<&mut Vec<PgWrite>>,
 ) -> Vec<BackendMessage> {
-    execute_query_with_mvcc(engine, schema, sql, default_schema, None, None, txn).await
+    let env = ReadEnv {
+        engine,
+        schema,
+        default_schema,
+        mvcc: None,
+        snapshot: None,
+        ddl: None,
+        jsonb_limits,
+    };
+    execute_query_with_mvcc(env, sql, txn).await
 }
 
 /// The SQLSTATE a parse failure is reported with (FMEA PG-T132a-04).
@@ -800,23 +908,11 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
 /// value; the server never calls it, because gathering a `SELECT`'s rows here is
 /// exactly the materialization the streaming path exists to avoid.
 pub(crate) async fn execute_query_with_mvcc(
-    engine: &Arc<StorageEngine>,
-    schema: &Schema,
+    env: ReadEnv<'_>,
     sql: &str,
-    default_schema: &str,
-    mvcc: Option<&MvccManager>,
-    snapshot: Option<&MvccSnapshot>,
     txn: Option<&mut Vec<PgWrite>>,
 ) -> Vec<BackendMessage> {
     let mut messages: Vec<BackendMessage> = Vec::new();
-    let env = ReadEnv {
-        engine,
-        schema,
-        default_schema,
-        mvcc,
-        snapshot,
-        ddl: None,
-    };
     let tail = execute_query_streaming(env, sql, txn, &mut messages).await;
     match tail {
         Ok(tail) => messages.extend(tail),
@@ -853,16 +949,7 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
         }
     };
     let Statement::Select(select) = stmt else {
-        return Ok(execute_statement(
-            env.engine,
-            env.schema,
-            stmt,
-            env.default_schema,
-            env.mvcc,
-            env.ddl,
-            txn,
-        )
-        .await);
+        return Ok(execute_statement(env, stmt, txn).await);
     };
     // Table query: load referenced tables (the R15 guard lives in
     // `load_table` — a missing table is `NoSuchTable`, never an empty scan),
@@ -888,6 +975,8 @@ pub(crate) struct ReadEnv<'a> {
     pub(crate) mvcc: Option<&'a MvccManager>,
     pub(crate) snapshot: Option<&'a MvccSnapshot>,
     pub(crate) ddl: Option<&'a dyn crate::ddl::DdlExecutor>,
+    /// Tunable jsonb ingest limits (D14b), for text coerced into jsonb columns.
+    pub(crate) jsonb_limits: &'a ferrosa_jsonb::Limits,
 }
 
 /// Load `select`'s tables and start its executor on a blocking thread, ready to
@@ -942,7 +1031,7 @@ pub(crate) fn encode_data_row(
     row: &Row,
     col_types: &[ColumnType],
     result_formats: &[i16],
-) -> Result<BackendMessage, String> {
+) -> Result<BackendMessage, EncodeError> {
     let columns = row
         .0
         .iter()
@@ -954,14 +1043,19 @@ pub(crate) fn encode_data_row(
 
 /// Every statement that is not a table `SELECT`: bounded replies, returned whole.
 async fn execute_statement(
-    engine: &Arc<StorageEngine>,
-    schema: &Schema,
+    env: ReadEnv<'_>,
     stmt: Statement,
-    default_schema: &str,
-    mvcc: Option<&MvccManager>,
-    ddl: Option<&dyn crate::ddl::DdlExecutor>,
     txn: Option<&mut Vec<PgWrite>>,
 ) -> Vec<BackendMessage> {
+    let ReadEnv {
+        engine,
+        schema,
+        default_schema,
+        mvcc,
+        ddl,
+        jsonb_limits,
+        ..
+    } = env;
     match stmt {
         // Routed to `execute_query_streaming` before this point.
         Statement::Select(_) => vec![error_response(
@@ -1017,6 +1111,7 @@ async fn execute_statement(
                     schema,
                     default_schema,
                     txn,
+                    jsonb_limits,
                 },
                 &ins,
                 &[],
@@ -1025,10 +1120,26 @@ async fn execute_statement(
             .await
         }
         Statement::Update(upd) => {
-            execute_update(engine, mvcc, schema, &upd, default_schema, &[], txn).await
+            let context = DmlContext {
+                engine,
+                mvcc,
+                schema,
+                default_schema,
+                txn,
+                jsonb_limits,
+            };
+            execute_update(context, &upd, &[]).await
         }
         Statement::Delete(del) => {
-            execute_delete(engine, mvcc, schema, &del, default_schema, &[], txn).await
+            let context = DmlContext {
+                engine,
+                mvcc,
+                schema,
+                default_schema,
+                txn,
+                jsonb_limits,
+            };
+            execute_delete(context, &del, &[]).await
         }
     }
 }
@@ -1234,7 +1345,15 @@ fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, B
 /// driven by the target column's [`CqlType`]. The inverse of
 /// `storage_provider::cql_to_value`; `Null` maps to a tombstone for any type,
 /// and a type mismatch fails loud (`42804`) rather than silently coercing.
-pub(crate) fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, BackendMessage> {
+///
+/// `jsonb_limits` gates the jsonb arm only: a text value bound to a jsonb column
+/// (an untyped literal, or a parameter declared text) is parsed and validated
+/// here, as PostgreSQL coerces an unknown-typed literal (D11, D14b).
+pub(crate) fn value_to_cql(
+    value: &SqlValue,
+    ty: &CqlType,
+    jsonb_limits: &ferrosa_jsonb::Limits,
+) -> Result<CqlValue, BackendMessage> {
     if matches!(value, SqlValue::Null) {
         return Ok(CqlValue::Null);
     }
@@ -1275,12 +1394,13 @@ pub(crate) fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, B
         }
         // T-160: a validated jsonb value binds to a jsonb column as its cell.
         (CqlType::Jsonb, SqlValue::Jsonb(doc)) => CqlValue::Jsonb(doc.clone()),
-        // Any other value for a jsonb column is a type mismatch, refused (the
-        // text -> jsonb parse is T-161a).
-        (CqlType::Jsonb, _) => return Err(error_response(
-            "0A000",
-            "only a jsonb value can be bound to a jsonb column (text and binary input are T-161a)",
-        )),
+        // Untyped literal / text-declared parameter: parse and validate.
+        (CqlType::Jsonb, SqlValue::Text(text)) => {
+            use crate::jsonb_wire::{parse_text_input, InputEdge};
+            let doc = parse_text_input(text.as_bytes(), jsonb_limits, InputEdge::Literal)
+                .map_err(|e| error_response(e.sqlstate, &e.message))?;
+            CqlValue::Jsonb(doc)
+        }
         (CqlType::Ascii, _)
         | (CqlType::Bigint, _)
         | (CqlType::Blob, _)
@@ -1306,6 +1426,7 @@ pub(crate) fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, B
         | (CqlType::Set(_), _)
         | (CqlType::Tuple(_), _)
         | (CqlType::Udt { .. }, _)
+        | (CqlType::Jsonb, _)
         | (CqlType::Vector(_, _), _) => {
             return Err(error_response(
                 "42804",
@@ -1334,6 +1455,8 @@ pub(crate) struct DmlContext<'a> {
     pub schema: &'a Schema,
     pub default_schema: &'a str,
     pub txn: Option<&'a mut Vec<PgWrite>>,
+    /// Tunable jsonb ingest limits (D14b) for text bound to jsonb columns.
+    pub jsonb_limits: &'a ferrosa_jsonb::Limits,
 }
 
 impl ReturningOpts<'_> {
@@ -1374,6 +1497,7 @@ pub(crate) async fn execute_insert(
         schema,
         default_schema,
         txn,
+        jsonb_limits,
     } = context;
 
     let ReturningOpts {
@@ -1407,7 +1531,10 @@ pub(crate) async fn execute_insert(
             &ins.table.table,
             col_name,
             &ins.values[i],
-            params,
+            ParamCtx {
+                params,
+                jsonb_limits,
+            },
         ) {
             Ok(r) => r,
             Err(msg) => return vec![msg],
@@ -1799,12 +1926,20 @@ fn render_dml_returning(
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(columns) => columns,
-            Err(error) => return vec![error_response("22003", &error)],
+            Err(error) => return vec![encode_error_response(&error)],
         };
         out.push(BackendMessage::DataRow { columns });
     }
     out.push(BackendMessage::CommandComplete { tag });
     out
+}
+
+/// What a DML value is resolved against: the bound parameters, and the jsonb
+/// ingest limits that gate text coerced into a jsonb column.
+#[derive(Clone, Copy)]
+struct ParamCtx<'a> {
+    params: &'a [SqlValue],
+    jsonb_limits: &'a ferrosa_jsonb::Limits,
 }
 
 /// Resolve a `(column, value)` pair from a DML statement to its `CqlValue`,
@@ -1821,7 +1956,7 @@ fn resolve_dml_value<'a>(
     table: &str,
     col_name: &str,
     sv: &ScalarValue,
-    params: &[SqlValue],
+    bound: ParamCtx<'_>,
 ) -> Result<(&'a ferrosa_schema::ColumnMetadata, SqlValue, CqlValue), BackendMessage> {
     let col_meta = meta.columns.get(col_name).ok_or_else(|| {
         error_response(
@@ -1832,8 +1967,8 @@ fn resolve_dml_value<'a>(
     let cql_type =
         ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
             .map_err(|e| error_response("42704", &e.to_string()))?;
-    let sql_value = substitute_param(sv, params)?;
-    let value = value_to_cql(&sql_value, &cql_type)?;
+    let sql_value = substitute_param(sv, bound.params)?;
+    let value = value_to_cql(&sql_value, &cql_type, bound.jsonb_limits)?;
     Ok((col_meta, sql_value, value))
 }
 
@@ -1843,15 +1978,20 @@ fn resolve_dml_value<'a>(
 /// is a blind upsert, so the affected-row count is reported as 1 when the write
 /// lands (Cassandra has no match count; this is the documented semantic).
 pub(crate) async fn execute_update(
-    engine: &StorageEngine,
-    mvcc: Option<&MvccManager>,
-    schema: &Schema,
+    context: DmlContext<'_>,
     upd: &UpdateStmt,
-    default_schema: &str,
     params: &[SqlValue],
-    txn: Option<&mut Vec<PgWrite>>,
 ) -> Vec<BackendMessage> {
     use std::collections::HashMap;
+
+    let DmlContext {
+        engine,
+        mvcc,
+        schema,
+        default_schema,
+        txn,
+        jsonb_limits,
+    } = context;
 
     // UPDATE ... RETURNING is out of scope for this PR (only INSERT RETURNING is
     // wired). Fail loud rather than silently dropping the clause.
@@ -1878,11 +2018,21 @@ pub(crate) async fn execute_update(
     // SET assignments -> regular/static cells (by storage index).
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
     for (col_name, sv) in &upd.assignments {
-        let (col_meta, _sql_value, value) =
-            match resolve_dml_value(meta, schema, ks, table, col_name, sv, params) {
-                Ok(r) => r,
-                Err(msg) => return vec![msg],
-            };
+        let (col_meta, _sql_value, value) = match resolve_dml_value(
+            meta,
+            schema,
+            ks,
+            table,
+            col_name,
+            sv,
+            ParamCtx {
+                params,
+                jsonb_limits,
+            },
+        ) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
+        };
         if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
             return vec![error_response(
                 "0A000",
@@ -1903,11 +2053,21 @@ pub(crate) async fn execute_update(
     // WHERE equality -> key values (must be key columns).
     let mut key_values: HashMap<String, CqlValue> = HashMap::new();
     for (col_name, sv) in &upd.where_eq {
-        let (col_meta, _sql_value, value) =
-            match resolve_dml_value(meta, schema, ks, table, col_name, sv, params) {
-                Ok(r) => r,
-                Err(msg) => return vec![msg],
-            };
+        let (col_meta, _sql_value, value) = match resolve_dml_value(
+            meta,
+            schema,
+            ks,
+            table,
+            col_name,
+            sv,
+            ParamCtx {
+                params,
+                jsonb_limits,
+            },
+        ) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
+        };
         if !matches!(
             col_meta.kind,
             ColumnKind::PartitionKey | ColumnKind::Clustering
@@ -1969,15 +2129,20 @@ pub(crate) async fn execute_update(
 /// "DELETE 1"` — the engine writes a tombstone unconditionally, so the count is
 /// reported as 1 when the write lands (Cassandra has no match count).
 pub(crate) async fn execute_delete(
-    engine: &StorageEngine,
-    mvcc: Option<&MvccManager>,
-    schema: &Schema,
+    context: DmlContext<'_>,
     del: &DeleteStmt,
-    default_schema: &str,
     params: &[SqlValue],
-    txn: Option<&mut Vec<PgWrite>>,
 ) -> Vec<BackendMessage> {
     use std::collections::HashMap;
+
+    let DmlContext {
+        engine,
+        mvcc,
+        schema,
+        default_schema,
+        txn,
+        jsonb_limits,
+    } = context;
 
     // DELETE ... RETURNING is out of scope for this PR. Fail loud.
     if del.returning.is_some() {
@@ -2002,11 +2167,21 @@ pub(crate) async fn execute_delete(
 
     let mut key_values: HashMap<String, CqlValue> = HashMap::new();
     for (col_name, sv) in &del.where_eq {
-        let (col_meta, _sql_value, value) =
-            match resolve_dml_value(meta, schema, ks, table, col_name, sv, params) {
-                Ok(r) => r,
-                Err(msg) => return vec![msg],
-            };
+        let (col_meta, _sql_value, value) = match resolve_dml_value(
+            meta,
+            schema,
+            ks,
+            table,
+            col_name,
+            sv,
+            ParamCtx {
+                params,
+                jsonb_limits,
+            },
+        ) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
+        };
         if !matches!(
             col_meta.kind,
             ColumnKind::PartitionKey | ColumnKind::Clustering
@@ -2292,7 +2467,7 @@ pub(crate) fn render_execute_result(
                     .collect::<Result<Vec<_>, _>>()
                 {
                     Ok(columns) => columns,
-                    Err(error) => return vec![error_response("22003", &error)],
+                    Err(error) => return vec![encode_error_response(&error)],
                 };
                 out.push(BackendMessage::DataRow { columns });
             }
@@ -2316,19 +2491,26 @@ mod tests {
 
     /// Decode a parameter that the test expects to be valid.
     fn decode_param(format: i16, type_oid: i32, bytes: Option<&[u8]>) -> SqlValue {
-        decode_param_checked(format, type_oid, bytes).expect("test parameter should decode")
+        decode_param_checked(format, type_oid, bytes, &crate::jsonb_wire::test_limits())
+            .expect("test parameter should decode")
     }
 
     fn param_err(format: i16, type_oid: i32, bytes: &[u8]) -> ParamError {
-        decode_param_checked(format, type_oid, Some(bytes))
-            .expect_err("test parameter should be refused")
+        decode_param_checked(
+            format,
+            type_oid,
+            Some(bytes),
+            &crate::jsonb_wire::test_limits(),
+        )
+        .expect_err("test parameter should be refused")
     }
 
     #[test]
     fn pg_param_unknown_oid_is_refused() {
-        // jsonb, json, timestamptz, bpchar, an int4 array and a made-up OID
-        // have no mapping: refused in both formats, never decoded as text.
-        for oid in [3802, 114, 1184, 1042, 1007, 999_999] {
+        // jsonpath, timestamptz, bpchar, an int4 array and a made-up OID have
+        // no mapping: refused in both formats, never decoded as text. (jsonb
+        // and json are mapped since T-161a.)
+        for oid in [4072, 1184, 1042, 1007, 999_999] {
             for format in [0, 1] {
                 let err = param_err(format, oid, b"{\"a\":1}");
                 assert_eq!(err.sqlstate, "42704", "oid {oid} format {format}");
@@ -2438,6 +2620,12 @@ mod tests {
         );
     }
 
+    /// `render_value` for a value that must render: the text bytes, or `None`
+    /// for NULL.
+    fn rv(v: &SqlValue) -> Option<Vec<u8>> {
+        render_value(v).expect("test value renders")
+    }
+
     #[test]
     fn column_type_sizes_are_wire_correct() {
         assert_eq!(column_type_size(ColumnType::Int), 4);
@@ -2448,35 +2636,26 @@ mod tests {
 
     #[test]
     fn render_value_text_format() {
-        assert_eq!(render_value(&SqlValue::Null), None);
-        assert_eq!(render_value(&SqlValue::Int(42)), Some(b"42".to_vec()));
-        assert_eq!(render_value(&SqlValue::Int(-7)), Some(b"-7".to_vec()));
-        assert_eq!(
-            render_value(&SqlValue::Text("hi".into())),
-            Some(b"hi".to_vec())
-        );
-        assert_eq!(render_value(&SqlValue::Bool(true)), Some(b"t".to_vec()));
-        assert_eq!(render_value(&SqlValue::Bool(false)), Some(b"f".to_vec()));
+        assert_eq!(rv(&SqlValue::Null), None);
+        assert_eq!(rv(&SqlValue::Int(42)), Some(b"42".to_vec()));
+        assert_eq!(rv(&SqlValue::Int(-7)), Some(b"-7".to_vec()));
+        assert_eq!(rv(&SqlValue::Text("hi".into())), Some(b"hi".to_vec()));
+        assert_eq!(rv(&SqlValue::Bool(true)), Some(b"t".to_vec()));
+        assert_eq!(rv(&SqlValue::Bool(false)), Some(b"f".to_vec()));
     }
 
     #[test]
     fn render_value_float_text_format() {
-        assert_eq!(render_value(&SqlValue::float(1.5)), Some(b"1.5".to_vec()));
-        assert_eq!(
-            render_value(&SqlValue::float(-0.25)),
-            Some(b"-0.25".to_vec())
-        );
+        assert_eq!(rv(&SqlValue::float(1.5)), Some(b"1.5".to_vec()));
+        assert_eq!(rv(&SqlValue::float(-0.25)), Some(b"-0.25".to_vec()));
         // Non-finite values use Postgres spellings.
+        assert_eq!(rv(&SqlValue::float(f64::NAN)), Some(b"NaN".to_vec()));
         assert_eq!(
-            render_value(&SqlValue::float(f64::NAN)),
-            Some(b"NaN".to_vec())
-        );
-        assert_eq!(
-            render_value(&SqlValue::float(f64::INFINITY)),
+            rv(&SqlValue::float(f64::INFINITY)),
             Some(b"Infinity".to_vec())
         );
         assert_eq!(
-            render_value(&SqlValue::float(f64::NEG_INFINITY)),
+            rv(&SqlValue::float(f64::NEG_INFINITY)),
             Some(b"-Infinity".to_vec())
         );
     }
@@ -2548,8 +2727,17 @@ mod tests {
         let max_date = i32::MAX.to_be_bytes();
         let max_timestamp = i64::MAX.to_be_bytes();
 
-        assert!(decode_param_checked(1, 1082, Some(&max_date)).is_err());
-        assert!(decode_param_checked(1, 1114, Some(&max_timestamp)).is_err());
+        assert!(
+            decode_param_checked(1, 1082, Some(&max_date), &crate::jsonb_wire::test_limits())
+                .is_err()
+        );
+        assert!(decode_param_checked(
+            1,
+            1114,
+            Some(&max_timestamp),
+            &crate::jsonb_wire::test_limits()
+        )
+        .is_err());
     }
 
     #[test]
@@ -2585,7 +2773,7 @@ mod tests {
     fn uuid_text_render_is_canonical_lowercase_hyphenated() {
         let u = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         assert_eq!(
-            render_value(&SqlValue::Uuid(u)),
+            rv(&SqlValue::Uuid(u)),
             Some(b"550e8400-e29b-41d4-a716-446655440000".to_vec())
         );
     }
@@ -2593,14 +2781,11 @@ mod tests {
     #[test]
     fn bytea_text_render_is_postgres_hex() {
         assert_eq!(
-            render_value(&SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef])),
+            rv(&SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef])),
             Some(b"\\xdeadbeef".to_vec())
         );
         // Empty bytea ⇒ just the `\x` prefix.
-        assert_eq!(
-            render_value(&SqlValue::Bytea(vec![])),
-            Some(b"\\x".to_vec())
-        );
+        assert_eq!(rv(&SqlValue::Bytea(vec![])), Some(b"\\x".to_vec()));
     }
 
     #[test]
@@ -2683,22 +2868,22 @@ mod tests {
             panic!("expected Timestamp");
         };
         assert_eq!(
-            render_value(&SqlValue::Timestamp(micros)),
+            rv(&SqlValue::Timestamp(micros)),
             Some(b"2024-01-15 10:30:00".to_vec())
         );
         // .5 second ⇒ ".5" (one digit, trailing zeros trimmed).
         assert_eq!(
-            render_value(&SqlValue::Timestamp(micros + 500_000)),
+            rv(&SqlValue::Timestamp(micros + 500_000)),
             Some(b"2024-01-15 10:30:00.5".to_vec())
         );
         // .123 ⇒ "123".
         assert_eq!(
-            render_value(&SqlValue::Timestamp(micros + 123_000)),
+            rv(&SqlValue::Timestamp(micros + 123_000)),
             Some(b"2024-01-15 10:30:00.123".to_vec())
         );
         // 1 microsecond ⇒ ".000001" (all 6 digits significant).
         assert_eq!(
-            render_value(&SqlValue::Timestamp(micros + 1)),
+            rv(&SqlValue::Timestamp(micros + 1)),
             Some(b"2024-01-15 10:30:00.000001".to_vec())
         );
     }
@@ -2709,7 +2894,7 @@ mod tests {
         // non-negative (.5) and the second floors correctly.
         let micros = -500_000;
         assert_eq!(
-            render_value(&SqlValue::Timestamp(micros)),
+            rv(&SqlValue::Timestamp(micros)),
             Some(b"1969-12-31 23:59:59.5".to_vec())
         );
     }
@@ -2719,48 +2904,36 @@ mod tests {
         let SqlValue::Date(days) = parse_date_text("2024-01-15").unwrap() else {
             panic!("expected Date");
         };
-        assert_eq!(
-            render_value(&SqlValue::Date(days)),
-            Some(b"2024-01-15".to_vec())
-        );
+        assert_eq!(rv(&SqlValue::Date(days)), Some(b"2024-01-15".to_vec()));
         // The Unix epoch is day 0.
-        assert_eq!(
-            render_value(&SqlValue::Date(0)),
-            Some(b"1970-01-01".to_vec())
-        );
+        assert_eq!(rv(&SqlValue::Date(0)), Some(b"1970-01-01".to_vec()));
         // A pre-epoch (negative) day renders correctly.
-        assert_eq!(
-            render_value(&SqlValue::Date(-1)),
-            Some(b"1969-12-31".to_vec())
-        );
+        assert_eq!(rv(&SqlValue::Date(-1)), Some(b"1969-12-31".to_vec()));
     }
 
     #[test]
     fn render_time_text_form_trims_fraction() {
         // 10:30:00 ⇒ no fraction.
         let micros = (10 * 3600 + 30 * 60) * 1_000_000;
-        assert_eq!(
-            render_value(&SqlValue::Time(micros)),
-            Some(b"10:30:00".to_vec())
-        );
+        assert_eq!(rv(&SqlValue::Time(micros)), Some(b"10:30:00".to_vec()));
         // + .25 second.
         assert_eq!(
-            render_value(&SqlValue::Time(micros + 250_000)),
+            rv(&SqlValue::Time(micros + 250_000)),
             Some(b"10:30:00.25".to_vec())
         );
         // Midnight.
-        assert_eq!(render_value(&SqlValue::Time(0)), Some(b"00:00:00".to_vec()));
+        assert_eq!(rv(&SqlValue::Time(0)), Some(b"00:00:00".to_vec()));
     }
 
     #[test]
     fn render_inet_text_is_canonical_ip() {
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
         assert_eq!(
-            render_value(&SqlValue::Inet(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)))),
+            rv(&SqlValue::Inet(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)))),
             Some(b"192.168.0.1".to_vec())
         );
         assert_eq!(
-            render_value(&SqlValue::Inet(IpAddr::V6(Ipv6Addr::LOCALHOST))),
+            rv(&SqlValue::Inet(IpAddr::V6(Ipv6Addr::LOCALHOST))),
             Some(b"::1".to_vec())
         );
     }
@@ -2772,37 +2945,37 @@ mod tests {
         use num_bigint::BigInt;
         // 123.45 (unscaled 12345, scale 2).
         assert_eq!(
-            render_value(&SqlValue::numeric(BigInt::from(12345), 2)),
+            rv(&SqlValue::numeric(BigInt::from(12345), 2)),
             Some(b"123.45".to_vec())
         );
         // Integer (scale 0).
         assert_eq!(
-            render_value(&SqlValue::numeric(BigInt::from(42), 0)),
+            rv(&SqlValue::numeric(BigInt::from(42), 0)),
             Some(b"42".to_vec())
         );
         // Negative.
         assert_eq!(
-            render_value(&SqlValue::numeric(BigInt::from(-12345), 2)),
+            rv(&SqlValue::numeric(BigInt::from(-12345), 2)),
             Some(b"-123.45".to_vec())
         );
         // 0.05 (leading-zero fraction padding).
         assert_eq!(
-            render_value(&SqlValue::numeric(BigInt::from(5), 2)),
+            rv(&SqlValue::numeric(BigInt::from(5), 2)),
             Some(b"0.05".to_vec())
         );
         // Zero.
         assert_eq!(
-            render_value(&SqlValue::numeric(BigInt::from(0), 4)),
+            rv(&SqlValue::numeric(BigInt::from(0), 4)),
             Some(b"0".to_vec())
         );
         // Trailing-zero normalization: 1.50 ⇒ "1.5".
         assert_eq!(
-            render_value(&SqlValue::numeric(BigInt::from(150), 2)),
+            rv(&SqlValue::numeric(BigInt::from(150), 2)),
             Some(b"1.5".to_vec())
         );
         // Negative scale (value scaled up): 12 * 10^2 = 1200.
         assert_eq!(
-            render_value(&SqlValue::numeric(BigInt::from(12), -2)),
+            rv(&SqlValue::numeric(BigInt::from(12), -2)),
             Some(b"1200".to_vec())
         );
     }
@@ -3053,34 +3226,74 @@ mod tests {
     fn value_to_cql_maps_per_target_type() {
         use ferrosa_common::CqlValue as C;
         assert_eq!(
-            value_to_cql(&SqlValue::Int(5), &CqlType::Int).unwrap(),
+            value_to_cql(
+                &SqlValue::Int(5),
+                &CqlType::Int,
+                &crate::jsonb_wire::test_limits()
+            )
+            .unwrap(),
             C::Int(5)
         );
         assert_eq!(
-            value_to_cql(&SqlValue::Int(5), &CqlType::Bigint).unwrap(),
+            value_to_cql(
+                &SqlValue::Int(5),
+                &CqlType::Bigint,
+                &crate::jsonb_wire::test_limits()
+            )
+            .unwrap(),
             C::Bigint(5)
         );
         assert_eq!(
-            value_to_cql(&SqlValue::Text("x".into()), &CqlType::Varchar).unwrap(),
+            value_to_cql(
+                &SqlValue::Text("x".into()),
+                &CqlType::Varchar,
+                &crate::jsonb_wire::test_limits()
+            )
+            .unwrap(),
             C::Text("x".to_string())
         );
         assert_eq!(
-            value_to_cql(&SqlValue::Bool(true), &CqlType::Boolean).unwrap(),
+            value_to_cql(
+                &SqlValue::Bool(true),
+                &CqlType::Boolean,
+                &crate::jsonb_wire::test_limits()
+            )
+            .unwrap(),
             C::Boolean(true)
         );
         // NULL maps to a tombstone for any target type.
         assert_eq!(
-            value_to_cql(&SqlValue::Null, &CqlType::Int).unwrap(),
+            value_to_cql(
+                &SqlValue::Null,
+                &CqlType::Int,
+                &crate::jsonb_wire::test_limits()
+            )
+            .unwrap(),
             C::Null
         );
         // float bit-pattern round-trips.
         assert_eq!(
-            value_to_cql(&SqlValue::float(9.5), &CqlType::Double).unwrap(),
+            value_to_cql(
+                &SqlValue::float(9.5),
+                &CqlType::Double,
+                &crate::jsonb_wire::test_limits()
+            )
+            .unwrap(),
             C::Double(9.5f64.to_bits())
         );
         // out-of-range int into int4, and a type mismatch, both fail loud.
-        assert!(value_to_cql(&SqlValue::Int(i64::MAX), &CqlType::Int).is_err());
-        assert!(value_to_cql(&SqlValue::Text("x".into()), &CqlType::Int).is_err());
+        assert!(value_to_cql(
+            &SqlValue::Int(i64::MAX),
+            &CqlType::Int,
+            &crate::jsonb_wire::test_limits()
+        )
+        .is_err());
+        assert!(value_to_cql(
+            &SqlValue::Text("x".into()),
+            &CqlType::Int,
+            &crate::jsonb_wire::test_limits()
+        )
+        .is_err());
     }
 
     #[test]
@@ -3245,6 +3458,7 @@ mod txn_buffer_tests {
             schema,
             &format!("SELECT k FROM kv WHERE k = '{key}'"),
             "public",
+            &crate::jsonb_wire::test_limits(),
             None,
         )
         .await;
@@ -3280,6 +3494,7 @@ mod txn_buffer_tests {
             &schema,
             "INSERT INTO kv (k, v) VALUES ('a', 'buffered')",
             "public",
+            &crate::jsonb_wire::test_limits(),
             Some(&mut buffer),
         )
         .await;
@@ -3305,6 +3520,7 @@ mod txn_buffer_tests {
             &schema,
             "INSERT INTO kv (k, v) VALUES ('b', 'autocommit')",
             "public",
+            &crate::jsonb_wire::test_limits(),
             None,
         )
         .await;
@@ -3332,6 +3548,7 @@ mod txn_buffer_tests {
             &schema,
             "INSERT INTO kv (k, v) VALUES ('c', 'committed')",
             "public",
+            &crate::jsonb_wire::test_limits(),
             Some(&mut buffer),
         )
         .await;
@@ -3373,6 +3590,7 @@ mod txn_buffer_tests {
             &schema,
             "INSERT INTO kv (k, v) VALUES ('over', 'cap')",
             "public",
+            &crate::jsonb_wire::test_limits(),
             Some(&mut buffer),
         )
         .await;
@@ -3405,13 +3623,19 @@ mod txn_buffer_tests {
         let dummy = PgWrite(Mutation::new("public".into(), "kv".into(), key, vec![], 0));
         let mut buffer = vec![dummy.clone(), dummy];
 
+        let limits = crate::jsonb_wire::test_limits();
+        let env = ReadEnv {
+            engine: &engine,
+            schema: &schema,
+            default_schema: "public",
+            mvcc: Some(&mvcc),
+            snapshot: None,
+            ddl: None,
+            jsonb_limits: &limits,
+        };
         let msgs = execute_query_with_mvcc(
-            &engine,
-            &schema,
+            env,
             "INSERT INTO kv (k, v) VALUES ('over', 'cap')",
-            "public",
-            Some(&mvcc),
-            None,
             Some(&mut buffer),
         )
         .await;

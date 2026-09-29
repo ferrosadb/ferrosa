@@ -28,10 +28,12 @@
 //!
 //! `jsonb` (OID 3802), `json` (114), `jsonpath` (4072) and `text[]` (1009) are
 //! engine column types ([`ColumnType::Jsonb`] and friends) with entries in
-//! [`ALL_PG_TYPES`]. `CqlType::Jsonb` maps to `jsonb`. The wire codec is not
-//! implemented (T-161a): the entries are `binary: false` and
-//! `query::encode_value` refuses these values loudly in both formats.
-//! `cql_type_for_pg_name` still refuses the name `jsonb` (DDL is T-131).
+//! [`ALL_PG_TYPES`]. `CqlType::Jsonb` maps to `jsonb`. The jsonb wire codec is
+//! implemented (T-161a, [`crate::jsonb_wire`]): the `jsonb` entry is
+//! `binary: true`. `json`, `jsonpath` and `text[]` values are still refused
+//! loudly by `query::encode_value` in both formats (T-161b). The names `jsonb`
+//! and `json` resolve to `CqlType::Jsonb` in `cql_type_for_pg_name` (D11:
+//! `json` is stored as jsonb).
 
 use std::fmt;
 
@@ -126,9 +128,10 @@ pub const ALL_PG_TYPES: [PgType; 16] = [
     // Binary numeric is not implemented: the encoder refuses it.
     entry(1700, "numeric", -1, ColumnType::Numeric, false),
     // T-160: the engine carries jsonb, json (stored as jsonb, D11), jsonpath and
-    // text[]. The wire codec is T-161a, so `binary` is false and
-    // `query::encode_value` refuses these values in both formats (PG-T160-1).
-    entry(PG_OID_JSONB, "jsonb", -1, ColumnType::Jsonb, false),
+    // text[]. jsonb has its wire codec (T-161a, `binary: true`); the other three
+    // have none yet, so `binary` is false and `query::encode_value` refuses them
+    // in both formats (PG-T160-1, T-161b).
+    entry(PG_OID_JSONB, "jsonb", -1, ColumnType::Jsonb, true),
     entry(PG_OID_JSON, "json", -1, ColumnType::Json, false),
     entry(PG_OID_JSONPATH, "jsonpath", -1, ColumnType::JsonPath, false),
     entry(1009, "_text", -1, ColumnType::TextArray, false),
@@ -181,7 +184,7 @@ fn column_type_of(t: &CqlType) -> (ColumnType, bool) {
         | CqlType::Udt { .. }
         | CqlType::Vector(_, _) => (ColumnType::Text, true),
         // T-160: a native engine column type (OID 3802). The wire codec is
-        // T-161a; until then `query::encode_value` refuses jsonb values.
+        // T-161a (`jsonb_wire`).
         CqlType::Jsonb => (ColumnType::Jsonb, false),
     }
 }
@@ -236,6 +239,8 @@ pub fn cql_type_for_pg_name(name: &str) -> Result<CqlType, PgTypeError> {
         "time" | "time without time zone" => Ok(CqlType::Time),
         "inet" => Ok(CqlType::Inet),
         "numeric" | "decimal" => Ok(CqlType::Decimal),
+        // D11: `json` has no verbatim text type; it is stored as jsonb.
+        "jsonb" | "json" => Ok(CqlType::Jsonb),
         _ => Err(PgTypeError::UnknownPgTypeName(name.to_string())),
     }
 }
@@ -285,9 +290,11 @@ mod tests {
             // Exactly one entry per engine type, reachable by OID.
             assert_eq!(by_oid(pg.oid).map(|p| p.column_type), Some(pg.column_type));
             if t == CqlType::Jsonb {
-                // DDL name resolution for jsonb is T-131; the type name is
-                // still refused by `cql_type_for_pg_name`.
+                // The name resolves back too (T-161a): `json` is stored as jsonb.
                 assert_eq!((pg.oid, pg.typname), (PG_OID_JSONB, "jsonb"));
+                for name in ["jsonb", "json", "JSONB"] {
+                    assert_eq!(cql_type_for_pg_name(name), Ok(CqlType::Jsonb), "{name}");
+                }
                 continue;
             }
             // The mapped name resolves back to a CqlType with the same PgType.
@@ -307,11 +314,13 @@ mod tests {
         }
         let oids: std::collections::HashSet<u32> = ALL_PG_TYPES.iter().map(|e| e.oid).collect();
         assert_eq!(oids.len(), ALL_PG_TYPES.len(), "OIDs are unique");
-        for oid in [PG_OID_JSON, PG_OID_JSONB, PG_OID_JSONPATH, 1009] {
+        for oid in [PG_OID_JSON, PG_OID_JSONPATH, 1009] {
             let e = by_oid(oid).expect("T-160 engine type");
-            // No wire codec until T-161a: never advertise a binary format.
+            // No wire codec until T-161b: never advertise a binary format.
             assert!(!e.binary, "{}", e.typname);
         }
+        // jsonb has its codec (T-161a): 0x01 plus text in binary format.
+        assert!(by_oid(PG_OID_JSONB).expect("jsonb entry").binary);
     }
 
     #[test]
@@ -350,7 +359,7 @@ mod tests {
 
     #[test]
     fn unknown_pg_type_name_is_refused_loudly() {
-        for bad in ["jsonb", "money", "", "int4range"] {
+        for bad in ["money", "", "int4range", "jsonpath"] {
             let err = cql_type_for_pg_name(bad).expect_err(bad);
             assert_eq!(err, PgTypeError::UnknownPgTypeName(bad.to_string()));
             assert!(err.to_string().contains("does not exist"));

@@ -111,8 +111,8 @@ both map to `float8` (701): the engine's one float column carries an `f64`
 them `text`). Collections, tuples, vectors, UDTs and `duration` are named arms
 that map to `text` with `text_rendered` set. A stored type string that does not
 resolve is a `PgTypeError` (catalog projection, parameter inference), never a
-silent `text`. `jsonb` (3802), `json` (114) and `jsonpath` (4072) are reserved
-as constants; the `CqlType` variant lands with type threading (T-161a).
+silent `text`. `jsonb` (3802) is a full type with a wire codec (T-161a, see the jsonb section);
+`json` (114) and `jsonpath` (4072) have `ALL_PG_TYPES` entries without one (T-161b).
 
 **DDL.** `Statement::CreateTable` executes in `ddl.rs`: `plan_create_table`
 builds the `TableMetadata` (first key column = partition key, rest = ascending
@@ -132,7 +132,7 @@ composites are rejected explicitly: the server does not send text bytes under a
 binary numeric OID or turn stored collection/duration values into SQL NULL.
 Bound parameters decode through `decode_param_checked` and fail loud: `22P02`
 (text value does not parse), `22P03` (malformed binary), `42704` (non-zero OID
-with no mapping, e.g. json/jsonb/timestamptz), `0A000` (binary numeric). Only
+with no mapping, e.g. jsonpath/timestamptz; jsonb 3802 and json 114 are mapped since T-161a), `0A000` (binary numeric). Only
 OID 0 (unspecified) is taken as UTF-8 text; nothing becomes NULL on error.
 The storage value bridge (`cql_to_value`) maps supported CQL scalars onto this
 model and reports a scan error for values without a representation.
@@ -174,6 +174,6 @@ Depends on `ferrosa-common`, `ferrosa-row-bridge`, `ferrosa-schema`,
 (the main binary). See the [root crate index](../../specs/crates.md) for the full
 graph.
 
-## jsonb (T-150, T-160)
+## jsonb (T-150, T-160, T-161a)
 
-`CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is T-161a: `query::encode_value` refuses jsonb, jsonpath and `text[]` values in both formats, and binding anything but a jsonb value to a jsonb column is `0A000`.
+`CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802, typlen -1, `binary: true`; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is `jsonb_wire` (T-161a): text format is the PostgreSQL 16 jsonb text (`TextStyle::PgText`, D26; `{"aa":2,"b":1}` prints `{"b": 1, "aa": 2}`, scale kept); binary format is `0x01` then that text (`jsonb_send`). `render_value` never returns NULL for a jsonb value: a corrupt cell is `XX001`, an over-budget print `54000`, and jsonpath/`text[]` are `0A000` (T-161b). Input is parsed with `ferrosa_jsonb::parse_text_observed` under `QueryContext::jsonb_limits` (resolved from `[jsonb]` in `ferrosa/src/main.rs`, no default): a parameter declared 3802 or 114 (or bound to a jsonb column after `Describe`) is parsed in `decode_param_checked`; an untyped string literal or a text-declared parameter bound to a jsonb column is parsed in `value_to_cql`. SQLSTATEs: `22P02` invalid JSON (byte offset, input never echoed), `22P03` bad or missing binary version byte, `22030` duplicate key under the strict policy, `54000` over a limit, `XX001` corrupt stored cell. Duplicate keys resolve last-wins and are logged as a `jsonb_duplicate_keys_dropped` edge line (D6b). DDL: `jsonb` and `json` create a CQL `jsonb` column (`json` is stored as jsonb, D11); `ddl::check_jsonb_ddl_allowed` is the always-Ok call point T-300 fills in. An unspecified-OID binary-format parameter is decoded as text: clients get 3802 from `Describe`, and a raw Bind without one fails 22P02 rather than writing.

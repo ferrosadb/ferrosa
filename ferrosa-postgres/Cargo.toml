@@ -21,6 +21,8 @@ ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-row-bridge = { path = "../ferrosa-row-bridge" }
 # Names the `Partition` type that `StorageEngine::range_iter` streams.
 ferrosa-sstable = { path = "../ferrosa-sstable" }
+# jsonb (T-161a): parse input under the configured limits, print PgText output.
+ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 futures = "0.3"
 base64 = "0.22"
 bytes = "1"
@@ -64,7 +66,6 @@ indexmap = "2"
 live-infra-tests = []
 
 [dev-dependencies]
-ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 indexmap = { version = "2", features = ["serde"] }
 proptest = "1"
 uuid = { version = "1", features = ["v4"] }

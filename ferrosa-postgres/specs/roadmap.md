@@ -81,8 +81,6 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   support (FMEA PG-4) — widen `ferrosa_sql::Value` and the
   `cql_to_value`/`value_to_cql` bridges. Until then, scans fail explicitly when
   they encounter one of these values.
-- **jsonb slot in `pg_types`** (T-161a): add the `CqlType` arm and `ALL_PG_TYPES`
-  entry for OID 3802 once type threading lands; constants are already reserved.
 - **Exact float/numeric text-format parity** with Postgres (FMEA PG-9).
 - **Real affected-row counts** for `UPDATE`/`DELETE` (FMEA PG-10) — read-before-
   write so the count reflects matches rather than always reporting `1`.
@@ -98,4 +96,4 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## jsonb (T-150)
 
-Done: type threading (T-150); engine `Value::Jsonb` and the storage mapping (T-160). Remaining: T-161a: OID 3802 text/binary codec, jsonb input parsing, DDL name `jsonb` in `cql_type_for_pg_name`.
+Done: type threading (T-150); engine `Value::Jsonb` and the storage mapping (T-160); OID 3802 text/binary codec, jsonb input parsing under the configured limits, `jsonb`/`json` DDL names, catalog row (T-161a). Remaining: standalone-vs-cluster DDL gate at `ddl::check_jsonb_ddl_allowed` (T-300); json 114 and jsonpath 4072 result codecs, casts and operators (T-161b, T-162); the per-edge `jsonb_duplicate_keys_dropped_total` counter (only the edge log line exists here); the strict duplicate-key mode is honored from `[jsonb]` but has no per-session or table switch; a typed `CorruptJsonb` from the row bridge (T-151) so a corrupt stored cell reports `XX001` instead of the scan-failure `58000`.

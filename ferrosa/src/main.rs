@@ -2818,15 +2818,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ddl: Some(std::sync::Arc::new(ferrosa_postgres::ClusterDdl::new(
                 shared_state.ddl_path.clone(),
             ))),
+            // The jsonb limits resolved at startup (`[jsonb]` TOML, then env, then
+            // the compiled defaults, ceilings enforced). No default is applied
+            // here: the PG front end gets exactly what startup resolved.
+            jsonb_limits,
         });
-        // The validated jsonb limits reach the PG front end here. QueryContext
-        // has no jsonb field yet (ferrosa-postgres does not depend on
-        // ferrosa-jsonb); the first jsonb consumer adds it and takes this copy.
-        let pg_jsonb_limits = jsonb_limits;
-        tracing::debug!(
-            ?pg_jsonb_limits,
-            "jsonb limits available to postgres startup"
-        );
         let pg_status = listener_status.clone();
         runtimes.background.spawn(async move {
             match tokio::net::TcpListener::bind(pg_bind).await {

@@ -183,7 +183,7 @@ same `ferrosa_cluster::ddl_path::DdlPath` the CQL router uses, via `ClusterDdl`
 cluster). Keys: one primary-key column is the partition key; a composite key is
 the first column as partition key and the rest as ascending clustering columns.
 Types go through `pg_types::cql_type_for_pg_name`; an unmapped type is `42704`
-naming it, `json`/`jsonb` is `0A000` until the engine type exists (T-150).
+naming it; `json`/`jsonb` create a CQL `jsonb` column (T-161a, D11).
 `varchar(n)` and `numeric(p,s)` store as unbounded `text`/`decimal`: the length
 and precision are not enforced. An existing table is `42P07`, or a success
 under `IF NOT EXISTS` with no NOTICE (there is no `NoticeResponse`). A missing
@@ -288,7 +288,7 @@ FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-postgres \
 
 Public marketing page: `docs/database/postgres.html` (ferrosadb.com).
 
-## jsonb (T-150, T-160)
+## jsonb (T-150, T-160, T-161a)
 
 `CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is T-161a: `query::encode_value` refuses jsonb, jsonpath and `text[]` values in both formats, and binding anything but a jsonb value to a jsonb column is `0A000`.
 
@@ -300,3 +300,5 @@ Public marketing page: `docs/database/postgres.html` (ferrosadb.com).
 refused with `42P16` naming the column. Postgres accepts it; ferrosa keeps
 jsonb out of key bytes (D3). The schema registry's own check runs again before
 the change is handed to the DDL path.
+
+`CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802, typlen -1, `binary: true`; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is `jsonb_wire` (T-161a): text format is the PostgreSQL 16 jsonb text (`TextStyle::PgText`, D26; `{"aa":2,"b":1}` prints `{"b": 1, "aa": 2}`, scale kept); binary format is `0x01` then that text (`jsonb_send`). `render_value` never returns NULL for a jsonb value: a corrupt cell is `XX001`, an over-budget print `54000`, and jsonpath/`text[]` are `0A000` (T-161b). Input is parsed with `ferrosa_jsonb::parse_text_observed` under `QueryContext::jsonb_limits` (resolved from `[jsonb]` in `ferrosa/src/main.rs`, no default): a parameter declared 3802 or 114 (or bound to a jsonb column after `Describe`) is parsed in `decode_param_checked`; an untyped string literal or a text-declared parameter bound to a jsonb column is parsed in `value_to_cql`. SQLSTATEs: `22P02` invalid JSON (byte offset, input never echoed), `22P03` bad or missing binary version byte, `22030` duplicate key under the strict policy, `54000` over a limit, `XX001` corrupt stored cell. Duplicate keys resolve last-wins and are logged as a `jsonb_duplicate_keys_dropped` edge line (D6b). DDL: `jsonb` and `json` create a CQL `jsonb` column (`json` is stored as jsonb, D11); `ddl::check_jsonb_ddl_allowed` is the always-Ok call point T-300 fills in. An unspecified-OID binary-format parameter is decoded as text: clients get 3802 from `Describe`, and a raw Bind without one fails 22P02 rather than writing.

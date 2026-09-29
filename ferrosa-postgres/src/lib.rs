@@ -19,6 +19,7 @@ pub mod connection;
 pub mod ddl;
 pub mod extended;
 pub mod handshake;
+pub mod jsonb_wire;
 pub mod messages;
 mod mvcc;
 pub mod pg_types;

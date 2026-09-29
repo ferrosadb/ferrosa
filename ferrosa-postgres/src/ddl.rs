@@ -6,10 +6,12 @@
 //! standalone mode, coordinator in pair mode, Raft-replicated in cluster mode).
 //! There is no second path: [`ClusterDdl`] is a thin adapter over `DdlPath`.
 //! Correctness: every refusal is a typed SQLSTATE naming the cause. A type with
-//! no `pg_types` mapping is `42704`, `json`/`jsonb` is `0A000` until the engine
-//! type exists (T-150), and nothing is stored under a guessed type.
+//! no `pg_types` mapping is `42704`; `json`/`jsonb` create a CQL `jsonb` column
+//! (T-161a; `json` is stored as jsonb, D11), gated by [`check_jsonb_ddl_allowed`]
+//! (T-300); nothing is stored under a guessed type.
 //! Last revised: 2026-09-28
-//! Last changed: jsonb refused in PRIMARY KEY columns, 42P16 (T-154a).
+//! Last changed: jsonb refused in PRIMARY KEY columns, 42P16 (T-154a); T-161a lifted the
+//! jsonb/json column refusal (was T-132a).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -233,16 +235,20 @@ fn schema_refusal(error: &ferrosa_schema::SchemaError) -> BackendMessage {
     error_response(code, &error.to_string())
 }
 
+/// The single call point for the jsonb DDL gate (D24, D15a).
+///
+/// Always `Ok` today. T-300 replaces the body with the standalone-vs-cluster
+/// check: jsonb DDL is allowed on single-node deployments and refused in
+/// cluster mode until the D15a capability ledger lands. The refusal is lifted
+/// by that gate, never by a flag. No mode check belongs anywhere else.
+pub fn check_jsonb_ddl_allowed() -> Result<(), BackendMessage> {
+    Ok(())
+}
+
 /// The CQL type string stored for `def`, through the one PG-name map (D10).
 fn cql_type_string(def: &ColumnDef) -> Result<&'static str, BackendMessage> {
     if matches!(def.ty, PgType::Json | PgType::Jsonb) {
-        return Err(error_response(
-            "0A000",
-            &format!(
-                "column \"{}\": jsonb/json columns are not supported yet (no engine jsonb type)",
-                def.name
-            ),
-        ));
+        check_jsonb_ddl_allowed()?;
     }
     let cql = cql_type_for_pg_name(pg_type_name(def.ty)).map_err(|e| match e {
         PgTypeError::UnknownPgTypeName(name) => error_response(
