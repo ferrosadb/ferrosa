@@ -364,6 +364,20 @@ pub fn assemble_udt(
     Ok(CqlValue::Udt(out))
 }
 
+/// An empty value of a collection type — `[]`, `{}`, or `{:}`. This is the read-back
+/// of a column cleared to empty, whether by a whole-value empty literal
+/// (`INSERT ... l = []`) or a `DELETE col`.
+fn empty_collection(col_type: &CqlType) -> CqlValue {
+    match col_type {
+        CqlType::List(_) => CqlValue::List(Vec::new()),
+        CqlType::Set(_) => CqlValue::Set(Vec::new()),
+        CqlType::Map(..) => CqlValue::Map(Vec::new()),
+        // Non-collections never reach here: the caller gates on the collection
+        // variants. `Null` keeps the function total without a panic path.
+        _ => CqlValue::Null,
+    }
+}
+
 /// Read-path assembly of a single column's cells into its value — the one place
 /// both the primary SELECT path (`crate::row::decode_output_row`) and the
 /// metadata variant (`ferrosa_cql::bridge`) share, so their collection handling
@@ -381,6 +395,14 @@ pub fn assemble_udt(
 ///   the whole value, preserving backward compatibility (lazy dual-read).
 ///
 /// `None` means the column has no live value (absent, deleted, or expired).
+///
+/// A whole-value overwrite that replaced a collection with an EMPTY literal
+/// (`INSERT ... l = []` / `UPDATE ... SET l = {}`) leaves one `path == None`
+/// collection-deletion sentinel — and, if the column previously held newer
+/// elements, possibly none of them live. That is still a present, empty
+/// collection: a lone sentinel on a non-frozen collection column assembles to
+/// `Some(<empty>)`, not `None`. An equivalent `DELETE col` writes the same
+/// sentinel shape, so it also reads back as empty rather than absent.
 pub fn assemble_column_cells(
     col_type: &CqlType,
     cells: &[&CellValue],
@@ -388,6 +410,18 @@ pub fn assemble_column_cells(
 ) -> Result<Option<CqlValue>, AssembleError> {
     if cells.is_empty() {
         return Ok(None);
+    }
+
+    // A lone `path == None` cell on a collection column is an empty whole-value
+    // overwrite or a `DELETE col` — either way the column is empty, not absent.
+    // (The complex branch below only triggers when some cell carries a path, so
+    // without this a lone deletion sentinel fell through to the scalar branch and
+    // returned `None`.) `CqlType::List/Set/Map` is the same multicell assumption
+    // the complex branch makes.
+    if matches!(col_type, CqlType::List(_) | CqlType::Set(_) | CqlType::Map(..))
+        && cells.iter().all(|c| c.path.is_none() && c.is_tombstone())
+    {
+        return Ok(Some(empty_collection(col_type)));
     }
 
     if cells.iter().any(|c| c.path.is_some()) {
