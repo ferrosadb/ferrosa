@@ -2779,12 +2779,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let pg_store =
             std::sync::Arc::new(ferrosa_postgres::SchemaVerifierStore::new(schema.clone()));
+        // Resolve the committer PER STATEMENT, not once here. This listener is
+        // bound at step 11b; seed connection (and therefore formation) begins at
+        // step 12, so at this moment a node that is about to become a Raft
+        // cluster is still a singleton. A committer captured here would be
+        // `None` for it forever, silently disabling Accord ordering for every
+        // PostgreSQL transaction on a real cluster.
+        let accord_core = shared_state.core.clone();
         let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
             engine: storage.clone(),
             schema: schema.clone(),
             default_schema: "public".into(),
             mvcc: std::sync::Arc::new(ferrosa_postgres::MvccManager::from_env()),
-            accord_committer: shared_state.core.accord_transaction_committer(),
+            accord: ferrosa_postgres::AccordAccess::live(
+                move || accord_core.accord_transaction_committer(),
+                {
+                    let accord_core = shared_state.core.clone();
+                    move |observer| {
+                        accord_core
+                            .register_postgres_mvcc_observer(observer)
+                            .map_err(|error| error.to_string())
+                    }
+                },
+            ),
         });
         let pg_status = listener_status.clone();
         runtimes.background.spawn(async move {

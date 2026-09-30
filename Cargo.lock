@@ -2716,6 +2716,8 @@ dependencies = [
  "ferrosa-schema",
  "ferrosa-storage",
  "ferrosa-udf",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

@@ -27,6 +27,8 @@ pub mod server;
 pub mod storage_provider;
 pub mod store;
 
+mod accord_access;
+
 pub use connection::{ConnError, Connection, TlsPolicy};
 pub use handshake::{Handshake, HandshakeError, VerifierStore};
 pub use store::SchemaVerifierStore;
@@ -39,3 +41,5 @@ pub use messages::{
 pub use mvcc::{MvccManager, PgWrite};
 pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
 pub use server::{PgTls, QueryContext};
+
+pub use accord_access::AccordAccess;
