@@ -161,11 +161,24 @@ pub(super) enum InvitePeerConnectionPlan {
     },
 }
 
+/// Decide whether and where to dial one peer named in a `ClusterInvite`.
+///
+/// `peer_addr` is used as the invite states it. Invites are built from
+/// `connected_peers`, whose addresses `on_inbound_peer` has already resolved
+/// to each peer's advertised internode address, plus the sender's own
+/// broadcast address -- so the port is the PEER's port.
+///
+/// It used to be rebuilt as `peer_addr.ip()` + this node's own bind port,
+/// which only works while every node shares one internode port (containers).
+/// Co-located nodes do not (t_7c01df7e): node3 on :29200, invited to reach
+/// node1 at 127.0.0.1:29000, dialled 127.0.0.1:29200 -- itself -- and filed
+/// that pool under node1's host id. A range read "to node1" then landed on
+/// node3's own handler, its reply to node3's own id failed "unknown peer",
+/// and the read idled out after 30 s.
 pub(super) fn plan_invite_peer_connection(
     local_host_id: Uuid,
     peer_id: Uuid,
     peer_addr: SocketAddr,
-    internode_port: u16,
     known_addr: Option<&str>,
     live: bool,
 ) -> InvitePeerConnectionPlan {
@@ -173,7 +186,7 @@ pub(super) fn plan_invite_peer_connection(
         return InvitePeerConnectionPlan::SkipSelf;
     }
 
-    let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+    let reverse_addr = peer_addr;
     let invite_addr = reverse_addr.to_string();
 
     if live {
@@ -191,6 +204,33 @@ pub(super) fn plan_invite_peer_connection(
         reverse_addr,
         previous_addr: known_addr.map(ToOwned::to_owned),
     }
+}
+
+/// The internode address to record for a `ClusterInvite`'s initiator.
+///
+/// `observed` is the RPC sender's address: the source address of the
+/// connection the invite arrived on, whose port is ephemeral. Prefer the
+/// address we already dial the initiator at, then the internode address it
+/// advertised in its handshake. Only when neither is known fall back to the
+/// observed IP plus OUR port -- the old assumption, wrong for co-located
+/// nodes -- and report that by returning `true` so the caller can log it.
+pub(super) fn plan_invite_initiator_addr(
+    known: Option<&str>,
+    advertised: Option<&str>,
+    observed: SocketAddr,
+    local_internode_port: u16,
+) -> (SocketAddr, bool) {
+    if let Some(addr) = known.and_then(|known| known.parse().ok()) {
+        return (addr, false);
+    }
+    if let Some(addr) = advertised.and_then(|advertised| {
+        std::net::ToSocketAddrs::to_socket_addrs(advertised.trim())
+            .ok()?
+            .next()
+    }) {
+        return (addr, false);
+    }
+    (SocketAddr::new(observed.ip(), local_internode_port), true)
 }
 
 use super::{ClusterStateHolder, ModeController};
@@ -565,10 +605,6 @@ pub(super) fn membership_addresses_need_repair(
 }
 
 impl ModeController {
-    fn normalize_cluster_peer_addr(&self, addr: SocketAddr) -> SocketAddr {
-        SocketAddr::new(addr.ip(), self.net_config.bind_addr.port())
-    }
-
     /// Send a `ClusterInvite` to a single peer with the current cluster's
     /// known peer list (everyone except the recipient). Used when a peer
     /// connects (or reconnects) after this node has already finished its
@@ -723,10 +759,11 @@ impl ModeController {
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
     pub(super) fn transition_to_cluster(&self, peers: Vec<(Uuid, SocketAddr)>) {
-        let peers: Vec<(Uuid, SocketAddr)> = peers
-            .into_iter()
-            .map(|(peer_uuid, addr)| (peer_uuid, self.normalize_cluster_peer_addr(addr)))
-            .collect();
+        // `peers` are internode addresses as tracked in `connected_peers`: the
+        // address dialled for an outbound peer, the resolved advertised
+        // address for an inbound one. They used to be rewritten to each
+        // peer's IP plus OUR port, which put every co-located peer at our own
+        // address in the ring (t_7c01df7e).
         let phase_runner = super::bootstrap::runner::BootstrapPhaseRunner::canonical();
         tracing::debug!(
             phase_count = phase_runner.phase_order().len(),
@@ -809,15 +846,16 @@ impl ModeController {
         // any peer the PeerManager doesn't already know about.
         let net_cfg = self.net_config.clone();
         let local_id = self.local_host_id;
-        let internode_port = self.net_config.bind_addr.port();
         let raft_rt_for_connect = self.raft_runtime.get().cloned();
         let data_rt_for_connect = self.data_runtime.get().cloned();
         for (peer_uuid, peer_addr) in &peers {
-            if !peer_manager.has_live_peer(*peer_uuid) {
+            if !peer_manager.has_live_peer(*peer_uuid)
+                && self.admit_dial_target(*peer_uuid, *peer_addr)
+            {
                 let pm = peer_manager.clone();
                 let cfg = net_cfg.clone();
                 let uuid = *peer_uuid;
-                let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+                let reverse_addr = *peer_addr;
                 let raft_rt = raft_rt_for_connect.clone();
                 let data_rt = data_rt_for_connect.clone();
                 self.spawn_tracked(async move {
@@ -2888,7 +2926,6 @@ impl RpcHandler for ClusterInviteHandler {
         // to reach the recreated node at its dead address forever
         // ("No route to host"), Raft replication times out, and reads
         // at LOCAL_QUORUM fail.
-        let internode_port = self.net_config.bind_addr.port();
         let mut new_peers = Vec::new();
         for (peer_id, peer_addr) in &peers {
             let known_addr = self.peer_manager.peer_addr(*peer_id).await;
@@ -2897,7 +2934,6 @@ impl RpcHandler for ClusterInviteHandler {
                 self.local_host_id,
                 *peer_id,
                 *peer_addr,
-                internode_port,
                 known_addr.as_deref(),
                 live,
             ) {
@@ -2966,6 +3002,11 @@ impl RpcHandler for ClusterInviteHandler {
                 }
             }
 
+            if let Some(ctrl) = connect_cooldown_ctrl.as_ref() {
+                if !ctrl.admit_dial_target(*peer_id, *reverse_addr) {
+                    continue;
+                }
+            }
             let pm = self.peer_manager.clone();
             let cfg = self.net_config.clone();
             let local_id = self.local_host_id;
@@ -3047,7 +3088,26 @@ impl RpcHandler for ClusterInviteHandler {
                 if initiator != self.local_host_id
                     && !all_peers.iter().any(|(id, _)| *id == initiator)
                 {
-                    all_peers.push((initiator, from.1));
+                    let known = self.peer_manager.peer_addr(initiator).await;
+                    let advertised = self
+                        .peer_manager
+                        .get_peer_internode_broadcast_sync(initiator);
+                    let (addr, assumed) = plan_invite_initiator_addr(
+                        known.as_deref(),
+                        advertised.as_deref(),
+                        from.1,
+                        self.net_config.bind_addr.port(),
+                    );
+                    if assumed {
+                        tracing::warn!(
+                            %initiator,
+                            observed = %from.1,
+                            chosen = %addr,
+                            "cluster invite: initiator's internode address unknown; \
+                             assuming it shares our internode port"
+                        );
+                    }
+                    all_peers.push((initiator, addr));
                 }
                 if all_peers.len() >= 2 {
                     tracing::info!(
