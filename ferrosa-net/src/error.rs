@@ -24,8 +24,13 @@ pub enum NetError {
     Io(std::io::Error),
     /// Lane is currently reconnecting; request cannot be served.
     Reconnecting,
-    /// Lane has exhausted all reconnection attempts and is permanently failed.
-    LaneFailed,
+    /// The lane actor has exited, so its command channel is closed (or the
+    /// actor dropped the reply). This happens when a peer's pool was retired
+    /// (connection replaced or peer removed) while a caller still held it.
+    /// It is NOT reconnect exhaustion: exhausted lanes go `Dormant`, keep
+    /// probing, and answer with [`NetError::Reconnecting`]. Callers holding a
+    /// pool should re-resolve the peer's current pool rather than retry this one.
+    LaneShutdown,
     /// Server failed during startup (e.g. bind notification could not be
     /// delivered to the caller because the receiver was dropped before the
     /// listener bound). Carries a human-readable cause for the operator.
@@ -47,8 +52,8 @@ impl fmt::Display for NetError {
             Self::Overloaded => write!(f, "max internode connections reached"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Reconnecting => write!(f, "lane is reconnecting; retry later"),
-            Self::LaneFailed => {
-                write!(f, "lane permanently failed after max reconnection attempts")
+            Self::LaneShutdown => {
+                write!(f, "lane actor shut down (connection replaced or closed)")
             }
             Self::StartupFailed(msg) => write!(f, "startup failed: {msg}"),
         }

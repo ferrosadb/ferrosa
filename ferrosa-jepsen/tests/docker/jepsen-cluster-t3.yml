@@ -28,7 +28,9 @@ services:
   # Volume permissions — RustFS runs as UID 10001
   # ---------------------------------------------------------------------------
   volume-permissions:
-    image: alpine
+    # Our digest-pinned mirror, not Docker Hub. The default keeps a local
+    # compose run working; CI exports FERROSA_ALPINE_IMAGE.
+    image: ${FERROSA_ALPINE_IMAGE:-alpine}
     volumes:
       - jepsen-t3-rustfs-data:/data
     command: >

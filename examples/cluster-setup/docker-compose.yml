@@ -13,8 +13,11 @@ services:
     restart: "no"
 
   # ── S3-compatible object store (RustFS) ──
+  # Defaults to upstream for arm64 dev machines; CI sets FERROSA_RUSTFS_IMAGE
+  # to the digest-pinned amd64 mirror on downloads.ferrosa.ai so the job does
+  # not depend on an upstream registry.
   rustfs:
-    image: rustfs/rustfs:latest
+    image: ${FERROSA_RUSTFS_IMAGE:-rustfs/rustfs:latest}
     depends_on:
       volume-permissions:
         condition: service_completed_successfully

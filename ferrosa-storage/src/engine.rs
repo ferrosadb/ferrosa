@@ -8566,6 +8566,23 @@ impl StorageEngine {
         }))
     }
 
+    /// Whether `key` names so large a share of `table_id` that a scan is
+    /// cheaper than serving it through `index_name`. See
+    /// [`TableStore::index_key_is_unselective`]. An unregistered table is
+    /// `false`: the index path that follows reports it loudly.
+    pub fn index_key_is_unselective(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+    ) -> ferrosa_common::Result<bool> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.index_key_is_unselective(index_name, key),
+            None => Ok(false),
+        }
+    }
+
     /// Query by secondary index restricted to ONE partition (t_430c4188).
     ///
     /// Delegates to [`TableStore::read_by_index_in_partition`], which keeps
@@ -10820,6 +10837,7 @@ impl StorageEngine {
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::SSTableComponents;
 
+        crate::flush::rehydrate_if_evicted(dir, gen)?;
         let data = Self::generation_component_path(dir, gen, "Data.db").ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "missing required Data.db for sstable generation {gen} in {}",
@@ -11422,7 +11440,10 @@ impl StorageEngine {
     /// from "compacted away, leave it gone": both are listed in the manifest
     /// and absent on disk. `<gen>.evicted` never matches generation discovery
     /// (`*-Data.db` files and numeric directories) or the `<gen>-` sweep.
-    fn evicted_marker_path(table_dir: &std::path::Path, gen: &str) -> std::path::PathBuf {
+    pub(crate) fn evicted_marker_path(
+        table_dir: &std::path::Path,
+        gen: &str,
+    ) -> std::path::PathBuf {
         table_dir.join(format!("{gen}.evicted"))
     }
 
@@ -27991,6 +28012,101 @@ mod tests {
                 "row {key} of an evicted SSTable must survive a restart"
             );
         }
+        engine.shutdown().unwrap();
+    }
+
+    /// Build an evicting engine holding one flushed, uploaded, evicted SSTable
+    /// of five rows, with its pooled reader and cached `Data.db` descriptor
+    /// dropped so the next read must reopen it by path. Returns the engine, the
+    /// table dir, the evicted generation and the keys.
+    async fn engine_with_evicted_sstable(
+        dir: &std::path::Path,
+        prefix: &str,
+    ) -> (StorageEngine, std::path::PathBuf, String, Vec<String>) {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let tid = table_id();
+        let engine = evicting_s3_engine(dir, &store, prefix);
+        // The test constructor does not install the read-through hook the
+        // production constructors do. Hooks are process-global but keyed by
+        // data dir, so this tempdir's hook ignores every other test's paths.
+        StorageEngine::install_s3_file_read_rehydration_hook(
+            dir.to_path_buf(),
+            prefix.to_string(),
+            Arc::clone(&store),
+        );
+        engine.register_table(test_schema()).unwrap();
+        let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+        for key in &keys {
+            engine
+                .write(&tid, &make_key(key), make_row(b"v", 1000), 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        assert!(engine.sync_sstables_to_s3().await.unwrap() >= 1);
+        let table_dir = engine.table_sstable_dir(&tid);
+        let evicted = StorageEngine::evicted_generations(&dir.join("sstables"));
+        let gens = evicted
+            .values()
+            .next()
+            .expect("the sync recorded an eviction");
+        let gen = gens.iter().next().expect("one evicted generation").clone();
+        assert!(StorageEngine::list_generations_in_dir(&table_dir).is_empty());
+        engine.evict_pooled_reader_for_test(&tid, gen.parse().unwrap());
+        ferrosa_sstable::io::evict_global_fd_for_test(table_dir.join(format!("{gen}-Data.db")));
+        (engine, table_dir, gen, keys)
+    }
+
+    /// Live failure on the memory cluster, 2026-09-29 (t_bfc0e4da): between an
+    /// eviction and the next restart, the read path could not reopen the
+    /// evicted SSTable because the required-component `exists()` check failed
+    /// BEFORE the S3 read-through hook could run, so reads returned partial
+    /// data. A marked generation must be rehydrated on reopen, and once it is
+    /// local again its marker must be cleared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_of_an_evicted_sstable_are_readable_live_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, keys) =
+            engine_with_evicted_sstable(dir.path(), "test-evicted-live").await;
+        let tid = table_id();
+
+        for key in &keys {
+            assert!(
+                engine.read(&tid, &make_key(key)).unwrap().is_some(),
+                "row {key} of an evicted SSTable must be readable before any restart"
+            );
+        }
+        assert!(
+            StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_some(),
+            "the reopen rehydrated the generation into the local cache"
+        );
+        assert!(
+            !StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
+            "a generation that is local again must not keep its eviction marker"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// The rehydration is for MARKED generations only. An unmarked generation
+    /// with missing components was compacted away, and restoring it from S3
+    /// would resurrect purged rows; its open must keep failing loud so the
+    /// read path's view-retry fires.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unmarked_missing_sstable_is_not_rehydrated_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable(dir.path(), "test-unmarked-missing").await;
+        std::fs::remove_file(StorageEngine::evicted_marker_path(&table_dir, &gen)).unwrap();
+
+        let err = match crate::flush::open_file_sstable(&table_dir, &gen) {
+            Ok(_) => panic!("an unmarked missing generation must not open"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("missing required"), "{err}");
+        assert!(
+            StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_none(),
+            "nothing may be restored for an unmarked generation"
+        );
         engine.shutdown().unwrap();
     }
 

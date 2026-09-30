@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 
 use crate::codec::Lane;
 use crate::config::NetConfig;
+use crate::error::NetError;
 use crate::message::Message;
 use crate::pool::{LaneOutcome, PriorityPool};
 use crate::rpc::handler::PeerId;
@@ -110,6 +111,11 @@ impl PeerManager {
         self.data_runtime.get().cloned()
     }
 
+    /// This node's own host_id. Never present in the peer table by design.
+    pub fn local_host_id(&self) -> uuid::Uuid {
+        self.local_host_id
+    }
+
     fn now_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
@@ -129,6 +135,49 @@ impl PeerManager {
             .map(Arc::clone)
             .ok_or_else(|| crate::error::NetError::Protocol("no connection pool".into()))?;
         Ok((state, pool))
+    }
+
+    /// Run `op` against the peer's current pool and record activity on success.
+    ///
+    /// Resolving the pool and using it are not atomic: [`Self::add_peer`] may
+    /// swap in a replacement and shut the old pool down in between, so `op`
+    /// then fails with [`NetError::LaneShutdown`] on a pool that is no longer
+    /// registered. That says nothing about the peer, so the request is
+    /// re-issued ONCE on the current pool. If the map still holds the same
+    /// (dead) pool there is nothing newer to try and the error is returned
+    /// after logging it, rather than looping.
+    async fn on_current_pool<T, F, Fut>(
+        &self,
+        host_id: uuid::Uuid,
+        op: F,
+    ) -> crate::error::Result<T>
+    where
+        F: Fn(Arc<PriorityPool>) -> Fut,
+        Fut: std::future::Future<Output = crate::error::Result<T>>,
+    {
+        let (state, pool) = self.pool_for_peer(host_id).await?;
+        let out = match op(Arc::clone(&pool)).await {
+            Err(NetError::LaneShutdown) => {
+                let (state, current) = self.pool_for_peer(host_id).await?;
+                if Arc::ptr_eq(&pool, &current) {
+                    tracing::error!(
+                        peer = %host_id,
+                        "peer's registered pool has dead lane actors and nothing replaced it"
+                    );
+                    return Err(NetError::LaneShutdown);
+                }
+                tracing::debug!(
+                    peer = %host_id,
+                    "pool was replaced mid-request; re-issuing on the current pool"
+                );
+                let out = op(current).await?;
+                state.record_activity(self.now_ms());
+                return Ok(out);
+            }
+            other => other?,
+        };
+        state.record_activity(self.now_ms());
+        Ok(out)
     }
 
     /// Add a connected peer with a real connection pool.
@@ -244,6 +293,26 @@ impl PeerManager {
             data_runtime,
         )
         .await?;
+        // The handshake tells us who actually answered at `addr`. `host_id`
+        // came from the caller's topology view, which can be stale or wrong
+        // (a peer that has not registered yet, a re-resolved hostname that now
+        // points back at this node). Pooling the connection under the expected
+        // id would route X's requests to whoever owns the address; when that
+        // is this node, the stream handler sees `from == local` and its
+        // replies fail with "unknown peer: <local>" (t_b78e8e9a). Fail loud.
+        let answered_by = pool.peer_host_id();
+        if answered_by != host_id {
+            pool.shutdown().await;
+            let who = if answered_by == self.local_host_id {
+                "this node itself"
+            } else {
+                "a different host"
+            };
+            return Err(crate::error::NetError::Protocol(format!(
+                "peer identity mismatch: expected {host_id} at {addr} ({resolved}) but the \
+                 handshake was answered by {answered_by} ({who}); refusing to pool it"
+            )));
+        }
         self.add_peer((host_id, resolved), pool).await;
         Ok(())
     }
@@ -277,10 +346,11 @@ impl PeerManager {
         msg: Message,
         lane: Lane,
     ) -> crate::error::Result<Message> {
-        let (state, pool) = self.pool_for_peer(host_id).await?;
-        let resp = pool.send(msg, lane).await?;
-        state.record_activity(self.now_ms());
-        Ok(resp)
+        self.on_current_pool(host_id, |pool| {
+            let msg = msg.clone();
+            async move { pool.send(msg, lane).await }
+        })
+        .await
     }
 
     /// Send a message to a peer on the specified lane with a custom timeout.
@@ -297,10 +367,11 @@ impl PeerManager {
         lane: Lane,
         timeout: Duration,
     ) -> crate::error::Result<Message> {
-        let (state, pool) = self.pool_for_peer(host_id).await?;
-        let resp = pool.send_with_timeout(msg, lane, timeout).await?;
-        state.record_activity(self.now_ms());
-        Ok(resp)
+        self.on_current_pool(host_id, |pool| {
+            let msg = msg.clone();
+            async move { pool.send_with_timeout(msg, lane, timeout).await }
+        })
+        .await
     }
 
     /// Fire-and-forget a message to a peer on the specified lane.
@@ -313,10 +384,11 @@ impl PeerManager {
         msg: Message,
         lane: Lane,
     ) -> crate::error::Result<()> {
-        let (state, pool) = self.pool_for_peer(host_id).await?;
-        pool.fire(msg, lane).await?;
-        state.record_activity(self.now_ms());
-        Ok(())
+        self.on_current_pool(host_id, |pool| {
+            let msg = msg.clone();
+            async move { pool.fire(msg, lane).await }
+        })
+        .await
     }
 
     /// Heartbeat loop: sends Ping at configured interval, marks peers suspected
@@ -858,6 +930,42 @@ mod tests {
         assert!(result.is_err(), "fire to unknown peer should fail");
     }
 
+    /// A ring entry whose address actually reaches a different node (stale
+    /// address, or one that loops back to the dialer) must not be pooled under
+    /// the expected host_id: requests addressed to X would be served by Y, and
+    /// Y's stream replies would target the dialer's own unregistered host_id
+    /// ("unknown peer: <self>", t_b78e8e9a).
+    #[tokio::test]
+    async fn ensure_peer_rejects_address_owned_by_another_host() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let pm = PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            Arc::new(TestListener::new()),
+        );
+        let expected = uuid::Uuid::new_v4();
+        let err = pm
+            .ensure_peer(expected, &addr.to_string())
+            .await
+            .expect_err("address is owned by a different host_id");
+
+        assert!(
+            err.to_string().contains("identity mismatch"),
+            "error must name the mismatch, got: {err}"
+        );
+        assert!(!pm.has_peer(expected), "mismatched pool must not be cached");
+        assert!(!pm.has_peer(server_id));
+        server.shutdown(Duration::from_millis(50)).await;
+    }
+
     #[tokio::test]
     async fn ensure_peer_connects_and_caches_pool() {
         let config = NetConfig {
@@ -1023,6 +1131,113 @@ mod tests {
         pm.remove_peer(server_id).await;
         server1.shutdown(Duration::from_millis(50)).await;
         server2.shutdown(Duration::from_millis(50)).await;
+    }
+
+    /// A request that resolved the peer's pool just before `add_peer` replaced
+    /// and shut it down must be re-issued on the replacement pool, not fail
+    /// with `LaneShutdown`. Observed live as bursts of "lane permanently
+    /// failed" during startup while reverse connections replaced pools.
+    #[tokio::test]
+    async fn request_in_flight_across_pool_replacement_lands_on_new_pool() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let mut servers = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..2 {
+            let registry = Arc::new(HandlerRegistry::new());
+            registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+            let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+            addrs.push(server.start_and_get_addr().await.unwrap().to_string());
+            servers.push(server);
+        }
+        let pm = PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            Arc::new(TestListener::new()),
+        );
+        pm.ensure_peer(server_id, &addrs[0]).await.unwrap();
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let resp = pm
+            .on_current_pool(server_id, |pool| {
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                let (pm, addr) = (&pm, addrs[1].clone());
+                async move {
+                    if first {
+                        // Replace the pool after this attempt already holds it.
+                        pm.ensure_peer(server_id, &addr).await.unwrap();
+                    }
+                    pool.send(
+                        Message::Ping {
+                            nonce: 5,
+                            sent_at: 0,
+                        },
+                        Lane::Data,
+                    )
+                    .await
+                }
+            })
+            .await
+            .expect("request must be re-issued on the replacement pool");
+        assert!(matches!(resp, Message::Pong { nonce: 5, .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one retry");
+
+        pm.remove_peer(server_id).await;
+        for s in servers {
+            s.shutdown(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// If the pool in the map is itself dead there is nothing newer to retry
+    /// on: the error must surface (once), not loop.
+    #[tokio::test]
+    async fn dead_current_pool_surfaces_lane_shutdown_without_retry_loop() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap().to_string();
+        let pm = PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            Arc::new(TestListener::new()),
+        );
+        pm.ensure_peer(server_id, &addr).await.unwrap();
+        let (_, current) = pm.pool_for_peer(server_id).await.unwrap();
+        current.shutdown().await;
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let err = pm
+            .on_current_pool(server_id, |pool| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    pool.send(
+                        Message::Ping {
+                            nonce: 1,
+                            sent_at: 0,
+                        },
+                        Lane::Data,
+                    )
+                    .await
+                }
+            })
+            .await
+            .expect_err("dead pool must error");
+        assert!(
+            matches!(err, crate::error::NetError::LaneShutdown),
+            "got {err:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry on the same pool");
+
+        pm.remove_peer(server_id).await;
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]

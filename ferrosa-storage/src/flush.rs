@@ -1713,6 +1713,50 @@ struct FileComponentPaths {
     crc: PathBuf,
 }
 
+/// Restore generation `gen` from S3 when the uploaded-cache evictor removed
+/// its local copy, so a live reader can reopen it without a restart.
+///
+/// Only a generation carrying an eviction marker (`<gen>.evicted`, written
+/// fsynced BEFORE the evictor deletes anything) is restored. An unmarked
+/// generation with missing components was compacted away: restoring it would
+/// resurrect purged rows, and its open error is what drives the read path's
+/// view-retry, so it is left to fail loud in the caller.
+///
+/// `rehydrate_file` (the registered S3 read-through hook) restores every
+/// component of the generation next to the path it is given, each via
+/// fsynced temp file + rename, so a failure leaves the marker in place for the
+/// next attempt. Once the generation is local again the marker is cleared so
+/// the restart path does not re-handle it; the evictor rewrites it if it evicts
+/// the generation again. A concurrent opener that already cleared the marker
+/// has also already restored the files, which the caller's own existence
+/// checks then observe.
+pub(crate) fn rehydrate_if_evicted(dir: &Path, gen: &str) -> Result<()> {
+    let data = dir.join(format!("{gen}-Data.db"));
+    let marker = crate::engine::StorageEngine::evicted_marker_path(dir, gen);
+    if data.exists() || !marker.exists() {
+        return Ok(());
+    }
+    if !ferrosa_sstable::io::rehydrate_file(&data)? {
+        tracing::error!(
+            dir = %dir.display(),
+            gen,
+            "evicted SSTable could not be rehydrated from S3 (no read-through hook \
+             owns it, or its objects are missing); the open will fail. Marker kept"
+        );
+        return Ok(());
+    }
+    if let Err(e) = std::fs::remove_file(&marker) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                marker = %marker.display(),
+                error = %e,
+                "rehydrated an evicted SSTable but could not clear its marker; a restart will find it already local"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Open a file-backed SSTable reader from component files for generation `gen`
 /// in `dir`. Shared by [`FileFlushTarget::open_reader`] and the engine's
 /// startup/load path so on-demand reopens go through one code path.
@@ -1723,6 +1767,7 @@ struct FileComponentPaths {
 /// fail loud (see the inline comment at the read). Genuinely-optional components
 /// (`Statistics.db`, `CompressionInfo.db`) default to empty/absent when missing.
 pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileReadAt>> {
+    rehydrate_if_evicted(dir, gen)?;
     let [data_component, partitions_component, rows_component, filter_component] =
         REQUIRED_SSTABLE_COMPONENTS;
     let required = |suffix: &str| -> Result<PathBuf> {

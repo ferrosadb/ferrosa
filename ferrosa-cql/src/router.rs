@@ -5877,6 +5877,7 @@ async fn route_select_user_table(
             &planner_indexes,
             &filtered_covered_columns,
         );
+        let scan_plan = scan_instead_of_unselective_index(scan_plan, s, table_meta, ks, state)?;
 
         // Withholding left nothing to serve this read, and the query licensed
         // no scan to fall back to. Refuse, naming each index and why: the
@@ -7675,12 +7676,20 @@ fn route_explain(
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
-        planner::plan(
-            &s.where_clauses,
-            &table_meta.partition_key,
-            &ck_columns,
-            &planner_indexes,
-        )
+        // Same selectivity decision the executor makes, so EXPLAIN reports
+        // the plan the query actually runs.
+        scan_instead_of_unselective_index(
+            planner::plan(
+                &s.where_clauses,
+                &table_meta.partition_key,
+                &ck_columns,
+                &planner_indexes,
+            ),
+            &s,
+            table_meta,
+            ks,
+            state,
+        )?
     };
 
     // `ORDER BY col ANN OF [...]` on a vector-indexed column is served by the
@@ -12406,6 +12415,69 @@ async fn advance_heads_to_partition(
     } else {
         PartitionMembership::Missing
     })
+}
+
+/// Replace a single-index plan with a scan when the query licenses one
+/// (`ALLOW FILTERING`) and the index key names a large share of the table.
+///
+/// The planner picks an index whenever one covers the predicate, and serving
+/// an index key point-reads every row it names. For a key that names most
+/// of the table — a tenant index over a single-tenant table — that is one
+/// point read per row where one scan would do: ferrosa-memory's edge count
+/// took 87 s this way (2026-09-29). The scan path post-filters on every
+/// WHERE predicate, so the rows are the same. A query without ALLOW
+/// FILTERING never switches: it did not license a scan.
+fn scan_instead_of_unselective_index(
+    plan: ScanPlan,
+    s: &SelectStatement,
+    table_meta: &TableMetadata,
+    ks: &str,
+    state: &SharedState,
+) -> Result<ScanPlan, CqlError> {
+    if !s.allow_filtering {
+        return Ok(plan);
+    }
+    let (ScanPlan::SingleIndex {
+        index_name,
+        index_column,
+    }
+    | ScanPlan::IndexScanWithFilter {
+        index_name,
+        index_column,
+        ..
+    }) = &plan
+    else {
+        return Ok(plan);
+    };
+    let Some(predicate) = s
+        .where_clauses
+        .iter()
+        .find(|wc| wc.column == *index_column && wc.op == ComparisonOp::Eq)
+    else {
+        return Ok(plan);
+    };
+    let key = term_to_index_key(
+        &predicate.value,
+        index_column,
+        table_meta,
+        ks,
+        &state.schema,
+    )?;
+    let table_id = TableId::new(ks, &s.table);
+    let unselective = state
+        .engine
+        .index_key_is_unselective(&table_id, index_name, &key)
+        .map_err(|e| CqlError::ServerError(format!("index selectivity estimate: {e}")))?;
+    if !unselective {
+        return Ok(plan);
+    }
+    tracing::info!(
+        keyspace = ks,
+        table = %s.table,
+        index = %index_name,
+        "index key matches a large share of the table; scanning instead of a point read per row"
+    );
+    Ok(ScanPlan::FullScan)
 }
 
 fn term_to_index_key(
@@ -24199,6 +24271,102 @@ mod tests {
         assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
         let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
         assert_eq!(count, 1, "btree index lookup must return exactly 1 row");
+    }
+
+    /// Build `sel.edges` with an index on `tenant`, 200 rows, `matching` of
+    /// them in tenant 'hot' and the rest each in a tenant of their own, then
+    /// flush so the rows are in an SSTable as they are in production.
+    async fn unselective_index_fixture(matching: i32) -> (SharedState, tempfile::TempDir) {
+        let (state, dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE sel WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE sel.edges (a int PRIMARY KEY, tenant text)",
+            "CREATE INDEX sel_tenant ON sel.edges (tenant)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        for a in 0..200 {
+            let tenant = if a < matching {
+                "hot".to_string()
+            } else {
+                format!("t{a}")
+            };
+            let cql = format!("INSERT INTO sel.edges (a, tenant) VALUES ({a}, '{tenant}')");
+            route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                .await
+                .unwrap();
+        }
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("sel", "edges"))
+            .unwrap();
+        (state, dir)
+    }
+
+    /// ferrosa-memory's `stats` counts edges with
+    /// `SELECT count(*) FROM co_occurs_with WHERE tenant_id = ? ALLOW FILTERING`.
+    /// Nearly every row is in one tenant, so the tenant index names the whole
+    /// table and serving it point-reads each of 193,181 rows: 87 s live
+    /// (2026-09-29), past the 30 s timeout, so `stats` never had an edge
+    /// count. When the query already licenses a scan and the index key
+    /// matches a large share of the table, one scan is far cheaper than a
+    /// point read per row — and returns the same rows.
+    #[tokio::test]
+    async fn an_index_key_matching_most_of_the_table_is_scanned_not_point_read() {
+        let (state, _dir) = unselective_index_fixture(200).await;
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+
+        let rows = assert_index_hit_and_count(
+            &state,
+            &ctx,
+            "SELECT a FROM sel.edges WHERE tenant = 'hot' ALLOW FILTERING",
+            0,
+        )
+        .await;
+
+        assert_eq!(rows, 200, "the scan must return every matching row");
+
+        // EXPLAIN must report the plan the query actually runs.
+        let explain = crate::parser::parse(
+            "EXPLAIN SELECT a FROM sel.edges WHERE tenant = 'hot' ALLOW FILTERING",
+        )
+        .unwrap();
+        match route(&state, &ctx, explain).await.unwrap() {
+            RouteResult::Result(b) => {
+                let plan = String::from_utf8_lossy(&b).into_owned();
+                assert!(
+                    plan.contains("FullScan"),
+                    "EXPLAIN must say FullScan, got: {plan}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+    }
+
+    /// The guard's other half: a selective key keeps its index.
+    #[tokio::test]
+    async fn a_selective_index_key_is_still_served_by_the_index() {
+        let (state, _dir) = unselective_index_fixture(1).await;
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+
+        let rows = assert_index_hit_and_count(
+            &state,
+            &ctx,
+            "SELECT a FROM sel.edges WHERE tenant = 'hot' ALLOW FILTERING",
+            1,
+        )
+        .await;
+
+        assert_eq!(rows, 1);
     }
 
     // ── PartitionIndexLookup: full PK equality + indexed residual (t_430c4188) ──
