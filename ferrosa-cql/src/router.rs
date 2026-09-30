@@ -7971,7 +7971,10 @@ pub async fn route_prepared_insert_fast(
                         ))
                     })?;
                     if storage_column_is_multicell(table_meta, col_name)
-                        && matches!(value, CqlValue::List(_) | CqlValue::Set(_) | CqlValue::Map(_))
+                        && matches!(
+                            value,
+                            CqlValue::List(_) | CqlValue::Set(_) | CqlValue::Map(_)
+                        )
                     {
                         pending_collections.push((col_idx, cql_type, value));
                     } else {
@@ -8012,9 +8015,7 @@ pub async fn route_prepared_insert_fast(
         // whole-value collection literals into per-element cells (D-15).
         let mut collection_cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
         for (col_idx, cql_type, value) in pending_collections {
-            if let Some(cells) =
-                collection_insert_cells(true, &cql_type, &value, timestamp, ttl)?
-            {
+            if let Some(cells) = collection_insert_cells(true, &cql_type, &value, timestamp, ttl)? {
                 collection_cells.extend(cells.into_iter().map(|cell| (col_idx, cell)));
             }
         }
@@ -8100,10 +8101,18 @@ fn collection_insert_cells(
     timestamp: i64,
     ttl: Option<i32>,
 ) -> Result<Option<Vec<ferrosa_common::CellValue>>, CqlError> {
-    if !is_multicell || !matches!(cql_type, CqlType::List(_) | CqlType::Set(_) | CqlType::Map(..)) {
+    if !is_multicell
+        || !matches!(
+            cql_type,
+            CqlType::List(_) | CqlType::Set(_) | CqlType::Map(..)
+        )
+    {
         return Ok(None);
     }
-    if !matches!(value, CqlValue::List(_) | CqlValue::Set(_) | CqlValue::Map(_)) {
+    if !matches!(
+        value,
+        CqlValue::List(_) | CqlValue::Set(_) | CqlValue::Map(_)
+    ) {
         return Ok(None);
     }
 
@@ -32686,19 +32695,26 @@ mod tests {
                 (CqlValue::Text("q".into()), CqlValue::Int(2)),
             ]))
         );
-        // Empty collections assemble to empty (not absent).
+        // An emptied collection assembles to ABSENT, not to an empty collection.
+        // Cassandra returns None for every way of emptying a collection column
+        // (`DELETE col`, `SET col = []`, `SET col = {}`, `INSERT ... (k, [])`,
+        // removing the last element) — it has no present-but-empty collection
+        // state. Measured live on 6.0-alpha2; these rows pin that agreement.
         let p3 = read_pk_int(&state, &tid, 3);
         assert_eq!(
             assembled_column(&p3, 0, &text_list()),
-            Some(CqlValue::List(vec![]))
+            None,
+            "list: an empty literal is a deletion in Cassandra and reads back absent"
         );
         assert_eq!(
             assembled_column(&p3, 2, &text_set()),
-            Some(CqlValue::Set(vec![]))
+            None,
+            "set: an empty literal is a deletion in Cassandra and reads back absent"
         );
         assert_eq!(
             assembled_column(&p3, 1, &text_int_map()),
-            Some(CqlValue::Map(vec![]))
+            None,
+            "map: an empty literal is a deletion in Cassandra and reads back absent"
         );
     }
 }

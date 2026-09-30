@@ -364,20 +364,6 @@ pub fn assemble_udt(
     Ok(CqlValue::Udt(out))
 }
 
-/// An empty value of a collection type — `[]`, `{}`, or `{:}`. This is the read-back
-/// of a column cleared to empty, whether by a whole-value empty literal
-/// (`INSERT ... l = []`) or a `DELETE col`.
-fn empty_collection(col_type: &CqlType) -> CqlValue {
-    match col_type {
-        CqlType::List(_) => CqlValue::List(Vec::new()),
-        CqlType::Set(_) => CqlValue::Set(Vec::new()),
-        CqlType::Map(..) => CqlValue::Map(Vec::new()),
-        // Non-collections never reach here: the caller gates on the collection
-        // variants. `Null` keeps the function total without a panic path.
-        _ => CqlValue::Null,
-    }
-}
-
 /// Read-path assembly of a single column's cells into its value — the one place
 /// both the primary SELECT path (`crate::row::decode_output_row`) and the
 /// metadata variant (`ferrosa_cql::bridge`) share, so their collection handling
@@ -410,18 +396,6 @@ pub fn assemble_column_cells(
 ) -> Result<Option<CqlValue>, AssembleError> {
     if cells.is_empty() {
         return Ok(None);
-    }
-
-    // A lone `path == None` cell on a collection column is an empty whole-value
-    // overwrite or a `DELETE col` — either way the column is empty, not absent.
-    // (The complex branch below only triggers when some cell carries a path, so
-    // without this a lone deletion sentinel fell through to the scalar branch and
-    // returned `None`.) `CqlType::List/Set/Map` is the same multicell assumption
-    // the complex branch makes.
-    if matches!(col_type, CqlType::List(_) | CqlType::Set(_) | CqlType::Map(..))
-        && cells.iter().all(|c| c.path.is_none() && c.is_tombstone())
-    {
-        return Ok(Some(empty_collection(col_type)));
     }
 
     if cells.iter().any(|c| c.path.is_some()) {
@@ -494,6 +468,20 @@ pub fn assemble_column_cells(
         if let CqlType::Udt { fields, .. } = col_type {
             return Ok(Some(assemble_udt(fields, &live)?));
         }
+        // No surviving element means the column is EMPTY, and Cassandra reports an
+        // emptied collection as ABSENT. Measured on 6.0-alpha2: `DELETE col`,
+        // `SET col = []`, `INSERT ... VALUES (k, [])`, `SET col = {}`,
+        // `col = col - [last_element]` and `DELETE map[last_key]` all read back as
+        // `None`. Cassandra has no "present but empty" collection state, so there
+        // is nothing to distinguish — the same lone collection-deletion sentinel
+        // is written for every one of them, and it must assemble to `None`.
+        //
+        // A live element is required to produce a value: falling through to
+        // `assemble_collection` with no live cells would return an empty
+        // collection, which is the divergence this branch exists to avoid.
+        if live.is_empty() {
+            return Ok(None);
+        }
         return Ok(Some(assemble_collection(col_type, &live)?));
     }
 
@@ -517,6 +505,76 @@ mod tests {
 
     fn t(v: &str) -> CqlValue {
         CqlValue::Text(v.to_string())
+    }
+
+    /// An empty collection assignment is a DELETION in Cassandra, so every way of
+    /// emptying a collection column reads back as absent — `None`, never `[]`.
+    ///
+    /// Measured against Cassandra 6.0-alpha2 rather than assumed (live probe):
+    ///
+    /// | statement                          | reads back |
+    /// |------------------------------------|------------|
+    /// | `DELETE l`                         | `None`     |
+    /// | `UPDATE ... SET l = []`            | `None`     |
+    /// | `INSERT ... VALUES (k, [])`        | `None`     |
+    /// | `UPDATE ... SET st = {}`           | `None`     |
+    /// | `l = l - ['only']` (last element)  | `None`     |
+    /// | `DELETE m['only']` (last key)      | `None`     |
+    ///
+    /// Cassandra has no "present but empty" collection state, so there is nothing
+    /// for ferrosa to distinguish: all of these write the same lone
+    /// collection-deletion sentinel, and that sentinel must assemble to `None`.
+    ///
+    /// This asserted `Some(vec![])` before the fix, which matched neither
+    /// Cassandra (`None`) nor the older ferrosa behaviour for `DELETE col` (also
+    /// `None`) — the divergence was already there and read-back made it worse.
+    #[test]
+    fn an_emptied_collection_reads_back_absent_not_empty() {
+        for (label, col_type) in [
+            ("list", text_list()),
+            ("set", text_set()),
+            ("map", text_map()),
+        ] {
+            let deletion = CellValue::tombstone(500, NO_DELETION_TIME); // path = None
+            let cells: Vec<&CellValue> = vec![&deletion];
+            assert_eq!(
+                assemble_column_cells(&col_type, &cells, 0).unwrap(),
+                None,
+                "{label}: a lone collection-deletion sentinel is an emptied column and \
+                 must read back as absent (None); Cassandra returns None for DELETE col, \
+                 SET col = [], INSERT ... VALUES (k, []), and removing the last element"
+            );
+        }
+    }
+
+    /// The shadowing case: a deletion newer than every element empties the column,
+    /// which Cassandra reports as absent, not as an empty collection.
+    #[test]
+    fn a_deletion_newer_than_all_elements_reads_back_absent() {
+        let a = build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("a")]), 100).unwrap();
+        let deletion = CellValue::tombstone(500, NO_DELETION_TIME);
+        let cells: Vec<&CellValue> = vec![&a[0], &deletion];
+        assert_eq!(
+            assemble_column_cells(&text_set(), &cells, 0).unwrap(),
+            None,
+            "all elements shadowed leaves the column empty, and Cassandra reports an \
+             empty collection as None (measured: `ALTER ... SET st = {{}}` -> None, \
+             `st = st - {{last}}` -> None)"
+        );
+    }
+
+    /// A live element still reads back, so the absent-vs-empty rule does not
+    /// swallow a collection that actually holds data.
+    #[test]
+    fn a_collection_with_a_live_element_still_reads_back() {
+        let a = build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("a")]), 100).unwrap();
+        let deletion = CellValue::tombstone(50, NO_DELETION_TIME); // older than the element
+        let cells: Vec<&CellValue> = vec![&a[0], &deletion];
+        assert_eq!(
+            assemble_column_cells(&text_set(), &cells, 0).unwrap(),
+            Some(CqlValue::Set(vec![t("a")])),
+            "an element newer than the deletion survives; the column is not empty"
+        );
     }
 
     /// A non-frozen UDT assembles its per-field cells (path = 2-byte field
@@ -562,7 +620,13 @@ mod tests {
         );
     }
 
-    /// A collection deletion newer than every element clears the collection.
+    /// A collection deletion newer than every element clears the collection, and
+    /// Cassandra reports an emptied collection as ABSENT, not as an empty value.
+    ///
+    /// This asserted `Some(Set(vec![]))` before the fix. Measured on
+    /// 6.0-alpha2, `SET st = {}` and `st = st - {last_element}` both read back as
+    /// `None`, so the old expectation encoded a divergence from Cassandra (and
+    /// disagreed with ferrosa's own `DELETE col` behaviour, which returned `None`).
     #[test]
     fn collection_deletion_newer_than_all_clears_collection() {
         let a =
@@ -570,7 +634,11 @@ mod tests {
         let deletion = CellValue::tombstone(500, NO_DELETION_TIME);
         let cells: Vec<&CellValue> = vec![&a[0], &deletion];
         let got = assemble_column_cells(&text_set(), &cells, 0).unwrap();
-        assert_eq!(got, Some(CqlValue::Set(vec![])), "all elements shadowed");
+        assert_eq!(
+            got, None,
+            "all elements shadowed leaves the column empty; Cassandra reads an empty \
+             collection as None, never as an empty collection"
+        );
     }
 
     /// §8 lazy dual-read: a partition holding a LIVE whole-value blob (`path ==
