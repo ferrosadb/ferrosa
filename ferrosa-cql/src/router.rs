@@ -10513,7 +10513,36 @@ async fn route_create_table(
 
             // Register with storage engine
             let storage_schema = table_meta.to_storage_schema();
-            state.engine.register_table(storage_schema)?;
+            let tid = TableId::new(&table_meta.keyspace, &table_meta.name);
+            state.engine.register_table(storage_schema.clone())?;
+
+            // Durability barrier: the table must be on disk BEFORE the client is
+            // told it was created. register_table_inner only puts the schema in
+            // memory, so without this the acknowledgement is a promise the node
+            // cannot keep: a kill between the ack and the next maintenance tick
+            // leaves no recoverable record of the table (t_0acc233d).
+            //
+            // `update_table_schema` is the existing barrier for this: it holds the
+            // table lock across a flush of the old schema, swaps in the new one,
+            // and persists the storage-side record. For a newly created table the
+            // memtable is empty, so the flush is a no-op in cost.
+            //
+            // Propagate the error rather than logging it: returning CREATED after
+            // a failed persist would be the same false promise in a different
+            // place.
+            state
+                .engine
+                .update_table_schema(&tid, storage_schema)
+                .map_err(|e| {
+                    CqlError::ServerError(format!(
+                        "CREATE TABLE durability barrier failed for {tid}: {e}"
+                    ))
+                })?;
+
+            // The registry snapshot is persisted after the match, so that it also
+            // covers the cascade tables this arm creates below (they mutate the
+            // registry) and so the same guarantee holds for the Pair and Cluster
+            // paths. See the barrier after the match.
 
             // Auto-create cascade tables if consolidation.cascade is enabled.
             create_cascade_tables_if_needed(state, &table_meta)?;
@@ -10539,6 +10568,37 @@ async fn route_create_table(
         }
     }
 
+    // Durability barrier — the last thing before the acknowledgement.
+    //
+    // This sits after the match (not inside the Direct arm) for two reasons:
+    //
+    //  1. It covers the Pair and Cluster paths too. A table coordinated through
+    //     Raft must be recoverable on the coordinator before it is acknowledged,
+    //     not only on a direct-mode node.
+    //
+    //  2. It runs after `create_cascade_tables_if_needed`, which mutates the
+    //     registry. Snapshotting before it would omit every cascade table
+    //     (sensor_5m/15m/1h and friends) from the durable record, so a crash
+    //     after a cascade CREATE TABLE would recover the base table and silently
+    //     lose its rollups.
+    //
+    // The storage-side record alone is NOT recoverable: it carries the partition
+    // key's TYPE (org.apache.cassandra.db.marshal.Int32Type) but never the key
+    // column's NAME, and it has no clustering order, column masks or table id.
+    // Startup reads the registry snapshot, so with only the storage-side record a
+    // restart still served zero user tables — measured, exactly that:
+    //
+    //   record on disk + survived SIGKILL  ->  USER tables: NONE
+    //   (schema.json absent -> S3 -> start fresh)
+    //
+    // The registry snapshot carries everything losslessly (partition_key names,
+    // clustering order, column metadata, table id), so no format change and no
+    // converter is involved — startup's existing preferred path works unchanged.
+    //
+    // Errors propagate: acknowledging a table the node cannot recover would be
+    // the same false promise in a different place.
+    persist_registry_snapshot_before_ack(state, &s.name)?;
+
     emit_schema_change(
         state,
         SchemaChangeType::Created,
@@ -10552,6 +10612,42 @@ async fn route_create_table(
         "TABLE",
         &[ks, &s.name],
     ))
+}
+
+/// Persist the registry snapshot before a DDL statement is acknowledged.
+///
+/// The storage-side record (`storage-schema.json`) alone cannot rebuild a
+/// CQL-nameable table after a crash: it carries the partition key's *type*
+/// (`org.apache.cassandra.db.marshal.Int32Type`) but never the key column's
+/// *name*, and it has no clustering order, column masks or table id. Partition
+/// key bytes are decoded positionally against the declared type at the key
+/// column's index, so a table restored from it alone would either fail to answer
+/// or answer with a wrongly-named column.
+///
+/// The registry snapshot carries all of it — `partition_key` names,
+/// `clustering_key` order, column metadata and the table id — and startup
+/// already prefers it. Persisting it here means an acknowledged CREATE TABLE is
+/// recoverable, not merely recorded.
+///
+/// Measured before this: a table created and then SIGKILLed left a
+/// `storage-schema.json` naming the table, and the restart still served zero user
+/// tables, because the startup path reads the registry snapshot and there was
+/// none (`schema.json` absent -> S3 -> start fresh) (t_0acc233d, D-47).
+///
+/// Fails loudly: the caller must not acknowledge a table it cannot recover.
+fn persist_registry_snapshot_before_ack(
+    state: &SharedState,
+    table_name: &str,
+) -> Result<(), CqlError> {
+    let snapshot = state.core.schema.snapshot();
+    ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(state.engine.data_dir())
+        .persist(&snapshot)
+        .map_err(|e| {
+            CqlError::ServerError(format!(
+                "CREATE TABLE durability barrier: registry snapshot persist failed for \
+                 {table_name}: {e}"
+            ))
+        })
 }
 
 /// If the table has `consolidation.cascade = true` in its extensions,
@@ -20872,6 +20968,96 @@ mod tests {
             result.is_ok(),
             "CREATE TABLE WITH COMPACTION must succeed, got: {:?}",
             result.err()
+        );
+    }
+
+    /// CREATE TABLE must be durable BEFORE it is acknowledged: the schema record
+    /// has to exist on disk by the time the statement returns OK.
+    ///
+    /// Measured live before the fix (node with every other blocker fix applied):
+    /// `CREATE TABLE durks.t` returned OK, the registry served the table, and
+    /// NEITHER `schema.json` NOR `storage-schema.json` existed on disk. A SIGKILL
+    /// immediately after the acknowledgement therefore lost the table with no
+    /// durable record to recover from (t_0acc233d, the D-47 residual). The audit
+    /// log shows the keyspace and table events with no persistence between the
+    /// acknowledgement and the kill.
+    ///
+    /// This is the guarantee the fix must provide: if the client was told the
+    /// table exists, then it exists on disk.
+    #[tokio::test]
+    async fn create_table_persists_a_durable_schema_record_before_acknowledging() {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE dur_ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE dur_ks.t (id int PRIMARY KEY, v text)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // The ack has been returned by now. The durable record must already be on
+        // disk — not written later by a maintenance tick, not waiting on a flush
+        // that a crash would prevent.
+        let schema_path = dir.path().join("storage-schema.json");
+        assert!(
+            schema_path.exists(),
+            "CREATE TABLE was acknowledged but no durable schema record exists at \
+             {}. A crash right now loses the table with nothing to recover from \
+             (t_0acc233d): if the client was told the table exists, it must exist \
+             on disk first",
+            schema_path.display()
+        );
+
+        let recorded = ferrosa_storage::schema_snapshot::user_tables_in_storage_schema(dir.path());
+        assert!(
+            recorded
+                .iter()
+                .any(|(ks, table)| ks == "dur_ks" && table == "t"),
+            "the durable schema record must name the table that was acknowledged; \
+             got {recorded:?}"
+        );
+
+        // The storage-side record alone is not RECOVERABLE: it has the partition
+        // key's type but not its column name, so a table rebuilt from it could not
+        // be named in CQL. Startup reads the registry snapshot, so that snapshot
+        // must exist before the acknowledgement too — otherwise a crash leaves a
+        // record that names the table while the restart still serves no user
+        // tables (measured: exactly that, before this fix).
+        let snapshot_path = dir.path().join("schema.json");
+        assert!(
+            snapshot_path.exists(),
+            "CREATE TABLE was acknowledged but no registry snapshot exists at {}. \
+             The storage-side record names the table but cannot rebuild a \
+             CQL-nameable one (no partition-key column name), so a crash here is \
+             still unrecoverable",
+            snapshot_path.display()
+        );
+
+        let snap = ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(dir.path())
+            .load()
+            .expect("registry snapshot must load")
+            .expect("registry snapshot must exist");
+        let recovered = snap
+            .tables
+            .get(&("dur_ks".to_string(), "t".to_string()))
+            .expect("the acknowledged table must be in the registry snapshot");
+        assert_eq!(
+            recovered.partition_key,
+            vec!["id".to_string()],
+            "the registry snapshot must carry the partition-key column NAME, which \
+             is the field the storage-side record cannot express"
         );
     }
 

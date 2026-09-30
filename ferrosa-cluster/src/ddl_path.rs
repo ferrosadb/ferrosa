@@ -307,8 +307,23 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
                 .create_table_internal(*table.clone())
                 .map_err(|e| ClusterError::Internal(format!("create_table: {e}")))?;
             let storage_schema = table.to_storage_schema();
+            let tid = ferrosa_storage::TableId::new(&table.keyspace, &table.name);
             engine
-                .register_table(storage_schema)
+                .register_table(storage_schema.clone())
+                .map_err(ClusterError::Storage)?;
+
+            // Durability barrier, matching the direct CQL DDL path: the schema
+            // record must be on disk before this operation reports success. A
+            // follower applies the Raft entry and then acknowledges, so a kill
+            // between the apply and a later maintenance tick would otherwise
+            // leave a table the cluster believes exists with no durable local
+            // record to rebuild it from after restart (t_0acc233d).
+            //
+            // `update_table_schema` flushes the (empty, for a new table) memtable
+            // and persists the schema record. Errors propagate so the apply fails
+            // loudly rather than committing an entry the node cannot honour.
+            engine
+                .update_table_schema(&tid, storage_schema)
                 .map_err(ClusterError::Storage)?;
         }
         DdlOperation::DropTable { keyspace, table } => {
