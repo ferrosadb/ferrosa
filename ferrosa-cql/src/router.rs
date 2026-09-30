@@ -7942,6 +7942,10 @@ pub async fn route_prepared_insert_fast(
         let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
         let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
         let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+        // Whole-value collection literals are held here and expanded once the
+        // timestamp and TTL binds are known (they are consumed after the column
+        // binds, so the paths cannot be minted inside this loop). D-15.
+        let mut pending_collections: Vec<(u16, CqlType, CqlValue)> = Vec::new();
         let mut bind_idx = 0usize;
 
         for (i, col_name) in s.columns.iter().enumerate() {
@@ -7966,7 +7970,13 @@ pub async fn route_prepared_insert_fast(
                             col_name
                         ))
                     })?;
-                    regular_cells.push((col_idx, value));
+                    if storage_column_is_multicell(table_meta, col_name)
+                        && matches!(value, CqlValue::List(_) | CqlValue::Set(_) | CqlValue::Map(_))
+                    {
+                        pending_collections.push((col_idx, cql_type, value));
+                    } else {
+                        regular_cells.push((col_idx, value));
+                    }
                 }
             }
         }
@@ -7996,6 +8006,18 @@ pub async fn route_prepared_insert_fast(
                 .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
                 .as_micros() as i64,
         };
+        let ttl = using_ttl_term_as_i32(ttl_term)?;
+
+        // Now that the timestamp and TTL binds are consumed, expand the
+        // whole-value collection literals into per-element cells (D-15).
+        let mut collection_cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
+        for (col_idx, cql_type, value) in pending_collections {
+            if let Some(cells) =
+                collection_insert_cells(true, &cql_type, &value, timestamp, ttl)?
+            {
+                collection_cells.extend(cells.into_iter().map(|cell| (col_idx, cell)));
+            }
+        }
 
         pk_vals.sort_by_key(|(pos, _)| *pos);
         ck_vals.sort_by_key(|(pos, _)| *pos);
@@ -8008,12 +8030,11 @@ pub async fn route_prepared_insert_fast(
             .collect::<Result<Vec<_>, _>>()?;
 
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-        let row = bridge::build_row(
-            &regular_cells,
-            &ck_values,
-            timestamp,
-            using_ttl_term_as_i32(ttl_term)?,
-        );
+        let mut row = bridge::build_row(&regular_cells, &ck_values, timestamp, ttl);
+        if !collection_cells.is_empty() {
+            row.cells.extend(collection_cells);
+            row.cells.sort_by_key(|(idx, _)| *idx);
+        }
         let table_id = TableId::new(ks, &s.table);
         let strategy = keyspace_strategy(&state.schema, ks);
 
@@ -8041,6 +8062,90 @@ pub async fn route_prepared_insert_fast(
     Some(result)
 }
 
+/// True when `column` uses the per-element **complex** cell layout on disk — a
+/// non-frozen `list`/`set`/`map`. A `frozen<..>` wrapper is a single whole-value
+/// cell (`FrozenType`) and must NOT be expanded, or the writer would reject the
+/// resulting cell paths on a simple column.
+fn storage_column_is_multicell(table_meta: &TableMetadata, column: &str) -> bool {
+    table_meta
+        .columns
+        .get(column)
+        .map(|c| ferrosa_schema::cql_to_marshal_type(&c.column_type))
+        .is_some_and(|marshal| ferrosa_sstable::marshal::is_multicell_collection(&marshal))
+}
+
+/// Expand a whole-value collection value into the per-element cells every other
+/// collection writer uses, so an INSERTed row never carries a live `path = None`
+/// cell on a complex column.
+///
+/// A collection UPDATE stores one path-bearing cell per element. If ANY cell in
+/// a flush carries a path the SSTable is framed complex
+/// (`ferrosa-storage/src/flush.rs`), and the writer then rejects a live
+/// path-less cell on a complex column (`ferrosa-sstable/src/writer.rs`). So the
+/// whole-value form a plain `INSERT ... VALUES (['a','b'])` produced used to
+/// panic the flush — cross-partition and data-dependent, which is why it looked
+/// intermittent.
+///
+/// Returns `None` (leave the value as a single cell) when the column is not a
+/// non-frozen collection, or when the value is not a collection literal —
+/// `NULL` is already emitted by `build_row` as a legal collection-deletion
+/// tombstone.
+///
+/// Reuses `build_collection_cells` — the exact expansion the UPDATE path uses —
+/// so list element paths stay time-ordered and set/map paths stay element-keyed.
+fn collection_insert_cells(
+    is_multicell: bool,
+    cql_type: &CqlType,
+    value: &CqlValue,
+    timestamp: i64,
+    ttl: Option<i32>,
+) -> Result<Option<Vec<ferrosa_common::CellValue>>, CqlError> {
+    if !is_multicell || !matches!(cql_type, CqlType::List(_) | CqlType::Set(_) | CqlType::Map(..)) {
+        return Ok(None);
+    }
+    if !matches!(value, CqlValue::List(_) | CqlValue::Set(_) | CqlValue::Map(_)) {
+        return Ok(None);
+    }
+
+    let mut elements = crate::collection_cells::build_collection_cells(
+        crate::collection_cells::CollectionOp::Add,
+        value,
+        timestamp,
+    )
+    .map_err(|e| CqlError::Invalid(format!("collection INSERT: {}", e.reason)))?;
+
+    // A whole-value INSERT REPLACES the column (Cassandra upsert semantics), so
+    // shadow any earlier element cells with a collection deletion one
+    // microsecond before the new elements — the same convention
+    // `ferrosa-storage`'s legacy-blob expansion uses. It is also the only way to
+    // represent an EMPTY literal, which yields no element cells of its own and
+    // must still read back as a present, empty collection rather than absent.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+        .as_secs();
+    let local_deletion_time = i32::try_from(now_secs).unwrap_or(i32::MAX);
+
+    // Bounded by the literal's element count plus the one sentinel.
+    let mut cells = Vec::with_capacity(elements.len() + 1);
+    cells.push(ferrosa_common::CellValue::tombstone(
+        timestamp.saturating_sub(1),
+        local_deletion_time,
+    ));
+
+    // A TTL'd INSERT must carry the TTL onto every element cell, not only onto
+    // the whole-value cell it replaced.
+    if let Some(ttl_secs) = ttl {
+        for cell in &mut elements {
+            cell.ttl = ttl_secs;
+            cell.local_deletion_time =
+                i32::try_from(now_secs.saturating_add(ttl_secs as u64)).unwrap_or(i32::MAX);
+        }
+    }
+    cells.append(&mut elements);
+    Ok(Some(cells))
+}
+
 async fn route_insert(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -8066,6 +8171,9 @@ async fn route_insert(
     let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    // Whole-value collection literals are expanded into per-element cells, kept
+    // separate because `build_row` takes single cells per column (D-15).
+    let mut collection_cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
     let timestamp = match using_timestamp_as_i64(&s.using_timestamp)? {
         Some(ts) => ts,
         None => std::time::SystemTime::now()
@@ -8073,6 +8181,7 @@ async fn route_insert(
             .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
             .as_micros() as i64,
     };
+    let ttl = using_ttl_as_i32(&s.using_ttl)?;
 
     for (i, col_name) in s.columns.iter().enumerate() {
         let col_meta = table_meta
@@ -8089,7 +8198,17 @@ async fn route_insert(
                 let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
                     CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
                 })?;
-                regular_cells.push((col_idx, value));
+                if let Some(cells) = collection_insert_cells(
+                    storage_column_is_multicell(table_meta, col_name),
+                    &cql_type,
+                    &value,
+                    timestamp,
+                    ttl,
+                )? {
+                    collection_cells.extend(cells.into_iter().map(|cell| (col_idx, cell)));
+                } else {
+                    regular_cells.push((col_idx, value));
+                }
             }
         }
     }
@@ -8106,12 +8225,18 @@ async fn route_insert(
         .collect::<Result<Vec<_>, _>>()?;
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let row = bridge::build_row(
+    let mut row = bridge::build_row(
         &regular_cells,
         &ck_values,
         timestamp,
         using_ttl_as_i32(&s.using_ttl)?,
     );
+    if !collection_cells.is_empty() {
+        row.cells.extend(collection_cells);
+        // Cells MUST be grouped by column index (per-element cells within one
+        // column keep insertion order and are re-ordered by path on read).
+        row.cells.sort_by_key(|(idx, _)| *idx);
+    }
     let table_id = TableId::new(ks, &s.table);
     let strategy = keyspace_strategy(&state.schema, ks);
 
@@ -8471,6 +8596,9 @@ async fn route_update(
     // whole collection. Same read cost as before (the RMW read below is untouched);
     // read elimination for pure-commutative updates is a later optimization.
     let mut complex_cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
+    // Statement-level TTL, hoisted so a whole-value collection assignment can
+    // carry it onto every element cell it expands into (D-15).
+    let ttl = using_ttl_as_i32(&s.using_ttl)?;
     for assignment in &s.assignments {
         // Commutative collection ops (list append, set add/remove, map put,
         // map-key remove) become per-element cells and skip the whole-value RMW.
@@ -8668,15 +8796,32 @@ async fn route_update(
         let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
             CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
         })?;
+        // Second producer of whole-value collection cells (D-15): a whole-value
+        // assignment (`SET l = [...]`) and the read-modify-write fall-through for
+        // an op `build_collection_cells` declines (list remove-by-value) both
+        // arrive here holding a collection value. Expand them into element cells
+        // so no live `path = None` cell on a complex column reaches the writer.
+        let col_meta = table_meta
+            .columns
+            .get(col_name)
+            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {col_name}")))?;
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+        if let Some(cells) = collection_insert_cells(
+            storage_column_is_multicell(table_meta, col_name),
+            &cql_type,
+            &value,
+            timestamp,
+            ttl,
+        )? {
+            for c in cells {
+                complex_cells.push((col_idx, c));
+            }
+            continue;
+        }
         regular_cells.push((col_idx, value));
     }
 
-    let mut row = bridge::build_row(
-        &regular_cells,
-        &ck_values,
-        timestamp,
-        using_ttl_as_i32(&s.using_ttl)?,
-    );
+    let mut row = bridge::build_row(&regular_cells, &ck_values, timestamp, ttl);
     if !complex_cells.is_empty() {
         row.cells.extend(complex_cells);
         row.cells.sort_by_key(|(idx, _)| *idx);
@@ -9051,6 +9196,10 @@ fn materialize_insert(
     let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    // Whole-value collection literals expand to per-element cells (D-15); kept
+    // separate because `build_row` takes one cell per column.
+    let mut collection_cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
+    let ttl = using_ttl_as_i32(&s.using_ttl)?;
 
     for (i, col_name) in s.columns.iter().enumerate() {
         let col_meta = table_meta
@@ -9067,7 +9216,17 @@ fn materialize_insert(
                 let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
                     CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
                 })?;
-                regular_cells.push((col_idx, value));
+                if let Some(cells) = collection_insert_cells(
+                    storage_column_is_multicell(table_meta, col_name),
+                    &cql_type,
+                    &value,
+                    timestamp,
+                    ttl,
+                )? {
+                    collection_cells.extend(cells.into_iter().map(|cell| (col_idx, cell)));
+                } else {
+                    regular_cells.push((col_idx, value));
+                }
             }
         }
     }
@@ -9083,12 +9242,11 @@ fn materialize_insert(
         .collect::<Result<Vec<_>, _>>()?;
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let row = bridge::build_row(
-        &regular_cells,
-        &ck_values,
-        timestamp,
-        using_ttl_as_i32(&s.using_ttl)?,
-    );
+    let mut row = bridge::build_row(&regular_cells, &ck_values, timestamp, ttl);
+    if !collection_cells.is_empty() {
+        row.cells.extend(collection_cells);
+        row.cells.sort_by_key(|(idx, _)| *idx);
+    }
     let table_id = TableId::new(ks, &s.table);
 
     Ok((table_id, decorated_key, row, timestamp))
@@ -9134,6 +9292,9 @@ fn materialize_update(
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
     let timestamp = using_timestamp_as_i64(&s.using_timestamp)?.unwrap_or(batch_timestamp);
+    // Statement-level TTL, hoisted so a whole-value collection assignment can
+    // carry it onto every element cell it expands into (D-15).
+    let ttl = using_ttl_as_i32(&s.using_ttl)?;
 
     let pk_values = extract_pk_values(
         &s.where_clauses,
@@ -9189,7 +9350,23 @@ fn materialize_update(
                 let col_idx = table_meta.storage_column_index(column).ok_or_else(|| {
                     CqlError::Invalid(format!("column '{}' not found in storage schema", column))
                 })?;
-                regular_cells.push((col_idx, val));
+                // Second producer of whole-value collection cells (D-15): a
+                // whole-value assignment (`SET l = [...]`) inside a transaction or
+                // logged batch emits a live `path = None` cell on a complex column,
+                // which the writer rejects. Expand it into element cells here too.
+                if let Some(cells) = collection_insert_cells(
+                    storage_column_is_multicell(table_meta, column),
+                    &cql_type,
+                    &val,
+                    timestamp,
+                    ttl,
+                )? {
+                    for c in cells {
+                        complex_cells.push((col_idx, c));
+                    }
+                } else {
+                    regular_cells.push((col_idx, val));
+                }
             }
             Assignment::Add { column, value } | Assignment::Sub { column, value } => {
                 let col_meta = table_meta
@@ -9244,12 +9421,7 @@ fn materialize_update(
     }
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let mut row = bridge::build_row(
-        &regular_cells,
-        &ck_values,
-        timestamp,
-        using_ttl_as_i32(&s.using_ttl)?,
-    );
+    let mut row = bridge::build_row(&regular_cells, &ck_values, timestamp, ttl);
     if !complex_cells.is_empty() {
         row.cells.extend(complex_cells);
         // Keep cells grouped by column index (per-element cells within a column
@@ -32145,5 +32317,264 @@ mod tests {
                  (same-clustering rows must fold, not duplicate)"
             );
         }
+    }
+
+    // ── D-15: no row may mix whole-value and per-element collection cells ─────
+    //
+    // A collection UPDATE stores one path-bearing cell per element; a plain
+    // INSERT stored the collection as ONE whole-value cell (`path = None`).
+    // `flush.rs` marks an SSTable complex if ANY cell anywhere carries a path,
+    // and `writer.rs:1958` then asserts that a `path = None` cell on a complex
+    // column must be a collection-deletion tombstone. So one INSERTed collection
+    // plus one per-element update in the same flush panicked the writer, and the
+    // auto-flush task with it ("urgent flush task panicked e=channel closed").
+    //
+    // The fix normalises whole-value collection cells at INSERT ingress, reusing
+    // `build_collection_cells` — the exact expansion the UPDATE path uses — so a
+    // row never mixes the two representations.
+
+    /// Test helper: read one partition by its `int` partition key.
+    fn read_pk_int(
+        state: &SharedState,
+        tid: &TableId,
+        want: i32,
+    ) -> ferrosa_sstable::types::Partition {
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            want.to_be_bytes().to_vec(),
+        ));
+        state
+            .engine
+            .read(tid, &key)
+            .unwrap()
+            .unwrap_or_else(|| panic!("partition {want} not found"))
+    }
+
+    /// Test helper: assemble one column's cells back into its `CqlValue`.
+    fn assembled_column(
+        part: &ferrosa_sstable::types::Partition,
+        col: u16,
+        ty: &CqlType,
+    ) -> Option<CqlValue> {
+        let cells: Vec<&ferrosa_common::CellValue> = part.rows[0]
+            .cells
+            .iter()
+            .filter(|(idx, _)| *idx == col)
+            .map(|(_, cell)| cell)
+            .collect();
+        ferrosa_row_bridge::collection::assemble_column_cells(ty, &cells, 0).unwrap()
+    }
+
+    fn text_list() -> CqlType {
+        CqlType::List(Box::new(CqlType::Varchar))
+    }
+    fn text_set() -> CqlType {
+        CqlType::Set(Box::new(CqlType::Varchar))
+    }
+    fn text_int_map() -> CqlType {
+        CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int))
+    }
+
+    /// REGRESSION (D-15): a whole-value collection INSERT on one partition plus
+    /// a per-element collection UPDATE on another must flush without the
+    /// `writer.rs:1958` panic, and both partitions must read back correctly.
+    ///
+    /// Before the fix the INSERT left live `path = None` collection cells; the
+    /// UPDATE contributed path-bearing element cells, so the flush's SSTable was
+    /// framed complex and the writer asserted on the INSERTed cells:
+    ///   "SSTable writer: complex col_idx 0 path=None cell must be a
+    ///    collection-deletion tombstone".
+    #[tokio::test]
+    async fn collection_insert_and_element_update_in_one_flush_do_not_panic() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (k int PRIMARY KEY, l list<text>, s set<text>, m map<text,int>)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let tid = TableId::new("ks", "t");
+
+        // pk=1: whole-value INSERT of all three collections.
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "INSERT INTO ks.t (k, l, s, m) VALUES (1, ['a','b','c'], {'x','y'}, {'p':1,'q':2})",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // pk=2: per-element collection UPDATE — supplies path-bearing cells, so
+        // the flush is framed complex and any whole-value cell becomes illegal.
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "UPDATE ks.t SET l = l + ['x'], s = s + {'y'}, m = m + {'p':1} WHERE k = 2",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // The flush must not panic; pre-fix this is where writer.rs:1958 trips.
+        state
+            .engine
+            .flush(&tid)
+            .expect("flush must succeed with no mixed-representation collection cells");
+        assert_eq!(state.engine.sstable_count(&tid), 1);
+
+        // pk=1 readback: the whole-value INSERT's collections assembled exactly.
+        let p1 = read_pk_int(&state, &tid, 1);
+        assert_eq!(
+            assembled_column(&p1, 0, &text_list()),
+            Some(CqlValue::List(vec![
+                CqlValue::Text("a".into()),
+                CqlValue::Text("b".into()),
+                CqlValue::Text("c".into()),
+            ]))
+        );
+        assert_eq!(
+            assembled_column(&p1, 2, &text_set()),
+            Some(CqlValue::Set(vec![
+                CqlValue::Text("x".into()),
+                CqlValue::Text("y".into()),
+            ]))
+        );
+        assert_eq!(
+            assembled_column(&p1, 1, &text_int_map()),
+            Some(CqlValue::Map(vec![
+                (CqlValue::Text("p".into()), CqlValue::Int(1)),
+                (CqlValue::Text("q".into()), CqlValue::Int(2)),
+            ]))
+        );
+
+        // pk=2 readback: the per-element UPDATE's collections.
+        let p2 = read_pk_int(&state, &tid, 2);
+        assert_eq!(
+            assembled_column(&p2, 0, &text_list()),
+            Some(CqlValue::List(vec![CqlValue::Text("x".into())]))
+        );
+        assert_eq!(
+            assembled_column(&p2, 2, &text_set()),
+            Some(CqlValue::Set(vec![CqlValue::Text("y".into())]))
+        );
+        assert_eq!(
+            assembled_column(&p2, 1, &text_int_map()),
+            Some(CqlValue::Map(vec![(
+                CqlValue::Text("p".into()),
+                CqlValue::Int(1)
+            )]))
+        );
+    }
+
+    /// The ingress normalisation must hold on its own: after a whole-value
+    /// INSERT the row carries per-element cells (paths), never a live
+    /// `path = None` cell on a collection column — that is the illegal shape
+    /// `writer.rs:1958` rejects. Also covers the empty-collection literal and
+    /// `USING TTL`, both of which reach the same ingress.
+    #[tokio::test]
+    async fn collection_insert_ingress_emits_only_path_bearing_cells() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (k int PRIMARY KEY, l list<text>, s set<text>, m map<text,int>)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let tid = TableId::new("ks", "t");
+
+        for cql in [
+            // whole-value INSERT, with and without TTL
+            "INSERT INTO ks.t (k, l, s, m) VALUES (1, ['a','b','c'], {'x','y'}, {'p':1,'q':2})",
+            "INSERT INTO ks.t (k, l, s, m) VALUES (2, ['t'], {'t'}, {'t':1}) USING TTL 60",
+            // empty collection literals on a fresh key
+            "INSERT INTO ks.t (k, l, s, m) VALUES (3, [], {}, {})",
+            // whole-value UPDATE (`SET l = [...]`) is the same producer
+            "UPDATE ks.t SET l = ['u'], s = {'u'}, m = {'u':1} WHERE k = 4",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        for k in 1..=4 {
+            let part = read_pk_int(&state, &tid, k);
+            let illegal: Vec<(u16, bool)> = part.rows[0]
+                .cells
+                .iter()
+                .filter(|(idx, cell)| *idx <= 2 && cell.path.is_none() && !cell.is_tombstone())
+                .map(|(idx, cell)| (*idx, cell.is_tombstone()))
+                .collect();
+            assert!(
+                illegal.is_empty(),
+                "pk={k}: live path=None collection cells must not reach storage: {illegal:?}"
+            );
+            // And the collection columns must actually be present as element cells
+            // (an empty collection keeps a collection-deletion tombstone instead).
+            let has_path = part.rows[0]
+                .cells
+                .iter()
+                .any(|(idx, cell)| *idx <= 2 && cell.path.is_some());
+            let has_coll_tombstone = part.rows[0]
+                .cells
+                .iter()
+                .any(|(idx, cell)| *idx <= 2 && cell.path.is_none() && cell.is_tombstone());
+            assert!(
+                has_path || has_coll_tombstone,
+                "pk={k}: a collection column must have element cells or a deletion sentinel"
+            );
+        }
+
+        // The whole-value values must still assemble exactly after ingress.
+        let p1 = read_pk_int(&state, &tid, 1);
+        assert_eq!(
+            assembled_column(&p1, 0, &text_list()),
+            Some(CqlValue::List(vec![
+                CqlValue::Text("a".into()),
+                CqlValue::Text("b".into()),
+                CqlValue::Text("c".into()),
+            ]))
+        );
+        assert_eq!(
+            assembled_column(&p1, 2, &text_set()),
+            Some(CqlValue::Set(vec![
+                CqlValue::Text("x".into()),
+                CqlValue::Text("y".into()),
+            ]))
+        );
+        assert_eq!(
+            assembled_column(&p1, 1, &text_int_map()),
+            Some(CqlValue::Map(vec![
+                (CqlValue::Text("p".into()), CqlValue::Int(1)),
+                (CqlValue::Text("q".into()), CqlValue::Int(2)),
+            ]))
+        );
+        // Empty collections assemble to empty (not absent).
+        let p3 = read_pk_int(&state, &tid, 3);
+        assert_eq!(
+            assembled_column(&p3, 0, &text_list()),
+            Some(CqlValue::List(vec![]))
+        );
+        assert_eq!(
+            assembled_column(&p3, 2, &text_set()),
+            Some(CqlValue::Set(vec![]))
+        );
+        assert_eq!(
+            assembled_column(&p3, 1, &text_int_map()),
+            Some(CqlValue::Map(vec![]))
+        );
     }
 }
