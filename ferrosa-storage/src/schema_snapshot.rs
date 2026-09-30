@@ -374,9 +374,10 @@ pub(crate) fn persist_bounded_json<T: Serialize>(
 /// A load failure is reported as an empty list rather than an error: this runs
 /// on a startup diagnostic path and must never itself prevent the node booting.
 pub fn user_tables_in_storage_schema(data_dir: &Path) -> Vec<(String, String)> {
-    let Ok(Some(schemas)) =
-        load_bounded_json::<Vec<ferrosa_common::schema::TableSchema>>(data_dir, "storage-schema.json")
-    else {
+    let Ok(Some(schemas)) = load_bounded_json::<Vec<ferrosa_common::schema::TableSchema>>(
+        data_dir,
+        "storage-schema.json",
+    ) else {
         return Vec::new();
     };
     schemas

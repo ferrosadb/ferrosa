@@ -551,7 +551,8 @@ mod tests {
     /// which Cassandra reports as absent, not as an empty collection.
     #[test]
     fn a_deletion_newer_than_all_elements_reads_back_absent() {
-        let a = build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("a")]), 100).unwrap();
+        let a =
+            build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("a")]), 100).unwrap();
         let deletion = CellValue::tombstone(500, NO_DELETION_TIME);
         let cells: Vec<&CellValue> = vec![&a[0], &deletion];
         assert_eq!(
@@ -567,7 +568,8 @@ mod tests {
     /// swallow a collection that actually holds data.
     #[test]
     fn a_collection_with_a_live_element_still_reads_back() {
-        let a = build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("a")]), 100).unwrap();
+        let a =
+            build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("a")]), 100).unwrap();
         let deletion = CellValue::tombstone(50, NO_DELETION_TIME); // older than the element
         let cells: Vec<&CellValue> = vec![&a[0], &deletion];
         assert_eq!(

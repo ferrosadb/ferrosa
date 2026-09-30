@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ferrosa_postgres::handshake::VerifierStore;
 use ferrosa_postgres::scram::ScramVerifier;
-use ferrosa_postgres::{server, QueryContext, AccordAccess};
+use ferrosa_postgres::{server, AccordAccess, QueryContext};
 use ferrosa_schema::{
     AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
     RateLimitConfig, Schema, SchemaConfig, TestAuditSink,

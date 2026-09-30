@@ -1749,7 +1749,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         schema_restored = true;
 
         if table_less {
-            report_table_less_schema_snapshot(&data_path, ks_count);
+            report_table_less_schema_snapshot(data_path, ks_count);
         }
 
         // Register existing tables with the storage engine so reads work. The
@@ -4049,11 +4049,11 @@ mod tests {
         // The storage engine the restore path is handed. Its own construction
         // already consumed storage-schema.json (FIX t_2db96eb9), so
         // `fault_ks.kv` IS registered and its SSTables ARE readable.
-        let engine =
-            ferrosa_storage::StorageEngine::new(ferrosa_storage::StorageEngineConfig::test_config(
-                dir.path(),
-            ), None)
-            .unwrap();
+        let engine = ferrosa_storage::StorageEngine::new(
+            ferrosa_storage::StorageEngineConfig::test_config(dir.path()),
+            None,
+        )
+        .unwrap();
 
         register_user_tables_with_storage(&engine, &schema).unwrap();
 
@@ -4076,7 +4076,9 @@ mod tests {
         // (t_0acc233d), which is why this test asserts the report and the absence
         // of invention rather than a rebuilt table.
         assert!(
-            !snap.tables.contains_key(&("fault_ks".to_string(), "kv".to_string())),
+            !snap
+                .tables
+                .contains_key(&("fault_ks".to_string(), "kv".to_string())),
             "a table-less snapshot must not silently gain a table built from \
              storage-schema.json: that format names no partition-key column, so any \
              reconstructed table would be nameable in CQL but undecodable. Found \
@@ -4086,8 +4088,7 @@ mod tests {
 
         // What the diagnostic must surface: the tables that exist on disk, so an
         // operator can see the data is present even though the registry lost it.
-        let on_disk =
-            ferrosa_storage::schema_snapshot::user_tables_in_storage_schema(dir.path());
+        let on_disk = ferrosa_storage::schema_snapshot::user_tables_in_storage_schema(dir.path());
         assert!(
             on_disk
                 .iter()

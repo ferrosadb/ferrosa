@@ -690,7 +690,8 @@ async fn dml_client_with_committer(
     // elsewhere), so it bypasses the live-mode gate with `fixed`.
     let accord = match accord_committer.as_ref() {
         Some(committer) => {
-            let committer: Arc<dyn ferrosa_storage::accord::TransactionCommitter> = committer.clone();
+            let committer: Arc<dyn ferrosa_storage::accord::TransactionCommitter> =
+                committer.clone();
             AccordAccess::fixed(committer)
         }
         None => AccordAccess::disabled(),

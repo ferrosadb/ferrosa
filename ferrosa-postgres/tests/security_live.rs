@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferrosa_postgres::{server, QueryContext, SchemaVerifierStore, AccordAccess};
+use ferrosa_postgres::{server, AccordAccess, QueryContext, SchemaVerifierStore};
 use ferrosa_schema::auth::permission::{Permission, Resource};
 use ferrosa_schema::auth::role::RoleMetadata;
 use ferrosa_schema::{
