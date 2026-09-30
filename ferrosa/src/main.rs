@@ -1096,6 +1096,72 @@ fn load_local_schema(
     ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(data_dir).load()
 }
 
+/// Register every non-system table the registry currently holds with the
+/// storage engine so reads work.
+///
+/// Extracted from `main` so the registration step is reachable from a test.
+fn register_user_tables_with_storage(
+    storage: &ferrosa_storage::StorageEngine,
+    schema: &ferrosa_schema::Schema,
+) -> ferrosa_common::Result<()> {
+    let snap = schema.snapshot();
+    for ((_ks, _tbl), table_meta) in &snap.tables {
+        if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
+            continue;
+        }
+        storage.register_table(table_meta.to_storage_schema())?;
+    }
+    Ok(())
+}
+
+/// Report a table-less local schema snapshot, and what the other durable source
+/// holds, without pretending the tables can be rebuilt.
+///
+/// A snapshot with keyspaces but no tables restores a registry that lists no
+/// user tables, so CQL answers `keyspace '<ks>' not found` for data whose
+/// SSTables are still on disk. The tempting fix — rebuild the registry from
+/// `storage-schema.json` — is NOT possible: that format carries the partition
+/// key's *type* (`key_type`, e.g. `...marshal.Int32Type`) but never the key
+/// column's *name*, and it carries no clustering order, no column masks, and no
+/// table id. PK bytes are decoded positionally against the declared type at the
+/// key column's index, so a synthesised name would either fail the query or
+/// return a wrongly-named column. A fabricated name is strictly worse than this
+/// explicit report, so none is invented (D-47, t_2db96eb9).
+///
+/// The durable fix is to persist a schema record when DDL is acknowledged rather
+/// than only from the maintenance loop's tick (t_0acc233d), so a table-less
+/// snapshot never becomes the last writer on disk in the first place.
+fn report_table_less_schema_snapshot(data_dir: &Path, keyspace_count: usize) {
+    let storage_side = ferrosa_storage::schema_snapshot::user_tables_in_storage_schema(data_dir);
+    let storage_side: Vec<String> = storage_side
+        .into_iter()
+        .map(|(ks, table)| format!("{ks}.{table}"))
+        .collect();
+
+    if storage_side.is_empty() {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            keyspaces = keyspace_count,
+            "local schema snapshot contains no tables and storage-schema.json has no user \
+             table either; if this node had user tables, their SSTables are on disk but \
+             unrecoverable without a schema — see the acknowledged-DDL durability task"
+        );
+        return;
+    }
+
+    tracing::warn!(
+        data_dir = %data_dir.display(),
+        keyspaces = keyspace_count,
+        recoverable_tables = storage_side.len(),
+        tables = %storage_side.join(", "),
+        "local schema snapshot contains no tables, but storage-schema.json names these user \
+         tables. They are NOT being restored into the CQL registry: that format carries the \
+         partition key's type but not its column name, so the tables could be read by token \
+         yet not named in CQL. Restarting will serve them again only once the schema snapshot \
+         is repopulated (acknowledged-DDL durability, t_0acc233d)"
+    );
+}
+
 /// The value the maintenance loop seeds `last_schema_version` with before its
 /// first tick.
 ///
@@ -1666,6 +1732,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(snapshot) = local_schema_snapshot {
         let ks_count = snapshot.keyspaces.len();
         let table_count = snapshot.tables.len();
+        // A snapshot that restored keyspaces but ZERO tables is a usable-looking
+        // file that hides every user table from CQL: `apply_snapshot` restores
+        // nothing table-wise, `schema_restored` then suppresses the S3 fallback,
+        // and any durable SSTables are unreadable because their schema is gone.
+        // That is the D-47 shape (t_2db96eb9). Report it loudly with what the
+        // other durable source holds, and continue rather than aborting: aborting
+        // would make a recoverable node unbootable.
+        let table_less = table_count == 0 && !snapshot.keyspaces.is_empty();
         schema.apply_snapshot(snapshot)?;
         tracing::info!(
             ks_count,
@@ -1674,14 +1748,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         schema_restored = true;
 
-        // Register existing tables with the storage engine so reads work.
-        let snap = schema.snapshot();
-        for ((_ks, _tbl), table_meta) in &snap.tables {
-            if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
-                continue;
-            }
-            storage.register_table(table_meta.to_storage_schema())?;
+        if table_less {
+            report_table_less_schema_snapshot(&data_path, ks_count);
         }
+
+        // Register existing tables with the storage engine so reads work. The
+        // registry holds the KEY COLUMN NAMES the storage schema cannot carry;
+        // registering the storage schema instead would make the table readable
+        // by token but not nameable in CQL (D-47).
+        register_user_tables_with_storage(&storage, &schema)?;
     }
 
     if !schema_restored && storage.has_s3() {
@@ -3883,6 +3958,138 @@ mod tests {
                 .unwrap(),
             "0.0.0.0:9042"
         );
+    }
+
+    /// RED (D-47): a table-less-but-PRESENT `schema.json` must not hide user
+    /// tables whose SSTables are intact on disk and whose complete schema sits
+    /// in `storage-schema.json` beside it.
+    ///
+    /// This is the shape a SIGKILL inside D-47's 30 s maintenance window left
+    /// behind: the registry snapshot carries the four system keyspaces and ZERO
+    /// tables, so `apply_snapshot` restores nothing, `schema_restored = true`
+    /// suppresses the S3 fallback, and the node serves a schema whose only user
+    /// table (`fault_ks.kv`) is invisible: `system_schema.tables` answers with
+    /// no user rows and `SELECT ... FROM fault_ks.kv` fails
+    /// "keyspace 'fault_ks' not found" — CQL resolves through the REGISTRY, not
+    /// the engine (ferrosa-cql/src/router.rs `validate_keyspace_exists`).
+    ///
+    /// The engine's own fallback (`load_local_table_schemas`) cannot fix this:
+    /// the flat storage format carries the partition key's TYPE but not its
+    /// COLUMN NAME, and the key column name is unrecoverable from every other
+    /// durable artifact (`system_schema.tables`/`columns` hold 0 SSTable files
+    /// on this fixture, and key columns are NOT named in the SSTable
+    /// `SerializationHeader` — see `ferrosa-ctl` `TableLayout`).
+    #[test]
+    fn table_less_snapshot_reports_disk_tables_and_fabricates_none() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // storage-schema.json: the complete flat schema, present all along.
+        let flat = serde_json::json!([{
+            "keyspace": "fault_ks",
+            "table": "kv",
+            "key_type": "org.apache.cassandra.db.marshal.Int32Type",
+            "clustering_columns": [],
+            "static_columns": [],
+            "regular_columns": [
+                {"name": "v", "type_name": "org.apache.cassandra.db.marshal.UTF8Type"}
+            ],
+            "extensions": {}
+        }]);
+        std::fs::write(
+            dir.path().join("storage-schema.json"),
+            serde_json::to_vec(&flat).unwrap(),
+        )
+        .unwrap();
+
+        // schema.json: keyspaces but ZERO tables — present, so the S3 fallback
+        // is suppressed by `schema_restored = true`.
+        let mut snap = ferrosa_schema::SchemaSnapshot::new();
+        snap.keyspaces.insert(
+            "fault_ks".into(),
+            ferrosa_schema::KeyspaceMetadata {
+                name: "fault_ks".into(),
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "SimpleStrategy".into(),
+                    options: [("replication_factor".into(), "1".into())]
+                        .into_iter()
+                        .collect(),
+                },
+                durable_writes: true,
+            },
+        );
+        let json = serde_json::to_vec_pretty(&snap).unwrap();
+        std::fs::write(dir.path().join("schema.json"), &json).unwrap();
+
+        let loaded = load_local_schema(dir.path()).unwrap().unwrap();
+        assert!(
+            loaded.tables.is_empty() && !loaded.keyspaces.is_empty(),
+            "fixture precondition: the snapshot must be table-less but present"
+        );
+
+        let schema = ferrosa_schema::Schema::new(test_schema_config()).unwrap();
+        schema.apply_snapshot(loaded).unwrap();
+
+        // The storage engine the restore path is handed. Its own construction
+        // already consumed storage-schema.json (FIX t_2db96eb9), so
+        // `fault_ks.kv` IS registered and its SSTables ARE readable.
+        let engine =
+            ferrosa_storage::StorageEngine::new(ferrosa_storage::StorageEngineConfig::test_config(
+                dir.path(),
+            ), None)
+            .unwrap();
+
+        register_user_tables_with_storage(&engine, &schema).unwrap();
+
+        let snap = schema.snapshot();
+
+        // The registry cannot be rebuilt from storage-schema.json, and this test
+        // pins WHY rather than asserting a recovery that cannot happen.
+        //
+        // A registry table needs `TableMetadata.partition_key: Vec<String>` — the
+        // partition key's COLUMN NAMES. `TableSchema` carries only `key_type`, a
+        // type class (`org.apache.cassandra.db.marshal.Int32Type`), and carries no
+        // clustering order, no column masks and no table id. Partition-key bytes
+        // are decoded positionally against the declared type at the key column's
+        // index, so a synthesised name either fails the query or returns a
+        // wrongly-named column — strictly worse than an explicit failure.
+        //
+        // So the contract for a table-less snapshot is: report loudly, name what
+        // storage-schema.json still holds, and do NOT fabricate a table. Recovery
+        // requires a durable schema record written when DDL is acknowledged
+        // (t_0acc233d), which is why this test asserts the report and the absence
+        // of invention rather than a rebuilt table.
+        assert!(
+            !snap.tables.contains_key(&("fault_ks".to_string(), "kv".to_string())),
+            "a table-less snapshot must not silently gain a table built from \
+             storage-schema.json: that format names no partition-key column, so any \
+             reconstructed table would be nameable in CQL but undecodable. Found \
+             tables={:?}",
+            snap.tables.keys().collect::<Vec<_>>()
+        );
+
+        // What the diagnostic must surface: the tables that exist on disk, so an
+        // operator can see the data is present even though the registry lost it.
+        let on_disk =
+            ferrosa_storage::schema_snapshot::user_tables_in_storage_schema(dir.path());
+        assert!(
+            on_disk
+                .iter()
+                .any(|(ks, table)| ks == "fault_ks" && table == "kv"),
+            "the table-less-snapshot report must name the user tables present in \
+             storage-schema.json; got {on_disk:?}"
+        );
+    }
+
+    fn test_schema_config() -> ferrosa_schema::SchemaConfig {
+        ferrosa_schema::SchemaConfig {
+            hasher: ferrosa_schema::PasswordHasher::default(),
+            password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+            auth_method: ferrosa_schema::AuthMethod::Password,
+            rate_limit: ferrosa_schema::RateLimitConfig::default(),
+            audit_sink: Box::new(ferrosa_schema::LogAuditSink),
+            secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+            mode: ferrosa_schema::DeploymentMode::Development,
+        }
     }
 
     #[test]

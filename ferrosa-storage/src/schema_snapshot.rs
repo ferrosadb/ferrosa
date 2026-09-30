@@ -362,6 +362,30 @@ pub(crate) fn persist_bounded_json<T: Serialize>(
     Ok(())
 }
 
+/// List the user tables named in `storage-schema.json`, for diagnostics.
+///
+/// Returns `(keyspace, table)` pairs for non-system entries, or an empty vector
+/// when the file is absent or unreadable. Used to tell an operator exactly which
+/// tables exist on disk when the authoritative schema snapshot has lost them:
+/// their SSTables are still there, but the flat storage format cannot restore
+/// them to CQL (it carries the partition key's type, not its column name), so
+/// the honest outcome is a named report rather than a fabricated table.
+///
+/// A load failure is reported as an empty list rather than an error: this runs
+/// on a startup diagnostic path and must never itself prevent the node booting.
+pub fn user_tables_in_storage_schema(data_dir: &Path) -> Vec<(String, String)> {
+    let Ok(Some(schemas)) =
+        load_bounded_json::<Vec<ferrosa_common::schema::TableSchema>>(data_dir, "storage-schema.json")
+    else {
+        return Vec::new();
+    };
+    schemas
+        .into_iter()
+        .filter(|s| !ferrosa_schema::is_system_keyspace(&s.keyspace))
+        .map(|s| (s.keyspace, s.table))
+        .collect()
+}
+
 /// Load a storage-private JSON document under the same hard byte bound used by
 /// authoritative snapshots.
 pub(crate) fn load_bounded_json<T: for<'de> Deserialize<'de>>(
