@@ -104,9 +104,9 @@ fn minimal_ctx() -> (Arc<QueryContext>, tempfile::TempDir) {
         schema: Arc::new(schema),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-accord: AccordAccess::disabled(),
-          ddl: None,
-          jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
+        accord: AccordAccess::disabled(),
+        ddl: None,
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
     (ctx, dir)
 }
