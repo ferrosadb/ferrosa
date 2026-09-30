@@ -28760,6 +28760,106 @@ mod tests {
         );
     }
 
+    /// A STANDALONE conditional UPDATE must evaluate its condition. On main,
+    /// `route_update` returns `encode_void()` and never consults `if_conditions`,
+    /// so `UPDATE ... IF version = ?` applies unconditionally and a caller
+    /// relying on the compare-and-set guard silently loses it.
+    ///
+    /// This is the non-batch counterpart of the conditional-batch bug: the same
+    /// "condition ignored" class, reachable without any batch at all. It is the
+    /// property ferrosa-dbaas compare_and_set depends on.
+    #[tokio::test]
+    async fn standalone_conditional_update_does_not_apply_when_condition_is_false() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        let ks = crate::parser::parse(
+            "CREATE KEYSPACE cw WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, ks).await.unwrap();
+
+        let table =
+            crate::parser::parse("CREATE TABLE cw.t (k int PRIMARY KEY, v text, version bigint)")
+                .unwrap();
+        route(&state, &ctx, table).await.unwrap();
+
+        // Seed at version 1.
+        let seed =
+            crate::parser::parse("INSERT INTO cw.t (k, v, version) VALUES (1, 'v1', 1)").unwrap();
+        route(&state, &ctx, seed).await.unwrap();
+
+        // The condition is FALSE (stored version is 1, we ask for 99). The write
+        // must not land.
+        let cas = crate::parser::parse(
+            "UPDATE cw.t SET v = 'clobbered', version = 2 WHERE k = 1 IF version = 99",
+        )
+        .unwrap();
+        let _ = route(&state, &ctx, cas).await;
+
+        let select = crate::parser::parse("SELECT v, version FROM cw.t WHERE k = 1").unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, select).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("clobbered"),
+            "a standalone conditional UPDATE applied while its IF condition was \
+             false: the compare-and-set guard was ignored. Rows: {text}"
+        );
+        assert!(
+            !text.contains('2'),
+            "the version must not advance past a refused CAS. Rows: {text}"
+        );
+    }
+
+    /// The true branch must still apply: the guard must not over-reject.
+    #[tokio::test]
+    async fn standalone_conditional_update_applies_when_condition_is_true() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        let ks = crate::parser::parse(
+            "CREATE KEYSPACE cwt WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, ks).await.unwrap();
+
+        let table =
+            crate::parser::parse("CREATE TABLE cwt.t (k int PRIMARY KEY, v text, version bigint)")
+                .unwrap();
+        route(&state, &ctx, table).await.unwrap();
+
+        let seed =
+            crate::parser::parse("INSERT INTO cwt.t (k, v, version) VALUES (1, 'v1', 1)").unwrap();
+        route(&state, &ctx, seed).await.unwrap();
+
+        // Condition TRUE: stored version is 1.
+        let cas = crate::parser::parse(
+            "UPDATE cwt.t SET v = 'applied', version = 2 WHERE k = 1 IF version = 1",
+        )
+        .unwrap();
+        route(&state, &ctx, cas)
+            .await
+            .expect("a satisfied conditional UPDATE must apply");
+
+        let select = crate::parser::parse("SELECT v FROM cwt.t WHERE k = 1").unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, select).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("applied"),
+            "a satisfied conditional UPDATE must land. Rows: {text}"
+        );
+    }
+
     /// A logged batch where one statement targets a non-existent table
     /// should not leave earlier statements committed.
     #[tokio::test]
