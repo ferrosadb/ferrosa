@@ -263,6 +263,24 @@ fn container_runtime() -> &'static str {
     }
 }
 
+/// The PostgreSQL image the oracle runs against: `$FERROSA_POSTGRES_IMAGE` if
+/// set, else the upstream tag.
+///
+/// The override exists so CI can point this at our own digest-pinned mirror on
+/// downloads.ferrosa.ai and stop depending on a registry we do not control --
+/// on 2026-09-29 a connection reset while pulling a manifest failed a CI job
+/// outright. CI does not set it yet because that mirror is pinned in the
+/// catalog sources but not published; until then both the pre-pull and this
+/// default resolve to upstream. The default also keeps a local `cargo test`
+/// working with the image most developers already have, mirroring the
+/// podman-vs-docker default in `container_runtime()`.
+fn postgres_image() -> String {
+    match std::env::var("FERROSA_POSTGRES_IMAGE") {
+        Ok(img) if !img.trim().is_empty() => img,
+        _ => "postgres:16".to_string(),
+    }
+}
+
 /// True if `bin` resolves on `PATH` (best-effort via `which`).
 fn which(bin: &str) -> bool {
     Command::new("which")
@@ -296,10 +314,18 @@ struct PgContainer {
 }
 
 impl PgContainer {
-    /// Launch `postgres:16`, publish 5432 to an ephemeral host port, discover
-    /// that port, and poll-connect until the server is ready.
+    /// Launch the pinned PostgreSQL image, publish 5432 to an ephemeral host
+    /// port, discover that port, and poll-connect until the server is ready.
+    ///
+    /// The image reference comes from `FERROSA_POSTGRES_IMAGE` (see
+    /// `postgres_image`), so CI can redirect it to our own mirror without a
+    /// code change. CI sets it to our own mirror; the default below is
+    /// upstream, which is what a local `cargo test` uses. Leaning on upstream
+    /// makes the job depend on a registry we do not control: on 2026-09-29 a
+    /// connection reset while pulling a manifest failed a CI job outright.
     async fn start() -> PgContainer {
         let runtime = container_runtime();
+        let image = postgres_image();
         let name = format!("ferrosa-oracle-{}", Uuid::new_v4().simple());
 
         let run = Command::new(runtime)
@@ -315,7 +341,7 @@ impl PgContainer {
                 "127.0.0.1::5432",
                 "--name",
                 &name,
-                "postgres:16",
+                &image,
             ])
             .output()
             .expect("spawn container runtime");

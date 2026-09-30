@@ -9,7 +9,9 @@
 #   cp target/x86_64-unknown-linux-musl/release/ferrosa tests/ferrosa
 #   docker build -f tests/Dockerfile.nightly-bin -t ferrosa-nightly:latest tests/
 
-FROM debian:trixie-slim
+# Our digest-pinned mirror, not Docker Hub (see
+# https://downloads.ferrosa.ai/images/services/index.json).
+FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
