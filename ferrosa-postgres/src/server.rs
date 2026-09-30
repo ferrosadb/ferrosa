@@ -25,6 +25,7 @@ use crate::handshake::{HandshakeError, VerifierStore};
 use crate::messages::{BackendMessage, FrontendMessage};
 use crate::mvcc::{MvccCommitError, MvccManager};
 use crate::query;
+use crate::AccordAccess;
 
 /// Shared context for the post-auth query phase: the storage engine and schema
 /// to resolve and scan tables, plus the default schema (Postgres `search_path`
@@ -39,7 +40,11 @@ pub struct QueryContext {
     /// Distributed commit coordination for PostgreSQL transactions. PostgreSQL
     /// owns snapshot/version validation; Accord supplies the cluster commit
     /// order and atomic write apply. CQL's transaction path is unchanged.
-    pub accord_committer: Option<Arc<dyn ferrosa_storage::accord::TransactionCommitter>>,
+    ///
+    /// The committer is resolved **per statement** (see
+    /// [`AccordAccess::committer`]) rather than captured here, because this
+    /// listener is built before the node has formed a cluster.
+    pub accord: AccordAccess,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -423,7 +428,9 @@ async fn begin_implicit_transaction(
     ctx: &QueryContext,
     session: &mut Session,
 ) -> Result<(), BackendMessage> {
-    let Some(committer) = &ctx.accord_committer else {
+    // Per statement: this node may have become a cluster (or lost its write
+    // path) since the listener was built.
+    let Some(committer) = ctx.accord.committer() else {
         return Ok(());
     };
     let cluster_ts = committer
@@ -456,7 +463,7 @@ async fn execute_simple(
             | ferrosa_sql::Statement::Update(_)
             | ferrosa_sql::Statement::Delete(_))
     );
-    if session.in_txn() || ctx.accord_committer.is_none() || !is_data_statement {
+    if session.in_txn() || ctx.accord.committer().is_none() || !is_data_statement {
         return execute_simple_inner(ctx, session, sql).await;
     }
     if let Err(error) = begin_implicit_transaction(ctx, session).await {
@@ -533,7 +540,7 @@ async fn execute_simple_inner(
                     "only SERIALIZABLE isolation is supported for explicit PostgreSQL transactions",
                 )];
             }
-            let snapshot = if let Some(committer) = &ctx.accord_committer {
+            let snapshot = if let Some(committer) = ctx.accord.committer() {
                 match committer.begin_postgres_snapshot(&ctx.default_schema).await {
                     Ok(cluster_ts) => ctx.mvcc.snapshot_with_cluster_ts(cluster_ts),
                     Err(error) => {
@@ -704,7 +711,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                 )],
             };
         }
-        if let Some(committer) = &ctx.accord_committer {
+        if let Some(committer) = ctx.accord.committer() {
             let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
                 session.end_txn();
                 return vec![query::error_response(
@@ -749,7 +756,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         })
         .collect();
     let _commit_guard = ctx.mvcc.commit_guard().await;
-    let outcome = if let Some(committer) = &ctx.accord_committer {
+    let outcome = if let Some(committer) = ctx.accord.committer() {
         if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &write_tables) {
             Err(error)
         } else {
@@ -1138,7 +1145,7 @@ async fn execute_portal(
                     | PreparedKind::Delete(_)
             )
         });
-    if session.in_txn() || ctx.accord_committer.is_none() || !is_data_statement {
+    if session.in_txn() || ctx.accord.committer().is_none() || !is_data_statement {
         return execute_portal_inner(ctx, session, portal_name).await;
     }
     if let Err(error) = begin_implicit_transaction(ctx, session).await {
@@ -1421,11 +1428,13 @@ where
     );
     let tls = Arc::new(tls);
     let _snapshot_reaper = crate::mvcc::MvccManager::spawn_snapshot_reaper(ctx.mvcc.clone());
-    if let Some(committer) = &ctx.accord_committer {
-        committer
-            .register_postgres_mvcc_observer(ctx.mvcc.clone())
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-    }
+    // Install the MVCC observer before any connection can run, and via the
+    // node's Accord-state slot rather than a committer: at this point the node
+    // has not formed a cluster yet, and the observer must be present when it
+    // does.
+    ctx.accord
+        .register_observer(ctx.mvcc.clone())
+        .map_err(std::io::Error::other)?;
     loop {
         let (stream, peer) = listener.accept().await?;
         let store = Arc::clone(&store);
@@ -1587,7 +1596,7 @@ mod txn_atomicity_tests {
             schema,
             default_schema: "public".to_string(),
             mvcc: Arc::new(MvccManager::default()),
-            accord_committer: None,
+            accord: AccordAccess::disabled(),
         }
     }
 
