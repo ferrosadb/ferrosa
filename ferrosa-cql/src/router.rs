@@ -8905,20 +8905,38 @@ async fn route_batch(
 }
 
 /// Route an UNLOGGED or COUNTER batch: dispatch each statement individually.
+///
+/// A batch-level `USING TIMESTAMP` applies to every statement in the batch, as
+/// it does on the LOGGED path. This path previously never read
+/// `b.using_timestamp`, so an UNLOGGED batch silently stamped its statements
+/// with wall-clock now and lost to any write it was meant to beat. A
+/// per-statement `USING TIMESTAMP` still wins, matching Cassandra precedence.
 async fn route_unlogged_batch(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     b: BatchStatement,
 ) -> Result<BytesMut, CqlError> {
+    let batch_timestamp = using_timestamp_as_i64(&b.using_timestamp)?;
+    let apply_batch_ts = |stmt_ts: &mut Option<Term>| {
+        if stmt_ts.is_none() {
+            if let Some(ts) = batch_timestamp {
+                *stmt_ts = Some(Term::IntegerLiteral(ts));
+            }
+        }
+    };
+
     for stmt in b.statements {
         match stmt {
-            Statement::Insert(s) => {
+            Statement::Insert(mut s) => {
+                apply_batch_ts(&mut s.using_timestamp);
                 route_insert(state, ctx, s).await?;
             }
-            Statement::Update(s) => {
+            Statement::Update(mut s) => {
+                apply_batch_ts(&mut s.using_timestamp);
                 route_update(state, ctx, s).await?;
             }
-            Statement::Delete(s) => {
+            Statement::Delete(mut s) => {
+                apply_batch_ts(&mut s.using_timestamp);
                 route_delete(state, ctx, s).await?;
             }
             _ => {
@@ -16769,6 +16787,112 @@ mod tests {
             using_timestamp: None,
         });
         assert!(route(&state, &ctx, batch).await.is_err());
+    }
+
+    // RED for the reported defect: an UNLOGGED batch ignored its batch-level
+    // USING TIMESTAMP, so a batch claiming a strictly newer timestamp silently
+    // lost to an older write it should have beaten.
+    //
+    // The timestamp is deliberately in the FUTURE. If the batch clause is
+    // dropped, each statement is stamped with wall-clock now, which is already
+    // newer than any past value -- so a pre-write timestamped in the past would
+    // lose either way and the defect would be invisible. The future value is
+    // what makes it observable, and this is the shape the differential oracle
+    // uses against a real Cassandra node.
+    #[tokio::test]
+    async fn unlogged_batch_honors_batch_level_using_timestamp() {
+        let (state, _dir) = setup();
+        let current_keyspace = Some("bt".to_string());
+        let auth = dev_auth();
+        let ctx = test_ctx(&auth, &current_keyspace);
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE bt WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("CREATE TABLE bt.t (id int PRIMARY KEY, name text)").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Above the wall clock (~1.79e12 today).
+        const BATCH_TS: i64 = 2_000_000_000_000_000;
+
+        // The older write the batch must beat.
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(&format!(
+                "INSERT INTO bt.t (id, name) VALUES (1, 'plain') USING TIMESTAMP {}",
+                BATCH_TS - 1
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // A control row is included so that a batch which did not execute at all
+        // cannot masquerade as the expected outcome.
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(&format!(
+                "BEGIN UNLOGGED BATCH USING TIMESTAMP {BATCH_TS} \
+                 INSERT INTO bt.t (id, name) VALUES (1, 'batch'); \
+                 INSERT INTO bt.t (id, name) VALUES (2, 'ctl'); \
+                 APPLY BATCH"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // id=1 must hold the BATCH value, not the older single write.
+        let rows = match route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT id, name FROM bt.t WHERE id = 1").unwrap(),
+        )
+        .await
+        .unwrap()
+        {
+            RouteResult::Result(b) => decode_id_name_rows(&b),
+            _ => panic!("expected a result for the batch-timestamp read-back"),
+        };
+        assert_eq!(
+            rows,
+            vec![(1, "batch".to_string())],
+            "the batch-level USING TIMESTAMP was ignored: the newer batch lost to the older \
+             single write"
+        );
+
+        // Control: proves the batch executed on this side at all, so a batch that
+        // did nothing cannot masquerade as the expected outcome.
+        let ctl = match route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT id, name FROM bt.t WHERE id = 2").unwrap(),
+        )
+        .await
+        .unwrap()
+        {
+            RouteResult::Result(b) => decode_id_name_rows(&b),
+            _ => panic!("expected a result for the control read-back"),
+        };
+        assert_eq!(
+            ctl,
+            vec![(2, "ctl".to_string())],
+            "control row missing: the batch did not execute, so the assertion above is vacuous"
+        );
     }
 
     #[tokio::test]
