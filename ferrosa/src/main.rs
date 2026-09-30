@@ -1096,6 +1096,31 @@ fn load_local_schema(
     ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(data_dir).load()
 }
 
+/// The value the maintenance loop seeds `last_schema_version` with before its
+/// first tick.
+///
+/// The loop's schema-persist guard is "has the version changed since I last
+/// wrote?" — the version it "last wrote" before it has written anything is the
+/// version the registry ALREADY holds at startup, because that snapshot was
+/// restored from disk (or is freshly seeded). Seeding this with `Uuid::nil()`
+/// made the guard true on the loop's immediate first tick, so every process
+/// wrote a snapshot within milliseconds of binding — and at that instant the
+/// registry held only system keyspaces, so the table-less snapshot became the
+/// last writer on disk. A SIGKILL before the next 30s tick then persisted it,
+/// and the node came back with its user tables gone (D-47). Seeding from the
+/// current version makes the first tick a no-op.
+fn maintenance_last_schema_version(current: uuid::Uuid) -> uuid::Uuid {
+    current
+}
+
+/// Whether the maintenance loop should persist a schema snapshot this tick.
+///
+/// Pure so the decision is unit-testable: the loop itself is an inline async
+/// block closed over runtime state and can never be driven from a test.
+fn should_persist_schema(current: uuid::Uuid, last: uuid::Uuid) -> bool {
+    current != last
+}
+
 /// Persist the current schema snapshot to S3 for cold restart recovery.
 async fn persist_schema_to_s3(
     storage: &ferrosa_storage::StorageEngine,
@@ -2834,7 +2859,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut compact_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         // Persist schema snapshot + flush all memtables to S3 every 30s.
         let mut schema_sync_interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        let mut last_schema_version = uuid::Uuid::nil();
+        // Seed from the version the registry ALREADY holds so the loop's
+        // immediate first tick is a no-op. See `maintenance_last_schema_version`.
+        let mut last_schema_version =
+            maintenance_last_schema_version(maintenance_schema.snapshot().version);
 
         loop {
             tokio::select! {
@@ -2954,7 +2982,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ = schema_sync_interval.tick() => {
                     let snap = maintenance_schema.snapshot();
-                    if snap.version != last_schema_version {
+                    if should_persist_schema(snap.version, last_schema_version) {
                         // Flush all memtables before persisting schema so SSTables
                         // on disk match the schema snapshot. Run it outside the
                         // Tokio blocking pool for the same reason as periodic
@@ -3944,6 +3972,59 @@ mod tests {
         assert!(
             loaded.is_none(),
             "must return None when schema.json is absent"
+        );
+    }
+
+    /// RED (D-47): the maintenance loop's schema-persist guard must be false on
+    /// the loop's very first tick when nothing has changed, because
+    /// `tokio::time::interval` fires its first tick immediately (t≈0) and at
+    /// that instant the registry holds only system keyspaces. Persisting there
+    /// writes a table-less `schema.json`; a SIGKILL before the next 30s tick
+    /// leaves it as the last writer on disk and the node restarts with its user
+    /// tables gone.
+    #[test]
+    fn maintenance_loop_does_not_persist_schema_on_first_tick() {
+        let current = uuid::Uuid::new_v4();
+        let seeded = maintenance_last_schema_version(current);
+
+        assert!(
+            !should_persist_schema(current, seeded),
+            "the first maintenance tick must see no version change and skip the \
+             persist; seeding `last_schema_version` with a value other than the \
+             live snapshot version (e.g. Uuid::nil()) writes a table-less \
+             schema.json within milliseconds of startup"
+        );
+    }
+
+    /// The seed must be the CURRENT registry version, not a fixed sentinel: a
+    /// constant would make the guard true on the first tick for every node.
+    #[test]
+    fn maintenance_seed_equals_the_live_snapshot_version() {
+        let current = uuid::Uuid::new_v4();
+        assert_eq!(
+            maintenance_last_schema_version(current),
+            current,
+            "the loop must start from the version the registry already holds"
+        );
+    }
+
+    #[test]
+    fn should_persist_schema_true_only_after_a_version_advance() {
+        let last = uuid::Uuid::new_v4();
+        assert!(
+            !should_persist_schema(last, last),
+            "an unchanged version must not trigger a persist"
+        );
+        assert!(
+            should_persist_schema(uuid::Uuid::new_v4(), last),
+            "a version the loop has not yet written must trigger a persist"
+        );
+        // The nil sentinel is exactly the case the old code got wrong: a real
+        // version differs from nil, so the guard fired on the first tick.
+        assert!(
+            should_persist_schema(uuid::Uuid::new_v4(), uuid::Uuid::nil()),
+            "a real version differs from nil — this is why nil as the seed fired \
+             the persist on tick one"
         );
     }
 
