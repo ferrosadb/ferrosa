@@ -49,7 +49,7 @@ use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_postgres::handshake::VerifierStore;
 use ferrosa_postgres::scram::ScramVerifier;
-use ferrosa_postgres::{server, QueryContext};
+use ferrosa_postgres::{server, AccordAccess, QueryContext};
 use ferrosa_schema::{
     AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
     EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
@@ -1084,7 +1084,7 @@ async fn start_ferrosa() -> (tokio_postgres::Client, tempfile::TempDir) {
         schema: Arc::new(schema),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
+        accord: AccordAccess::disabled(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

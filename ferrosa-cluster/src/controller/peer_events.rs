@@ -567,11 +567,12 @@ impl InboundPeerCallback for ModeController {
         let plan = peer_plan::plan_peer_connected(PeerConnectPlanInput {
             mode: current_mode,
             host_id,
-            addr: if matches!(current_mode, DeploymentMode::Cluster) {
-                reverse_addr
-            } else {
-                addr
-            },
+            // The peer's internode address, in every mode. The observed `addr`
+            // is the ephemeral source port of its outbound connection, and a
+            // pair transition used to rebuild a dial target from it as
+            // `addr.ip()` + OUR port -- ourselves, when nodes share a host on
+            // distinct ports (t_7c01df7e).
+            addr: reverse_addr,
             inbound: true,
             connected_peers_after_track: all_peers.clone(),
             committed_cluster_size: self

@@ -4368,16 +4368,36 @@ impl StorageEngine {
     fn load_local_table_schemas(
         data_dir: &Path,
     ) -> ferrosa_common::Result<Option<LocalTableSchemas>> {
+        // Exhaust every schema source before giving up, preferring the newest
+        // format but never accepting an unusable one.
+        //
+        // A registry snapshot that carries keyspaces but ZERO tables is not a
+        // usable schema. Treating its mere presence as success bricked a node:
+        // `tables` stayed empty, commit-log replay had no schema to bind
+        // mutations to, the pending-replay budget filled, and startup exited with
+        // "restore local/S3 schema" -- unactionable on a local-only node, while
+        // the complete schema sat unreferenced in storage-schema.json beside it.
+        // Observed live after a kill during flush (t_2db96eb9).
         if data_dir.join("schema.json").exists() {
-            let snapshot = crate::schema_snapshot::SchemaSnapshotStore::new(data_dir)
-                .load()?
-                .ok_or_else(|| {
-                    ferrosa_common::Error::InvalidFormat(
-                        "schema.json disappeared while acquiring its snapshot lock".to_owned(),
-                    )
-                })?;
-            return Ok(Some(LocalTableSchemas::Registry(Box::new(snapshot))));
+            match crate::schema_snapshot::SchemaSnapshotStore::new(data_dir).load()? {
+                Some(snapshot) if !snapshot.tables.is_empty() => {
+                    return Ok(Some(LocalTableSchemas::Registry(Box::new(snapshot))));
+                }
+                Some(snapshot) => {
+                    tracing::warn!(
+                        data_dir = %data_dir.display(),
+                        keyspaces = snapshot.keyspaces.len(),
+                        "local schema snapshot contains no tables; falling back to \
+                         storage-schema.json rather than starting with an empty schema \
+                         (an empty schema makes commit-log replay unable to bind and \
+                         aborts startup)"
+                    );
+                }
+                None => {}
+            }
         }
+        // Fallback: the flat storage schema. This is normally the older format,
+        // but here it is the more complete one -- prefer usable over newest.
         crate::schema_snapshot::load_bounded_json(data_dir, "storage-schema.json")
             .map(|schemas| schemas.map(LocalTableSchemas::Storage))
     }
