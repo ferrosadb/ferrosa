@@ -1,0 +1,356 @@
+//! Module: `CREATE TABLE` parsing for the Ecto-migration DDL subset (D10, T-130).
+//! Correctness: Correct when every statement `ecto_sql` emits for `create table`
+//! parses to the expected AST, and every out-of-scope clause fails with a typed
+//! `ParseError::UnsupportedClause` naming that clause (never silently dropped).
+//! Last revised: 2026-09-28
+//! Last changed: New module; parse layer only, no execution or schema creation.
+//!
+//! This is a child module of `parser` so it shares the private lexer/`Parser`.
+//! Every loop here iterates over the token vector once; there is no recursion.
+
+use super::{ParseError, Parser, Tok};
+use crate::ast::{ColumnDef, CreateTableStmt, PgType, Statement, TableRef, UnsupportedClause};
+
+/// The one schema a table may be qualified with. Other schemas are refused
+/// (`UnsupportedClause::ForeignSchema`) until schema-to-keyspace mapping exists.
+const MAPPED_SCHEMA: &str = "public";
+
+impl Parser {
+    /// `CREATE TABLE [IF NOT EXISTS] name ( elem [, elem]* )`. The leading
+    /// `CREATE` token has not been consumed yet.
+    pub(super) fn parse_create(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("CREATE")?;
+        self.expect_ident_kw("TABLE")?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.parse_create_table_name()?;
+        self.expect(&Tok::LParen, "(")?;
+        let mut columns: Vec<ColumnDef> = Vec::new();
+        let mut table_pk: Option<Vec<String>> = None;
+        loop {
+            self.parse_table_element(&mut columns, &mut table_pk)?;
+            match self.next() {
+                Some(Tok::Comma) => {}
+                Some(Tok::RParen) => break,
+                Some(t) => {
+                    return Err(ParseError::Unexpected {
+                        expected: ", or )",
+                        found: format!("{t:?}"),
+                    })
+                }
+                None => return Err(ParseError::UnexpectedEnd),
+            }
+        }
+        self.expect_end()?;
+        finish_create_table(if_not_exists, name, columns, table_pk)
+    }
+
+    fn parse_if_not_exists(&mut self) -> Result<bool, ParseError> {
+        if !self.peek_is_kw("IF") {
+            return Ok(false);
+        }
+        self.next();
+        self.expect(&Tok::Not, "NOT")?;
+        self.expect_ident_kw("EXISTS")?;
+        Ok(true)
+    }
+
+    fn parse_create_table_name(&mut self) -> Result<TableRef, ParseError> {
+        let table = self.parse_qualified_table()?;
+        match &table.schema {
+            Some(s) if !s.eq_ignore_ascii_case(MAPPED_SCHEMA) => Err(
+                ParseError::UnsupportedClause(UnsupportedClause::ForeignSchema),
+            ),
+            _ => Ok(table),
+        }
+    }
+
+    /// One element of the table body: a table constraint or a column definition.
+    fn parse_table_element(
+        &mut self,
+        columns: &mut Vec<ColumnDef>,
+        table_pk: &mut Option<Vec<String>>,
+    ) -> Result<(), ParseError> {
+        if self.peek_is_kw("CONSTRAINT") {
+            self.next();
+            self.ident()?; // constraint name; the constraint kind follows
+            return self.parse_table_constraint(table_pk);
+        }
+        if let Some(Tok::Ident(w)) = self.peek() {
+            if matches!(
+                w.to_ascii_uppercase().as_str(),
+                "PRIMARY" | "FOREIGN" | "CHECK" | "UNIQUE"
+            ) {
+                return self.parse_table_constraint(table_pk);
+            }
+        }
+        let col = self.parse_column_def()?;
+        columns.push(col);
+        Ok(())
+    }
+
+    fn parse_table_constraint(
+        &mut self,
+        table_pk: &mut Option<Vec<String>>,
+    ) -> Result<(), ParseError> {
+        let word = self.ident()?.to_ascii_uppercase();
+        match word.as_str() {
+            "PRIMARY" => {
+                self.expect_ident_kw("KEY")?;
+                if table_pk.is_some() {
+                    return Err(ParseError::MultiplePrimaryKeys);
+                }
+                *table_pk = Some(self.parse_paren_ident_list()?);
+                Ok(())
+            }
+            "FOREIGN" => Err(ParseError::UnsupportedClause(UnsupportedClause::ForeignKey)),
+            "CHECK" => Err(ParseError::UnsupportedClause(UnsupportedClause::Check)),
+            "UNIQUE" => Err(ParseError::UnsupportedClause(UnsupportedClause::Unique)),
+            _ => Err(ParseError::Unexpected {
+                expected: "PRIMARY KEY, FOREIGN KEY, CHECK or UNIQUE",
+                found: word,
+            }),
+        }
+    }
+
+    /// `( ident [, ident]* )` — the column list of a table-level PRIMARY KEY.
+    fn parse_paren_ident_list(&mut self) -> Result<Vec<String>, ParseError> {
+        self.expect(&Tok::LParen, "(")?;
+        let mut names = vec![self.ident()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            names.push(self.ident()?);
+        }
+        self.expect(&Tok::RParen, ")")?;
+        Ok(names)
+    }
+
+    /// `name type [column-constraint]*`. A column-level `PRIMARY KEY` is recorded
+    /// on the returned def (`primary_key`) and folded into the table key later.
+    fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
+        let name = self.ident()?;
+        let ty = self.parse_pg_type()?;
+        let mut def = ColumnDef {
+            name,
+            ty,
+            not_null: false,
+            primary_key: false,
+        };
+        while let Some(tok) = self.peek() {
+            if matches!(tok, Tok::Comma | Tok::RParen) {
+                break;
+            }
+            self.parse_column_constraint(&mut def)?;
+        }
+        Ok(def)
+    }
+
+    fn parse_column_constraint(&mut self, def: &mut ColumnDef) -> Result<(), ParseError> {
+        if matches!(self.peek(), Some(Tok::Not)) {
+            self.next();
+            self.expect_ident_kw("NULL")?;
+            def.not_null = true;
+            return Ok(());
+        }
+        let word = self.ident()?.to_ascii_uppercase();
+        match word.as_str() {
+            "NULL" => Ok(()),
+            "PRIMARY" => {
+                self.expect_ident_kw("KEY")?;
+                def.primary_key = true;
+                Ok(())
+            }
+            "DEFAULT" => Err(ParseError::UnsupportedClause(
+                UnsupportedClause::DefaultExpr,
+            )),
+            "REFERENCES" => Err(ParseError::UnsupportedClause(UnsupportedClause::ForeignKey)),
+            "CHECK" => Err(ParseError::UnsupportedClause(UnsupportedClause::Check)),
+            "UNIQUE" => Err(ParseError::UnsupportedClause(UnsupportedClause::Unique)),
+            _ => Err(ParseError::Unexpected {
+                expected: "column constraint",
+                found: word,
+            }),
+        }
+    }
+
+    fn peek_is_kw(&self, kw: &str) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case(kw))
+    }
+
+    /// `( n )` after a type name, or nothing. Returns the modifiers in order.
+    fn parse_type_modifiers(&mut self) -> Result<Vec<u32>, ParseError> {
+        if !matches!(self.peek(), Some(Tok::LParen)) {
+            return Ok(Vec::new());
+        }
+        self.next();
+        let mut mods = vec![self.parse_type_modifier()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            mods.push(self.parse_type_modifier()?);
+        }
+        self.expect(&Tok::RParen, ")")?;
+        Ok(mods)
+    }
+
+    fn parse_type_modifier(&mut self) -> Result<u32, ParseError> {
+        match self.next() {
+            Some(Tok::Int(n)) => u32::try_from(n).map_err(|_| ParseError::BadToken(n.to_string())),
+            Some(t) => Err(ParseError::Unexpected {
+                expected: "type modifier",
+                found: format!("{t:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEnd),
+        }
+    }
+
+    /// Parse a PG column type name (with optional modifiers and time-zone suffix).
+    fn parse_pg_type(&mut self) -> Result<PgType, ParseError> {
+        let first = self.ident()?.to_ascii_lowercase();
+        match first.as_str() {
+            "double" => {
+                self.expect_ident_kw("PRECISION")?;
+                Ok(PgType::DoublePrecision)
+            }
+            "character" => {
+                self.expect_ident_kw("VARYING")?;
+                Ok(PgType::Varchar(self.optional_length()?))
+            }
+            "timestamp" | "time" => self.parse_temporal(&first),
+            _ => self.parse_simple_type(&first),
+        }
+    }
+
+    fn optional_length(&mut self) -> Result<Option<u32>, ParseError> {
+        let mods = self.parse_type_modifiers()?;
+        match mods.as_slice() {
+            [] => Ok(None),
+            [n] => Ok(Some(*n)),
+            _ => Err(ParseError::BadToken("type takes one modifier".into())),
+        }
+    }
+
+    /// `timestamp|time [(p)] [WITH|WITHOUT TIME ZONE]`. `time with time zone`
+    /// is refused as an unknown type: there is no storage type for it.
+    fn parse_temporal(&mut self, base: &str) -> Result<PgType, ParseError> {
+        self.optional_length()?; // precision: accepted, storage is microseconds
+        let with_tz = if self.peek_is_kw("WITH") {
+            self.next();
+            true
+        } else if self.peek_is_kw("WITHOUT") {
+            self.next();
+            false
+        } else {
+            return Ok(temporal_type(base, false));
+        };
+        self.expect_ident_kw("TIME")?;
+        self.expect_ident_kw("ZONE")?;
+        if base == "time" && with_tz {
+            return Err(ParseError::UnknownType("time with time zone".into()));
+        }
+        Ok(temporal_type(base, with_tz))
+    }
+
+    fn parse_simple_type(&mut self, name: &str) -> Result<PgType, ParseError> {
+        match name {
+            "smallint" | "int2" => Ok(PgType::SmallInt),
+            "integer" | "int" | "int4" => Ok(PgType::Integer),
+            "bigint" | "int8" => Ok(PgType::BigInt),
+            "real" | "float4" => Ok(PgType::Real),
+            "float8" => Ok(PgType::DoublePrecision),
+            "boolean" | "bool" => Ok(PgType::Boolean),
+            "text" => Ok(PgType::Text),
+            "varchar" => Ok(PgType::Varchar(self.optional_length()?)),
+            "bytea" => Ok(PgType::Bytea),
+            "uuid" => Ok(PgType::Uuid),
+            "date" => Ok(PgType::Date),
+            "inet" => Ok(PgType::Inet),
+            "timestamptz" => Ok(PgType::TimestampTz),
+            "jsonb" => Ok(PgType::Jsonb),
+            "json" => Ok(PgType::Json),
+            "numeric" | "decimal" => self.parse_numeric(),
+            "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial" => {
+                Err(ParseError::UnsupportedClause(UnsupportedClause::Serial))
+            }
+            other => Err(ParseError::UnknownType(other.to_string())),
+        }
+    }
+
+    fn parse_numeric(&mut self) -> Result<PgType, ParseError> {
+        let mods = self.parse_type_modifiers()?;
+        match mods.as_slice() {
+            [] => Ok(PgType::Numeric {
+                precision: None,
+                scale: None,
+            }),
+            [p] => Ok(PgType::Numeric {
+                precision: Some(*p),
+                scale: None,
+            }),
+            [p, s] => Ok(PgType::Numeric {
+                precision: Some(*p),
+                scale: Some(*s),
+            }),
+            _ => Err(ParseError::BadToken(
+                "numeric takes at most two modifiers".into(),
+            )),
+        }
+    }
+}
+
+fn temporal_type(base: &str, with_tz: bool) -> PgType {
+    match (base, with_tz) {
+        ("time", _) => PgType::Time,
+        (_, true) => PgType::TimestampTz,
+        (_, false) => PgType::Timestamp,
+    }
+}
+
+/// Merge column-level and table-level primary keys, validate, and build the AST.
+fn finish_create_table(
+    if_not_exists: bool,
+    name: TableRef,
+    mut columns: Vec<ColumnDef>,
+    table_pk: Option<Vec<String>>,
+) -> Result<Statement, ParseError> {
+    if columns.is_empty() {
+        return Err(ParseError::Unexpected {
+            expected: "at least one column",
+            found: ")".into(),
+        });
+    }
+    check_unique_names(&columns)?;
+    let inline: Vec<String> = columns
+        .iter()
+        .filter(|c| c.primary_key)
+        .map(|c| c.name.clone())
+        .collect();
+    let primary_key = match (inline.len(), table_pk) {
+        (0, Some(cols)) => cols,
+        (0, None) => return Err(ParseError::MissingPrimaryKey),
+        (1, None) => inline,
+        _ => return Err(ParseError::MultiplePrimaryKeys),
+    };
+    for key in &primary_key {
+        match columns.iter_mut().find(|c| &c.name == key) {
+            Some(col) => {
+                col.primary_key = true;
+                col.not_null = true; // a key column can never be NULL
+            }
+            None => return Err(ParseError::UnknownPrimaryKeyColumn(key.clone())),
+        }
+    }
+    Ok(Statement::CreateTable(Box::new(CreateTableStmt {
+        if_not_exists,
+        name,
+        columns,
+        primary_key,
+    })))
+}
+
+fn check_unique_names(columns: &[ColumnDef]) -> Result<(), ParseError> {
+    for (i, col) in columns.iter().enumerate() {
+        if columns[..i].iter().any(|c| c.name == col.name) {
+            return Err(ParseError::DuplicateColumn(col.name.clone()));
+        }
+    }
+    Ok(())
+}

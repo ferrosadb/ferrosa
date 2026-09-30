@@ -39,6 +39,13 @@ gated behind a `ferrosa:streaming-aggregate:v1` custom-section marker.
 - **Type conversion** (`convert`) — `cql_to_wit` / `wit_to_cql` for all 26
   `CqlValue` cases (scalars, collections, tuple, UDT; `Vector` maps to a list of
   floats).
+- **Guest memory limit** — enforced on every `Store` via wasmtime `StoreLimits`
+  (memory, table elements, instances) through `Store::limiter`. The memory cap is
+  operator config: `[udf] max_memory_bytes` in the ferrosa TOML, or
+  `FERROSA_UDF_MAX_MEMORY_BYTES` (TOML wins). Default 16 MiB; valid range
+  64 KiB..=4 GiB, anything else (including 0) aborts startup. A guest that grows
+  past it fails with `UdfError::MemoryLimitExceeded` naming the key and value;
+  the failure is logged once per edge (started / recovered), not per call.
 - **Sandbox limits** (`SandboxConfig`) — memory, per-call fuel, per-aggregate
   fuel, wall-clock timeout (epoch), cache capacity, max WASM upload size.
 - **Inline AssemblyScript compiler** (feature `asc-udf`, modules `asc` +
@@ -119,3 +126,7 @@ FERROSA_ASC_BUNDLE=/tmp/asc-host/asc-bundle.mjs \
 - [Architecture overview](specs/overview.md) — module map, ABI, invariants, data flow
 - [FMEA / known issues](specs/fmea.md) — failure modes + gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+## jsonb (T-150)
+
+`convert::cql_to_wit` now returns `Result`: a `Jsonb` value (top level or nested) is a typed `UdfError::TypeMismatch` because the WIT contract has no jsonb case (T-150).

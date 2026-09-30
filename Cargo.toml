@@ -10,6 +10,7 @@ members = [
     "ferrosa-flight",
     "ferrosa-graph",
     "ferrosa-index",
+    "ferrosa-jsonb",
     "ferrosa-net",
     "ferrosa-postgres",
     "ferrosa-row-bridge",
@@ -29,6 +30,10 @@ members = [
     "ferrosa-sim",
     "xtask",
 ]
+# Dev-only oracle with its own [workspace] and Cargo.lock: parquet-variant 60
+# needs chrono >= 0.4.40, which breaks arrow-arith 53 (ferrosa-flight) at
+# `d.quarter()`. Run it with `--manifest-path ferrosa-jsonb-conformance/Cargo.toml`.
+exclude = ["ferrosa-jsonb-conformance"]
 
 [patch.crates-io]
 # Sprint 3 (ADR-012): the ferrosadb/openraft fork carries PreVote +

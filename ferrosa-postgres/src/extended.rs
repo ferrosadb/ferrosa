@@ -35,6 +35,7 @@ use crate::mvcc::{MvccSnapshot, PgWrite};
 use crate::query::{
     decode_param_checked, error_response, exec_error_response, row_description_fields,
 };
+use crate::result_stream::ResultStream;
 
 /// What a prepared statement parses to: a table query, a no-`FROM` expression
 /// query (`SELECT version()`, `SELECT 1`), or parameterized DML (`INSERT` /
@@ -92,6 +93,9 @@ pub struct Session {
     /// set through the PostgreSQL MVCC manager atomically; `ROLLBACK`/`end_txn` clears it
     /// so a discarded transaction never touches storage (FMEA PG-1).
     txn_writes: Vec<PgWrite>,
+    /// Running queries of suspended portals (`Execute` with `max_rows` stopped
+    /// short), keyed by portal name. Dropping an entry stops its executor.
+    streams: HashMap<String, ResultStream>,
 }
 
 /// The format code (0 text / 1 binary) for parameter `i` under the Bind fan-out
@@ -117,6 +121,7 @@ impl Session {
             txn_snapshot: None,
             txn_read_tables: HashSet::new(),
             txn_writes: Vec::new(),
+            streams: HashMap::new(),
         }
     }
 
@@ -153,8 +158,32 @@ impl Session {
 
     /// Handle `Sync`: clear the error-skip flag. The caller then emits
     /// `ReadyForQuery`.
+    ///
+    /// Outside a transaction block the unit of work ends here, so suspended
+    /// portals are released with it (PostgreSQL destroys them at the implicit
+    /// commit). Inside a block they live until `Close`, a rebind of the same
+    /// name, or the end of the session.
     pub fn on_sync(&mut self) {
         self.error_pending = false;
+        if matches!(self.txn, TransactionStatus::Idle) {
+            self.streams.clear();
+        }
+    }
+
+    /// Take a suspended portal's running query, to continue it. The caller must
+    /// [`Session::park_stream`] it again if it suspends once more.
+    pub(crate) fn take_stream(&mut self, portal: &str) -> Option<ResultStream> {
+        self.streams.remove(portal)
+    }
+
+    /// Park a query whose portal was suspended, so the next `Execute` resumes it.
+    pub(crate) fn park_stream(&mut self, portal: String, stream: ResultStream) {
+        self.streams.insert(portal, stream);
+    }
+
+    /// How many portals currently hold a running, suspended query.
+    pub fn suspended_portals(&self) -> usize {
+        self.streams.len()
     }
 
     /// The protocol transaction status to report in `ReadyForQuery`.
@@ -302,7 +331,8 @@ impl Session {
     }
 
     /// Handle `Bind`: decode each parameter value against the prepared
-    /// statement's declared OIDs and store the portal. A missing prepared
+    /// statement's declared OIDs (jsonb parameters are parsed under
+    /// `jsonb_limits`, D14b) and store the portal. A missing prepared
     /// statement is a fail-loud error (26000, invalid_sql_statement_name); on
     /// success return `BindComplete`.
     #[allow(clippy::too_many_arguments)]
@@ -313,6 +343,7 @@ impl Session {
         param_formats: &[i16],
         param_values: &[Option<Vec<u8>>],
         result_formats: Vec<i16>,
+        jsonb_limits: &ferrosa_jsonb::Limits,
     ) -> BackendMessage {
         let Some(stmt) = self.statements.get(&stmt_name) else {
             self.error_pending = true;
@@ -343,18 +374,19 @@ impl Session {
                 let format = param_format_for(param_formats, i);
                 // A declared OID is matched positionally; unspecified ⇒ 0.
                 let oid = stmt.param_oids.get(i).copied().unwrap_or(0);
-                decode_param_checked(format, oid, bytes.as_deref())
+                decode_param_checked(format, oid, bytes.as_deref(), jsonb_limits)
             })
             .collect();
         let params = match params {
             Ok(params) => params,
-            Err((format, message)) => {
+            Err(err) => {
                 self.error_pending = true;
-                let code = if format == 1 { "22P03" } else { "22P02" };
-                return error_response(code, &message);
+                return error_response(err.sqlstate, &err.message);
             }
         };
 
+        // Rebinding a name replaces the portal, and with it any suspended query.
+        self.streams.remove(&portal);
         self.portals.insert(
             portal,
             Portal {
@@ -375,6 +407,8 @@ impl Session {
             }
             b'P' => {
                 self.portals.remove(name);
+                // Releases the running query of a suspended portal.
+                self.streams.remove(name);
             }
             _ => {}
         }
@@ -485,6 +519,7 @@ mod tests {
             &[1],          // binary param format
             &[Some(7i32.to_be_bytes().to_vec())],
             vec![1], // binary result format
+            &crate::jsonb_wire::test_limits(),
         );
         assert!(matches!(ack, BackendMessage::BindComplete));
         let portal = s.portal("").expect("portal stored");
@@ -496,7 +531,14 @@ mod tests {
     #[test]
     fn bind_missing_statement_fails_loud() {
         let mut s = Session::new(test_auth());
-        let resp = s.on_bind("".into(), "ghost".into(), &[], &[], vec![]);
+        let resp = s.on_bind(
+            "".into(),
+            "ghost".into(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         assert!(matches!(
             resp,
             BackendMessage::ErrorResponse { ref fields } if fields[1] == (b'C', "26000".to_string())
@@ -515,6 +557,7 @@ mod tests {
             &[0],
             &[Some(b"not-an-integer".to_vec())],
             vec![],
+            &crate::jsonb_wire::test_limits(),
         );
 
         assert!(matches!(
@@ -529,12 +572,63 @@ mod tests {
         );
     }
 
+    /// Bind one parameter and return the ErrorResponse SQLSTATE, asserting the
+    /// portal was not created and the session is in the error state.
+    fn bind_error_code(oid: i32, format: i16, value: &[u8]) -> String {
+        let mut s = Session::new(test_auth());
+        s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![oid]);
+        let response = s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[format],
+            &[Some(value.to_vec())],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
+        assert!(s.is_error_pending(), "oid {oid} format {format}");
+        assert!(s.portal("p").is_none(), "oid {oid} format {format}");
+        match response {
+            BackendMessage::ErrorResponse { fields } => fields[1].1.clone(),
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_param_parse_failure_is_22p02_not_null() {
+        // Text format: int, uuid, timestamp (and the rest) are 22P02.
+        assert_eq!(bind_error_code(23, 0, b"12x"), "22P02");
+        assert_eq!(bind_error_code(2950, 0, b"not-a-uuid"), "22P02");
+        assert_eq!(bind_error_code(1114, 0, b"2024-99-99 25:00:00"), "22P02");
+        assert_eq!(bind_error_code(16, 0, b"maybe"), "22P02");
+        assert_eq!(bind_error_code(25, 0, &[0xff, 0xfe]), "22P02");
+        // Binary format: PG's invalid_binary_representation.
+        assert_eq!(bind_error_code(23, 1, &[1, 2]), "22P03");
+        assert_eq!(bind_error_code(2950, 1, &[0; 3]), "22P03");
+        assert_eq!(bind_error_code(1114, 1, &[0; 4]), "22P03");
+        // jsonb / json are mapped since T-161a: bad JSON is 22P02 (text and
+        // binary), a bad version byte is XX000 (PostgreSQL's own code).
+        assert_eq!(bind_error_code(3802, 0, b"{"), "22P02");
+        assert_eq!(bind_error_code(3802, 1, b"\x01{"), "22P02");
+        assert_eq!(bind_error_code(3802, 1, b"\x02{}"), "XX000");
+        assert_eq!(bind_error_code(114, 1, b"{"), "22P02");
+        // An unmapped OID is refused at Bind, in both formats.
+        assert_eq!(bind_error_code(4072, 0, b"$"), "42704");
+        assert_eq!(bind_error_code(1184, 1, b"{}"), "42704");
+    }
+
     #[test]
     fn bind_rejects_malformed_binary_value_with_binary_sqlstate() {
         let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users WHERE id = $1", vec![23]);
 
-        let response = s.on_bind("p".into(), "st".into(), &[1], &[Some(vec![1])], vec![]);
+        let response = s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[1],
+            &[Some(vec![1])],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
 
         assert!(matches!(
             response,
@@ -555,6 +649,7 @@ mod tests {
             &[0, 1],
             &[Some(b"7".to_vec())],
             vec![],
+            &crate::jsonb_wire::test_limits(),
         );
 
         assert!(matches!(
@@ -569,7 +664,14 @@ mod tests {
     fn close_removes_statement_and_portal() {
         let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users", vec![]);
-        s.on_bind("p".into(), "st".into(), &[], &[], vec![]);
+        s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         assert!(matches!(
             s.on_close(b'P', "p"),
             BackendMessage::CloseComplete
@@ -580,6 +682,86 @@ mod tests {
             BackendMessage::CloseComplete
         ));
         assert!(s.statement("st").is_none());
+    }
+
+    /// A running query for a portal, over a table far larger than the channel.
+    async fn running_query() -> crate::result_stream::ResultStream {
+        use ferrosa_sql::{Column, ColumnType, InMemoryTable, MapCatalog, RelSchema, Row};
+        let schema = RelSchema::new(vec![Column::new("id", ColumnType::Int)]);
+        let rows = (0..1_000)
+            .map(|i| Row::new(vec![SqlValue::Int(i)]))
+            .collect();
+        let catalog = MapCatalog::new().with_table(
+            "public",
+            "t",
+            std::sync::Arc::new(InMemoryTable::new(schema, rows)),
+        );
+        let Ok(Statement::Select(select)) = parse_statement("SELECT id FROM t") else {
+            panic!("fixture query must parse to a SELECT");
+        };
+        crate::result_stream::open_stream(
+            *select,
+            catalog,
+            crate::storage_provider::ScanFailure::default(),
+            "public".to_string(),
+            Vec::new(),
+        )
+        .await
+        .expect("query starts")
+    }
+
+    /// `Close` on a portal releases its suspended query.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_releases_a_suspended_portals_query() {
+        let mut s = Session::new(test_auth());
+        s.park_stream("p".into(), running_query().await);
+        assert_eq!(s.suspended_portals(), 1);
+        s.on_close(b'P', "p");
+        assert_eq!(s.suspended_portals(), 0);
+        assert!(s.take_stream("p").is_none());
+    }
+
+    /// Rebinding a portal name replaces it, and its suspended query with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebind_releases_a_suspended_portals_query() {
+        let mut s = Session::new(test_auth());
+        s.on_parse("st".into(), "SELECT id FROM users", vec![]);
+        s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
+        s.park_stream("p".into(), running_query().await);
+        s.on_bind(
+            "p".into(),
+            "st".into(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
+        assert_eq!(s.suspended_portals(), 0);
+    }
+
+    /// Outside a transaction block `Sync` ends the unit of work and releases
+    /// suspended portals; inside one they survive until closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_releases_suspended_portals_only_outside_a_transaction() {
+        let mut s = Session::new(test_auth());
+        s.park_stream("p".into(), running_query().await);
+        s.begin_txn(None, crate::mvcc::MvccManager::default().snapshot());
+        s.on_sync();
+        assert_eq!(s.suspended_portals(), 1, "a transaction keeps its portals");
+        s.end_txn();
+        s.on_sync();
+        assert_eq!(
+            s.suspended_portals(),
+            0,
+            "Sync outside a block releases them"
+        );
     }
 
     #[test]

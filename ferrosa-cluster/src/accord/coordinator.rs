@@ -1938,6 +1938,15 @@ impl AccordCoordinatorDriver {
             // read-at-`t` so that, with RF=2 (sq=2), F+1 agreement is achievable and
             // the result is deterministic across all replicas. The applier already
             // persisted earlier conflicting txns locally before this read (dep-wait).
+            // Only a replica of the key may vote on its row. A coordinator that
+            // does not own the key (RF below the cluster size) holds no copy of
+            // it, so its local read is always "absent" -- and at RF=1 that one
+            // empty read WAS the F+1 agreement: a conditional UPDATE never saw a
+            // row the replica held, and INSERT IF NOT EXISTS applied over it
+            // (t_0bcd56f7). The same `self_is_replica` gate the PreAccept phase
+            // uses.
+            let self_is_replica =
+                self_id != uuid::Uuid::nil() && self.replica_ids.contains(&self_id);
             if is_snapshot_barrier {
                 if let Some(local_sm) = &self.local_accord_state {
                     if crate::accord::handlers::await_conflicting_deps_applied(
@@ -1954,7 +1963,7 @@ impl AccordCoordinatorDriver {
                         );
                     }
                 }
-            } else if is_generic {
+            } else if is_generic && self_is_replica {
                 if let crate::accord::wire::ReadPredicate::ReadRow { keyspace, table } =
                     &self.read_predicate
                 {
@@ -2002,7 +2011,9 @@ impl AccordCoordinatorDriver {
                         }
                     }
                 }
-            } else if let Some(local_sm) = &self.local_accord_state {
+            } else if let (false, true, Some(local_sm)) =
+                (is_generic, self_is_replica, &self.local_accord_state)
+            {
                 // The coordinator's own replica casts the same bounded,
                 // dependency-aware existence vote as a remote handler. It was
                 // durably committed above, so this is a real vote rather than an
@@ -5006,6 +5017,153 @@ mod tests {
         assert!(
             !targets.contains(&self_host),
             "coordinator must never send PreAccept to itself; sent to {targets:?}"
+        );
+    }
+
+    /// A replica that holds `row` for every key: answers every read-vote with
+    /// those row bytes, and with `condition_holds = row.is_empty()` for the
+    /// existence predicate (the row is absent only when `row` is empty).
+    struct RowHoldingReplicaTransport {
+        row: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for RowHoldingReplicaTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            use crate::accord::wire::{
+                PreAcceptOkPayload, PreAcceptPayload, ReadVoteOkPayload, ReadVotePayload,
+            };
+            match msg {
+                Message::AccordPreAccept(b) => {
+                    let pa: PreAcceptPayload = bincode::deserialize(&b).unwrap();
+                    let payload = PreAcceptOkPayload {
+                        from: node_id_of(host_id),
+                        t: pa.t0,
+                        deps: vec![],
+                        snapshot_stale: false,
+                    };
+                    Ok(Message::AccordPreAcceptOK(Bytes::from(
+                        bincode::serialize(&payload).unwrap(),
+                    )))
+                }
+                Message::AccordRead(bytes) => {
+                    let read: ReadVotePayload = bincode::deserialize(&bytes).unwrap();
+                    let payload = ReadVoteOkPayload {
+                        txn_id: read.txn_id,
+                        from: node_id_of(host_id),
+                        condition_holds: self.row.is_empty(),
+                        current_row: self.row.clone(),
+                    };
+                    Ok(Message::AccordReadOK(Bytes::from(
+                        bincode::serialize(&payload).unwrap(),
+                    )))
+                }
+                _ => Ok(Message::AccordApplyOK(Bytes::new())),
+            }
+        }
+    }
+
+    /// The coordinator's own engine does not hold the key: its local
+    /// read-at-`t` finds nothing.
+    struct AbsentLocalReader;
+
+    impl crate::accord::apply::StorageReader for AbsentLocalReader {
+        fn read_row_at(
+            &self,
+            _keyspace: &str,
+            _table: &str,
+            _key: &[u8],
+            _t: Timestamp,
+        ) -> Result<Option<Vec<u8>>, crate::accord::apply::RowReadError> {
+            Ok(None)
+        }
+    }
+
+    /// t_0bcd56f7: the coordinator is NOT a replica of the key (RF=1 on a
+    /// 3-node cluster, the key owned by another node). The one replica holds
+    /// the row, so a conditional UPDATE whose condition the row satisfies must
+    /// apply. The coordinator's own engine has no copy of the key, and its empty
+    /// local read must not be counted as a replica's vote -- at RF=1 it alone
+    /// was the F+1 "agreement" that the row is absent.
+    #[tokio::test]
+    async fn a_non_replica_coordinator_does_not_vote_on_a_generic_if() {
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        // Distinct in both halves: node ids come from the high 64 bits.
+        let coordinator_host = uuid::Uuid::from_u128((0x3333_u128 << 64) | 0x3333);
+        let replica = uuid::Uuid::from_u128((0x1111_u128 << 64) | 0x1111);
+        let coordinator_node = node_id_of(coordinator_host);
+        let clock = HybridLogicalClock::new(coordinator_node, 0);
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            AccordStateMachine::new(coordinator_node, Arc::new(MockSyncWriter::new())),
+        ));
+
+        let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+            coordinator_node,
+            vec![replica], // RF=1, and the coordinator is not the replica
+            Arc::new(RowHoldingReplicaTransport {
+                row: b"row-with-phase-offered".to_vec(),
+            }),
+            false,
+            &clock,
+            vec![(b"k".to_vec(), b"m".to_vec())],
+        )
+        .with_local_accord_state(local_state)
+        .with_local_reader(Arc::new(AbsentLocalReader))
+        .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()))
+        .with_read_predicate(crate::accord::wire::ReadPredicate::ReadRow {
+            keyspace: "ks".into(),
+            table: "t".into(),
+        })
+        .with_condition_gate(Box::new(|row| row.is_some_and(|r| !r.is_empty())));
+
+        let result = driver.run_transaction().await;
+        assert!(
+            result.is_ok(),
+            "the only replica holds the row, so the condition holds: {result:?}"
+        );
+        assert_eq!(driver.last_read_row(), Some(&b"row-with-phase-offered"[..]));
+    }
+
+    /// The same for `INSERT IF NOT EXISTS`: a non-replica coordinator's local
+    /// "absent" must not outvote the replica that holds the row.
+    #[tokio::test]
+    async fn a_non_replica_coordinator_does_not_vote_on_if_not_exists() {
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        // Distinct in both halves: node ids come from the high 64 bits.
+        let coordinator_host = uuid::Uuid::from_u128((0x3333_u128 << 64) | 0x3333);
+        let replica = uuid::Uuid::from_u128((0x1111_u128 << 64) | 0x1111);
+        let coordinator_node = node_id_of(coordinator_host);
+        let clock = HybridLogicalClock::new(coordinator_node, 0);
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            AccordStateMachine::new(coordinator_node, Arc::new(MockSyncWriter::new())),
+        ));
+
+        let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+            coordinator_node,
+            vec![replica],
+            Arc::new(RowHoldingReplicaTransport {
+                row: b"existing-row".to_vec(),
+            }),
+            false,
+            &clock,
+            vec![(b"k".to_vec(), b"m".to_vec())],
+        )
+        .with_local_accord_state(local_state)
+        .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()));
+
+        let result = driver.run_transaction().await;
+        assert!(
+            matches!(result, Err(AccordDriverError::ConditionNotMet { .. })),
+            "the replica holds the row, so IF NOT EXISTS must not apply: {result:?}"
         );
     }
 

@@ -82,7 +82,8 @@ flowchart LR
     B --> C["convert::record_batch_to_rows<br/>(scalar Arrow types; fail-loud on rest)"]
     C --> D["per row: build_insert<br/>INSERT INTO ks.t (...) VALUES (...)"]
     D --> E{"column representable?<br/>(cql_literal)"}
-    E -- "no (NULL / non-finite / rich type)" --> F["column omitted from INSERT (FMEA FL-1)"]
+    E -- "NULL cell" --> F["cell skipped (absent by design)"]
+    E -- "no (non-finite / unsupported type)" --> X["Status::invalid_argument naming the column;<br/>whole batch rejected before any write (FL-T016)"]
     E -- "yes" --> G["escaped literal added"]
     F --> H["parse + ferrosa_cql::router::route"]
     G --> H

@@ -60,3 +60,21 @@ exist in the source — the gaps below come from code review, not grep.
 - **Wire-protocol framing / query planning** — those belong to the front-ends
   (`ferrosa-cql`, `ferrosa-postgres`, `ferrosa-flight`).
 </content>
+
+## jsonb (T-150)
+
+Done: type threading. Remaining: None for T-150.
+
+## T-300 follow-ups
+
+- T-154b replaces `jsonb_ddl_permitted` with the `ferrosa.jsonb.v1` ledger check
+  at the same call sites and lifts the standalone-only rule.
+- `jsonb_ddl_refused_total{mode}` is an in-process counter
+  (`jsonb_rules::jsonb_ddl_refused_total`); exporting it to Prometheus is not
+  wired yet.
+
+## T-154a follow-ups
+
+- T-154b: the `ferrosa.jsonb.v1` capability gate at propose and apply.
+- ALTER ... TYPE to or from jsonb is not applied by any path yet (the CQL router
+  rejects ALTER TYPE outright), so no rule exists for it here.

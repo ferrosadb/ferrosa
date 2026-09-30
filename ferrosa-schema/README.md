@@ -38,7 +38,24 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
   **plus** `*_internal` variants that bypass auth/audit for Raft/pair-mode
   replication. Both `drop_table` and `drop_table_internal` cascade over the
   dropped table's `SchemaSnapshot.indexes` entries (t_ae06e925).
-  `apply_snapshot` bulk-loads a snapshot (skips system keyspaces).
+  `apply_snapshot` bulk-loads a snapshot (skips system keyspaces) and
+  refuses the whole snapshot, before applying any of it, when a table breaks
+  the jsonb placement rules.
+- **jsonb placement rules** ([`jsonb_rules.rs`](src/jsonb_rules.rs), T-154a,
+  D3/D21) — jsonb is refused in partition and clustering keys (through
+  frozen collections, tuples and UDTs) and as a set element, map key or
+  vector element. One check serves `create_table[_internal]`,
+  `alter_table[_internal]`, `alter_type_add_field`, `apply_snapshot` and the
+  propose-side `check_create_table_jsonb` / `check_alter_table_jsonb`. Errors
+  are `SchemaError::JsonbInKey` and `SchemaError::JsonbNesting`.
+- **jsonb DDL gate** (`jsonb_rules::check_jsonb_ddl_allowed`, T-300, D24) —
+  jsonb DDL (top level, nested, or through a UDT) is allowed on a standalone
+  node only until the D15a capability ledger lands; every other
+  `DeploymentMode` is refused with `SchemaError::JsonbDdlRefused`. The
+  `Schema` holds a live mode cell (`deployment_mode_handle()`, shared with the
+  cluster controller) and checks it at DDL entry and at every apply, including
+  `apply_snapshot`. `tables_with_jsonb()` names the tables that block leaving
+  standalone. No flag bypasses it.
 - **Auth / RBAC** ([`auth/`](src/auth)) — `AuthContext`, `RoleMetadata`,
   Cassandra-style `Permission` (9 variants) and `Resource` hierarchy
   (`AllKeyspaces > Keyspace > Table`, `AllRoles > Role`),
@@ -123,3 +140,9 @@ validation. Live gaps are tracked in [specs/fmea.md](specs/fmea.md).
 - [Data flow](specs/data-flow.md) — DDL apply + auth-check sequence
 </content>
 </invoke>
+
+> T-022: `cql_to_marshal_type` and the aggregate-table type stringifier delegate to `ferrosa_common::cql_type::names`.
+
+## jsonb (T-150)
+
+`system_schema.aggregates` initcond rendering lists `CqlValue::Jsonb` with the other non-literal values (T-150). No schema behaviour changed.

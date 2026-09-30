@@ -25,9 +25,11 @@ spec `specs/reference/remote-index-build-backend.md`.
 
 ## Next
 
-- **Authn on `/internal/index/build`** (FMEA IB-7). The route is "internal" by
-  naming only; add a shared-secret/bearer token or mTLS so it is not an open S3
-  read/write trigger for anyone on the network.
+- **TLS/mTLS and token rotation on `/internal/index/build`** (FMEA IB-7).
+  Bearer-token auth, validated ids and loopback default landed with T-032; the
+  token still travels in clear text and has no rotation.
+- **Stream SSTable components instead of `.bytes()`** (worker `do_build`
+  downloads each component whole into memory, and re-reads the sidecar whole).
 - **Temp-disk robustness** (FMEA IB-4, IB-5). Reconcile `temp_bytes_used`
   against actual disk, reap the `ferrosa-index-builder/` temp dir on startup, and
   ensure a `spawn_blocking` panic releases both the temp dir and the byte count.

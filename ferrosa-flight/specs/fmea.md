@@ -12,7 +12,8 @@ path, so confidentiality and silent-wrong-data severities dominate.
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
-| FL-1 | `DoPut` materializes each row to a CQL `INSERT` text string, re-parsed per row | Slow, lossy write path: only `cql_literal`-representable scalar values survive; NULL / non-finite floats / rich types are silently *omitted* from the INSERT (the column simply isn't written) | 7 | 5 | 6 | 210 | **Open gap.** `cql_literal` returns `None` (column dropped) for NULL, non-finite f32/f64, and any non-scalar `CqlValue`. Write a typed prepared-statement / direct-mutation path that carries NULLs and rich types instead of string interpolation. |
+| FL-1 | `DoPut` materializes each row to a CQL `INSERT` text string, re-parsed per row | Slow write path: only `cql_literal`-representable scalar values can be written; other values now reject the put (see FL-T016) | 4 | 5 | 3 | 60 | **Narrowed by FL-T016.** The silent-omission half is closed. Remaining gap: rich types cannot be written at all. Write a typed prepared-statement / direct-mutation path that carries NULLs and rich types instead of string interpolation. |
+| FL-T016 | `cql_literal` returned `None` for non-finite floats and unsupported types, so `build_insert` silently dropped the column (FM-65, JB-T4) | A successful `DoPut`/`DoExchange` stored a row missing a column the client sent: silent wrong data | 8 | 3 | 2 | 48 | **Mitigated.** `cql_literal` returns `Err(reason)` (exhaustive match, no `_ =>`); `build_insert` maps it to `InvalidArgument` naming the column; `write_batch` renders the whole batch before writing any row. Tests: `tests/put_unsupported_column.rs` (`flight_put_unsupported_column_fails_loud`), `service::literal_tests`. NULL cells remain skipped by design. |
 | FL-2 | `record_batch_to_rows` (the `DoPut`/`DoExchange` reverse path) only decodes ~9 scalar Arrow types | An inbound batch containing List/Map/Struct/Date32/Time64/Interval/Decimal columns fails the whole write with `UnsupportedArrow` | 6 | 5 | 3 | 90 | **Partial / by design.** Fails loud (no silent drop) but the reverse type matrix is far narrower than the forward path — a `DoGet` batch (Date32, lists, structs) cannot be round-tripped back through `DoPut`. Track the supported-Arrow matrix; extend to match the forward path. |
 | FL-3 | `DoExchange` is an upsert-with-ack channel, **not** a live CDC / subscribe stream | Clients expecting a change-feed over `DoExchange` get only per-batch write acks; there is no server-initiated push of committed changes | 4 | 4 | 4 | 64 | **By design (post-v1).** Documented in `service.rs` ("Out of scope (post-v1): a live-subscribe channel over `DoExchange`"). A real CDC `DoExchange` is unwired — see roadmap. |
 | FL-4 | `GetFlightInfo` / `GetSchema` / `ListFlights` execute the real `SELECT` (page_size 1) just to learn the schema | A schema lookup runs a live single-row query: cost on an expensive predicate, and side effects of executing user CQL for metadata; `ListFlights` does this once per table | 5 | 4 | 5 | 100 | **Open gap.** Schema is derived by executing `query_to_batch` rather than from table metadata. Derive the Arrow schema from the schema snapshot (column types) without running the query. |
@@ -26,11 +27,10 @@ path, so confidentiality and silent-wrong-data severities dominate.
 
 ## Top risks to act on
 
-1. **FL-1 (RPN 210)** — the write path stringifies rows into CQL `INSERT`s and
-   *silently omits* any column it cannot render (NULL, non-finite float, rich
-   types). A client writing such a column sees a successful `DoPut` with that
-   column missing. Replace text interpolation with a typed write path that
-   carries NULLs and the full type set.
+1. **FL-1 (RPN 60, was 210)** — the write path stringifies rows into CQL
+   `INSERT`s. Unrenderable columns now fail the put loudly (FL-T016) rather than
+   being omitted, but rich types still cannot be written. Replace text
+   interpolation with a typed write path that carries the full type set.
 2. **FL-4 (RPN 100)** — schema discovery executes the user's query. Derive the
    Arrow schema from table metadata so `GetSchema`/`GetFlightInfo`/`ListFlights`
    do not run live queries.
@@ -51,3 +51,9 @@ path, so confidentiality and silent-wrong-data severities dominate.
 - `token.rs` unit tests — tamper/expiry/wrong-key/rotation precedence.
 - `plan.rs` unit tests — per-range tickets, RF>1 multi-location, unresolvable
   address omitted (not faked).
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| FLT-T150-01 | jsonb exported as a lossy Arrow type | Consumers read a wrong type | 6 | 2 | 2 | 24 | Explicit unsupported arms; the Variant export is a later packet (arrow stays out of ferrosa-jsonb, D5a). |

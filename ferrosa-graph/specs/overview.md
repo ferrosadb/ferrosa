@@ -56,7 +56,7 @@ resolved Bolt port.
 | `adjacency::reconcile` | background safety-net scan (repair missing, tombstone orphans) |
 | `engine` (~3.2k LoC) | composition root: orchestrates parse→plan→exec, lazy adjacency setup, FOREACH / CALL {} expansion, DDL coordinators |
 | `http` | axum HTTP/JSON endpoint, Basic auth, TLS, body limit, SSE for SUBSCRIBE |
-| `bolt` | Bolt v5 handshake, PackStream codec, message dispatch, TCP server |
+| `bolt` | Bolt v5 handshake, PackStream codec (nesting depth capped at 128, counts validated against remaining input), message dispatch, TCP server |
 
 ## Data flow (summary)
 
@@ -87,6 +87,10 @@ full sequence.
    observable (logs repaired/orphan counts) and idempotent. It is a safety net,
    never the source of truth — fail-loud philosophy: the observer is expected to
    keep the index correct; the reconciler quantifies and closes residual drift.
+   **Write values are never silently emptied.** CREATE/MERGE property values
+   that are not literals (maps, lists, computed expressions) return a typed
+   `GraphError::Validation` on the schema-less path instead of storing empty
+   bytes (FMEA G-11); jsonb storage of maps/lists arrives with D12.
 3. **Adjacency clustering wire format is fixed.** Each clustering component is
    `[u16 BE length][bytes]`: `(direction:1B, edge_label:text, neighbor_id:blob)`.
    The SSTable writer's composite parser (`validate_clustering_shape`) rejects any

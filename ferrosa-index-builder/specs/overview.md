@@ -59,9 +59,11 @@ S3; on `NotFound` it spawns a `WorkerPool::execute` for a default `btree` build.
 
 ## BuildRequest / BuildResponse contract
 
-`BuildRequest` carries: `sstable_id`, `index_name`, `index_type`,
-optional `artifact_kind` + `direct_upload` (quantized vectors), S3 coordinates
-(`s3_endpoint` / `s3_bucket` / `s3_prefix`), `table` as a
+`BuildRequest` carries: an engine-issued `job_id`, `sstable_id`, `index_name`,
+`index_type`, optional `artifact_kind` + `direct_upload` (quantized vectors),
+informational `s3_endpoint` / `s3_bucket` (ignored; the builder uses its own
+configured store and derives every key from `--s3-prefix` + validated ids — there
+is no caller `s3_prefix`), `table` as a
 `(keyspace, table)` pair, `column_position`, `priority`, and an optional
 `filter_predicate` (`Option&lt;FilterPredicate&gt;`, present only for `filtered`
 builds) plus optional `clustering_source`
@@ -91,6 +93,11 @@ and on success either `sidecar_s3_path` + `entries_built` (sidecar builds) or an
    artifact the engine cannot publish.
 5. **Remote build == in-process build.** The service wraps the engine's own
    `LocalBackend`; it adds no second index encoder.
+7. **Callers are authenticated and never choose paths (JB-T3).** The build route
+   requires `Authorization: Bearer <FERROSA_INDEX_BUILDER_TOKEN>` (refused before
+   any S3 or filesystem access); `job_id`, `sstable_id`, `index_name`, keyspace and
+   table must match `[A-Za-z0-9._-]{1,128}` with no `..`; the listener defaults to
+   `127.0.0.1:8090`.
 6. **`CompressionInfo.db` is optional; every other component is mandatory.** A
    missing mandatory component fails the job and cleans up the temp dir.
 

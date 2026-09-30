@@ -367,6 +367,7 @@ async fn cluster_status(State(mc): State<Arc<ModeController>>) -> Json<Value> {
         "mode": mc.mode().to_string(),
         "role": mc.role().map(|r| r.to_string()),
         "host_id": mc.host_id().to_string(),
+        "ddl_path": mc.ddl_path_kind(),
     }))
 }
 
@@ -794,7 +795,10 @@ pub(crate) fn virtual_table_to_json(registry: &VirtualTableRegistry, table_name:
                                 }
                             }
                             DataType::Boolean => Value::Bool(!bytes.is_empty() && bytes[0] != 0),
-                            _ => Value::String("<binary>".to_string()),
+                            DataType::Uuid
+                            | DataType::Inet
+                            | DataType::Blob
+                            | DataType::Duration => Value::String("<binary>".to_string()),
                         };
                         obj.insert(col.name.clone(), val);
                     } else {
@@ -2595,6 +2599,32 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let mode = parsed["mode"].as_str().expect("mode must be a string");
         assert!(!mode.is_empty(), "mode must be a non-empty string");
+    }
+
+    /// CQL-T467ci-01: `mode` flips to "cluster" when a node starts forming,
+    /// but DDL stays on the local `Direct` path until Raft has a leader
+    /// (`transition_to_cluster`). A readiness probe on mode + ring alone
+    /// therefore cannot tell that DDL is still local-only, and a system-keyspace
+    /// ALTER in that window is refused. The status endpoint must report which
+    /// DDL path is live so probes can wait on it.
+    #[tokio::test]
+    async fn api_cluster_status_reports_the_live_ddl_path() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/cluster/status")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["ddl_path"].as_str(),
+            Some("direct"),
+            "a fresh standalone node applies DDL directly: {parsed}"
+        );
     }
 
     // =========================================================================

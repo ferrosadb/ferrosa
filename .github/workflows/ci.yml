@@ -58,6 +58,49 @@ jobs:
       - name: Guard tests
         run: bash tests/test_guard_no_memory_public.sh
 
+  # jsonb guards (T-025): serde_json features are unified workspace-wide, so one
+  # dependent enabling arbitrary_precision / preserve_order / unbounded_depth
+  # changes number and object semantics everywhere (hazards M8, M12). The value
+  # model crates must also stay arrow-free (D5a). The guard-arrow-free.sh crate
+  # list includes ferrosa-jsonb (T-100).
+  json-guards:
+    name: jsonb guards (serde_json features, arrow-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Fetch crates (the guard tests resolve offline)
+        run: cargo fetch --locked
+      - name: serde_json feature guard
+        run: bash scripts/ci/guard-serde-json-features.sh
+      - name: Arrow-free guard
+        run: bash scripts/ci/guard-arrow-free.sh ferrosa-common ferrosa-jsonb
+      - name: Guard tests (seeded bad trees must fail)
+        run: bash tests/test_guard_ci_json.sh
+      - name: Excluded crates must have a CI job
+        run: bash scripts/ci/guard-excluded-crates-have-ci.sh
+
+  # ferrosa-jsonb-conformance is a standalone workspace (excluded from the root:
+  # its parquet-variant 60 needs a chrono that breaks the root's arrow 53), so no
+  # `--workspace` job reaches it. This job runs it by manifest; the
+  # guard-excluded-crates-have-ci.sh step in json-guards fails if it is dropped.
+  jsonb-conformance:
+    name: jsonb conformance oracle (clippy + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ferrosa-jsonb-conformance
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Clippy
+        run: cargo clippy --manifest-path ferrosa-jsonb-conformance/Cargo.toml --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        run: cargo test --manifest-path ferrosa-jsonb-conformance/Cargo.toml --all-features --locked
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -189,6 +232,7 @@ jobs:
                --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
                --skip differential_oracle \
                --skip fly_multi_node_streaming_scan \
+               --skip replicated_jsonb_index_builds_on_every_node \
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
                --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
@@ -509,10 +553,13 @@ jobs:
               base_url="http://127.0.0.1:${web_port}"
               status=$(curl --connect-timeout 2 --max-time 5 -sf \
                 "${base_url}/api/cluster/status") || status=''
+              # `.mode` flips to "cluster" when formation starts, but DDL stays on
+              # the local Direct path until Raft has a leader; `ALTER KEYSPACE
+              # system_auth` on that path is refused. Wait for the DDL path too.
               if ! printf '%s' "$status" | jq -e --arg id "$expected_host_id" \
-                '.host_id == $id and .mode == "cluster"' >/dev/null; then
+                '.host_id == $id and .mode == "cluster" and .ddl_path == "cluster"' >/dev/null; then
                 all_ready=0
-                last_problem="node $expected_host_id has not entered cluster mode"
+                last_problem="node $expected_host_id has not entered cluster mode with cluster-routed DDL (status: ${status:-none})"
                 break
               fi
               ring=$(curl --connect-timeout 2 --max-time 5 -sf \
@@ -975,6 +1022,25 @@ jobs:
           cargo test --workspace --all-features \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -- --ignored
+      - name: Put cqlsh on PATH (docker, no host install)
+        # The live test shells out to `cqlsh <host> <port> -e <stmt>`. This
+        # wrapper forwards to the same cassandra:5.0 image the PostgreSQL
+        # Jepsen job uses; --network host reaches the published 9042-9044.
+        run: |
+          docker pull cassandra:5.0
+          printf '#!/bin/sh\nexec docker run --rm --network host cassandra:5.0 cqlsh "$@"\n' > cqlsh
+          sudo install -m 0755 cqlsh /usr/local/bin/cqlsh
+          rm cqlsh
+      - name: Run live-infra cluster test (replicated jsonb index)
+        # FERROSA_TEST_CLUSTER_NODES came from "Bring up cluster" via
+        # GITHUB_ENV (127.0.0.1:9042-9044). The Test + Coverage job skips this
+        # test by name (it has no cluster); this is where it runs. It panics if
+        # the variable is unset, so a wiring regression is loud.
+        run: |
+          # --all-features (not just live-infra-tests) keeps the build shared
+          # with the rest of this job's cache; it enables live-infra-tests.
+          cargo test --all-features -p ferrosa-cluster \
+            --test replicated_jsonb_index_live -- --nocapture
       - name: Collect cluster logs on failure
         if: failure()
         run: |

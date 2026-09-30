@@ -18252,24 +18252,25 @@ mod tests {
         let (engine, pending) = StorageEngine::open(config, None).unwrap();
         assert!(pending.is_empty());
 
-        // Focused runs finish in about three seconds. Allow full-suite CI file
-        // I/O contention without turning the regression into an unbounded wait.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            loop {
-                engine.poll_compactions().await;
-                if engine.sstable_count(&tid) <= 1 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "maintenance must keep scheduling bounded compaction rounds until an existing backlog drains; remaining={}",
-            engine.sstable_count(&tid)
-        );
+        // ST-T9e30472a: drive rounds by the executor's completion signal, not
+        // a wall-clock budget. Each `poll_compactions` schedules the next
+        // bounded round; the round count is capped (16 inputs at 4 per task
+        // drain in a handful), and a round that never posts a result fails
+        // loudly through `wait_for_compaction_result`'s hang guard.
+        const MAX_ROUNDS: usize = 32;
+        engine.poll_compactions().await;
+        let mut rounds = 0;
+        while engine.sstable_count(&tid) > 1 {
+            assert!(
+                rounds < MAX_ROUNDS,
+                "maintenance must keep scheduling bounded compaction rounds until an existing \
+                 backlog drains; remaining={} after {rounds} rounds",
+                engine.sstable_count(&tid)
+            );
+            wait_for_compaction_result(&engine);
+            engine.poll_compactions().await;
+            rounds += 1;
+        }
         let rows = engine.read_range(&tid, None, None, INPUT_SSTABLES).unwrap();
         assert_eq!(rows.len(), INPUT_SSTABLES);
     }
@@ -24793,18 +24794,11 @@ mod tests {
         };
         engine.compaction_executor.submit(task).unwrap();
 
-        let compaction_dir = dir.path().join("compaction");
-        for _ in 0..80 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists()
-                && std::fs::read_dir(&compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false)
-            {
-                break;
-            }
-        }
+        // ST-T9e30472a: wait on the executor's completion signal (a result
+        // parked for the next poll), not on a wall-clock budget or on files
+        // appearing under `compaction/`. The single `poll_compactions` below
+        // then integrates that result deterministically.
+        wait_for_compaction_result(&engine);
 
         // Simulate a crash after retiring only B (the tombstone holder): the
         // real `poll_compactions` runs inside a spawned task, so the panic the
@@ -24812,23 +24806,16 @@ mod tests {
         // failing this test -- exactly what a process crash looks like, since
         // no code past the panic point ever runs (no phase=Retired write, no
         // record deletion).
-        let mut crashed = false;
-        for _ in 0..40 {
-            let poll_engine = Arc::clone(&engine);
-            let joined = tokio::spawn(
-                TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
-                    .scope(1, async move { poll_engine.poll_compactions().await }),
-            )
-            .await;
-            if joined.is_err() {
-                crashed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        let poll_engine = Arc::clone(&engine);
+        let joined = tokio::spawn(
+            TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
+                .scope(1, async move { poll_engine.poll_compactions().await }),
+        )
+        .await;
         assert!(
-            crashed,
-            "the crash seam must panic once the compaction result is available, to simulate a crash"
+            joined.as_ref().is_err_and(|e| e.is_panic()),
+            "the crash seam must panic in the one poll that integrates the available \
+             compaction result, to simulate a crash; got {joined:?}"
         );
 
         let sstable_dir = dir.path().join("sstables").join(tid.to_string());
@@ -30640,20 +30627,10 @@ mod tests {
             engine.compaction_executor.submit(task).unwrap();
         }
 
-        // Wait for the compaction thread to produce the result, then poll.
-        let compaction_dir = dir.path().join("compaction").join(tid.to_string());
-        for _ in 0..60 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists() {
-                let has_output = std::fs::read_dir(&compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false);
-                if has_output {
-                    break;
-                }
-            }
-        }
+        // ST-T9e30472a: wait on the executor's completion signal, not on
+        // files appearing under `compaction/` (which can be a half-written
+        // staging artifact) or a wall-clock budget; then poll.
+        wait_for_compaction_result(&engine);
 
         engine.poll_compactions().await;
 

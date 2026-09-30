@@ -30,6 +30,23 @@ in-memory table in tests and by Ferrosa storage in production.
   `SELECT $1`, `SELECT TRUE`.
 - DML (single-row, key-equality WHERE): `INSERT INTO t (cols) VALUES (...)`,
   `UPDATE t SET ... WHERE k = v [AND ...]`, `DELETE FROM t WHERE k = v [AND ...]`.
+- PG DDL (T-130, D10), **parsed only** (no execution or schema creation yet; the
+  Postgres front end answers `0A000`): `CREATE TABLE [IF NOT EXISTS] [public.]t
+  (col type [NOT NULL | PRIMARY KEY], ..., [CONSTRAINT n] PRIMARY KEY (a, b))`
+  into `Statement::CreateTable`. Types: smallint/int/bigint, real/double
+  precision, numeric(p,s), boolean, text, varchar(n), bytea, uuid, date, time,
+  timestamp[tz], inet, `jsonb`, `json` (`PgType::storage()` maps `json` to
+  `jsonb`, D11). Double-quoted identifiers are supported. Refused by name with
+  `ParseError::UnsupportedClause`: `FOREIGN KEY`/`REFERENCES`, `CHECK`,
+  `SERIAL` types, `DEFAULT`, a schema other than `public`, `UNIQUE`.
+- jsonb values (T-160): `Value::Jsonb(ferrosa_jsonb::JsonbValue)`, plus
+  `Value::JsonPath(String)` (text until the path parser, T-162) and
+  `Value::TextArray`; `ColumnType` gains `Jsonb`, `Json`, `JsonPath`, `TextArray`.
+  Equality, hashing, GROUP BY, DISTINCT and hash-join keys use jsonb value
+  equality (`1` == `1.0`); `sql_cmp` and `spill::canonical_cmp` use the D18
+  order. Spill records carry the validated cell (base64 in JSON, validated on
+  read) and `row_bytes` counts the real cell bytes. Operators, casts, SRFs and
+  parsing jsonb literals are later packets.
 - Transaction / session statements **parsed** (not executed here): `BEGIN`/`START`,
   `COMMIT`/`END`, `ROLLBACK`/`ABORT`, `SET`, `RESET`.
 - WHERE/HAVING boolean expressions: `AND` / `OR` / `NOT` with parentheses and
@@ -94,15 +111,17 @@ parse_statement ─▶ Statement (ast)
                                                  │ → simple project | hash_aggregate*
                                                  │ → dedup* → sort* → limit_offset
                                                  ▼
-                                              QueryResult { columns, rows }
+                                              RowSink::columns, then ::row per row
 ```
 
 `*` marks a blocking operator: it spills to disk past the context's byte
-threshold and streams its output. Everything upstream of `QueryResult` is
-bounded. The `rows` `Vec` itself is not — the Postgres front end's
-`render_result` builds every `DataRow` before writing any, so handing it a stream
-would relocate the buffer rather than remove it. Streaming the result to the wire
-is front-end work, tracked separately.
+threshold and streams its output. The pipeline is drained one row at a time into
+a `RowSink` (`execute_streaming`), so a caller that forwards rows holds O(batch),
+not O(result); the sink may block for backpressure and may stop the query early
+with `ControlFlow::Break`. An `Err` after rows were delivered means the delivered
+rows are an incomplete result and MUST be reported. `execute`/`execute_with`
+gather the rows into a `QueryResult` for tests and tools — they hold the whole
+result and are not for the wire (FMEA SQL-12, `t_f348ba0b`).
 
 ## Public API (key entry points)
 
@@ -110,7 +129,7 @@ is front-end work, tracked separately.
 |------|-------|
 | Parse | `parse`, `parse_statement`, `ParseError` |
 | AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `Expr`, `Operand`, `Term`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
-| Plan | `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
+| Plan | `execute_streaming`, `RowSink`, `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
 | Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `dedup`, `limit_offset`, `fallible`, `try_filter`, `try_project`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream`, `TryRowStream` |
 | Spill | `SpillCtx`, `SpillReserver`, `DirReserver`, `SpillStats`, `SpillError`, `default_temp_root`, `sweep_orphaned_temp_dirs` |
 | Catalog | `Catalog`, `MapCatalog`, `SharedTable`, `TableProvider`, `InMemoryTable` |
@@ -145,7 +164,8 @@ NULL/Kleene logic, sort NULL placement, aggregate edge cases, numeric
 normalization, join key resolution, binder fail-loud paths, and the spill
 module's orders, replay buffer and orphan sweep.
 
-`tests/spill_operators.rs` (10 tests) holds the per-operator spill invariant:
+`tests/spill_operators.rs` (11 tests, including a negative control that proves
+the budget assertions fail when the threshold is unreachable) holds the per-operator spill invariant:
 given an input larger than the threshold, the operator returns EVERY row, peak
 resident rows stay an order of magnitude below the rows processed, output order
 is unchanged, a dropped stream removes its temp directory, and a reservation

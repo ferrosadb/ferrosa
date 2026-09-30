@@ -3,6 +3,7 @@
 //! Maps CQL type names to Cassandra marshal type class names and converts
 //! `TableMetadata` into `ferrosa_common::schema::TableSchema`.
 
+use ferrosa_common::cql_type::names;
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 
 use crate::metadata::column::ColumnKind;
@@ -47,30 +48,15 @@ pub fn cql_to_marshal_type(cql_type: &str) -> String {
         }
     }
 
-    // Scalar types
-    match trimmed {
-        "text" | "varchar" => "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-        "int" => "org.apache.cassandra.db.marshal.Int32Type".to_string(),
-        "bigint" => "org.apache.cassandra.db.marshal.LongType".to_string(),
-        "boolean" => "org.apache.cassandra.db.marshal.BooleanType".to_string(),
-        "float" => "org.apache.cassandra.db.marshal.FloatType".to_string(),
-        "double" => "org.apache.cassandra.db.marshal.DoubleType".to_string(),
-        "blob" => "org.apache.cassandra.db.marshal.BytesType".to_string(),
-        "timestamp" => "org.apache.cassandra.db.marshal.TimestampType".to_string(),
-        "uuid" => "org.apache.cassandra.db.marshal.UUIDType".to_string(),
-        "timeuuid" => "org.apache.cassandra.db.marshal.TimeUUIDType".to_string(),
-        "inet" => "org.apache.cassandra.db.marshal.InetAddressType".to_string(),
-        "counter" => "org.apache.cassandra.db.marshal.CounterColumnType".to_string(),
-        "ascii" => "org.apache.cassandra.db.marshal.AsciiType".to_string(),
-        "decimal" => "org.apache.cassandra.db.marshal.DecimalType".to_string(),
-        "varint" => "org.apache.cassandra.db.marshal.IntegerType".to_string(),
-        "smallint" => "org.apache.cassandra.db.marshal.ShortType".to_string(),
-        "tinyint" => "org.apache.cassandra.db.marshal.ByteType".to_string(),
-        "date" => "org.apache.cassandra.db.marshal.SimpleDateType".to_string(),
-        "time" => "org.apache.cassandra.db.marshal.TimeType".to_string(),
-        "duration" => "org.apache.cassandra.db.marshal.DurationType".to_string(),
-        // Unknown types: return as-is for forward compatibility
-        other => other.to_string(),
+    // Scalar types. A name that is not a scalar (a UDT name, `tuple<..>`,
+    // `vector<..>`) is returned as-is: it is not a marshal class this
+    // function can name, so the caller sees the original text.
+    match names::scalar_from_name(trimmed)
+        .as_ref()
+        .and_then(names::scalar_marshal_class)
+    {
+        Some(class) => class.to_string(),
+        None => trimmed.to_string(),
     }
 }
 
@@ -279,6 +265,8 @@ mod tests {
     use super::*;
     use crate::metadata::column::{ClusteringOrder, ColumnMetadata};
     use crate::metadata::table::TableParams;
+    use ferrosa_common::cql_type::names::{scalar_from_name, scalar_marshal_class};
+    use ferrosa_common::cql_type::CqlType;
     use indexmap::IndexMap;
     use std::collections::{HashMap, HashSet};
 
@@ -344,6 +332,48 @@ mod tests {
             cql_to_marshal_type("counter"),
             "org.apache.cassandra.db.marshal.CounterColumnType"
         );
+    }
+
+    #[test]
+    fn no_wildcard_default_for_new_variant() {
+        // Every scalar name maps to a class; every non-scalar CqlType has no
+        // scalar class (never a silent default).
+        for name in [
+            "text",
+            "varchar",
+            "int",
+            "bigint",
+            "boolean",
+            "float",
+            "double",
+            "blob",
+            "timestamp",
+            "uuid",
+            "timeuuid",
+            "inet",
+            "counter",
+            "ascii",
+            "decimal",
+            "varint",
+            "smallint",
+            "tinyint",
+            "date",
+            "time",
+            "duration",
+        ] {
+            let t = scalar_from_name(name).expect("scalar name parses");
+            let class = scalar_marshal_class(&t).expect("scalar has a class");
+            assert_eq!(cql_to_marshal_type(name), class);
+        }
+        let non_scalars = [
+            CqlType::List(Box::new(CqlType::Int)),
+            CqlType::Tuple(vec![CqlType::Int]),
+            CqlType::Vector(Box::new(CqlType::Float), 3),
+        ];
+        for t in &non_scalars {
+            assert_eq!(scalar_marshal_class(t), None);
+        }
+        assert_eq!(scalar_from_name("my_udt"), None);
     }
 
     #[test]

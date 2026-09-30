@@ -18,8 +18,9 @@ pub mod types;
 
 pub use ast::SelectStmt;
 pub use ast::{
-    AggArg, DeleteStmt, Expr, InsertStmt, IsolationLevel, Operand, OrderItem, Projection,
-    Returning, ScalarItem, ScalarValue, SelectItem, Statement, Term, UpdateStmt,
+    AggArg, ColumnDef, CreateTableStmt, DeleteStmt, Expr, InsertStmt, IsolationLevel, Operand,
+    OrderItem, PgType, Projection, Returning, ScalarItem, ScalarValue, SelectItem, Statement, Term,
+    UnsupportedClause, UpdateStmt,
 };
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{
@@ -27,7 +28,10 @@ pub use exec::{
     try_filter, try_project, AggFunc, CmpOp, Predicate, RowStream, SortDir, SortKey, TryRowStream,
 };
 pub use parser::{parse, parse_statement, ParseError};
-pub use plan::{describe, execute, execute_with, infer_param_types, ExecError, QueryResult};
+pub use plan::{
+    describe, execute, execute_streaming, execute_with, infer_param_types, ExecError, QueryResult,
+    RowSink,
+};
 pub use provider::{InMemoryTable, TableProvider};
 pub use spill::{
     default_temp_root, sweep_orphaned_temp_dirs, DirReserver, SpillCtx, SpillError, SpillReserver,

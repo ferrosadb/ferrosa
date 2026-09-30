@@ -12,7 +12,9 @@
 //! | … `RETURNING` | additionally `SELECT` on `t` (the row is read back) |
 //! | `SELECT <exprs>` (no `FROM`), `BEGIN`/`COMMIT`/`ROLLBACK`, `SET`/`RESET` | nothing — no table is touched |
 //!
-//! The front-end has no DDL today; DDL is refused at parse time. The mapping
+//! | `CREATE TABLE` | `CREATE` on the target keyspace |
+//!
+//! The mapping
 //! matches on every statement kind with no wildcard arm, so adding a kind to
 //! `ferrosa_sql::Statement` or [`PreparedKind`] does not compile until it is
 //! given an explicit rule — an unmapped kind can never run unchecked.
@@ -68,6 +70,20 @@ pub(crate) fn statement_permissions(
         Statement::Insert(ins) => dml(&ins.table, ins.returning.is_some(), default_schema),
         Statement::Update(upd) => dml(&upd.table, upd.returning.is_some(), default_schema),
         Statement::Delete(del) => dml(&del.table, del.returning.is_some(), default_schema),
+        // DDL (T-132a, t_d3930503): CREATE on the target keyspace, as the CQL
+        // router requires for CREATE TABLE. Checked at dispatch, before the
+        // executor looks at the schema, so a denial reveals nothing about
+        // whether the keyspace or table exists.
+        Statement::CreateTable(create) => vec![(
+            Permission::Create,
+            Resource::Keyspace(
+                create
+                    .name
+                    .schema
+                    .clone()
+                    .unwrap_or_else(|| default_schema.to_string()),
+            ),
+        )],
         Statement::SelectExprs(_)
         | Statement::Begin { .. }
         | Statement::Commit
@@ -162,6 +178,19 @@ mod tests {
                 (Permission::Modify, t("public", "kv")),
                 (Permission::Select, t("public", "kv")),
             ]
+        );
+    }
+
+    #[test]
+    fn create_table_needs_create_on_the_target_keyspace() {
+        assert_eq!(
+            perms("CREATE TABLE docs (id int PRIMARY KEY, doc jsonb)"),
+            vec![(Permission::Create, Resource::Keyspace("public".into()))]
+        );
+        // Only `public` parses today (T-130 refuses other schemas by name).
+        assert_eq!(
+            perms("CREATE TABLE IF NOT EXISTS public.docs (id int PRIMARY KEY)"),
+            vec![(Permission::Create, Resource::Keyspace("public".into()))]
         );
     }
 

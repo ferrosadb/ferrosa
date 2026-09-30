@@ -46,6 +46,124 @@ pub enum Statement {
     Update(Box<UpdateStmt>),
     /// `DELETE FROM t WHERE ...`. Boxed for size parity with `Select`.
     Delete(Box<DeleteStmt>),
+    /// `CREATE TABLE [IF NOT EXISTS] ...` (D10 Ecto-migration subset). Parse
+    /// only: execution and schema creation are later packets. Boxed for size
+    /// parity with `Select`.
+    CreateTable(Box<CreateTableStmt>),
+}
+
+/// `CREATE TABLE [IF NOT EXISTS] [public.]name (col type [NOT NULL]..., PRIMARY KEY (...))`.
+///
+/// `primary_key` is non-empty and every entry names a column in `columns`; the
+/// first entry is the partition key and the rest are clustering columns (D10).
+/// Key columns have `not_null` and `primary_key` set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTableStmt {
+    pub if_not_exists: bool,
+    pub name: TableRef,
+    pub columns: Vec<ColumnDef>,
+    pub primary_key: Vec<String>,
+}
+
+/// One column of a `CREATE TABLE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub ty: PgType,
+    pub not_null: bool,
+    /// True when the column is part of the table's primary key.
+    pub primary_key: bool,
+}
+
+/// A PostgreSQL column type accepted by `CREATE TABLE`, as written (aliases
+/// normalized). Mapping to a storage type is the next packet's job, except
+/// [`PgType::storage`], which encodes D11: `json` is stored as `jsonb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgType {
+    SmallInt,
+    Integer,
+    BigInt,
+    Real,
+    DoublePrecision,
+    Numeric {
+        precision: Option<u32>,
+        scale: Option<u32>,
+    },
+    Boolean,
+    Text,
+    /// `varchar[(n)]` / `character varying[(n)]`.
+    Varchar(Option<u32>),
+    Bytea,
+    Uuid,
+    /// `timestamp [(p)] [without time zone]`.
+    Timestamp,
+    /// `timestamptz` / `timestamp [(p)] with time zone`.
+    TimestampTz,
+    Date,
+    Time,
+    Inet,
+    Jsonb,
+    /// `json`. Stored as `jsonb` (D11); see [`PgType::storage`].
+    Json,
+}
+
+impl PgType {
+    /// The type actually stored: `json` collapses to `jsonb` (D11), all else is
+    /// itself.
+    pub fn storage(self) -> PgType {
+        match self {
+            PgType::Json => PgType::Jsonb,
+            PgType::SmallInt
+            | PgType::Integer
+            | PgType::BigInt
+            | PgType::Real
+            | PgType::DoublePrecision
+            | PgType::Numeric { .. }
+            | PgType::Boolean
+            | PgType::Text
+            | PgType::Varchar(_)
+            | PgType::Bytea
+            | PgType::Uuid
+            | PgType::Timestamp
+            | PgType::TimestampTz
+            | PgType::Date
+            | PgType::Time
+            | PgType::Inet
+            | PgType::Jsonb => self,
+        }
+    }
+}
+
+/// A DDL clause that is out of scope for the PG subset (D10). Each is refused
+/// by name, never dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedClause {
+    /// `FOREIGN KEY (...)` or a column `REFERENCES`.
+    ForeignKey,
+    /// `CHECK (...)`, table or column level.
+    Check,
+    /// `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` (implicit sequences).
+    Serial,
+    /// `DEFAULT <expr>`.
+    DefaultExpr,
+    /// A table schema other than the mapped one (`public`).
+    ForeignSchema,
+    /// `UNIQUE` constraints (not in the D10 subset).
+    Unique,
+}
+
+impl UnsupportedClause {
+    /// The clause as a user would write it, for error messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            UnsupportedClause::ForeignKey => "FOREIGN KEY",
+            UnsupportedClause::Check => "CHECK",
+            UnsupportedClause::Serial => "SERIAL",
+            UnsupportedClause::DefaultExpr => "DEFAULT",
+            UnsupportedClause::ForeignSchema => "schema other than public",
+            UnsupportedClause::Unique => "UNIQUE",
+        }
+    }
 }
 
 /// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...) [RETURNING ...]`.

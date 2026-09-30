@@ -42,8 +42,9 @@ the code, not from leftover tags.
   when a consumer needs them — the current behavior is a documented fail-loud
   limitation, not a bug.
 - **Audit `#[non_exhaustive]` downstream matches (FMEA FC-6).** When new
-  `Error`/`DataType` variants are added, sweep downstream wildcard arms so a new
-  error isn't silently swallowed by a catch-all.
+  `Error` variants are added, sweep downstream wildcard arms so a new
+  error isn't silently swallowed by a catch-all. (`DataType` is exhaustive
+  since T-020, so the compiler does this for it.)
 
 ## Non-goals
 
@@ -53,3 +54,7 @@ the code, not from leftover tags.
   (`CqlType`/`CqlValue`, `TableSchema`) were made to break.
 - Consensus orchestration, storage layout, transport — only the shared *types*
   for them live here.
+
+## jsonb (T-150)
+
+Done: type threading. Remaining: T-154a: refuse jsonb in key positions at DDL; T-161a: PG OID 3802.

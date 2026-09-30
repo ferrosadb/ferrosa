@@ -83,6 +83,10 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   generated/echoed key. RETURNING rows honor the portal's result formats (binary
   works). `UPDATE`/`DELETE … RETURNING`, `ON CONFLICT`, and `= ANY($N)` are
   **not yet supported** and fail loud (`0A000`/parse error), never silently.
+- **Corrupt stored cells fail the query (t_cf7ca2cc)** — the shared row bridge
+  returns `RowDecodeError`; the streaming scan records a failure naming
+  `keyspace.table` and the column, so the client gets an error rather than a NULL
+  (FMEA `PG-Tcf7ca2cc`).
 - **PostgreSQL MVCC transactions** — explicit `BEGIN ISOLATION LEVEL
   SERIALIZABLE` pins a
   local or Accord cluster timestamp. Simple and extended `SELECT` use sparse row
@@ -132,9 +136,10 @@ values log an error and the process uses the complete defaults:
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
 | `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry and history-pruning interval |
 
-The scan buffer is a storage-side backpressure bound. The relational executor
-and PostgreSQL protocol renderer still materialize full query results. See the
-public [`PROFILE.md`](../PROFILE.md) for tuning guidance and caveats.
+The scan buffer is a storage-side backpressure bound. The result side is
+bounded too: rows reach the client in batches of `RESULT_BATCH_ROWS` (16) through
+a channel of `RESULT_CHANNEL_BATCHES` (2), with backpressure from the socket. See
+the public [`PROFILE.md`](../PROFILE.md) for tuning guidance and caveats.
 
 ## Data flow
 
@@ -142,29 +147,50 @@ public [`PROFILE.md`](../PROFILE.md) for tuning guidance and caveats.
 `load_catalog` opens each referenced table as a streamed storage provider. A
 snapshot's sparse MVCC row overlay replaces current versions and restores
 deleted historical rows as the scan passes. The provider uses a bounded channel
-and decodes one storage partition at a time, but the relational executor
-materializes base scan rows and `QueryResult.rows`; rendering then builds a
-second vector of all wire messages before sending. Thus query execution and
-protocol output are not end-to-end streaming and peak memory grows with result
-size. `offload::execute_offloaded` runs the sync operators **on a blocking
-thread** → `RowDescription` + `DataRow`s +
-`CommandComplete "SELECT n"`.
+and decodes one storage partition at a time. `ferrosa_sql::execute_streaming`
+runs **on a blocking thread** and pushes its output through a bounded channel of
+row batches (`result_stream`); the async side encodes each batch to `DataRow`s
+and writes it to the socket, so nothing gathers the result:
+`RowDescription` + `DataRow`s streamed + `CommandComplete "SELECT n"`.
 
-`ferrosa_sql::execute` is synchronous and CPU-bound (scan, filter, sort,
-hash-aggregate, hash-join). It must never be called inline from the async
+**Extended protocol.** `Execute` honours `max_rows`: the portal returns that many
+rows, answers `PortalSuspended`, and keeps its running query, so the next
+`Execute` continues from the next row (no gap, no duplicate). `Close`, a rebind
+of the portal name, `Sync` outside a transaction block, or a disconnect drops the
+query, which stops the executor. **Simple protocol** streams the same way.
+
+**Errors mid-stream.** A failure after rows were sent (an unencodable value, a
+spill error, a storage error during the scan) is reported as an `ErrorResponse`
+after the rows already written — as PostgreSQL does — never as a
+`CommandComplete` and never as a silently short result (FMEA PG-Tf348ba0b).
+
+`ferrosa_sql::execute_streaming` is synchronous and CPU-bound (scan, filter,
+sort, hash-aggregate, hash-join). It must never run inline on the async
 handlers: doing so pins an async worker for the whole query and starves
 connection keepalives — the failure mode PR #131 fixed on the CQL path. Both
-call sites (simple query in `query.rs`, extended query in `server.rs`) go
-through `offload::execute_offloaded`, and
-`offload::tests::executor_does_not_run_on_the_async_worker` fails if either
-regresses (forge t_d3b2dec1).
+call sites (simple and extended) start it through `result_stream::open_stream`,
+and `result_stream::tests::executor_does_not_run_on_the_async_worker` fails if
+that regresses (forge t_d3b2dec1).
 
-Known limitation: source-side scanning is bounded by one partition plus the
-channel, but the synchronous executor collects rows and the wire path collects
-encoded messages. A full-table query can therefore use memory proportional to
-its input/result size. End-to-end streaming requires changes to `ferrosa_sql`
-and the PostgreSQL message writer; streaming only the storage loader does not
-remove the materialization peak.
+Cost of suspension: a suspended portal parks one `spawn_blocking` thread in a
+channel send until it resumes or is closed. The runtimes cap blocking threads,
+so many concurrently suspended portals consume that budget.
+
+**DDL (`CREATE TABLE [IF NOT EXISTS]`, T-132a).** Simple protocol only. The
+statement is planned into a `TableMetadata` (`ddl.rs`) and applied through the
+same `ferrosa_cluster::ddl_path::DdlPath` the CQL router uses, via `ClusterDdl`
+(direct when standalone, coordinator in pair mode, Raft-replicated in a
+cluster). Keys: one primary-key column is the partition key; a composite key is
+the first column as partition key and the rest as ascending clustering columns.
+Types go through `pg_types::cql_type_for_pg_name`; an unmapped type is `42704`
+naming it; `json`/`jsonb` create a CQL `jsonb` column (T-161a, D11).
+`varchar(n)` and `numeric(p,s)` store as unbounded `text`/`decimal`: the length
+and precision are not enforced. An existing table is `42P07`, or a success
+under `IF NOT EXISTS` with no NOTICE (there is no `NoticeResponse`). A missing
+keyspace is `3F000`; DDL in a transaction block is `25001`; a context without a
+`ddl` executor refuses `0A000`. Unsupported clauses keep their `0A000` names.
+`CREATE TABLE` requires `CREATE` on the target keyspace, checked at dispatch
+in `authz::statement_permissions` before the executor reads the schema (42501). `DROP`/`ALTER` are T-132b; extended-protocol `Parse` of DDL is refused.
 
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +
@@ -188,9 +214,10 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 | Connection | `connection::Connection`, `ConnError`, `TlsPolicy` |
 | Auth | `handshake::Handshake`, `VerifierStore` (verifier + limiter hooks), `store::SchemaVerifierStore`, `scram::{ScramVerifier, ScramServerFirst, server_first, verify_client_final}` |
 | Simple query | `query::execute_query` |
-| Extended query | `extended::Session` (`on_parse`/`on_bind`/`on_close`/`on_sync`), `query::decode_param`/`encode_value` |
+| Extended query | `extended::Session` (`on_parse`/`on_bind`/`on_close`/`on_sync`), `query::decode_param_checked` (fails loud: `22P02` text parse, `22P03` binary, `42704` unmapped OID)/`encode_value` |
 | Storage glue | `storage_provider::load_table`, `cql_to_value`, `LoadError` |
-| Catalog | `catalog::{type_oid, …}` |
+| Catalog | `catalog::{pg_attribute, pg_type, catalog_tables}` (fallible: `PgTypeError`) |
+| Type map | `pg_types::{pg_type_of, pg_type_of_column, for_column_type, cql_type_for_pg_name, PgType, PgTypeError}` — the one `CqlType` ↔ Postgres type map (OID, typname, typlen, engine `ColumnType`, binary support); catalog, storage provider, RowDescription and parameter inference all read it |
 | Codec / messages | `codec::{read_startup, read_frontend, MAX_MESSAGE_LEN}`, `messages::{FrontendMessage, BackendMessage, TransactionStatus, …}` |
 
 ## Dependencies
@@ -245,6 +272,14 @@ infrastructure, plus integration tests:
   runs a fixed corpus + DML against BOTH real PostgreSQL 16 (container) and
   ferrosa over the same data and asserts agreement. Gated; panics with setup
   instructions if `FERROSA_TEST_CONTAINERS=1` is unset (never a silent skip).
+  Also holds the jsonb differential (T-301): `differential_oracle_jsonb_corpus_agrees`
+  (80 documents x literal / text `$1` / binary `$1`, read back in text and binary
+  format, byte for byte against `SELECT doc::text` on postgres:16),
+  `differential_oracle_jsonb_bad_binary_version_agrees` and
+  `differential_oracle_jsonb_plain_select_equals_cast_on_postgres`.
+- `tests/jsonb_slice.rs` (4) — the same corpus (`tests/common/jsonb_corpus.rs`)
+  through the in-process server with `tokio-postgres`, no infrastructure, against
+  PostgreSQL 16's recorded output.
 
 ```bash
 cargo test -p ferrosa-postgres                       # unit + in-process integration
@@ -260,3 +295,32 @@ FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-postgres \
 - [Data flow](specs/data-flow.md) — SELECT + INSERT sequence diagrams
 
 Public marketing page: `docs/database/postgres.html` (ferrosadb.com).
+
+## jsonb (T-150, T-160, T-161a)
+
+`CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is T-161a: `query::encode_value` refuses jsonb, jsonpath and `text[]` values in both formats, and binding anything but a jsonb value to a jsonb column is `0A000`.
+
+`CqlType::Jsonb` has a named arm in `pg_types::column_type_of` that advertises `text`; reading or writing a jsonb value is refused (`0A000` on write, a conversion error on read) until T-160 adds the SQL value and T-161a the wire codec (T-150).
+
+### jsonb in a PRIMARY KEY (T-154a)
+
+`CREATE TABLE t (doc jsonb PRIMARY KEY)` (or jsonb in a composite key) is
+refused with `42P16` naming the column. Postgres accepts it; ferrosa keeps
+jsonb out of key bytes (D3). The schema registry's own check runs again before
+the change is handed to the DDL path.
+
+`CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802, typlen -1, `binary: true`; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is `jsonb_wire` (T-161a): text format is the PostgreSQL 16 jsonb text (`TextStyle::PgText`, D26; `{"aa":2,"b":1}` prints `{"b": 1, "aa": 2}`, scale kept); binary format is `0x01` then that text (`jsonb_send`). `render_value` never returns NULL for a jsonb value: a corrupt cell is `XX001`, an over-budget print `54000`, and jsonpath/`text[]` are `0A000` (T-161b). Input is parsed with `ferrosa_jsonb::parse_text_observed` under `QueryContext::jsonb_limits` (resolved from `[jsonb]` in `ferrosa/src/main.rs`, no default): a parameter declared 3802 or 114 (or bound to a jsonb column after `Describe`) is parsed in `decode_param_checked`; an untyped string literal or a text-declared parameter bound to a jsonb column is parsed in `value_to_cql`. SQLSTATEs: `22P02` invalid JSON (byte offset, input never echoed), `22P05` a `\u0000` escape (a PG text value cannot hold NUL; `NulPolicy::Reject`), `XX000` unknown binary version byte and `08P01` no version byte (both what PostgreSQL 16 answers), `22030` duplicate key under the strict policy, `54000` over a limit, `XX001` corrupt stored cell. Duplicate keys resolve last-wins and are logged as a `jsonb_duplicate_keys_dropped` edge line (D6b). DDL: `jsonb` and `json` create a CQL `jsonb` column (`json` is stored as jsonb, D11); Off a standalone node such DDL is refused `0A000` by `Schema::check_create_table_jsonb` (T-300, D24). An unspecified-OID binary-format parameter is decoded as text: clients get 3802 from `Describe`, and a raw Bind without one fails 22P02 rather than writing.
+
+### Slice acceptance evidence (T-301)
+
+Acceptance for the PG-first slice (D24): `CREATE TABLE ... jsonb` through PG DDL;
+`INSERT` by literal, text `$1` and binary `$1`; `SELECT` in text and binary
+format. `tests/jsonb_slice.rs` runs without infrastructure. The differential
+oracle sends the identical statements to a postgres:16 container and to ferrosa
+and compares byte for byte (`SELECT doc::text` there, `SELECT doc` here) with no
+tolerance. Live run (podman, `FERROSA_TEST_CONTAINERS=1`): 80 corpus cases x 3
+paths = 240 runs, 0 differences, 0 stale expectations. The oracle found two
+differences, both fixed: a `\u0000` escape was accepted (Postgres: `22P05`), and
+a bad binary version byte answered `22P03` (Postgres: `XX000`; `08P01` for an
+empty value). There are no named divergences: `NAMED_DIVERGENCES` in the oracle is
+empty and fails if an entry stops differing.

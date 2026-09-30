@@ -216,9 +216,11 @@ rebuilding Ferrosa:
 Every value must be a positive integer. If any PostgreSQL override is invalid,
 Ferrosa logs an error and uses the complete default set without stopping
 startup. The scan buffer bounds rows in flight from storage; it does not limit
-the number of rows returned by a query. The SQL executor and protocol renderer
-still materialize query results, so increasing this buffer only changes the
-storage-side producer window.
+the number of rows returned by a query. Query results are streamed to the client
+in small fixed batches with socket backpressure, so response memory does not grow
+with result size; increasing this buffer only changes the storage-side producer
+window. A portal suspended by `Execute` with `max_rows` keeps one blocking
+executor thread until it resumes or is closed.
 
 The maximum snapshot age bounds how long an abandoned or long-running
 transaction can retain old row versions. Once expired, its next query or commit

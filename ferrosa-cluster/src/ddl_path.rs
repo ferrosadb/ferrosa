@@ -123,6 +123,22 @@ pub enum DdlPath {
 }
 
 impl DdlPath {
+    /// Stable lowercase name of the live path, for status endpoints.
+    ///
+    /// `Cluster` is the only path on which DDL is Raft-replicated. A node
+    /// reports `mode = cluster` from the start of `transition_to_cluster` but
+    /// stays on `Direct` until a Raft leader exists, so probes that need
+    /// cluster-routed DDL must wait for `"cluster"` here, not for the mode.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Direct { .. } => "direct",
+            Self::Pair(_) => "pair",
+            Self::Cluster { .. } => "cluster",
+            Self::Forming { .. } => "forming",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
     /// Execute a DDL operation on the current path.
     ///
     /// - `Direct`: applies directly to local schema + storage.
@@ -1465,6 +1481,15 @@ mod tests {
             live_rows, 0,
             "dropped index should leave no live rows in system_schema.indexes"
         );
+    }
+
+    /// CQL-T467ci-01: every path names itself, so a status probe can tell a
+    /// cluster-routed node from one still on the local transition path.
+    #[test]
+    fn ddl_path_kind_names_each_variant() {
+        assert_eq!(DdlPath::Unavailable.kind(), "unavailable");
+        let (queue, _rx) = tokio::sync::mpsc::channel(1);
+        assert_eq!(DdlPath::Forming { queue }.kind(), "forming");
     }
 
     #[tokio::test]

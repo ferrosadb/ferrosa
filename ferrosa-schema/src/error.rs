@@ -59,6 +59,27 @@ pub enum SchemaError {
     AggregateNotFound(String, String),
     /// Generic schema validation error.
     InvalidSchema(String),
+    /// jsonb (at any depth) in a partition or clustering key column (D3, D21).
+    JsonbInKey {
+        keyspace: String,
+        table: String,
+        column: String,
+        /// `"partition key"` or `"clustering key"`.
+        position: &'static str,
+    },
+    /// A jsonb nesting D21 forbids: set element, map key or vector element.
+    JsonbNesting {
+        keyspace: String,
+        table: String,
+        column: String,
+        rule: ferrosa_common::cql_type::names::JsonbNestingError,
+    },
+    /// jsonb DDL on a node that is not standalone: refused until the D15a
+    /// capability ledger lands (T-300, D24). `subject` names what was refused.
+    JsonbDdlRefused {
+        mode: ferrosa_common::deployment_mode::DeploymentMode,
+        subject: String,
+    },
 }
 
 impl fmt::Display for SchemaError {
@@ -117,6 +138,28 @@ impl fmt::Display for SchemaError {
                 write!(f, "aggregate not found: {ks}.{agg}")
             }
             Self::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
+            Self::JsonbInKey {
+                keyspace,
+                table,
+                column,
+                position,
+            } => write!(
+                f,
+                "column '{column}' of {keyspace}.{table} is jsonb (or contains jsonb) and \
+                 cannot be in the {position}: jsonb is allowed in regular columns only (D3)"
+            ),
+            Self::JsonbNesting {
+                keyspace,
+                table,
+                column,
+                rule,
+            } => write!(f, "column '{column}' of {keyspace}.{table}: {rule}"),
+            Self::JsonbDdlRefused { mode, subject } => write!(
+                f,
+                "jsonb DDL refused ({subject}): this node is in {mode} mode and jsonb columns \
+                 are allowed on a standalone node only until the capability ledger (D15a, \
+                 ferrosa.jsonb.v1) is available"
+            ),
         }
     }
 }

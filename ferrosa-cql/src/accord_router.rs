@@ -506,7 +506,28 @@ fn as_integer(value: &CqlValue) -> Option<num_bigint::BigInt> {
         CqlValue::Smallint(n) => Some(num_bigint::BigInt::from(*n)),
         CqlValue::Tinyint(n) => Some(num_bigint::BigInt::from(*n)),
         CqlValue::Varint(n) => Some(n.clone()),
-        _ => None,
+        CqlValue::Null
+        | CqlValue::Ascii(_)
+        | CqlValue::Blob(_)
+        | CqlValue::Boolean(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Double(_)
+        | CqlValue::Float(_)
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Text(_)
+        | CqlValue::Timeuuid(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Vector(_)
+        | CqlValue::Jsonb(_)
+        | CqlValue::Udt(_) => None,
     }
 }
 
@@ -550,7 +571,37 @@ fn cmp_values(a: &Option<CqlValue>, b: &Option<CqlValue>) -> Option<std::cmp::Or
             let b_f = f32::from_bits(*b_bits);
             a_f.partial_cmp(&b_f)
         }
-        _ => None,
+        // jsonb orders by the D18 total order; a mixed pair is not comparable.
+        (Some(CqlValue::Jsonb(a)), Some(CqlValue::Jsonb(b))) => Some(a.cmp(b)),
+        (None, _)
+        | (Some(CqlValue::Null), _)
+        | (Some(CqlValue::Ascii(_)), _)
+        | (Some(CqlValue::Bigint(_)), _)
+        | (Some(CqlValue::Blob(_)), _)
+        | (Some(CqlValue::Boolean(_)), _)
+        | (Some(CqlValue::Counter(_)), _)
+        | (Some(CqlValue::Decimal { .. }), _)
+        | (Some(CqlValue::Double(_)), _)
+        | (Some(CqlValue::Float(_)), _)
+        | (Some(CqlValue::Int(_)), _)
+        | (Some(CqlValue::Timestamp(_)), _)
+        | (Some(CqlValue::Uuid(_)), _)
+        | (Some(CqlValue::Text(_)), _)
+        | (Some(CqlValue::Varint(_)), _)
+        | (Some(CqlValue::Timeuuid(_)), _)
+        | (Some(CqlValue::Inet(_)), _)
+        | (Some(CqlValue::Date(_)), _)
+        | (Some(CqlValue::Time(_)), _)
+        | (Some(CqlValue::Smallint(_)), _)
+        | (Some(CqlValue::Tinyint(_)), _)
+        | (Some(CqlValue::Duration { .. }), _)
+        | (Some(CqlValue::List(_)), _)
+        | (Some(CqlValue::Set(_)), _)
+        | (Some(CqlValue::Map(_)), _)
+        | (Some(CqlValue::Tuple(_)), _)
+        | (Some(CqlValue::Vector(_)), _)
+        | (Some(CqlValue::Udt(_)), _)
+        | (Some(CqlValue::Jsonb(_)), _) => None,
     }
 }
 

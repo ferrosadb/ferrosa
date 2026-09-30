@@ -43,7 +43,7 @@ here so storage and schema share it without a cycle through `ferrosa-sstable`.
 | `key` (`src/key.rs`) | 176 | `PartitionKey`, `DecoratedKey` (cached token, token-then-bytes order, `filter_hash`) |
 | `error` (`src/error.rs`) | 168 | `Error` / `Result`; typed `CorruptSstable` repair signal; `is_backpressure` |
 | `cell` (`src/cell.rs`) | 151 | `CellValue` live/expiring/tombstone + sentinels |
-| `data_type` (`src/data_type.rs`) | 89 | `DataType` scalar descriptor (`#[non_exhaustive]`) |
+| `data_type` (`src/data_type.rs`) | 89 | `DataType` scalar descriptor (exhaustive) |
 | `token` (`src/token.rs`) | 79 | `Token` newtype + `from_key` |
 | `task_pool` (`src/task_pool.rs`) | 71 | `TaskPool` runtime-aware spawn helper |
 | `test_generators` (`src/test_generators.rs`) | ~140 | proptest strategies (feature `test-generators`) for cells/keys and shrink-friendly generated DDL/snapshot table identities, drop markers, and index declarations |
@@ -96,8 +96,10 @@ flowchart TD
    for NaN — required wherever values are used as sorted keys.
 5. **`CorruptSstable` is a typed signal, never string-matched.** The repair range
    is read via `corrupt_sstable_range()`.
-6. **`#[non_exhaustive]` on `Error` and `DataType`.** New variants can be added
-   without a semver break; downstream matches must keep a wildcard arm.
+6. **`#[non_exhaustive]` on `Error` only.** `DataType` dropped it (jsonb M3) so
+   downstream matches are exhaustive and the compiler flags every site when a
+   variant is added. `CqlValue::cmp` and its storage/schema callers have no
+   wildcard arms either.
 
 ## Position in the dependency graph
 
@@ -110,3 +112,7 @@ Cancellation uses a one-slot Crossbeam channel solely for disconnection. No
 payload is sent or consumed; every cloned receiver observes closure, including
 clones created after cancellation. Fixed capacity avoids zero-channel select
 packet allocations in storage pump waits (T-081).
+
+## jsonb (T-150)
+
+`CqlType::Jsonb` and `CqlValue::Jsonb(ferrosa_jsonb::JsonbValue)` (T-150). The value is validated and never raw bytes; `Ord`/`Eq`/`Hash` delegate to `JsonbValue` (D18, D2a) and `discriminant_index` gives it index 27. The name registry has `jsonb` with the POC marshal class `org.apache.cassandra.db.marshal.JsonbType`; `custom_class_type` resolves only that class (D20) and `check_jsonb_nesting` rejects `set<jsonb>`, `map<jsonb, _>` and `vector<jsonb>` at any depth (D21). `jsonb_canonical_text` prints a value. New edge: `ferrosa-common` -> `ferrosa-jsonb` (leaf; `guard-arrow-free.sh` passes).

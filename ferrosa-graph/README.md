@@ -101,6 +101,9 @@ resolved port.
 - **Variable-length paths** (`executor/varpath.rs`, `leapfrog.rs`) — BFS over
   `min..=max` hops with a visited set for cycle detection and a
   `max_var_path_visited` vertex budget (threat T13).
+- **Property write encoding** (`executor/expand.rs`) — schema-less CREATE/MERGE
+  accept literal values only; a map, list or computed expression returns
+  `GraphError::Validation` rather than storing empty bytes (FMEA G-11).
 - **Aggregations** (`executor/aggregate.rs`) — `count`, `sum`, `avg`, `min`,
   `max`, `collect`, with `max_groups` / `max_collect_size` caps.
 - **Adjacency index** (`adjacency/`) — `schema` (table layout + naming),
@@ -114,6 +117,11 @@ resolved port.
   to start when `require_tls` is set without a certificate, and the
   disabled-engine stub serves over TLS when a certificate is configured
   (t_d5d122ba). The binary feeds both from `[graph] tls_cert/tls_key/require_tls`.
+
+  SUBSCRIBE) and `bolt/` (Bolt v5 handshake, PackStream codec, message dispatch). The PackStream decoder bounds
+  List/Map/Structure nesting at `codec::MAX_NESTING_DEPTH` (128) and rejects
+  declared counts the input cannot satisfy, so a pre-auth HELLO cannot overflow
+  the stack or force a huge allocation (`CodecError::NestingTooDeep`).
 - **Cluster-aware DDL** — adjacency keyspace/table creation routes through the
   same `DdlPath` regular CQL `CREATE TABLE` uses, so every replica registers the
   system table (`ClusterGraphSchemaCoordinator`); a local coordinator is the

@@ -2255,6 +2255,7 @@ dependencies = [
  "ferrosa-cql",
  "ferrosa-flight",
  "ferrosa-graph",
+ "ferrosa-jsonb",
  "ferrosa-net",
  "ferrosa-postgres",
  "ferrosa-sched",
@@ -2343,6 +2344,7 @@ name = "ferrosa-common"
 version = "0.22.0"
 dependencies = [
  "crossbeam-channel",
+ "ferrosa-jsonb",
  "num-bigint",
  "proptest",
  "serde",
@@ -2366,6 +2368,7 @@ dependencies = [
  "ferrosa-cluster",
  "ferrosa-common",
  "ferrosa-index",
+ "ferrosa-jsonb",
  "ferrosa-net",
  "ferrosa-row-bridge",
  "ferrosa-sched",
@@ -2567,6 +2570,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-jsonb"
+version = "0.22.0"
+dependencies = [
+ "bytes",
+ "num-bigint",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ferrosa-loadgen"
 version = "0.22.0"
 dependencies = [
@@ -2625,12 +2640,14 @@ dependencies = [
 name = "ferrosa-postgres"
 version = "0.22.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",
  "ferrosa-cluster",
  "ferrosa-common",
+ "ferrosa-jsonb",
  "ferrosa-net",
  "ferrosa-row-bridge",
  "ferrosa-schema",
@@ -2663,6 +2680,7 @@ name = "ferrosa-row-bridge"
 version = "0.22.0"
 dependencies = [
  "ferrosa-common",
+ "ferrosa-jsonb",
  "ferrosa-schema",
  "ferrosa-sstable",
  "num-bigint",
@@ -2766,6 +2784,7 @@ name = "ferrosa-sql"
 version = "0.22.0"
 dependencies = [
  "chrono",
+ "ferrosa-jsonb",
  "ferrosa-storage",
  "num-bigint",
  "ordered-float",
@@ -2810,6 +2829,7 @@ dependencies = [
  "ferrosa-cdc",
  "ferrosa-common",
  "ferrosa-index",
+ "ferrosa-jsonb",
  "ferrosa-row-bridge",
  "ferrosa-sched",
  "ferrosa-schema",

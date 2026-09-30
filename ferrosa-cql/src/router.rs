@@ -249,7 +249,33 @@ fn prepare_order_by_execution(
 fn vector_bits_from_term(term: &Term, target_type: &CqlType) -> Result<Vec<u32>, CqlError> {
     match bridge::term_to_cql_value(term, target_type)? {
         CqlValue::Vector(bits) => Ok(bits),
-        other => Err(CqlError::Invalid(format!(
+        other @ (CqlValue::Null
+        | CqlValue::Ascii(_)
+        | CqlValue::Bigint(_)
+        | CqlValue::Blob(_)
+        | CqlValue::Boolean(_)
+        | CqlValue::Counter(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Double(_)
+        | CqlValue::Float(_)
+        | CqlValue::Int(_)
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Text(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Timeuuid(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Smallint(_)
+        | CqlValue::Tinyint(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Jsonb(_)
+        | CqlValue::Udt(_)) => Err(CqlError::Invalid(format!(
             "ANN query value must resolve to vector, got {other:?}"
         ))),
     }
@@ -1098,7 +1124,7 @@ async fn count_rows_from_partitions(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1153,7 +1179,7 @@ async fn extend_rows_from_partitions(
     pk_indices: &[usize],
     ck_indices: &[usize],
     storage_to_table: &[usize],
-) {
+) -> Result<(), CqlError> {
     for (idx, partition) in partitions.iter().enumerate() {
         let mut prows = bridge::partition_to_rows_with_storage_mapping(
             partition,
@@ -1162,12 +1188,13 @@ async fn extend_rows_from_partitions(
             pk_indices,
             ck_indices,
             storage_to_table,
-        );
+        )?;
         all_rows.append(&mut prows);
         if should_yield_during_partition_scan(idx + 1, cooperative_scan_yield_every_partitions()) {
             tokio::task::yield_now().await;
         }
     }
+    Ok(())
 }
 
 /// Drain a projected partition stream into `all_rows`, moving each partition
@@ -1198,7 +1225,7 @@ async fn extend_rows_from_partition_stream(
             pk_indices,
             ck_indices,
             storage_to_table,
-        );
+        )?;
         all_rows.append(&mut prows);
         processed_partitions += 1;
         if should_yield_during_partition_scan(
@@ -1234,7 +1261,7 @@ async fn collect_index_rows_with_limit(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1290,7 +1317,7 @@ async fn sort_rows_from_partition_stream_spilling(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1341,7 +1368,7 @@ async fn count_rows_from_partition_stream(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1588,7 +1615,7 @@ async fn fold_builtin_aggregates(
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        ) {
+        )? {
             if row_matches_select_predicates(
                 &row,
                 predicate_context.statement,
@@ -1816,7 +1843,7 @@ async fn collect_page_from_partition_stream(
                 }
                 ControlFlow::Continue(())
             },
-        );
+        )?;
         if cursor_from_current_partition {
             last_pk = partition_key;
         }
@@ -1888,7 +1915,7 @@ async fn collect_distinct_partition_page_from_stream(
                 first_row = Some(output_row);
                 ControlFlow::Break(())
             },
-        );
+        )?;
 
         let Some(row) = first_row else {
             continue;
@@ -2023,7 +2050,7 @@ async fn collect_filtered_page_from_partition_stream(
                 }
                 ControlFlow::Continue(())
             },
-        );
+        )?;
         if cursor_from_current_partition {
             last_pk = partition_key;
         }
@@ -2097,7 +2124,33 @@ fn eval_to_timestamp(timeuuid: &CqlValue) -> Result<CqlValue, CqlError> {
             let millis = (uuid_ts - crate::bridge::UUID_EPOCH_OFFSET) / 10_000;
             Ok(CqlValue::Timestamp(millis as i64))
         }
-        _ => Err(CqlError::Invalid(
+        CqlValue::Null
+        | CqlValue::Ascii(_)
+        | CqlValue::Bigint(_)
+        | CqlValue::Blob(_)
+        | CqlValue::Boolean(_)
+        | CqlValue::Counter(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Double(_)
+        | CqlValue::Float(_)
+        | CqlValue::Int(_)
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Text(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Smallint(_)
+        | CqlValue::Tinyint(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Vector(_)
+        | CqlValue::Jsonb(_)
+        | CqlValue::Udt(_) => Err(CqlError::Invalid(
             "toTimestamp requires a timeuuid argument".into(),
         )),
     }
@@ -2372,6 +2425,19 @@ fn build_transaction_write(
     stmt: &Statement,
 ) -> Result<ferrosa_storage::accord::TransactionWrite, CqlError> {
     use ferrosa_storage::Mutation;
+
+    // Authorize first (D22, fail closed): a MODIFY-only principal gets
+    // Unauthorized before any other verdict on a conditional statement.
+    authorize_conditional_statement(state, ctx, stmt)?;
+
+    // A staged write carries only its mutation: there is no slot for a
+    // condition, so encoding one here would silently drop it and let the
+    // COMMIT apply the write unconditionally. Reject loudly instead.
+    if crate::accord_router::classify_lwt(stmt).is_some() {
+        return Err(CqlError::ConditionalUnsupported {
+            scope: "a BEGIN TRANSACTION block",
+        });
+    }
 
     let now_micros = || -> Result<i64, CqlError> {
         Ok(std::time::SystemTime::now()
@@ -2742,7 +2808,7 @@ fn decode_agreed_row_to_map(
         &pk_indices,
         &ck_indices,
         &storage_to_table,
-    );
+    )?;
 
     let row_values = match rows.into_iter().next() {
         None => return Ok(None),
@@ -3247,6 +3313,11 @@ pub async fn route(
         &ctx.client_address,
         &ctx.auth.role,
     );
+
+    // Conditional statements need SELECT as well as MODIFY. Reject before the
+    // Accord path can touch the row, a peer, or any cluster-state error that
+    // would tell a MODIFY-only caller something about the table.
+    authorize_conditional_statement(state, ctx, &stmt)?;
 
     // Check if this statement requires Accord consensus (LWT).
     // Determined by serial_consistency being set in the request context.
@@ -4623,6 +4694,24 @@ pub async fn route_prepared_select_fast(
     s: &SelectStatement,
     bound_terms: &[Term],
 ) -> Option<Result<RouteResult, CqlError>> {
+    let outcome = route_prepared_select_fast_inner(state, ctx, s, bound_terms).await?;
+    // A corrupt stored cell names its table (CQL-Tcf7ca2cc).
+    Some(outcome.map_err(|e| {
+        let ks = s
+            .keyspace
+            .as_deref()
+            .or(ctx.current_keyspace.as_deref())
+            .unwrap_or("<no keyspace>");
+        e.in_table(&format!("{ks}.{}", s.table))
+    }))
+}
+
+async fn route_prepared_select_fast_inner(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &SelectStatement,
+    bound_terms: &[Term],
+) -> Option<Result<RouteResult, CqlError>> {
     // `allow_filtering` is deliberately NOT disqualifying.
     //
     // It is a PERMISSION — "I will take the scan if no index can serve me" —
@@ -4815,7 +4904,7 @@ pub async fn route_prepared_select_fast(
                 &pk_indices,
                 &ck_indices,
                 &storage_to_table,
-            );
+            )?;
             let selected = select_columns(&rows, &all_col_names, &col_names);
             if let Some(limit) = limit {
                 selected.into_iter().take(limit.max(0) as usize).collect()
@@ -4886,15 +4975,98 @@ fn row_geo_point(row: &[Option<CqlValue>], col_idx: usize) -> Option<(f64, f64)>
         Some(Some(CqlValue::Tuple(elems))) if elems.len() == 2 => {
             let lat = match elems[0] {
                 Some(CqlValue::Double(bits)) => f64::from_bits(bits),
-                _ => return None,
+                None
+                | Some(CqlValue::Null)
+                | Some(CqlValue::Ascii(_))
+                | Some(CqlValue::Bigint(_))
+                | Some(CqlValue::Blob(_))
+                | Some(CqlValue::Boolean(_))
+                | Some(CqlValue::Counter(_))
+                | Some(CqlValue::Decimal { .. })
+                | Some(CqlValue::Float(_))
+                | Some(CqlValue::Int(_))
+                | Some(CqlValue::Timestamp(_))
+                | Some(CqlValue::Uuid(_))
+                | Some(CqlValue::Text(_))
+                | Some(CqlValue::Varint(_))
+                | Some(CqlValue::Timeuuid(_))
+                | Some(CqlValue::Inet(_))
+                | Some(CqlValue::Date(_))
+                | Some(CqlValue::Time(_))
+                | Some(CqlValue::Smallint(_))
+                | Some(CqlValue::Tinyint(_))
+                | Some(CqlValue::Duration { .. })
+                | Some(CqlValue::List(_))
+                | Some(CqlValue::Set(_))
+                | Some(CqlValue::Map(_))
+                | Some(CqlValue::Tuple(_))
+                | Some(CqlValue::Vector(_))
+                | Some(CqlValue::Jsonb(_))
+                | Some(CqlValue::Udt(_)) => return None,
             };
             let lon = match elems[1] {
                 Some(CqlValue::Double(bits)) => f64::from_bits(bits),
-                _ => return None,
+                None
+                | Some(CqlValue::Null)
+                | Some(CqlValue::Ascii(_))
+                | Some(CqlValue::Bigint(_))
+                | Some(CqlValue::Blob(_))
+                | Some(CqlValue::Boolean(_))
+                | Some(CqlValue::Counter(_))
+                | Some(CqlValue::Decimal { .. })
+                | Some(CqlValue::Float(_))
+                | Some(CqlValue::Int(_))
+                | Some(CqlValue::Timestamp(_))
+                | Some(CqlValue::Uuid(_))
+                | Some(CqlValue::Text(_))
+                | Some(CqlValue::Varint(_))
+                | Some(CqlValue::Timeuuid(_))
+                | Some(CqlValue::Inet(_))
+                | Some(CqlValue::Date(_))
+                | Some(CqlValue::Time(_))
+                | Some(CqlValue::Smallint(_))
+                | Some(CqlValue::Tinyint(_))
+                | Some(CqlValue::Duration { .. })
+                | Some(CqlValue::List(_))
+                | Some(CqlValue::Set(_))
+                | Some(CqlValue::Map(_))
+                | Some(CqlValue::Tuple(_))
+                | Some(CqlValue::Vector(_))
+                | Some(CqlValue::Jsonb(_))
+                | Some(CqlValue::Udt(_)) => return None,
             };
             Some((lat, lon))
         }
-        _ => None,
+        None
+        | Some(None)
+        | Some(Some(CqlValue::Tuple(_))) // guard `elems.len() == 2` failed
+        | Some(Some(CqlValue::Null))
+        | Some(Some(CqlValue::Ascii(_)))
+        | Some(Some(CqlValue::Bigint(_)))
+        | Some(Some(CqlValue::Blob(_)))
+        | Some(Some(CqlValue::Boolean(_)))
+        | Some(Some(CqlValue::Counter(_)))
+        | Some(Some(CqlValue::Decimal { .. }))
+        | Some(Some(CqlValue::Double(_)))
+        | Some(Some(CqlValue::Float(_)))
+        | Some(Some(CqlValue::Int(_)))
+        | Some(Some(CqlValue::Timestamp(_)))
+        | Some(Some(CqlValue::Uuid(_)))
+        | Some(Some(CqlValue::Text(_)))
+        | Some(Some(CqlValue::Varint(_)))
+        | Some(Some(CqlValue::Timeuuid(_)))
+        | Some(Some(CqlValue::Inet(_)))
+        | Some(Some(CqlValue::Date(_)))
+        | Some(Some(CqlValue::Time(_)))
+        | Some(Some(CqlValue::Smallint(_)))
+        | Some(Some(CqlValue::Tinyint(_)))
+        | Some(Some(CqlValue::Duration { .. }))
+        | Some(Some(CqlValue::List(_)))
+        | Some(Some(CqlValue::Set(_)))
+        | Some(Some(CqlValue::Map(_)))
+        | Some(Some(CqlValue::Vector(_)))
+        | Some(Some(CqlValue::Jsonb(_)))
+        | Some(Some(CqlValue::Udt(_))) => None,
     }
 }
 
@@ -4988,7 +5160,7 @@ async fn route_geo_select(
                 rowctx.pk_indices,
                 rowctx.ck_indices,
                 rowctx.storage_to_table,
-            );
+            )?;
             rows.append(&mut prows);
         }
         Ok(rows)
@@ -5198,7 +5370,21 @@ thread_local! {
     static BOUNDED_PARTITION_ROWS_MATERIALIZED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Run a user-table SELECT. A corrupt stored cell fails the read with the
+/// table named (CQL-Tcf7ca2cc); the decode layers below only know the column
+/// and partition key, so the table is attached here, where it is known.
 async fn route_select_user_table(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    ks: &str,
+    s: &SelectStatement,
+) -> Result<SelectRawResult, CqlError> {
+    route_select_user_table_inner(state, ctx, ks, s)
+        .await
+        .map_err(|e| e.in_table(&format!("{ks}.{}", s.table)))
+}
+
+async fn route_select_user_table_inner(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     ks: &str,
@@ -5438,7 +5624,7 @@ async fn route_select_user_table(
                         &pk_indices,
                         &ck_indices,
                         &storage_to_table,
-                    );
+                    )?;
                     // Post-filter: apply remaining (non-fts_match) WHERE predicates.
                     filter_rows_by_select_predicates(
                         &mut prows,
@@ -5786,7 +5972,7 @@ async fn route_select_user_table(
                 &pk_indices,
                 &ck_indices,
                 &storage_to_table,
-            ));
+            )?);
         }
         #[cfg(test)]
         PK_LOOKUP_ROWS_VISITED.with(|c| c.set(c.get() + pk_rows.len()));
@@ -5986,7 +6172,7 @@ async fn route_select_user_table(
                 &ck_indices,
                 &storage_to_table,
             )
-            .await;
+            .await?;
             ann_rows
         } else {
             match scan_plan {
@@ -6070,7 +6256,7 @@ async fn route_select_user_table(
                         &ck_indices,
                         &storage_to_table,
                     )
-                    .await;
+                    .await?;
                     filter_rows_by_select_predicates(
                         &mut all_rows,
                         s,
@@ -6990,7 +7176,7 @@ async fn route_select_user_table(
                                     &ck_indices,
                                     &storage_to_table,
                                 )
-                                .await;
+                                .await?;
                             } else {
                                 return Err(CqlError::Invalid(
                                     "unbounded full-table materialization is disabled; use a \
@@ -7415,7 +7601,7 @@ pub(crate) fn cdc_event_to_result_frame(
         &pk_indices,
         &ck_indices,
         &storage_to_table,
-    );
+    )?;
     let selected = select_columns(&all_rows, &all_col_names, &col_names);
     Ok(Some(result::encode_rows(
         &col_names,
@@ -7441,8 +7627,6 @@ fn data_type_to_cql_type(dt: &DataType) -> CqlType {
         DataType::Timestamp => CqlType::Timestamp,
         DataType::Blob => CqlType::Blob,
         DataType::Duration => CqlType::Duration,
-        // DataType is #[non_exhaustive]; treat unknown variants as blob.
-        _ => CqlType::Blob,
     }
 }
 
@@ -7504,8 +7688,9 @@ fn cell_to_cql_value(
             CqlValue::Timestamp(ms)
         }
         DataType::Blob => CqlValue::Blob(bytes.clone()),
-        // DataType is #[non_exhaustive]; treat unknown as blob.
-        _ => CqlValue::Blob(bytes.clone()),
+        // Duration has no virtual-cell decoder yet; it is surfaced as a blob
+        // (pre-existing silent fallback, tracked as a fail-loud follow-up).
+        DataType::Duration => CqlValue::Blob(bytes.clone()),
     }))
 }
 
@@ -7578,7 +7763,33 @@ fn encode_virtual_rows_streaming(
                     Some(ferrosa_schema::WireType::SetText) => {
                         Ok(decode_list_text_cell(cell).map(|value| match value {
                             CqlValue::List(items) => CqlValue::Set(items),
-                            other => other,
+                            other @ (CqlValue::Null
+                            | CqlValue::Ascii(_)
+                            | CqlValue::Bigint(_)
+                            | CqlValue::Blob(_)
+                            | CqlValue::Boolean(_)
+                            | CqlValue::Counter(_)
+                            | CqlValue::Decimal { .. }
+                            | CqlValue::Double(_)
+                            | CqlValue::Float(_)
+                            | CqlValue::Int(_)
+                            | CqlValue::Timestamp(_)
+                            | CqlValue::Uuid(_)
+                            | CqlValue::Text(_)
+                            | CqlValue::Varint(_)
+                            | CqlValue::Timeuuid(_)
+                            | CqlValue::Inet(_)
+                            | CqlValue::Date(_)
+                            | CqlValue::Time(_)
+                            | CqlValue::Smallint(_)
+                            | CqlValue::Tinyint(_)
+                            | CqlValue::Duration { .. }
+                            | CqlValue::Set(_)
+                            | CqlValue::Map(_)
+                            | CqlValue::Tuple(_)
+                            | CqlValue::Vector(_)
+                            | CqlValue::Jsonb(_)
+                            | CqlValue::Udt(_)) => other,
                         }))
                     }
                     None => cell_to_cql_value(cell, &col.data_type),
@@ -8172,12 +8383,8 @@ async fn route_insert(
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
     validate_keyspace_exists(&state.schema, ks)?;
 
-    // Permission check (M8)
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
-    )?;
+    // Permission check (M8); IF NOT EXISTS also needs SELECT (fail closed).
+    check_write_permission(state, ctx, ks, &s.table, s.if_not_exists)?;
 
     let snap = state.schema.snapshot();
     let table_meta = snap
@@ -8258,65 +8465,32 @@ async fn route_insert(
     let table_id = TableId::new(ks, &s.table);
     let strategy = keyspace_strategy(&state.schema, ks);
 
-    // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
+    // BUG-0016: IF NOT EXISTS. The existence check and the write are one
+    // atomic step under the partition lock (held until the write lands), so two
+    // racing inserts cannot both observe "absent".
+    let _lwt_guard = if s.if_not_exists {
+        Some(crate::local_lwt::lock_partition(&table_id, &decorated_key).await)
+    } else {
+        None
+    };
     if s.if_not_exists {
-        let existing_row = if let Some(partition) = state
-            .write_path
-            .load()
-            .read(&table_id, &decorated_key)
-            .await
-            .map_err(|e| CqlError::ServerError(format!("{e}")))?
-        {
-            let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
-            let all_col_types: Vec<CqlType> = table_meta
-                .columns
-                .values()
-                .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
-                .collect::<Result<Vec<_>, _>>()?;
-            let pk_indices: Vec<usize> = table_meta
-                .partition_key
-                .iter()
-                .filter_map(|name| table_meta.columns.get_index_of(name))
-                .collect();
-            let ck_indices: Vec<usize> = table_meta
-                .clustering_key
-                .iter()
-                .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
-                .collect();
-            let storage_to_table = storage_to_table_indices(table_meta);
-            let rows = bridge::partition_to_rows_with_storage_mapping(
-                &partition,
-                &all_col_names,
-                &all_col_types,
-                &pk_indices,
-                &ck_indices,
-                &storage_to_table,
-            );
-            let matching = if ck_values.is_empty() {
-                rows.into_iter().next()
-            } else {
-                rows.into_iter().find(|row| {
-                    ck_indices
-                        .iter()
-                        .zip(ck_values.iter())
-                        .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
-                })
-            };
-            matching
-        } else {
-            None
+        let target = LwtRow {
+            ks,
+            table_meta,
+            table_id: &table_id,
+            key: &decorated_key,
+            ck_values: &ck_values,
         };
-
-        if let Some(ref existing) = existing_row {
+        if let Some(existing) = read_lwt_row(state, &target).await? {
             // Row already exists — return [applied] = false with existing row data
-            return Ok(encode_lwt_applied(
+            return encode_lwt_applied(
                 false,
                 ks,
                 &s.table,
                 table_meta,
                 &state.schema,
-                Some(existing),
-            ));
+                Some(existing.as_slice()),
+            );
         }
     }
 
@@ -8335,14 +8509,7 @@ async fn route_insert(
 
     if s.if_not_exists {
         // Insert was applied — return [applied] = true
-        Ok(encode_lwt_applied(
-            true,
-            ks,
-            &s.table,
-            table_meta,
-            &state.schema,
-            None,
-        ))
+        encode_lwt_applied(true, ks, &s.table, table_meta, &state.schema, None)
     } else {
         Ok(result::encode_void())
     }
@@ -8436,6 +8603,57 @@ fn route_update_virtual_table(
     Ok(result::encode_void())
 }
 
+/// Authorize a DML write on `ks.table`.
+///
+/// Every write needs MODIFY. A *conditional* write (`IF NOT EXISTS`,
+/// `IF EXISTS`, `IF <cond>`) additionally needs SELECT: the outcome of the
+/// condition (`[applied]`, and on failure the current row) is a read of the
+/// table, so a MODIFY-only principal could otherwise probe row existence and
+/// contents (JB-I2, t_9d641778).
+///
+/// This fails closed. It must run BEFORE anything reads the row or evaluates
+/// the condition, and a rejection carries no row data and is identical whether
+/// or not the row exists, so the response reveals nothing about the table.
+fn check_write_permission(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    ks: &str,
+    table: &str,
+    conditional: bool,
+) -> Result<(), CqlError> {
+    let resource = Resource::Table(ks.to_string(), table.to_string());
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Modify, &resource)?;
+    if conditional {
+        state
+            .schema
+            .check_permission(ctx.auth, Permission::Select, &resource)?;
+    }
+    Ok(())
+}
+
+/// Fail-closed authorization for a conditional INSERT/UPDATE/DELETE, applied at
+/// the top of dispatch. A no-op for every other statement (their handlers
+/// authorize themselves). See [`check_write_permission`].
+fn authorize_conditional_statement(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+) -> Result<(), CqlError> {
+    if crate::accord_router::classify_lwt(stmt).is_none() {
+        return Ok(());
+    }
+    let (ks_opt, table) = match stmt {
+        Statement::Insert(s) => (&s.keyspace, &s.table),
+        Statement::Update(s) => (&s.keyspace, &s.table),
+        Statement::Delete(s) => (&s.keyspace, &s.table),
+        _ => return Ok(()),
+    };
+    let ks = resolve_keyspace(ks_opt, ctx.current_keyspace)?;
+    check_write_permission(state, ctx, ks, table, true)
+}
+
 /// Encode a lightweight-transaction `[applied]` result.
 ///
 /// Cassandra semantics:
@@ -8452,15 +8670,15 @@ fn encode_lwt_applied(
     table_meta: &TableMetadata,
     schema: &Schema,
     existing_row: Option<&[Option<CqlValue>]>,
-) -> BytesMut {
+) -> Result<BytesMut, CqlError> {
     if applied {
-        return result::encode_rows(
+        return Ok(result::encode_rows(
             &["[applied]".to_string()],
             &[CqlType::Boolean],
             keyspace,
             table,
             &[vec![Some(CqlValue::Boolean(true))]],
-        );
+        ));
     }
 
     let mut col_names = vec!["[applied]".to_string()];
@@ -8469,13 +8687,120 @@ fn encode_lwt_applied(
 
     for (i, (name, cm)) in table_meta.columns.iter().enumerate() {
         col_names.push(name.clone());
-        let cql_type = resolve_col_type(&cm.column_type, keyspace, schema).unwrap_or(CqlType::Blob);
+        // An unresolvable column type is an error, never silently a blob.
+        let cql_type = resolve_col_type(&cm.column_type, keyspace, schema)?;
         col_types.push(cql_type);
         let val = existing_row.and_then(|r| r.get(i)).and_then(|v| v.clone());
         row.push(val);
     }
 
-    result::encode_rows(&col_names, &col_types, keyspace, table, &[row])
+    Ok(result::encode_rows(
+        &col_names,
+        &col_types,
+        keyspace,
+        table,
+        &[row],
+    ))
+}
+
+/// The row a standalone conditional statement targets.
+struct LwtRow<'a> {
+    ks: &'a str,
+    table_meta: &'a TableMetadata,
+    table_id: &'a TableId,
+    key: &'a ferrosa_common::DecoratedKey,
+    ck_values: &'a [CqlValue],
+}
+
+/// Read the single row `target` addresses, as values in table-column order.
+///
+/// Reads the target partition through the write path and picks the one row
+/// matching the clustering key; nothing is retained beyond that row.
+async fn read_lwt_row(
+    state: &SharedState,
+    target: &LwtRow<'_>,
+) -> Result<Option<Vec<Option<CqlValue>>>, CqlError> {
+    let meta = target.table_meta;
+    let Some(partition) = state
+        .write_path
+        .load()
+        .read(target.table_id, target.key)
+        .await
+        .map_err(|e| CqlError::ServerError(format!("{e}")))?
+    else {
+        return Ok(None);
+    };
+    let names: Vec<String> = meta.columns.keys().cloned().collect();
+    let types: Vec<CqlType> = meta
+        .columns
+        .values()
+        .map(|c| resolve_col_type(&c.column_type, target.ks, &state.schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pk_idx: Vec<usize> = meta
+        .partition_key
+        .iter()
+        .filter_map(|n| meta.columns.get_index_of(n))
+        .collect();
+    let ck_idx: Vec<usize> = meta
+        .clustering_key
+        .iter()
+        .filter_map(|(n, _)| meta.columns.get_index_of(n))
+        .collect();
+    let rows = bridge::partition_to_rows_with_storage_mapping(
+        &partition,
+        &names,
+        &types,
+        &pk_idx,
+        &ck_idx,
+        &storage_to_table_indices(meta),
+    )
+    .map_err(|e| {
+        CqlError::CorruptCell(e.in_table(format!("{}.{}", target.ks, target.table_id.table)))
+    })?;
+    Ok(rows.into_iter().find(|row| {
+        ck_idx
+            .iter()
+            .zip(target.ck_values)
+            .all(|(&i, want)| row.get(i).and_then(|v| v.as_ref()) == Some(want))
+    }))
+}
+
+/// Evaluate a standalone `IF` clause against the current row.
+///
+/// The caller MUST hold [`crate::local_lwt::lock_partition`] for the row's
+/// partition until its write lands, which is what makes read-evaluate-write
+/// atomic on a node without Accord. Returns `Some(frame)` (`[applied]=false`
+/// plus the current values) when the condition fails and the write must not
+/// happen; `None` when it holds. The evaluator is the same
+/// [`crate::accord_router::eval_if_conditions`] the cluster path gates on.
+async fn eval_local_condition(
+    state: &SharedState,
+    target: &LwtRow<'_>,
+    conditions: &[IfCondition],
+    if_exists: bool,
+) -> Result<Option<BytesMut>, CqlError> {
+    let existing = read_lwt_row(state, target).await?;
+    let as_map: Option<HashMap<String, Option<CqlValue>>> = existing.as_ref().map(|row| {
+        target
+            .table_meta
+            .columns
+            .keys()
+            .cloned()
+            .zip(row.iter().cloned())
+            .collect()
+    });
+    let verdict = crate::accord_router::eval_if_conditions(conditions, if_exists, as_map.as_ref());
+    if verdict.applied {
+        return Ok(None);
+    }
+    Ok(Some(encode_lwt_applied(
+        false,
+        target.ks,
+        &target.table_id.table,
+        target.table_meta,
+        &state.schema,
+        existing.as_deref(),
+    )?))
 }
 
 // ── UPDATE ───────────────────────────────────────────────────────────────
@@ -8487,14 +8812,21 @@ async fn route_update(
 ) -> Result<BytesMut, CqlError> {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    // Permission check (M8)
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+    // Permission check (M8); conditional updates also need SELECT (fail closed).
+    check_write_permission(
+        state,
+        ctx,
+        ks,
+        &s.table,
+        s.if_exists || !s.if_conditions.is_empty(),
     )?;
 
     if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
+        if s.if_exists || !s.if_conditions.is_empty() {
+            return Err(CqlError::ConditionalUnsupported {
+                scope: "an UPDATE of a virtual table",
+            });
+        }
         return route_update_virtual_table(ctx, vtable.as_ref(), &s);
     }
 
@@ -8548,6 +8880,29 @@ async fn route_update(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let table_id = TableId::new(ks, &s.table);
 
+    // Standalone LWT: the IF clause is decided against the current row while
+    // holding the partition lock, which is kept until the write below lands.
+    let conditional = s.if_exists || !s.if_conditions.is_empty();
+    let _lwt_guard = if conditional {
+        Some(crate::local_lwt::lock_partition(&table_id, &decorated_key).await)
+    } else {
+        None
+    };
+    if conditional {
+        let target = LwtRow {
+            ks,
+            table_meta,
+            table_id: &table_id,
+            key: &decorated_key,
+            ck_values: &ck_values,
+        };
+        if let Some(not_applied) =
+            eval_local_condition(state, &target, &s.if_conditions, s.if_exists).await?
+        {
+            return Ok(not_applied);
+        }
+    }
+
     // Check if any assignments require a read-modify-write (collection +/- or counter)
     let needs_read = s
         .assignments
@@ -8588,7 +8943,7 @@ async fn route_update(
                 &pk_indices,
                 &ck_indices,
                 &storage_to_table,
-            );
+            )?;
             // Find the row matching our CK values
             if ck_values.is_empty() {
                 rows.into_iter().next()
@@ -8637,7 +8992,33 @@ async fn route_update(
             // A Sub on a map removes keys given as a set; other ops use the column type.
             let rhs_type = match (&cql_type, is_add) {
                 (CqlType::Map(k, _), false) => CqlType::Set(k.clone()),
-                _ => cql_type.clone(),
+                (CqlType::Ascii, _)
+                | (CqlType::Bigint, _)
+                | (CqlType::Blob, _)
+                | (CqlType::Boolean, _)
+                | (CqlType::Counter, _)
+                | (CqlType::Decimal, _)
+                | (CqlType::Double, _)
+                | (CqlType::Float, _)
+                | (CqlType::Int, _)
+                | (CqlType::Timestamp, _)
+                | (CqlType::Uuid, _)
+                | (CqlType::Varchar, _)
+                | (CqlType::Varint, _)
+                | (CqlType::Timeuuid, _)
+                | (CqlType::Inet, _)
+                | (CqlType::Date, _)
+                | (CqlType::Time, _)
+                | (CqlType::Smallint, _)
+                | (CqlType::Tinyint, _)
+                | (CqlType::Duration, _)
+                | (CqlType::List(_), _)
+                | (CqlType::Map(_, _), _)
+                | (CqlType::Set(_), _)
+                | (CqlType::Tuple(_), _)
+                | (CqlType::Jsonb, _)
+                | (CqlType::Udt { .. }, _)
+                | (CqlType::Vector(_, _), _) => cql_type.clone(),
             };
             if let Ok(rhs) = bridge::term_to_cql_value(value, &rhs_type) {
                 if let Ok(cells) =
@@ -8688,7 +9069,33 @@ async fn route_update(
                                 .and_then(|v| v.as_ref())
                                 .and_then(|v| match v {
                                     CqlValue::Counter(c) => Some(*c),
-                                    _ => None,
+                                    CqlValue::Null
+                                    | CqlValue::Ascii(_)
+                                    | CqlValue::Bigint(_)
+                                    | CqlValue::Blob(_)
+                                    | CqlValue::Boolean(_)
+                                    | CqlValue::Decimal { .. }
+                                    | CqlValue::Double(_)
+                                    | CqlValue::Float(_)
+                                    | CqlValue::Int(_)
+                                    | CqlValue::Timestamp(_)
+                                    | CqlValue::Uuid(_)
+                                    | CqlValue::Text(_)
+                                    | CqlValue::Varint(_)
+                                    | CqlValue::Timeuuid(_)
+                                    | CqlValue::Inet(_)
+                                    | CqlValue::Date(_)
+                                    | CqlValue::Time(_)
+                                    | CqlValue::Smallint(_)
+                                    | CqlValue::Tinyint(_)
+                                    | CqlValue::Duration { .. }
+                                    | CqlValue::List(_)
+                                    | CqlValue::Set(_)
+                                    | CqlValue::Map(_)
+                                    | CqlValue::Tuple(_)
+                                    | CqlValue::Vector(_)
+                                    | CqlValue::Jsonb(_)
+                                    | CqlValue::Udt(_) => None,
                                 })
                                 .unwrap_or(0);
                             (column.as_str(), CqlValue::Counter(current + n))
@@ -8698,7 +9105,32 @@ async fn route_update(
                             ));
                         }
                     }
-                    _ => {
+                    CqlType::Ascii
+                    | CqlType::Bigint
+                    | CqlType::Blob
+                    | CqlType::Boolean
+                    | CqlType::Decimal
+                    | CqlType::Double
+                    | CqlType::Float
+                    | CqlType::Int
+                    | CqlType::Timestamp
+                    | CqlType::Uuid
+                    | CqlType::Varchar
+                    | CqlType::Varint
+                    | CqlType::Timeuuid
+                    | CqlType::Inet
+                    | CqlType::Date
+                    | CqlType::Time
+                    | CqlType::Smallint
+                    | CqlType::Tinyint
+                    | CqlType::Duration
+                    | CqlType::List(_)
+                    | CqlType::Map(_, _)
+                    | CqlType::Set(_)
+                    | CqlType::Tuple(_)
+                    | CqlType::Udt { .. }
+                    | CqlType::Jsonb
+                    | CqlType::Vector(_, _) => {
                         let new_val = bridge::term_to_cql_value(value, &cql_type)?;
                         let col_table_idx = table_meta
                             .columns
@@ -8734,7 +9166,33 @@ async fn route_update(
                                 .and_then(|v| v.as_ref())
                                 .and_then(|v| match v {
                                     CqlValue::Counter(c) => Some(*c),
-                                    _ => None,
+                                    CqlValue::Null
+                                    | CqlValue::Ascii(_)
+                                    | CqlValue::Bigint(_)
+                                    | CqlValue::Blob(_)
+                                    | CqlValue::Boolean(_)
+                                    | CqlValue::Decimal { .. }
+                                    | CqlValue::Double(_)
+                                    | CqlValue::Float(_)
+                                    | CqlValue::Int(_)
+                                    | CqlValue::Timestamp(_)
+                                    | CqlValue::Uuid(_)
+                                    | CqlValue::Text(_)
+                                    | CqlValue::Varint(_)
+                                    | CqlValue::Timeuuid(_)
+                                    | CqlValue::Inet(_)
+                                    | CqlValue::Date(_)
+                                    | CqlValue::Time(_)
+                                    | CqlValue::Smallint(_)
+                                    | CqlValue::Tinyint(_)
+                                    | CqlValue::Duration { .. }
+                                    | CqlValue::List(_)
+                                    | CqlValue::Set(_)
+                                    | CqlValue::Map(_)
+                                    | CqlValue::Tuple(_)
+                                    | CqlValue::Vector(_)
+                                    | CqlValue::Jsonb(_)
+                                    | CqlValue::Udt(_) => None,
                                 })
                                 .unwrap_or(0);
                             (column.as_str(), CqlValue::Counter(current - n))
@@ -8759,7 +9217,31 @@ async fn route_update(
                         let merged = collection_sub_map(existing, &keys_to_remove);
                         (column.as_str(), merged)
                     }
-                    _ => {
+                    CqlType::Ascii
+                    | CqlType::Bigint
+                    | CqlType::Blob
+                    | CqlType::Boolean
+                    | CqlType::Decimal
+                    | CqlType::Double
+                    | CqlType::Float
+                    | CqlType::Int
+                    | CqlType::Timestamp
+                    | CqlType::Uuid
+                    | CqlType::Varchar
+                    | CqlType::Varint
+                    | CqlType::Timeuuid
+                    | CqlType::Inet
+                    | CqlType::Date
+                    | CqlType::Time
+                    | CqlType::Smallint
+                    | CqlType::Tinyint
+                    | CqlType::Duration
+                    | CqlType::List(_)
+                    | CqlType::Set(_)
+                    | CqlType::Tuple(_)
+                    | CqlType::Udt { .. }
+                    | CqlType::Jsonb
+                    | CqlType::Vector(_, _) => {
                         // Set/list subtraction: remove matching elements.
                         let to_remove = bridge::term_to_cql_value(value, &cql_type)?;
                         let col_table_idx = table_meta
@@ -8803,7 +9285,31 @@ async fn route_update(
                             "column '{column}': list index updates require a read-modify-write path"
                         )));
                     }
-                    _ => {
+                    CqlType::Ascii
+                    | CqlType::Bigint
+                    | CqlType::Blob
+                    | CqlType::Boolean
+                    | CqlType::Counter
+                    | CqlType::Decimal
+                    | CqlType::Double
+                    | CqlType::Float
+                    | CqlType::Int
+                    | CqlType::Timestamp
+                    | CqlType::Uuid
+                    | CqlType::Varchar
+                    | CqlType::Varint
+                    | CqlType::Timeuuid
+                    | CqlType::Inet
+                    | CqlType::Date
+                    | CqlType::Time
+                    | CqlType::Smallint
+                    | CqlType::Tinyint
+                    | CqlType::Duration
+                    | CqlType::Set(_)
+                    | CqlType::Tuple(_)
+                    | CqlType::Jsonb
+                    | CqlType::Udt { .. }
+                    | CqlType::Vector(_, _) => {
                         return Err(CqlError::Invalid(format!(
                             "column '{column}' does not support element updates"
                         )));
@@ -8858,6 +9364,9 @@ async fn route_update(
             &strategy,
         )
         .await?;
+    if conditional {
+        return encode_lwt_applied(true, ks, &s.table, table_meta, &state.schema, None);
+    }
     Ok(result::encode_void())
 }
 
@@ -8895,7 +9404,34 @@ fn collection_add(existing: Option<&CqlValue>, new_val: &CqlValue) -> CqlValue {
             CqlValue::Map(merged)
         }
         (None, _) => new_val.clone(),
-        _ => new_val.clone(),
+        (Some(CqlValue::Null), _)
+        | (Some(CqlValue::Ascii(_)), _)
+        | (Some(CqlValue::Bigint(_)), _)
+        | (Some(CqlValue::Blob(_)), _)
+        | (Some(CqlValue::Boolean(_)), _)
+        | (Some(CqlValue::Counter(_)), _)
+        | (Some(CqlValue::Decimal { .. }), _)
+        | (Some(CqlValue::Double(_)), _)
+        | (Some(CqlValue::Float(_)), _)
+        | (Some(CqlValue::Int(_)), _)
+        | (Some(CqlValue::Timestamp(_)), _)
+        | (Some(CqlValue::Uuid(_)), _)
+        | (Some(CqlValue::Text(_)), _)
+        | (Some(CqlValue::Varint(_)), _)
+        | (Some(CqlValue::Timeuuid(_)), _)
+        | (Some(CqlValue::Inet(_)), _)
+        | (Some(CqlValue::Date(_)), _)
+        | (Some(CqlValue::Time(_)), _)
+        | (Some(CqlValue::Smallint(_)), _)
+        | (Some(CqlValue::Tinyint(_)), _)
+        | (Some(CqlValue::Duration { .. }), _)
+        | (Some(CqlValue::List(_)), _)
+        | (Some(CqlValue::Set(_)), _)
+        | (Some(CqlValue::Map(_)), _)
+        | (Some(CqlValue::Tuple(_)), _)
+        | (Some(CqlValue::Vector(_)), _)
+        | (Some(CqlValue::Jsonb(_)), _)
+        | (Some(CqlValue::Udt(_)), _) => new_val.clone(),
     }
 }
 
@@ -8955,11 +9491,13 @@ async fn route_delete(
 ) -> Result<BytesMut, CqlError> {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    // Permission check (M8)
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+    // Permission check (M8); conditional deletes also need SELECT (fail closed).
+    check_write_permission(
+        state,
+        ctx,
+        ks,
+        &s.table,
+        s.if_exists || !s.if_conditions.is_empty(),
     )?;
 
     let snap = state.schema.snapshot();
@@ -9029,6 +9567,29 @@ async fn route_delete(
     let table_id = TableId::new(ks, &s.table);
     let strategy = keyspace_strategy(&state.schema, ks);
 
+    // Standalone LWT: decide the IF clause under the partition lock, held
+    // until the tombstone below lands.
+    let conditional = s.if_exists || !s.if_conditions.is_empty();
+    let _lwt_guard = if conditional {
+        Some(crate::local_lwt::lock_partition(&table_id, &decorated_key).await)
+    } else {
+        None
+    };
+    if conditional {
+        let target = LwtRow {
+            ks,
+            table_meta,
+            table_id: &table_id,
+            key: &decorated_key,
+            ck_values: &ck_values,
+        };
+        if let Some(not_applied) =
+            eval_local_condition(state, &target, &s.if_conditions, s.if_exists).await?
+        {
+            return Ok(not_applied);
+        }
+    }
+
     state
         .write_path
         .load()
@@ -9041,6 +9602,9 @@ async fn route_delete(
             &strategy,
         )
         .await?;
+    if conditional {
+        return encode_lwt_applied(true, ks, &s.table, table_meta, &state.schema, None);
+    }
     Ok(result::encode_void())
 }
 
@@ -9059,6 +9623,25 @@ async fn route_batch(
             b.statements.len(),
             max_batch
         )));
+    }
+
+    // Authorize first (D22, fail closed): every conditional member needs
+    // SELECT+MODIFY, and Unauthorized takes precedence over any other verdict.
+    for member in &b.statements {
+        authorize_conditional_statement(state, ctx, member)?;
+    }
+
+    // Conditional batches (all conditions on one partition, applied atomically)
+    // are not implemented on this path. Reject before anything is written: the
+    // batch paths below never evaluate a condition, so accepting one would
+    // apply the mutations unconditionally while reporting success.
+    if b.statements
+        .iter()
+        .any(|s| crate::accord_router::classify_lwt(s).is_some())
+    {
+        return Err(CqlError::ConditionalUnsupported {
+            scope: "a BATCH statement",
+        });
     }
 
     match b.batch_type {
@@ -9215,11 +9798,7 @@ fn materialize_insert(
 > {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
-    )?;
+    check_write_permission(state, ctx, ks, &s.table, s.if_not_exists)?;
 
     let snap = state.schema.snapshot();
     let table_meta = snap
@@ -9315,10 +9894,12 @@ fn materialize_update(
 > {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+    check_write_permission(
+        state,
+        ctx,
+        ks,
+        &s.table,
+        s.if_exists || !s.if_conditions.is_empty(),
     )?;
 
     let snap = state.schema.snapshot();
@@ -9508,10 +10089,12 @@ fn materialize_delete(
 > {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
 
-    state.schema.check_permission(
-        ctx.auth,
-        Permission::Modify,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+    check_write_permission(
+        state,
+        ctx,
+        ks,
+        &s.table,
+        s.if_exists || !s.if_conditions.is_empty(),
     )?;
 
     let snap = state.schema.snapshot();
@@ -9917,6 +10500,10 @@ async fn route_create_table(
         is_system: false,
     };
 
+    // T-154a: refuse jsonb in key positions before any path (direct, pair or
+    // Raft) sees the statement.
+    state.schema.check_create_table_jsonb(&table_meta)?;
+
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
@@ -10179,6 +10766,11 @@ async fn route_alter_table(
         extensions,
     };
 
+    // T-154a: refuse forbidden jsonb before any path sees the statement.
+    state
+        .schema
+        .check_alter_table_jsonb(ks, &s.table, &updates)?;
+
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
@@ -10391,7 +10983,22 @@ fn filter_value_to_term(value: &str, cql_type: &CqlType) -> Result<Term, CqlErro
         }
         // Text, inet, timestamps-as-strings, uuid, blob, dates, etc. all accept
         // a string literal and parse it in `term_to_cql_value`.
-        _ => Ok(Term::StringLiteral(value.to_string())),
+        CqlType::Ascii
+        | CqlType::Blob
+        | CqlType::Uuid
+        | CqlType::Varchar
+        | CqlType::Timeuuid
+        | CqlType::Inet
+        | CqlType::Date
+        | CqlType::Time
+        | CqlType::Duration
+        | CqlType::List(_)
+        | CqlType::Map(_, _)
+        | CqlType::Set(_)
+        | CqlType::Tuple(_)
+        | CqlType::Jsonb
+        | CqlType::Udt { .. }
+        | CqlType::Vector(_, _) => Ok(Term::StringLiteral(value.to_string())),
     }
 }
 
@@ -12030,7 +12637,32 @@ fn build_column_info(
                                     // non-decimal types; close enough for now).
                                     match arg_type {
                                         CqlType::Float => CqlType::Float,
-                                        _ => CqlType::Double,
+                                        CqlType::Ascii
+                                        | CqlType::Bigint
+                                        | CqlType::Blob
+                                        | CqlType::Boolean
+                                        | CqlType::Counter
+                                        | CqlType::Decimal
+                                        | CqlType::Double
+                                        | CqlType::Int
+                                        | CqlType::Timestamp
+                                        | CqlType::Uuid
+                                        | CqlType::Varchar
+                                        | CqlType::Varint
+                                        | CqlType::Timeuuid
+                                        | CqlType::Inet
+                                        | CqlType::Date
+                                        | CqlType::Time
+                                        | CqlType::Smallint
+                                        | CqlType::Tinyint
+                                        | CqlType::Duration
+                                        | CqlType::List(_)
+                                        | CqlType::Map(_, _)
+                                        | CqlType::Set(_)
+                                        | CqlType::Tuple(_)
+                                        | CqlType::Jsonb
+                                        | CqlType::Udt { .. }
+                                        | CqlType::Vector(_, _) => CqlType::Double,
                                     }
                                 } else {
                                     // min, max, sum return the same type as the column.
@@ -12266,7 +12898,7 @@ fn try_pk_in_lookup(
                 pk_indices,
                 ck_indices,
                 storage_to_table,
-            );
+            )?;
             all_rows.append(&mut prows);
         }
     }
@@ -12757,8 +13389,36 @@ fn evaluate_where_predicates(
             let element_type = match &cql_type {
                 CqlType::List(inner) | CqlType::Set(inner) => (**inner).clone(),
                 CqlType::Map(_, val_type) => (**val_type).clone(),
-                _ => return Ok(false),
+                CqlType::Ascii
+                | CqlType::Bigint
+                | CqlType::Blob
+                | CqlType::Boolean
+                | CqlType::Counter
+                | CqlType::Decimal
+                | CqlType::Double
+                | CqlType::Float
+                | CqlType::Int
+                | CqlType::Timestamp
+                | CqlType::Uuid
+                | CqlType::Varchar
+                | CqlType::Varint
+                | CqlType::Timeuuid
+                | CqlType::Inet
+                | CqlType::Date
+                | CqlType::Time
+                | CqlType::Smallint
+                | CqlType::Tinyint
+                | CqlType::Duration
+                | CqlType::Tuple(_)
+                | CqlType::Jsonb
+                | CqlType::Udt { .. }
+                | CqlType::Vector(_, _) => return Ok(false),
             };
+            // The needle coercion below swallows errors into "no match"; a
+            // jsonb element must not vanish that way (T-150, no silent fallback).
+            if element_type == CqlType::Jsonb {
+                return Err(bridge::jsonb_unsupported("CONTAINS predicates"));
+            }
             let needle = match bridge::term_to_cql_value(&wc.value, &element_type) {
                 Ok(v) => v,
                 Err(_) => return Ok(false),
@@ -12766,7 +13426,31 @@ fn evaluate_where_predicates(
             let found = match actual {
                 CqlValue::List(items) | CqlValue::Set(items) => items.contains(&needle),
                 CqlValue::Map(entries) => entries.iter().any(|(_, v)| *v == needle),
-                _ => false,
+                CqlValue::Null
+                | CqlValue::Ascii(_)
+                | CqlValue::Bigint(_)
+                | CqlValue::Blob(_)
+                | CqlValue::Boolean(_)
+                | CqlValue::Counter(_)
+                | CqlValue::Decimal { .. }
+                | CqlValue::Double(_)
+                | CqlValue::Float(_)
+                | CqlValue::Int(_)
+                | CqlValue::Timestamp(_)
+                | CqlValue::Uuid(_)
+                | CqlValue::Text(_)
+                | CqlValue::Varint(_)
+                | CqlValue::Timeuuid(_)
+                | CqlValue::Inet(_)
+                | CqlValue::Date(_)
+                | CqlValue::Time(_)
+                | CqlValue::Smallint(_)
+                | CqlValue::Tinyint(_)
+                | CqlValue::Duration { .. }
+                | CqlValue::Tuple(_)
+                | CqlValue::Vector(_)
+                | CqlValue::Jsonb(_)
+                | CqlValue::Udt(_) => false,
             };
             if !found {
                 return Ok(false);
@@ -12776,7 +13460,32 @@ fn evaluate_where_predicates(
         if wc.op == ComparisonOp::ContainsKey {
             let key_type = match &cql_type {
                 CqlType::Map(key_type, _) => (**key_type).clone(),
-                _ => return Ok(false),
+                CqlType::Ascii
+                | CqlType::Bigint
+                | CqlType::Blob
+                | CqlType::Boolean
+                | CqlType::Counter
+                | CqlType::Decimal
+                | CqlType::Double
+                | CqlType::Float
+                | CqlType::Int
+                | CqlType::Timestamp
+                | CqlType::Uuid
+                | CqlType::Varchar
+                | CqlType::Varint
+                | CqlType::Timeuuid
+                | CqlType::Inet
+                | CqlType::Date
+                | CqlType::Time
+                | CqlType::Smallint
+                | CqlType::Tinyint
+                | CqlType::Duration
+                | CqlType::List(_)
+                | CqlType::Set(_)
+                | CqlType::Tuple(_)
+                | CqlType::Jsonb
+                | CqlType::Udt { .. }
+                | CqlType::Vector(_, _) => return Ok(false),
             };
             let needle = match bridge::term_to_cql_value(&wc.value, &key_type) {
                 Ok(v) => v,
@@ -12784,7 +13493,33 @@ fn evaluate_where_predicates(
             };
             let found = match actual {
                 CqlValue::Map(entries) => entries.iter().any(|(k, _)| *k == needle),
-                _ => false,
+                CqlValue::Null
+                | CqlValue::Ascii(_)
+                | CqlValue::Bigint(_)
+                | CqlValue::Blob(_)
+                | CqlValue::Boolean(_)
+                | CqlValue::Counter(_)
+                | CqlValue::Decimal { .. }
+                | CqlValue::Double(_)
+                | CqlValue::Float(_)
+                | CqlValue::Int(_)
+                | CqlValue::Timestamp(_)
+                | CqlValue::Uuid(_)
+                | CqlValue::Text(_)
+                | CqlValue::Varint(_)
+                | CqlValue::Timeuuid(_)
+                | CqlValue::Inet(_)
+                | CqlValue::Date(_)
+                | CqlValue::Time(_)
+                | CqlValue::Smallint(_)
+                | CqlValue::Tinyint(_)
+                | CqlValue::Duration { .. }
+                | CqlValue::List(_)
+                | CqlValue::Set(_)
+                | CqlValue::Tuple(_)
+                | CqlValue::Vector(_)
+                | CqlValue::Jsonb(_)
+                | CqlValue::Udt(_) => false,
             };
             if !found {
                 return Ok(false);
@@ -12825,7 +13560,34 @@ fn evaluate_where_predicates(
                 // (e.g., "John Smith" matches "Jon Smyth").
                 match (actual, &expected) {
                     (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
-                    _ => *actual == expected,
+                    (CqlValue::Null, _)
+                    | (CqlValue::Ascii(_), _)
+                    | (CqlValue::Bigint(_), _)
+                    | (CqlValue::Blob(_), _)
+                    | (CqlValue::Boolean(_), _)
+                    | (CqlValue::Counter(_), _)
+                    | (CqlValue::Decimal { .. }, _)
+                    | (CqlValue::Double(_), _)
+                    | (CqlValue::Float(_), _)
+                    | (CqlValue::Int(_), _)
+                    | (CqlValue::Timestamp(_), _)
+                    | (CqlValue::Uuid(_), _)
+                    | (CqlValue::Text(_), _)
+                    | (CqlValue::Varint(_), _)
+                    | (CqlValue::Timeuuid(_), _)
+                    | (CqlValue::Inet(_), _)
+                    | (CqlValue::Date(_), _)
+                    | (CqlValue::Time(_), _)
+                    | (CqlValue::Smallint(_), _)
+                    | (CqlValue::Tinyint(_), _)
+                    | (CqlValue::Duration { .. }, _)
+                    | (CqlValue::List(_), _)
+                    | (CqlValue::Set(_), _)
+                    | (CqlValue::Map(_), _)
+                    | (CqlValue::Tuple(_), _)
+                    | (CqlValue::Vector(_), _)
+                    | (CqlValue::Jsonb(_), _)
+                    | (CqlValue::Udt(_), _) => *actual == expected,
                 }
             }
             ComparisonOp::Eq => *actual == expected,
@@ -12836,11 +13598,65 @@ fn evaluate_where_predicates(
             ComparisonOp::Le => *actual <= expected,
             ComparisonOp::SoundsLike => match (actual, &expected) {
                 (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
-                _ => false,
+                (CqlValue::Null, _)
+                | (CqlValue::Ascii(_), _)
+                | (CqlValue::Bigint(_), _)
+                | (CqlValue::Blob(_), _)
+                | (CqlValue::Boolean(_), _)
+                | (CqlValue::Counter(_), _)
+                | (CqlValue::Decimal { .. }, _)
+                | (CqlValue::Double(_), _)
+                | (CqlValue::Float(_), _)
+                | (CqlValue::Int(_), _)
+                | (CqlValue::Timestamp(_), _)
+                | (CqlValue::Uuid(_), _)
+                | (CqlValue::Text(_), _)
+                | (CqlValue::Varint(_), _)
+                | (CqlValue::Timeuuid(_), _)
+                | (CqlValue::Inet(_), _)
+                | (CqlValue::Date(_), _)
+                | (CqlValue::Time(_), _)
+                | (CqlValue::Smallint(_), _)
+                | (CqlValue::Tinyint(_), _)
+                | (CqlValue::Duration { .. }, _)
+                | (CqlValue::List(_), _)
+                | (CqlValue::Set(_), _)
+                | (CqlValue::Map(_), _)
+                | (CqlValue::Tuple(_), _)
+                | (CqlValue::Vector(_), _)
+                | (CqlValue::Jsonb(_), _)
+                | (CqlValue::Udt(_), _) => false,
             },
             ComparisonOp::Like => match (actual, &expected) {
                 (CqlValue::Text(a), CqlValue::Text(b)) => like_match(a, b),
-                _ => false,
+                (CqlValue::Null, _)
+                | (CqlValue::Ascii(_), _)
+                | (CqlValue::Bigint(_), _)
+                | (CqlValue::Blob(_), _)
+                | (CqlValue::Boolean(_), _)
+                | (CqlValue::Counter(_), _)
+                | (CqlValue::Decimal { .. }, _)
+                | (CqlValue::Double(_), _)
+                | (CqlValue::Float(_), _)
+                | (CqlValue::Int(_), _)
+                | (CqlValue::Timestamp(_), _)
+                | (CqlValue::Uuid(_), _)
+                | (CqlValue::Text(_), _)
+                | (CqlValue::Varint(_), _)
+                | (CqlValue::Timeuuid(_), _)
+                | (CqlValue::Inet(_), _)
+                | (CqlValue::Date(_), _)
+                | (CqlValue::Time(_), _)
+                | (CqlValue::Smallint(_), _)
+                | (CqlValue::Tinyint(_), _)
+                | (CqlValue::Duration { .. }, _)
+                | (CqlValue::List(_), _)
+                | (CqlValue::Set(_), _)
+                | (CqlValue::Map(_), _)
+                | (CqlValue::Tuple(_), _)
+                | (CqlValue::Vector(_), _)
+                | (CqlValue::Jsonb(_), _)
+                | (CqlValue::Udt(_), _) => false,
             },
             ComparisonOp::In => unreachable!("IN handled above"),
             ComparisonOp::Contains | ComparisonOp::ContainsKey => {
@@ -13321,7 +14137,27 @@ fn cql_value_to_f64(val: &CqlValue) -> Option<f64> {
         CqlValue::Float(bits) => Some(f64::from(f32::from_bits(*bits))),
         CqlValue::Double(bits) => Some(f64::from_bits(*bits)),
         CqlValue::Counter(v) => Some(*v as f64),
-        _ => None,
+        CqlValue::Null
+        | CqlValue::Ascii(_)
+        | CqlValue::Blob(_)
+        | CqlValue::Boolean(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Timestamp(_)
+        | CqlValue::Uuid(_)
+        | CqlValue::Text(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Timeuuid(_)
+        | CqlValue::Inet(_)
+        | CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Duration { .. }
+        | CqlValue::List(_)
+        | CqlValue::Set(_)
+        | CqlValue::Map(_)
+        | CqlValue::Tuple(_)
+        | CqlValue::Vector(_)
+        | CqlValue::Jsonb(_)
+        | CqlValue::Udt(_) => None,
     }
 }
 
@@ -13341,7 +14177,27 @@ fn f64_to_cql_aggregate(val: f64, col_type: &CqlType) -> CqlValue {
         CqlType::Bigint | CqlType::Counter => CqlValue::Bigint(val as i64),
         CqlType::Float => CqlValue::Float((val as f32).to_bits()),
         // Default to Double for any other numeric or unknown type.
-        _ => CqlValue::Double(val.to_bits()),
+        CqlType::Ascii
+        | CqlType::Blob
+        | CqlType::Boolean
+        | CqlType::Decimal
+        | CqlType::Double
+        | CqlType::Timestamp
+        | CqlType::Uuid
+        | CqlType::Varchar
+        | CqlType::Varint
+        | CqlType::Timeuuid
+        | CqlType::Inet
+        | CqlType::Date
+        | CqlType::Time
+        | CqlType::Duration
+        | CqlType::List(_)
+        | CqlType::Map(_, _)
+        | CqlType::Set(_)
+        | CqlType::Tuple(_)
+        | CqlType::Jsonb
+        | CqlType::Udt { .. }
+        | CqlType::Vector(_, _) => CqlValue::Double(val.to_bits()),
     }
 }
 
@@ -13747,6 +14603,12 @@ async fn route_create_type(
         name: name.clone(),
         fields: resolved_fields,
     };
+
+    // T-300: a field that is or nests jsonb is standalone-only until D15a.
+    // Refused at entry, before any path (direct, pair or Raft) sees it.
+    state
+        .schema
+        .check_create_type_jsonb(&ks, &name, &udt.fields)?;
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
@@ -17609,6 +18471,156 @@ mod tests {
         );
     }
 
+    /// Seed `cc_ks.t (id int PRIMARY KEY, v text)` with a healthy row (id=1) and
+    /// a row (id=2) whose `v` cell is invalid UTF-8: corrupt for a text column
+    /// (the engine rejects wrong-width fixed types at write, not bad text).
+    async fn seed_corrupt_text_cell(state: &SharedState, ctx: &RequestContext<'_>) {
+        for cql in [
+            "CREATE KEYSPACE cc_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE cc_ks.t (id int PRIMARY KEY, v text)",
+            "INSERT INTO cc_ks.t (id, v) VALUES (1, 'ok')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(state, ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let key = bridge::build_decorated_key(&[CqlValue::Int(2)], &[CqlType::Int]).unwrap();
+        let row = ferrosa_sstable::Row {
+            clustering: vec![],
+            cells: vec![(
+                0,
+                ferrosa_common::CellValue::live(vec![0xff, 0xfe], 5_000_000),
+            )],
+            deletion: ferrosa_sstable::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::LivenessInfo::with_timestamp(5_000_000),
+        };
+        let tid = TableId::new("cc_ks", "t");
+        state.engine.write(&tid, &key, row, 5_000_000).unwrap();
+    }
+
+    /// CQL-Tcf7ca2cc: a partition with one corrupt simple cell fails the SELECT
+    /// with a server error that names the table; it is not a row with a NULL.
+    #[tokio::test]
+    async fn corrupt_simple_cell_fails_select_and_names_the_table() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_corrupt_text_cell(&state, &ctx).await;
+
+        for cql in [
+            "SELECT * FROM cc_ks.t",
+            "SELECT id, v FROM cc_ks.t WHERE id = 2",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            let err = match route(&state, &ctx, stmt).await {
+                Err(e) => e,
+                Ok(_) => panic!("{cql}: a corrupt cell must fail the read, not return a NULL"),
+            };
+            let CqlError::CorruptCell(inner) = &err else {
+                panic!("{cql}: expected CorruptCell, got {err:?}");
+            };
+            assert_eq!(inner.table(), Some("cc_ks.t"), "{cql}");
+            assert_eq!(inner.column(), "v", "{cql}");
+            assert_eq!(err.error_code(), 0x0000, "server error, not a client error");
+        }
+    }
+
+    /// T-151 (FM-07, FM-90): jsonb cells corrupted at the storage level are
+    /// refused by SELECT with a typed `CorruptCell` server error, never a NULL.
+    /// The unknown envelope is its own fault; a nested jsonb corrupts the same way.
+    #[tokio::test]
+    async fn corrupt_jsonb_cells_fail_select_with_typed_fault() {
+        use ferrosa_row_bridge::JsonbFault;
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE cj_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE cj_ks.t (id int PRIMARY KEY, v jsonb, l list<jsonb>)",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        let mut nested = 1i32.to_be_bytes().to_vec();
+        nested.extend_from_slice(&3i32.to_be_bytes());
+        nested.extend_from_slice(&[0xf2, 0, 0]);
+        // Storage columns sort by name: l = 0, v = 1.
+        // (id, storage column, bytes, expected unknown-envelope?)
+        let cases: [(i32, u16, Vec<u8>, bool); 4] = [
+            (1, 1, vec![0xf2, 1, 2, 3], true),
+            (2, 1, vec![], false),
+            (3, 1, b"{\"a\":1}".to_vec(), true),
+            (4, 0, nested, true),
+        ];
+        for (id, col, bytes, unknown) in cases {
+            let key = bridge::build_decorated_key(&[CqlValue::Int(id)], &[CqlType::Int]).unwrap();
+            let row = ferrosa_sstable::Row {
+                clustering: vec![],
+                cells: vec![(col, ferrosa_common::CellValue::live(bytes, 5_000_000))],
+                deletion: ferrosa_sstable::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::LivenessInfo::with_timestamp(5_000_000),
+            };
+            let tid = TableId::new("cj_ks", "t");
+            state.engine.write(&tid, &key, row, 5_000_000).unwrap();
+
+            let cql = format!("SELECT * FROM cj_ks.t WHERE id = {id}");
+            let stmt = crate::parser::parse(&cql).unwrap();
+            let err = match route(&state, &ctx, stmt).await {
+                Err(e) => e,
+                Ok(_) => panic!("{cql}: a corrupt jsonb cell must fail the read, not return NULL"),
+            };
+            let CqlError::CorruptCell(inner) = &err else {
+                panic!("{cql}: expected CorruptCell, got {err:?}");
+            };
+            assert_eq!(inner.table(), Some("cj_ks.t"), "{cql}");
+            assert_eq!(err.error_code(), 0x0000, "server error, not a client error");
+            match inner.jsonb_fault() {
+                Some(JsonbFault::UnknownEnvelope { .. }) => assert!(unknown, "{cql}"),
+                Some(JsonbFault::CorruptJsonb { .. }) => assert!(!unknown, "{cql}"),
+                None => panic!("{cql}: no typed jsonb fault: {inner}"),
+            }
+        }
+    }
+
+    /// An uncorrupted read of the same table is unchanged.
+    #[tokio::test]
+    async fn uncorrupted_row_in_same_table_still_reads() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_corrupt_text_cell(&state, &ctx).await;
+
+        let stmt = crate::parser::parse("SELECT id, v FROM cc_ks.t WHERE id = 1").unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(extract_row_count(&body), 1);
+    }
+
     /// Dogfooding parity: `CREATE TYPE` persists a `system_schema.types` row
     /// and `SELECT * FROM system_schema.types` is served from that stored row
     /// (not the in-memory Registry or the retired virtual table).
@@ -19962,6 +20974,172 @@ mod tests {
             "frozen<UDT> in list must parse, got: {:?}",
             stmt.err()
         );
+    }
+
+    /// T-154a: run `cql` (parse + route) in keyspace `ks` and return the error.
+    async fn jsonb_ddl_error(state: &SharedState, cql: &str) -> CqlError {
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let stmt = match crate::parser::parse(cql) {
+            Ok(stmt) => stmt,
+            Err(e) => return e,
+        };
+        match route(state, &ctx_ks, stmt).await {
+            Err(e) => e,
+            Ok(_) => panic!("jsonb placement must be refused: {cql}"),
+        }
+    }
+
+    async fn jsonb_ddl_setup() -> (SharedState, tempfile::TempDir) {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        (state, dir)
+    }
+
+    /// T-154a: CQL CREATE TABLE refuses jsonb in a partition or clustering
+    /// key, nested or not, as InvalidRequest (0x2200) naming column and rule.
+    #[tokio::test]
+    async fn create_table_refuses_jsonb_in_key_as_invalid_request() {
+        let (state, _dir) = jsonb_ddl_setup().await;
+        let cases = [
+            "CREATE TABLE ks.a (doc jsonb PRIMARY KEY, v int)",
+            "CREATE TABLE ks.b (k int, doc jsonb, PRIMARY KEY (k, doc))",
+            "CREATE TABLE ks.c (doc frozen<list<jsonb>> PRIMARY KEY, v int)",
+            "CREATE TABLE ks.d (k int, doc frozen<tuple<int, jsonb>>, PRIMARY KEY (k, doc))",
+        ];
+        for cql in cases {
+            let err = jsonb_ddl_error(&state, cql).await;
+            assert_eq!(err.error_code(), 0x2200, "{cql}: {err}");
+            let msg = err.to_string();
+            assert!(msg.contains("doc") && msg.contains("jsonb"), "{cql}: {msg}");
+        }
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.ok (k int PRIMARY KEY, doc jsonb)").unwrap();
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        route(&state, &ctx_ks, stmt)
+            .await
+            .expect("jsonb in a regular column is allowed");
+    }
+
+    /// T-154a: CQL ALTER TABLE ADD refuses set/map-key/vector of jsonb.
+    #[tokio::test]
+    async fn alter_table_add_refuses_forbidden_jsonb_as_invalid_request() {
+        let (state, _dir) = jsonb_ddl_setup().await;
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY)").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+        let cases = [
+            "ALTER TABLE ks.t ADD s set<jsonb>",
+            "ALTER TABLE ks.t ADD s map<jsonb, int>",
+            "ALTER TABLE ks.t ADD s vector<jsonb, 3>",
+        ];
+        for cql in cases {
+            let err = jsonb_ddl_error(&state, cql).await;
+            assert_eq!(err.error_code(), 0x2200, "{cql}: {err}");
+            assert!(err.to_string().contains("jsonb"), "{cql}: {err}");
+        }
+    }
+
+    /// T-300 (CQL-T300-01): jsonb DDL is InvalidRequest naming the mode and the
+    /// D15a ledger in every non-standalone mode, and allowed when standalone.
+    #[tokio::test]
+    async fn jsonb_ddl_is_refused_outside_standalone_as_invalid_request() {
+        use ferrosa_common::deployment_mode::DeploymentMode;
+        let (state, _dir) = jsonb_ddl_setup().await;
+        for setup_cql in [
+            "CREATE TABLE ks.t (k int PRIMARY KEY)",
+            "CREATE TYPE ks.u (a int)",
+        ] {
+            let stmt = crate::parser::parse(setup_cql).unwrap();
+            let ctx = RequestContext {
+                auth: &dev_auth(),
+                current_keyspace: &Some("ks".into()),
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+                protocol_version: 4,
+            };
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+        let cases = [
+            "CREATE TABLE ks.j (k int PRIMARY KEY, doc jsonb)",
+            "CREATE TABLE ks.jl (k int PRIMARY KEY, doc list<jsonb>)",
+            "ALTER TABLE ks.t ADD doc jsonb",
+            "CREATE TYPE ks.uj (a jsonb)",
+            "ALTER TYPE ks.u ADD doc jsonb",
+        ];
+        for mode in [
+            DeploymentMode::Pair,
+            DeploymentMode::Forming,
+            DeploymentMode::Cluster,
+            DeploymentMode::DegradedPair,
+            DeploymentMode::DegradedCluster,
+        ] {
+            state.schema.set_deployment_mode(mode);
+            for cql in cases {
+                let err = jsonb_ddl_error(&state, cql).await;
+                assert_eq!(err.error_code(), 0x2200, "{mode} {cql}: {err}");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("D15a") && msg.contains(&mode.to_string()),
+                    "{msg}"
+                );
+                assert!(!msg.to_lowercase().contains("disable"), "{msg}");
+            }
+        }
+        state.schema.set_deployment_mode(DeploymentMode::Standalone);
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in cases {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("standalone must allow {cql}: {e}"));
+        }
     }
 
     /// Temporal uses CLUSTERING ORDER BY in table definition.
@@ -27911,6 +29089,248 @@ mod tests {
             "GRANT SELECT ON TABLE should succeed: {:?}",
             result.err()
         );
+    }
+
+    // ── Conditional statements fail closed without SELECT (t_9d641778) ──
+
+    const LWT_SECRET: &str = "top-secret-document";
+
+    fn role_auth(role: &str) -> AuthContext {
+        AuthContext {
+            role: role.into(),
+            is_superuser: false,
+            must_change_password: false,
+        }
+    }
+
+    /// Keyspace `lwtz`, table `t` seeded with row k=1 holding `LWT_SECRET`,
+    /// role `mod_only` (MODIFY) and role `rw_user` (SELECT + MODIFY).
+    async fn lwt_authz_fixture() -> (SharedState, TempDir) {
+        let (state, dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        for cql in [
+            "CREATE KEYSPACE lwtz WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE lwtz.t (k int PRIMARY KEY, v text)",
+            &format!("INSERT INTO lwtz.t (k, v) VALUES (1, '{LWT_SECRET}')"),
+            "CREATE ROLE mod_only WITH PASSWORD = 'pass' AND LOGIN = true",
+            "CREATE ROLE rw_user WITH PASSWORD = 'pass' AND LOGIN = true",
+            "GRANT MODIFY ON lwtz.t TO mod_only",
+            "GRANT MODIFY ON lwtz.t TO rw_user",
+            "GRANT SELECT ON lwtz.t TO rw_user",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        (state, dir)
+    }
+
+    /// Run `cql` as `role` and return the routing error, panicking if it succeeded.
+    async fn lwt_denied(state: &SharedState, role: &str, cql: &str) -> CqlError {
+        let auth = role_auth(role);
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        let stmt = crate::parser::parse(cql).unwrap();
+        match route(state, &ctx, stmt).await {
+            Ok(_) => panic!("{role} must be rejected for `{cql}`"),
+            Err(e) => e,
+        }
+    }
+
+    fn assert_unauthorized_without_row_data(err: &CqlError, cql: &str) {
+        assert!(
+            matches!(err, CqlError::Unauthorized(_)),
+            "`{cql}` must fail with Unauthorized, got {err:?}"
+        );
+        let text = format!("{err:?} {err}");
+        assert!(
+            !text.contains(LWT_SECRET),
+            "`{cql}` error leaked row data: {text}"
+        );
+    }
+
+    /// Every conditional shape, each against an existing row (k=1) and a
+    /// missing row (k=99), each with a condition that fails and one that
+    /// would succeed. All must be rejected identically.
+    fn lwt_conditional_statements() -> Vec<String> {
+        let mut out = Vec::new();
+        for k in [1, 99] {
+            out.push(format!(
+                "UPDATE lwtz.t SET v = 'x' WHERE k = {k} IF v = 'WRONG'"
+            ));
+            out.push(format!(
+                "UPDATE lwtz.t SET v = 'x' WHERE k = {k} IF v = '{LWT_SECRET}'"
+            ));
+            out.push(format!("UPDATE lwtz.t SET v = 'x' WHERE k = {k} IF EXISTS"));
+            out.push(format!("DELETE FROM lwtz.t WHERE k = {k} IF v = 'WRONG'"));
+            out.push(format!(
+                "DELETE FROM lwtz.t WHERE k = {k} IF v = '{LWT_SECRET}'"
+            ));
+            out.push(format!("DELETE FROM lwtz.t WHERE k = {k} IF EXISTS"));
+            out.push(format!(
+                "INSERT INTO lwtz.t (k, v) VALUES ({k}, 'x') IF NOT EXISTS"
+            ));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn modify_only_conditional_statements_are_unauthorized() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        for cql in lwt_conditional_statements() {
+            let err = lwt_denied(&state, "mod_only", &cql).await;
+            assert_unauthorized_without_row_data(&err, &cql);
+        }
+    }
+
+    /// D22 ordering: a MODIFY-only principal must get Unauthorized for a
+    /// conditional batch member, never the ConditionalUnsupported verdict.
+    #[tokio::test]
+    async fn modify_only_conditional_in_batch_is_unauthorized() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        for cql in lwt_conditional_statements() {
+            for kind in ["", "UNLOGGED "] {
+                let batch = format!("BEGIN {kind}BATCH {cql}; APPLY BATCH");
+                let err = lwt_denied(&state, "mod_only", &batch).await;
+                assert_unauthorized_without_row_data(&err, &batch);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn modify_only_failing_if_returns_no_row_data() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        let cql = "UPDATE lwtz.t SET v = 'x' WHERE k = 1 IF v = 'WRONG'";
+        let err = lwt_denied(&state, "mod_only", cql).await;
+        assert_unauthorized_without_row_data(&err, cql);
+    }
+
+    #[tokio::test]
+    async fn modify_only_would_succeed_if_is_unauthorized_and_not_applied() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        let cql = format!("UPDATE lwtz.t SET v = 'changed' WHERE k = 1 IF v = '{LWT_SECRET}'");
+        let err = lwt_denied(&state, "mod_only", &cql).await;
+        assert_unauthorized_without_row_data(&err, &cql);
+
+        // The write must not have landed: a superuser's IF NOT EXISTS reports
+        // the row still holding its original value.
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        let stmt = crate::parser::parse("INSERT INTO lwtz.t (k, v) VALUES (1, 'z') IF NOT EXISTS")
+            .unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(LWT_SECRET),
+            "original value must have survived"
+        );
+        assert!(
+            !text.contains("changed"),
+            "the rejected write must not land"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_and_modify_conditional_results_are_unchanged() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        let auth = role_auth("rw_user");
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        // Not-applied branch: [applied]=false plus the current row.
+        let stmt = crate::parser::parse("INSERT INTO lwtz.t (k, v) VALUES (1, 'z') IF NOT EXISTS")
+            .unwrap();
+        let RouteResult::Result(failed) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let snap = state.schema.snapshot();
+        let table_meta = snap
+            .tables
+            .get(&("lwtz".to_string(), "t".to_string()))
+            .unwrap();
+        let expected_false = encode_lwt_applied(
+            false,
+            "lwtz",
+            "t",
+            table_meta,
+            &state.schema,
+            Some(&[
+                Some(CqlValue::Int(1)),
+                Some(CqlValue::Text(LWT_SECRET.into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(failed, expected_false);
+
+        // Applied branch: the single [applied]=true column.
+        let stmt = crate::parser::parse("INSERT INTO lwtz.t (k, v) VALUES (2, 'z') IF NOT EXISTS")
+            .unwrap();
+        let RouteResult::Result(applied) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let expected_true = result::encode_rows(
+            &["[applied]".to_string()],
+            &[CqlType::Boolean],
+            "lwtz",
+            "t",
+            &[vec![Some(CqlValue::Boolean(true))]],
+        );
+        assert_eq!(applied, expected_true);
+
+        // UPDATE/DELETE ... IF are authorized for SELECT+MODIFY (both branches).
+        for cql in [
+            "UPDATE lwtz.t SET v = 'x' WHERE k = 1 IF v = 'WRONG'",
+            "UPDATE lwtz.t SET v = 'x' WHERE k = 1 IF EXISTS",
+            "DELETE FROM lwtz.t WHERE k = 2 IF v = 'z'",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("SELECT+MODIFY `{cql}` must be allowed: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn modify_only_conditional_in_transaction_is_unauthorized() {
+        let (state, _dir) = lwt_authz_fixture().await;
+        for cql in lwt_conditional_statements() {
+            let auth = role_auth("mod_only");
+            let no_ks = None;
+            let ctx = test_ctx(&auth, &no_ks);
+            let mut shim = None;
+            let now = std::time::Instant::now();
+
+            // Transaction block: BEGIN TRANSACTION; <conditional>; COMMIT TRANSACTION;
+            let block =
+                crate::parser::parse(&format!("BEGIN TRANSACTION; {cql}; COMMIT TRANSACTION;"))
+                    .unwrap();
+            let err = route_transactional(&state, &ctx, &block, &mut shim, now)
+                .await
+                .expect("transaction block is handled by route_transactional")
+                .err()
+                .unwrap_or_else(|| panic!("`{cql}` in a transaction block must be rejected"));
+            assert_unauthorized_without_row_data(&err, &cql);
+
+            // Bare DML staged into an open compat-shim transaction.
+            let begin = crate::parser::parse("BEGIN TRANSACTION").unwrap();
+            route_transactional(&state, &ctx, &begin, &mut shim, now)
+                .await
+                .expect("BEGIN handled")
+                .expect("BEGIN succeeds");
+            let stmt = crate::parser::parse(&cql).unwrap();
+            let err = route_transactional(&state, &ctx, &stmt, &mut shim, now)
+                .await
+                .expect("bare DML with an open shim is handled")
+                .err()
+                .unwrap_or_else(|| panic!("`{cql}` staged in a transaction must be rejected"));
+            assert_unauthorized_without_row_data(&err, &cql);
+        }
     }
 
     /// t_fb280b30: in standalone (Direct) mode a GRANT must be written to

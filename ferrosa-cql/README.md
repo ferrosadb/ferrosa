@@ -154,6 +154,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   millis) on an already-corrupt on-disk timestamp instead of emitting an
   undecodable value that would crash `SELECT *` for the whole partition. See
   FMEA `CQL-12`.
+  **Corrupt cells fail the read (t_cf7ca2cc)**: the row-bridge decomposition
+  returns `RowDecodeError`, surfaced as `CqlError::CorruptCell` (server error
+  0x0000, message names `keyspace.table`, column and partition key) instead of a
+  row with a NULL. See FMEA `CQL-Tcf7ca2cc`.
 - **Result encoding** (`result.rs`, `types.rs`) — CQL RESULT-frame encoder, the
   16-bit type system, and the re-exported `encode_value`/`decode_value` codec.
 - **Prepared statements** (`prepared.rs`) — `moka` W-TinyLFU cache keyed by the
@@ -192,11 +196,22 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 - **LWT / transactions** (`accord_router.rs`, `transaction_keys.rs`,
   `transaction_limits.rs`) — routing decision (Accord in cluster mode, local in
   standalone), `IF [NOT] EXISTS` / `IF <cond>` CAS semantics with the `[applied]`
-  result column, partition-key extraction for Accord, and per-connection
+  result column (conditional statements require SELECT as well as MODIFY and
+  fail closed with `Unauthorized` before the condition is evaluated, in CQL,
+  batches and transaction blocks alike), partition-key extraction for Accord, and per-connection
   transaction limits (concurrency / timeout / key count). Both separately sent
   `BEGIN` / body / `COMMIT` statements and the documented single-query
   `BEGIN TRANSACTION; ...; COMMIT TRANSACTION;` block form use the same
   registry-backed Accord path; body errors roll the block back immediately.
+  **Every conditional write is evaluated, never dropped (t_cd5142b5).**
+  Standalone `UPDATE`/`DELETE ... IF <cond>`, `IF EXISTS` and `INSERT ... IF NOT
+  EXISTS` read the current row and evaluate the clause with the same
+  `accord_router::eval_if_conditions` the cluster path gates on, atomically
+  under a per-partition lock (`local_lwt.rs`) held until the write lands; the
+  reply is the standard `[applied]` row (plus current values when not applied).
+  Conditions inside `BEGIN TRANSACTION` blocks and inside any `BATCH`
+  (logged/unlogged/counter) are rejected with the typed
+  `CqlError::ConditionalUnsupported` (code 0x2200) before anything is written.
 - **SUBSCRIBE / CDC** (`subscribe.rs`, `event.rs`) — per-connection streaming
   subscriptions that re-run an inner SELECT on an interval and push delta frames;
   dual-timestamp (Accord ts + apply ts) events; CQL `EVENT` push via a broadcast
@@ -326,3 +341,23 @@ for older storage/cluster errors and logs when it is used.
 - [FMEA / known issues](specs/fmea.md) — failure modes + real gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
 - Topic reference: [`specs/reference/cql.md`](../specs/reference/cql.md)
+
+> T-022: `bridge::{resolve_builtin_type, cql_type_name, cql_type_display_name}` delegate to `ferrosa_common::cql_type::names`.
+
+## jsonb (T-150)
+
+jsonb has no CQL literal binding yet: `term_to_cql_value` refuses every literal into a jsonb target with a "not yet supported (T-170/T-171)" error, and `CONTAINS` over `list<jsonb>` errors instead of matching nothing. Results follow D6a: the wire type is varchar and the cell is the JSON text; `toJson` prints the document. LWT `IF` orders jsonb by D18 (T-150).
+
+### jsonb placement (T-154a)
+
+`CREATE TABLE` and `ALTER TABLE ADD` refuse jsonb in a partition or clustering
+key and `set<jsonb>`, `map<jsonb, _>`, `vector<jsonb, n>` as InvalidRequest
+(0x2200), naming the column and the rule. The check runs before the direct,
+pair or Raft path sees the statement.
+
+### jsonb DDL is standalone-only for now (T-300)
+
+`CREATE TABLE`, `ALTER TABLE ADD`, `CREATE TYPE` and `ALTER TYPE ADD` that
+create or add a jsonb column or field (top level, nested, or through a UDT) are
+InvalidRequest (0x2200) on a node that is not standalone. The message names the
+mode and says the capability ledger (D15a) is required; there is no bypass.

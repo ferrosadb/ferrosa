@@ -13,11 +13,10 @@ toward the Postgres queries real clients send.
 
 ## Now (highest value)
 
-- **Stream `QueryResult` to the wire** (FMEA SQL-12). Every operator now spills,
-  so the one remaining unbounded buffer is `QueryResult.rows` — and it exists
-  because `ferrosa-postgres::render_result` builds all `DataRow` messages before
-  writing any. The fix is in the front end: write rows as they are produced, then
-  give `execute` a streaming return.
+- **(done) Stream the result to the wire** (FMEA SQL-12, `t_f348ba0b`).
+  `execute_streaming` + `RowSink` deliver rows as the pipeline yields them and
+  the Postgres front end forwards them with backpressure. Follow-up: retire the
+  collecting `execute`/`execute_with` once no test or tool needs a `Vec`.
 
 - **`IS NULL` / `IS NOT NULL`** (FMEA SQL-1). Add the `IS`/`NOT NULL` tokens and
   grammar plus an `IsNull` predicate path. Today NULL filtering is impossible in
@@ -31,6 +30,15 @@ toward the Postgres queries real clients send.
   columns through `add_numeric`.
 
 ## Next
+
+- **PG DDL execution** (D10): T-130 parses `CREATE TABLE`; T-132a creates the
+  schema. `DROP TABLE`, `ALTER TABLE ADD/DROP COLUMN` and `CREATE/DROP INDEX`
+  are separate packets. The PG type map is a fourth string-to-type table and
+  must converge with the existing three (research/type-threading-map.md).
+
+- **jsonb** (D11): T-160 added the value and column types (done). Next: the
+  wire codec (T-161a), jsonb literal parsing and casts, operators and SRFs
+  (T-162 onward), and a real `jsonpath` value in place of the text holder.
 
 - **Richer joins** (FMEA SQL-3): `LEFT`/`RIGHT`/`FULL` outer joins, a multi-table
   FROM / join list, and `ON` predicates beyond a single `a = b` (AND-of-equalities,

@@ -201,6 +201,8 @@ pub fn build_collection_cells(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssembleError {
     pub reason: String,
+    /// Typed jsonb fault when a jsonb cell (top level or nested) caused this.
+    pub jsonb: Option<crate::JsonbFault>,
 }
 
 /// Reconcile a legacy whole-value blob's synthetic per-element cells (`blob_cells`)
@@ -230,6 +232,15 @@ fn merge_blob_and_element_cells(
             .or_insert(cell);
     }
     by_path.into_values().collect()
+}
+
+static CORRUPT_ELEMENT_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total simple-cell decode failures surfaced as errors by
+/// [`assemble_column_cells`] since process start (FM-78). Intended for a
+/// metrics exporter; monotonically increasing.
+pub fn corrupt_element_count() -> u64 {
+    CORRUPT_ELEMENT_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl std::fmt::Display for AssembleError {
@@ -263,11 +274,13 @@ pub fn assemble_collection(
     let live = || cells.iter().copied().filter(|c| c.value.is_some());
     let decode = |ty: &CqlType, bytes: &[u8]| -> Result<CqlValue, AssembleError> {
         decode_value(ty, bytes).map_err(|e| AssembleError {
+            jsonb: e.jsonb_fault().cloned(),
             reason: format!("decode element: {e}"),
         })
     };
     fn path_of(c: &CellValue) -> Result<&[u8], AssembleError> {
         c.path.as_deref().ok_or_else(|| AssembleError {
+            jsonb: None,
             reason: "complex column cell is missing its path".into(),
         })
     }
@@ -302,6 +315,7 @@ pub fn assemble_collection(
             let mut keyed: Vec<(ListOrderKey, CqlValue)> = live()
                 .map(|c| {
                     let key = list_order_key(path_of(c)?).ok_or_else(|| AssembleError {
+                        jsonb: None,
                         reason: "list cell path is not a 16-byte TimeUUID".into(),
                     })?;
                     Ok((
@@ -314,6 +328,7 @@ pub fn assemble_collection(
             Ok(CqlValue::List(keyed.into_iter().map(|(_, v)| v).collect()))
         }
         other => Err(AssembleError {
+            jsonb: None,
             reason: format!("not a collection column type: {other:?}"),
         }),
     }
@@ -331,10 +346,12 @@ pub fn assemble_udt(
     let mut values: Vec<Option<CqlValue>> = vec![None; fields.len()];
     for c in live {
         let path = c.path.as_deref().ok_or_else(|| AssembleError {
+            jsonb: None,
             reason: "UDT field cell is missing its path".into(),
         })?;
         if path.len() != 2 {
             return Err(AssembleError {
+                jsonb: None,
                 reason: format!(
                     "UDT field cell path is not a 2-byte position (len {})",
                     path.len()
@@ -343,6 +360,7 @@ pub fn assemble_udt(
         }
         let pos = u16::from_be_bytes([path[0], path[1]]) as usize;
         let (_, field_ty) = fields.get(pos).ok_or_else(|| AssembleError {
+            jsonb: None,
             reason: format!(
                 "UDT field position {pos} out of range ({} fields)",
                 fields.len()
@@ -351,6 +369,7 @@ pub fn assemble_udt(
         let value =
             decode_value(field_ty, c.value.as_deref().unwrap_or_default()).map_err(|e| {
                 AssembleError {
+                    jsonb: e.jsonb_fault().cloned(),
                     reason: format!("decode UDT field {pos}: {e}"),
                 }
             })?;
@@ -375,8 +394,9 @@ pub fn assemble_udt(
 ///   and [`assemble_collection`] the survivors. A genuine assembly failure is
 ///   returned as `Err` for the caller to log loudly.
 /// - Simple column (all `path == None`): newest cell wins (LWW); returns `None`
-///   if it is not live, or if its bytes fail to decode (lenient, matching the
-///   long-standing scalar read behavior). A legacy whole-value collection — one
+///   if it is not live. Bytes that fail to decode are an `Err` (counted by
+///   [`corrupt_element_count`]), never `None` — a corrupt value must not read
+///   as a missing one (FM-78). A legacy whole-value collection — one
 ///   `path == None` cell holding the entire encoded collection — decodes here as
 ///   the whole value, preserving backward compatibility (lazy dual-read).
 ///
@@ -428,10 +448,14 @@ pub fn assemble_column_cells(
                 match &blob.value {
                     Some(bytes) => {
                         let decoded = decode_value(col_type, bytes).map_err(|e| AssembleError {
+                            jsonb: e.jsonb_fault().cloned(),
                             reason: format!("decode whole-value collection blob: {e}"),
                         })?;
                         build_collection_cells(CollectionOp::Add, &decoded, blob.timestamp)
-                            .map_err(|e| AssembleError { reason: e.reason })?
+                            .map_err(|e| AssembleError {
+                                jsonb: None,
+                                reason: e.reason,
+                            })?
                     }
                     None => Vec::new(),
                 }
@@ -494,7 +518,16 @@ pub fn assemble_column_cells(
         return Ok(None);
     }
     match &newest.value {
-        Some(bytes) => Ok(decode_value(col_type, bytes).ok()),
+        Some(bytes) => decode_value(col_type, bytes).map(Some).map_err(|e| {
+            CORRUPT_ELEMENT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            AssembleError {
+                jsonb: e.jsonb_fault().cloned(),
+                reason: format!(
+                    "decode simple cell ({} bytes) as {col_type:?}: {e}",
+                    bytes.len()
+                ),
+            }
+        }),
         None => Ok(None),
     }
 }
@@ -505,6 +538,39 @@ mod tests {
 
     fn t(v: &str) -> CqlValue {
         CqlValue::Text(v.to_string())
+    }
+
+    /// FM-78 / JB-T8: a corrupt element in a whole-value list, a per-element map
+    /// value, or a scalar/tuple-shaped simple cell is a typed error with
+    /// context, never a missing value, and is counted.
+    #[test]
+    fn collection_corrupt_element_is_error_not_none() {
+        let before = corrupt_element_count();
+
+        // Simple cell: a frozen list<int> whose bytes are truncated mid-element.
+        let list_ty = CqlType::List(Box::new(CqlType::Int));
+        let mut bytes = encode_value(&CqlValue::List(vec![CqlValue::Int(7), CqlValue::Int(9)]));
+        bytes.truncate(bytes.len() - 1);
+        let cell = CellValue::live(bytes, 100);
+        let err = assemble_column_cells(&list_ty, &[&cell], 0)
+            .expect_err("truncated list cell must be an error, not None");
+        assert!(err.reason.contains("decode"), "context: {}", err.reason);
+
+        // Simple cell: an int cell of the wrong width.
+        let short = CellValue::live(vec![1, 2, 3], 100);
+        assemble_column_cells(&CqlType::Int, &[&short], 0)
+            .expect_err("short int cell must be an error, not None");
+
+        // Per-element map cell: valid text key, corrupt int value.
+        let map_ty = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int));
+        let entry = CellValue::live(vec![1, 2, 3], 100).with_path(b"k".to_vec());
+        assemble_column_cells(&map_ty, &[&entry], 0)
+            .expect_err("corrupt map value must be an error, not None");
+
+        assert!(
+            corrupt_element_count() >= before + 2,
+            "simple-cell decode failures must be counted"
+        );
     }
 
     /// An empty collection assignment is a DELETION in Cassandra, so every way of

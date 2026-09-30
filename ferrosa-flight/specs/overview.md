@@ -92,3 +92,7 @@ per batch, strictly ordered, stopping on the first error.
 A thin top-of-stack adapter: depends on `ferrosa-cql`, `ferrosa-cluster`,
 `ferrosa-schema`, `ferrosa-common`; depended on only by the `ferrosa` binary.
 See the [root crate index](../../specs/crates.md) for the full graph.
+
+## jsonb (T-150)
+
+jsonb has no Arrow mapping yet: `cql_type_to_arrow` returns `None`, the column builder returns `ConvertError::Unsupported`, and `cql_literal` reports it unsupported (T-150).

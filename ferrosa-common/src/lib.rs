@@ -43,9 +43,10 @@ pub use complex_cell::{
     accord_list_cell_path, list_path_element_seq, reconcile, CellPath, ComplexColumn, CounterCell,
     CounterShard, CounterShardId,
 };
-pub use cql_type::{CqlType, CqlValue};
+pub use cql_type::{jsonb_canonical_text, CqlType, CqlValue};
 pub use data_type::DataType;
 pub use error::{Error, Result};
+pub use ferrosa_jsonb::JsonbValue;
 pub use geometry::{marshal_wkb, parse_wkb, Geometry};
 pub use key::{DecoratedKey, PartitionKey};
 pub use schema::{ColumnDefinition, TableSchema};

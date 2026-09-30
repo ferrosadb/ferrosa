@@ -4,6 +4,8 @@
 //! crates below `ferrosa-cql` in the dependency graph) can reference them
 //! without creating circular dependencies.
 
+pub mod names;
+
 use std::net::IpAddr;
 
 use num_bigint::BigInt;
@@ -45,6 +47,10 @@ pub enum CqlType {
     /// Vector type: element type + fixed dimension.
     /// Cassandra encodes vectors as Custom type (0x0000) on the wire.
     Vector(Box<CqlType>, usize),
+    /// Validated jsonb document (D3: regular columns only). Cassandra has no
+    /// native id for it, so on the wire it is `Custom` (0x0000) like vectors;
+    /// `system_schema` reports `text` (D6a).
+    Jsonb,
 }
 
 impl CqlType {
@@ -76,6 +82,7 @@ impl CqlType {
             Self::Set(_) => 0x0022,
             Self::Udt { .. } => 0x0030,
             Self::Tuple(_) => 0x0031,
+            Self::Jsonb => 0x0000, // Custom (no native Cassandra id, D6a)
             Self::Vector(_, _) => 0x0000, // Custom — Cassandra encodes vectors as Custom type
         }
     }
@@ -142,6 +149,9 @@ pub enum CqlValue {
     Vector(Vec<u32>),
     /// User-Defined Type -- named fields, some potentially null.
     Udt(Vec<(String, Option<CqlValue>)>),
+    /// Validated jsonb cell (T-150). Never raw bytes: the only constructors of
+    /// `JsonbValue` validate. `Eq`/`Ord`/`Hash` are by value (D2a, D18).
+    Jsonb(ferrosa_jsonb::JsonbValue),
 }
 
 impl PartialOrd for CqlValue {
@@ -153,11 +163,6 @@ impl PartialOrd for CqlValue {
 impl Ord for CqlValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
-        let d_self = std::mem::discriminant(self);
-        let d_other = std::mem::discriminant(other);
-        if d_self != d_other {
-            return self.discriminant_index().cmp(&other.discriminant_index());
-        }
         match (self, other) {
             (Self::Null, Self::Null) => Ordering::Equal,
             (Self::Ascii(a), Self::Ascii(b)) | (Self::Text(a), Self::Text(b)) => a.cmp(b),
@@ -211,7 +216,39 @@ impl Ord for CqlValue {
                 a.len().cmp(&b.len())
             }
             (Self::Udt(a), Self::Udt(b)) => a.cmp(b),
-            _ => Ordering::Equal, // same discriminant, unreachable
+            (Self::Jsonb(a), Self::Jsonb(b)) => a.cmp(b),
+            // Different variants: order by variant index. Every variant is
+            // listed on the left so adding a `CqlValue` variant without a
+            // same-variant arm above fails to compile instead of comparing
+            // Equal (jsonb hazard H3, FM-18).
+            (Self::Null, _)
+            | (Self::Ascii(_), _)
+            | (Self::Bigint(_), _)
+            | (Self::Blob(_), _)
+            | (Self::Boolean(_), _)
+            | (Self::Counter(_), _)
+            | (Self::Decimal { .. }, _)
+            | (Self::Double(_), _)
+            | (Self::Float(_), _)
+            | (Self::Int(_), _)
+            | (Self::Timestamp(_), _)
+            | (Self::Uuid(_), _)
+            | (Self::Text(_), _)
+            | (Self::Varint(_), _)
+            | (Self::Timeuuid(_), _)
+            | (Self::Inet(_), _)
+            | (Self::Date(_), _)
+            | (Self::Time(_), _)
+            | (Self::Smallint(_), _)
+            | (Self::Tinyint(_), _)
+            | (Self::Duration { .. }, _)
+            | (Self::List(_), _)
+            | (Self::Set(_), _)
+            | (Self::Map(_), _)
+            | (Self::Tuple(_), _)
+            | (Self::Vector(_), _)
+            | (Self::Udt(_), _)
+            | (Self::Jsonb(_), _) => self.discriminant_index().cmp(&other.discriminant_index()),
         }
     }
 }
@@ -247,8 +284,19 @@ impl CqlValue {
             Self::Tuple(_) => 24,
             Self::Vector(_) => 25,
             Self::Udt(_) => 26,
+            Self::Jsonb(_) => 27,
         }
     }
+}
+
+/// Compact canonical JSON text of a jsonb value (D6), for text-producing paths
+/// such as `toJson`. Nothing is truncated: a failure is an error, never a
+/// shortened string.
+pub fn jsonb_canonical_text(
+    j: &ferrosa_jsonb::JsonbValue,
+) -> Result<String, ferrosa_jsonb::PrintError> {
+    let view = j.view()?;
+    ferrosa_jsonb::print_to_string(view.root(), ferrosa_jsonb::TextStyle::Canonical, usize::MAX)
 }
 
 /// Serde helper for `num_bigint::BigInt` which doesn't implement
@@ -330,5 +378,178 @@ mod tests {
         assert_eq!(CqlType::Varchar.type_id(), 0x000D);
         assert_eq!(CqlType::List(Box::new(CqlType::Int)).type_id(), 0x0020);
         assert_eq!(CqlType::Tuple(vec![CqlType::Int]).type_id(), 0x0031);
+    }
+
+    /// One (lo, hi) pair per `CqlValue` variant, lo < hi by content.
+    fn ordered_pairs() -> Vec<(CqlValue, CqlValue)> {
+        use std::net::Ipv4Addr;
+        let u1 = uuid::Uuid::from_u128(1);
+        let u2 = uuid::Uuid::from_u128(2);
+        let dur = |d| CqlValue::Duration {
+            months: 0,
+            days: d,
+            nanos: 0,
+        };
+        vec![
+            (CqlValue::Null, CqlValue::Null),
+            (CqlValue::Ascii("a".into()), CqlValue::Ascii("b".into())),
+            (CqlValue::Bigint(1), CqlValue::Bigint(2)),
+            (CqlValue::Blob(vec![1]), CqlValue::Blob(vec![2])),
+            (CqlValue::Boolean(false), CqlValue::Boolean(true)),
+            (CqlValue::Counter(1), CqlValue::Counter(2)),
+            (
+                CqlValue::Decimal {
+                    scale: 1,
+                    unscaled: 1.into(),
+                },
+                CqlValue::Decimal {
+                    scale: 1,
+                    unscaled: 2.into(),
+                },
+            ),
+            (
+                CqlValue::Double(1.0f64.to_bits()),
+                CqlValue::Double(2.0f64.to_bits()),
+            ),
+            (
+                CqlValue::Float(1.0f32.to_bits()),
+                CqlValue::Float(2.0f32.to_bits()),
+            ),
+            (CqlValue::Int(1), CqlValue::Int(2)),
+            (CqlValue::Timestamp(1), CqlValue::Timestamp(2)),
+            (CqlValue::Uuid(u1), CqlValue::Uuid(u2)),
+            (CqlValue::Text("a".into()), CqlValue::Text("b".into())),
+            (CqlValue::Varint(1.into()), CqlValue::Varint(2.into())),
+            (CqlValue::Timeuuid(u1), CqlValue::Timeuuid(u2)),
+            (
+                CqlValue::Inet(Ipv4Addr::new(10, 0, 0, 1).into()),
+                CqlValue::Inet(Ipv4Addr::new(10, 0, 0, 2).into()),
+            ),
+            (CqlValue::Date(1), CqlValue::Date(2)),
+            (CqlValue::Time(1), CqlValue::Time(2)),
+            (CqlValue::Smallint(1), CqlValue::Smallint(2)),
+            (CqlValue::Tinyint(1), CqlValue::Tinyint(2)),
+            (dur(1), dur(2)),
+            (
+                CqlValue::List(vec![CqlValue::Int(1)]),
+                CqlValue::List(vec![CqlValue::Int(2)]),
+            ),
+            (
+                CqlValue::Set(vec![CqlValue::Int(1)]),
+                CqlValue::Set(vec![CqlValue::Int(2)]),
+            ),
+            (
+                CqlValue::Map(vec![(CqlValue::Int(1), CqlValue::Int(1))]),
+                CqlValue::Map(vec![(CqlValue::Int(1), CqlValue::Int(2))]),
+            ),
+            (
+                CqlValue::Tuple(vec![Some(CqlValue::Int(1))]),
+                CqlValue::Tuple(vec![Some(CqlValue::Int(2))]),
+            ),
+            (
+                CqlValue::Vector(vec![1.0f32.to_bits()]),
+                CqlValue::Vector(vec![2.0f32.to_bits()]),
+            ),
+            (
+                CqlValue::Udt(vec![("x".into(), Some(CqlValue::Int(1)))]),
+                CqlValue::Udt(vec![("x".into(), Some(CqlValue::Int(2)))]),
+            ),
+            (jsonb_of("1"), jsonb_of("2")),
+        ]
+    }
+
+    #[test]
+    fn cqlvalue_cmp_has_no_equal_wildcard() {
+        use std::cmp::Ordering;
+        let pairs = ordered_pairs();
+        assert_eq!(pairs.len(), 28, "one pair per CqlValue variant");
+        for (lo, hi) in &pairs {
+            assert_eq!(lo.cmp(lo), Ordering::Equal, "{lo:?} equals itself");
+            if lo == hi {
+                continue; // Null has a single value
+            }
+            assert_eq!(lo.cmp(hi), Ordering::Less, "{lo:?} < {hi:?}");
+            assert_eq!(hi.cmp(lo), Ordering::Greater, "{hi:?} > {lo:?}");
+        }
+    }
+
+    #[test]
+    fn no_wildcard_default_for_new_variant() {
+        // Values of different variants never compare Equal, and the order
+        // follows the variant index in both directions.
+        let pairs = ordered_pairs();
+        for (i, (a, _)) in pairs.iter().enumerate() {
+            for (j, (b, _)) in pairs.iter().enumerate() {
+                assert_eq!(a.cmp(b), i.cmp(&j), "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    fn jsonb_of(text: &str) -> CqlValue {
+        use ferrosa_jsonb::{parse_text, JsonbValue, Limits, LimitsConfig};
+        let limits = Limits::from_config_with_env(&LimitsConfig::default(), &|_| None, 64 << 20)
+            .expect("default limits");
+        let enc = parse_text(text.as_bytes(), &limits).expect("valid json");
+        CqlValue::Jsonb(JsonbValue::from_encoded(enc).expect("valid cell"))
+    }
+
+    #[test]
+    fn cqlvalue_cmp_jsonb_is_not_always_equal() {
+        use std::cmp::Ordering;
+        let a = jsonb_of("1");
+        let b = jsonb_of("2");
+        assert_ne!(a.cmp(&b), Ordering::Equal);
+        assert_eq!(a.cmp(&b), Ordering::Less);
+        assert_eq!(b.cmp(&a), Ordering::Greater);
+        // D18 kind order: Object > Array > Boolean > Number > String > Null.
+        assert!(jsonb_of("{}") > jsonb_of("[]"));
+        assert!(jsonb_of("[]") > jsonb_of("true"));
+        assert!(jsonb_of("true") > jsonb_of("1"));
+        assert!(jsonb_of("1") > jsonb_of("\"s\""));
+        assert!(jsonb_of("\"s\"") > jsonb_of("null"));
+    }
+
+    #[test]
+    fn cqlvalue_jsonb_ord_eq_hash_delegate_to_jsonb_value() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let (x, y) = (jsonb_of("1.0"), jsonb_of("1"));
+        // D2a: equal by value although the bytes differ in scale.
+        assert_eq!(x, y);
+        assert_eq!(x.cmp(&y), std::cmp::Ordering::Equal);
+        let hash = |v: &CqlValue| {
+            let mut h = DefaultHasher::new();
+            match v {
+                CqlValue::Jsonb(j) => j.hash(&mut h),
+                other => panic!("not jsonb: {other:?}"),
+            }
+            h.finish()
+        };
+        assert_eq!(hash(&x), hash(&y));
+        assert_ne!(x, jsonb_of("2"));
+    }
+
+    #[test]
+    fn cqlvalue_jsonb_orders_between_variants_by_discriminant() {
+        assert!(CqlValue::Udt(vec![]) < jsonb_of("null"));
+        assert!(jsonb_of("null") > CqlValue::Vector(vec![]));
+    }
+
+    #[test]
+    fn jsonb_canonical_text_prints_the_document() {
+        match jsonb_of("{\"a\": [1, 2.50]}") {
+            CqlValue::Jsonb(j) => {
+                assert_eq!(
+                    jsonb_canonical_text(&j).expect("prints"),
+                    "{\"a\":[1,2.50]}"
+                )
+            }
+            other => panic!("not jsonb: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cqltype_jsonb_type_id_is_custom() {
+        assert_eq!(CqlType::Jsonb.type_id(), 0x0000);
     }
 }

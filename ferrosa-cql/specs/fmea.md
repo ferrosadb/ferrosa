@@ -40,6 +40,11 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 | CQL-22 | `system_schema.tables` sent `count(*)` through a projection-only helper that silently discarded the function column | The response declared zero columns but encoded one empty row per table; Python-driver decoding ran past the frame and closed the connection | 7 | 7 | 3 | 147 → 7 | **Fixed:** `system_schema.tables` uses the aggregate-aware system-table encoder already used by neighboring schema tables, returning one declared `bigint` column and one aggregate row while retaining ordinary projection. Regression: `count_system_schema_tables_returns_one_bigint_row`. |
 | CQL-24 | The planner picked a secondary index for any covered `=` predicate regardless of how much of the table the key names | A tenant index over a single-tenant table point-read every row: ferrosa-memory's `SELECT count(*) FROM co_occurs_with WHERE tenant_id = ? ALLOW FILTERING` took 87 s for 193,181 rows (2026-09-29), past its 30 s timeout, so `stats` never had an edge count | 6 | 6 | 5 | 180 → 24 | **Fixed:** when the query licenses a scan, an index key matching ≥ 1/10 of the table's partitions (min 50) is served by `FullScan` + post-filter; the posting count stops at the threshold so selective keys pay nothing. EXPLAIN reports the same decision. Tests: `an_index_key_matching_most_of_the_table_is_scanned_not_point_read`, `a_selective_index_key_is_still_served_by_the_index`. Residual: the estimate is the coordinator's local share, a proxy for the replicas'. |
 | CQL-23 | The reference syntax sent `BEGIN TRANSACTION; ...; COMMIT TRANSACTION;` as one query, but the parser accepted only separately submitted control/body statements. | Every documented transaction block failed at the first body token, so examples and the Jepsen LWT-16 workload could not reach Accord. | 8 | 8 | 2 | 128 → 8 | **Fixed:** the parser emits a bounded `TransactionBlock` containing only SELECT/DML and a COMMIT/ROLLBACK terminator. The connection router opens one registry transaction, routes every body statement through its id, commits or rolls back, and cleans up immediately on a body error. Regressions cover the documented transfer, empty rollback, nested/DDL rejection, and registry cleanup. |
+| CQL-24 | Conditional statements (`IF NOT EXISTS`, `IF EXISTS`, `IF <cond>`; also inside `BEGIN TRANSACTION` blocks and batches) checked only MODIFY, and a failed condition returned every column of the current row (JB-I2, t_9d641778). | A MODIFY-only principal read whole rows it had no SELECT on through a failing `IF`, and learned row existence from `[applied]`. | 9 | 5 | 4 | 180 → 9 | **Fixed (fail closed):** `check_write_permission` requires SELECT in addition to MODIFY for any conditional statement, and `authorize_conditional_statement` runs it at the top of `route()` before Accord dispatch. The check is before the condition is evaluated or any row is read, returns `Unauthorized` with no row data (never a redacted row), and is identical whether the row exists, so existence is not observable. The transaction/batch paths (`materialize_*`) share the same gate. `encode_lwt_applied` no longer types an unresolved column as blob; it returns the error. Regressions: `modify_only_conditional_statements_are_unauthorized`, `modify_only_would_succeed_if_is_unauthorized_and_not_applied`, `modify_only_conditional_in_transaction_is_unauthorized`, `select_and_modify_conditional_results_are_unchanged`. **Open:** standalone (non-Accord) `UPDATE/DELETE ... IF <cond>` and transaction-staged IF conditions do not evaluate the condition at all (tracked separately). |
+
+| CQL-25 | Standalone `UPDATE/DELETE ... IF <cond>` / `IF EXISTS` never evaluated the condition; transaction-staged conditions were dropped by `build_transaction_write`; `route_logged_batch` / `route_unlogged_batch` ignored conditions. | The client asked for a compare-and-set and got an unconditional write with a success reply (fake success). `INSERT ... IF NOT EXISTS` evaluated its check without atomicity, so two racers could both apply. | 9 | 7 | 6 | 378 → 18 | **Fixed (t_cd5142b5):** standalone conditional statements evaluate under `local_lwt::lock_partition` with the shared `eval_if_conditions` and return `[applied]` (+ current values). Conditions in transactions, batches and virtual-table updates are rejected loudly with `CqlError::ConditionalUnsupported`. Regressions in `local_lwt::tests` (false/true UPDATE and DELETE, IF EXISTS on a missing row, txn and batch rejection, 8-way race applies exactly once over 20 rounds). Residual: unconditional writes to the same row are not serialized against conditional ones (same as Cassandra), and conditional transactions/batches remain unsupported. |
+
+| CQL-Tcf7ca2cc | A corrupt stored cell reached the client as a row with a NULL (row bridge logged and returned `None`) | Silent data loss on SELECT, LWT/DML pre-reads and paging | 9 | 3 | 3 | 81 → 9 | **Fixed (t_cf7ca2cc):** row decomposition returns `RowDecodeError`; `CqlError::CorruptCell` is a server error (0x0000), never `Invalid`, and `route_select_user_table` / the prepared fast path attach `keyspace.table`. No fallback. Tests: `corrupt_simple_cell_fails_select_and_names_the_table`, `uncorrupted_row_in_same_table_still_reads`. |
 
 ## Top risks to act on
 
@@ -62,3 +67,30 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
   native `fts_match` results on a 3-node cluster.
 - Postgres differential oracle (in `ferrosa-postgres`) guards the shared codec.
 - Per-opcode CQL metrics + Prometheus endpoint surface error/overload rates.
+
+## T-022 type-name registry
+
+| ID | Failure mode | Effect | Detection | Mitigation |
+|----|--------------|--------|-----------|------------|
+| CQL-T022-01 | `bridge::resolve_builtin_type`, `cql_type_name`, `cql_type_display_name` keep private name tables | Drift from the row-bridge parser and schema converters (FM-20) | `bridge::tests::type_names_consumers_agree` | Thin delegates to `ferrosa_common::cql_type::names` (see COM-T022-01) |
+| CQL-T022-02 | `connection.rs` and `router.rs` function-argument type switches still hold their own scalar names | Not covered by T-022 | Known, out of scope | Follow-up: migrate to the registry |
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| CQL-T150-01 | jsonb literal reported as a generic type mismatch, or CONTAINS silently false | Client cannot tell "unsupported" from "wrong type" | 5 | 3 | 2 | 30 | Guard at the top of `term_to_cql_value`; explicit error in the CONTAINS path. Tests: `jsonb_literals_are_a_typed_refusal_not_a_type_mismatch`. |
+| CQL-T150-02 | jsonb cell sent under type id 0x0000 with no class name | Malformed RESULT frame | 8 | 2 | 2 | 32 | `encode_type` reports varchar (D6a); cells carry JSON text. Test: `jsonb_is_reported_as_varchar_with_text_cells_d6a`. Known gap: a jsonb nested in a collection cell still carries its canonical bytes (T-170). |
+
+## T-154a jsonb placement refusal
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| CQL-T154a-01 | A jsonb placement refusal surfaces as ConfigError (0x2300) or ServerError | Client cannot tell a bad statement from a server fault | 5 | 3 | 2 | 30 | `From<SchemaError>` maps `JsonbInKey` / `JsonbNesting` to `Invalid` (0x2200) naming column and rule; `route_create_table` / `route_alter_table` check before any DDL path. |
+
+## T-300 interim jsonb DDL gate
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| CQL-T300-01 | Outside standalone the refusal surfaces as ServerError, or hints at disabling a safety feature | Client retries or bypasses | 5 | 3 | 2 | 30 | `From<SchemaError>` maps `JsonbDdlRefused` to `Invalid` (0x2200); the message names the mode and D15a and offers no bypass. Test: `jsonb_ddl_is_refused_outside_standalone_as_invalid_request`. |
+| CQL-T300-02 | CREATE TYPE with a jsonb field reaches the Raft or pair path on a non-standalone node | Divergent apply | 8 | 2 | 2 | 32 | `route_create_type` calls `check_create_type_jsonb` before any DDL path; ALTER TYPE ADD is refused inside `alter_type_add_field`. |

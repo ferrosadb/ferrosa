@@ -16,12 +16,15 @@ pub(crate) mod authz;
 pub mod catalog;
 pub mod codec;
 pub mod connection;
+pub mod ddl;
 pub mod extended;
 pub mod handshake;
+pub mod jsonb_wire;
 pub mod messages;
 mod mvcc;
-pub(crate) mod offload;
+pub mod pg_types;
 pub mod query;
+pub(crate) mod result_stream;
 pub mod scram;
 pub mod server;
 pub mod storage_provider;
@@ -30,6 +33,7 @@ pub mod store;
 mod accord_access;
 
 pub use connection::{ConnError, Connection, TlsPolicy};
+pub use ddl::{ClusterDdl, DdlExecutor};
 pub use handshake::{Handshake, HandshakeError, VerifierStore};
 pub use store::SchemaVerifierStore;
 

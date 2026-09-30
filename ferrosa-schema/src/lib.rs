@@ -8,6 +8,7 @@ pub mod audit;
 pub mod auth;
 pub mod convert;
 pub mod error;
+pub mod jsonb_rules;
 pub mod metadata;
 pub mod registry;
 pub mod secrets;

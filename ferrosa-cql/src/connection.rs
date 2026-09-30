@@ -2822,7 +2822,9 @@ fn cql_value_to_term(v: &CqlValue) -> Term {
                 })
                 .collect(),
         ),
-        CqlValue::Vector(_) | CqlValue::Udt(_) => {
+        // jsonb travels as its exact canonical bytes; `term_to_cql_value` refuses
+        // it as a target until the CQL jsonb binding lands (T-170/T-171).
+        CqlValue::Vector(_) | CqlValue::Udt(_) | CqlValue::Jsonb(_) => {
             // Opaque typed values must preserve their exact wire payload across
             // bind substitution. Re-rendering them as debug strings makes later
             // INSERT/UPDATE execution re-parse the value through the wrong type.
@@ -2842,11 +2844,34 @@ fn cql_value_to_term(v: &CqlValue) -> Term {
 fn raw_bytes_to_term(cql_type: &CqlType, bytes: &[u8]) -> Term {
     match cql_type {
         // Collection types: pass bytes through unchanged for storage fidelity.
-        CqlType::Map(_, _) | CqlType::List(_) | CqlType::Set(_) | CqlType::Vector(_, _) => {
-            Term::BlobLiteral(bytes.to_vec())
-        }
+        CqlType::Map(_, _)
+        | CqlType::List(_)
+        | CqlType::Set(_)
+        | CqlType::Vector(_, _)
+        | CqlType::Jsonb => Term::BlobLiteral(bytes.to_vec()),
         // All other types: decode to a typed CqlValue, then convert to Term.
-        _ => match decode_value(cql_type, bytes) {
+        CqlType::Ascii
+        | CqlType::Bigint
+        | CqlType::Blob
+        | CqlType::Boolean
+        | CqlType::Counter
+        | CqlType::Decimal
+        | CqlType::Double
+        | CqlType::Float
+        | CqlType::Int
+        | CqlType::Timestamp
+        | CqlType::Uuid
+        | CqlType::Varchar
+        | CqlType::Varint
+        | CqlType::Timeuuid
+        | CqlType::Inet
+        | CqlType::Date
+        | CqlType::Time
+        | CqlType::Smallint
+        | CqlType::Tinyint
+        | CqlType::Duration
+        | CqlType::Tuple(_)
+        | CqlType::Udt { .. } => match decode_value(cql_type, bytes) {
             Ok(cql_value) => cql_value_to_term(&cql_value),
             Err(_) => Term::BlobLiteral(bytes.to_vec()),
         },

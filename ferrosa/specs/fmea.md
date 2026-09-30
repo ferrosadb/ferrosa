@@ -27,6 +27,8 @@ own their own internal FMEAs.
 | FE-12 | **A background client listener fails to bind and the node still probes ready.** Postgres, SPARQL, graph HTTP and Bolt each logged one ERROR and carried on. | An orchestrator or operator sees a healthy node with a client port missing; clients get connection refused with no signal on the node. | 7 | 5 | 8 | 280 → 35 | **Mitigated:** every background listener records itself in `ListenerStatus`; a failure makes `/readyz` return 503 `waiting_for: listeners` naming the listener and reason, and `ferrosa_listener_up{listener}` goes to 0. A failure is deliberately not fatal (a SPARQL port clash should not take down a database that is serving CQL). Residual: graph HTTP, Bolt and SPARQL learn of a bind failure only when their server task returns, so a listener that dies silently without returning is not detected. Tests: `listener_status::tests::*`, `readyz_is_not_ready_while_a_client_listener_has_failed`, `metrics_export_the_health_of_the_background_listeners`. |
 | FE-13 | **Unusable configuration values are dropped silently.** `FERROSA_CQL_BROADCAST` fell back to `127.0.0.1`; `NetConfig::from_env` ignored unparseable values, so `FERROSA_INTERNODE_REQUIRE_TLS=ture` silently disabled the TLS requirement. | Drivers told to connect to loopback; a node that was meant to refuse plaintext internode traffic accepts it. | 8 | 4 | 8 | 256 → 32 | **Fixed:** `parse_cql_broadcast` returns an error naming the value; `NetConfig::from_lookup` reports a `ConfigIssue` for every rejected value and `from_env_checked` makes typos fatal at startup (seed and broadcast hostnames that may not resolve yet warn only). Tests: `cql_broadcast::tests::an_unusable_value_is_an_error_that_names_it`, `ferrosa-net` `config::tests::*`. |
 
+| FE-T300 | **Startup outside standalone with jsonb columns in the persisted schema (T-300, D24, D15a).** Seeds configured or a former cluster member, with jsonb tables restored. | A node joins peers with jsonb and no capability ledger. | 9 | 2 | 2 | 36 | **Fixed:** `ModeController::check_startup_jsonb` runs right after controller construction; `main` logs FATAL naming the tables and returns the error (non-zero exit). No flag bypasses it. Test: `startup_with_jsonb_outside_standalone_is_refused_naming_tables` (ferrosa-cluster). |
+
 ## Top risks to act on
 
 1. **FE-10 (RPN 252) — TOML internode advertisement.** The focused regression is
@@ -47,6 +49,9 @@ own their own internal FMEAs.
   classification, hinted-handoff dir, schema persist/load, web auth bypass.
 - `/readyz` (un-authenticated) and `/metrics` on the web console.
 - Per-step structured WARN/ERROR logs across bootstrap, replay, and shutdown.
+- **CQL-T467ci-01:** `GET /api/cluster/status` reports `ddl_path` (`direct`, `pair`,
+  `cluster`, `forming`, `unavailable`) beside `mode`; `mode` leads it during the
+  transition to cluster. Pinned by `api_cluster_status_reports_the_live_ddl_path`.
 - `ferrosa-net` `default_bind_port_is_not_7000` guard (FE-6).
 - `apply_internode_toml_overrides_sets_other_fields` pins TOML broadcast
   propagation into the handshake advertisement (FE-10).

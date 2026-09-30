@@ -328,6 +328,13 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     ],
                 };
                 send_message(&mut stream, &failure).await?;
+                // A nesting-depth violation is a hostile or broken client, not
+                // a typo: reply FAILURE once, then close so the peer cannot
+                // keep sending them (one log line per connection).
+                if matches!(e, codec::CodecError::NestingTooDeep(_)) {
+                    tracing::warn!(%e, "closing Bolt connection: PackStream nesting limit exceeded");
+                    return Ok(());
+                }
                 continue;
             }
         };

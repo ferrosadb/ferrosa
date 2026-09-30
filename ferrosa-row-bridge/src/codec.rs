@@ -15,7 +15,7 @@ use num_bigint::BigInt;
 pub use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::Schema;
 
-use crate::RowBridgeError;
+use crate::{JsonbFault, RowBridgeError};
 
 /// Encode a [`CqlValue`] as CQL wire-format bytes (no length prefix).
 pub fn encode_value(value: &CqlValue) -> Vec<u8> {
@@ -113,8 +113,28 @@ pub fn encode_value(value: &CqlValue) -> Vec<u8> {
             }
             buf
         }
+        // The validated canonical cell bytes (D4); never re-serialized.
+        CqlValue::Jsonb(j) => j.as_bytes().to_vec(),
         CqlValue::Null => vec![],
     }
+}
+
+/// Validate a top-level jsonb cell exactly once (`JsonbValue::from_bytes`) and
+/// classify a refusal: an unknown envelope byte is distinct from corruption.
+fn decode_jsonb(bytes: &[u8]) -> Result<CqlValue, RowBridgeError> {
+    use ferrosa_jsonb::JsonbError;
+    let len = bytes.len();
+    ferrosa_jsonb::JsonbValue::from_bytes(bytes.to_vec())
+        .map(CqlValue::Jsonb)
+        .map_err(|e| match e {
+            JsonbError::UnknownEnvelope { byte } => {
+                RowBridgeError::jsonb(JsonbFault::UnknownEnvelope { byte, len })
+            }
+            other => RowBridgeError::jsonb(JsonbFault::CorruptJsonb {
+                reason: other.to_string(),
+                len,
+            }),
+        })
 }
 
 /// Decode a [`CqlValue`] from CQL wire-format bytes given its type.
@@ -350,6 +370,9 @@ pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<CqlValue, RowBri
             }
             Ok(CqlValue::Udt(result_fields))
         }
+        // A stored cell is never trusted: validate it (D4, D14b). A corrupt
+        // cell is an error, not NULL (RB-Tcf7ca2cc, RB-T150-01).
+        CqlType::Jsonb => decode_jsonb(bytes),
     }
 }
 
@@ -432,6 +455,13 @@ fn read_collection_element(
 // CQL type-name parser
 // ---------------------------------------------------------------------------
 
+/// Refuse the jsonb nestings D21 forbids (`set<jsonb>`, `map<jsonb, _>`,
+/// `vector<jsonb, _>`) at type parse, so no such type is ever constructed.
+fn reject_forbidden_jsonb(t: &CqlType) -> Result<(), RowBridgeError> {
+    ferrosa_common::cql_type::names::check_jsonb_nesting(t)
+        .map_err(|e| RowBridgeError::invalid(e.to_string()))
+}
+
 /// Parse a CQL type name string (e.g. `"int"`, `"list<text>"`, `"frozen<map<text, int>>"`)
 /// into a [`CqlType`].
 ///
@@ -447,6 +477,7 @@ pub fn parse_cql_type(s: &str) -> Result<CqlType, RowBridgeError> {
             "unexpected trailing characters in type: '{remaining}'"
         )));
     }
+    reject_forbidden_jsonb(&result)?;
     Ok(result)
 }
 
@@ -468,6 +499,7 @@ pub fn parse_cql_type_in_keyspace(
             "unexpected trailing characters in type: '{remaining}'"
         )));
     }
+    reject_forbidden_jsonb(&result)?;
     Ok(result)
 }
 
@@ -549,27 +581,11 @@ impl<'a> TypeParser<'a> {
         let ident = self.read_ident()?;
         let lower = ident.to_ascii_lowercase();
 
+        if let Some(scalar) = ferrosa_common::cql_type::names::scalar_from_name(&lower) {
+            return Ok(scalar);
+        }
+
         match lower.as_str() {
-            "text" | "varchar" => Ok(CqlType::Varchar),
-            "int" => Ok(CqlType::Int),
-            "bigint" => Ok(CqlType::Bigint),
-            "smallint" => Ok(CqlType::Smallint),
-            "tinyint" => Ok(CqlType::Tinyint),
-            "float" => Ok(CqlType::Float),
-            "double" => Ok(CqlType::Double),
-            "boolean" => Ok(CqlType::Boolean),
-            "blob" => Ok(CqlType::Blob),
-            "uuid" => Ok(CqlType::Uuid),
-            "timeuuid" => Ok(CqlType::Timeuuid),
-            "timestamp" => Ok(CqlType::Timestamp),
-            "inet" => Ok(CqlType::Inet),
-            "ascii" => Ok(CqlType::Ascii),
-            "counter" => Ok(CqlType::Counter),
-            "varint" => Ok(CqlType::Varint),
-            "decimal" => Ok(CqlType::Decimal),
-            "date" => Ok(CqlType::Date),
-            "time" => Ok(CqlType::Time),
-            "duration" => Ok(CqlType::Duration),
             "list" => {
                 self.skip_whitespace();
                 self.consume(b'<')?;
@@ -697,5 +713,168 @@ mod duration_vint_tests {
     fn duration_rejects_trailing_bytes() {
         let err = decode_value(&CqlType::Duration, &[0, 0, 0, 0]).unwrap_err();
         assert!(err.to_string().contains("trailing bytes"));
+    }
+
+    fn jsonb(text: &str) -> CqlValue {
+        use ferrosa_jsonb::{parse_text, JsonbValue, Limits, LimitsConfig};
+        let limits = Limits::from_config_with_env(&LimitsConfig::default(), &|_| None, 64 << 20)
+            .expect("default limits");
+        let enc = parse_text(text.as_bytes(), &limits).expect("valid json");
+        CqlValue::Jsonb(JsonbValue::from_encoded(enc).expect("valid cell"))
+    }
+
+    fn round_trip(ty: &CqlType, v: &CqlValue) {
+        let bytes = encode_value(v);
+        assert_eq!(&decode_value(ty, &bytes).expect("decodes"), v);
+    }
+
+    #[test]
+    fn jsonb_round_trips_top_level() {
+        round_trip(&CqlType::Jsonb, &jsonb(r#"{"a":[1,2.50,"x",null,true]}"#));
+        round_trip(&CqlType::Jsonb, &jsonb("null"));
+    }
+
+    #[test]
+    fn jsonb_encode_is_the_canonical_cell_bytes() {
+        let v = jsonb("[1,2]");
+        match &v {
+            CqlValue::Jsonb(j) => assert_eq!(encode_value(&v), j.as_bytes()),
+            other => panic!("not jsonb: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jsonb_round_trips_nested_per_d21() {
+        let list = CqlType::List(Box::new(CqlType::Jsonb));
+        round_trip(&list, &CqlValue::List(vec![jsonb("1"), jsonb("{\"k\":2}")]));
+        let map = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Jsonb));
+        round_trip(
+            &map,
+            &CqlValue::Map(vec![(CqlValue::Text("a".into()), jsonb("[3]"))]),
+        );
+        let tup = CqlType::Tuple(vec![CqlType::Int, CqlType::Jsonb]);
+        round_trip(
+            &tup,
+            &CqlValue::Tuple(vec![Some(CqlValue::Int(7)), Some(jsonb("\"s\""))]),
+        );
+        let udt = CqlType::Udt {
+            keyspace: "k".into(),
+            name: "u".into(),
+            fields: vec![("doc".into(), CqlType::Jsonb), ("n".into(), CqlType::Int)],
+        };
+        let v = CqlValue::Udt(vec![("doc".into(), Some(jsonb("{}"))), ("n".into(), None)]);
+        round_trip(&udt, &v);
+    }
+
+    /// RB-T151-01: every byte-level mutation of a valid cell is refused with a
+    /// typed fault, never a value. Cell width is preserved by flipping bits and
+    /// shortened by truncation.
+    #[test]
+    fn rowbridge_jsonb_corrupt_cell_is_error() {
+        let valid = encode_value(&jsonb(r#"{"a":[1,"xyz",null],"b":{"c":true}}"#));
+        let before = crate::corrupt_jsonb_count();
+        let mut refused = 0u64;
+        for cut in 0..valid.len() {
+            let err = decode_value(&CqlType::Jsonb, &valid[..cut]).unwrap_err();
+            assert!(err.jsonb_fault().is_some(), "truncated to {cut}: {err}");
+            refused += 1;
+        }
+        for i in 0..valid.len() {
+            let mut m = valid.clone();
+            m[i] ^= 0xff;
+            match decode_value(&CqlType::Jsonb, &m) {
+                Err(err) => {
+                    assert!(err.jsonb_fault().is_some(), "flip {i}: {err}");
+                    refused += 1;
+                }
+                // A flip inside a string payload leaves a valid, different cell.
+                Ok(CqlValue::Jsonb(j)) => assert_ne!(j.as_bytes(), valid.as_slice()),
+                Ok(other) => panic!("flip {i} decoded as {other:?}"),
+            }
+        }
+        assert!(crate::corrupt_jsonb_count() >= before + refused);
+    }
+
+    /// RB-T151-02 (FM-07): an envelope byte from a future codec version is its
+    /// own typed error, distinct from corruption.
+    #[test]
+    fn mixed_version_read_of_future_envelope_is_error_not_null() {
+        let mut cell = encode_value(&jsonb("[1]"));
+        cell[0] = 0xF2;
+        let err = decode_value(&CqlType::Jsonb, &cell).unwrap_err();
+        assert_eq!(
+            err.jsonb_fault(),
+            Some(&crate::JsonbFault::UnknownEnvelope {
+                byte: 0xF2,
+                len: cell.len()
+            })
+        );
+        assert!(err.to_string().contains("unknown envelope"), "{err}");
+        let corrupt = decode_value(&CqlType::Jsonb, &[]).unwrap_err();
+        assert!(matches!(
+            corrupt.jsonb_fault(),
+            Some(crate::JsonbFault::CorruptJsonb { len: 0, .. })
+        ));
+    }
+
+    /// RB-T151-03: corruption nested in a list, map, tuple or UDT keeps the
+    /// typed fault instead of collapsing to a string.
+    #[test]
+    fn nested_jsonb_corruption_keeps_the_typed_fault() {
+        let bad = [0xffu8, 0xff, 0xff];
+        let mut list = 1i32.to_be_bytes().to_vec();
+        list.extend_from_slice(&(bad.len() as i32).to_be_bytes());
+        list.extend_from_slice(&bad);
+        let list_ty = CqlType::List(Box::new(CqlType::Jsonb));
+        assert!(decode_value(&list_ty, &list)
+            .unwrap_err()
+            .jsonb_fault()
+            .is_some());
+        let tup_ty = CqlType::Tuple(vec![CqlType::Jsonb]);
+        let mut tup = (bad.len() as i32).to_be_bytes().to_vec();
+        tup.extend_from_slice(&bad);
+        assert!(decode_value(&tup_ty, &tup)
+            .unwrap_err()
+            .jsonb_fault()
+            .is_some());
+    }
+
+    #[test]
+    fn corrupt_jsonb_cell_is_a_typed_error_not_null() {
+        for bad in [&[][..], &[0xff, 0xff, 0xff][..], b"{\"a\":1}"] {
+            let err = decode_value(&CqlType::Jsonb, bad).unwrap_err();
+            assert!(err.jsonb_fault().is_some(), "{err}");
+        }
+        // A corrupt element inside a collection fails the whole decode.
+        let mut buf = 1i32.to_be_bytes().to_vec();
+        buf.extend_from_slice(&3i32.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0xff, 0xff]);
+        let list = CqlType::List(Box::new(CqlType::Jsonb));
+        assert!(decode_value(&list, &buf).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_jsonb_and_nested_positions() {
+        assert_eq!(parse_cql_type("jsonb").unwrap(), CqlType::Jsonb);
+        assert_eq!(
+            parse_cql_type("list<jsonb>").unwrap(),
+            CqlType::List(Box::new(CqlType::Jsonb))
+        );
+        assert!(parse_cql_type("map<text, frozen<jsonb>>").is_ok());
+        assert!(parse_cql_type("tuple<int, jsonb>").is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_set_map_key_and_vector_of_jsonb() {
+        for bad in [
+            "set<jsonb>",
+            "map<jsonb, int>",
+            "vector<jsonb, 3>",
+            "list<set<jsonb>>",
+            "frozen<set<jsonb>>",
+        ] {
+            let err = parse_cql_type(bad).unwrap_err();
+            assert!(err.to_string().contains("jsonb"), "{bad}: {err}");
+        }
     }
 }

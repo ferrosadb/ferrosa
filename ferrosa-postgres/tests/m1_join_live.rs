@@ -326,6 +326,8 @@ async fn m1_join_returns_rows_to_a_real_driver() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
+        ddl: None,
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -417,6 +419,8 @@ async fn extended_query_error_recovers_after_sync() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
+        ddl: None,
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -465,6 +469,8 @@ async fn extended_parameterized_join_over_a_real_driver() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
+        ddl: None,
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -521,6 +527,8 @@ async fn group_by_order_by_limit_over_a_real_driver() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
+        ddl: None,
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -587,6 +595,8 @@ async fn where_having_distinct_over_a_real_driver() {
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
+        ddl: None,
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -702,6 +712,8 @@ async fn dml_client_with_committer(
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord,
+        ddl: None,
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -780,6 +792,8 @@ async fn dml_client_with_local_accord() -> (
         // The real in-process Accord state machine below IS this fixture's
         // cluster, so offer it unconditionally.
         accord: AccordAccess::fixed(query_committer),
+        ddl: None,
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -904,6 +918,8 @@ async fn dml_clients_on_two_accord_nodes() -> (
             mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
             // Two real Accord nodes are the cluster here.
             accord: AccordAccess::fixed(query_committer),
+            ddl: None,
+            jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

@@ -14,22 +14,23 @@ byte-identical to CQL.
 ## SELECT (read path)
 
 A simple `Q` query for `SELECT ... FROM t [JOIN ...] WHERE ...`. Storage rows
-flow through a bounded provider into the synchronous executor, which currently
-materializes its input and result rows before wire encoding.
+flow through a bounded provider into the synchronous executor, whose output is
+streamed to the socket in bounded batches with backpressure (t_f348ba0b).
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Drv as Postgres driver
     participant Srv as server::query_loop
-    participant Q as query::execute_query
+    participant Q as query::execute_query_streaming
     participant SP as storage_provider::load_table
     participant Eng as ferrosa-storage StorageEngine
     participant RB as ferrosa-row-bridge
-    participant SQL as ferrosa-sql::execute
+    participant RS as result_stream (blocking thread)
+    participant SQL as ferrosa-sql::execute_streaming
 
     Drv->>Srv: Query 'Q' (SELECT ...)
-    Srv->>Q: execute_query(engine, schema, sql)
+    Srv->>Q: execute_query_streaming(engine, schema, sql, sink)
     Q->>Q: parse_statement(sql) (err =&gt; 42601)
     Q->>SP: load_catalog: load_table per FROM/JOIN
     Note over SP: R15 guard — schema metadata decides<br/>existence (missing =&gt; 42P01, not empty)
@@ -39,19 +40,29 @@ sequenceDiagram
     RB-->>SP: one partition's decoded rows
     SP->>SP: bounded channel (64 rows) + sparse MVCC overlay
     SP-->>Q: MapCatalog (re-scannable streaming provider)
-    Q->>SQL: execute(select, catalog, params)
-    SQL-->>Q: QueryResult (columns + rows)
-    Q->>Q: render_result (encodes all rows into a Vec)
-    Q-->>Srv: Vec&lt;BackendMessage&gt;
-    Srv->>Drv: RowDescription, DataRow*, CommandComplete, ReadyForQuery
+    Q->>RS: open_stream(select, catalog, params)
+    RS->>SQL: execute_streaming(.., ChannelSink)
+    SQL-->>RS: columns, then rows in batches (bounded channel)
+    RS-->>Q: ResultStream (columns known)
+    Q->>Drv: RowDescription
+    loop per batch, until done or max_rows
+        RS-->>Q: batch of rows
+        Q->>Drv: DataRow* (socket write = backpressure)
+    end
+    Q-->>Srv: tail: CommandComplete, PortalSuspended, or ErrorResponse
+    Srv->>Drv: tail, ReadyForQuery
 ```
 
 Notes:
 
 - The storage provider reads one partition at a time and applies backpressure
-  through the bounded channel. The executor then collects its base scan and
-  `QueryResult`; the renderer collects encoded wire messages. End-to-end result
-  streaming is not implemented.
+  through the bounded channel. The result side is a second bounded channel of
+  row batches; the socket write is the backpressure. Memory is O(batch) whatever
+  the result size. Extended-protocol `Execute` with `max_rows` stops after that
+  many rows with `PortalSuspended` and parks the running query on the portal;
+  the next `Execute` continues from the next row.
+- A failure after rows were sent yields an `ErrorResponse` after those rows,
+  never a `CommandComplete`.
 - Column order follows the table's declared (DDL) order via the shared bridge,
   matching the CQL `route_select` read path exactly.
 - On any failure exactly one `ErrorResponse` is emitted (`42601` parse, `42P01`

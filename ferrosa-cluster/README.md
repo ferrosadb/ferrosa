@@ -75,6 +75,11 @@ early acknowledgement.
   `ddl_path` apply, and all three delegate to
   `StorageEngine::register_index_in_engine` — the resolver the restart reload
   uses — so the wiring cannot drift between the paths again.
+- `DdlPath::kind()` / `ModeController::ddl_path_kind()` name the live DDL path
+  (`direct`, `pair`, `cluster`, `forming`, `unavailable`). The mode reads
+  `cluster` from the start of `transition_to_cluster`, but DDL stays `direct`
+  until Raft has a leader, so readiness probes wait on `ddl_path == "cluster"`
+  (exposed on `/api/cluster/status`; CQL-T467ci-01).
   Snapshot install no longer treats `previous - next` as authority to unregister
   local tables. A table that is absent from an incoming snapshot is considered
   ambiguous until snapshots carry explicit identity-scoped drop markers; if the
@@ -271,6 +276,13 @@ early acknowledgement.
   reporting healthy on `/readyz`, so an unpinned stack can hand you a node that
   looks up but serves nothing.
 - `rebalance.rs` — token-skew rebalancing with data streaming.
+- `controller/jsonb_gate.rs` (T-300, D24) — while any table holds jsonb, a
+  standalone node may not move to Pair, Forming or Cluster: the transition entry
+  points and `try_transition_mode` refuse, naming the tables and the D15a
+  ledger. `check_startup_jsonb` lets `main` fail startup for a non-standalone or
+  seeded node whose schema holds jsonb. The controller's mode cell is shared
+  with `Schema`, so the schema's DDL gate always sees the live mode. No flag
+  bypasses it; T-154b replaces it with the ledger.
 
 ### Repair & hints (`repair/`, `hints/`)
 - `repair/merkle.rs` — depth-15 Merkle trees (32 768 leaves), content-aware
@@ -386,6 +398,13 @@ INDEPENDENT of N — the `t_3fc6be3c`/`t_ee98faa0` bounded-consume proof — plu
 producer/backpressure bounds). The gated multi-node live confirmation is `fly_stream_scan_live` (feature
 `live-infra-tests` + `FERROSA_TEST_FLY=1`), which drives
 `deploy/fly-stream-scan/`; it panics loudly on missing infra rather than passing.
+
+Replicated `CREATE INDEX` (FM-70 / CL-18, `t_1f2741a0`) is guarded end to end by
+`replicated_create_index` (three in-process Raft voters, each with its own
+`StorageEngine` + `Schema` via `TestCluster::with_voters_and_engines`; the DDL is
+proposed once on the leader and every node must build the index and answer an
+indexed read) and, on a real cluster, `replicated_jsonb_index_live` (feature
+`live-infra-tests` + `FERROSA_TEST_CLUSTER_NODES`, panics when unset).
 
 The multi-node `TestCluster` harness (`tests/common/raft_harness.rs`) runs
 openraft with short timers (50 ms heartbeat, 200–400 ms election). To keep

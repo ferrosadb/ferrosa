@@ -24,6 +24,7 @@ pub mod bootstrap;
 pub mod cluster;
 pub mod cluster_rejoin;
 mod invite;
+pub mod jsonb_gate;
 mod membership;
 mod operator;
 mod pair;
@@ -294,6 +295,9 @@ pub struct ModeController {
     /// witnesses (write-side monotonicity for strict-serializable list appends,
     /// t_813caf39). Empty until set.
     pub(super) accord_clock: std::sync::OnceLock<Arc<ferrosa_common::accord::HybridLogicalClock>>,
+    /// True while a departure from standalone is being refused because jsonb
+    /// columns exist (T-300). Only the edges are logged: refused, recovered.
+    pub(super) jsonb_gate_refusing: AtomicBool,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -409,9 +413,13 @@ impl ModeController {
             );
         }
 
+        // The controller's mode cell IS the schema's mode cell (T-300): the
+        // jsonb DDL gate reads it at every entry and apply, so it can never
+        // lag a transition the controller has made.
+        schema.set_deployment_mode(initial_mode);
         let controller = Arc::new(Self {
             consensus_health: Arc::new(ConsensusHealth::new()),
-            mode: Arc::new(ArcSwap::from_pointee(initial_mode)),
+            mode: schema.deployment_mode_handle(),
             write_path: write_path.clone(),
             cluster_state: cluster_state.clone(),
             storage,
@@ -450,6 +458,7 @@ impl ModeController {
             raft_node_map: arc_swap::ArcSwapOption::empty(),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
+            jsonb_gate_refusing: AtomicBool::new(false),
         });
 
         let handles = ModeControllerHandles {
@@ -526,7 +535,10 @@ impl ModeController {
 
         Arc::new(Self {
             consensus_health: Arc::new(ConsensusHealth::new()),
-            mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Standalone)),
+            mode: {
+                schema.set_deployment_mode(DeploymentMode::Standalone);
+                schema.deployment_mode_handle()
+            },
             write_path,
             cluster_state,
             storage: engine,
@@ -565,6 +577,7 @@ impl ModeController {
             raft_node_map: arc_swap::ArcSwapOption::empty(),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
+            jsonb_gate_refusing: AtomicBool::new(false),
         })
     }
 
@@ -592,7 +605,10 @@ impl ModeController {
 
         Arc::new(Self {
             consensus_health: Arc::new(ConsensusHealth::new()),
-            mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Pair)),
+            mode: {
+                schema.set_deployment_mode(DeploymentMode::Pair);
+                schema.deployment_mode_handle()
+            },
             write_path,
             cluster_state,
             storage: engine,
@@ -631,6 +647,7 @@ impl ModeController {
             raft_node_map: arc_swap::ArcSwapOption::empty(),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
+            jsonb_gate_refusing: AtomicBool::new(false),
         })
     }
 
@@ -682,6 +699,13 @@ impl ModeController {
     /// Get current deployment mode.
     pub fn mode(&self) -> DeploymentMode {
         **self.mode.load()
+    }
+
+    /// Name of the live DDL path (see [`DdlPath::kind`]). Lags [`Self::mode`]
+    /// during the transition to cluster mode; readiness probes that need
+    /// Raft-routed DDL must wait for `"cluster"`.
+    pub fn ddl_path_kind(&self) -> &'static str {
+        self.ddl_path.load().kind()
     }
 
     /// Get current pair role, if in pair mode.
@@ -1017,6 +1041,10 @@ impl ModeController {
                 %target,
                 "refused illegal mode transition; staying in the current mode"
             );
+            return false;
+        }
+        // T-300 backstop: leaving standalone with jsonb present is refused.
+        if !self.leaving_standalone_permitted(target) {
             return false;
         }
         self.mode.store(Arc::new(target));

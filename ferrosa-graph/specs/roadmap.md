@@ -28,6 +28,10 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 
 ## Next
 
+- **Store Cypher map/list property values as jsonb (D12, T-191).** T-012 made
+  them a typed error on the schema-less CREATE/MERGE path (FMEA G-11); the jsonb
+  write replaces that error. Also fix `expr_to_column_bytes` integer/float widths.
+
 - **Reflect reconciler read failures in `ReconcileMetrics` (FMEA G-7).** The
   discarded `Err(_) => continue` / `unwrap_or_default()` paths are gone — both
   scans stream and log every failure with the table and how far it got
@@ -41,6 +45,9 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
   whose filters keep most of a large table still holds a query-sized frontier.
   The `AnchorScan` operator in `specs/streaming-executor-design.md` is the
   remaining step.
+- **Fuzz the PackStream decoder (FMEA G-10).** Depth and pre-allocation are
+  bounded and unit-tested; add a cargo-fuzz target over `bolt::codec::decode`
+  and `BoltMessage::decode` to find the next parser hazard.
 - **Cost-aware variable-length paths (FMEA G-4).** Add a planner estimate for
   `[*min..max]` fan-out and reject/flag unbounded `[*]` at `EXPLAIN` time; make the
   vertex budget cardinality-aware rather than a single global cap.

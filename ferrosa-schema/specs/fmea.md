@@ -41,3 +41,36 @@ aspirations.
 - 354 in-crate tests + 19 integration tests
   (`tests/{auth_integration,integration,property_tests}.rs`).
 </content>
+
+## T-022 type-name registry
+
+| ID | Failure mode | Effect | Detection | Mitigation |
+|----|--------------|--------|-----------|------------|
+| SCH-T022-01 | `cql_to_marshal_type` / `aggregate_tables::cql_type_to_string` keep private name tables | Drift from the CQL parser tables (FM-20) | `type_names_consumers_agree` (aggregate_tables), `no_wildcard_default_for_new_variant` (convert) | Both delegate to `ferrosa_common::cql_type::names` (see COM-T022-01) |
+
+## T-150 jsonb type threading
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| SCH-T150-01 | New CqlValue variant unhandled in initcond rendering | Compile error only | 2 | 1 | 1 | 2 | Named arm; the exhaustive match forced it. |
+
+## T-154a jsonb placement rules
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| SCH-T154a-01 | jsonb (or a type holding jsonb) accepted in a partition or clustering key on CREATE TABLE | Key bytes with no stable jsonb order (D3, FM-77) | 9 | 3 | 2 | 54 | `jsonb_rules::check_table` on `create_table`, `create_table_internal`, and the propose-side `check_create_table_jsonb`; recursive through frozen collections, tuples and UDTs. `tests/jsonb_key_rules.rs`. |
+| SCH-T154a-02 | ALTER TABLE ADD slips in set/map-key/vector of jsonb or a key-kind jsonb column | Same, after the table exists (FM-79) | 8 | 3 | 2 | 48 | `check_added_columns` in `alter_table`, `alter_table_internal`, `check_alter_table_jsonb`. A refused ALTER changes nothing. |
+| SCH-T154a-03 | A replicated or reloaded schema (`apply_snapshot`, Raft apply, disk load) carries a jsonb key | A bad schema loaded silently, or its bad table skipped | 9 | 2 | 2 | 36 | `apply_snapshot` checks the whole snapshot before applying any of it and returns the typed error; the Raft apply already surfaces `create_table_internal` errors loudly. |
+| SCH-T154a-04 | A column type string the checker cannot read is treated as clean | The rule silently not applied | 8 | 2 | 2 | 32 | An unparseable type is `SchemaError::InvalidSchema`, never skipped. |
+| SCH-T154a-05 | ALTER TYPE ADD FIELD jsonb on a UDT a key already uses | jsonb enters a key through the UDT (D21) | 8 | 2 | 3 | 48 | `alter_type_add_field` re-checks every key column against the changed type map and refuses; a jsonb-nesting field type is refused too. |
+
+## T-300 interim jsonb DDL gate (D24, D15a, FM-23)
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| SCH-T300-01 | A new `DeploymentMode` is added and silently permits jsonb DDL | jsonb replicated without the capability ledger | 9 | 2 | 1 | 18 | `jsonb_ddl_permitted` and `mode_slot` are exhaustive matches with no wildcard: a new mode does not compile until decided. |
+| SCH-T300-02 | jsonb DDL reaches a non-standalone node by a path that skips the entry check (replicated apply, Raft apply, authed and internal create/alter, snapshot apply) | A node without the ledger holds jsonb | 9 | 3 | 2 | 54 | The gate runs at entry (`check_create_table_jsonb`, `check_alter_table_jsonb`, `check_create_type_jsonb`) and again in `create_table[_internal]`, `alter_table[_internal]`, `create_type_internal`, `alter_type_add_field` and `apply_snapshot` (whole snapshot, tables and types, before any of it applies). One WARN and one `jsonb_ddl_refused_total{mode}` tick per refusal. `tests/jsonb_ddl_gate.rs`. |
+| SCH-T300-03 | An unparseable column type is treated as not-jsonb by the gate | The gate silently not applied | 8 | 2 | 2 | 32 | `any_jsonb` returns `InvalidSchema`; never skipped. |
+| SCH-T300-04 | A UDT field that is or nests jsonb, or a column typed by such a UDT, slips past | Nested jsonb outside standalone | 8 | 2 | 2 | 32 | `check_udt_fields_ddl_allowed` on CREATE TYPE / ALTER TYPE ADD; column types resolve UDTs through the type map. |
+| SCH-T300-05 | A node leaves standalone while jsonb columns exist | Cluster with jsonb and no ledger | 9 | 2 | 2 | 36 | `tables_with_jsonb` names the tables; the cluster controller refuses the transition and the process refuses to start (see ferrosa-cluster). |
+| SCH-T300-06 | The scan for jsonb tables fails and is read as "none" | Departure allowed with jsonb present | 9 | 1 | 2 | 18 | `tables_with_jsonb` returns the error; the controller treats it as a refusal (fail closed). |

@@ -19,6 +19,10 @@ dependency/usage review.
   Duration's signed-vint compatibility and malformed trailing-byte cases are
   already covered in-crate.
 
+- ~~**Carry decode errors to the client** (FMEA RB-8)~~ Done (t_cf7ca2cc,
+  FMEA RB-Tcf7ca2cc): the `partition_to_rows*` family, both visitors and the
+  `ferrosa-cql` metadata decomposition return `Result<_, RowDecodeError>`.
+
 ## Next
 
 - **Enumerate the supported-type matrix per front-end.** Make explicit which CQL
@@ -40,3 +44,7 @@ dependency/usage review.
 
 - Protocol framing, query planning, or transport — those belong to the front-ends
   (`ferrosa-cql` / `ferrosa-postgres`), not here.
+
+## jsonb (T-150)
+
+Done: type threading. T-151 done: typed `JsonbFault` (corrupt vs unknown envelope) on the cell codec and `RowDecodeError`. Remaining: PG read path mapping of `RowDecodeError` (FMEA RB-T151-05).

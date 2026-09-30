@@ -575,6 +575,12 @@ compaction executor's task/result queues), `crc32fast`, `sha2`, `dashmap`,
   **`ferrosa-loadgen`**, **`ferrosa-postgres`**, **`ferrosa-session`**,
   **`ferrosa-sparql`**.
 
+**Remote index builder client**: `index::RemoteBackend` authenticates to
+`ferrosa-index-builder` with `Authorization: Bearer $FERROSA_INDEX_BUILDER_TOKEN`
+(logged loudly when unset, since the builder then refuses and every build falls
+back to local), sends an engine-issued `job_id` instead of an S3 prefix, and
+rejects an implausible `sidecar_s3_path` in the response.
+
 ## Tests
 
 ~1024 test functions across in-module `#[test]`/`#[tokio::test]` and 17
@@ -842,3 +848,7 @@ default 3; invalid values use the default). The in-memory pause clears on
 restart, or an operator can call
 `StorageEngine::resume_table_compactions_after_digest_failures(table_id)` to
 clear the pause and retry streak; the next failure starts at the initial delay.
+
+## jsonb (T-150)
+
+`external_sort` payload accounting counts the canonical jsonb bytes (T-150); a document-sized value never accounts as 0.

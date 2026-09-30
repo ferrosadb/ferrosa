@@ -59,13 +59,24 @@ pub enum CqlError {
     /// classify it as a transient timeout; the message carries the budget and
     /// the elapsed time. The transaction is aborted: nothing was persisted.
     TransactionTimeout { timeout_ms: u64, elapsed_ms: u64 },
+    /// 0x2200 — a conditional statement (`IF <cond>`, `IF EXISTS`,
+    /// `IF NOT EXISTS`) appeared in a context that cannot evaluate its
+    /// condition atomically yet. `scope` names the context (for example
+    /// `"a BEGIN TRANSACTION block"`). The statement is rejected and nothing is
+    /// written: a condition is never dropped and the write never applied
+    /// unconditionally.
+    ConditionalUnsupported { scope: &'static str },
+    /// 0x0000 — a stored cell could not be decoded. The read fails; the value
+    /// is never returned as NULL (FM CQL-Tcf7ca2cc). Carries table, column and
+    /// partition-key context.
+    CorruptCell(ferrosa_row_bridge::RowDecodeError),
 }
 
 impl CqlError {
     /// Returns the CQL error code for this error.
     pub fn error_code(&self) -> u32 {
         match self {
-            Self::ServerError(_) => 0x0000,
+            Self::ServerError(_) | Self::CorruptCell(_) => 0x0000,
             Self::Protocol(_) | Self::ProtocolVersionMismatch { .. } => 0x000A,
             Self::BadCredentials => 0x0100,
             Self::Unavailable { .. } => 0x1000,
@@ -74,7 +85,7 @@ impl CqlError {
             Self::ReadTimeout { .. } => 0x1200,
             Self::SyntaxError(_) => 0x2000,
             Self::Unauthorized(_) => 0x2100,
-            Self::Invalid(_) => 0x2200,
+            Self::Invalid(_) | Self::ConditionalUnsupported { .. } => 0x2200,
             Self::ConfigError(_) => 0x2300,
             Self::AlreadyExists { .. } => 0x2400,
             Self::Unprepared(_) => 0x2500,
@@ -176,6 +187,7 @@ impl std::fmt::Display for CqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ServerError(msg) => write!(f, "server error: {msg}"),
+            Self::CorruptCell(err) => write!(f, "server error: {err}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::BadCredentials => write!(f, "bad credentials"),
             Self::Unavailable {
@@ -239,6 +251,12 @@ impl std::fmt::Display for CqlError {
                 "transaction timed out and was aborted: budget={timeout_ms}ms, \
                  elapsed={elapsed_ms}ms; nothing was persisted"
             ),
+            Self::ConditionalUnsupported { scope } => write!(
+                f,
+                "IF conditions are not supported in {scope}: the statement was \
+                 rejected and nothing was written (issue the conditional \
+                 statement on its own instead)"
+            ),
         }
     }
 }
@@ -288,6 +306,13 @@ impl From<ferrosa_schema::SchemaError> for CqlError {
                 Self::Invalid(format!("role cycle detected involving: {r}"))
             }
             SchemaError::InvalidSchema(msg) => Self::ConfigError(msg),
+            // T-154a: a jsonb placement refusal is InvalidRequest (0x2200),
+            // naming the column and the rule in the message.
+            // T-300: jsonb DDL outside standalone is InvalidRequest too; the
+            // message names the mode and the D15a ledger requirement.
+            e @ (SchemaError::JsonbInKey { .. }
+            | SchemaError::JsonbNesting { .. }
+            | SchemaError::JsonbDdlRefused { .. }) => Self::Invalid(e.to_string()),
             _ => {
                 tracing::warn!("unmapped schema error variant: {err}");
                 Self::ServerError(format!("schema error: {err}"))
@@ -320,6 +345,36 @@ impl From<ferrosa_common::Error> for CqlError {
 impl From<ferrosa_row_bridge::RowBridgeError> for CqlError {
     fn from(err: ferrosa_row_bridge::RowBridgeError) -> Self {
         Self::Invalid(err.0)
+    }
+}
+
+/// `CqlError` reaches `corrupt_cell` only from key-component decodes, where the
+/// error has already been flattened to `Invalid`; it keeps no typed jsonb fault.
+/// Jsonb key columns are meant to be rejected by the schema rules (not enforced
+/// by T-151), so this path should not see one.
+impl ferrosa_row_bridge::HasJsonbFault for CqlError {
+    fn fault(&self) -> Option<&ferrosa_row_bridge::JsonbFault> {
+        None
+    }
+}
+
+/// A corrupt stored cell is a server-side data fault, not a client mistake:
+/// it maps to a server error (0x0000), never to a row with a NULL.
+impl From<ferrosa_row_bridge::RowDecodeError> for CqlError {
+    fn from(err: ferrosa_row_bridge::RowDecodeError) -> Self {
+        Self::CorruptCell(err)
+    }
+}
+
+impl CqlError {
+    /// Name the table on a [`CqlError::CorruptCell`]; every other error passes
+    /// through unchanged. Applied at the level that knows the table.
+    #[must_use]
+    pub fn in_table(mut self, table: &str) -> Self {
+        if let Self::CorruptCell(err) = &mut self {
+            *err = err.clone().in_table(table);
+        }
+        self
     }
 }
 
@@ -395,6 +450,12 @@ impl From<ferrosa_udf::UdfError> for CqlError {
             }
             UdfError::ExecutionFailed(msg) => Self::Invalid(format!("UDF execution failed: {msg}")),
             UdfError::KeyInvalid => Self::Invalid("UDF function key is invalid or expired".into()),
+            err @ UdfError::MemoryLimitExceeded { .. } => {
+                Self::Invalid(format!("UDF resource exhausted: {err}"))
+            }
+            UdfError::InvalidConfig(msg) => {
+                Self::Invalid(format!("UDF sandbox misconfigured: {msg}"))
+            }
         }
     }
 }

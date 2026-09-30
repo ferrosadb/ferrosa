@@ -27,56 +27,13 @@
 //! scheme is pure (no counters, no insertion-order dependence), so the same
 //! schema always projects the same OIDs.
 
+use crate::pg_types::{pg_type_of_column, PgType, PgTypeError};
 use ferrosa_schema::{ColumnMetadata, Schema, SchemaSnapshot};
 use ferrosa_sql::{Column, ColumnType, InMemoryTable, RelSchema, Row, Value};
 
 /// First OID Postgres hands out to user objects. Everything below is reserved
-/// for built-in catalog entries (the fixed type OIDs in [`type_oid`] live here).
+/// for built-in catalog entries (the fixed type OIDs in [`crate::pg_types`] live here).
 const FIRST_USER_OID: u32 = 16_384;
-
-/// Map a ferrosa/CQL column type name to its Postgres type OID.
-///
-/// The input is the CQL type string as stored in `ColumnMetadata::column_type`
-/// (e.g. `"text"`, `"int"`, `"frozen<map<text, text>>"`). Matching is
-/// case-insensitive and strips a leading `frozen<...>` wrapper so collection /
-/// frozen types resolve to their inner head type. Unknown types fall back to
-/// `25` (text) — the most permissive textual representation — which is the
-/// documented default rather than a silent panic.
-pub fn type_oid(column_type: &str) -> u32 {
-    let normalized = normalize_type_name(column_type);
-    match normalized.as_str() {
-        "text" | "varchar" | "ascii" => 25,             // text
-        "int" | "int32" | "smallint" | "tinyint" => 23, // int4
-        "bigint" | "counter" | "long" => 20,            // int8
-        "boolean" | "bool" => 16,                       // bool
-        "uuid" | "timeuuid" => 2950,                    // uuid
-        "float" => 700,                                 // float4
-        "double" => 701,                                // float8
-        "blob" | "bytes" => 17,                         // bytea
-        "timestamp" | "datetime" => 1114,               // timestamp (without tz)
-        "date" => 1082,                                 // date
-        "time" => 1083,                                 // time (without tz)
-        "inet" => 869,                                  // inet
-        "decimal" | "varint" => 1700,                   // numeric
-        // Unknown / unsupported CQL types (collections, UDTs, …) are surfaced to
-        // drivers as `text` rather than dropped. Widen this map as the engine
-        // grows real support for the underlying types.
-        _ => 25,
-    }
-}
-
-/// Lower-case a CQL type name and strip an outer `frozen<...>` wrapper, taking
-/// the head identifier before any `<` (so `map<text,text>` -> `map`).
-fn normalize_type_name(column_type: &str) -> String {
-    let trimmed = column_type.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let unwrapped = lower
-        .strip_prefix("frozen<")
-        .and_then(|rest| rest.strip_suffix('>'))
-        .unwrap_or(&lower);
-    let head = unwrapped.split('<').next().unwrap_or(unwrapped);
-    head.trim().to_string()
-}
 
 /// Deterministic synthetic OID for a named object of a given kind.
 ///
@@ -188,9 +145,14 @@ pub fn pg_class(schema: &Schema) -> InMemoryTable {
 /// `pg_catalog.pg_attribute` — one row per column per table.
 ///
 /// Columns: `attrelid` (owning relation OID), `attname` (column name),
-/// `atttypid` (Postgres type OID via [`type_oid`]), `attnum` (1-based ordinal
-/// in the table's column order).
-pub fn pg_attribute(schema: &Schema) -> InMemoryTable {
+/// `atttypid` (Postgres type OID via [`crate::pg_types`]), `attnum` (1-based
+/// ordinal in the table's column order).
+///
+/// # Errors
+///
+/// A column whose stored CQL type does not resolve is a [`PgTypeError`]; the
+/// projection never advertises an unresolvable type as `text`.
+pub fn pg_attribute(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
         Column::new("attrelid", ColumnType::Int),
@@ -208,20 +170,21 @@ pub fn pg_attribute(schema: &Schema) -> InMemoryTable {
         // IndexMap preserves the table's declared column order; attnum is the
         // 1-based position in that order, matching Postgres semantics.
         for (idx, col) in meta.columns.values().enumerate() {
-            rows.push(attribute_row(relid, col, idx));
+            let pg = pg_type_of_column(&col.column_type, &ks, schema)?;
+            rows.push(attribute_row(relid, col, idx, pg));
         }
     }
 
-    InMemoryTable::new(rel_schema, rows)
+    Ok(InMemoryTable::new(rel_schema, rows))
 }
 
 /// Build a single `pg_attribute` row for `col` at 0-based `idx`.
-fn attribute_row(relid: u32, col: &ColumnMetadata, idx: usize) -> Row {
+fn attribute_row(relid: u32, col: &ColumnMetadata, idx: usize, pg: PgType) -> Row {
     let attnum = i64::try_from(idx + 1).unwrap_or(i64::MAX);
     Row::new(vec![
         oid_val(relid),
         Value::Text(col.name.clone()),
-        oid_val(type_oid(&col.column_type)),
+        oid_val(pg.oid),
         Value::Int(attnum),
     ])
 }
@@ -230,77 +193,60 @@ fn attribute_row(relid: u32, col: &ColumnMetadata, idx: usize) -> Row {
 /// the projected columns.
 ///
 /// Columns: `oid` (Postgres type OID), `typname` (canonical type name).
-pub fn pg_type(schema: &Schema) -> InMemoryTable {
+///
+/// # Errors
+///
+/// As [`pg_attribute`]: an unresolvable column type is a [`PgTypeError`].
+pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
     let snapshot = schema.snapshot();
     let rel_schema = RelSchema::new(vec![
         Column::new("oid", ColumnType::Int),
         Column::new("typname", ColumnType::Text),
     ]);
 
-    // Collect the distinct OIDs actually referenced by columns, sorted for a
+    // Distinct types actually referenced by columns, sorted by OID for a
     // deterministic projection.
-    let mut oids: Vec<u32> = snapshot
-        .tables
-        .values()
-        .flat_map(|t| t.columns.values())
-        .map(|c| type_oid(&c.column_type))
-        .collect();
-    oids.sort_unstable();
-    oids.dedup();
-
-    let rows: Vec<Row> = oids
-        .into_iter()
-        .map(|oid| Row::new(vec![oid_val(oid), Value::Text(type_name(oid).to_string())]))
-        .collect();
-
-    InMemoryTable::new(rel_schema, rows)
-}
-
-/// Canonical Postgres `typname` for an OID we mint (inverse of [`type_oid`]).
-fn type_name(oid: u32) -> &'static str {
-    match oid {
-        25 => "text",
-        23 => "int4",
-        20 => "int8",
-        16 => "bool",
-        2950 => "uuid",
-        700 => "float4",
-        701 => "float8",
-        17 => "bytea",
-        1114 => "timestamp",
-        1082 => "date",
-        1083 => "time",
-        869 => "inet",
-        1700 => "numeric",
-        _ => "text",
+    let mut used: Vec<PgType> = Vec::new();
+    for ((ks, _), table) in &snapshot.tables {
+        for col in table.columns.values() {
+            used.push(pg_type_of_column(&col.column_type, ks, schema)?);
+        }
     }
+    used.sort_unstable_by_key(|p| p.oid);
+    used.dedup_by_key(|p| p.oid);
+
+    let rows: Vec<Row> = used
+        .into_iter()
+        .map(|p| Row::new(vec![oid_val(p.oid), Value::Text(p.typname.to_string())]))
+        .collect();
+
+    Ok(InMemoryTable::new(rel_schema, rows))
 }
 
 /// All catalog tables, keyed by their `pg_catalog` relation name, so a future
 /// query path can resolve `pg_catalog.<name>` to a [`ferrosa_sql::TableProvider`].
-pub fn catalog_tables(schema: &Schema) -> Vec<(String, InMemoryTable)> {
-    vec![
+///
+/// # Errors
+///
+/// Propagates a [`PgTypeError`] from [`pg_attribute`] / [`pg_type`].
+pub fn catalog_tables(schema: &Schema) -> Result<Vec<(String, InMemoryTable)>, PgTypeError> {
+    Ok(vec![
         ("pg_namespace".to_string(), pg_namespace(schema)),
         ("pg_class".to_string(), pg_class(schema)),
-        ("pg_attribute".to_string(), pg_attribute(schema)),
-        ("pg_type".to_string(), pg_type(schema)),
-    ]
+        ("pg_attribute".to_string(), pg_attribute(schema)?),
+        ("pg_type".to_string(), pg_type(schema)?),
+    ])
 }
 
+/// Shared schema fixtures for catalog and `pg_types` tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
     use ferrosa_schema::{
-        AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
-        EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
-        ReplicationParams, Schema, SchemaConfig, TableMetadata, TableParams, TestAuditSink,
+        AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+        RateLimitConfig, Schema, SchemaConfig, TestAuditSink,
     };
-    use ferrosa_sql::{TableProvider, Value};
-    use indexmap::IndexMap;
-    use std::collections::{HashMap, HashSet};
-    use uuid::Uuid;
 
-    fn test_config() -> SchemaConfig {
+    pub(crate) fn test_config() -> SchemaConfig {
         SchemaConfig {
             hasher: PasswordHasher::Bcrypt { cost: 4 },
             password_policy: PasswordPolicy::permissive(),
@@ -311,6 +257,24 @@ mod tests {
             mode: DeploymentMode::Development,
         }
     }
+
+    pub(crate) fn empty_schema() -> Schema {
+        Schema::new(test_config()).expect("schema bootstraps")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::test_config;
+    use super::*;
+    use ferrosa_schema::{
+        AuthContext, ClusteringOrder, ColumnKind, ColumnMetadata, KeyspaceMetadata,
+        ReplicationParams, Schema, TableMetadata, TableParams,
+    };
+    use ferrosa_sql::{TableProvider, Value};
+    use indexmap::IndexMap;
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
 
     fn superuser() -> AuthContext {
         AuthContext {
@@ -335,6 +299,11 @@ mod tests {
     /// through the public DDL API (so the projection reads the same metadata a
     /// real CREATE TABLE would produce).
     fn schema_with_ks_tbl() -> Schema {
+        schema_with_ks_tbl_extra(&[])
+    }
+
+    /// As [`schema_with_ks_tbl`], plus one regular column per `(name, cql_type)`.
+    fn schema_with_ks_tbl_extra(extra: &[(&str, &str)]) -> Schema {
         let schema = Schema::new(test_config()).expect("schema bootstraps");
         let auth = superuser();
 
@@ -365,6 +334,9 @@ mod tests {
             "name".to_string(),
             column("name", ColumnKind::Regular, "text"),
         );
+        for (name, ty) in extra {
+            columns.insert(name.to_string(), column(name, ColumnKind::Regular, ty));
+        }
 
         schema
             .create_table(
@@ -392,38 +364,45 @@ mod tests {
         table.scan().collect()
     }
 
-    #[test]
-    fn type_oid_maps_core_types() {
-        assert_eq!(type_oid("text"), 25);
-        assert_eq!(type_oid("varchar"), 25);
-        assert_eq!(type_oid("ascii"), 25);
-        assert_eq!(type_oid("int"), 23);
-        assert_eq!(type_oid("int32"), 23);
-        assert_eq!(type_oid("bigint"), 20);
-        assert_eq!(type_oid("counter"), 20);
-        assert_eq!(type_oid("boolean"), 16);
-        assert_eq!(type_oid("uuid"), 2950);
-        assert_eq!(type_oid("timeuuid"), 2950);
-        assert_eq!(type_oid("float"), 700);
-        assert_eq!(type_oid("double"), 701);
-        assert_eq!(type_oid("blob"), 17);
-        assert_eq!(type_oid("bytes"), 17);
-        assert_eq!(type_oid("timestamp"), 1114);
-        assert_eq!(type_oid("date"), 1082);
-        assert_eq!(type_oid("time"), 1083);
-        assert_eq!(type_oid("inet"), 869);
-        assert_eq!(type_oid("decimal"), 1700);
-        assert_eq!(type_oid("varint"), 1700);
+    /// `atttypid` of column `name` in `ks.tbl` as projected by `pg_attribute`.
+    fn atttypid(schema: &Schema, name: &str) -> Value {
+        let table = pg_attribute(schema).expect("pg_attribute projects");
+        rows_of(&table)
+            .iter()
+            .find(|r| matches!(r.get(1), Value::Text(s) if s == name))
+            .map(|r| r.get(2).clone())
+            .expect("attribute present")
     }
 
     #[test]
-    fn type_oid_is_case_insensitive_and_unwraps_frozen() {
-        assert_eq!(type_oid("TEXT"), 25);
-        assert_eq!(type_oid("Int"), 23);
-        assert_eq!(type_oid("frozen<int>"), 23);
-        // Collections / UDTs fall back to text (documented default).
-        assert_eq!(type_oid("map<text, text>"), 25);
-        assert_eq!(type_oid("some_udt"), 25);
+    fn pg_attribute_types_come_from_pg_types_and_float_double_agree() {
+        let types = [
+            ("f", "float"),
+            ("d", "double"),
+            ("s", "smallint"),
+            ("c", "counter"),
+            ("m", "frozen<map<text, text>>"),
+        ];
+        let schema = schema_with_ks_tbl_extra(&types);
+        // float and double both advertise float8 (t_cd417149).
+        assert_eq!(atttypid(&schema, "f"), Value::Int(701));
+        assert_eq!(atttypid(&schema, "d"), Value::Int(701));
+        assert_eq!(atttypid(&schema, "s"), Value::Int(23));
+        assert_eq!(atttypid(&schema, "c"), Value::Int(20));
+        // Composites are the named text-rendered arm, not a fallback.
+        assert_eq!(atttypid(&schema, "m"), Value::Int(25));
+    }
+
+    #[test]
+    fn unresolvable_column_type_fails_the_projection_loudly() {
+        let schema = schema_with_ks_tbl_extra(&[("bad", "no_such_udt")]);
+        for err in [
+            pg_attribute(&schema).expect_err("pg_attribute refuses"),
+            pg_type(&schema).expect_err("pg_type refuses"),
+            catalog_tables(&schema).expect_err("catalog_tables refuses"),
+        ] {
+            assert!(err.to_string().contains("no_such_udt"), "{err}");
+        }
     }
 
     #[test]
@@ -475,7 +454,7 @@ mod tests {
     #[test]
     fn pg_attribute_lists_columns_with_ordinals_and_type_oids() {
         let schema = schema_with_ks_tbl();
-        let table = pg_attribute(&schema);
+        let table = pg_attribute(&schema).expect("pg_attribute projects");
         let rows = rows_of(&table);
 
         let relid = relation_oid("ks", "tbl");
@@ -500,7 +479,7 @@ mod tests {
     #[test]
     fn pg_type_maps_used_types() {
         let schema = schema_with_ks_tbl();
-        let table = pg_type(&schema);
+        let table = pg_type(&schema).expect("pg_type projects");
         let rows = rows_of(&table);
 
         let pairs: Vec<(i64, &str)> = rows
@@ -515,10 +494,24 @@ mod tests {
         assert!(pairs.contains(&(25, "text")), "pg_type rows: {pairs:?}");
     }
 
+    /// PG-T161a-06: a jsonb column projects as OID 3802 in `pg_attribute` and
+    /// puts a `jsonb` row in `pg_type` (D11).
+    #[test]
+    fn pg_type_and_pg_attribute_report_jsonb_3802() {
+        let schema = schema_with_ks_tbl_extra(&[("doc", "jsonb")]);
+        assert_eq!(atttypid(&schema, "doc"), Value::Int(3802));
+        let rows = rows_of(&pg_type(&schema).expect("pg_type projects"));
+        assert!(
+            rows.iter()
+                .any(|r| r.get(0) == &Value::Int(3802) && r.get(1) == &Value::Text("jsonb".into())),
+            "pg_type has a jsonb row: {rows:?}"
+        );
+    }
+
     #[test]
     fn catalog_tables_exposes_all_four_relations() {
         let schema = schema_with_ks_tbl();
-        let tables = catalog_tables(&schema);
+        let tables = catalog_tables(&schema).expect("catalog projects");
         let names: Vec<&str> = tables.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,

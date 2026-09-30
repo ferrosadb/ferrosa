@@ -394,6 +394,63 @@ pub struct TruncateReport {
     pub committed_after: Option<LogId<u64>>,
 }
 
+/// Backoff schedule and total budget for the sled directory-lock retry.
+///
+/// `DEFAULT` is exactly `origin/main`'s production retry: 10 attempts, a fixed
+/// 50 ms apart (about 450 ms of sleeping). Production must not wait longer:
+/// during cluster formation `SledLogStore::new` can hit a raft dir whose lock
+/// another in-process handle really holds (t_e67af7e7), and a long wait there
+/// makes Raft miss its leader window (CL-Tsledrevert). Tests that must
+/// outlast a slow release use the test-only `TEST_LONG` instead.
+#[derive(Debug, Clone, Copy)]
+struct LockRetryPolicy {
+    initial: Duration,
+    max_backoff: Duration,
+    /// Wall-clock cap on total waiting.
+    budget: Duration,
+    /// Cap on open attempts, including the first.
+    max_attempts: u32,
+}
+
+impl LockRetryPolicy {
+    /// Main's retry: 10 attempts, fixed 50 ms interval.
+    const DEFAULT: Self = Self {
+        initial: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(50),
+        budget: Duration::from_millis(500),
+        max_attempts: 10,
+    };
+
+    /// Test-only: exponential backoff under a 10 s budget, so event-synced
+    /// tests never race the budget under load. Never used by production.
+    #[cfg(test)]
+    const TEST_LONG: Self = Self {
+        initial: Duration::from_millis(10),
+        max_backoff: Duration::from_millis(250),
+        budget: Duration::from_secs(10),
+        max_attempts: u32::MAX,
+    };
+}
+
+#[cfg(test)]
+type ContentionHook = std::rc::Rc<dyn Fn(u32)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only observation point, called on the opening thread after each
+    /// lock-contention attempt, so tests can release the holder on an event.
+    static CONTENTION_HOOK: std::cell::RefCell<Option<ContentionHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn notify_contention_hook(attempt: u32) {
+    let hook = CONTENTION_HOOK.with(|h| h.borrow().clone());
+    if let Some(hook) = hook {
+        hook(attempt);
+    }
+}
+
 #[allow(clippy::result_large_err)] // StorageIOError is 224 bytes — dictated by openraft
 impl SledLogStore {
     /// Open (or create) a log store at the given filesystem `path`.
@@ -404,13 +461,17 @@ impl SledLogStore {
     /// on a millisecond-scale race — a just-exited handle still releasing, or
     /// (seen in CI) heavy parallel I/O making `flock` momentarily return
     /// `Resource temporarily unavailable` even on a fresh dir. Failing the open
-    /// on such a transient is wrong, so we retry with a bounded backoff
-    /// (≤ `MAX_ATTEMPTS` × `BACKOFF` ≈ 500 ms). A **genuinely** held lock (a live
-    /// node already running on this dir) is held for the node's whole lifetime,
-    /// far longer than the budget, so a real dual-open conflict still surfaces
-    /// the error — only the transient is absorbed.
+    /// on such a transient is wrong, so we retry under
+    /// `LockRetryPolicy::DEFAULT` (main's 10 attempts, 50 ms apart). A **genuinely** held lock (a
+    /// live node already running on this dir) is held for the node's whole
+    /// lifetime, so a real dual-open conflict still surfaces the error.
     pub fn new(path: &Path) -> Result<Self, sled::Error> {
-        let db = Self::open_sled_db_with_lock_retry(path)?;
+        Self::new_with_policy(path, LockRetryPolicy::DEFAULT)
+    }
+
+    /// [`Self::new`] under an explicit retry policy (the test seam).
+    fn new_with_policy(path: &Path, policy: LockRetryPolicy) -> Result<Self, sled::Error> {
+        let db = Self::open_sled_db_with_policy(path, policy)?;
         let log = db.open_tree("log")?;
         let meta = db.open_tree("meta")?;
         Ok(Self {
@@ -432,37 +493,91 @@ impl SledLogStore {
     }
 
     /// Open a sled `Db` at `path`, retrying through **transient** directory-lock
-    /// contention with a bounded backoff (≤ `MAX_ATTEMPTS` × `BACKOFF` ≈ 500 ms,
-    /// logged per attempt, classified by `is_lock_contention`).
+    /// contention under `LockRetryPolicy::DEFAULT` (10 attempts, 50 ms apart,
+    /// about 500 ms, as on `origin/main`).
     ///
     /// The single transient-lock retry primitive: used by [`Self::new`] and the
     /// offline tooling, and exposed (`pub`) for tools/tests that need the raw
-    /// `sled::Db` directly (manipulating trees) and would otherwise hit the same
-    /// `EWOULDBLOCK`/`EAGAIN` flake on a fresh dir under heavy parallel I/O. A
-    /// genuinely-held lock (a live node on this dir) outlasts the budget, so a
-    /// real dual-open conflict still surfaces the error — only the transient is
-    /// absorbed.
+    /// `sled::Db`. Dropping a sled `Db` flushes and joins its threads, which
+    /// under heavy I/O can take seconds while the directory stays locked,
+    /// hence the generous budget. A genuinely-held lock (a live node on this
+    /// dir) outlasts any budget, so a real dual-open conflict still surfaces a
+    /// typed `WouldBlock` error carrying the waited duration. The budget stays
+    /// short on purpose: see `LockRetryPolicy`.
     pub fn open_sled_db_with_lock_retry(path: &Path) -> Result<sled::Db, sled::Error> {
-        const MAX_ATTEMPTS: u32 = 10;
-        const BACKOFF: Duration = Duration::from_millis(50);
-        let mut attempt: u32 = 1;
+        Self::open_sled_db_with_policy(path, LockRetryPolicy::DEFAULT)
+    }
+
+    /// Retry loop behind [`Self::open_sled_db_with_lock_retry`]. Logs the edges
+    /// only: first contention, then recovered or given up, each with the
+    /// waited duration. Terminates: each iteration returns or consumes budget,
+    /// checked against a monotonic clock.
+    fn open_sled_db_with_policy(
+        path: &Path,
+        policy: LockRetryPolicy,
+    ) -> Result<sled::Db, sled::Error> {
+        let started = std::time::Instant::now();
+        let mut backoff = policy.initial;
+        let mut attempt: u32 = 0;
         loop {
-            match sled::open(path) {
-                Ok(db) => return Ok(db),
-                Err(err) if attempt < MAX_ATTEMPTS && Self::is_lock_contention(&err) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        attempt,
-                        max_attempts = MAX_ATTEMPTS,
-                        error = %err,
-                        "sled open hit a transient directory lock; retrying after backoff"
-                    );
-                    std::thread::sleep(BACKOFF);
-                    attempt += 1;
+            attempt += 1;
+            let err = match sled::open(path) {
+                Ok(db) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            path = %path.display(),
+                            attempts = attempt,
+                            waited_ms = started.elapsed().as_millis() as u64,
+                            "sled directory lock acquired after transient contention"
+                        );
+                    }
+                    return Ok(db);
                 }
-                Err(err) => return Err(err),
+                Err(err) => err,
+            };
+            if !Self::is_lock_contention(&err) {
+                return Err(err);
             }
+            if attempt == 1 {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "sled open hit a transient directory lock; retrying with backoff"
+                );
+            }
+            #[cfg(test)]
+            notify_contention_hook(attempt);
+            let waited = started.elapsed();
+            let remaining = policy.budget.checked_sub(waited).filter(|r| !r.is_zero());
+            let Some(remaining) = remaining.filter(|_| attempt < policy.max_attempts) else {
+                return Err(Self::lock_gave_up(path, attempt, waited, &err));
+            };
+            std::thread::sleep(backoff.min(remaining));
+            backoff = (backoff * 2).min(policy.max_backoff);
         }
+    }
+
+    /// Log and build the typed `WouldBlock` error for an exhausted budget.
+    fn lock_gave_up(
+        path: &Path,
+        attempts: u32,
+        waited: Duration,
+        cause: &sled::Error,
+    ) -> sled::Error {
+        tracing::error!(
+            path = %path.display(),
+            attempts,
+            waited_ms = waited.as_millis() as u64,
+            error = %cause,
+            "sled directory lock still held; giving up"
+        );
+        sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "could not acquire lock on {} after {attempts} attempts over {waited:?}: {cause}",
+                path.display()
+            ),
+        ))
     }
 
     /// Open a store for **offline** operator tooling (`inspect` /
@@ -470,6 +585,12 @@ impl SledLogStore {
     /// named entry point for the offline tools.
     fn open_offline(path: &Path) -> Result<Self, sled::Error> {
         Self::new(path)
+    }
+
+    /// [`Self::open_offline`] under an explicit retry policy (test seam).
+    #[cfg(test)]
+    fn open_offline_with_policy(path: &Path, policy: LockRetryPolicy) -> Result<Self, sled::Error> {
+        Self::new_with_policy(path, policy)
     }
 
     /// True only for the transient "directory lock already held" condition,
@@ -2160,19 +2281,71 @@ mod tests {
 
         let holder = SledLogStore::new(dir.path()).expect("hold the directory lock");
         let path = dir.path().to_path_buf();
+
+        let store = open_after_contention_observed(holder, || {
+            SledLogStore::open_offline_with_policy(&path, LockRetryPolicy::TEST_LONG)
+        })
+        .expect("open_offline must retry past the transient lock and succeed");
+        drop(store);
+    }
+
+    /// Hold `holder`, run `open` on this thread, and drop the holder only after
+    /// `open` has observed a lock-contention attempt. Event-synchronised, no
+    /// sleeps: the outcome does not depend on how long the drop takes.
+    fn open_after_contention_observed<T>(
+        holder: SledLogStore,
+        open: impl FnOnce() -> Result<T, sled::Error>,
+    ) -> Result<T, sled::Error> {
+        let (tx, rx) = std::sync::mpsc::channel::<u32>();
+        CONTENTION_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::rc::Rc::new(move |attempt| {
+                // A closed receiver means the releaser already ran.
+                if tx.send(attempt).is_err() {
+                    tracing::debug!(attempt, "contention hook: releaser already gone");
+                }
+            }));
+        });
         let releaser = std::thread::spawn(move || {
-            // Release well within the retry budget (10 × 50 ms ≈ 500 ms).
-            std::thread::sleep(Duration::from_millis(120));
+            rx.recv()
+                .expect("opener must observe contention before release");
             drop(holder);
         });
+        let result = open();
+        CONTENTION_HOOK.with(|h| *h.borrow_mut() = None);
+        releaser.join().expect("releaser thread");
+        result
+    }
 
-        // (`new`/`open_offline` now share the same transient-lock retry, so a
-        // plain open no longer fails fast on a still-releasing holder — that
-        // exact behaviour is asserted by `new_retries_through_a_transient_lock`.)
-        let store = SledLogStore::open_offline(&path)
-            .expect("open_offline must retry past the transient lock and succeed");
-        drop(store);
-        releaser.join().unwrap();
+    /// A live peer that never releases must still surface a typed lock error
+    /// after the budget, carrying the waited duration (CL-T2c1678cb).
+    #[tokio::test]
+    async fn a_never_released_lock_fails_typed_after_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_store(dir.path(), 1..=3, &[]).await;
+        let _holder = SledLogStore::new(dir.path()).expect("hold the directory lock");
+        let policy = LockRetryPolicy {
+            initial: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+            budget: Duration::from_millis(150),
+            max_attempts: u32::MAX,
+        };
+
+        let started = std::time::Instant::now();
+        let err = SledLogStore::open_sled_db_with_policy(dir.path(), policy)
+            .expect_err("a held lock must not open");
+
+        assert!(
+            SledLogStore::is_lock_contention(&err),
+            "typed lock error: {err}"
+        );
+        assert!(
+            started.elapsed() >= policy.budget,
+            "must wait out the budget"
+        );
+        assert!(
+            err.to_string().contains("attempts over"),
+            "waited duration: {err}"
+        );
     }
 
     /// `SledLogStore::new` must retry through a *transient* directory-lock
@@ -2191,18 +2364,15 @@ mod tests {
 
         let holder = SledLogStore::new(dir.path()).expect("hold the directory lock");
         let path = dir.path().to_path_buf();
-        let releaser = std::thread::spawn(move || {
-            // Release well within the retry budget (10 × 50 ms ≈ 500 ms).
-            std::thread::sleep(Duration::from_millis(120));
-            drop(holder);
-        });
 
-        // The online open must retry past the transient lock and succeed —
-        // exactly like `open_offline`.
-        let store =
-            SledLogStore::new(&path).expect("new() must retry past the transient lock and succeed");
+        // Released only after contention was observed, under the test-only
+        // long budget (CL-T2c1678cb: the old 120 ms sleep raced a 500 ms
+        // budget and lost under load; production keeps the 500 ms budget).
+        let store = open_after_contention_observed(holder, || {
+            SledLogStore::new_with_policy(&path, LockRetryPolicy::TEST_LONG)
+        })
+        .expect("new() must retry past the transient lock and succeed");
         drop(store);
-        releaser.join().unwrap();
     }
 
     #[tokio::test]

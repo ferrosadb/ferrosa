@@ -37,6 +37,7 @@ inner equi-join — and widens outward.
 | `exec` (`src/exec.rs`) | ~900 | Physical operators: streaming `seq_scan`, `filter`, `project`; **blocking, spilling** `hash_join`, `sort`, `hash_aggregate`, `dedup`; `limit_offset`, `Predicate`, `CmpOp`, `AggFunc` |
 | `spill` (`src/spill.rs`) | ~700 | Spill backing for the blocking operators: `SpillCtx`/`SpillReserver` (per-node temp location), `SpillSort` over `ferrosa_storage::ExternalSorter`, `ReplayBuffer` (the join's replayable inner group), `canonical_cmp` (type-aware total order for grouping/DISTINCT), orphan sweep |
 | `parser` (`src/parser.rs`) | ~1752 | Hand-written lexer + recursive-descent parser; `parse`, `parse_statement`, `ParseError`, typed-literal parsing |
+| `parser_ddl` (`src/parser_ddl.rs`, child of `parser`) | ~330 | `CREATE TABLE` (Ecto subset, D10): PG type map, PRIMARY KEY merge/validation, typed refusal of out-of-scope clauses. Parse only |
 | `plan` (`src/plan.rs`) | ~1598 | Binder + planner: `execute`, `describe`, `infer_param_types`; scope resolution, Kleene WHERE/HAVING eval, `ExecError` |
 | `ast` (`src/ast.rs`) | ~207 | Logical AST: `Statement`, `SelectStmt`, DML statements, `Expr`, `Operand`, `Projection`, `OrderItem` |
 | `catalog` (`src/catalog.rs`) | ~81 | `Catalog` trait + `MapCatalog`; name → provider resolution (fail-loud on miss) |
@@ -61,7 +62,7 @@ flowchart TD
   AGG --> SRT["sort (ORDER BY)"]
   PRJ --> SRT
   SRT --> LO["limit_offset"]
-  LO --> QR["QueryResult { columns, rows }"]
+  LO --> QR["RowSink: columns, then row by row"]
 ```
 
 Aggregate mode is entered iff `GROUP BY` is present, `HAVING` is present, or any

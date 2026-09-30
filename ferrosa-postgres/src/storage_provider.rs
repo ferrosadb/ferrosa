@@ -22,7 +22,7 @@
 //!
 //! `blocking_recv` would panic on an async worker, and blocking one would be the
 //! deadlock this module used to avoid by materializing. It is legal here because
-//! the synchronous executor no longer runs on an async worker: the `offload`
+//! the synchronous executor no longer runs on an async worker: the `result_stream`
 //! module moved `ferrosa_sql::execute` onto `spawn_blocking` (t_d3b2dec1). That
 //! change is the prerequisite for this one — the sync consumer is now *allowed* to
 //! block, which is exactly what a bounded channel needs.
@@ -34,11 +34,10 @@
 //! channel only decides how far ahead the producer may run. A cap on rows
 //! *returned* would be a different thing entirely and is not what this is.
 //!
-//! This bounds the **source** side. The relational executor still collects its
-//! base row set (`ferrosa-sql`, `seq_scan(..).collect()`) and `QueryResult.rows`
-//! is a `Vec`, so an end-to-end `SELECT *` peak remains O(result) until that is
-//! streamed (t_50d99192). Those sites carry their own audit allowlist entries;
-//! nothing here hides them.
+//! This bounds the **source** side. The result side is bounded too: the
+//! executor's rows reach the client through `result_stream`, which delivers
+//! them in bounded batches with backpressure from the socket, so an end-to-end
+//! `SELECT *` holds O(batch) rows (t_f348ba0b).
 //!
 //! ### Re-scannable, because `scan()` is
 //!
@@ -104,7 +103,7 @@ use std::sync::{Arc, Mutex};
 
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema, TableMetadata};
-use ferrosa_sql::{Column, ColumnType, RelSchema, Row, TableProvider, Value};
+use ferrosa_sql::{Column, RelSchema, Row, TableProvider, Value};
 use ferrosa_storage::{StorageEngine, TableId};
 use futures::{FutureExt, StreamExt};
 use tokio::runtime::Handle;
@@ -162,6 +161,9 @@ pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
         | CqlValue::Vector(_) => {
             return Err(format!("unsupported CQL value for PostgreSQL: {v:?}"))
         }
+        // The validated cell moves across unchanged (T-160): no re-parse, no
+        // text detour, so a scale variant like `1.0` keeps its bytes.
+        CqlValue::Jsonb(doc) => Value::Jsonb(doc.clone()),
     })
 }
 
@@ -192,58 +194,17 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// Map a CQL column-type string to the engine's [`ColumnType`].
+/// Build the engine [`RelSchema`] from a table's column names and resolved types,
+/// in declared order.
 ///
-/// The CQL integral family collapses to `Int`, the textual family to `Text`;
-/// `uuid`/`timeuuid` map to `Uuid` and `blob`/`bytes` to `Bytea` so a column's
-/// declared schema type agrees with the [`cql_to_value`] value type (and hence
-/// the advertised RowDescription OID). Anything the engine can't yet model (and
-/// any unknown type) defaults to `Text` — the most permissive textual
-/// representation — consistent with `catalog::type_oid`'s text fallback.
-fn engine_column_type(cql_type: &str) -> ColumnType {
-    match normalize_type_head(cql_type).as_str() {
-        "int" | "smallint" | "tinyint" => ColumnType::Int,
-        "bigint" | "counter" => ColumnType::BigInt,
-        "boolean" | "bool" => ColumnType::Bool,
-        "text" | "varchar" | "ascii" => ColumnType::Text,
-        "uuid" | "timeuuid" => ColumnType::Uuid,
-        "blob" | "bytes" => ColumnType::Bytea,
-        // Temporal / network / arbitrary-precision now map to widened engine
-        // types (exact Postgres text). `varint` is an arbitrary-precision integer
-        // ⇒ numeric (so a value outside i64 range is not silently lost).
-        "timestamp" | "datetime" => ColumnType::Timestamp,
-        "date" => ColumnType::Date,
-        "time" => ColumnType::Time,
-        "inet" => ColumnType::Inet,
-        "decimal" | "varint" => ColumnType::Numeric,
-        // Unknown / not-yet-modelled types default to Text (documented fallback).
-        _ => ColumnType::Text,
-    }
-}
-
-/// Lower-case a CQL type name, strip an outer `frozen<...>`, and take the head
-/// identifier before any `<` (so `map<text,text>` -> `map`). Mirrors
-/// `catalog::normalize_type_name`.
-fn normalize_type_head(column_type: &str) -> String {
-    let lower = column_type.trim().to_ascii_lowercase();
-    let unwrapped = lower
-        .strip_prefix("frozen<")
-        .and_then(|rest| rest.strip_suffix('>'))
-        .unwrap_or(&lower);
-    unwrapped
-        .split('<')
-        .next()
-        .unwrap_or(unwrapped)
-        .trim()
-        .to_string()
-}
-
-/// Build the engine [`RelSchema`] from a table's columns in declared order.
-fn rel_schema_for(meta: &TableMetadata) -> RelSchema {
-    let columns = meta
-        .columns
-        .values()
-        .map(|col| Column::new(col.name.clone(), engine_column_type(&col.column_type)))
+/// Each column's engine type comes from [`crate::pg_types::pg_type_of`], the same
+/// map the catalog and RowDescription use, so the three cannot drift.
+fn rel_schema_for(col_names: &[String], col_types: &[CqlType]) -> RelSchema {
+    debug_assert_eq!(col_names.len(), col_types.len());
+    let columns = col_names
+        .iter()
+        .zip(col_types)
+        .map(|(name, ty)| Column::new(name.clone(), crate::pg_types::pg_type_of(ty).column_type))
         .collect();
     RelSchema::new(columns)
 }
@@ -375,7 +336,7 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
         // Mirror the CQL SELECT path: one engine row per logical CQL row, with
         // values in the table's declared column order. The decomposition is
         // per-partition, so this holds one partition's rows, not the table's.
-        for cql_row in ferrosa_row_bridge::partition_to_rows_with_storage_mapping(
+        let cql_rows = match ferrosa_row_bridge::partition_to_rows_with_storage_mapping(
             &partition,
             &ctx.col_names,
             &ctx.col_types,
@@ -383,6 +344,17 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
             &ctx.ck_idx,
             &ctx.storage_to_table,
         ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                // A corrupt cell fails the query. It must never surface as a
+                // NULL or a truncated result (PG-Tcf7ca2cc).
+                let error =
+                    error.in_table(format!("{}.{}", ctx.table_id.keyspace, ctx.table_id.table));
+                failure.record(format!("scan failed: {error}"));
+                return;
+            }
+        };
+        for cql_row in cql_rows {
             let values: Vec<Value> = match cql_row
                 .iter()
                 .map(|cell| match cell {
@@ -442,7 +414,7 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
 /// The sync half of the hand-off: pulls rows the producer pushes.
 ///
 /// `blocking_recv` is legal here because the relational executor runs on a
-/// `spawn_blocking` thread (see the `offload` module). Dropping this iterator
+/// `spawn_blocking` thread (see the `result_stream` module). Dropping this iterator
 /// closes the channel, which is what tells the producer to stop.
 struct ScanIter {
     rx: mpsc::Receiver<Row>,
@@ -566,8 +538,6 @@ pub(crate) async fn load_table_with_overlay(
             table: table.to_string(),
         })?;
 
-    let rel_schema = rel_schema_for(meta);
-
     // Column context for the canonical CQL decomposition, in declared order.
     let col_names: Vec<String> = meta.columns.keys().cloned().collect();
     let col_types = meta
@@ -576,6 +546,7 @@ pub(crate) async fn load_table_with_overlay(
         .map(|c| ferrosa_row_bridge::parse_cql_type_in_keyspace(&c.column_type, keyspace, schema))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| LoadError::Storage(format!("failed to resolve column type: {e}")))?;
+    let rel_schema = rel_schema_for(&col_names, &col_types);
     let pk_idx = pk_indices(meta);
     let ck_idx = ck_indices(meta);
     let storage_to_table = storage_to_table_indices(meta);
@@ -753,7 +724,12 @@ pub(crate) fn read_row_image(
         &pk,
         &ck,
         &storage_to_table,
-    );
+    )
+    .map_err(|error| {
+        error
+            .in_table(format!("{}.{}", mutation.keyspace, mutation.table))
+            .to_string()
+    })?;
     let Some((_, cells)) = rows.into_iter().next() else {
         return Ok(None);
     };
@@ -775,6 +751,39 @@ pub(crate) fn read_row_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrosa_sql::ColumnType;
+
+    fn jsonb_cell(text: &str) -> ferrosa_jsonb::JsonbValue {
+        use ferrosa_jsonb::{parse_text, JsonbValue, Limits, LimitsConfig};
+        let limits = Limits::from_config_with_env(&LimitsConfig::default(), &|_| None, 64 << 20)
+            .expect("default limits");
+        let enc = parse_text(text.as_bytes(), &limits).expect("valid json");
+        JsonbValue::from_encoded(enc).expect("valid cell")
+    }
+
+    /// PG-T160-2: a jsonb cell crosses the storage boundary byte-for-byte in
+    /// both directions, keeping scale variants (`1.0`) intact.
+    #[test]
+    fn storage_provider_round_trips_a_jsonb_cell() {
+        let doc = jsonb_cell(r#"{"a":[1.0,{"b":12345678901234567890.5e300}],"s":"x"}"#);
+        let cql = CqlValue::Jsonb(doc.clone());
+        let sql = super::cql_to_value(&cql).expect("jsonb is representable");
+        match &sql {
+            Value::Jsonb(got) => assert_eq!(got.as_bytes(), doc.as_bytes()),
+            other => panic!("expected Value::Jsonb, got {other:?}"),
+        }
+        match crate::query::value_to_cql(&sql, &CqlType::Jsonb, &crate::jsonb_wire::test_limits()) {
+            Ok(back) => assert_eq!(back, cql),
+            Err(_) => panic!("a jsonb value must bind to a jsonb column"),
+        }
+        // A non-jsonb, non-text value for a jsonb column is refused, never
+        // coerced. (Text is parsed and validated: T-161a.)
+        let limits = crate::jsonb_wire::test_limits();
+        assert!(crate::query::value_to_cql(&Value::Int(1), &CqlType::Jsonb, &limits).is_err());
+        assert!(
+            crate::query::value_to_cql(&Value::Text("{".into()), &CqlType::Jsonb, &limits).is_err()
+        );
+    }
 
     fn cql_to_value(value: &CqlValue) -> Value {
         super::cql_to_value(value).expect("test value should be representable")
@@ -910,26 +919,17 @@ mod tests {
     }
 
     #[test]
-    fn engine_column_type_maps_families() {
-        assert_eq!(engine_column_type("int"), ColumnType::Int);
-        assert_eq!(engine_column_type("bigint"), ColumnType::BigInt);
-        assert_eq!(engine_column_type("counter"), ColumnType::BigInt);
-        assert_eq!(engine_column_type("text"), ColumnType::Text);
-        assert_eq!(engine_column_type("ASCII"), ColumnType::Text);
-        assert_eq!(engine_column_type("boolean"), ColumnType::Bool);
-        // uuid / timeuuid / blob now map to the widened engine types.
-        assert_eq!(engine_column_type("uuid"), ColumnType::Uuid);
-        assert_eq!(engine_column_type("timeuuid"), ColumnType::Uuid);
-        assert_eq!(engine_column_type("blob"), ColumnType::Bytea);
-        // Temporal / network / arbitrary-precision map to the new engine types.
-        assert_eq!(engine_column_type("timestamp"), ColumnType::Timestamp);
-        assert_eq!(engine_column_type("date"), ColumnType::Date);
-        assert_eq!(engine_column_type("time"), ColumnType::Time);
-        assert_eq!(engine_column_type("inet"), ColumnType::Inet);
-        assert_eq!(engine_column_type("decimal"), ColumnType::Numeric);
-        assert_eq!(engine_column_type("varint"), ColumnType::Numeric);
-        // Unknown / not-yet-modelled -> Text fallback.
-        assert_eq!(engine_column_type("map<text, text>"), ColumnType::Text);
+    fn rel_schema_uses_the_pg_types_map_for_every_cql_type() {
+        use crate::pg_types::pg_type_of;
+        use ferrosa_common::cql_type::names::SCALAR_TYPES;
+        let types: Vec<CqlType> = SCALAR_TYPES.to_vec();
+        let names: Vec<String> = (0..types.len()).map(|i| format!("c{i}")).collect();
+        let rel = rel_schema_for(&names, &types);
+        let cols: Vec<&Column> = rel.columns.iter().collect();
+        assert_eq!(cols.len(), types.len());
+        for (col, ty) in cols.iter().zip(&types) {
+            assert_eq!(col.ty, pg_type_of(ty).column_type, "{ty:?}");
+        }
     }
 
     #[test]
@@ -1267,6 +1267,43 @@ mod tests {
             failure.take(),
             None,
             "a healthy empty scan must not record a failure"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// PG-Tcf7ca2cc: a partition with one corrupt simple cell fails the scan
+    /// with an error that names the table and column. The corrupt row is never
+    /// emitted as a row with a NULL; the healthy partition still reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_records_failure_naming_table_for_a_corrupt_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+        let tid = TableId::new("ks", "t");
+
+        // `name` (ordinal 0) is text: invalid UTF-8 is corrupt. (The engine
+        // rejects wrong-width fixed types at write, but not bad text.)
+        let mut corrupt = storage_row(1, "bad", 0, 1000);
+        corrupt.cells[0] = (0, CellValue::live(vec![0xff, 0xfe], 1000));
+        let key = DecoratedKey::new(PartitionKey::new(b"corrupt".to_vec()));
+        engine.write(&tid, &key, corrupt, 1000).unwrap();
+
+        let failure = ScanFailure::default();
+        let table = Arc::new(
+            load_table(&engine, &schema, "ks", "t", failure.clone())
+                .await
+                .expect("load succeeds"),
+        );
+        let rows = scan_rows(table).await;
+
+        let message = failure.take().expect("a corrupt cell must fail the scan");
+        assert!(message.contains("ks.t"), "must name the table: {message}");
+        assert!(message.contains("name"), "must name the column: {message}");
+        assert!(
+            rows.is_empty(),
+            "a corrupt row must not be emitted with a NULL: {rows:?}"
         );
 
         engine.shutdown().unwrap();

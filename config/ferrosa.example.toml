@@ -24,6 +24,28 @@ max_connections_per_ip = 64
 # tls_key  = "~/.ferrosa/config/tls/server.key"
 # require_tls = false
 
+[udf]
+# Per-Store cap on WASM guest linear memory, in bytes (default 16 MiB).
+# Env fallback: FERROSA_UDF_MAX_MEMORY_BYTES (TOML wins). Valid range
+# 65536..=4294967296; 0 or out-of-range aborts startup.
+# max_memory_bytes = 16777216
+
+[jsonb]
+# Ingest limits for the jsonb type (writes and query arguments only).
+# TOML wins over the FERROSA_JSONB_<KEY> env fallback (keys with an env
+# fallback: max_input_bytes, max_encoded_bytes, max_nesting_depth,
+# max_key_list_length, max_index_terms_per_doc). Zero, a value above its hard
+# ceiling, or a max_input_bytes/max_encoded_bytes above the commit-log segment
+# size aborts startup with a FATAL message naming the key.
+# max_input_bytes = 10485760          # default 10 MiB; ceiling 256 MiB
+# max_encoded_bytes = 10485760        # default 10 MiB; ceiling 256 MiB
+# max_nesting_depth = 1000            # default 1000; ceiling 1000
+# max_key_list_length = 1000          # default 1000; ceiling 1000000
+# max_index_terms_per_doc = 10000     # default 10000; ceiling 10000000
+# max_path_len = 4096                 # default 4096; ceiling 1048576 (TOML only)
+# path_step_budget = 1000000          # default 1000000; ceiling 1000000000 (TOML only)
+# duplicate_keys = "last_wins"        # or "error"
+
 # ---------------------------------------------------------------------------
 # Internode RPC — used by multi-node clusters. A single-node install never
 # accepts inbound peers, but ferrosa-net still binds the listener at startup.

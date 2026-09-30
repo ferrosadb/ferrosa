@@ -24,7 +24,8 @@ use crate::extended::{self, PreparedKind, Session};
 use crate::handshake::{HandshakeError, VerifierStore};
 use crate::messages::{BackendMessage, FrontendMessage};
 use crate::mvcc::{MvccCommitError, MvccManager};
-use crate::query;
+use crate::query::{self, ReplySink};
+use crate::result_stream::{PumpEnd, ResultStream};
 use crate::AccordAccess;
 
 /// Shared context for the post-auth query phase: the storage engine and schema
@@ -45,6 +46,15 @@ pub struct QueryContext {
     /// [`AccordAccess::committer`]) rather than captured here, because this
     /// listener is built before the node has formed a cluster.
     pub accord: AccordAccess,
+    /// Schema-change path for PostgreSQL DDL (`CREATE TABLE`). `None` means the
+    /// front-end has no DDL authority (unit-test contexts): DDL is then refused
+    /// with `0A000` rather than reported as done.
+    pub ddl: Option<Arc<dyn crate::ddl::DdlExecutor>>,
+    /// Tunable jsonb ingest limits (D14b), resolved once at startup by the
+    /// binary from `[jsonb]` / env and passed in here. There is no default:
+    /// every constructor must supply the resolved value. They gate INSERT and
+    /// UPDATE input only; reads use the codec's fixed hard ceilings.
+    pub jsonb_limits: ferrosa_jsonb::Limits,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -364,7 +374,7 @@ where
     let mut out = BytesMut::new();
     match msg {
         FrontendMessage::Query(sql) => {
-            let msgs = execute_simple(ctx, session, &sql).await;
+            let msgs = execute_simple_to(ctx, session, &sql, &mut SocketSink(&mut *stream)).await?;
             for m in &msgs {
                 m.encode(&mut out);
             }
@@ -393,6 +403,7 @@ where
                     &param_formats,
                     &param_values,
                     result_formats,
+                    &ctx.jsonb_limits,
                 )
                 .encode(&mut out);
         }
@@ -401,8 +412,16 @@ where
                 m.encode(&mut out);
             }
         }
-        FrontendMessage::Execute { portal, .. } => {
-            for m in execute_portal(ctx, session, &portal).await {
+        FrontendMessage::Execute { portal, max_rows } => {
+            let tail = execute_portal_to(
+                ctx,
+                session,
+                &portal,
+                max_rows,
+                &mut SocketSink(&mut *stream),
+            )
+            .await?;
+            for m in &tail {
                 m.encode(&mut out);
             }
         }
@@ -449,13 +468,32 @@ async fn begin_implicit_transaction(
     Ok(())
 }
 
+/// Writes each batch of messages to the socket as it is produced, so a streaming
+/// `SELECT` never gathers its rows.
+struct SocketSink<'a, St>(&'a mut St);
+
+impl<St: AsyncWrite + Unpin> ReplySink for SocketSink<'_, St> {
+    async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()> {
+        let mut buf = BytesMut::new();
+        for message in &messages {
+            message.encode(&mut buf);
+        }
+        self.0.write_all(&buf).await
+    }
+}
+
 /// Treat standalone PostgreSQL data statements as implicit transactions in
 /// cluster mode, so autocommit has the same Accord ordering as explicit BEGIN.
-async fn execute_simple(
+///
+/// A `SELECT`'s rows are written to `out` as they are produced; the returned
+/// messages are the tail still to send (its `CommandComplete`, or the
+/// `ErrorResponse` that ended it).
+async fn execute_simple_to<O: ReplySink>(
     ctx: &QueryContext,
     session: &mut Session,
     sql: &str,
-) -> Vec<BackendMessage> {
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
     let is_data_statement = matches!(
         ferrosa_sql::parse_statement(sql),
         Ok(ferrosa_sql::Statement::Select(_)
@@ -464,30 +502,30 @@ async fn execute_simple(
             | ferrosa_sql::Statement::Delete(_))
     );
     if session.in_txn() || ctx.accord.committer().is_none() || !is_data_statement {
-        return execute_simple_inner(ctx, session, sql).await;
+        return execute_simple_inner(ctx, session, sql, out).await;
     }
     if let Err(error) = begin_implicit_transaction(ctx, session).await {
-        return vec![error];
+        return Ok(vec![error]);
     }
 
-    let messages = execute_simple_inner(ctx, session, sql).await;
+    let messages = execute_simple_inner(ctx, session, sql, out).await?;
     if messages
         .iter()
         .any(|message| matches!(message, BackendMessage::ErrorResponse { .. }))
     {
         session.end_txn();
-        return messages;
+        return Ok(messages);
     }
 
     let commit_messages = commit_txn(ctx, session).await;
-    match commit_messages.first() {
+    Ok(match commit_messages.first() {
         Some(BackendMessage::CommandComplete { tag }) if tag == "COMMIT" => messages,
         Some(BackendMessage::ErrorResponse { .. }) => commit_messages,
         _ => vec![query::error_response(
             "58000",
             "implicit PostgreSQL transaction did not commit",
         )],
-    }
+    })
 }
 
 /// Execute one simple-query string with transaction-state awareness.
@@ -497,16 +535,20 @@ async fn execute_simple(
 /// session and commits through the PostgreSQL MVCC manager. All other statements delegate to the
 /// stateless executor; an error inside a transaction aborts it (`T` → `E`), and
 /// while aborted only `COMMIT`/`ROLLBACK` are accepted (PG `25P02`).
-async fn execute_simple_inner(
+async fn execute_simple_inner<O: ReplySink>(
     ctx: &QueryContext,
     session: &mut Session,
     sql: &str,
-) -> Vec<BackendMessage> {
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
     let stmt = match ferrosa_sql::parse_statement(sql) {
         Ok(s) => s,
         Err(e) => {
             session.mark_txn_failed();
-            return vec![query::error_response("42601", &e.to_string())];
+            return Ok(vec![query::error_response(
+                query::parse_error_sqlstate(&e),
+                &e.to_string(),
+            )]);
         }
     };
 
@@ -516,10 +558,10 @@ async fn execute_simple_inner(
             ferrosa_sql::Statement::Commit | ferrosa_sql::Statement::Rollback
         )
     {
-        return vec![query::error_response(
+        return Ok(vec![query::error_response(
             "25P02",
             "current transaction is aborted, commands ignored until end of transaction block",
-        )];
+        )]);
     }
 
     // t_e1c819ad: authorize against the role before anything touches storage.
@@ -529,120 +571,169 @@ async fn execute_simple_inner(
         &authz::statement_permissions(&stmt, &ctx.default_schema),
     ) {
         session.mark_txn_failed();
-        return vec![denied];
+        return Ok(vec![denied]);
     }
 
     match stmt {
         ferrosa_sql::Statement::Begin { isolation } => {
-            if isolation.is_some_and(|level| level != ferrosa_sql::IsolationLevel::Serializable) {
-                return vec![query::error_response(
-                    "0A000",
-                    "only SERIALIZABLE isolation is supported for explicit PostgreSQL transactions",
-                )];
-            }
-            let snapshot = if let Some(committer) = ctx.accord.committer() {
-                match committer.begin_postgres_snapshot(&ctx.default_schema).await {
-                    Ok(cluster_ts) => ctx.mvcc.snapshot_with_cluster_ts(cluster_ts),
-                    Err(error) => {
-                        return vec![query::error_response(
-                            "58000",
-                            &format!(
-                                "could not establish PostgreSQL transaction snapshot: {error}"
-                            ),
-                        )];
-                    }
-                }
-            } else {
-                ctx.mvcc.snapshot()
-            };
-            session.begin_txn(isolation, snapshot);
-            vec![BackendMessage::CommandComplete {
-                tag: "BEGIN".to_string(),
-            }]
+            Ok(begin_block(ctx, session, isolation).await)
         }
-        ferrosa_sql::Statement::Commit => commit_txn(ctx, session).await,
+        ferrosa_sql::Statement::Commit => Ok(commit_txn(ctx, session).await),
         ferrosa_sql::Statement::Rollback => {
             // ROLLBACK discards the buffered write-set — those writes were never
             // applied — and leaves the transaction block.
             session.end_txn();
-            vec![BackendMessage::CommandComplete {
+            Ok(vec![BackendMessage::CommandComplete {
                 tag: "ROLLBACK".to_string(),
-            }]
+            }])
         }
         // Data + session statements: delegate to the stateless executor. (It
         // re-parses; cheap, and keeps the executor self-contained.) In an open
         // transaction, DML is BUFFERED into the session write-set instead of
         // applied; autocommit (no open txn) applies immediately.
-        _ => {
-            if let Some(error) = expired_transaction_error(ctx, session) {
-                session.mark_txn_failed();
-                return vec![error];
-            }
-            if session.in_txn()
-                && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
-            {
-                if let ferrosa_sql::Statement::Select(select) = &stmt {
-                    let read_tables = session.txn_read_tables_mut();
-                    read_tables.insert(format!(
-                        "{}.{}",
-                        select.from.schema.as_deref().unwrap_or(&ctx.default_schema),
-                        select.from.table
-                    ));
-                    if let Some(join) = &select.join {
-                        read_tables.insert(format!(
-                            "{}.{}",
-                            join.table.schema.as_deref().unwrap_or(&ctx.default_schema),
-                            join.table.table
-                        ));
-                    }
-                }
-            }
-            let snapshot = if session.in_txn()
-                && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
-            {
-                session
-                    .txn_snapshot()
-                    .cloned()
-                    .unwrap_or_else(|| ctx.mvcc.snapshot())
-            } else {
-                ctx.mvcc.snapshot()
-            };
-            let msgs = if session.in_txn() {
-                query::execute_query_with_mvcc(
-                    &ctx.engine,
-                    &ctx.schema,
-                    sql,
-                    &ctx.default_schema,
-                    Some(&ctx.mvcc),
-                    Some(&snapshot),
-                    Some(session.txn_writes_mut()),
-                )
-                .await
-            } else {
-                query::execute_query_with_mvcc(
-                    &ctx.engine,
-                    &ctx.schema,
-                    sql,
-                    &ctx.default_schema,
-                    Some(&ctx.mvcc),
-                    Some(&snapshot),
-                    None,
-                )
-                .await
-            };
-            if session.in_txn()
-                && msgs
-                    .iter()
-                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
-            {
-                // A statement that fails inside a transaction POISONS it (`T` →
-                // `E`): the next COMMIT is rejected (PG `25P02`) rather than
-                // committing a partial buffered write-set.
-                session.mark_txn_failed();
-            }
-            msgs
-        }
+        other => run_data_statement(ctx, session, sql, &other, out).await,
     }
+}
+
+/// `BEGIN`: take the transaction's snapshot and open the block.
+async fn begin_block(
+    ctx: &QueryContext,
+    session: &mut Session,
+    isolation: Option<ferrosa_sql::IsolationLevel>,
+) -> Vec<BackendMessage> {
+    if isolation.is_some_and(|level| level != ferrosa_sql::IsolationLevel::Serializable) {
+        return vec![query::error_response(
+            "0A000",
+            "only SERIALIZABLE isolation is supported for explicit PostgreSQL transactions",
+        )];
+    }
+    let snapshot = if let Some(committer) = ctx.accord.committer() {
+        match committer.begin_postgres_snapshot(&ctx.default_schema).await {
+            Ok(cluster_ts) => ctx.mvcc.snapshot_with_cluster_ts(cluster_ts),
+            Err(error) => {
+                return vec![query::error_response(
+                    "58000",
+                    &format!("could not establish PostgreSQL transaction snapshot: {error}"),
+                )];
+            }
+        }
+    } else {
+        ctx.mvcc.snapshot()
+    };
+    session.begin_txn(isolation, snapshot);
+    vec![BackendMessage::CommandComplete {
+        tag: "BEGIN".to_string(),
+    }]
+}
+
+/// Record a `SELECT`'s tables in the open serializable transaction's read set,
+/// so commit can detect a phantom or write-skew against them.
+fn track_select_reads(ctx: &QueryContext, session: &mut Session, select: &ferrosa_sql::SelectStmt) {
+    if !(session.in_txn()
+        && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable))
+    {
+        return;
+    }
+    let read_tables = session.txn_read_tables_mut();
+    read_tables.insert(format!(
+        "{}.{}",
+        select.from.schema.as_deref().unwrap_or(&ctx.default_schema),
+        select.from.table
+    ));
+    if let Some(join) = &select.join {
+        read_tables.insert(format!(
+            "{}.{}",
+            join.table.schema.as_deref().unwrap_or(&ctx.default_schema),
+            join.table.table
+        ));
+    }
+}
+
+/// The environment a read runs against under `snapshot`.
+fn read_env<'a>(
+    ctx: &'a QueryContext,
+    snapshot: &'a crate::mvcc::MvccSnapshot,
+) -> query::ReadEnv<'a> {
+    query::ReadEnv {
+        engine: &ctx.engine,
+        schema: &ctx.schema,
+        default_schema: &ctx.default_schema,
+        mvcc: Some(&ctx.mvcc),
+        snapshot: Some(snapshot),
+        ddl: ctx.ddl.as_deref(),
+        jsonb_limits: &ctx.jsonb_limits,
+    }
+}
+
+/// The storage and limits context for one extended-protocol DML statement.
+fn dml_context<'a>(
+    ctx: &'a QueryContext,
+    txn: Option<&'a mut Vec<crate::PgWrite>>,
+) -> query::DmlContext<'a> {
+    query::DmlContext {
+        engine: &ctx.engine,
+        mvcc: Some(&ctx.mvcc),
+        schema: &ctx.schema,
+        default_schema: &ctx.default_schema,
+        txn,
+        jsonb_limits: &ctx.jsonb_limits,
+    }
+}
+
+/// The snapshot a read runs at: the transaction's own under serializable
+/// isolation, otherwise the current one.
+fn read_snapshot(ctx: &QueryContext, session: &Session) -> crate::mvcc::MvccSnapshot {
+    if session.in_txn()
+        && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
+    {
+        session
+            .txn_snapshot()
+            .cloned()
+            .unwrap_or_else(|| ctx.mvcc.snapshot())
+    } else {
+        ctx.mvcc.snapshot()
+    }
+}
+
+/// Run a data or session statement from the simple-query path.
+async fn run_data_statement<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    sql: &str,
+    stmt: &ferrosa_sql::Statement,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return Ok(vec![error]);
+    }
+    if let ferrosa_sql::Statement::Select(select) = stmt {
+        track_select_reads(ctx, session, select);
+    }
+    let snapshot = read_snapshot(ctx, session);
+    let in_txn = session.in_txn();
+    let msgs = query::execute_query_streaming(
+        read_env(ctx, &snapshot),
+        sql,
+        if in_txn {
+            Some(session.txn_writes_mut())
+        } else {
+            None
+        },
+        out,
+    )
+    .await?;
+    if in_txn
+        && msgs
+            .iter()
+            .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+    {
+        // A statement that fails inside a transaction POISONS it (`T` →
+        // `E`): the next COMMIT is rejected (PG `25P02`) rather than
+        // committing a partial buffered write-set.
+        session.mark_txn_failed();
+    }
+    Ok(msgs)
 }
 
 fn expired_transaction_error(ctx: &QueryContext, session: &Session) -> Option<BackendMessage> {
@@ -1123,15 +1214,21 @@ async fn describe_columns(
     }
 }
 
-/// Handle `Execute`: load the portal's tables, run the bound query, and emit the
-/// result rows encoded per the portal's result formats + `CommandComplete`. On
-/// any error, set the skip flag and reply a single `ErrorResponse`. (Does NOT
-/// emit `ReadyForQuery` — that follows `Sync`.)
-async fn execute_portal(
+/// Handle `Execute`: run the bound query and emit its rows encoded per the
+/// portal's result formats. A `SELECT` streams its `DataRow`s to `out` as the
+/// executor yields them and stops at `max_rows` (0 = no limit) with
+/// `PortalSuspended`, keeping the running query on the portal so the next
+/// `Execute` continues where this one stopped. The returned messages are the
+/// tail still to send (`CommandComplete`, `PortalSuspended`, or the
+/// `ErrorResponse` that ended a failed query). On any error, set the skip flag.
+/// (Does NOT emit `ReadyForQuery` — that follows `Sync`.)
+async fn execute_portal_to<O: ReplySink>(
     ctx: &QueryContext,
     session: &mut Session,
     portal_name: &str,
-) -> Vec<BackendMessage> {
+    max_rows: i32,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
     let is_data_statement = session
         .portal(portal_name)
         .and_then(|portal| session.statement(&portal.stmt_name))
@@ -1146,23 +1243,23 @@ async fn execute_portal(
             )
         });
     if session.in_txn() || ctx.accord.committer().is_none() || !is_data_statement {
-        return execute_portal_inner(ctx, session, portal_name).await;
+        return execute_portal_body(ctx, session, portal_name, max_rows, out).await;
     }
     if let Err(error) = begin_implicit_transaction(ctx, session).await {
-        return vec![session.fail(error)];
+        return Ok(vec![session.fail(error)]);
     }
 
-    let messages = execute_portal_inner(ctx, session, portal_name).await;
+    let messages = execute_portal_body(ctx, session, portal_name, max_rows, out).await?;
     if messages
         .iter()
         .any(|message| matches!(message, BackendMessage::ErrorResponse { .. }))
     {
         session.end_txn();
-        return messages;
+        return Ok(messages);
     }
 
     let commit_messages = commit_txn(ctx, session).await;
-    match commit_messages.first() {
+    Ok(match commit_messages.first() {
         Some(BackendMessage::CommandComplete { tag }) if tag == "COMMIT" => messages,
         Some(BackendMessage::ErrorResponse { .. }) => {
             session.mark_error();
@@ -1175,7 +1272,107 @@ async fn execute_portal(
                 "implicit PostgreSQL transaction did not commit",
             )]
         }
+    })
+}
+
+/// Route a portal to the streaming `SELECT` path or the bounded-reply path.
+async fn execute_portal_body<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    portal_name: &str,
+    max_rows: i32,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
+    let is_select = session
+        .portal(portal_name)
+        .and_then(|portal| session.statement(&portal.stmt_name))
+        .is_some_and(|stmt| matches!(&stmt.parsed, PreparedKind::Select(_)));
+    if is_select {
+        execute_select_portal(ctx, session, portal_name, max_rows, out).await
+    } else {
+        Ok(execute_portal_inner(ctx, session, portal_name).await)
     }
+}
+
+/// The `SELECT` a portal is bound to, with its bound parameters.
+fn portal_select(
+    session: &Session,
+    portal_name: &str,
+) -> Option<(Box<ferrosa_sql::SelectStmt>, Vec<ferrosa_sql::Value>)> {
+    let portal = session.portal(portal_name)?;
+    let stmt = session.statement(&portal.stmt_name)?;
+    match &stmt.parsed {
+        PreparedKind::Select(select) => Some((select.clone(), portal.params.clone())),
+        PreparedKind::Exprs(_)
+        | PreparedKind::Insert(_)
+        | PreparedKind::Update(_)
+        | PreparedKind::Delete(_) => None,
+    }
+}
+
+/// Start a portal's `SELECT`: check the snapshot, record the read, load the
+/// tables and launch the executor.
+async fn open_portal_stream(
+    ctx: &QueryContext,
+    session: &mut Session,
+    portal_name: &str,
+) -> Result<ResultStream, BackendMessage> {
+    let Some((select, params)) = portal_select(session, portal_name) else {
+        return Err(query::error_response(
+            "34000",
+            &format!("portal \"{portal_name}\" does not exist"),
+        ));
+    };
+    if let Some(error) = expired_transaction_error(ctx, session) {
+        session.mark_txn_failed();
+        return Err(error);
+    }
+    track_select_reads(ctx, session, &select);
+    let snapshot = read_snapshot(ctx, session);
+    query::open_select_stream(
+        read_env(ctx, &snapshot),
+        *select,
+        Some(session.txn_writes()),
+        params,
+    )
+    .await
+}
+
+/// Execute a portal bound to a `SELECT`, resuming its suspended query if it has
+/// one and starting it otherwise.
+async fn execute_select_portal<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    portal_name: &str,
+    max_rows: i32,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
+    let mut stream = match session.take_stream(portal_name) {
+        Some(stream) => stream,
+        None => match open_portal_stream(ctx, session, portal_name).await {
+            Ok(stream) => stream,
+            Err(error) => return Ok(vec![session.fail(error)]),
+        },
+    };
+    let result_formats = session
+        .portal(portal_name)
+        .map(|portal| portal.result_formats.clone())
+        .unwrap_or_default();
+    if result_formats.len() > 1 && result_formats.len() != stream.columns().len() {
+        return Ok(vec![session.fail(query::error_response(
+            "08P01",
+            "Bind result format count must be zero, one, or match the result column count",
+        ))]);
+    }
+    let limit = usize::try_from(max_rows).ok().filter(|n| *n > 0);
+    let end = stream.pump(limit, &result_formats, out).await?;
+    match &end {
+        PumpEnd::Suspended => session.park_stream(portal_name.to_string(), stream),
+        // Skip the rest of the sequence until Sync (PostgreSQL semantics).
+        PumpEnd::Failed(_) => session.mark_error(),
+        PumpEnd::Complete { .. } => {}
+    }
+    Ok(end.into_messages())
 }
 
 async fn execute_portal_inner(
@@ -1217,72 +1414,11 @@ async fn execute_portal_inner(
     }
 
     match parsed {
-        PreparedKind::Select(select) => {
-            if session.in_txn()
-                && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
-            {
-                let reads = session.txn_read_tables_mut();
-                reads.insert(format!(
-                    "{}.{}",
-                    select.from.schema.as_deref().unwrap_or(&ctx.default_schema),
-                    select.from.table
-                ));
-                if let Some(join) = &select.join {
-                    reads.insert(format!(
-                        "{}.{}",
-                        join.table.schema.as_deref().unwrap_or(&ctx.default_schema),
-                        join.table.table
-                    ));
-                }
-            }
-            let snapshot = if session.in_txn()
-                && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable)
-            {
-                session
-                    .txn_snapshot()
-                    .cloned()
-                    .unwrap_or_else(|| ctx.mvcc.snapshot())
-            } else {
-                ctx.mvcc.snapshot()
-            };
-            let (catalog, failure) = match query::load_catalog_with_mvcc(
-                &ctx.engine,
-                &ctx.schema,
-                &select,
-                &ctx.default_schema,
-                Some(&ctx.mvcc),
-                Some(&snapshot),
-                Some(session.txn_writes()),
-            )
-            .await
-            {
-                Ok(loaded) => loaded,
-                Err(err) => return vec![session.fail(err)],
-            };
-            // Offloaded for the same reason as the simple-query path: the
-            // relational executor is synchronous and CPU-bound, so running it
-            // inline pins an async worker for the whole sort/join.
-            let result = crate::offload::execute_offloaded(
-                *select,
-                catalog,
-                ctx.default_schema.clone(),
-                params.clone(),
-            )
-            .await;
-            // A scan that died on a storage error closed its channel, leaving
-            // the executor with a short row set it cannot tell is short. Fail
-            // the query loud rather than encode a truncated result.
-            if let Some(err) = query::check_scan_failure(&failure) {
-                return vec![session.fail(err)];
-            }
-            let msgs = query::render_execute_result(result, &result_formats);
-            // On an execution error, set the skip flag so the rest of the
-            // sequence is ignored until Sync (Postgres semantics).
-            if matches!(msgs.first(), Some(BackendMessage::ErrorResponse { .. })) {
-                session.mark_error();
-            }
-            msgs
-        }
+        // Routed to `execute_select_portal` before this point.
+        PreparedKind::Select(_) => vec![session.fail(query::error_response(
+            "XX000",
+            "internal error: a SELECT portal reached the non-streaming path",
+        ))],
         // No-FROM expression select: no tables, no params. Evaluate and render.
         PreparedKind::Exprs(items) => {
             match query::execute_scalar_select(&items, &ctx.default_schema) {
@@ -1317,13 +1453,7 @@ async fn execute_portal_inner(
                 None
             };
             let msgs = query::execute_insert(
-                query::DmlContext {
-                    engine: &ctx.engine,
-                    mvcc: Some(&ctx.mvcc),
-                    schema: &ctx.schema,
-                    default_schema: &ctx.default_schema,
-                    txn: transaction_writes,
-                },
+                dml_context(ctx, transaction_writes),
                 &ins,
                 &params,
                 returning_opts,
@@ -1332,57 +1462,21 @@ async fn execute_portal_inner(
             execute_dml(session, msgs)
         }
         PreparedKind::Update(upd) => {
-            let in_txn = session.in_txn();
-            let msgs = if in_txn {
-                query::execute_update(
-                    &ctx.engine,
-                    Some(&ctx.mvcc),
-                    &ctx.schema,
-                    &upd,
-                    &ctx.default_schema,
-                    &params,
-                    Some(session.txn_writes_mut()),
-                )
-                .await
+            let txn = if session.in_txn() {
+                Some(session.txn_writes_mut())
             } else {
-                query::execute_update(
-                    &ctx.engine,
-                    Some(&ctx.mvcc),
-                    &ctx.schema,
-                    &upd,
-                    &ctx.default_schema,
-                    &params,
-                    None,
-                )
-                .await
+                None
             };
+            let msgs = query::execute_update(dml_context(ctx, txn), &upd, &params).await;
             execute_dml(session, msgs)
         }
         PreparedKind::Delete(del) => {
-            let in_txn = session.in_txn();
-            let msgs = if in_txn {
-                query::execute_delete(
-                    &ctx.engine,
-                    Some(&ctx.mvcc),
-                    &ctx.schema,
-                    &del,
-                    &ctx.default_schema,
-                    &params,
-                    Some(session.txn_writes_mut()),
-                )
-                .await
+            let txn = if session.in_txn() {
+                Some(session.txn_writes_mut())
             } else {
-                query::execute_delete(
-                    &ctx.engine,
-                    Some(&ctx.mvcc),
-                    &ctx.schema,
-                    &del,
-                    &ctx.default_schema,
-                    &params,
-                    None,
-                )
-                .await
+                None
             };
+            let msgs = query::execute_delete(dml_context(ctx, txn), &del, &params).await;
             execute_dml(session, msgs)
         }
     }
@@ -1468,6 +1562,35 @@ mod txn_atomicity_tests {
     use std::path::Path;
     use std::time::Duration;
     use uuid::Uuid;
+
+    /// The whole reply of a simple query as one value: streamed messages, then
+    /// the tail. These tests read small results and want them collected.
+    async fn execute_simple(
+        ctx: &QueryContext,
+        session: &mut Session,
+        sql: &str,
+    ) -> Vec<BackendMessage> {
+        let mut messages: Vec<BackendMessage> = Vec::new();
+        let tail = execute_simple_to(ctx, session, sql, &mut messages)
+            .await
+            .expect("an in-memory sink cannot fail");
+        messages.extend(tail);
+        messages
+    }
+
+    /// The whole reply of an unlimited `Execute`, collected.
+    async fn execute_portal(
+        ctx: &QueryContext,
+        session: &mut Session,
+        portal_name: &str,
+    ) -> Vec<BackendMessage> {
+        let mut messages: Vec<BackendMessage> = Vec::new();
+        let tail = execute_portal_to(ctx, session, portal_name, 0, &mut messages)
+            .await
+            .expect("an in-memory sink cannot fail");
+        messages.extend(tail);
+        messages
+    }
 
     fn schema_config() -> SchemaConfig {
         SchemaConfig {
@@ -1597,6 +1720,8 @@ mod txn_atomicity_tests {
             default_schema: "public".to_string(),
             mvcc: Arc::new(MvccManager::default()),
             accord: AccordAccess::disabled(),
+            ddl: None,
+            jsonb_limits: crate::jsonb_wire::test_limits(),
         }
     }
 
@@ -1616,6 +1741,7 @@ mod txn_atomicity_tests {
             &ctx.schema,
             &format!("SELECT k FROM kv WHERE k = '{key}'"),
             &ctx.default_schema,
+            &ctx.jsonb_limits,
             None,
         )
         .await;
@@ -1635,6 +1761,60 @@ mod txn_atomicity_tests {
             matches!(m, BackendMessage::ErrorResponse { fields }
                 if fields.iter().any(|f| *f == (b'C', code.to_string())))
         })
+    }
+
+    /// Records how many messages each `send` carried.
+    #[derive(Default)]
+    struct BatchRecorder {
+        sends: Vec<usize>,
+        data_rows: usize,
+    }
+
+    impl ReplySink for BatchRecorder {
+        async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()> {
+            self.sends.push(messages.len());
+            self.data_rows += messages
+                .iter()
+                .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+                .count();
+            Ok(())
+        }
+    }
+
+    /// The simple protocol streams: a `SELECT` reaches the sink as several
+    /// bounded batches, never as one message list holding the whole result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simple_select_streams_rows_in_bounded_batches() {
+        const TOTAL: usize = 200;
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        for i in 0..TOTAL {
+            let sql = format!("INSERT INTO kv (k, v) VALUES ('k{i:04}', 'v')");
+            let reply = execute_simple(&ctx, &mut session, &sql).await;
+            assert!(
+                !reply
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+                "insert {i} failed: {reply:?}"
+            );
+        }
+
+        let mut sink = BatchRecorder::default();
+        let tail = execute_simple_to(&ctx, &mut session, "SELECT k, v FROM kv", &mut sink)
+            .await
+            .expect("in-memory sink cannot fail");
+
+        assert_eq!(sink.data_rows, TOTAL, "every row is streamed");
+        assert!(
+            matches!(&tail[..], [BackendMessage::CommandComplete { tag }] if tag == &format!("SELECT {TOTAL}")),
+            "the tail is the completion, not the rows: {tail:?}"
+        );
+        let largest = sink.sends.iter().copied().max().unwrap_or(0);
+        assert!(
+            largest <= crate::result_stream::RESULT_BATCH_ROWS,
+            "a single send carried {largest} messages; batches are bounded"
+        );
+        assert!(sink.sends.len() > TOTAL / crate::result_stream::RESULT_BATCH_ROWS);
     }
 
     #[tokio::test]
@@ -1827,12 +2007,8 @@ mod txn_atomicity_tests {
             snapshot: &crate::mvcc::MvccSnapshot,
         ) -> Vec<BackendMessage> {
             query::execute_query_with_mvcc(
-                &ctx.engine,
-                &ctx.schema,
+                read_env(ctx, snapshot),
                 "SELECT k, v FROM kv ORDER BY k",
-                &ctx.default_schema,
-                Some(&ctx.mvcc),
-                Some(snapshot),
                 None,
             )
             .await
@@ -2137,6 +2313,7 @@ mod txn_atomicity_tests {
                 &[],
                 &[Some(b"expired-write".to_vec())],
                 vec![],
+                &crate::jsonb_wire::test_limits()
             ),
             BackendMessage::BindComplete
         ));
@@ -2326,7 +2503,14 @@ mod txn_atomicity_tests {
             "SELECT v FROM kv WHERE k = 'extended-snapshot'",
             vec![],
         );
-        reader.on_bind("portal".to_string(), "read".to_string(), &[], &[], vec![]);
+        reader.on_bind(
+            "portal".to_string(),
+            "read".to_string(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         let first = execute_portal(&ctx, &mut reader, "portal").await;
         assert_eq!(read_first_text_column(&first).as_deref(), Some("before"));
 

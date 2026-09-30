@@ -83,12 +83,13 @@ differential oracle exercise.
 `query::load_catalog` resolves every referenced table (FROM + optional JOIN) by
 opening each referenced table as a bounded-channel storage provider. The scan
 producer decodes storage partitions as the synchronous executor pulls rows;
-the scan channel capacity defaults to 64 and is configurable. The relational
-executor still materializes base rows and `QueryResult.rows`, while
-`render_result` collects the complete wire-message vector, so response memory
-still scales with result size. `offload::execute_offloaded` runs sync operators
-on a blocking thread → `RowDescription` + `DataRow`s + `CommandComplete
-"SELECT n"`. The caller appends one `ReadyForQuery`.
+the scan channel capacity defaults to 64 and is configurable. The executor
+(`ferrosa_sql::execute_streaming`) runs on a blocking thread and hands rows to
+the async side in bounded batches (`result_stream`); each batch is encoded and
+written to the socket before the next is taken, so response memory is O(batch).
+Extended `Execute` honours `max_rows` with `PortalSuspended`. → `RowDescription`
++ streamed `DataRow`s + `CommandComplete "SELECT n"`. The caller appends one
+`ReadyForQuery`.
 
 **Write path (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` driven by the target column's `CqlType` (`value_to_cql`, fail-loud on
@@ -101,6 +102,26 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
 
 ## Type model & wire parity
 
+One module, `pg_types`, maps every `CqlType` to a `PgType { oid, typname, typlen,
+column_type, binary, text_rendered }` through an exhaustive match (T-023). It
+replaced `catalog::type_oid`/`type_name`, `storage_provider::engine_column_type`
+and `query::cql_type_to_column_type`/`column_type_size`. CQL `float` and `double`
+both map to `float8` (701): the engine's one float column carries an `f64`
+(this fixed the drift of board task t_cd417149, where the storage provider typed
+them `text`). Collections, tuples, vectors, UDTs and `duration` are named arms
+that map to `text` with `text_rendered` set. A stored type string that does not
+resolve is a `PgTypeError` (catalog projection, parameter inference), never a
+silent `text`. `jsonb` (3802) is a full type with a wire codec (T-161a, see the jsonb section);
+`json` (114) and `jsonpath` (4072) have `ALL_PG_TYPES` entries without one (T-161b).
+
+**DDL.** `Statement::CreateTable` executes in `ddl.rs`: `plan_create_table`
+builds the `TableMetadata` (first key column = partition key, rest = ascending
+clustering columns; types via `cql_type_for_pg_name`), and `ClusterDdl` applies it
+through `ferrosa_cluster::ddl_path::DdlPath`, the path CQL DDL uses (Raft in
+cluster mode). `QueryContext.ddl` carries the executor into `ReadEnv`. Parse
+errors map to typed SQLSTATEs (`query::parse_error_sqlstate`). See FMEA
+`PG-T132a-*`.
+
 `query` renders/parses each `ferrosa_sql::Value` to/from its exact Postgres text
 form and (for most) the binary form, with OIDs/sizes advertised in
 `RowDescription`: `Int→int4(23)`, `Text→text(25)`, `Bool→bool(16)`,
@@ -109,6 +130,10 @@ form and (for most) the binary form, with OIDs/sizes advertised in
 `Inet→inet(869)`, `Numeric→numeric(1700)`. Binary `numeric` and unsupported
 composites are rejected explicitly: the server does not send text bytes under a
 binary numeric OID or turn stored collection/duration values into SQL NULL.
+Bound parameters decode through `decode_param_checked` and fail loud: `22P02`
+(text value does not parse), `22P03` (malformed binary), `42704` (non-zero OID
+with no mapping, e.g. jsonpath/timestamptz; jsonb 3802 and json 114 are mapped since T-161a), `0A000` (binary numeric). Only
+OID 0 (unspecified) is taken as UTF-8 text; nothing becomes NULL on error.
 The storage value bridge (`cql_to_value`) maps supported CQL scalars onto this
 model and reports a scan error for values without a representation.
 
@@ -138,8 +163,9 @@ query-materialization caveats are in the public
 4. **No `ferrosa-cql` dependency (D10).** Structural — enforced by the crate
    graph.
 5. **Async storage, sync engine.** The provider bridges the async storage scan
-   to the sync executor through a bounded channel and blocking iterator. The
-   executor still materializes scan/result rows; see the data-flow notes.
+   to the sync executor through a bounded channel and blocking iterator, and the
+   executor's rows return to the async side through another. Neither the scan
+   nor the result is ever gathered.
 
 ## Position in the dependency graph
 
@@ -147,3 +173,9 @@ Depends on `ferrosa-common`, `ferrosa-row-bridge`, `ferrosa-schema`,
 `ferrosa-sql`, `ferrosa-sstable`, `ferrosa-storage`. Depended on by `ferrosa`
 (the main binary). See the [root crate index](../../specs/crates.md) for the full
 graph.
+
+## jsonb (T-150, T-160, T-161a)
+
+`CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802, typlen -1, `binary: true`; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is `jsonb_wire` (T-161a): text format is the PostgreSQL 16 jsonb text (`TextStyle::PgText`, D26; `{"aa":2,"b":1}` prints `{"b": 1, "aa": 2}`, scale kept); binary format is `0x01` then that text (`jsonb_send`). `render_value` never returns NULL for a jsonb value: a corrupt cell is `XX001`, an over-budget print `54000`, and jsonpath/`text[]` are `0A000` (T-161b). Input is parsed with `ferrosa_jsonb::parse_text_observed` under `QueryContext::jsonb_limits` (resolved from `[jsonb]` in `ferrosa/src/main.rs`, no default): a parameter declared 3802 or 114 (or bound to a jsonb column after `Describe`) is parsed in `decode_param_checked`; an untyped string literal or a text-declared parameter bound to a jsonb column is parsed in `value_to_cql`. SQLSTATEs: `22P02` invalid JSON (byte offset, input never echoed), `22P03` bad or missing binary version byte, `22030` duplicate key under the strict policy, `54000` over a limit, `XX001` corrupt stored cell. Duplicate keys resolve last-wins and are logged as a `jsonb_duplicate_keys_dropped` edge line (D6b). DDL: `jsonb` and `json` create a CQL `jsonb` column (`json` is stored as jsonb, D11); Off a standalone node such DDL is refused `0A000` by `Schema::check_create_table_jsonb` (T-300, D24). An unspecified-OID binary-format parameter is decoded as text: clients get 3802 from `Describe`, and a raw Bind without one fails 22P02 rather than writing.
+
+T-301 acceptance: `tests/jsonb_slice.rs` (no infrastructure) and the `differential_oracle_jsonb_*` tests compare ferrosa with postgres:16 byte for byte over jsonb DDL, INSERT (literal, text `$1`, binary `$1`) and SELECT (text, binary). See the README section "Slice acceptance evidence (T-301)".

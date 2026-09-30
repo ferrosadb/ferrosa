@@ -59,6 +59,8 @@ test-util = []
 slow-tests = []
 
 [dev-dependencies]
+# Builds `CqlValue::Jsonb` cells for the T-150 refusal / D6a wire tests.
+ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 criterion = "0.5"
 proptest = "1"
 rcgen = "0.14"

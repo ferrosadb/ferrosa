@@ -86,6 +86,30 @@ fn sort_returns_every_row_when_forced_to_spill() {
     );
 }
 
+/// Negative control (T-029, SQL-T029): the budget assertions above only mean
+/// something if they FAIL when spilling is off. With an unreachable threshold the
+/// sort holds the whole input, so `spilled()` is false and the peak equals the
+/// row count. If this ever stops holding, the spill tests have gone vacuous.
+#[test]
+fn control_unbounded_threshold_keeps_everything_resident_and_never_spills() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = SpillCtx::new(Arc::new(DirReserver::new(dir.path())), u64::MAX);
+    let rows: Vec<Row> = (0..BIG).rev().map(|i| row(vec![Value::Int(i)])).collect();
+    let keys = [SortKey {
+        col: 0,
+        dir: SortDir::Asc,
+    }];
+    let sorted = drain(sort(stream(rows), &keys, &ctx).unwrap());
+
+    assert_eq!(sorted.len() as i64, BIG);
+    assert!(!ctx.stats().spilled(), "no spill expected under u64::MAX");
+    assert!(
+        ctx.stats().max_resident_rows() >= BIG as usize,
+        "control must exceed the budget the spill tests enforce, got {}",
+        ctx.stats().max_resident_rows()
+    );
+}
+
 #[test]
 fn sort_is_stable_across_spilled_runs() {
     let dir = tempfile::tempdir().unwrap();

@@ -25,7 +25,9 @@ use crate::auth::role::{AuthContext, RoleMetadata, RoleUpdates};
 use crate::error::SchemaError;
 use ferrosa_common::CqlType;
 
+use crate::jsonb_rules::TypeMap;
 use crate::metadata::aggregate::UserAggregateMetadata;
+use crate::metadata::column::ColumnMetadata;
 use crate::metadata::function::UserFunctionMetadata;
 use crate::metadata::index::IndexMetadata;
 use crate::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
@@ -34,6 +36,7 @@ use crate::metadata::user_type::UserTypeMetadata;
 use crate::secrets::SecretsProvider;
 use crate::startup::DeploymentMode;
 use crate::virtual_registry::VirtualTableRegistry;
+use ferrosa_common::deployment_mode::DeploymentMode as NodeMode;
 
 /// An immutable point-in-time snapshot of all schema state.
 ///
@@ -143,6 +146,12 @@ pub struct Schema {
     default_password_roles: Mutex<HashSet<String>>,
     /// Registry of virtual tables (e.g. system_observability views).
     virtual_table_registry: Arc<VirtualTableRegistry>,
+    /// The node's live deployment mode, read by the T-300 jsonb DDL gate at
+    /// every entry and apply. Starts `Standalone`; the cluster controller
+    /// shares this very handle as its own mode cell (see
+    /// [`Schema::deployment_mode_handle`]), so the gate can never lag the
+    /// controller's view of the node.
+    deployment_mode: Arc<ArcSwap<NodeMode>>,
 }
 
 impl Schema {
@@ -225,6 +234,7 @@ impl Schema {
             audit_sink: config.audit_sink,
             default_password_roles: Mutex::new(HashSet::new()),
             virtual_table_registry: Arc::new(VirtualTableRegistry::new()),
+            deployment_mode: Arc::new(ArcSwap::from_pointee(NodeMode::Standalone)),
         };
 
         // Built-in virtual tables.
@@ -286,6 +296,7 @@ impl Schema {
     pub fn apply_snapshot(&self, snapshot: SchemaSnapshot) -> crate::Result<()> {
         let _lock = self.write_lock.lock().unwrap();
         let mut current = (**self.inner.load()).clone();
+        self.check_snapshot_jsonb(&current, &snapshot)?;
 
         for (name, ks) in &snapshot.keyspaces {
             if is_system_keyspace(name) {
@@ -354,6 +365,124 @@ impl Schema {
         Ok(())
     }
 
+    /// Propose-side jsonb placement check for a new table (SCH-T154a-01).
+    ///
+    /// DDL entry points that hand the change to a coordinator or to Raft call
+    /// this first, so the client gets a typed refusal instead of a diverged
+    /// apply. The apply paths re-check on their own (defense in depth).
+    pub fn check_create_table_jsonb(&self, table: &TableMetadata) -> crate::Result<()> {
+        let types = &self.snapshot().types;
+        crate::jsonb_rules::check_table(table, types)?;
+        crate::jsonb_rules::check_table_ddl_allowed(self.deployment_mode(), table, types)
+    }
+
+    /// The node's live deployment mode as the T-300 jsonb gate sees it.
+    pub fn deployment_mode(&self) -> NodeMode {
+        **self.deployment_mode.load()
+    }
+
+    /// Set the deployment mode the jsonb gate reads. Production code shares
+    /// the controller's cell via [`Self::deployment_mode_handle`] instead.
+    pub fn set_deployment_mode(&self, mode: NodeMode) {
+        self.deployment_mode.store(Arc::new(mode));
+    }
+
+    /// The shared mode cell. The cluster controller adopts this handle as its
+    /// own mode cell, so every controller transition is seen here at once.
+    pub fn deployment_mode_handle(&self) -> Arc<ArcSwap<NodeMode>> {
+        Arc::clone(&self.deployment_mode)
+    }
+
+    /// Propose-side jsonb gate for CREATE TYPE (SCH-T300-04).
+    pub fn check_create_type_jsonb(
+        &self,
+        keyspace: &str,
+        name: &str,
+        fields: &[(String, CqlType)],
+    ) -> crate::Result<()> {
+        crate::jsonb_rules::check_udt_fields_ddl_allowed(
+            self.deployment_mode(),
+            keyspace,
+            name,
+            fields,
+        )
+    }
+
+    /// `keyspace.table` of every user table holding jsonb (directly or through
+    /// a UDT): what a refused departure from standalone names (SCH-T300-05).
+    pub fn tables_with_jsonb(&self) -> crate::Result<Vec<String>> {
+        let snap = self.snapshot();
+        crate::jsonb_rules::tables_with_jsonb(snap.tables.values(), &snap.types)
+    }
+
+    /// Propose-side jsonb placement check for ALTER TABLE ADD (SCH-T154a-02).
+    /// A missing table is not this check's error: the DDL path reports it.
+    pub fn check_alter_table_jsonb(
+        &self,
+        keyspace: &str,
+        table: &str,
+        updates: &TableUpdates,
+    ) -> crate::Result<()> {
+        let snap = self.snapshot();
+        match snap.tables.get(&(keyspace.to_string(), table.to_string())) {
+            Some(existing) => self.check_added_jsonb(existing, &updates.add_columns, &snap.types),
+            None => Ok(()),
+        }
+    }
+
+    /// Defense in depth (SCH-T154a-03): refuse the WHOLE snapshot, before any
+    /// of it is applied, when a table it would install violates the jsonb
+    /// placement rules. A refused snapshot is an error, never a partial load.
+    fn check_snapshot_jsonb(
+        &self,
+        current: &SchemaSnapshot,
+        incoming: &SchemaSnapshot,
+    ) -> crate::Result<()> {
+        let mut types = current.types.clone();
+        types.extend(incoming.types.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let mode = self.deployment_mode();
+        for ((ks, _), table) in &incoming.tables {
+            if is_system_keyspace(ks) {
+                continue;
+            }
+            crate::jsonb_rules::check_table(table, &types)?;
+            crate::jsonb_rules::check_table_ddl_allowed(mode, table, &types)?;
+        }
+        for udt in incoming.types.values() {
+            crate::jsonb_rules::check_udt_fields_ddl_allowed(
+                mode,
+                &udt.keyspace,
+                &udt.name,
+                &udt.fields,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Apply-time jsonb checks for a whole table: placement rules, then the
+    /// T-300 mode gate (SCH-T300-02).
+    fn check_table_jsonb(&self, table: &TableMetadata, types: &TypeMap) -> crate::Result<()> {
+        crate::jsonb_rules::check_table(table, types)?;
+        crate::jsonb_rules::check_table_ddl_allowed(self.deployment_mode(), table, types)
+    }
+
+    /// Apply-time jsonb checks for ALTER TABLE ADD: placement rules, then the
+    /// T-300 mode gate (SCH-T300-02).
+    fn check_added_jsonb(
+        &self,
+        existing: &TableMetadata,
+        added: &[ColumnMetadata],
+        types: &TypeMap,
+    ) -> crate::Result<()> {
+        crate::jsonb_rules::check_added_columns(existing, added, types)?;
+        crate::jsonb_rules::check_added_columns_ddl_allowed(
+            self.deployment_mode(),
+            existing,
+            added,
+            types,
+        )
+    }
+
     /// Set the schema snapshot version to a specific UUID.
     ///
     /// Used by the Raft state machine to apply the leader-generated version
@@ -385,6 +514,7 @@ impl Schema {
         crate::validation::validate_table(&table)?;
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
+        self.check_table_jsonb(&table, &snap.types)?;
         let key = (table.keyspace.clone(), table.name.clone());
         if snap.tables.contains_key(&key) {
             return Ok(());
@@ -454,6 +584,9 @@ impl Schema {
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (keyspace.to_string(), table.to_string());
+        if let Some(existing) = snap.tables.get(&key) {
+            self.check_added_jsonb(existing, &updates.add_columns, &snap.types)?;
+        }
         let Some(tbl) = snap.tables.get_mut(&key) else {
             return Ok(());
         };
@@ -1054,6 +1187,7 @@ impl Schema {
         if snap.tables.contains_key(&key) {
             return Err(SchemaError::TableExists(table.keyspace, table.name));
         }
+        self.check_table_jsonb(&table, &snap.types)?;
         if table.extensions.keys().any(|k| k.starts_with("graph.")) {
             self.validate_graph_extensions(
                 &snap,
@@ -1112,6 +1246,11 @@ impl Schema {
         drop(snap_ref);
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
+        let existing = snap
+            .tables
+            .get(&key)
+            .ok_or_else(|| SchemaError::TableNotFound(ks.to_string(), table.to_string()))?;
+        self.check_added_jsonb(existing, &updates.add_columns, &snap.types)?;
         let tbl = snap
             .tables
             .get_mut(&key)
@@ -1609,6 +1748,12 @@ impl Schema {
         if !snap.keyspaces.contains_key(&udt.keyspace) {
             return Err(SchemaError::KeyspaceNotFound(udt.keyspace.clone()));
         }
+        crate::jsonb_rules::check_udt_fields_ddl_allowed(
+            self.deployment_mode(),
+            &udt.keyspace,
+            &udt.name,
+            &udt.fields,
+        )?;
         snap.types.insert(key, udt.clone());
         self.inner.store(Arc::new(snap));
         Ok(())
@@ -1661,7 +1806,22 @@ impl Schema {
                 field_name.to_string(),
             ));
         }
+        ferrosa_common::cql_type::names::check_jsonb_nesting(&field_type).map_err(|rule| {
+            SchemaError::InvalidSchema(format!(
+                "field '{field_name}' of type {keyspace}.{name}: {rule}"
+            ))
+        })?;
+        crate::jsonb_rules::check_udt_fields_ddl_allowed(
+            self.deployment_mode(),
+            keyspace,
+            name,
+            &[(field_name.to_string(), field_type.clone())],
+        )?;
         udt.fields.push((field_name.to_string(), field_type));
+        crate::jsonb_rules::check_key_columns(
+            snap.tables.values().filter(|t| !t.is_system),
+            &snap.types,
+        )?;
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())

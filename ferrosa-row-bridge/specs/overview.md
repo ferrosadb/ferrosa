@@ -56,7 +56,14 @@ paging cursors) or emit raw byte slices.
    reads (100% data loss for that row). Enforced in `build_row`.
 3. **NULL is a tombstone, not an empty cell.** An explicit `Null` value emits a
    cell tombstone so reads return NULL, not `""`/`0`.
-4. **No dependency on `ferrosa-cql`.** Enforced structurally (it would create a
+4. **A corrupt cell is an error, not a missing value.** `assemble_column_cells`
+   returns `AssembleError` (and bumps `corrupt_element_count()`) when a cell
+   fails to decode; only an absent, deleted or expired column is `None`. The
+   row decomposition (`partition_to_rows*`, `visit_/consume_partition_rows_*`)
+   propagates it as `RowDecodeError` (column, partition key, reason; the caller
+   adds the table with `in_table`). Undecodable partition/clustering key
+   components fail the same way. There is no fallback to NULL.
+5. **No dependency on `ferrosa-cql`.** Enforced structurally (it would create a
    cycle: `ferrosa-cql` → `ferrosa-row-bridge`).
 
 ## Position in the dependency graph
@@ -64,3 +71,9 @@ paging cursors) or emit raw byte slices.
 Leaf-adjacent: depends only on `ferrosa-common`, `ferrosa-sstable`,
 `ferrosa-schema`. Depended on by `ferrosa-cql` and `ferrosa-postgres`. See the
 [root crate index](../../specs/crates.md) for the full graph.
+
+## jsonb (T-150)
+
+`encode_value` writes the canonical jsonb cell bytes; `decode_value` validates them (`JsonbValue::from_bytes`) and a corrupt cell is an error, never NULL. jsonb nests in list, map value, tuple and UDT (D21). `parse_cql_type*` accept `jsonb` and refuse `set<jsonb>`, `map<jsonb, _>` and `vector<jsonb, _>` at parse (T-150).
+
+Refusals are typed (T-151): `decode_value` validates once and returns a `RowBridgeError` carrying a `JsonbFault`, either `CorruptJsonb { reason, len }` or `UnknownEnvelope { byte, len }` (a future codec version, distinct from corruption). The fault survives collection/UDT nesting through `AssembleError` into `RowDecodeError::jsonb_fault()` (column from `column()`, table from `in_table`), and reaches clients as `CqlError::CorruptCell`, never NULL. `corrupt_jsonb_count()` counts refusals (M10).
