@@ -25,7 +25,7 @@ use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_postgres::handshake::VerifierStore;
 use ferrosa_postgres::scram::ScramVerifier;
-use ferrosa_postgres::{server, QueryContext};
+use ferrosa_postgres::{server, AccordAccess, QueryContext};
 use ferrosa_schema::{
     AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
     EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
@@ -325,7 +325,7 @@ async fn m1_join_returns_rows_to_a_real_driver() {
         schema: Arc::new(schema),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
+        accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
@@ -418,7 +418,7 @@ async fn extended_query_error_recovers_after_sync() {
         schema: Arc::new(schema),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
+        accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
@@ -468,7 +468,7 @@ async fn extended_parameterized_join_over_a_real_driver() {
         schema: Arc::new(schema),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
+        accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
@@ -526,7 +526,7 @@ async fn group_by_order_by_limit_over_a_real_driver() {
         schema: Arc::new(schema),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
+        accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
@@ -594,7 +594,7 @@ async fn where_having_distinct_over_a_real_driver() {
         schema: Arc::new(schema),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
+        accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
@@ -696,16 +696,22 @@ async fn dml_client_with_committer(
     } else {
         None
     };
-    let query_committer: Option<Arc<dyn ferrosa_storage::accord::TransactionCommitter>> =
-        accord_committer.as_ref().map(|committer| {
-            committer.clone() as Arc<dyn ferrosa_storage::accord::TransactionCommitter>
-        });
+    // The fixture owns the Accord plumbing (a mock here, a real state machine
+    // elsewhere), so it bypasses the live-mode gate with `fixed`.
+    let accord = match accord_committer.as_ref() {
+        Some(committer) => {
+            let committer: Arc<dyn ferrosa_storage::accord::TransactionCommitter> =
+                committer.clone();
+            AccordAccess::fixed(committer)
+        }
+        None => AccordAccess::disabled(),
+    };
     let ctx = Arc::new(QueryContext {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: query_committer,
+        accord,
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
@@ -783,7 +789,9 @@ async fn dml_client_with_local_accord() -> (
         schema,
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: Some(query_committer),
+        // The real in-process Accord state machine below IS this fixture's
+        // cluster, so offer it unconditionally.
+        accord: AccordAccess::fixed(query_committer),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
@@ -908,7 +916,8 @@ async fn dml_clients_on_two_accord_nodes() -> (
             schema,
             default_schema: "public".into(),
             mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-            accord_committer: Some(query_committer),
+            // Two real Accord nodes are the cluster here.
+            accord: AccordAccess::fixed(query_committer),
             ddl: None,
             jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
         });

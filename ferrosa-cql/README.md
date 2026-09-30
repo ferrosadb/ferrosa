@@ -111,6 +111,14 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   branches). Full-text resolution filters for `FullTextIndex`, so an earlier
   phonetic or scalar index on the same column cannot hijack `fts_match`.
   `FullScan`. `EXPLAIN SELECT …` renders the same plan the router executes.
+  **Unselective index keys scan:** with `ALLOW FILTERING`, a `SingleIndex` /
+  `IndexScanWithFilter` plan whose key matches at least a tenth of the table's
+  partitions (and at least 50 rows) runs as `FullScan` with post-filter instead
+  (`scan_instead_of_unselective_index`, backed by
+  `TableStore::index_key_is_unselective`, which counts postings only up to that
+  threshold). Serving such a key point-reads every row it names; ferrosa-memory's
+  single-tenant edge count took 87 s that way. Without `ALLOW FILTERING` the plan
+  never switches.
   `CREATE INDEX` on a CLUSTERING column wires the storage engine's
   clustering-component build path (previously a silent schema-only no-op).
   Scalar indexes created after writes synchronously stream pre-existing active

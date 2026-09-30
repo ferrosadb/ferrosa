@@ -293,8 +293,12 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   generation discovery reads local files only. Only marked generations are
   restored: a manifest entry without a marker may be a compacted-away input, and
   restoring it would resurrect purged rows. Retiring a generation
-  (`delete_sstable_files`) removes its marker. System keyspaces are never
-  evicted. See FMEA ST-38.
+  (`delete_sstable_files`) removes its marker. A live reader that reopens a
+  marked generation between eviction and restart rehydrates it from S3 first
+  (`flush::rehydrate_if_evicted`, called by `open_file_sstable` and
+  `open_sstable_from_dir`) and then clears the marker; an unmarked missing
+  generation still fails to open so the read path's view-retry fires. System
+  keyspaces are never evicted. See FMEA ST-38.
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
@@ -314,7 +318,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   DROP INDEX choke point for live storage state: it removes the table store's
   memtable/vector metadata, sidecar read guards, and the tracker entry
   immediately, before restart; tracker cleanup is still idempotent when the
-  table is not registered in this engine process. Re-registering an already
+  table is not registered in this engine process.
+  Because `unregister_table` also deletes the table's SSTable directory, cluster
+  snapshot install must only reach it for explicit drops, not for table-map
+  absence alone; the Raft state machine now enforces that guard before calling
+  this storage cleanup primitive. Re-registering an already
   loaded table with index declarations merges any missing declarations into the
   existing store, keeping disk-loaded sidecars readable after local-schema
   boot preload. The registry-owned `schema.json` is a discriminated, bounded,

@@ -80,6 +80,13 @@ early acknowledgement.
   `cluster` from the start of `transition_to_cluster`, but DDL stays `direct`
   until Raft has a leader, so readiness probes wait on `ddl_path == "cluster"`
   (exposed on `/api/cluster/status`; CQL-T467ci-01).
+  Snapshot install no longer treats `previous - next` as authority to unregister
+  local tables. A table that is absent from an incoming snapshot is considered
+  ambiguous until snapshots carry explicit identity-scoped drop markers; if the
+  local engine still has SSTables or persisted `system_schema.indexes` rows for
+  such a table, install fails loud before `engine.unregister_table` can tombstone
+  indexes or remove SSTables. Plain `RaftOp::DropTable` still uses the normal
+  destructive cleanup path.
 - `SystemTableLoader` reconstructs durable schema/auth state during cold
   start. Persisted `system_auth.roles` rows replace fresh-process bootstrap
   roles before missing seed roles are created, so rotated hashes survive both
@@ -353,6 +360,13 @@ early acknowledgement.
 - `durability.rs`, `leaseholder.rs`, `linearizable_read.rs`, `two_phase_ddl.rs`.
 - In-crate Jepsen-style tests: `jepsen_bank.rs`, `jepsen_nemesis.rs`,
   `recovery_scenarios.rs`, `proptests.rs` — all on the deterministic `TestCluster`.
+
+- **Peer identity is verified on connect.** `PeerManager::ensure_peer` rejects a
+  connection whose handshake host_id differs from the id the ring said lives at
+  that address (`peer identity mismatch`), so a stale or looped-back address can
+  never be pooled under another node's id. `PeerFireSink` (range-stream
+  replies) also refuses to stream to the local host_id with a specific error
+  instead of a bare "unknown peer" (t_b78e8e9a).
 
 ## Dependencies
 

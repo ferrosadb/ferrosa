@@ -18,7 +18,7 @@ use arc_swap::ArcSwap;
 use ferrosa_cluster::ddl_path::DdlPath;
 use ferrosa_postgres::handshake::VerifierStore;
 use ferrosa_postgres::scram::ScramVerifier;
-use ferrosa_postgres::{server, ClusterDdl, QueryContext};
+use ferrosa_postgres::{server, AccordAccess, ClusterDdl, QueryContext};
 use ferrosa_schema::{
     AuthContext, AuthMethod, ColumnKind, DeploymentMode, EnvSecretsProvider, KeyspaceMetadata,
     PasswordHasher, PasswordPolicy, RateLimitConfig, ReplicationParams, Schema, SchemaConfig,
@@ -140,7 +140,7 @@ async fn start_with(with_public: bool) -> Fixture {
         schema: schema.clone(),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
+        accord: AccordAccess::disabled(),
         ddl: Some(Arc::new(ClusterDdl::new(path))),
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });

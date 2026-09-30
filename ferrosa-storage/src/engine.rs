@@ -4368,16 +4368,36 @@ impl StorageEngine {
     fn load_local_table_schemas(
         data_dir: &Path,
     ) -> ferrosa_common::Result<Option<LocalTableSchemas>> {
+        // Exhaust every schema source before giving up, preferring the newest
+        // format but never accepting an unusable one.
+        //
+        // A registry snapshot that carries keyspaces but ZERO tables is not a
+        // usable schema. Treating its mere presence as success bricked a node:
+        // `tables` stayed empty, commit-log replay had no schema to bind
+        // mutations to, the pending-replay budget filled, and startup exited with
+        // "restore local/S3 schema" -- unactionable on a local-only node, while
+        // the complete schema sat unreferenced in storage-schema.json beside it.
+        // Observed live after a kill during flush (t_2db96eb9).
         if data_dir.join("schema.json").exists() {
-            let snapshot = crate::schema_snapshot::SchemaSnapshotStore::new(data_dir)
-                .load()?
-                .ok_or_else(|| {
-                    ferrosa_common::Error::InvalidFormat(
-                        "schema.json disappeared while acquiring its snapshot lock".to_owned(),
-                    )
-                })?;
-            return Ok(Some(LocalTableSchemas::Registry(Box::new(snapshot))));
+            match crate::schema_snapshot::SchemaSnapshotStore::new(data_dir).load()? {
+                Some(snapshot) if !snapshot.tables.is_empty() => {
+                    return Ok(Some(LocalTableSchemas::Registry(Box::new(snapshot))));
+                }
+                Some(snapshot) => {
+                    tracing::warn!(
+                        data_dir = %data_dir.display(),
+                        keyspaces = snapshot.keyspaces.len(),
+                        "local schema snapshot contains no tables; falling back to \
+                         storage-schema.json rather than starting with an empty schema \
+                         (an empty schema makes commit-log replay unable to bind and \
+                         aborts startup)"
+                    );
+                }
+                None => {}
+            }
         }
+        // Fallback: the flat storage schema. This is normally the older format,
+        // but here it is the more complete one -- prefer usable over newest.
         crate::schema_snapshot::load_bounded_json(data_dir, "storage-schema.json")
             .map(|schemas| schemas.map(LocalTableSchemas::Storage))
     }
@@ -8546,6 +8566,23 @@ impl StorageEngine {
         }))
     }
 
+    /// Whether `key` names so large a share of `table_id` that a scan is
+    /// cheaper than serving it through `index_name`. See
+    /// [`TableStore::index_key_is_unselective`]. An unregistered table is
+    /// `false`: the index path that follows reports it loudly.
+    pub fn index_key_is_unselective(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+    ) -> ferrosa_common::Result<bool> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.index_key_is_unselective(index_name, key),
+            None => Ok(false),
+        }
+    }
+
     /// Query by secondary index restricted to ONE partition (t_430c4188).
     ///
     /// Delegates to [`TableStore::read_by_index_in_partition`], which keeps
@@ -10800,6 +10837,7 @@ impl StorageEngine {
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::SSTableComponents;
 
+        crate::flush::rehydrate_if_evicted(dir, gen)?;
         let data = Self::generation_component_path(dir, gen, "Data.db").ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "missing required Data.db for sstable generation {gen} in {}",
@@ -11402,7 +11440,10 @@ impl StorageEngine {
     /// from "compacted away, leave it gone": both are listed in the manifest
     /// and absent on disk. `<gen>.evicted` never matches generation discovery
     /// (`*-Data.db` files and numeric directories) or the `<gen>-` sweep.
-    fn evicted_marker_path(table_dir: &std::path::Path, gen: &str) -> std::path::PathBuf {
+    pub(crate) fn evicted_marker_path(
+        table_dir: &std::path::Path,
+        gen: &str,
+    ) -> std::path::PathBuf {
         table_dir.join(format!("{gen}.evicted"))
     }
 
@@ -26461,6 +26502,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn degraded_index_layer_returns_error_not_empty_count() {
+        use ferrosa_index::{IndexKey, IndexType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        engine.register_table(test_schema()).unwrap();
+        engine
+            .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+            .unwrap();
+        assert_eq!(
+            collect_index_results(
+                &engine,
+                &table_id,
+                "val_idx",
+                &IndexKey(b"indexed".to_vec()),
+            )
+            .unwrap()
+            .len(),
+            1,
+            "precondition: healthy index answers the row"
+        );
+
+        engine.drop_index(&table_id, "val_idx").unwrap();
+
+        let degraded = collect_index_results(
+            &engine,
+            &table_id,
+            "val_idx",
+            &IndexKey(b"indexed".to_vec()),
+        );
+        assert!(
+            degraded.is_err(),
+            "a missing/degraded index layer must fail loudly; it must not return Ok(empty) indistinguishable from a genuine zero-count result"
+        );
+    }
+
     /// Replaying an already-applied CREATE INDEX must preserve the active
     /// memtable postings. Schema-event delivery is at-least-once, and replacing
     /// the index map here would make a just-written phonetic row disappear
@@ -26793,6 +26876,283 @@ mod tests {
         assert!(
             engine.read_persisted_indexes().unwrap().is_empty(),
             "system_schema.indexes must hold no live rows for the dropped table"
+        );
+    }
+
+    /// The conservative guard's storage-side predicate.
+    ///
+    /// `FerrosStateMachine::table_has_local_artifacts` is what refuses an
+    /// ambiguous snapshot absence (a table in local state, absent from the
+    /// incoming snapshot, with no explicit identity-matching drop marker). It
+    /// delegates entirely to the three engine queries asserted here, so this
+    /// test pins the contract the guard depends on: each signal must be TRUE
+    /// for a table that holds durable data, and FALSE once it is genuinely
+    /// gone.
+    ///
+    /// Both directions matter. If this predicate ever answers `false` for a
+    /// data-bearing table, the guard silently stops protecting it and the
+    /// snapshot-drop cascade deletes live SSTables and index registrations —
+    /// the exact P0. If it answers `true` for an absent table, the guard
+    /// deadlocks a real drop.
+    ///
+    /// Non-vacuous by construction: the second half drives the real
+    /// `unregister_table` (the destructive path guarded against) and asserts
+    /// the predicate flips, so a predicate that always returned `true` fails
+    /// here.
+    #[test]
+    fn table_has_local_artifacts_predicate_tracks_durable_state() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        let table_dir = dir.path().join("sstables").join(table_id.to_string());
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "test_table",
+            "val_idx",
+            IndexType::BTree,
+        );
+        engine
+            .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+            .unwrap();
+        engine.flush(&table_id).unwrap();
+        engine
+            .flush(&TableId::new("system_schema", "indexes"))
+            .unwrap();
+
+        // --- direction 1: a live, data-bearing table must be seen as durable
+        // so the Raft guard refuses ambiguous absence instead of unregistering.
+        assert!(
+            engine.sstable_count(&table_id) > 0,
+            "guard signal: a flushed table must report live SSTables"
+        );
+        assert!(
+            !StorageEngine::list_generations_in_dir(&engine.table_sstable_dir(&table_id))
+                .is_empty(),
+            "guard signal: the on-disk generation list must be non-empty \
+             (survives a restart where in-memory state is rebuilt)"
+        );
+        assert!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .any(|row| row.keyspace_name == "test_ks"
+                    && row.table_name == "test_table"
+                    && row.index_name == "val_idx"),
+            "guard signal: the persisted index registration must be present"
+        );
+
+        // --- direction 2: after a REAL drop the same signals must clear, or
+        // the guard would refuse every legitimate DROP TABLE forever.
+        engine.unregister_table(&table_id).unwrap();
+
+        assert_eq!(
+            engine.sstable_count(&table_id),
+            0,
+            "after a real drop the guard must no longer see live SSTables"
+        );
+        assert!(
+            !table_dir.exists(),
+            "after a real drop the SSTable directory is gone"
+        );
+        assert!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .all(|row| row.keyspace_name != "test_ks" || row.table_name != "test_table"),
+            "after a real drop no persisted index registration for the table may remain"
+        );
+    }
+
+    #[test]
+    fn snapshot_explicit_drop_cascades_indexes_and_sstables() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        let table_dir = dir.path().join("sstables").join(table_id.to_string());
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "test_table",
+            "val_idx",
+            IndexType::BTree,
+        );
+        engine
+            .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+            .unwrap();
+        engine.flush(&table_id).unwrap();
+
+        assert!(table_dir.exists(), "precondition: table SSTable dir exists");
+        assert_eq!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .filter(|row| row.keyspace_name == "test_ks" && row.table_name == "test_table")
+                .count(),
+            1,
+            "precondition: persisted index row exists"
+        );
+
+        engine.unregister_table(&table_id).unwrap();
+
+        assert!(
+            !table_dir.exists(),
+            "a real explicit drop must remove the old table SSTable directory"
+        );
+        assert!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .all(|row| row.keyspace_name != "test_ks" || row.table_name != "test_table"),
+            "a real explicit drop must tombstone the table's system_schema.indexes rows"
+        );
+        assert!(
+            !engine.declares_index(&table_id, "val_idx"),
+            "a real explicit drop must remove live declared/registered index state"
+        );
+    }
+
+    #[test]
+    fn restart_after_ambiguous_snapshot_preserves_declared_persisted_registered_index_sets() {
+        use ferrosa_index::IndexType;
+        use std::collections::BTreeSet;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        let schema_declared: BTreeSet<String> = ["val_idx".to_string()].into_iter().collect();
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_system_tables().unwrap();
+            persist_index_row(
+                &engine,
+                "test_ks",
+                "test_table",
+                "val_idx",
+                IndexType::BTree,
+            );
+            engine
+                .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+                .unwrap();
+            engine
+                .write(&table_id, &make_key("pk"), make_row(b"indexed", 1000), 1000)
+                .unwrap();
+            engine.flush(&table_id).unwrap();
+            engine
+                .flush(&TableId::new("system_schema", "indexes"))
+                .unwrap();
+        }
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        engine.replay_mutations(pending).unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
+
+        let persisted: BTreeSet<String> = engine
+            .read_persisted_indexes()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.keyspace_name == "test_ks" && row.table_name == "test_table")
+            .map(|row| row.index_name)
+            .collect();
+        let declared_by_engine: BTreeSet<String> = schema_declared
+            .iter()
+            .filter(|name| engine.declares_index(&table_id, name))
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            persisted, schema_declared,
+            "persisted system_schema.indexes rows must match schema-declared indexes"
+        );
+        assert_eq!(
+            declared_by_engine, schema_declared,
+            "engine-declared/registered indexes must match schema-declared indexes"
+        );
+        assert_eq!(
+            outcome.restored,
+            schema_declared.len(),
+            "reload outcome must prove persisted index rows were restored, not silently empty"
+        );
+        assert_eq!(outcome.skipped, 0);
+    }
+
+    #[test]
+    fn restart_after_real_drop_has_no_orphaned_index_rows() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_system_tables().unwrap();
+            persist_index_row(
+                &engine,
+                "test_ks",
+                "test_table",
+                "val_idx",
+                IndexType::BTree,
+            );
+            engine
+                .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+                .unwrap();
+            engine.unregister_table(&table_id).unwrap();
+        }
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        assert!(
+            !pending.is_empty(),
+            "test must replay both index registration and explicit-drop tombstone mutations"
+        );
+        engine.replay_mutations(pending).unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
+
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.restored, 0);
+        assert!(
+            engine
+                .read_persisted_indexes()
+                .unwrap()
+                .iter()
+                .all(|row| row.keyspace_name != "test_ks" || row.table_name != "test_table"),
+            "real drop must leave no orphaned persisted index rows after restart"
+        );
+        assert!(
+            !engine.declares_index(&table_id, "val_idx"),
+            "real drop must leave no registered index declaration after restart"
         );
     }
 
@@ -27639,6 +27999,101 @@ mod tests {
                 "row {key} of an evicted SSTable must survive a restart"
             );
         }
+        engine.shutdown().unwrap();
+    }
+
+    /// Build an evicting engine holding one flushed, uploaded, evicted SSTable
+    /// of five rows, with its pooled reader and cached `Data.db` descriptor
+    /// dropped so the next read must reopen it by path. Returns the engine, the
+    /// table dir, the evicted generation and the keys.
+    async fn engine_with_evicted_sstable(
+        dir: &std::path::Path,
+        prefix: &str,
+    ) -> (StorageEngine, std::path::PathBuf, String, Vec<String>) {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let tid = table_id();
+        let engine = evicting_s3_engine(dir, &store, prefix);
+        // The test constructor does not install the read-through hook the
+        // production constructors do. Hooks are process-global but keyed by
+        // data dir, so this tempdir's hook ignores every other test's paths.
+        StorageEngine::install_s3_file_read_rehydration_hook(
+            dir.to_path_buf(),
+            prefix.to_string(),
+            Arc::clone(&store),
+        );
+        engine.register_table(test_schema()).unwrap();
+        let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+        for key in &keys {
+            engine
+                .write(&tid, &make_key(key), make_row(b"v", 1000), 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        assert!(engine.sync_sstables_to_s3().await.unwrap() >= 1);
+        let table_dir = engine.table_sstable_dir(&tid);
+        let evicted = StorageEngine::evicted_generations(&dir.join("sstables"));
+        let gens = evicted
+            .values()
+            .next()
+            .expect("the sync recorded an eviction");
+        let gen = gens.iter().next().expect("one evicted generation").clone();
+        assert!(StorageEngine::list_generations_in_dir(&table_dir).is_empty());
+        engine.evict_pooled_reader_for_test(&tid, gen.parse().unwrap());
+        ferrosa_sstable::io::evict_global_fd_for_test(table_dir.join(format!("{gen}-Data.db")));
+        (engine, table_dir, gen, keys)
+    }
+
+    /// Live failure on the memory cluster, 2026-09-29 (t_bfc0e4da): between an
+    /// eviction and the next restart, the read path could not reopen the
+    /// evicted SSTable because the required-component `exists()` check failed
+    /// BEFORE the S3 read-through hook could run, so reads returned partial
+    /// data. A marked generation must be rehydrated on reopen, and once it is
+    /// local again its marker must be cleared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_of_an_evicted_sstable_are_readable_live_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, keys) =
+            engine_with_evicted_sstable(dir.path(), "test-evicted-live").await;
+        let tid = table_id();
+
+        for key in &keys {
+            assert!(
+                engine.read(&tid, &make_key(key)).unwrap().is_some(),
+                "row {key} of an evicted SSTable must be readable before any restart"
+            );
+        }
+        assert!(
+            StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_some(),
+            "the reopen rehydrated the generation into the local cache"
+        );
+        assert!(
+            !StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
+            "a generation that is local again must not keep its eviction marker"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// The rehydration is for MARKED generations only. An unmarked generation
+    /// with missing components was compacted away, and restoring it from S3
+    /// would resurrect purged rows; its open must keep failing loud so the
+    /// read path's view-retry fires.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unmarked_missing_sstable_is_not_rehydrated_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable(dir.path(), "test-unmarked-missing").await;
+        std::fs::remove_file(StorageEngine::evicted_marker_path(&table_dir, &gen)).unwrap();
+
+        let err = match crate::flush::open_file_sstable(&table_dir, &gen) {
+            Ok(_) => panic!("an unmarked missing generation must not open"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("missing required"), "{err}");
+        assert!(
+            StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_none(),
+            "nothing may be restored for an unmarked generation"
+        );
         engine.shutdown().unwrap();
     }
 

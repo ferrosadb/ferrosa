@@ -46,7 +46,7 @@ here so storage and schema share it without a cycle through `ferrosa-sstable`.
 | `data_type` (`src/data_type.rs`) | 89 | `DataType` scalar descriptor (exhaustive) |
 | `token` (`src/token.rs`) | 79 | `Token` newtype + `from_key` |
 | `task_pool` (`src/task_pool.rs`) | 71 | `TaskPool` runtime-aware spawn helper |
-| `test_generators` (`src/test_generators.rs`) | 48 | proptest strategies (feature `test-generators`) |
+| `test_generators` (`src/test_generators.rs`) | ~140 | proptest strategies (feature `test-generators`) for cells/keys and shrink-friendly generated DDL/snapshot table identities, drop markers, and index declarations |
 | `lib` (`src/lib.rs`) | 39 | module declarations + headline re-exports |
 
 ## Data flow / role

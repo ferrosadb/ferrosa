@@ -25,7 +25,7 @@ use ferrosa_cluster::ddl_path::DdlPath;
 use ferrosa_jsonb::{Limits, LimitsConfig};
 use ferrosa_postgres::handshake::VerifierStore;
 use ferrosa_postgres::scram::ScramVerifier;
-use ferrosa_postgres::{server, ClusterDdl, QueryContext};
+use ferrosa_postgres::{server, AccordAccess, ClusterDdl, QueryContext};
 use ferrosa_schema::{
     AuthContext, AuthMethod, DeploymentMode, EnvSecretsProvider, KeyspaceMetadata, PasswordHasher,
     PasswordPolicy, RateLimitConfig, ReplicationParams, Schema, SchemaConfig, TestAuditSink,
@@ -224,7 +224,7 @@ pub async fn start_ferrosa_pg() -> FerrosaPg {
         schema,
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
+        accord: AccordAccess::disabled(),
         ddl: Some(Arc::new(ClusterDdl::new(path))),
         jsonb_limits,
     });

@@ -31,7 +31,7 @@ use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_postgres::handshake::VerifierStore;
 use ferrosa_postgres::scram::ScramVerifier;
-use ferrosa_postgres::{server, QueryContext};
+use ferrosa_postgres::{server, AccordAccess, QueryContext};
 use ferrosa_schema::{
     AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
     EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
@@ -272,7 +272,7 @@ async fn start() -> (tokio_postgres::Client, tempfile::TempDir) {
         schema: Arc::new(schema_with_table()),
         default_schema: "ks".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
+        accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });

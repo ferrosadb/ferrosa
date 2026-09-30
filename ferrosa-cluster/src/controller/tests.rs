@@ -566,45 +566,6 @@ proptest! {
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
-
-    /// Invite-initiator site (t_7c01df7e): an invite arriving on a connection
-    /// from the initiator's ephemeral source port makes this node dial the
-    /// initiator at the internode address it advertised -- never at `from.1`,
-    /// never at its IP plus our port.
-    #[test]
-    fn invite_initiator_is_dialled_at_its_advertised_address_on_any_co_located_layout(
-        (own_port, initiator_port, ephemeral) in co_located_ports(),
-        peer_port in 46000u16..46500,
-    ) {
-        on_runtime(async move {
-            let dir = tempfile::tempdir().unwrap();
-            let local = Uuid::from_u128(3);
-            let controller = co_located_controller(dir.path(), own_port, local);
-            let pm = controller.peer_manager.load().as_ref().clone().expect("peer manager");
-            let initiator = Uuid::from_u128(2);
-            let advertised: SocketAddr = format!("127.0.0.1:{initiator_port}").parse().unwrap();
-            pm.set_peer_internode_broadcast(initiator, advertised.to_string()).await;
-            let handler = super::cluster::ClusterInviteHandler::new(
-                local,
-                pm,
-                controller.net_config.clone(),
-                Arc::downgrade(&controller),
-            );
-            let peer = Uuid::from_u128(1);
-            let invited: SocketAddr = format!("127.0.0.1:{peer_port}").parse().unwrap();
-            handler
-                .handle(
-                    (initiator, format!("127.0.0.1:{ephemeral}").parse().unwrap()),
-                    Message::ClusterInvite { initiator, peers: vec![(peer, invited)] },
-                )
-                .await;
-            assert_eq!(controller.dial_target(initiator), Some(advertised));
-        });
-    }
-}
-
 /// A formation path that computes our own address for another peer is
 /// refused at the one place every dial passes through.
 #[test]
@@ -721,116 +682,28 @@ async fn raft_initializes_on_third_peer() {
     assert_eq!(controller.mode(), DeploymentMode::Cluster);
 }
 
-/// The peers reached us inbound, so the addresses handed over carry
-/// ephemeral source ports. What they advertised on connect is what
-/// `connected_peers` tracks (on_inbound_peer), and that must win. It used to
-/// be recovered by rewriting every address to OUR port, which dialled
-/// ourselves whenever peers do not share our port (t_7c01df7e, CL-22).
-#[tokio::test]
-async fn transition_to_cluster_normalizes_ephemeral_peer_ports_before_seeding_ring() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = Arc::new(ClusterConfig {
-        raft_data_dir: Some(dir.path().join("raft")),
-        ..ClusterConfig::default()
-    });
-    let net_config = Arc::new(NetConfig::default());
-    let local_id = Uuid::new_v4();
-    let peer1_id = Uuid::new_v4();
-    let peer2_id = Uuid::new_v4();
-    let (controller, _handles) = ModeController::new(
-        config,
-        net_config.clone(),
-        local_id,
-        test_storage(dir.path()),
-        test_schema(),
-        Arc::new(HandlerRegistry::new()),
-    );
-    let pm = Arc::new(PeerManager::new(
-        net_config.clone(),
-        local_id,
-        controller.clone(),
-    ));
-    controller.set_peer_manager(pm);
-
-    controller.connected_peers.lock().extend([
-        (peer1_id, "10.89.1.53:17000".parse().unwrap()),
-        (peer2_id, "10.89.1.54:17000".parse().unwrap()),
-    ]);
-    controller.transition_to_cluster(vec![
-        (peer1_id, "10.89.1.53:50318".parse().unwrap()),
-        (peer2_id, "10.89.1.54:50319".parse().unwrap()),
-    ]);
-
-    let ring = controller
-        .token_ring()
-        .expect("cluster transition should publish a token ring snapshot");
-    let peer1 = ring
-        .get_node(uuid_to_node_id(peer1_id))
-        .expect("peer1 should be seeded into the initial ring");
-    let peer2 = ring
-        .get_node(uuid_to_node_id(peer2_id))
-        .expect("peer2 should be seeded into the initial ring");
-    assert_eq!(peer1.addr, "10.89.1.53:17000");
-    assert_eq!(peer2.addr, "10.89.1.54:17000");
-}
-
-/// t_7c01df7e: forming a cluster keeps each peer's own port. Found live on
-/// GPU-PC after 0af1e04a: node3 on :39200 logged "cluster: reverse connection
-/// established uuid=<node2> reverse_addr=127.0.0.1:39200" -- its own address
-/// -- and node1 then received an invite naming node2 at :39200.
-#[test]
-fn cluster_peer_addresses_keep_each_peers_own_port() {
-    let node1 = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
-    let node2 = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
-    let given: Vec<(Uuid, SocketAddr)> = vec![
-        (node1, "127.0.0.1:39000".parse().unwrap()),
-        (node2, "127.0.0.1:39100".parse().unwrap()),
-    ];
-    let dial = super::cluster::cluster_peer_dial_addrs(&given, &[]);
-    assert_eq!(
-        dial, given,
-        "no peer's port may be replaced with ours (:39200)"
-    );
-}
-
-/// The address a peer advertised when it connected wins over the one we were
-/// handed, e.g. an invite built by a node that has not seen it connect.
-#[test]
-fn cluster_peer_addresses_prefer_the_tracked_advertised_address() {
-    let node2 = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
-    let handed = vec![(node2, "127.0.0.1:39200".parse().unwrap())];
-    let tracked = vec![(node2, "127.0.0.1:39100".parse().unwrap())];
-    let dial = super::cluster::cluster_peer_dial_addrs(&handed, &tracked);
-    assert_eq!(dial, tracked);
-}
-
-/// A `ClusterInvite`'s initiator is recorded at its own internode address,
-/// never at the RPC sender's address (`from.1`), whose port is the source
-/// port of its connection.
+/// The one place an ephemeral port reached cluster formation: a
+/// `ClusterInvite`'s initiator was recorded at the RPC sender's address,
+/// whose port is the source port of its connection. It used to be repaired by
+/// rewriting EVERY peer to its IP plus our port inside `transition_to_cluster`,
+/// which is also what put co-located peers at our own address (t_7c01df7e).
+/// The initiator is now resolved where it enters.
 #[test]
 fn invite_initiator_is_recorded_at_its_known_internode_address() {
-    let observed: SocketAddr = "127.0.0.1:49171".parse().unwrap();
+    let observed: SocketAddr = "10.89.1.53:50318".parse().unwrap();
+    assert_eq!(
+        super::cluster::plan_invite_initiator_addr(Some("10.89.1.53:17000"), None, observed, 17000),
+        ("10.89.1.53:17000".parse().unwrap(), false)
+    );
     assert_eq!(
         super::cluster::plan_invite_initiator_addr(
-            Some("127.0.0.1:29000".parse().unwrap()),
-            Some("127.0.0.1:29999"),
+            Some("127.0.0.1:29000"),
             None,
-            observed,
+            "127.0.0.1:49171".parse().unwrap(),
             29200,
         ),
         ("127.0.0.1:29000".parse().unwrap(), false),
-        "the address connected_peers tracks wins"
-    );
-    assert_eq!(
-        super::cluster::plan_invite_initiator_addr(
-            None,
-            Some("127.0.0.1:29000"),
-            None,
-            observed,
-            29200
-        ),
-        ("127.0.0.1:29000".parse().unwrap(), false),
-        "then the address we already dial it at"
+        "co-located: the known address, never ours"
     );
 }
 
@@ -838,18 +711,12 @@ fn invite_initiator_is_recorded_at_its_known_internode_address() {
 fn invite_initiator_falls_back_to_its_advertised_address_then_to_our_port_loudly() {
     let observed: SocketAddr = "127.0.0.1:49171".parse().unwrap();
     assert_eq!(
-        super::cluster::plan_invite_initiator_addr(
-            None,
-            None,
-            Some("127.0.0.1:29000"),
-            observed,
-            29200
-        ),
+        super::cluster::plan_invite_initiator_addr(None, Some("127.0.0.1:29000"), observed, 29200),
         ("127.0.0.1:29000".parse().unwrap(), false)
     );
     // Nothing known: the old assumption, flagged so the caller warns.
     assert_eq!(
-        super::cluster::plan_invite_initiator_addr(None, None, None, observed, 29200),
+        super::cluster::plan_invite_initiator_addr(None, None, observed, 29200),
         ("127.0.0.1:29200".parse().unwrap(), true)
     );
 }
@@ -2777,141 +2644,6 @@ async fn cluster_invite_transition_registers_raft_handlers() {
     );
 }
 
-/// A pair-mode controller with a peer manager, for the invite-race tests.
-fn pair_mode_controller_for_invites(
-    dir: &std::path::Path,
-) -> (Arc<ModeController>, Arc<PeerManager>, Arc<NetConfig>, Uuid) {
-    let config = Arc::new(ClusterConfig {
-        raft_data_dir: Some(dir.join("raft")),
-        ..ClusterConfig::default()
-    });
-    let net_config = Arc::new(NetConfig::default());
-    let local_id = Uuid::new_v4();
-    let (controller, _handles) = ModeController::new(
-        config,
-        net_config.clone(),
-        local_id,
-        test_storage(dir),
-        test_schema(),
-        Arc::new(HandlerRegistry::new()),
-    );
-    let pm = Arc::new(PeerManager::new(
-        net_config.clone(),
-        local_id,
-        controller.clone(),
-    ));
-    controller.set_peer_manager(pm.clone());
-    (controller, pm, net_config, local_id)
-}
-
-/// The ClusterInvite handler must decide and transition under
-/// `transition_guard`, like every other transition path.
-///
-/// Every invite receiver re-broadcasts the invite, so duplicates arrive
-/// concurrently (0.4 ms apart on a live cross-host run). The handler checked
-/// the mode, awaited the initiator's address, then called
-/// `transition_to_cluster` with no guard: two copies both saw Pair, the
-/// transition ran twice, the second re-opened the sled Raft store the first
-/// held, and after the lock retry gave up the node had no Raft at all. The
-/// seed-laggard formation test failed 12 of 24 runs under load that way.
-///
-/// Holding the guard here stands in for the other copy's transition: the
-/// handler must wait for it, then see its result.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cluster_invite_transitions_only_under_the_transition_guard() {
-    use ferrosa_net::rpc::RpcHandler;
-
-    let dir = tempfile::tempdir().unwrap();
-    let (controller, pm, net_config, local_id) = pair_mode_controller_for_invites(dir.path());
-    let peer1_id = Uuid::new_v4();
-    let peer2_id = Uuid::new_v4();
-    // Closed loopback ports: the handler's dials to the invited peers are
-    // refused at once, so it reaches its transition decision promptly.
-    controller.on_peer_connected((peer1_id, "127.0.0.1:2".parse().unwrap()));
-    assert_eq!(controller.mode(), DeploymentMode::Pair);
-
-    let handler =
-        cluster::ClusterInviteHandler::new(local_id, pm, net_config, Arc::downgrade(&controller));
-    let invite = ferrosa_net::message::Message::ClusterInvite {
-        initiator: peer1_id,
-        peers: vec![
-            (local_id, "127.0.0.1:1".parse().unwrap()),
-            (peer1_id, "127.0.0.1:2".parse().unwrap()),
-            (peer2_id, "127.0.0.1:3".parse().unwrap()),
-        ],
-    };
-
-    // The holder is an OS thread: a sync guard must not be held across the
-    // awaits below.
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let holder_ctrl = controller.clone();
-    let holder = std::thread::spawn(move || {
-        let _guard = holder_ctrl.transition_guard.lock();
-        locked_tx.send(()).expect("test is waiting for the lock");
-        release_rx.recv().expect("test releases the lock");
-    });
-    locked_rx.recv().expect("the holder thread took the guard");
-
-    let handling = tokio::spawn(async move {
-        handler
-            .handle((peer1_id, "127.0.0.1:2".parse().unwrap()), invite)
-            .await
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-    let mode_while_held = controller.mode();
-    release_tx.send(()).expect("the holder thread is waiting");
-    holder.join().expect("the holder thread panicked");
-    assert_eq!(
-        mode_while_held,
-        DeploymentMode::Pair,
-        "the invite handler transitioned while another transition held the guard"
-    );
-
-    let reply = tokio::time::timeout(std::time::Duration::from_secs(30), handling)
-        .await
-        .expect("the invite handler must finish once the guard is free")
-        .expect("the invite handler task panicked");
-    assert!(reply.is_some(), "handler should reply with ack");
-    assert_eq!(controller.mode(), DeploymentMode::Cluster);
-}
-
-/// A second `transition_to_cluster` on a node already in Cluster mode is
-/// refused at once instead of re-opening the Raft store.
-///
-/// The first transition's Raft owns the sled store. A second one used to open
-/// it again, wait out the lock retry (about 10 s), and fail -- or, had it
-/// succeeded, run a second Raft beside the first. Either way the node is
-/// broken, so re-entry is refused at the top, loudly.
-#[tokio::test]
-async fn a_second_cluster_transition_is_refused_at_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let (controller, _pm, _net_config, _local_id) = pair_mode_controller_for_invites(dir.path());
-    let peers = vec![
-        (Uuid::new_v4(), "127.0.0.1:7001".parse().unwrap()),
-        (Uuid::new_v4(), "127.0.0.2:7002".parse().unwrap()),
-    ];
-    controller.transition_to_cluster(peers.clone());
-    assert_eq!(controller.mode(), DeploymentMode::Cluster);
-    let write_path = Arc::as_ptr(&controller.write_path.load_full());
-
-    let started = std::time::Instant::now();
-    controller.transition_to_cluster(peers);
-    let elapsed = started.elapsed();
-
-    assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "the second transition must be refused at once, not re-open the Raft store \
-         (took {elapsed:?})"
-    );
-    assert_eq!(controller.mode(), DeploymentMode::Cluster);
-    assert_eq!(
-        Arc::as_ptr(&controller.write_path.load_full()),
-        write_path,
-        "the refused transition must not replace the write path"
-    );
-}
-
 // -----------------------------------------------------------------------
 // Progressive join: standalone → pair → cluster
 // -----------------------------------------------------------------------
@@ -4201,159 +3933,4 @@ async fn an_inbound_peer_is_registered_in_the_raft_node_map() {
          route Raft RPCs to a member that dialled IT, and every AppendEntries \
          is 'registration pending' forever: {map:?}"
     );
-}
-
-// ---- T-300: leaving standalone is refused while jsonb columns exist ----
-
-fn jsonb_test_table(name: &str, ty: &str) -> ferrosa_schema::TableMetadata {
-    use ferrosa_schema::{ClusteringOrder, ColumnKind, ColumnMetadata, TableMetadata, TableParams};
-    let col = |n: &str, kind: ColumnKind, t: &str| ColumnMetadata {
-        name: n.to_string(),
-        kind,
-        position: 0,
-        column_type: t.to_string(),
-        clustering_order: ClusteringOrder::None,
-        mask: None,
-    };
-    let mut columns = indexmap::IndexMap::new();
-    columns.insert("pk".to_string(), col("pk", ColumnKind::PartitionKey, "int"));
-    columns.insert("v".to_string(), col("v", ColumnKind::Regular, ty));
-    TableMetadata {
-        keyspace: "jk".to_string(),
-        name: name.to_string(),
-        id: Uuid::new_v4(),
-        columns,
-        partition_key: vec!["pk".to_string()],
-        clustering_key: vec![],
-        params: TableParams::default(),
-        flags: std::collections::HashSet::new(),
-        extensions: HashMap::new(),
-        is_system: false,
-    }
-}
-
-fn jsonb_controller(
-    net_config: NetConfig,
-) -> (Arc<ModeController>, Arc<Schema>, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = test_schema();
-    schema
-        .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
-            name: "jk".to_string(),
-            durable_writes: true,
-            replication: ferrosa_schema::ReplicationParams {
-                strategy: "SimpleStrategy".to_string(),
-                options: HashMap::from([("replication_factor".into(), "1".into())]),
-            },
-        })
-        .unwrap();
-    let (controller, _handles) = ModeController::new(
-        Arc::new(ClusterConfig::default()),
-        Arc::new(net_config),
-        Uuid::new_v4(),
-        test_storage(dir.path()),
-        schema.clone(),
-        Arc::new(HandlerRegistry::new()),
-    );
-    (controller, schema, dir)
-}
-
-fn jsonb_refusing(controller: &ModeController) -> bool {
-    controller
-        .jsonb_gate_refusing
-        .load(std::sync::atomic::Ordering::Relaxed)
-}
-
-#[test]
-fn leaving_standalone_refused_while_jsonb_exists() {
-    let (controller, schema, _dir) = jsonb_controller(NetConfig::default());
-    schema
-        .create_table_internal(jsonb_test_table("plain", "int"))
-        .unwrap();
-    // No jsonb: the check passes and the transition proceeds.
-    assert!(controller
-        .check_leaving_standalone(DeploymentMode::Pair)
-        .is_ok());
-    schema
-        .create_table_internal(jsonb_test_table("docs", "jsonb"))
-        .unwrap();
-    for target in [DeploymentMode::Pair, DeploymentMode::Cluster] {
-        let refused = controller
-            .check_leaving_standalone(target)
-            .expect_err("refused while jsonb exists");
-        let text = refused.to_string();
-        assert!(text.contains("jk.docs") && text.contains("D15a"), "{text}");
-        assert!(!text.contains("jk.plain"), "{text}");
-        assert!(!controller.try_transition_mode(target), "{target}");
-        assert_eq!(controller.mode(), DeploymentMode::Standalone);
-    }
-    // The entry guards refuse before touching any write path: the refusal
-    // flag is set by the guard, which runs before the peer-manager check.
-    let peer: SocketAddr = "127.0.0.1:7100".parse().unwrap();
-    for entry in 0..3 {
-        controller
-            .jsonb_gate_refusing
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        match entry {
-            0 => controller.transition_to_pair(Uuid::new_v4(), peer, false),
-            1 => controller.transition_to_cluster(vec![(Uuid::new_v4(), peer)]),
-            _ => controller.transition_to_forming(vec![(Uuid::new_v4(), peer)]),
-        }
-        assert!(
-            jsonb_refusing(&controller),
-            "entry {entry} must consult the gate"
-        );
-        assert_eq!(controller.mode(), DeploymentMode::Standalone);
-    }
-}
-
-#[test]
-fn leaving_standalone_proceeds_without_jsonb_and_the_edge_recovers() {
-    let (controller, schema, _dir) = jsonb_controller(NetConfig::default());
-    schema
-        .create_table_internal(jsonb_test_table("docs", "jsonb"))
-        .unwrap();
-    assert!(!controller.try_transition_mode(DeploymentMode::Pair));
-    assert!(jsonb_refusing(&controller));
-    schema.drop_table_internal("jk", "docs").unwrap();
-    assert!(controller.try_transition_mode(DeploymentMode::Pair));
-    assert!(!jsonb_refusing(&controller), "recovery clears the edge");
-    assert_eq!(controller.mode(), DeploymentMode::Pair);
-}
-
-#[test]
-fn startup_with_jsonb_outside_standalone_is_refused_naming_tables() {
-    // Seeds configured: the node will leave standalone.
-    let seeded = NetConfig {
-        seeds: vec!["127.0.0.1:7000".parse().unwrap()],
-        ..NetConfig::default()
-    };
-    let (controller, schema, _dir) = jsonb_controller(seeded);
-    controller.check_startup_jsonb().expect("no jsonb yet");
-    schema
-        .create_table_internal(jsonb_test_table("docs", "list<jsonb>"))
-        .unwrap();
-    let refused = controller.check_startup_jsonb().expect_err("fatal");
-    assert!(refused.to_string().contains("jk.docs"), "{refused}");
-
-    // No seeds, standalone: fine even with jsonb.
-    let (alone, schema, _dir2) = jsonb_controller(NetConfig::default());
-    schema
-        .create_table_internal(jsonb_test_table("docs", "jsonb"))
-        .unwrap();
-    alone.check_startup_jsonb().expect("standalone with jsonb");
-    // A node that restarts as a former cluster member is not standalone.
-    alone.set_mode_for_test(DeploymentMode::DegradedCluster);
-    let refused = alone.check_startup_jsonb().expect_err("fatal");
-    assert!(refused.to_string().contains("jk.docs"), "{refused}");
-}
-
-#[test]
-fn schema_sees_every_controller_mode_change_at_once() {
-    let (controller, schema, _dir) = jsonb_controller(NetConfig::default());
-    assert!(controller.try_transition_mode(DeploymentMode::Pair));
-    let refused = schema
-        .create_table_internal(jsonb_test_table("late", "jsonb"))
-        .expect_err("a pair node refuses replicated jsonb DDL");
-    assert!(refused.to_string().contains("D15a"), "{refused}");
 }

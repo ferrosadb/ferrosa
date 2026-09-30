@@ -459,7 +459,7 @@ fn should_retry_missing_peer_error(err: &str) -> bool {
     err.contains("unknown peer")
         || err.contains("no connection pool")
         || err.contains("lane is reconnecting")
-        || err.contains("lane permanently failed")
+        || err.contains("lane actor shut down")
 }
 
 /// Select the internode lane for a single-partition read.
@@ -2268,7 +2268,7 @@ mod tests {
             "lane is reconnecting; retry later"
         ));
         assert!(should_retry_missing_peer_error(
-            "lane permanently failed after max reconnection attempts"
+            "lane actor shut down (connection replaced or closed)"
         ));
     }
 

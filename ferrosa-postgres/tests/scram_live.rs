@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ferrosa_postgres::handshake::VerifierStore;
 use ferrosa_postgres::scram::ScramVerifier;
-use ferrosa_postgres::{server, QueryContext};
+use ferrosa_postgres::{server, AccordAccess, QueryContext};
 use ferrosa_schema::{
     AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
     RateLimitConfig, Schema, SchemaConfig, TestAuditSink,
@@ -104,9 +104,9 @@ fn minimal_ctx() -> (Arc<QueryContext>, tempfile::TempDir) {
         schema: Arc::new(schema),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
-        ddl: None,
-        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
+accord: AccordAccess::disabled(),
+          ddl: None,
+          jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
     (ctx, dir)
 }

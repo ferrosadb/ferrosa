@@ -206,51 +206,20 @@ pub(super) fn plan_invite_peer_connection(
     }
 }
 
-/// The address to dial each cluster peer at: its own internode address.
-///
-/// The address `connected_peers` tracks for a peer wins -- `on_inbound_peer`
-/// resolved it from the peer's advertised internode broadcast, and an
-/// outbound peer is tracked at the address we dialled -- and otherwise the
-/// address given (an invite's, whose sender resolved it the same way) is
-/// used as stated.
-///
-/// This used to rewrite every address to `peer_ip:<this node's bind port>`,
-/// which only holds while every node shares one internode port. Co-located
-/// nodes do not (t_7c01df7e): node3 on :39200 filed a pool for node2 at
-/// 127.0.0.1:39200, its own address, put that address in Raft membership,
-/// and sent it to node1 in a ClusterInvite.
-pub(super) fn cluster_peer_dial_addrs(
-    peers: &[(Uuid, SocketAddr)],
-    connected: &[(Uuid, SocketAddr)],
-) -> Vec<(Uuid, SocketAddr)> {
-    peers
-        .iter()
-        .map(|(id, given)| {
-            let tracked = connected.iter().find(|(c, _)| c == id).map(|(_, a)| *a);
-            (*id, tracked.unwrap_or(*given))
-        })
-        .collect()
-}
-
 /// The internode address to record for a `ClusterInvite`'s initiator.
 ///
 /// `observed` is the RPC sender's address: the source address of the
 /// connection the invite arrived on, whose port is ephemeral. Prefer the
-/// address `connected_peers` tracks for the initiator, then the address we
-/// already dial it at, then the internode address it advertised in its
-/// handshake. Only when none is known fall back to the observed IP plus OUR
-/// port -- the old assumption, wrong for co-located nodes -- and report that
-/// by returning `true` so the caller can log it.
+/// address we already dial the initiator at, then the internode address it
+/// advertised in its handshake. Only when neither is known fall back to the
+/// observed IP plus OUR port -- the old assumption, wrong for co-located
+/// nodes -- and report that by returning `true` so the caller can log it.
 pub(super) fn plan_invite_initiator_addr(
-    tracked: Option<SocketAddr>,
     known: Option<&str>,
     advertised: Option<&str>,
     observed: SocketAddr,
     local_internode_port: u16,
 ) -> (SocketAddr, bool) {
-    if let Some(addr) = tracked {
-        return (addr, false);
-    }
     if let Some(addr) = known.and_then(|known| known.parse().ok()) {
         return (addr, false);
     }
@@ -743,10 +712,6 @@ impl ModeController {
     /// for mesh formation. Does NOT initialize Raft — that happens in
     /// `transition_to_cluster` after all peers are connected.
     pub(super) fn transition_to_forming(&self, peers: Vec<(Uuid, SocketAddr)>) {
-        // T-300: no departure from standalone while jsonb columns exist.
-        if !self.leaving_standalone_permitted(DeploymentMode::Forming) {
-            return;
-        }
         if self.peer_manager.load().is_none() {
             tracing::error!("cannot transition to forming: peer_manager not set");
             return;
@@ -794,29 +759,11 @@ impl ModeController {
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
     pub(super) fn transition_to_cluster(&self, peers: Vec<(Uuid, SocketAddr)>) {
-        // One transition per formation. A second one re-opens the sled Raft
-        // store the first transition's Raft holds: it waits out the lock
-        // retry and fails, or would run a second Raft beside the first.
-        // Callers hold `transition_guard`, so the mode read here cannot change
-        // before the swap below.
-        let current = self.mode();
-        if !current.can_transition_to(DeploymentMode::Cluster) {
-            tracing::error!(
-                %current,
-                "refusing to re-enter the cluster transition: this node is already {current}"
-            );
-            return;
-        }
-        // T-300: no departure from standalone while jsonb columns exist.
-        if !self.leaving_standalone_permitted(DeploymentMode::Cluster) {
-            return;
-        }
-        // Each peer at its own internode address -- see
-        // `cluster_peer_dial_addrs`. Every peer used to be rewritten to its IP
-        // plus OUR port, which put every co-located peer at our own address in
-        // the ring and in Raft membership (t_7c01df7e).
-        let connected = self.connected_peers.lock().clone();
-        let peers = cluster_peer_dial_addrs(&peers, &connected);
+        // `peers` are internode addresses as tracked in `connected_peers`: the
+        // address dialled for an outbound peer, the resolved advertised
+        // address for an inbound one. They used to be rewritten to each
+        // peer's IP plus OUR port, which put every co-located peer at our own
+        // address in the ring (t_7c01df7e).
         let phase_runner = super::bootstrap::runner::BootstrapPhaseRunner::canonical();
         tracing::debug!(
             phase_count = phase_runner.phase_order().len(),
@@ -1297,17 +1244,7 @@ impl ModeController {
         // Clear pair context — no longer in pair mode
         *self.pair_context.lock() = None;
 
-        // The checks at the top make a refusal here unreachable while callers
-        // hold `transition_guard`. If one happens anyway, stop before starting
-        // a Raft for a node the state machine did not move into Cluster.
-        if !self.try_transition_mode(DeploymentMode::Cluster) {
-            tracing::error!(
-                mode = %self.mode(),
-                "cluster transition refused after the write path was swapped; \
-                 not starting Raft (a caller entered without transition_guard)"
-            );
-            return;
-        }
+        self.try_transition_mode(DeploymentMode::Cluster);
 
         // Durably record that this node has been a cluster member, BEFORE
         // announcing the transition. On restart this is what stops the node
@@ -3151,18 +3088,11 @@ impl RpcHandler for ClusterInviteHandler {
                 if initiator != self.local_host_id
                     && !all_peers.iter().any(|(id, _)| *id == initiator)
                 {
-                    let tracked = ctrl
-                        .connected_peers
-                        .lock()
-                        .iter()
-                        .find(|(id, _)| *id == initiator)
-                        .map(|(_, addr)| *addr);
                     let known = self.peer_manager.peer_addr(initiator).await;
                     let advertised = self
                         .peer_manager
                         .get_peer_internode_broadcast_sync(initiator);
                     let (addr, assumed) = plan_invite_initiator_addr(
-                        tracked,
                         known.as_deref(),
                         advertised.as_deref(),
                         from.1,
@@ -3179,21 +3109,7 @@ impl RpcHandler for ClusterInviteHandler {
                     }
                     all_peers.push((initiator, addr));
                 }
-                // Decide and transition under `transition_guard`, as every
-                // other transition path does. Every receiver re-broadcasts the
-                // invite, so copies arrive concurrently; the await above lets
-                // two of them both see Pair here, and an unguarded second
-                // `transition_to_cluster` re-opens the Raft store the first
-                // holds. Re-read the mode under the guard: a copy that lost
-                // the race sees Cluster and stands down. No await below.
-                let _guard = ctrl.transition_guard.lock();
-                let mode = ctrl.mode();
-                if !matches!(mode, DeploymentMode::Pair | DeploymentMode::Standalone) {
-                    tracing::debug!(
-                        %mode,
-                        "cluster invite: another transition won the race; nothing to do"
-                    );
-                } else if all_peers.len() >= 2 {
+                if all_peers.len() >= 2 {
                     tracing::info!(
                         peer_count = all_peers.len(),
                         "cluster invite: triggering cluster transition from {mode:?}"

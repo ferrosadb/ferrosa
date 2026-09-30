@@ -13,7 +13,20 @@ case "$target" in
     ;;
   aarch64-unknown-linux-musl)
     host=aarch64-linux-musl
-    cflags=-mno-outline-atomics
+    # -O2 is REQUIRED here, not an optimization flourish.
+    #
+    # Setting CFLAGS at all REPLACES autoconf's default (-g -O2) rather than
+    # appending to it. At -O0 libunwind 1.8.1's aarch64 aarch64_local_resume
+    # inline asm -- which names 18 general and vector registers as fixed
+    # operands (Gos-linux.c:41) -- cannot satisfy the register allocator:
+    #
+    #   src/aarch64/Gos-linux.c:41:7: error: 'asm' operand has impossible constraints
+    #
+    # x86_64 is unaffected only because its cflags are empty, so autoconf's
+    # -O2 survives. Verified on aarch64 Linux / GCC 13.3 / musl-gcc: with
+    # CFLAGS=-mno-outline-atomics the build fails at Gos-linux.c:41; adding
+    # -O2 makes it succeed. Do not drop -O2 from this line.
+    cflags="-O2 -mno-outline-atomics"
     ;;
   *)
     echo "unsupported libunwind target: $target" >&2

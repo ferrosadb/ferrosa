@@ -1256,6 +1256,17 @@ thread_local! {
 /// its memory map).
 type PostingSource<'a> = Box<dyn Iterator<Item = RowPositionRef<'a>> + 'a>;
 
+/// An index key matching at least `1 / UNSELECTIVE_INDEX_SHARE_DENOMINATOR`
+/// of a table's partitions is served by scan rather than point reads, when
+/// the query licenses a scan (see [`TableStore::index_key_is_unselective`]).
+/// A point read probes every SSTable; a scan streams each once, so the scan
+/// wins long before the key names the whole table.
+pub const UNSELECTIVE_INDEX_SHARE_DENOMINATOR: u64 = 10;
+
+/// Below this many matches an index key is always served by the index: on a
+/// small table the point reads are cheap and the scan saves nothing.
+pub const UNSELECTIVE_INDEX_MIN_MATCHES: usize = 50;
+
 /// The row-ordered posting sources for one index key, each positioned at
 /// `from` (inclusive): the active memtable's pinned list, then every SSTable
 /// sidecar that holds the index.
@@ -5407,6 +5418,49 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
         Ok(())
+    }
+
+    /// Whether an index key names so large a share of the table that one
+    /// sequential scan beats a point read per match.
+    ///
+    /// Serving an index key point-reads every row it names, and each point
+    /// read probes every SSTable. A tenant index over a single-tenant table
+    /// names the whole table: ferrosa-memory's edge count point-read 193,181
+    /// rows through `co_occurs_with`'s tenant index in 87 s (2026-09-29),
+    /// where a scan takes well under a second. The postings are counted only
+    /// up to the threshold, so a selective key costs a handful of posting
+    /// reads, never a walk of the whole index.
+    pub fn index_key_is_unselective(&self, index_name: &str, key: &IndexKey) -> Result<bool> {
+        if !self.secondary_index_declared(index_name) {
+            // The read path refuses an undeclared index loudly; not here.
+            return Ok(false);
+        }
+        let Some(lookup_key) = self.encode_index_lookup_key(index_name, key)? else {
+            return Ok(false);
+        };
+        let guard = self.view.load();
+        let partitions = guard
+            .sstables
+            .iter()
+            .map(|sstable| sstable.partition_count)
+            .sum::<u64>()
+            .saturating_add(guard.active.partition_count() as u64)
+            .saturating_add(
+                guard
+                    .flushing
+                    .as_ref()
+                    .map_or(0, |memtable| memtable.partition_count() as u64),
+            );
+        let threshold = usize::try_from(partitions / UNSELECTIVE_INDEX_SHARE_DENOMINATOR)
+            .unwrap_or(usize::MAX)
+            .max(UNSELECTIVE_INDEX_MIN_MATCHES);
+        let memtable = guard
+            .indexes
+            .get(index_name)
+            .and_then(|index| index.posting_list(&lookup_key));
+        let sources =
+            index_posting_sources(&guard, memtable.as_ref(), index_name, &lookup_key, None);
+        Ok(OrderedPostings::new(sources).take(threshold).count() >= threshold)
     }
 
     /// Point-read the one row a row posting names and hand it to `visitor`.

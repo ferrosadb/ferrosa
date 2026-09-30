@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferrosa_postgres::{server, QueryContext, SchemaVerifierStore};
+use ferrosa_postgres::{server, AccordAccess, QueryContext, SchemaVerifierStore};
 use ferrosa_schema::auth::permission::{Permission, Resource};
 use ferrosa_schema::auth::role::RoleMetadata;
 use ferrosa_schema::{
@@ -214,9 +214,9 @@ async fn start_with_tls(rate_limit: RateLimitConfig, tls: server::PgTls) -> Fixt
         schema: schema.clone(),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord_committer: None,
-        ddl: None,
-        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
+accord: AccordAccess::disabled(),
+          ddl: None,
+          jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
     });
     let store = Arc::new(SchemaVerifierStore::new(schema.clone()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
