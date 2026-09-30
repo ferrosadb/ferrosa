@@ -319,9 +319,10 @@ impl PgContainer {
     ///
     /// The image reference comes from `FERROSA_POSTGRES_IMAGE` (see
     /// `postgres_image`), so CI can redirect it to our own mirror without a
-    /// code change. Running a bare `postgres:16` makes the job depend on a
-    /// registry we do not control: on 2026-09-29 a connection reset while
-    /// pulling a manifest failed a CI job outright.
+    /// code change. CI sets it to our own mirror; the default below is
+    /// upstream, which is what a local `cargo test` uses. Leaning on upstream
+    /// makes the job depend on a registry we do not control: on 2026-09-29 a
+    /// connection reset while pulling a manifest failed a CI job outright.
     async fn start() -> PgContainer {
         let runtime = container_runtime();
         let image = postgres_image();
