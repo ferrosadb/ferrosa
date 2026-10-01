@@ -695,6 +695,51 @@ pub fn raft_log_dir_for_dc(base: &std::path::Path, dc_name: &str) -> std::path::
     base.join(dc_name)
 }
 
+/// Resolve the DC to commit for a peer in this node's topology.
+///
+/// The announced DC is the authority: a peer that told us it lives in `dc2`
+/// must never be recorded under OUR DC. Peers that announced nothing (an
+/// older peer mid-rolling-upgrade, or none configured) fall back to the local
+/// DC — the behaviour before DC advertisement existed, so classifying them
+/// cannot change an existing single-DC cluster.
+///
+/// This is deliberately the same rule [`partition_peers_by_dc`] applies, so a
+/// peer's ring entry and its voter classification cannot disagree.
+pub fn dc_for_peer(
+    host_id: uuid::Uuid,
+    peer_dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    local_dc: &str,
+) -> String {
+    match peer_dcs.get(&host_id) {
+        Some(dc) if !dc.trim().is_empty() => dc.clone(),
+        _ => local_dc.to_string(),
+    }
+}
+
+/// Resolved (data_center, rack) for a peer, as committed into topology.
+pub type PeerTopology = (String, String);
+
+/// Resolve the `(dc, rack)` to commit for a peer.
+///
+/// The peer's announced values win and absent ones fall back to the local
+/// node's — the single rule every producer (initial ring, recovered-topology
+/// refresh, seed join, membership admission) shares, so no two sites can
+/// disagree and no peer is ever recorded under another node's topology.
+pub fn peer_topology(
+    host_id: uuid::Uuid,
+    peer_dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    peer_racks: &std::collections::HashMap<uuid::Uuid, String>,
+    local_dc: &str,
+    local_rack: &str,
+) -> PeerTopology {
+    let dc = dc_for_peer(host_id, peer_dcs, local_dc);
+    let rack = match peer_racks.get(&host_id) {
+        Some(rack) if !rack.trim().is_empty() => rack.clone(),
+        _ => local_rack.to_string(),
+    };
+    (dc, rack)
+}
+
 /// W6.3: partition a `(host_id, addr)` peer list by DC, given a lookup
 /// table from `host_id` to DC name. Peers not present in `dcs` default
 /// to `local_dc` — this preserves single-DC behavior when no per-peer
@@ -719,14 +764,11 @@ pub fn partition_peers_by_dc(
     let mut others: std::collections::BTreeMap<String, Vec<(uuid::Uuid, SocketAddr)>> =
         std::collections::BTreeMap::new();
     for (uuid, addr) in peers {
-        let dc = dcs.get(uuid).map(String::as_str).unwrap_or(local_dc);
+        let dc = dc_for_peer(*uuid, dcs, local_dc);
         if dc == local_dc {
             local.push((*uuid, *addr));
         } else {
-            others
-                .entry(dc.to_string())
-                .or_default()
-                .push((*uuid, *addr));
+            others.entry(dc).or_default().push((*uuid, *addr));
         }
     }
     (local, others)
@@ -742,6 +784,8 @@ pub(super) fn build_recovered_topology_refresh_plan(
     peers: &[(uuid::Uuid, SocketAddr)],
     peer_cql_broadcasts: &std::collections::HashMap<uuid::Uuid, Option<String>>,
     peer_internode_broadcasts: &std::collections::HashMap<uuid::Uuid, Option<String>>,
+    peer_dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    peer_racks: &std::collections::HashMap<uuid::Uuid, String>,
 ) -> Vec<crate::raft::NodeInfo> {
     let mut plan = Vec::with_capacity(peers.len() + 1);
     plan.push(crate::raft::NodeInfo {
@@ -758,11 +802,16 @@ pub(super) fn build_recovered_topology_refresh_plan(
         let peer_internode_broadcast = peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
         let node_addr =
             super::membership::node_info_addr(*addr, peer_internode_broadcast.as_deref());
+        // The refresh commits THE PEER's DC/rack. Re-authoring it under our own
+        // would silently undo every correct ring entry on the first leader
+        // restart with recovered topology, re-enabling the LOCAL_QUORUM bug.
+        let (peer_dc, peer_rack) =
+            peer_topology(*peer_uuid, peer_dcs, peer_racks, data_center, rack);
         plan.push(crate::raft::NodeInfo {
             host_id: *peer_uuid,
             addr: node_addr,
-            data_center: data_center.to_string(),
-            rack: rack.to_string(),
+            data_center: peer_dc,
+            rack: peer_rack,
             state: crate::raft::NodeState::Normal,
             cql_broadcast: peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
         });
@@ -1118,6 +1167,14 @@ impl ModeController {
                 )
             })
             .collect();
+        let peer_racks: std::collections::HashMap<Uuid, String> = peers
+            .iter()
+            .filter_map(|(peer_uuid, _)| {
+                peer_manager
+                    .get_peer_rack_sync(*peer_uuid)
+                    .map(|rack| (*peer_uuid, rack))
+            })
+            .collect();
 
         // Determine whether this node is the seed (responsible for calling
         // raft.initialize()). The seed is the node with the highest UUID among
@@ -1454,10 +1511,20 @@ impl ModeController {
             );
 
             // Add peers
+            // Each peer's ring entry carries THE PEER's announced DC/rack, not
+            // ours — a peer in dc2 recorded under our dc1 would make LOCAL_*
+            // quorum counting (and NTS placement) treat a remote replica as
+            // local. Peers that announced nothing fall back to the local DC
+            // via `dc_for_peer`, preserving single-DC behaviour for a peer
+            // that is still on the old version.
             for (peer_uuid, addr) in &peers {
                 let peer_node_id = uuid_to_node_id(*peer_uuid);
                 let peer_internode_broadcast =
                     peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
+                let peer_dc = super::cluster::dc_for_peer(*peer_uuid, &peer_dc_map, &local_dc);
+                let peer_rack = peer_manager
+                    .get_peer_rack_sync(*peer_uuid)
+                    .unwrap_or_else(|| self.config.rack.clone());
                 ring.add_node(
                     peer_node_id,
                     NodeInfo {
@@ -1466,8 +1533,8 @@ impl ModeController {
                             *addr,
                             peer_internode_broadcast.as_deref(),
                         ),
-                        data_center: self.config.data_center.clone(),
-                        rack: self.config.rack.clone(),
+                        data_center: peer_dc,
+                        rack: peer_rack,
                         state: NodeState::Normal,
                         cql_broadcast: peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
                     },
@@ -2512,6 +2579,8 @@ impl ModeController {
                             &peers,
                             &peer_cql_broadcasts,
                             &peer_internode_broadcasts,
+                            &peer_dc_map,
+                            &peer_racks,
                         );
                         let desired_raft_members = build_raft_members_from_node_info(&refresh_plan);
                         let raft_for_membership_repair = raft_arc.clone();
@@ -2576,6 +2645,8 @@ impl ModeController {
                             &peers,
                             &peer_cql_broadcasts,
                             &peer_internode_broadcasts,
+                            &peer_dc_map,
+                            &peer_racks,
                         );
                         let token_repair_plan = build_recovered_topology_token_repair_plan(
                             &refresh_plan,

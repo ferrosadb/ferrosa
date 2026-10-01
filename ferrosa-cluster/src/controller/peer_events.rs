@@ -591,6 +591,8 @@ impl InboundPeerCallback for ModeController {
         cql_broadcast: Option<String>,
         internode_broadcast: Option<String>,
         capabilities: u32,
+        data_center: Option<String>,
+        rack: Option<String>,
     ) {
         let (host_id, addr) = peer_id;
         if host_id == self.local_host_id {
@@ -609,9 +611,41 @@ impl InboundPeerCallback for ModeController {
             self.net_config.bind_addr.port(),
             internode_broadcast.as_deref(),
         );
-        tracing::info!(peer = %host_id, %addr, ?cql_broadcast, ?internode_broadcast, "inbound peer connected");
+        tracing::info!(
+            peer = %host_id,
+            %addr,
+            ?cql_broadcast,
+            ?internode_broadcast,
+            ?data_center,
+            ?rack,
+            "inbound peer connected"
+        );
 
-        // Register the peer here too, not only in `on_peer_connected`.
+        // Record the peer's announced data center BEFORE anything can build
+        // topology from it. `transition_to_cluster` (cluster.rs) reads
+        // `peer_dcs_snapshot()` synchronously, and for an inbound connection
+        // this callback is the only place the announcement arrives — the
+        // outbound path learns it in `PeerManager::add_peer`. Without this,
+        // every peer stays unclassified and `partition_peers_by_dc` treats it
+        // as local (the bug): LOCAL_* quorum counting then includes remote-DC
+        // replicas and DC-aware placement stamps peers with OUR DC.
+        //
+        // Must happen before the `transition_guard` is taken below, so a
+        // concurrent cluster transition cannot snapshot an empty map.
+        if let Some(ref dc) = data_center {
+            self.record_peer_dc(host_id, dc.clone());
+            // Mirror into PeerManager so system.peers/peers_v2 report the
+            // peer's own DC. try_write: this callback cannot await (see
+            // `set_peer_data_center_sync`); the controller map above is the
+            // authority for placement either way.
+            if !dc.trim().is_empty() {
+                if let Some(pm) = &**self.peer_manager.load() {
+                    pm.set_peer_data_center_sync(host_id, dc.clone());
+                }
+            }
+        }
+
+        // Register this peer here too, not only in `on_peer_connected`.
         //
         // Which handler runs is decided by who dialled whom, and that has
         // nothing to do with whether the leader needs to route Raft RPCs to

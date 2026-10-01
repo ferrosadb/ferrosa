@@ -230,7 +230,7 @@ async fn promote_from_degraded_pair_restores_writes() {
 
     // Enter pair mode via inbound connection. Lower host-id wins primary.
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0);
+    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0, None, None);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(controller.role(), Some(PairRole::Primary));
 
@@ -279,7 +279,7 @@ async fn degraded_pair_serves_stale_reads() {
 
     // Enter pair mode
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0);
+    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0, None, None);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
 
     // Peer disconnects → DegradedPair
@@ -391,6 +391,8 @@ async fn pair_mode_reaches_an_inbound_peer_at_its_advertised_internode_address()
         None,
         Some("127.0.0.1:29000".into()),
         0,
+        None,
+        None,
     );
 
     assert_eq!(controller.mode(), DeploymentMode::Pair);
@@ -527,6 +529,8 @@ fn pair_formation_dials_the_advertised_address_on_any_co_located_layout() {
                 None,
                 Some(advertised.to_string()),
                 0,
+                None,
+                None,
             );
             assert_eq!(controller.mode(), DeploymentMode::Pair);
             assert_eq!(controller.dial_target(peer), Some(advertised));
@@ -1471,6 +1475,10 @@ fn recovered_topology_refresh_plan_uses_current_live_addresses() {
     // refresh plan must commit that hostname, not the observed IP.
     let peer_internode_broadcasts =
         std::collections::HashMap::from([(peer_host_id, Some("peer-node:7000".to_string()))]);
+    // The peer announced its OWN dc/rack; the recovered plan must commit those,
+    // never the local node's.
+    let peer_dcs = std::collections::HashMap::from([(peer_host_id, "dc2".to_string())]);
+    let peer_racks = std::collections::HashMap::from([(peer_host_id, "rack2".to_string())]);
 
     let plan = build_recovered_topology_refresh_plan(
         local_host_id,
@@ -1481,6 +1489,8 @@ fn recovered_topology_refresh_plan_uses_current_live_addresses() {
         &peers,
         &peer_cql_broadcasts,
         &peer_internode_broadcasts,
+        &peer_dcs,
+        &peer_racks,
     );
 
     assert_eq!(plan.len(), 2);
@@ -1494,6 +1504,15 @@ fn recovered_topology_refresh_plan_uses_current_live_addresses() {
         "recovered topology must commit the advertised internode hostname, not the observed IP"
     );
     assert_eq!(plan[1].cql_broadcast.as_deref(), Some("127.0.0.1:38043"));
+    assert_eq!(
+        plan[1].data_center, "dc2",
+        "the recovered plan must commit the PEER's announced DC, never the local node's"
+    );
+    assert_eq!(plan[1].rack, "rack2");
+    assert_eq!(
+        plan[0].data_center, "dc1",
+        "the local node keeps its own DC"
+    );
 }
 
 #[test]
@@ -1503,6 +1522,9 @@ fn recovered_topology_refresh_plan_repairs_tokens_for_every_voter() {
     let peers = vec![(peer_host_id, "10.89.5.18:7000".parse().unwrap())];
     let peer_cql_broadcasts = std::collections::HashMap::new();
     let peer_internode_broadcasts = std::collections::HashMap::new();
+    // No announcement: the peer must fall back to the local dc/rack (invariant 3).
+    let peer_dcs = std::collections::HashMap::new();
+    let peer_racks = std::collections::HashMap::new();
     let num_tokens = 4;
 
     let refresh_plan = build_recovered_topology_refresh_plan(
@@ -1514,6 +1536,8 @@ fn recovered_topology_refresh_plan_repairs_tokens_for_every_voter() {
         &peers,
         &peer_cql_broadcasts,
         &peer_internode_broadcasts,
+        &peer_dcs,
+        &peer_racks,
     );
     let token_plan = build_recovered_topology_token_repair_plan(&refresh_plan, num_tokens);
 
@@ -2323,6 +2347,8 @@ async fn existing_inbound_cluster_member_with_ephemeral_source_port_does_not_que
         None,
         None,
         0,
+        None,
+        None,
     );
 
     let pending = controller.pending_joins.lock();
@@ -2454,6 +2480,8 @@ fn self_connection_does_not_advance_cluster_formation() {
         None,
         None,
         0,
+        None,
+        None,
     );
     assert_eq!(controller.mode(), DeploymentMode::Standalone);
     assert!(controller.connected_peers.lock().is_empty());
@@ -2685,7 +2713,14 @@ async fn reverse_inbound_race_does_not_promote_joiner_to_primary() {
 
     // Live 38xxx shape: the seed's reverse inbound arrives on an ephemeral
     // port before the joiner's canonical outbound `:7000` peer-connected event.
-    controller.on_inbound_peer((peer_id, "10.0.0.1:40370".parse().unwrap()), None, None, 0);
+    controller.on_inbound_peer(
+        (peer_id, "10.0.0.1:40370".parse().unwrap()),
+        None,
+        None,
+        0,
+        None,
+        None,
+    );
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(
         controller.role(),
@@ -3078,7 +3113,14 @@ async fn standalone_inbound_peer_transitions_to_pair() {
 
     // Inbound connection — should also transition, not reject.
     use ferrosa_net::rpc::InboundPeerCallback;
-    controller.on_inbound_peer((peer_id, "10.0.0.2:7000".parse().unwrap()), None, None, 0);
+    controller.on_inbound_peer(
+        (peer_id, "10.0.0.2:7000".parse().unwrap()),
+        None,
+        None,
+        0,
+        None,
+        None,
+    );
 
     assert_eq!(
         controller.mode(),
@@ -4409,7 +4451,7 @@ async fn an_inbound_peer_is_registered_in_the_raft_node_map() {
         ))));
 
     let addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
-    controller.on_inbound_peer((inbound_peer, addr), None, None, 0);
+    controller.on_inbound_peer((inbound_peer, addr), None, None, 0, None, None);
 
     let map = controller
         .raft_node_map_snapshot()

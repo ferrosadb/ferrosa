@@ -43,6 +43,7 @@ pub trait InboundPeerCallback: Send + Sync {
         internode_broadcast: Option<String>,
         capabilities: u32,
         data_center: Option<String>,
+        rack: Option<String>,
     );
 }
 
@@ -364,6 +365,7 @@ impl RpcServer {
                 peer.internode_broadcast,
                 peer.capabilities,
                 peer.data_center,
+                peer.rack,
             );
         }
 
