@@ -47,6 +47,12 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_release_workflow.py
       - name: Check CI cache workflow contract
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
+      # Pins the daily OOM-audit workflow: that it still runs on a schedule,
+      # still enforces, and still runs byte-for-byte the same command as the
+      # Clippy job's audit step below. A safety control whose nightly can be
+      # quietly weakened is not a control.
+      - name: Check OOM-audit daily workflow contract
+        run: python3 -m unittest tests.ci.test_oom_audit_daily_workflow
 
   no-memory-public:
     name: memory-public is NOT TO BE USED

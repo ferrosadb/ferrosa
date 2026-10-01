@@ -293,6 +293,196 @@ pub fn expired_allow_findings(allow: &Allowlist, today: &str) -> Vec<Finding> {
 }
 
 // ---------------------------------------------------------------------------
+// Warn-ahead: allow entries that are about to expire
+// ---------------------------------------------------------------------------
+//
+// An allow entry is silently fine until the instant it blocks every PR. On
+// 2026-10-01 nine entries dated 2026-09-30 expired at once and turned `main`
+// red on its next push — nobody saw it coming because nothing reports an entry
+// that expires in a week. `expired_allow_findings` is the FAILURE half of that
+// contract; the warnings below are the ADVISORY half.
+
+/// Default warn-ahead window: warn on an entry that expires within 21 days.
+/// Roughly a release cycle, so the owner still has time to renew or fix.
+pub const DEFAULT_WARN_WITHIN_DAYS: i64 = 21;
+
+/// Kinds of advisory warning. Kept as constants (like `rule`) so tests and
+/// consumers can't typo them.
+pub mod warning {
+    /// The entry's `expires` is a valid date inside the warn-ahead window, or
+    /// already today. Its exemption lapses soon and will then fail the gate.
+    pub const EXPIRING_ALLOW: &str = "expiring-allow-entry";
+    /// The entry's `expires` is not a valid `YYYY-MM-DD` date. Such an entry can
+    /// neither warn ahead nor (reliably) expire, so it is reported instead of
+    /// being silently skipped.
+    pub const UNPARSEABLE_ALLOW_EXPIRY: &str = "unparseable-allow-expiry";
+}
+
+/// An allow entry that needs its owner's attention soon — a WARNING, never a
+/// finding: it does not fail the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiringAllowWarning {
+    pub issue: &'static str,
+    pub path: String,
+    pub rule: String,
+    pub symbol: Option<String>,
+    pub owner: String,
+    pub expires: String,
+    /// Whole days from `today` to `expires`; `0` means "expires today".
+    /// `None` when `expires` is not a parseable date.
+    pub days_remaining: Option<i64>,
+}
+
+impl ExpiringAllowWarning {
+    /// One line naming the owner, rule, path, expiry and days remaining, so the
+    /// warning is actionable without opening the allowlist.
+    pub fn message(&self) -> String {
+        let entry = format!(
+            "allow entry for rule `{}` on `{}`{}",
+            self.rule,
+            self.path,
+            match &self.symbol {
+                Some(s) => format!(" (symbol `{s}`)"),
+                None => String::new(),
+            }
+        );
+        match self.days_remaining {
+            Some(days) => format!(
+                "{entry} expires {} in {days} day(s) (owner {}); renew the exemption or land \
+                 the fix before it fails the gate",
+                self.expires, self.owner
+            ),
+            None => format!(
+                "{entry} has expires=\"{}\", which is not a valid YYYY-MM-DD date (owner {}); \
+                 fix the date — a malformed expiry can neither warn ahead nor expire",
+                self.expires, self.owner
+            ),
+        }
+    }
+}
+
+/// Days in `month` for `year` (1-indexed month; Gregorian leap rule).
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Days since 1970-01-01 for an ISO `YYYY-MM-DD` date. Pure, no clock.
+///
+/// This is what makes the expiry comparisons calendar arithmetic rather than
+/// string comparison: `2026-9-30 < 2026-10-15` is true as strings but the
+/// dates say otherwise, and `2026-12-31` vs `2027-01-01` sorts right as a
+/// string only for zero-padded dates. Returns `None` for anything that is not
+/// exactly a real `YYYY-MM-DD` date.
+fn days_since_epoch(iso: &str) -> Option<i64> {
+    let (y, m, d) = parse_iso_date(iso)?;
+    let mut days = 0i64;
+    for year in 1970..y {
+        days += if days_in_month(year, 2) == 29 {
+            366
+        } else {
+            365
+        };
+    }
+    if y < 1970 {
+        // Dates before the epoch are not expected; count backwards exactly.
+        for year in y..1970 {
+            days -= if days_in_month(year, 2) == 29 {
+                366
+            } else {
+                365
+            };
+        }
+    }
+    for month in 1..m {
+        days += days_in_month(y, month);
+    }
+    Some(days + d - 1)
+}
+
+/// Split an ISO date into `(year, month, day)`, rejecting anything that is not
+/// a real `YYYY-MM-DD` calendar date (`2026-02-30` and `2026-13-01` included).
+fn parse_iso_date(iso: &str) -> Option<(i64, i64, i64)> {
+    let parts: Vec<&str> = iso.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let (ys, ms, ds) = (parts[0], parts[1], parts[2]);
+    if ys.len() != 4 || ms.len() != 2 || ds.len() != 2 {
+        return None;
+    }
+    if !ys.bytes().all(|b| b.is_ascii_digit())
+        || !ms.bytes().all(|b| b.is_ascii_digit())
+        || !ds.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let (y, m, d) = (ys.parse().ok()?, ms.parse().ok()?, ds.parse().ok()?);
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// Warnings for allow entries that need attention: those expiring within
+/// `within_days` (INCLUSIVE — an entry expiring exactly `within_days` from
+/// `today` warns, as does one expiring today), plus entries whose `expires` is
+/// not a valid date.
+///
+/// Already-expired entries are deliberately NOT warned about: they are findings
+/// (`expired_allow_findings`) and fail the gate. Pass `within_days = 0` to warn
+/// only about entries expiring today, or `DEFAULT_WARN_WITHIN_DAYS` for the
+/// standard window.
+///
+/// Ordering follows the allowlist, so the output is stable and diffable.
+pub fn expiring_allow_warnings(
+    allow: &Allowlist,
+    today: &str,
+    within_days: i64,
+) -> Vec<ExpiringAllowWarning> {
+    let today_days = days_since_epoch(today);
+    allow
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let warn = |days_remaining: Option<i64>| ExpiringAllowWarning {
+                issue: if days_remaining.is_some() {
+                    warning::EXPIRING_ALLOW
+                } else {
+                    warning::UNPARSEABLE_ALLOW_EXPIRY
+                },
+                path: e.path.clone(),
+                rule: e.rule.clone(),
+                symbol: e.symbol.clone(),
+                owner: e.owner.clone(),
+                expires: e.expires.clone(),
+                days_remaining,
+            };
+            let expiry_days = days_since_epoch(&e.expires);
+            match (expiry_days, today_days) {
+                // A malformed expiry is reported even when `today` is garbage:
+                // the entry is the thing that is broken.
+                (None, _) => Some(warn(None)),
+                (Some(expiry), Some(today)) => {
+                    let days_remaining = expiry - today;
+                    (0..=within_days.max(0))
+                        .contains(&days_remaining)
+                        .then(|| warn(Some(days_remaining)))
+                }
+                // Unparseable "today" cannot place the window; the entry is
+                // nevertheless fine, so report nothing rather than guessing.
+                (Some(_), None) => None,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Type / call shape helpers (pure)
 // ---------------------------------------------------------------------------
 
@@ -2490,5 +2680,380 @@ mod tests {
             !f.iter().any(|x| x.rule == rule::COPY_DERIVE_LARGE_TYPE),
             "small Copy types and non-Copy big types must not fire: {f:?}"
         );
+    }
+
+    // -- Warn-ahead: entries about to expire --------------------------------
+    //
+    // The failure half (`expired_allow_findings`) already exists. These cover
+    // the advisory half: an entry is silently fine until the instant it blocks
+    // every PR, so entries inside the window must be reported loudly and early.
+
+    /// An allowlist entry with every field explicit, so a test can vary one.
+    fn entry(path: &str, rule_name: &str, owner: &str, expires: &str) -> AllowEntry {
+        AllowEntry {
+            path: path.to_string(),
+            rule: rule_name.to_string(),
+            symbol: None,
+            reason: "test".to_string(),
+            owner: owner.to_string(),
+            expires: expires.to_string(),
+        }
+    }
+
+    fn allow_of(entries: Vec<AllowEntry>) -> Allowlist {
+        Allowlist { entries }
+    }
+
+    #[test]
+    fn entry_expiring_inside_the_window_is_warned_about() {
+        let allow = allow_of(vec![entry(
+            "ferrosa-cluster/src/write_path.rs",
+            "returns-vec-partition-or-row",
+            "storage",
+            "2026-10-10",
+        )]);
+        let w = expiring_allow_warnings(&allow, "2026-09-30", 21);
+        assert_eq!(w.len(), 1, "an entry 10 days out must warn: {w:?}");
+        assert_eq!(w[0].issue, warning::EXPIRING_ALLOW);
+        assert_eq!(w[0].path, "ferrosa-cluster/src/write_path.rs");
+        assert_eq!(w[0].rule, "returns-vec-partition-or-row");
+        assert_eq!(w[0].owner, "storage");
+        assert_eq!(w[0].expires, "2026-10-10");
+        assert_eq!(w[0].days_remaining, Some(10));
+    }
+
+    /// The window bound is INCLUSIVE: an entry expiring exactly `within_days`
+    /// out warns, one day past it does not. Off-by-one here means the last
+    /// chance to react is missed.
+    #[test]
+    fn warn_window_boundary_is_inclusive() {
+        let allow = allow_of(vec![
+            entry("a.rs", "r", "o", "2026-10-21"), // exactly 21 days out
+            entry("b.rs", "r", "o", "2026-10-22"), // 22 days out
+        ]);
+        let w = expiring_allow_warnings(&allow, "2026-09-30", 21);
+        assert_eq!(w.len(), 1, "only the entry AT the window warns: {w:?}");
+        assert_eq!(w[0].path, "a.rs");
+        assert_eq!(w[0].days_remaining, Some(21));
+    }
+
+    /// An entry expiring TODAY still has not expired, so it is a warning now
+    /// and a failure tomorrow — never both at once.
+    #[test]
+    fn entry_expiring_today_warns_with_zero_days_remaining() {
+        let allow = allow_of(vec![entry("a.rs", "r", "o", "2026-09-30")]);
+        let w = expiring_allow_warnings(&allow, "2026-09-30", 21);
+        assert_eq!(w.len(), 1, "the last day must warn: {w:?}");
+        assert_eq!(w[0].days_remaining, Some(0));
+        assert!(
+            expired_allow_findings(&allow, "2026-09-30").is_empty(),
+            "an entry expiring today is not yet expired"
+        );
+    }
+
+    /// An entry that is already expired is a FINDING, not a warning. Reporting
+    /// it as a warning too would let a reader think the gate tolerates it.
+    #[test]
+    fn already_expired_entry_is_not_also_a_warning() {
+        let allow = allow_of(vec![entry("a.rs", "r", "o", "2026-09-29")]);
+        assert_eq!(
+            expired_allow_findings(&allow, "2026-09-30").len(),
+            1,
+            "the past-dated entry is a finding"
+        );
+        assert!(
+            expiring_allow_warnings(&allow, "2026-09-30", 21).is_empty(),
+            "an expired entry must not ALSO warn — it already fails the gate"
+        );
+    }
+
+    #[test]
+    fn far_future_entry_does_not_warn() {
+        let allow = allow_of(vec![entry("a.rs", "r", "o", "2027-07-01")]);
+        assert!(
+            expiring_allow_warnings(&allow, "2026-09-30", 21).is_empty(),
+            "an entry a year out is not news"
+        );
+    }
+
+    /// The window is tunable, not baked in: `within_days = 0` warns only about
+    /// today, and widening it catches the same entry.
+    #[test]
+    fn warn_window_is_tunable() {
+        let allow = allow_of(vec![entry("a.rs", "r", "o", "2026-10-10")]);
+        assert!(
+            expiring_allow_warnings(&allow, "2026-09-30", 0).is_empty(),
+            "a 10-day-out entry is outside a same-day-only window"
+        );
+        assert_eq!(
+            expiring_allow_warnings(&allow, "2026-09-30", 30).len(),
+            1,
+            "a 30-day window must catch it"
+        );
+    }
+
+    /// Every warnable entry is reported, in allowlist order, one line each —
+    /// this is what lets a single run say "these nine are about to ambush you".
+    #[test]
+    fn every_entry_inside_the_window_is_warned_in_allowlist_order() {
+        let allow = allow_of(vec![
+            entry("third.rs", "r", "o", "2026-12-31"),
+            entry("first.rs", "r", "o", "2026-10-05"),
+            entry("second.rs", "r", "o", "2026-10-20"),
+        ]);
+        let w = expiring_allow_warnings(&allow, "2026-09-30", 21);
+        let paths: Vec<&str> = w.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["first.rs", "second.rs"],
+            "all in-window entries, in allowlist order: {w:?}"
+        );
+        assert_eq!(w[0].days_remaining, Some(5));
+        assert_eq!(w[1].days_remaining, Some(20));
+    }
+
+    /// Warning message names owner/rule/path/expiry/days remaining.
+    #[test]
+    fn warning_message_names_owner_rule_path_expiry_and_days_remaining() {
+        let allow = allow_of(vec![entry(
+            "ferrosa-cluster/src/write_path.rs",
+            "returns-vec-partition-or-row",
+            "storage",
+            "2026-10-10",
+        )]);
+        let w = expiring_allow_warnings(&allow, "2026-09-30", 21);
+        let msg = w[0].message();
+        for needle in [
+            "storage",
+            "returns-vec-partition-or-row",
+            "ferrosa-cluster/src/write_path.rs",
+            "2026-10-10",
+            "10",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "warning message must name `{needle}`: {msg}"
+            );
+        }
+    }
+
+    // =======================================================================
+    // INVARIANTS — the audit is a SAFETY CONTROL, so warn-ahead must be a pure
+    // addition. Weakening the gate is worse than never having had it.
+    // =======================================================================
+
+    /// The real shipped allowlist, loaded from the repo (not a fixture).
+    fn shipped_allow() -> Allowlist {
+        let path = repo_root().join("specs/p0-oom-guard/oom-audit-allow.toml");
+        Allowlist::load(&path).expect("the shipped allowlist parses")
+    }
+
+    /// INVARIANT (b): the expiry semantics are UNCHANGED — an entry dated
+    /// yesterday still fails today, and it is reported as a failure only.
+    #[test]
+    fn invariant_entry_dated_yesterday_still_fails_and_is_not_a_warning() {
+        let allow = allow_of(vec![entry("a.rs", "r", "o", "2026-09-30")]);
+        let today = "2026-10-01"; // the day after the entry lapses
+        let expired = expired_allow_findings(&allow, today);
+        assert_eq!(
+            expired.len(),
+            1,
+            "an entry dated yesterday must still be a finding: {expired:?}"
+        );
+        assert_eq!(expired[0].rule, rule::EXPIRED_ALLOW);
+        assert!(
+            expiring_allow_warnings(&allow, today, 21).is_empty(),
+            "an expired entry must not be downgraded to a warning"
+        );
+    }
+
+    /// INVARIANT (a): warn-ahead output never suppresses a finding. Findings are
+    /// computed independently of warnings, so a warning-heavy run is still a
+    /// failing run when a finding exists.
+    #[test]
+    fn invariant_warnings_never_suppress_or_excuse_a_finding() {
+        let allow = allow_of(vec![
+            entry("expiring.rs", "r", "o", "2026-10-10"), // in the window
+            entry("expired.rs", "r", "o", "2026-09-01"),  // a finding
+        ]);
+        let findings = expired_allow_findings(&allow, "2026-09-30");
+        assert_eq!(findings.len(), 1, "exactly the expired entry fails");
+        assert_eq!(findings[0].path, "expired.rs");
+        assert_eq!(
+            expiring_allow_warnings(&allow, "2026-09-30", 21).len(),
+            1,
+            "the same allowlist also yields a warning for the other entry"
+        );
+        // The wider the window, the more warnings — and still one finding.
+        for window in [0, 21, 3650] {
+            assert_eq!(
+                expired_allow_findings(&allow, "2026-09-30").len(),
+                1,
+                "window {window} must not change the finding set"
+            );
+            let _ = expiring_allow_warnings(&allow, "2026-09-30", window);
+        }
+    }
+
+    /// INVARIANT (b), over the REAL allowlist: every shipped `expires` is a real
+    /// zero-padded ISO date. This is what makes the gate's lexicographic compare
+    /// (`e.expires.as_str() < today`) sound; a single malformed date would make
+    /// an entry immortal (`2026-9-30` > any ISO date as a string).
+    #[test]
+    fn invariant_every_shipped_allow_expiry_is_a_real_iso_date() {
+        let allow = shipped_allow();
+        assert!(
+            allow.entries.len() > 100,
+            "sanity: the shipped allowlist should not have shrunk to {} entries",
+            allow.entries.len()
+        );
+        for e in &allow.entries {
+            assert!(
+                parse_iso_date(&e.expires).is_some(),
+                "allow entry for `{}` on `{}` has expires=\"{}\", which is not a \
+                 valid YYYY-MM-DD date; the date-based gate cannot be trusted for it",
+                e.rule,
+                e.path,
+                e.expires
+            );
+        }
+    }
+
+    /// INVARIANT (f): the gate's lexicographic expiry compare must agree with a
+    /// real calendar compare on EVERY shipped entry, at every probe date that
+    /// matters. If this ever fails, the gate is either hardening candidate or
+    /// already wrong — either way it must be known, not assumed.
+    #[test]
+    fn invariant_lexicographic_expiry_compare_agrees_with_calendar_compare() {
+        let allow = shipped_allow();
+        // Every expiry value in the shipped file, plus the boundaries around
+        // them, so the comparison is exercised on both sides of each date.
+        let mut probes: Vec<String> = allow.entries.iter().map(|e| e.expires.clone()).collect();
+        probes.extend(
+            [
+                "2026-09-29",
+                "2026-09-30",
+                "2026-10-01",
+                "2026-10-02",
+                "2026-12-30",
+                "2026-12-31",
+                "2027-01-01",
+                "2027-06-30",
+                "2027-07-01",
+                "2027-07-02",
+                "2099-01-01",
+            ]
+            .iter()
+            .map(|s| (*s).to_string()),
+        );
+        probes.sort();
+        probes.dedup();
+
+        let mut checked = 0;
+        for probe in &probes {
+            let Some(probe_days) = days_since_epoch(probe) else {
+                panic!("probe `{probe}` must itself be a real ISO date");
+            };
+            for e in &allow.entries {
+                let lexical = e.expires.as_str() < probe.as_str();
+                let calendar =
+                    days_since_epoch(&e.expires).expect("shipped expiry is ISO") < probe_days;
+                assert_eq!(
+                    lexical, calendar,
+                    "the string compare and the calendar compare disagree for \
+                     expires=\"{}\" vs today=\"{probe}\": the lexicographic gate \
+                     would take the wrong branch",
+                    e.expires
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 1000,
+            "sanity: expected a real cross-product of entries x probes, got {checked}"
+        );
+    }
+
+    /// INVARIANT (d): warn-ahead is additive — nothing about the pre-existing
+    /// expiry failure contract changed. This is the historical test's exact
+    /// expectation, restated beside the new behaviour so a future edit to the
+    /// warn path cannot quietly move it.
+    #[test]
+    fn invariant_expired_entry_detection_is_unchanged() {
+        let allow = shipped_allow();
+        // Every entry is in the future relative to a date before the earliest
+        // expiry in the file, so a clean run reports no expired entries.
+        let none_expired = expired_allow_findings(&allow, "2020-01-01");
+        assert!(
+            none_expired.is_empty(),
+            "no entry is expired in 2020: {none_expired:?}"
+        );
+        // Far in the future, every entry is expired — all of them, not a subset.
+        let all_expired = expired_allow_findings(&allow, "2099-01-01");
+        assert_eq!(
+            all_expired.len(),
+            allow.entries.len(),
+            "every shipped entry must expire exactly once"
+        );
+        assert!(all_expired.iter().all(|f| f.rule == rule::EXPIRED_ALLOW));
+    }
+
+    /// A malformed `expires` is a latent hole in the whole expiry contract: it
+    /// cannot warn ahead, and the lexicographic expiry compare can only be
+    /// trusted for ISO dates. Report it instead of silently ignoring it.
+    #[test]
+    fn unparseable_expiry_is_reported_not_silently_skipped() {
+        let allow = allow_of(vec![entry("a.rs", "r", "o", "2026-9-30")]);
+        assert!(
+            expired_allow_findings(&allow, "2026-10-15").is_empty(),
+            "sanity: a non-ISO date compares as \"after\" ISO dates, so it \
+             never expires — which is exactly why it must be reported"
+        );
+        let w = expiring_allow_warnings(&allow, "2026-09-30", 21);
+        assert_eq!(w.len(), 1, "the malformed date must be reported: {w:?}");
+        assert_eq!(w[0].issue, warning::UNPARSEABLE_ALLOW_EXPIRY);
+        assert_eq!(w[0].days_remaining, None);
+        assert!(
+            w[0].message().contains("2026-9-30"),
+            "the message must quote the offending value: {}",
+            w[0].message()
+        );
+    }
+
+    /// Calendar arithmetic, not string arithmetic: the window crosses month,
+    /// year and leap-day boundaries correctly.
+    #[test]
+    fn days_remaining_counts_calendar_days_across_month_boundaries() {
+        let allow = allow_of(vec![
+            entry("month_end.rs", "r", "o", "2026-10-01"),
+            entry("year_end.rs", "r", "o", "2027-01-05"),
+        ]);
+
+        // Month boundary: 2026-09-30 -> 2026-10-01 is 1 day.
+        let w = expiring_allow_warnings(&allow, "2026-09-30", 21);
+        assert_eq!(w.len(), 1, "only the 1-day-out entry is inside 21 days");
+        assert_eq!(w[0].path, "month_end.rs");
+        assert_eq!(w[0].days_remaining, Some(1));
+
+        // Year boundary: 2026-12-20 -> 2027-01-05 is 16 days, the same span
+        // lexicographic comparison would get wrong (`2027-...` > `2026-...` is
+        // right as a string here, but the day arithmetic is what is asserted).
+        let w = expiring_allow_warnings(&allow, "2026-12-20", 21);
+        assert_eq!(w.len(), 1, "the year-end entry is 16 days out: {w:?}");
+        assert_eq!(w[0].path, "year_end.rs");
+        assert_eq!(w[0].days_remaining, Some(16));
+
+        // Leap day: 2028-02-25 -> 2028-03-01 spans 29 Feb, so 5 days.
+        let leap = allow_of(vec![
+            entry("leap.rs", "r", "o", "2028-03-01"),
+            entry("expired.rs", "r", "o", "2026-10-01"),
+        ]);
+        let w = expiring_allow_warnings(&leap, "2028-02-25", 366);
+        assert_eq!(
+            w.len(),
+            1,
+            "the 2026 entry has long expired so only the leap entry warns: {w:?}"
+        );
+        assert_eq!(w[0].days_remaining, Some(5));
     }
 }
