@@ -557,16 +557,30 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `ferrosa_commitlog_replay_set_aside_pending_mutations` gauge, and `/readyz`
   (503, `waiting_for: "set_aside_mutations"`). Set-aside mutations are durable
   but NOT visible to reads until re-ingested.
-- **Set-aside re-ingest** (`replay_set_aside.rs`, `StorageEngine::adopt_set_aside_files`)
-  — every constructor (`new`, `new_with_archive_store`, `open`) finds
-  `*.unreplayed` files, and each table registration (startup local schema, the
+- **Set-aside re-ingest** (`replay_set_aside.rs`, `StorageEngine::finish_construction`)
+  — every constructor finds `*.unreplayed` files: `StorageEngine` holds a
+  `SetAsideLedger` whose only constructor scans the data dir, so a constructor
+  cannot build the struct without adopting (and ends with `finish_construction`,
+  which re-ingests tables registered before the engine existed, as `open`'s are).
+  `every_public_constructor_adopts_a_pre_existing_set_aside_file` lists them all.
+  Each table registration (startup local schema, the
   `open` schema, or DDL) re-ingests that table's frames. Frames stream one at a
   time; each is applied through a strict path (a failed row aborts the file and
   keeps it whole), the touched tables are flushed to SSTables, and only then
   does the file shrink: frames for tables still unknown are copied to
   `<file>.partial`, which atomically replaces the file, and a fully applied file
   is removed. A crash at any point leaves the original, and re-applying a frame
-  rewrites identical cells, so a repeat adds no rows. A torn or corrupt file is
+  rewrites identical cells, so a repeat adds no rows. Frames of a table that
+  was DROPPED after they were written are never applied to a re-created table of
+  the same name: `unregister_table` durably records each drop in
+  `<data_dir>/dropped-tables.json` (`table_drops.rs`; a drop that cannot be
+  recorded is refused), and a file created at or before a table's drop holds only
+  earlier-incarnation frames. Those are copied (fsynced) to
+  `<data_dir>/commitlog-quarantine/<file>.stale`, logged at ERROR, counted in
+  `replay_set_aside_stale_frames_total`, and only then leave the set-aside file.
+  The engine has no stable table id (the registry's UUID never reaches storage),
+  so a file created AFTER the drop that still holds pre-drop frames is not
+  detected. A torn or corrupt file is
   never skipped or partly applied: it is reported (ERROR, `/readyz`
   `unreadable_files`) and kept for the operator. Offline route:
   `ferrosa-ctl commitlog set-aside <data-dir> [--apply]`

@@ -61,6 +61,19 @@ pub fn replay_set_aside_mutations_total() -> u64 {
     SET_ASIDE_MUTATIONS_TOTAL.load(Ordering::Relaxed)
 }
 
+static SET_ASIDE_STALE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of set-aside frames withheld from a table because they
+/// predate its current incarnation (they sit in the quarantine directory).
+pub fn replay_set_aside_stale_frames_total() -> u64 {
+    SET_ASIDE_STALE_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Counts one frame quarantined as stale.
+pub fn count_stale_frame() {
+    SET_ASIDE_STALE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 static SET_ASIDE_PENDING: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide count of set-aside mutations not yet re-ingested. Unlike the
@@ -331,6 +344,61 @@ impl SetAsideStatus {
     }
 }
 
+/// The engine's record of what is set aside.
+///
+/// This is the one place the engine learns about set-aside files, and it is
+/// the enforcement point for adoption: `StorageEngine` holds one as a field, it
+/// has no `Default`, and [`adopt`](Self::adopt) is its only constructor. A
+/// constructor of `StorageEngine` cannot build the struct without scanning the
+/// data directory, so a future constructor that forgets set-aside files does
+/// not compile, rather than quietly serving empty tables (the failure mode of
+/// PR #468's evicted-SSTable restore, which was wired into `new` but not `open`).
+#[derive(Debug)]
+pub struct SetAsideLedger {
+    status: parking_lot::Mutex<SetAsideStatus>,
+}
+
+impl SetAsideLedger {
+    /// Scans `data_dir`, reports what is set aside (ERROR per unreadable file,
+    /// ERROR for the pending total), and publishes the pending-mutations gauge.
+    pub fn adopt(data_dir: &Path) -> Result<Self> {
+        let status = scan_set_aside_dir(data_dir)?;
+        for file in status.unreadable() {
+            tracing::error!(
+                path = %file.path.display(),
+                error = file.error.as_deref().unwrap_or_default(),
+                "set-aside file cannot be read to its end; it is kept untouched and its \
+                 mutations are NOT re-ingested. Inspect it with \
+                 `ferrosa-ctl commitlog set-aside`"
+            );
+        }
+        if !status.is_empty() {
+            tracing::error!(
+                files = status.files.len(),
+                mutations = status.mutations(),
+                tables = ?status.tables(),
+                "mutations are set aside on disk and invisible to reads until their table \
+                 schema is registered; /readyz reports this node as not ready"
+            );
+        }
+        set_replay_set_aside_pending_mutations(status.mutations());
+        Ok(Self {
+            status: parking_lot::Mutex::new(status),
+        })
+    }
+
+    /// The current status, locked for the caller.
+    pub fn lock(&self) -> parking_lot::MutexGuard<'_, SetAsideStatus> {
+        self.status.lock()
+    }
+
+    /// Replaces the status and the pending gauge together.
+    pub fn publish(&self, status: SetAsideStatus) {
+        set_replay_set_aside_pending_mutations(status.mutations());
+        *self.status.lock() = status;
+    }
+}
+
 /// Counts what a file holds by streaming it. A torn or corrupt frame is
 /// recorded in `error`; the frames before it are still counted.
 pub fn summarize_set_aside_file(path: &Path) -> SetAsideFileStatus {
@@ -392,11 +460,42 @@ pub fn scan_set_aside_dir(data_dir: &Path) -> Result<SetAsideStatus> {
     Ok(SetAsideStatus { files })
 }
 
+/// What a [`SetAsideSink`] decided for one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameFate {
+    /// Applied to a table; the frame leaves the file once the table is durable.
+    Applied,
+    /// Stays in the file (its schema is still unknown, or the run is scoped to
+    /// another table).
+    Keep,
+    /// Belongs to a previous incarnation of its table. It is NOT applied; it
+    /// is copied to the quarantine file and leaves the set-aside file only once
+    /// that copy is durable. Never dropped, never applied.
+    Stale,
+}
+
+/// Directory under the data dir that holds frames withheld as stale.
+pub const STALE_QUARANTINE_DIR: &str = "commitlog-quarantine";
+
+/// Where the stale frames of the set-aside file at `path` are quarantined:
+/// `<data_dir>/commitlog-quarantine/<file name>.stale`.
+pub fn stale_quarantine_path(path: &Path) -> Result<PathBuf> {
+    let data_dir = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Error::InvalidData(format!("{} has no data dir", path.display())))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::InvalidData(format!("{} has no file name", path.display())))?;
+    let mut file = name.to_os_string();
+    file.push(".stale");
+    Ok(data_dir.join(STALE_QUARANTINE_DIR).join(file))
+}
+
 /// Receives frames during [`reingest_file`].
 pub trait SetAsideSink {
-    /// Applies one mutation. `Ok(true)` once applied, `Ok(false)` to keep it in
-    /// the file (its schema is still unknown).
-    fn apply(&mut self, index: usize, mutation: &Mutation) -> Result<bool>;
+    /// Decides one mutation's fate.
+    fn apply(&mut self, index: usize, mutation: &Mutation) -> Result<FrameFate>;
     /// Makes everything applied so far durable.
     fn make_durable(&mut self) -> Result<()>;
 }
@@ -407,7 +506,17 @@ pub struct FileOutcome {
     pub applied: u64,
     pub kept: u64,
     pub kept_tables: BTreeMap<String, u64>,
+    /// Frames of a previous table incarnation, moved to the quarantine file.
+    pub stale: u64,
+    pub stale_tables: BTreeMap<String, u64>,
     pub removed: bool,
+}
+
+impl FileOutcome {
+    /// Frames that left the file, applied or quarantined.
+    pub fn departed(&self) -> u64 {
+        self.applied + self.stale
+    }
 }
 
 /// Applied frames between `make_durable` calls, so a huge file does not pile
@@ -431,74 +540,126 @@ fn sync_dir(dir: &Path) -> Result<()> {
 /// and keeps the file.
 pub fn reingest_file(path: &Path, sink: &mut dyn SetAsideSink) -> Result<FileOutcome> {
     let mut reader = SetAsideReader::open(path)?;
-    let partial = path.with_extension("partial");
-    let mut kept_writer: Option<BufWriter<File>> = None;
-    let mut outcome = FileOutcome::default();
+    let mut run = ReingestRun {
+        partial: path.with_extension("partial"),
+        kept_writer: None,
+        stale_writer: None,
+        outcome: FileOutcome::default(),
+    };
     let mut since_durable = 0u64;
     let mut index = 0usize;
     while let Some(frame) = reader.next_frame()? {
-        if sink.apply(index, &frame.mutation)? {
-            outcome.applied += 1;
-            since_durable += 1;
-            if since_durable >= DURABLE_EVERY {
-                sink.make_durable()?;
-                since_durable = 0;
+        match sink.apply(index, &frame.mutation)? {
+            FrameFate::Applied => {
+                run.outcome.applied += 1;
+                since_durable += 1;
+                if since_durable >= DURABLE_EVERY {
+                    sink.make_durable()?;
+                    since_durable = 0;
+                }
             }
-        } else {
-            if kept_writer.is_none() {
-                kept_writer = Some(BufWriter::new(File::create(&partial)?));
-            }
-            if let Some(writer) = kept_writer.as_mut() {
-                writer.write_all(&frame.raw)?;
-            }
-            outcome.kept += 1;
-            *outcome
-                .kept_tables
-                .entry(table_key(&frame.mutation))
-                .or_insert(0) += 1;
+            FrameFate::Keep => run.keep(&frame)?,
+            FrameFate::Stale => run.quarantine(path, &frame)?,
         }
         index += 1;
     }
-    finish_file(path, &partial, kept_writer, sink, &mut outcome)?;
-    Ok(outcome)
+    finish_file(path, run, sink)
+}
+
+/// The two side files a re-ingest run may write, and its tally.
+struct ReingestRun {
+    partial: PathBuf,
+    kept_writer: Option<BufWriter<File>>,
+    stale_writer: Option<(BufWriter<File>, PathBuf)>,
+    outcome: FileOutcome,
+}
+
+impl ReingestRun {
+    fn keep(&mut self, frame: &SetAsideFrame) -> Result<()> {
+        if self.kept_writer.is_none() {
+            self.kept_writer = Some(BufWriter::new(File::create(&self.partial)?));
+        }
+        if let Some(writer) = self.kept_writer.as_mut() {
+            writer.write_all(&frame.raw)?;
+        }
+        self.outcome.kept += 1;
+        *self
+            .outcome
+            .kept_tables
+            .entry(table_key(&frame.mutation))
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Appends the frame to the quarantine file. Appending (not truncating)
+    /// keeps frames an earlier run already moved there; a rerun after a crash
+    /// may repeat a frame, which is harmless for a file an operator reads.
+    fn quarantine(&mut self, source: &Path, frame: &SetAsideFrame) -> Result<()> {
+        if self.stale_writer.is_none() {
+            let target = stale_quarantine_path(source)?;
+            if let Some(dir) = target.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let file = OpenOptions::new().create(true).append(true).open(&target)?;
+            self.stale_writer = Some((BufWriter::new(file), target));
+        }
+        if let Some((writer, _)) = self.stale_writer.as_mut() {
+            writer.write_all(&frame.raw)?;
+        }
+        self.outcome.stale += 1;
+        *self
+            .outcome
+            .stale_tables
+            .entry(table_key(&frame.mutation))
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Flushes and fsyncs the quarantine file and its directory. Must complete
+    /// before any stale frame leaves the set-aside file.
+    fn make_quarantine_durable(&mut self) -> Result<()> {
+        if let Some((writer, target)) = self.stale_writer.take() {
+            let file = writer.into_inner().map_err(|e| e.into_error())?;
+            file.sync_all()?;
+            if let Some(dir) = target.parent() {
+                sync_dir(dir)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn finish_file(
     path: &Path,
-    partial: &Path,
-    kept_writer: Option<BufWriter<File>>,
+    mut run: ReingestRun,
     sink: &mut dyn SetAsideSink,
-    outcome: &mut FileOutcome,
-) -> Result<()> {
-    let discard_partial = |writer: Option<BufWriter<File>>| -> Result<()> {
-        if writer.is_some() {
-            drop(writer);
-            std::fs::remove_file(partial)?;
-        }
-        Ok(())
-    };
-    if outcome.applied == 0 {
+) -> Result<FileOutcome> {
+    if run.outcome.departed() == 0 {
         // Nothing changed; the original stays byte for byte.
-        return discard_partial(kept_writer);
+        if run.kept_writer.take().is_some() {
+            std::fs::remove_file(&run.partial)?;
+        }
+        return Ok(run.outcome);
     }
     sink.make_durable()?;
+    run.make_quarantine_durable()?;
     let dir = path.parent().ok_or_else(|| {
         Error::InvalidData(format!("set-aside file {} has no parent", path.display()))
     })?;
-    match kept_writer {
+    match run.kept_writer.take() {
         None => {
             std::fs::remove_file(path)?;
             sync_dir(dir)?;
-            outcome.removed = true;
+            run.outcome.removed = true;
         }
         Some(writer) => {
             let file = writer.into_inner().map_err(|e| e.into_error())?;
             file.sync_all()?;
-            std::fs::rename(partial, path)?;
+            std::fs::rename(&run.partial, path)?;
             sync_dir(dir)?;
         }
     }
-    Ok(())
+    Ok(run.outcome)
 }
 
 #[cfg(test)]
@@ -562,6 +723,7 @@ mod tests {
     /// Applies only the tables in `known`; can be told to fail at a frame.
     struct RecordingSink {
         known: Vec<String>,
+        stale: Vec<String>,
         durable_calls: usize,
         fail_at: Option<usize>,
     }
@@ -570,6 +732,7 @@ mod tests {
         fn new(known: &[&str]) -> Self {
             Self {
                 known: known.iter().map(|s| (*s).to_string()).collect(),
+                stale: Vec::new(),
                 durable_calls: 0,
                 fail_at: None,
             }
@@ -577,11 +740,18 @@ mod tests {
     }
 
     impl SetAsideSink for RecordingSink {
-        fn apply(&mut self, index: usize, m: &Mutation) -> Result<bool> {
+        fn apply(&mut self, index: usize, m: &Mutation) -> Result<FrameFate> {
             if self.fail_at == Some(index) {
                 return Err(Error::InvalidData("injected".into()));
             }
-            Ok(self.known.contains(&m.table))
+            if self.stale.contains(&m.table) {
+                return Ok(FrameFate::Stale);
+            }
+            Ok(if self.known.contains(&m.table) {
+                FrameFate::Applied
+            } else {
+                FrameFate::Keep
+            })
         }
         fn make_durable(&mut self) -> Result<()> {
             self.durable_calls += 1;
@@ -743,5 +913,66 @@ mod tests {
             .to_string();
         assert!(err.contains("torn frame"), "got: {err}");
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn stale_frames_move_to_quarantine_and_leave_the_file_only_after_it_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = aside_file(
+            dir.path(),
+            &[
+                mutation("a", "k1"),
+                mutation("old", "k2"),
+                mutation("a", "k3"),
+                mutation("old", "k4"),
+            ],
+        );
+        let mut sink = RecordingSink::new(&["a"]);
+        sink.stale.push("old".into());
+        let outcome = reingest_file(&path, &mut sink).unwrap();
+        assert_eq!(outcome.applied, 2);
+        assert_eq!(outcome.stale, 2);
+        assert_eq!(outcome.stale_tables.get("ks.old"), Some(&2));
+        assert!(outcome.removed, "every frame left: applied or quarantined");
+        assert!(!path.exists());
+
+        let quarantine = stale_quarantine_path(&path).unwrap();
+        let held = read_set_aside_file(&quarantine).unwrap();
+        assert_eq!(held.len(), 2, "stale frames are kept, never dropped");
+        assert!(held.iter().all(|m| m.table == "old"));
+    }
+
+    #[test]
+    fn a_file_of_only_stale_frames_is_quarantined_even_with_nothing_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = aside_file(dir.path(), &[mutation("old", "k1")]);
+        let mut sink = RecordingSink::new(&[]);
+        sink.stale.push("old".into());
+        let outcome = reingest_file(&path, &mut sink).unwrap();
+        assert_eq!((outcome.applied, outcome.stale), (0, 1));
+        assert!(!path.exists());
+        assert_eq!(
+            read_set_aside_file(&stale_quarantine_path(&path).unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn quarantined_frames_accumulate_across_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = aside_file(dir.path(), &[mutation("old", "k1")]);
+        let quarantine = stale_quarantine_path(&path).unwrap();
+        let mut sink = RecordingSink::new(&[]);
+        sink.stale.push("old".into());
+        reingest_file(&path, &mut sink).unwrap();
+        // A later file under the same name: the quarantine path follows the name.
+        let second = aside_file(dir.path(), &[mutation("old", "k2")]);
+        if second != path {
+            std::fs::rename(&second, &path).unwrap();
+        }
+        reingest_file(&path, &mut sink).unwrap();
+        assert_eq!(read_set_aside_file(&quarantine).unwrap().len(), 2);
     }
 }

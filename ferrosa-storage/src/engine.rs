@@ -604,10 +604,79 @@ struct EngineSetAsideSink<'a> {
     only: Option<&'a TableId>,
     touched: std::collections::HashSet<TableId>,
     faults: SetAsideFaults,
+    /// When the file was created: an upper bound on when each frame was written.
+    /// `None` when the file name carries no time.
+    file_created_ms: Option<u64>,
+    /// Latest recorded drop of each table name.
+    drops: crate::table_drops::DropLedger,
+    /// Tables already reported, so a table logs once per file, not per frame.
+    reported: std::collections::HashSet<TableId>,
+}
+
+impl<'a> EngineSetAsideSink<'a> {
+    fn new(
+        engine: &'a StorageEngine,
+        path: &Path,
+        only: Option<&'a TableId>,
+        faults: SetAsideFaults,
+    ) -> ferrosa_common::Result<Self> {
+        Ok(Self {
+            engine,
+            only,
+            touched: std::collections::HashSet::new(),
+            faults,
+            file_created_ms: crate::table_drops::set_aside_file_created_millis(path),
+            drops: crate::table_drops::load(&engine.config.data_dir)?,
+            reported: std::collections::HashSet::new(),
+        })
+    }
+
+    /// The drop time that proves this frame predates its table's current
+    /// incarnation: the table was dropped at or after the file was created, so
+    /// the frame was written before the drop.
+    fn dropped_after_written(&mut self, table_id: &TableId) -> Option<u64> {
+        let dropped = *self.drops.get(&crate::table_drops::ledger_key(
+            table_id.keyspace(),
+            table_id.table(),
+        ))?;
+        let Some(created) = self.file_created_ms else {
+            if self.reported.insert(table_id.clone()) {
+                tracing::warn!(
+                    table = %table_id,
+                    dropped_at_ms = dropped,
+                    "set-aside file name carries no creation time, so frames cannot be \
+                     compared with this table's recorded drop; applying them"
+                );
+            }
+            return None;
+        };
+        (created <= dropped).then_some(dropped)
+    }
+
+    fn report_stale(&mut self, table_id: &TableId, dropped_ms: u64) {
+        crate::replay_set_aside::count_stale_frame();
+        if !self.reported.insert(table_id.clone()) {
+            return;
+        }
+        tracing::error!(
+            table = %table_id,
+            frames_written_before_ms = self.file_created_ms,
+            live_table_dropped_at_ms = dropped_ms,
+            quarantine_dir = crate::replay_set_aside::STALE_QUARANTINE_DIR,
+            "set-aside frames belong to a previous table of this name (it was dropped \
+             after they were written) and are NOT applied to the live table; they are \
+             kept in the quarantine directory for an operator, and are not lost"
+        );
+    }
 }
 
 impl crate::replay_set_aside::SetAsideSink for EngineSetAsideSink<'_> {
-    fn apply(&mut self, index: usize, mutation: &Mutation) -> ferrosa_common::Result<bool> {
+    fn apply(
+        &mut self,
+        index: usize,
+        mutation: &Mutation,
+    ) -> ferrosa_common::Result<crate::replay_set_aside::FrameFate> {
+        use crate::replay_set_aside::FrameFate;
         if self.faults.fail_before_frame == Some(index) {
             return Err(ferrosa_common::Error::InvalidData(format!(
                 "injected set-aside re-ingest fault before frame {index}"
@@ -615,13 +684,17 @@ impl crate::replay_set_aside::SetAsideSink for EngineSetAsideSink<'_> {
         }
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
         if self.only.is_some_and(|only| *only != table_id) {
-            return Ok(false);
+            return Ok(FrameFate::Keep);
+        }
+        if let Some(dropped_ms) = self.dropped_after_written(&table_id) {
+            self.report_stale(&table_id, dropped_ms);
+            return Ok(FrameFate::Stale);
         }
         if !StorageEngine::apply_replay_mutation_strict(&self.engine.tables, mutation)? {
-            return Ok(false);
+            return Ok(FrameFate::Keep);
         }
         self.touched.insert(table_id);
-        Ok(true)
+        Ok(FrameFate::Applied)
     }
 
     fn make_durable(&mut self) -> ferrosa_common::Result<()> {
@@ -1204,7 +1277,7 @@ pub struct StorageEngine {
     /// not been re-ingested yet. Empty when nothing is set aside. These rows
     /// are invisible to reads, so `/readyz` reports them. See
     /// [`crate::replay_set_aside`].
-    set_aside_status: parking_lot::Mutex<crate::replay_set_aside::SetAsideStatus>,
+    set_aside_status: crate::replay_set_aside::SetAsideLedger,
     /// Serializes set-aside re-ingest runs (startup and table registration).
     set_aside_reingest: parking_lot::Mutex<()>,
     /// Index registrations that arrived before their table was registered,
@@ -2888,6 +2961,7 @@ impl StorageEngine {
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
 
+        let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -2903,7 +2977,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
-            set_aside_status: parking_lot::Mutex::new(Default::default()),
+            set_aside_status,
             set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
@@ -2961,14 +3035,11 @@ impl StorageEngine {
         // disk pressure plus a restart emptied system_schema.indexes and most
         // agent_memory tables on all three memory-cluster nodes.
         engine.restore_evicted_sstables_blocking()?;
-        // Before the local schema registers its tables: each registration then
-        // re-ingests that table's set-aside mutations (see
-        // `replay_deferred_mutations_for_table`). This constructor is the one a
-        // restart goes through once the commit-log segments that fed a
-        // set-aside file are gone, so it must find the file itself.
-        engine.adopt_set_aside_files()?;
+        // Each registration re-ingests that table's set-aside mutations (see
+        // `replay_deferred_mutations_for_table`); the ledger already holds the
+        // files, found when the struct was built.
         engine.load_local_schema_if_present()?;
-        Ok(engine)
+        engine.finish_construction()
     }
 
     /// Probe the configured object store for conditional put support.
@@ -3122,6 +3193,7 @@ impl StorageEngine {
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
 
+        let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -3137,7 +3209,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
-            set_aside_status: parking_lot::Mutex::new(Default::default()),
+            set_aside_status,
             set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
@@ -3176,10 +3248,7 @@ impl StorageEngine {
             #[cfg(test)]
             upload_store_override: None,
         };
-        // Same as `new`: a set-aside file from an earlier boot is found here
-        // even though this constructor replays nothing.
-        engine.adopt_set_aside_files()?;
-        Ok(engine)
+        engine.finish_construction()
     }
 
     /// Opens an existing storage engine directory and replays uncommitted
@@ -3357,6 +3426,7 @@ impl StorageEngine {
             }
         }
 
+        let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -3372,7 +3442,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations,
-            set_aside_status: parking_lot::Mutex::new(Default::default()),
+            set_aside_status,
             set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
@@ -3412,7 +3482,7 @@ impl StorageEngine {
             upload_store_override: None,
         };
 
-        engine.adopt_set_aside_files()?;
+        let engine = engine.finish_construction()?;
         Ok((engine, pending_mutations))
     }
 
@@ -4683,6 +4753,18 @@ impl StorageEngine {
     }
 
     fn unregister_table_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        // Recorded BEFORE anything is removed, and a failure refuses the drop:
+        // without the record, set-aside frames of this table would later be
+        // applied to a re-created table of the same name. Only a registered
+        // table is a drop; a replayed DROP of an absent table records nothing.
+        if self.tables.read().contains_key(table_id) {
+            crate::table_drops::record_drop(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+                crate::table_drops::now_millis()?,
+            )?;
+        }
         self.clear_compaction_retry_state(table_id);
         if let Some(state) = self.tables.write().remove(table_id) {
             if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
@@ -10341,33 +10423,19 @@ impl StorageEngine {
         self.set_aside_status.lock().clone()
     }
 
-    /// Finds the set-aside files on disk, records them as the engine's
-    /// degraded state, and re-ingests whatever the registered tables can take.
-    fn adopt_set_aside_files(&self) -> ferrosa_common::Result<()> {
-        let status = crate::replay_set_aside::scan_set_aside_dir(&self.config.data_dir)?;
-        for file in status.unreadable() {
-            tracing::error!(
-                path = %file.path.display(),
-                error = file.error.as_deref().unwrap_or_default(),
-                "set-aside file cannot be read to its end; it is kept untouched and its \
-                 mutations are NOT re-ingested. Inspect it with \
-                 `ferrosa-ctl commitlog set-aside`"
-            );
-        }
-        if !status.is_empty() {
-            tracing::error!(
-                files = status.files.len(),
-                mutations = status.mutations(),
-                tables = ?status.tables(),
-                "mutations are set aside on disk and invisible to reads until their table \
-                 schema is registered; /readyz reports this node as not ready"
-            );
-        }
-        self.publish_set_aside_status(status);
+    /// The last step of every constructor. The set-aside files were found when
+    /// the struct was built (`SetAsideLedger::adopt` is the only way to fill its
+    /// `set_aside_status` field, so no constructor can skip the scan); this
+    /// re-ingests whatever the tables registered so far can take. Tables
+    /// registered later re-ingest through `replay_deferred_mutations_for_table`.
+    ///
+    /// A failure to re-ingest is logged and the frames stay set aside, reported
+    /// by `/readyz`; it does not fail construction.
+    fn finish_construction(self) -> ferrosa_common::Result<Self> {
         if let Err(e) = self.reingest_set_aside_with_faults(None, SetAsideFaults::default()) {
             tracing::error!(%e, "startup re-ingest of set-aside mutations is incomplete");
         }
-        Ok(())
+        Ok(self)
     }
 
     /// Offline re-ingest for `ferrosa-ctl commitlog set-aside --apply`. The
@@ -10403,8 +10471,7 @@ impl StorageEngine {
     }
 
     fn publish_set_aside_status(&self, status: crate::replay_set_aside::SetAsideStatus) {
-        crate::replay_set_aside::set_replay_set_aside_pending_mutations(status.mutations());
-        *self.set_aside_status.lock() = status;
+        self.set_aside_status.publish(status);
     }
 
     /// Called whenever a table becomes known: replays that table's set-aside
@@ -10439,11 +10506,18 @@ impl StorageEngine {
             if !self.set_aside_file_is_ready(&path, only) {
                 continue;
             }
-            let mut sink = EngineSetAsideSink {
-                engine: self,
-                only,
-                touched: std::collections::HashSet::new(),
-                faults,
+            let mut sink = match EngineSetAsideSink::new(self, &path, only, faults) {
+                Ok(sink) => sink,
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        path = %path.display(),
+                        "cannot read the dropped-tables ledger, so set-aside frames cannot be \
+                         checked against table drops; the file is kept whole"
+                    );
+                    first_error.get_or_insert(e);
+                    continue;
+                }
             };
             match crate::replay_set_aside::reingest_file(&path, &mut sink) {
                 Ok(outcome) => self.record_set_aside_outcome(&path, &outcome),
@@ -10486,7 +10560,7 @@ impl StorageEngine {
         path: &Path,
         outcome: &crate::replay_set_aside::FileOutcome,
     ) {
-        if outcome.applied == 0 {
+        if outcome.departed() == 0 {
             return;
         }
         let mut status = self.set_aside_status.lock().clone();
@@ -10500,6 +10574,14 @@ impl StorageEngine {
                     tables: outcome.kept_tables.clone(),
                     error: None,
                 });
+        }
+        if outcome.stale > 0 {
+            tracing::error!(
+                path = %path.display(),
+                stale = outcome.stale,
+                tables = ?outcome.stale_tables,
+                "set-aside frames of dropped tables were quarantined instead of applied"
+            );
         }
         tracing::info!(
             path = %path.display(),
@@ -14228,6 +14310,7 @@ impl StorageEngine {
         let pump_sample_total_ns = (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free()
             * 1_000_000_000.0) as u64;
 
+        let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -14236,7 +14319,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
-            set_aside_status: parking_lot::Mutex::new(Default::default()),
+            set_aside_status,
             set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
@@ -14281,7 +14364,7 @@ impl StorageEngine {
         // Mirror the production constructor: a restart restores evicted
         // SSTables before any table can register.
         engine.restore_evicted_sstables_blocking()?;
-        Ok(engine)
+        engine.finish_construction()
     }
 
     /// Test helper: uploads the engine's current SSTable inventory to the
@@ -29398,6 +29481,245 @@ mod tests {
 
         assert_each_key_has_one_row(&engine, &keys);
         assert!(!path.exists());
+    }
+
+    /// Builds an engine over a directory that already holds a set-aside file of
+    /// two frames, and asserts that engine found it: the frames are counted as
+    /// pending at construction, and registering the table brings them back.
+    fn assert_constructor_adopts_set_aside(
+        label: &str,
+        build: impl FnOnce(&std::path::Path) -> StorageEngine,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["x0", "x1"];
+        let path = set_aside_test_keys(dir.path(), &keys);
+
+        let engine = build(dir.path());
+
+        assert_eq!(
+            engine.replay_set_aside_status().mutations(),
+            2,
+            "{label}: the constructor must find the set-aside file, or its rows are \
+             durable but invisible and nothing says so"
+        );
+        engine.register_table(test_schema()).unwrap();
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(
+            !path.exists(),
+            "{label}: the file is gone once its table registered"
+        );
+    }
+
+    /// The guard against the next constructor being added without adoption.
+    /// PR #468 wired its restore into `new` but not `open`; this wiring started
+    /// the same way. Every way to build a `StorageEngine` is listed here.
+    #[test]
+    fn every_public_constructor_adopts_a_pre_existing_set_aside_file() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        assert_constructor_adopts_set_aside("new", |dir| {
+            StorageEngine::new(StorageEngineConfig::test_config(dir), None).unwrap()
+        });
+        assert_constructor_adopts_set_aside("new_with_archive_store", |dir| {
+            StorageEngine::new_with_archive_store(
+                StorageEngineConfig::test_config(dir),
+                None,
+                None,
+                "adopt".into(),
+            )
+            .unwrap()
+        });
+        assert_constructor_adopts_set_aside("new_with_upload_store", |dir| {
+            StorageEngine::new_with_upload_store(
+                StorageEngineConfig::test_config(dir),
+                Arc::new(object_store::memory::InMemory::new()),
+                "adopt".into(),
+                rt.handle(),
+            )
+            .unwrap()
+        });
+        assert_constructor_adopts_set_aside("new_with_upload_store_and_queue_depth", |dir| {
+            StorageEngine::new_with_upload_store_and_queue_depth(
+                StorageEngineConfig::test_config(dir),
+                Arc::new(object_store::memory::InMemory::new()),
+                "adopt".into(),
+                rt.handle(),
+                4,
+            )
+            .unwrap()
+        });
+        assert_constructor_adopts_set_aside("open_from_snapshot_with_store", |dir| {
+            rt.block_on(restore_from_an_empty_snapshot(dir))
+        });
+
+        open_adopts_set_aside_for_a_table_it_already_knows();
+    }
+
+    /// `open_from_snapshot` and `open_from_snapshot_with_store` restore into the
+    /// data directory and then open it, so they inherit whatever `new` does.
+    async fn restore_from_an_empty_snapshot(dir: &std::path::Path) -> StorageEngine {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "adopt-node";
+        let manifest = crate::manifest::Manifest::new();
+        manifest
+            .save_with_retry(store.as_ref(), prefix)
+            .await
+            .unwrap();
+        crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+            .await
+            .unwrap();
+        let pos = crate::commitlog::CommitLogPosition {
+            segment_id: 1,
+            offset: 0,
+        };
+        crate::snapshot::SnapshotManager::new(Arc::clone(&store), prefix.to_string())
+            .create_snapshot("adopt-snap", &manifest, b"{}", pos, "node-1", None, false)
+            .await
+            .unwrap();
+        StorageEngine::open_from_snapshot_with_store(
+            StorageEngineConfig::test_config(dir),
+            "adopt-snap",
+            None,
+            "node-1",
+            false,
+            store,
+            prefix,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// `open` registers tables from the local schema before the engine exists,
+    /// so its adoption is a sweep rather than a per-registration trigger.
+    fn open_adopts_set_aside_for_a_table_it_already_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine
+                .write(&table_id(), &make_key("anchor"), make_row(b"v", 9), 9)
+                .unwrap();
+            engine.flush(&table_id()).unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+        let keys = ["y0", "y1"];
+        let path = set_aside_test_keys(dir.path(), &keys);
+        let (engine, _pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists(), "open: the sweep re-ingests and removes it");
+    }
+
+    fn pause_for_the_clock() {
+        // Set-aside file names and the drop ledger both carry milliseconds.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    fn assert_quarantined_not_applied(
+        engine: &StorageEngine,
+        path: &std::path::Path,
+        keys: &[&str],
+    ) {
+        for key in keys {
+            assert!(
+                engine.read(&table_id(), &make_key(key)).unwrap().is_none(),
+                "{key} belongs to a dropped table and must not appear in the new one"
+            );
+        }
+        assert!(
+            !path.exists(),
+            "the file is emptied: nothing is left pending"
+        );
+        assert!(engine.replay_set_aside_status().is_empty());
+        let held = crate::replay_set_aside::read_set_aside_file(
+            &crate::replay_set_aside::stale_quarantine_path(path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(held.len(), keys.len(), "withheld frames are kept, not lost");
+        assert!(
+            crate::replay_set_aside::replay_set_aside_stale_frames_total() >= keys.len() as u64
+        );
+    }
+
+    #[test]
+    fn frames_older_than_a_drop_are_quarantined_not_resurrected_into_a_recreated_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["s0", "s1"];
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let path = set_aside_test_keys(dir.path(), &keys);
+        pause_for_the_clock();
+
+        engine.unregister_table(&table_id()).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.reingest_set_aside().unwrap();
+
+        assert_quarantined_not_applied(&engine, &path, &keys);
+    }
+
+    #[test]
+    fn a_restart_after_the_drop_still_withholds_the_old_tables_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["r0", "r1", "r2"];
+        let path;
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            path = set_aside_test_keys(dir.path(), &keys);
+            pause_for_the_clock();
+            engine.unregister_table(&table_id()).unwrap();
+        }
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert_eq!(engine.replay_set_aside_status().mutations(), 3);
+        engine.register_table(test_schema()).unwrap();
+
+        assert_quarantined_not_applied(&engine, &path, &keys);
+    }
+
+    #[test]
+    fn frames_written_after_the_drop_belong_to_the_new_table_and_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["n0", "n1"];
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.unregister_table(&table_id()).unwrap();
+        pause_for_the_clock();
+        let path = set_aside_test_keys(dir.path(), &keys);
+        engine.register_table(test_schema()).unwrap();
+        engine.reingest_set_aside().unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_drop_that_cannot_be_recorded_is_refused_and_the_table_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        std::fs::write(
+            dir.path().join(crate::table_drops::DROPPED_TABLES_FILE),
+            b"{broken",
+        )
+        .unwrap();
+
+        let err = engine
+            .unregister_table(&table_id())
+            .expect_err("an unrecorded drop would let stale frames resurrect");
+        assert!(err.to_string().contains("does not parse"), "got: {err}");
+        assert!(engine.is_table_registered_for_test(&table_id()));
     }
 
     #[test]

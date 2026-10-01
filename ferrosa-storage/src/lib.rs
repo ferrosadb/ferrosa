@@ -50,6 +50,7 @@ pub mod spilling_dedup;
 pub(crate) mod sstable_health;
 pub mod store;
 pub mod subscription_observer;
+pub mod table_drops;
 #[cfg(feature = "test-generators")]
 pub mod test_support;
 pub mod timeseries;
