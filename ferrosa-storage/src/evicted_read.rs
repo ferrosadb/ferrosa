@@ -132,7 +132,7 @@ fn env_u64(name: &str, default: u64, min: u64) -> u64 {
 }
 
 /// What [`EvictedReadStore::fetch_query_components`] found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum QueryFetch {
     /// The index components are local; `Data.db` is served by ranged reads.
     Ready,
@@ -141,6 +141,10 @@ pub(crate) enum QueryFetch {
     /// The object store lacks the generation (its `Data.db` or a required
     /// component), so it cannot be opened.
     Missing,
+    /// The generation's marker lists index artifacts the object store no
+    /// longer has. The message names them. Startup refuses to start on this; a
+    /// live open reports it as the typed corrupt-SSTable error.
+    IndexArtifactsLost(String),
 }
 
 type PageKey = (String, u64);
@@ -744,6 +748,12 @@ impl EvictedReadStore {
                 "opened an evicted SSTable for ranged reads: fetched its index components only"
             );
         }
+        if let Some(lost) = self
+            .fetch_index_artifacts(dir, gen, data_loc, fetched_bytes > 0)
+            .await?
+        {
+            return Ok(QueryFetch::IndexArtifactsLost(lost));
+        }
         // Seed the layout cache now that `CompressionInfo.db` is local, so the
         // first read neither re-HEADs the object nor falls back to fixed pages.
         let info = Arc::new(ObjectInfo {
@@ -752,6 +762,61 @@ impl EvictedReadStore {
         });
         self.remember_object(data_loc.key.to_string(), info);
         Ok(QueryFetch::Ready)
+    }
+
+    /// Obtain the generation's index artifacts (`.sidecar`, full-text, vector
+    /// files), whole, next to its other components (ST-57).
+    ///
+    /// Whole, not paged: a sidecar or full-text segment is opened by mapping a
+    /// local file, so a ranged reader would need a second implementation of
+    /// each index format. They are small next to `Data.db`. The generation's
+    /// eviction marker records the artifacts it held; every one must come
+    /// back, and one that cannot is an error, never an index with fewer
+    /// postings. A marker that does not record them (legacy, recovered)
+    /// leaves only what the store lists to pull, and that is done once, when
+    /// the generation's components are first fetched.
+    async fn fetch_index_artifacts(
+        &self,
+        dir: &Path,
+        gen: &str,
+        data_loc: &ObjectLocation,
+        components_just_fetched: bool,
+    ) -> Result<Option<String>> {
+        let expected = crate::eviction_marker::expected_index_artifacts(
+            &crate::eviction_marker::marker_path(dir, gen),
+        );
+        let local = |name: &str| dir.join(format!("{gen}-{name}")).exists();
+        let needed = match &expected {
+            Some(names) => names.iter().any(|name| !local(name)),
+            None => components_just_fetched,
+        };
+        if !needed {
+            return Ok(None);
+        }
+        let hex = crate::upload::manager::hex_prefix_for(&data_loc.sstable_id);
+        StorageEngine::pull_index_artifacts(
+            self.store.as_ref(),
+            &self.prefix,
+            &hex,
+            &data_loc.table_id,
+            gen,
+            dir,
+        )
+        .await?;
+        let missing: Vec<&String> = expected
+            .iter()
+            .flatten()
+            .filter(|name| !local(name))
+            .collect();
+        if !missing.is_empty() {
+            return Ok(Some(format!(
+                "evicted generation {gen} of {}: index artifact(s) {missing:?} are gone from the \
+                 object store, so its secondary and full-text index reads would answer with \
+                 missing postings; refusing to serve it",
+                data_loc.table_id
+            )));
+        }
+        Ok(None)
     }
 
     /// Size of an object, `None` when it does not exist.

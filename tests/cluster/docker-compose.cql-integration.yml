@@ -68,6 +68,7 @@ services:
       FERROSA_FLUSH_THRESHOLD_BYTES: "8192"
       FERROSA_COMPACTION_MIN_THRESHOLD: "2"
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: "ferrosa-cql-test"
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
@@ -104,6 +105,7 @@ services:
       FERROSA_FLUSH_THRESHOLD_BYTES: "8192"
       FERROSA_COMPACTION_MIN_THRESHOLD: "2"
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: "ferrosa-cql-test"
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
@@ -140,6 +142,7 @@ services:
       FERROSA_FLUSH_THRESHOLD_BYTES: "8192"
       FERROSA_COMPACTION_MIN_THRESHOLD: "2"
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: "ferrosa-cql-test"
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"

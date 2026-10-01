@@ -1713,6 +1713,22 @@ struct FileComponentPaths {
     crc: PathBuf,
 }
 
+/// The directory holding generation `gen`'s eviction marker, given the
+/// directory its components are opened from.
+///
+/// The evictor writes the marker in the TABLE directory. A compaction output
+/// lives in its own `<table>/<gen>/` directory and readers reopen it with that
+/// directory, so look one level up. Without this the marker is never found, the
+/// open fails as "missing Data.db", and the read path quarantines a healthy,
+/// uploaded generation as corrupt. Every open path that gates on the marker
+/// must use this.
+fn eviction_marker_dir<'a>(dir: &'a Path, gen: &str) -> &'a Path {
+    match dir.file_name() {
+        Some(name) if name == gen => dir.parent().unwrap_or(dir),
+        _ => dir,
+    }
+}
+
 /// Restore generation `gen` from S3 when the uploaded-cache evictor removed
 /// its local copy, so a live reader can reopen it without a restart.
 ///
@@ -1732,7 +1748,8 @@ struct FileComponentPaths {
 /// checks then observe.
 pub(crate) fn rehydrate_if_evicted(dir: &Path, gen: &str) -> Result<()> {
     let data = dir.join(format!("{gen}-Data.db"));
-    let marker = crate::engine::StorageEngine::evicted_marker_path(dir, gen);
+    let marker =
+        crate::engine::StorageEngine::evicted_marker_path(eviction_marker_dir(dir, gen), gen);
     if data.exists() || !marker.exists() {
         return Ok(());
     }
@@ -1792,12 +1809,24 @@ pub(crate) fn rehydrate_if_evicted(dir: &Path, gen: &str) -> Result<()> {
 /// the open fails on the missing `Data.db` exactly as before.
 pub(crate) fn prepare_evicted_for_query(dir: &Path, gen: &str) -> Result<bool> {
     let data = dir.join(format!("{gen}-Data.db"));
-    let marker = crate::engine::StorageEngine::evicted_marker_path(dir, gen);
+    let marker =
+        crate::engine::StorageEngine::evicted_marker_path(eviction_marker_dir(dir, gen), gen);
     if data.exists() || !marker.exists() {
         return Ok(false);
     }
     match crate::evicted_read::fetch_query_components(dir, gen)? {
         crate::evicted_read::QueryFetch::Ready => Ok(true),
+        // The typed error: the read path's view retry and the coordinator's
+        // replica failover key on it. The token range is not known at this
+        // layer, so it claims the whole ring, which can only over-fail over.
+        crate::evicted_read::QueryFetch::IndexArtifactsLost(message) => {
+            tracing::error!(dir = %dir.display(), gen, "{message}");
+            Err(ferrosa_common::Error::corrupt_sstable(
+                gen,
+                i64::MIN,
+                i64::MAX,
+            ))
+        }
         outcome @ (crate::evicted_read::QueryFetch::NotOwned
         | crate::evicted_read::QueryFetch::Missing) => {
             tracing::error!(
