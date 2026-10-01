@@ -59,9 +59,21 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
 - **Reconnect / dormancy lifecycle** (`reconnect`, `lane_actor`) — on disconnect
   a lane immediately enters `Reconnecting` so new work is not dispatched to the
   dead RPC client, then retries with exponential backoff
-  (`connect_with_retry_cancelable`); after `MAX_RECONNECT_ATTEMPTS` it counts an exhaustion, and after
-  `DORMANT_AFTER_EXHAUSTIONS` it goes `Dormant`, probing once per
-  `DORMANT_PROBE_INTERVAL`. Reconnects re-resolve the peer's advertised hostname
+  (`connect_with_retry_cancelable`, the fast phase); after
+  `reconnect_fast_attempts()` (default `MAX_RECONNECT_ATTEMPTS` = 10) it counts
+  an exhaustion, and after `DORMANT_AFTER_EXHAUSTIONS` it drops into the
+  indefinite slow-retry phase (`Dormant`): one single-attempt probe per
+  `slow_retry_interval()` (default 30 s, plus up to 25% jitter) until the peer
+  returns or the lane is shut down, for an outage of any length. Both bounds are
+  env-tunable (`FERROSA_NET_RECONNECT_FAST_ATTEMPTS`,
+  `FERROSA_NET_RECONNECT_SLOW_INTERVAL_MS`; see `PROFILE.md`). Logging is
+  edge-only: one line on losing the connection, one on entering slow-retry, one
+  on recovery; per-attempt detail is DEBUG and counted in
+  `total_reconnect_attempts()`. A lane remembers the node it was opened to and
+  refuses a reconnect answered by a different host id (logged once per episode).
+  The client records its death with `send_replace`, and the alive watcher checks
+  the current value before waiting, so a connection that dies before the lane
+  subscribes is not missed. Reconnects re-resolve the peer's advertised hostname
   so container IP churn is handled automatically. `NetError::LaneShutdown`
   means a pool's actors have exited (peer connection replaced); it is not
   reconnect exhaustion. `PeerManager` re-issues a request once on the current
@@ -69,8 +81,11 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   pool itself is dead, `PeerManager` deregisters it, re-dials once via
   `ensure_peer` (identity-checked), logs the failure and the recovery once
   each, and re-issues the request; if the dial fails the request errors and a
-  pool-less placeholder keeps the peer's address for the next `ensure_peer`. `remove_peer` shuts
-  the peer's pool down so its lane-actor tasks exit.
+  pool-less placeholder keeps the peer's address, which the heartbeat loop
+  re-dials (identity-checked, exponential backoff capped at the slow-retry
+  interval, jittered) until the peer answers or is removed. `remove_peer` shuts
+  the peer's pool down so its lane-actor tasks exit, and a re-dial that
+  completes after removal is refused (`install_pool` guard).
 - **RPC server + handler registry** (`rpc`) — `RpcServer` accepts inbound
   connections, runs the acceptor handshake, and dispatches frames through a
   thread-safe `HandlerRegistry` (`MsgType` → `Arc<dyn RpcHandler>`) that supports

@@ -35,4 +35,5 @@ capnpc = "0.25"
 proptest = "1"
 rcgen = "0.13"
 serial_test = "3"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 tokio = { version = "1", features = ["full", "test-util"] }

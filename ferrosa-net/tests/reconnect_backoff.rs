@@ -75,10 +75,15 @@ async fn dead_peer_enters_dormant_after_exhausted_reconnects() {
 // Test 2 — dormant lane stays dormant and rate-limits probes
 // ---------------------------------------------------------------------------
 
-/// Once dormant, the lane must stay dormant and fire at most one connection
-/// attempt per probe interval.  We assert that `total_reconnect_attempts`
-/// advances by at most `MAX_RECONNECT_ATTEMPTS` across one probe interval
-/// (one `connect_with_retry` call), not the old unbounded rate.
+/// Once dormant, the lane must stay dormant (probing indefinitely) and fire at
+/// most one connection attempt per slow-retry interval.
+///
+/// Updated for t_48d168ee: a probe used to be a whole `connect_with_retry`
+/// cycle (up to `MAX_RECONNECT_ATTEMPTS` attempts) every five minutes, which
+/// left a returning peer unreached for many minutes. A probe is now a single
+/// attempt every `DORMANT_PROBE_INTERVAL` (+ up to 25% jitter). The original
+/// intent, a bounded rate rather than an unbounded one, is kept: over N
+/// intervals the lane may make at most N attempts, and at least one.
 #[tokio::test(start_paused = true)]
 async fn dormant_lane_rate_limits_probes() {
     use ferrosa_net::reconnect::{DORMANT_AFTER_EXHAUSTIONS, DORMANT_PROBE_INTERVAL};
@@ -112,38 +117,24 @@ async fn dormant_lane_rate_limits_probes() {
     let status = handle.query_status().await.unwrap();
     assert_eq!(status, LaneStatusReport::Dormant, "must be Dormant first");
 
-    // Record attempt count, then advance one probe interval.
+    // Advance ten probe intervals, a second at a time so each probe task runs.
     let attempts_before = total_reconnect_attempts();
-    tokio::time::advance(DORMANT_PROBE_INTERVAL + Duration::from_secs(1)).await;
-    // Let spawned tasks run: the DormantProbe fires connect_with_retry.
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
+    const INTERVALS: u64 = 10;
+    for _ in 0..(DORMANT_PROBE_INTERVAL.as_secs() * INTERVALS) {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
     }
+    let delta = total_reconnect_attempts().saturating_sub(attempts_before);
 
-    // The probe spawns connect_with_retry which runs up to MAX_RECONNECT_ATTEMPTS
-    // individual attempts.  But we need time to advance past each attempt's
-    // sleep too — with time paused, the connect_with_retry sleeps are instant.
-    // Advance enough for all attempts in one probe cycle.
-    use ferrosa_net::reconnect::MAX_RECONNECT_ATTEMPTS;
-    // Each attempt sleeps up to BACKOFF_CAP_MS (30 s).
-    for _ in 0..MAX_RECONNECT_ATTEMPTS {
-        tokio::time::advance(Duration::from_secs(35)).await;
-        tokio::task::yield_now().await;
-    }
-
-    let attempts_after = total_reconnect_attempts();
-    let delta = attempts_after.saturating_sub(attempts_before);
-
-    // At most one full connect_with_retry cycle per probe interval.
     assert!(
-        delta <= MAX_RECONNECT_ATTEMPTS as u64,
-        "dormant probe should fire at most one connect_with_retry cycle ({} attempts), fired {}",
-        MAX_RECONNECT_ATTEMPTS,
-        delta
+        (1..=INTERVALS).contains(&delta),
+        "dormant lane must probe once per interval: expected 1..={INTERVALS} attempts over \
+         {INTERVALS} intervals, saw {delta}"
     );
 
-    // Lane must still be Dormant (probe failed, peer still down).
-    // Allow extra time for the next probe to be scheduled (not yet fired).
+    // Lane must still be Dormant (probes failed, peer still down).
     let status = handle.query_status().await.unwrap();
     assert_eq!(
         status,

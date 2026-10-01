@@ -251,17 +251,23 @@ impl RpcClient {
                     }
                 }
             }
-            // Stream ended — peer is gone. Notify subscribers; if no one is
-            // listening (no lane is currently using this connection), fall
-            // back to a debug log so the situation is observable but not
-            // alarming.
-            if alive_tx_clone.send(false).is_err() {
+            // Stream ended — peer is gone. Record it unconditionally with
+            // `send_replace`: `send` discards the value when no receiver
+            // exists, and a lane subscribes only after the client is built (or
+            // after a reconnected client has sat in the actor's mailbox), so a
+            // connection that dies in that gap would read as alive to every
+            // later subscriber and its lane would never reconnect.
+            let had_subscribers = alive_tx_clone.receiver_count() > 0;
+            alive_tx_clone.send_replace(false);
+            if had_subscribers {
+                tracing::info!(peer = %read_loop_peer, "RPC peer connection closed");
+            } else {
+                // Not alarming: the state is recorded and a later subscriber
+                // sees it.
                 tracing::debug!(
                     peer = %read_loop_peer,
-                    "alive=false delivered to no subscribers (no active lanes on this connection)"
+                    "alive=false recorded with no subscribers (no active lanes on this connection)"
                 );
-            } else {
-                tracing::info!(peer = %read_loop_peer, "RPC peer connection closed");
             }
         });
 

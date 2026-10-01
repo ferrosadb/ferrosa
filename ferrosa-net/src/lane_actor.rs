@@ -10,21 +10,30 @@
 //!
 //! ## Reconnect lifecycle
 //!
+//! A lane never gives up on its peer. A short outage is retried quickly; a
+//! long one is retried slowly and indefinitely, until the peer returns or the
+//! lane is shut down (`remove_peer`).
+//!
 //! ```text
-//! Connected ──(disconnect)──► Reconnecting(exhaustion_count=0)
-//!                                    │
-//!                    MAX_RECONNECT_ATTEMPTS reached
+//! Connected ──(disconnect)──► Reconnecting(exhaustion_count=0)   fast phase:
+//!                                    │                           exponential backoff,
+//!                    reconnect_fast_attempts() reached           ≤ 30 s between attempts
 //!                                    │
 //!                                    ▼
 //!                       exhaustion_count+1 < DORMANT_AFTER_EXHAUSTIONS?
 //!                              yes │                  no │
 //!                                  ▼                     ▼
-//!                            Reconnecting              Dormant
-//!                         (exhaustion_count+1)    probe every DORMANT_PROBE_INTERVAL
+//!                            Reconnecting              Dormant (slow-retry)
+//!                         (exhaustion_count+1)    one attempt every slow_retry_interval()
+//!                                                 (+ up to 25% jitter), forever
 //!                                                       │ success
 //!                                                       ▼
 //!                                                   Connected
 //! ```
+//!
+//! Logging is edge-only: one line on losing the connection, one on dropping
+//! into slow-retry, one on recovery. Per-attempt detail is DEBUG, and the
+//! attempts are counted in `reconnect::total_reconnect_attempts`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,8 +49,9 @@ use crate::error::{NetError, Result};
 use crate::message::Message;
 use crate::metrics;
 use crate::reconnect::{
-    connect_with_retry_cancelable, dec_dormant_peer_count, inc_dormant_peer_count,
-    spawn_alive_watcher, LaneState, DORMANT_AFTER_EXHAUSTIONS, DORMANT_PROBE_INTERVAL,
+    connect_once_cancelable, connect_with_retry_cancelable, dec_dormant_peer_count,
+    inc_dormant_peer_count, slow_retry_interval, spawn_alive_watcher, with_jitter, LaneState,
+    DORMANT_AFTER_EXHAUSTIONS,
 };
 use crate::rpc::client::RpcClient;
 use crate::task_pool::TaskPool;
@@ -117,8 +127,8 @@ pub(crate) enum LaneCommand {
     /// actor can detect stale signals from earlier reconnect tasks that raced
     /// with a successful connection.
     MarkFailed { exhaustion_count: u32 },
-    /// Trigger a dormant probe attempt.  Sent by the dormant wake-up task
-    /// after sleeping for one [`DORMANT_PROBE_INTERVAL`].
+    /// Trigger a slow-retry probe attempt.  Sent by the dormant wake-up task
+    /// after sleeping for one jittered [`slow_retry_interval`].
     DormantProbe,
     /// Query the current lane status.
     QueryStatus {
@@ -153,8 +163,9 @@ enum PendingLaneCommand {
 pub enum LaneStatusReport {
     Connected,
     Reconnecting,
-    /// The lane is dormant: all reconnect cycles were exhausted.
-    /// Probes the peer at most once every [`DORMANT_PROBE_INTERVAL`].
+    /// The lane is in the slow-retry phase: the fast reconnect cycles were
+    /// exhausted. It probes the peer once per [`slow_retry_interval`] (plus
+    /// jitter) for as long as the lane exists.
     Dormant,
     /// Kept for legacy callers; the actor never transitions to this in normal
     /// operation — use `Dormant` instead.
@@ -373,7 +384,8 @@ impl ActorReconnectContext {
         });
     }
 
-    /// Schedule a dormant probe after sleeping for [`DORMANT_PROBE_INTERVAL`].
+    /// Schedule a slow-retry probe after sleeping for one jittered
+    /// [`slow_retry_interval`].
     ///
     /// The probe is triggered by sending `DormantProbe` to the actor, which
     /// then decides whether to fire a connection attempt.
@@ -381,7 +393,7 @@ impl ActorReconnectContext {
         let handle = self.handle.clone();
         let cancelled = Arc::clone(&self.cancelled);
         self.task_pool.spawn(async move {
-            tokio::time::sleep(DORMANT_PROBE_INTERVAL).await;
+            tokio::time::sleep(with_jitter(slow_retry_interval())).await;
             if cancelled.load(Ordering::Relaxed) {
                 return;
             }
@@ -509,6 +521,15 @@ async fn lane_actor_loop(
     let mut pending_streams = VecDeque::new();
     let mut dispatch_retry_scheduled = false;
 
+    // The node this lane was opened to. Every later reconnect must reach the
+    // same node: a different one that took over the address (container IP
+    // reuse) is refused rather than silently swapped in.
+    let expected_peer = match &state {
+        LaneState::Connected(client) => Some(client.peer_host_id()),
+        LaneState::Reconnecting { .. } | LaneState::Dormant => None,
+    };
+    let mut identity_refusal_logged = false;
+
     // If initial state is Connected, attach an alive watcher immediately.
     if let LaneState::Connected(ref client) = state {
         let alive_rx = client.alive_rx();
@@ -628,16 +649,44 @@ async fn lane_actor_loop(
                 );
             }
             LaneCommand::SwapClient(new_client) => {
-                // If we were dormant, decrement the dormant counter.
+                if let Some(expected) = expected_peer {
+                    let answered_by = new_client.peer_host_id();
+                    if answered_by != expected {
+                        // One line per refusal episode, not per attempt: the
+                        // retry machinery keeps dialing until the right node
+                        // answers.
+                        if !identity_refusal_logged {
+                            identity_refusal_logged = true;
+                            tracing::error!(
+                                ?lane,
+                                peer = %ctx.peer_host,
+                                %expected,
+                                %answered_by,
+                                "reconnect refused: peer identity mismatch; the address is now \
+                                 answered by a different node. Retrying until the expected node returns"
+                            );
+                        }
+                        drop(new_client);
+                        match &state {
+                            LaneState::Dormant => ctx.spawn_dormant_probe(),
+                            LaneState::Reconnecting {
+                                exhaustion_count, ..
+                            } => ctx.handle.mark_failed(*exhaustion_count),
+                            LaneState::Connected(_) => {}
+                        }
+                        continue;
+                    }
+                }
+                identity_refusal_logged = false;
                 if matches!(state, LaneState::Dormant) {
                     dec_dormant_peer_count();
                     tracing::info!(
                         ?lane,
                         peer = %ctx.peer_host,
-                        "lane woke from dormant: reconnected"
+                        "lane reconnected after slow-retry"
                     );
                 } else {
-                    tracing::info!(?lane, peer = %ctx.peer_host, "lane actor: swapping in new client");
+                    tracing::info!(?lane, peer = %ctx.peer_host, "lane reconnected");
                 }
                 let alive_rx = new_client.alive_rx();
                 state = LaneState::Connected(new_client);
@@ -702,12 +751,13 @@ async fn lane_actor_loop(
                 let next_exhaustion = current_exhaustion + 1;
 
                 if next_exhaustion >= DORMANT_AFTER_EXHAUSTIONS {
-                    tracing::info!(
+                    tracing::warn!(
                         ?lane,
                         peer = %ctx.peer_host,
                         exhaustion_count = next_exhaustion,
-                        probe_interval = ?DORMANT_PROBE_INTERVAL,
-                        "lane entering dormant state"
+                        probe_interval = ?slow_retry_interval(),
+                        "lane entering slow-retry: fast reconnect cycles exhausted; probing \
+                         until the peer returns"
                     );
                     state = LaneState::Dormant;
                     inc_dormant_peer_count();
@@ -743,7 +793,7 @@ async fn lane_actor_loop(
                     if probe_ctx.cancelled.load(Ordering::Relaxed) {
                         return;
                     }
-                    let result = connect_with_retry_cancelable(
+                    let result = connect_once_cancelable(
                         Arc::clone(&probe_ctx.config),
                         probe_ctx.local_host_id,
                         &probe_ctx.peer_host,
@@ -761,7 +811,7 @@ async fn lane_actor_loop(
                             probe_ctx.handle.try_swap_client(client);
                         }
                         None => {
-                            // Probe exhausted; schedule the next probe.
+                            // Probe failed; schedule the next one.
                             probe_ctx.spawn_dormant_probe();
                         }
                     }

@@ -551,6 +551,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_config = config.clone();
+        // One node answers every connection, as a real peer does. A fresh id per
+        // connection would model different nodes, which lane reconnects now refuse.
+        let server_id = uuid::Uuid::new_v4();
         let (reconnected_tx, reconnected_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         let server_task = tokio::spawn(async move {
@@ -561,7 +564,7 @@ mod tests {
                     stream,
                     InternodeCodec::new(server_config.max_frame_body_size),
                 );
-                accept_handshake(&mut framed, &server_config, uuid::Uuid::new_v4())
+                accept_handshake(&mut framed, &server_config, server_id)
                     .await
                     .unwrap();
                 initial_connections.push(framed);
@@ -576,7 +579,7 @@ mod tests {
                     stream,
                     InternodeCodec::new(server_config.max_frame_body_size),
                 );
-                accept_handshake(&mut framed, &server_config, uuid::Uuid::new_v4())
+                accept_handshake(&mut framed, &server_config, server_id)
                     .await
                     .unwrap();
                 replacement_connections.push(framed);

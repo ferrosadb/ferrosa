@@ -64,15 +64,15 @@ sequenceDiagram
     Actor->>Actor: spawn_reconnect (connect_with_retry_cancelable, backoff)
     alt reconnect succeeds
         Actor->>Actor: LaneState = Connected(new client); re-attach alive watcher
-    else MAX_RECONNECT_ATTEMPTS exhausted
+    else reconnect_fast_attempts() exhausted
         Actor->>Actor: exhaustion_count += 1
         alt exhaustion_count &lt; DORMANT_AFTER_EXHAUSTIONS
             Actor->>Actor: schedule retry cycle (sleep 5s)
         else
-            Actor->>Actor: LaneState = Dormant; probe every DORMANT_PROBE_INTERVAL
+            Actor->>Actor: LaneState = Dormant (slow-retry); one attempt every slow_retry_interval() + jitter, forever
         end
     end
-    Note over Caller,Actor: while reconnecting -> Err(Reconnecting); dormant probe can wake to Connected
+    Note over Caller,Actor: while reconnecting -> Err(Reconnecting); a slow-retry probe wakes the lane to Connected when the peer returns
 ```
 
 ## Notes on the path

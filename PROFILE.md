@@ -75,6 +75,24 @@ process starts.
 | `/api/debug/flamechart?seconds=N` | Duration of the authenticated tracing activity chart | Default `5` seconds, capped at `60` |
 | `RUST_LOG` | Runtime tracing log filter | For example, `info` or `ferrosa=debug` |
 
+### Internode reconnect (ferrosa-net)
+
+A lane whose peer connection drops retries quickly, then slowly and
+indefinitely, until the peer returns or the peer is removed. A peer whose pool
+could not be replaced is re-dialed by the heartbeat loop on the same schedule.
+These are read when a retry cycle or probe is scheduled, so a changed value
+applies to the next one. A value that is not a positive integer is ignored with
+one warning per setting and the default is used.
+
+| Environment variable | What it changes | Default |
+|---|---|---:|
+| `FERROSA_NET_RECONNECT_FAST_ATTEMPTS` | Connect attempts per fast-phase cycle (exponential backoff 1 s doubling to 30 s). After three exhausted cycles the lane enters slow-retry | `10` |
+| `FERROSA_NET_RECONNECT_SLOW_INTERVAL_MS` | Interval between single-attempt probes in slow-retry, and the cap on a pool-less peer's re-dial backoff. Up to 25% random jitter is added so nodes do not dial in lockstep | `30000` ms |
+
+Logging is edge-only: one line when a lane drops into slow-retry and one when
+it reconnects, however long the outage. Per-attempt detail is DEBUG, and every
+attempt is counted by `ferrosa_net::reconnect::total_reconnect_attempts`.
+
 ### CQL Accord transaction bounds
 
 These per-node CQL settings bound open Accord transaction state. They take effect
