@@ -57,6 +57,13 @@ recovery against a stopped node's files):
 | `cluster demote-to-learner <host_id>` | `POST /api/cluster/demote-to-learner` |
 | `snapshot create\|list\|delete` | `…/api/snapshots[…]` |
 | `restore <name> [--point-in-time --force]` | `POST /api/restore` |
+| `index rebuild --keyspace --table --index` | `POST /api/index/rebuild?…` |
+
+`index rebuild` prints `N of M SSTables, F failed` (plus the count compacted
+away with metadata left behind) and **exits non-zero when the rebuild did not
+complete**, naming the failed SSTables; the index then stays stale and refuses
+reads. The node must report `sstables_vanished` and `sstables_failed`; a
+response without them is refused rather than read as zero failures.
 
 Several of these (`raft transfer-leader`, the three `cluster` learner-lifecycle
 commands, and `snapshot`/`restore`) call endpoints that are **not yet served by
@@ -86,6 +93,22 @@ so ctl can never disagree with what the node decides at boot.
 - `sstable salvage <dir> [--include-quarantine --json]` — measure recoverable-row yield (pure read).
 - `sstable reingest <dir> [--user --password-env --apply --include-quarantine --limit]` — salvage CORRUPT gens and re-insert through the **live** write path (`--host`), preserving original timestamps; dry-run default.
 - `sstable s3-clean <dir> [--apply]` — delete CORRUPT generations' objects from the object store so a cold restart can't re-download them; dry-run default.
+- `sstable mark-evicted --data-dir <dir> --log <node.log> [--tail-mb N --apply --assume-stopped]` — write eviction markers for generations an older ferrosa evicted without recording it (evidence: the node log's `evicted uploaded local SSTable from cache` lines), so the next start restores them from S3. Replaces the unsupported `scripts/recover-evicted-sstables.py`. Dry-run default, reports per table; refuses a data dir whose node holds the sled lock under `<dir>/raft` (even for a dry run); `--apply` also refuses a dir with no lock to probe unless `--assume-stopped`; skips generations that are local, already marked or whose table is gone, and never overwrites a marker. Markers carry `source = ferrosa-ctl sstable mark-evicted`, `trigger = recovered`.
+
+### Commit-log set-aside recovery (filesystem only)
+
+- `commitlog set-aside <data-dir> [--apply --json]` — startup replay with no table
+  schema writes overflow mutations to `<data-dir>/commitlog-unreplayed/*.unreplayed`;
+  those rows are durable but invisible to reads and `/readyz` reports the node as
+  not ready (`waiting_for: "set_aside_mutations"`). Without `--apply` it reports
+  file, mutation and per-table counts (pure read; an unreadable file is named
+  with its byte offset). With `--apply`, **node stopped**, it applies every frame
+  whose table schema is in the data dir's local schema, flushes those tables to
+  SSTables, and rewrites each file without the applied frames (removing it when
+  empty). It exits non-zero while anything stays set aside. The node's own commit
+  log is never touched (the engine runs over a scratch commit log). A node
+  normally does this itself at startup once the schema is known; the flushed
+  SSTables reach S3 through the node's sync after it restarts.
 
 ## Dependencies
 

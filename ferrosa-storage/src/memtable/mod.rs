@@ -183,9 +183,9 @@ pub(crate) fn normalize_collection_rows_for_merge(
         let mut replacements = std::collections::HashMap::new();
         for (idx, cell) in &row.cells {
             if complex_columns.contains(idx) && cell.path.is_none() && !cell.is_tombstone() {
-                let column = schema.regular_columns.get(*idx as usize).ok_or_else(|| {
+                let column = schema.column_at_ordinal(*idx).ok_or_else(|| {
                     Error::InvalidData(format!(
-                        "collection cell column index {idx} is outside the regular schema"
+                        "collection cell column index {idx} is outside the table schema"
                     ))
                 })?;
                 let kind = raw_collection_kind(&column.type_name).ok_or_else(|| {
@@ -224,6 +224,62 @@ pub(crate) fn normalize_collection_rows_for_merge(
     Ok(())
 }
 
+/// Collection kind of the column at cell index `idx` (statics first, then
+/// regulars, per `TableSchema`'s contract), or `None` for a non-collection,
+/// frozen or out-of-range column.
+fn collection_kind_at(schema: &TableSchema, idx: u16) -> Option<RawCollectionKind> {
+    let idx = idx as usize;
+    let static_count = schema.static_columns.len();
+    let column = if idx < static_count {
+        schema.static_columns.get(idx)
+    } else {
+        schema.regular_columns.get(idx - static_count)
+    }?;
+    raw_collection_kind(&column.type_name)
+}
+
+/// Expand every legacy whole-value collection cell (live, `path == None`, on a
+/// non-frozen list/set/map column) into a deletion sentinel plus per-element
+/// cells, in place. `row` is untouched when an error is returned.
+///
+/// Commit-log segments written before collection writes were normalised can
+/// still carry such cells. Replayed as-is they reach the flush writer, which
+/// asserts `path == None` cells on a complex column are tombstones whenever
+/// ANY cell in the same flush has a path — so one old blob beside an element
+/// write on another partition panics the flush. Normalising at the replay
+/// producer keeps the writer's assertion intact.
+pub(crate) fn expand_legacy_collection_blobs(row: &mut Row, schema: &TableSchema) -> Result<()> {
+    let is_blob = |cell: &CellValue| cell.path.is_none() && !cell.is_tombstone();
+    if !row
+        .cells
+        .iter()
+        .any(|(idx, cell)| is_blob(cell) && collection_kind_at(schema, *idx).is_some())
+    {
+        return Ok(());
+    }
+    // Move the cells rather than cloning them: this runs per row on a replay
+    // path and `cell.clone()` copies row data (P0 OOM audit, rule
+    // `clone-on-row-data`). Taking the vec is safe because every caller hands
+    // this function a row it already owns — `expand_legacy_collection_blobs`'s
+    // caller normalizes a `row.clone()` and discards it wholesale on `Err`,
+    // quarantining the original — so a part-consumed row never reaches storage.
+    let original = std::mem::take(&mut row.cells);
+    let mut cells = Vec::with_capacity(original.len() + 1);
+    for (idx, cell) in original {
+        match collection_kind_at(schema, idx).filter(|_| is_blob(&cell)) {
+            Some(kind) => cells.extend(
+                expand_legacy_collection_cell(kind, &cell)?
+                    .into_iter()
+                    .map(|element| (idx, element)),
+            ),
+            None => cells.push((idx, cell)),
+        }
+    }
+    cells.sort_by(|(a_idx, a), (b_idx, b)| (a_idx, &a.path).cmp(&(b_idx, &b.path)));
+    row.cells = cells;
+    Ok(())
+}
+
 pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Result<()> {
     // Clustering shape: production wedge was an 8-byte clustering on a
     // TimeUUID-clustered table. Catching this at the memtable boundary
@@ -247,18 +303,12 @@ pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Re
         }
     }
 
-    let static_count = schema.static_columns.len();
     for (col_idx, cell) in &row.cells {
         let bytes = match &cell.value {
             Some(v) => v,
             None => continue,
         };
-        let idx = *col_idx as usize;
-        let column = if idx < static_count {
-            &schema.static_columns[idx]
-        } else if idx - static_count < schema.regular_columns.len() {
-            &schema.regular_columns[idx - static_count]
-        } else {
+        let Some(column) = schema.column_at_ordinal(*col_idx) else {
             continue;
         };
         if let Err(reason) = validate_cell_bytes(&column.type_name, bytes) {

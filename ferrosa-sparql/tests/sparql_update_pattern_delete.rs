@@ -45,6 +45,7 @@ fn setup() -> (Arc<StorageEngine>, Arc<WritePath>, TempDir) {
         auth_warn: false,
         max_pending_replay_mutations_without_schema: 1024,
         memtable_num_shards: 64,
+        cache_hot_window_secs: 900,
     };
     let storage = Arc::new(StorageEngine::new(config, None).unwrap());
     let write_path = Arc::new(WritePath::direct(Arc::clone(&storage)));

@@ -11717,19 +11717,34 @@ async fn route_create_index(
                                     | IndexType::Phonetic
                             ) =>
                         {
-                            if let Err(e) = state.engine.add_partition_key_index(
+                            match state.engine.add_partition_key_index(
                                 &table_id,
                                 &index_name,
                                 component,
                                 index_type,
                             ) {
-                                tracing::warn!(
-                                    %e,
-                                    index_name,
-                                    table = %format!("{ks}.{}", s.table),
-                                    "router: CREATE INDEX failed to wire \
-                                     partition-key index to storage engine"
-                                );
+                                Ok(outcome) if !outcome.is_complete() => {
+                                    // Registered and stale: reads through it are
+                                    // refused, not short. Say so where the DDL ran.
+                                    tracing::error!(
+                                        ?outcome,
+                                        index_name,
+                                        table = %format!("{ks}.{}", s.table),
+                                        "router: CREATE INDEX backfill did NOT complete; the \
+                                         partition-key index is stale and refuses reads until \
+                                         `ferrosa-ctl index rebuild` finishes it"
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        %e,
+                                        index_name,
+                                        table = %format!("{ks}.{}", s.table),
+                                        "router: CREATE INDEX failed to wire \
+                                         partition-key index to storage engine"
+                                    );
+                                }
                             }
                         }
                         Some(_) => {
@@ -16067,6 +16082,7 @@ mod tests {
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
+            cache_hot_window_secs: 900,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
         // Real startup registers the system tables unconditionally (main.rs:802);
@@ -27276,6 +27292,7 @@ mod tests {
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
+            cache_hot_window_secs: 900,
         };
         let engine = StorageEngine::new(engine_config, None).unwrap();
 

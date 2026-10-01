@@ -522,6 +522,26 @@ impl FileReadAt {
 }
 
 impl FileReadAt {
+    /// Open a component whose local copy is known to be evicted, for ranged
+    /// read-through.
+    ///
+    /// [`Self::open`] and [`Self::open_with_cache`] restore a missing file
+    /// through the rehydration hooks, which downloads the whole generation.
+    /// This constructor does not touch the file system at all: every read is
+    /// offered to the range hook (and `len` to the len hook) while the file is
+    /// missing, and goes to the local file once it exists (a later full
+    /// rehydrate, e.g. by compaction). A read that no hook can serve fails
+    /// exactly as an `open_with_cache` reader's would, so a missing object is
+    /// an error, never an empty read.
+    pub fn open_evicted(path: impl AsRef<std::path::Path>) -> Self {
+        Self {
+            inner: FileReadAtInner::CachedFd {
+                path: path.as_ref().to_path_buf(),
+                cache: global_fd_cache(),
+            },
+        }
+    }
+
     /// True when this reader is a cache-bypassing sequential scan
     /// ([`Self::open_scan`]) rather than a shared, page-cached reader.
     pub fn is_scan(&self) -> bool {
@@ -1190,6 +1210,65 @@ mod tests {
             !path.exists(),
             "range fast path must not rehydrate the whole component"
         );
+    }
+
+    #[test]
+    fn open_evicted_serves_ranges_without_touching_or_rehydrating_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evicted-open-Data.db");
+        let remote = Arc::new(b"0123456789abcdef".to_vec());
+        let rehydrations = Arc::new(AtomicU64::new(0));
+
+        let hook_path = path.clone();
+        let remote_for_range = Arc::clone(&remote);
+        register_file_read_range_hook(Arc::new(move |p, offset, len| {
+            if p != hook_path {
+                return Ok(None);
+            }
+            let start = offset as usize;
+            let end = start.saturating_add(len).min(remote_for_range.len());
+            Ok(Some(remote_for_range[start..end].to_vec()))
+        }));
+        let hook_path = path.clone();
+        let remote_for_len = Arc::clone(&remote);
+        register_file_read_len_hook(Arc::new(move |p| {
+            Ok((p == hook_path).then(|| remote_for_len.len() as u64))
+        }));
+        let hook_path = path.clone();
+        let rehydrations_for_hook = Arc::clone(&rehydrations);
+        register_file_read_rehydration_hook(Arc::new(move |p| {
+            if p == hook_path {
+                rehydrations_for_hook.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false)
+        }));
+
+        let reader = FileReadAt::open_evicted(&path);
+        let mut buf = [0u8; 4];
+        reader.read_exact_at(&mut buf, 6).unwrap();
+
+        assert_eq!(&buf, b"6789");
+        assert_eq!(reader.len().unwrap(), remote.len() as u64);
+        assert!(!path.exists(), "no local file may appear");
+        assert_eq!(
+            rehydrations.load(Ordering::Relaxed),
+            0,
+            "a servable range must not trigger a whole-generation rehydrate"
+        );
+    }
+
+    #[test]
+    fn open_evicted_fails_loud_when_no_hook_can_serve_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = FileReadAt::open_evicted(dir.path().join("nobody-owns-this-Data.db"));
+        let mut buf = [0u8; 4];
+
+        let err = reader
+            .read_at(&mut buf, 0)
+            .expect_err("an unservable read of a missing file must be an error");
+
+        assert!(is_not_found(&err), "expected NotFound, got {err}");
+        assert!(reader.len().is_err());
     }
 
     #[cfg(target_os = "linux")]

@@ -191,6 +191,38 @@ enum Commands {
         #[command(subcommand)]
         action: SstableAction,
     },
+
+    /// Commit-log recovery (operates on a data directory; no live node
+    /// connection required).
+    Commitlog {
+        #[command(subcommand)]
+        action: CommitlogAction,
+    },
+}
+
+/// Commit-log recovery sub-actions (offline, filesystem-only).
+#[derive(Debug, Subcommand)]
+enum CommitlogAction {
+    /// Inspect the commit-log mutations startup replay set aside because no
+    /// table schema was available (`<data dir>/commitlog-unreplayed/`), and
+    /// replay them. Those rows are durable but invisible to reads, and `/readyz`
+    /// reports the node as not ready until they are applied. A node re-ingests
+    /// them itself once the table's schema registers. Dry-run by default — pass
+    /// `--apply`, with the node STOPPED, to replay the frames whose table schema
+    /// is known locally and drop them from the file.
+    SetAside {
+        /// The node's data directory (the one that holds `commitlog-unreplayed/`).
+        dir: std::path::PathBuf,
+
+        /// Actually replay. Without this flag the command only reports counts.
+        /// The node MUST be stopped before applying.
+        #[arg(long)]
+        apply: bool,
+
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Index sub-actions. These ask ONE node: an index can be built on this
@@ -329,6 +361,36 @@ enum SstableAction {
         /// Actually delete the objects. Without this, only the plan is printed.
         #[arg(long)]
         apply: bool,
+    },
+
+    /// Mark generations an older ferrosa evicted without recording it, so the
+    /// next start restores them from S3. Evidence is the node's log: each
+    /// `evicted uploaded local SSTable from cache` line names one. Replaces the
+    /// unsupported `scripts/recover-evicted-sstables.py`. Dry-run by default;
+    /// refuses a data dir whose node is running (it probes the sled lock under
+    /// `<data-dir>/raft`). Never overwrites an existing marker.
+    MarkEvicted {
+        /// The node's data directory (holds `sstables/` and `raft/`).
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+
+        /// The node's stdout/stderr log recording the evictions.
+        #[arg(long)]
+        log: std::path::PathBuf,
+
+        /// Scan only the last N MiB of the log (0 = all).
+        #[arg(long, default_value_t = 0)]
+        tail_mb: u64,
+
+        /// Write the markers. Without this, only the plan is printed. The node
+        /// MUST be stopped.
+        #[arg(long)]
+        apply: bool,
+
+        /// With --apply, proceed although no lock file exists to prove the
+        /// node is stopped (single-node dirs without a raft directory).
+        #[arg(long)]
+        assume_stopped: bool,
     },
 }
 
@@ -706,6 +768,11 @@ async fn main() {
                     .await
             }
         },
+        Commands::Commitlog { action } => match action {
+            CommitlogAction::SetAside { dir, apply, json } => {
+                commands::set_aside::run_set_aside(&dir, apply, json)
+            }
+        },
         Commands::Sstable { action } => match action {
             SstableAction::Scan {
                 dir,
@@ -748,6 +815,19 @@ async fn main() {
             SstableAction::S3Clean { dir, apply } => {
                 commands::sstable::sstable_s3_clean(&dir, apply).await
             }
+            SstableAction::MarkEvicted {
+                data_dir,
+                log,
+                tail_mb,
+                apply,
+                assume_stopped,
+            } => commands::evicted::sstable_mark_evicted(
+                &data_dir,
+                &log,
+                tail_mb,
+                apply,
+                assume_stopped,
+            ),
         },
     };
 
@@ -1444,6 +1524,36 @@ mod tests {
                 assert_eq!(dir, std::path::PathBuf::from("/data/ks.t"));
                 assert!(!apply, "quarantine must default to dry-run (apply=false)");
                 assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_mark_evicted_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "mark-evicted",
+            "--data-dir",
+            "/data/node1",
+            "--log",
+            "/logs/node1.log",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action:
+                    SstableAction::MarkEvicted {
+                        apply,
+                        assume_stopped,
+                        tail_mb,
+                        ..
+                    },
+            } => {
+                assert!(!apply, "mark-evicted must default to dry-run");
+                assert!(!assume_stopped);
+                assert_eq!(tail_mb, 0);
             }
             other => panic!("unexpected command: {other:?}"),
         }

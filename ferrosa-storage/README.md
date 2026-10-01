@@ -274,12 +274,34 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   **Request throttling (`upload/throttle.rs`):** every path shares one object
   store, wrapped in `ThrottledStore`. `FERROSA_S3_MAX_REQUESTS_PER_SECOND` paces
   requests evenly (no burst) and `FERROSA_S3_MAX_CONCURRENT_REQUESTS` caps them
-  in flight (`object_store::limit::LimitStore`); unset means unlimited, and a
+  in flight (`object_store::limit::LimitStore`); unset means the WAN default of 64, and a
   non-positive or non-integer value stops startup naming the variable. A request
   answered `429 Too Many Requests` is retried with exponential backoff (10
   attempts, 250 ms doubling to 30 s) — `object_store` retries only 5xx — and the
   log reports the start and end of a throttling episode, not every 429. Set both
   when recovering from Cloudflare R2.
+  **Downloads and pooling (`upload/download.rs`):** a component above
+  `FERROSA_S3_DOWNLOAD_PART_BYTES` (16 MiB) is fetched as ranged GETs
+  (`FERROSA_S3_DOWNLOAD_PART_CONCURRENCY`, default 4, through the same shared
+  store) written with positional writes into a preallocated `.part` file, which is
+  length-checked, fsynced and renamed; a failed part is retried alone (5
+  attempts) and a 429 shrinks that object's concurrency. A smaller component is
+  one GET through a 1 MiB buffered writer. Startup restore runs
+  `FERROSA_RESTORE_CONCURRENCY` generations at a time, clearing each marker only
+  once its generation is on disk. There is one client per process
+  (`ObjectStoreConfig::client_options` holds the pool, sized from the in-flight target
+  `FERROSA_S3_MAX_CONCURRENT_REQUESTS`, default 64 for a WAN, never from cores;
+  `FERROSA_S3_POOL_MAX_IDLE_PER_HOST`, `FERROSA_S3_POOL_IDLE_TIMEOUT_SECS` and
+  `FERROSA_S3_CONNECT_TIMEOUT_SECS` tune it; effective values are logged at
+  construction),
+  and `object_store_and_config` errors rather than building a second client.
+  **Stats (`upload/stats.rs`, `FERROSA_S3_STATS=1`):** a `StatsStore` layer under
+  the throttle records per-operation counts, bytes, latency histograms, errors,
+  429s and retries, and per (table, component) bytes, object-size histogram,
+  ranged vs whole GETs, download throughput and read amplification. Exposed as
+  `ferrosa_s3_*` Prometheus series and the virtual tables
+  `system_observability.object_store_stats` and `object_store_ops`. Off by
+  default; the keyed table is capped at 4096 keys with an overflow bucket.
 - **Local cache** (`cache.rs`) — LRU eviction with manifest-pinned entries that
   are never evicted. With the local `file://` backend the cache is constructed
   durable (`new_with_durability`): the local disk *is* the store of record, so
@@ -287,18 +309,92 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   durable copy.
 - **Uploaded-SSTable cache eviction** (`enforce_uploaded_sstable_cache_limit`) —
   under disk pressure or over `local_cache_max_bytes`, deletes the local copy of
-  manifest-listed SSTables, oldest first. Before deleting, it writes and fsyncs a
+  manifest-listed SSTables of tables that are not hot, never-read tables first,
+  then least recently read (`eviction_plan::order_for_eviction`, a pure
+  function). A table is hot for `FERROSA_CACHE_HOT_WINDOW_SECS` (default 900,
+  `0` disables) after a foreground read; the per-table stamp is set by the
+  engine's point, range, index and full-text read entry points and never by
+  anti-entropy repair, compaction or self-heal. When only hot tables keep the
+  cache over its limit, one WARN names `hot_bytes` and the hot tables (and one
+  INFO when it clears). Startup restore of evicted SSTables logs its plan and
+  progress. Before deleting, it writes and fsyncs a
   `<gen>.evicted` marker; the engine constructors restore every marked generation
   from S3 before any table registers (`restore_evicted_sstables`), because
   generation discovery reads local files only. Only marked generations are
   restored: a manifest entry without a marker may be a compacted-away input, and
-  restoring it would resurrect purged rows. Retiring a generation
-  (`delete_sstable_files`) removes its marker. A live reader that reopens a
+  restoring it would resurrect purged rows. Retiring a generation removes its
+  marker: `delete_sstable_files` (truncate/eviction) and compaction's input
+  retirement (`compaction::retire::retire`, which clears it last and fails the
+  retirement if it cannot, FMEA ST-61). Retirement and S3 rehydration of one
+  generation exclude each other (`generation_guard`), and a retired generation
+  is not rehydrated again. A live reader that reopens a
   marked generation between eviction and restart rehydrates it from S3 first
   (`flush::rehydrate_if_evicted`, called by `open_file_sstable` and
   `open_sstable_from_dir`) and then clears the marker; an unmarked missing
+  restoring it would resurrect purged rows. Retiring a generation
+  (`delete_sstable_files`) removes its marker. **Startup no longer bulk
+  downloads** (t_6a2847c8): `register_evicted_sstables_remote_in` fetches each
+  marked generation's index components (16 at a time) and the table loader
+  registers it remote-backed (`remote_backed_generations`; the Data.db walk and
+  smoke test are skipped, since reads verify checksums). A marked generation
+  missing from the manifest or the store fails startup. The pre-ST-51 behaviour
+  is `FERROSA_RESTORE_EVICTED_MODE=full` or `restore_evicted_sstables()`. After
+  each sync, `restore_hot_evicted_sstables` fully restores hot tables'
+  generations (8 per pass, only while free disk stays above the eviction target
+  and the uploaded cache under its limit; `FERROSA_RESTORE_HOT_TABLES_ON_START=0`
+  disables). A live QUERY that reopens a
+  marked generation between eviction and restart does not download it
+  (ST-51, `evicted_read.rs`): `open_file_sstable` fetches only the small index
+  components (`Partitions.db`, `Rows.db`, `Filter.db`, `Statistics.db`,
+  `CompressionInfo.db`, `TOC.txt`, digests) and serves `Data.db` through ranged
+  GETs. Pages follow compression-chunk boundaries (else
+  `FERROSA_S3_READ_PAGE_BYTES`, default 1 MiB), sit in a bounded LRU
+  (`FERROSA_S3_PAGE_CACHE_BYTES`, default 256 MiB), concurrent readers of a page
+  share one fetch, and adjacent misses become one ranged GET. All requests use
+  the engine's one shared object-store client. The marker stays, the per-chunk
+  CRC / `CRC.db` checks run on the ranged bytes, and a short or failed ranged
+  read is an error (ST-41). Whole-generation rehydrate
+  (the `FileReadAt` read-through hook, `rehydrate_file`) remains for
+  compaction inputs; an unmarked missing
   generation still fails to open so the read path's view-retry fires. System
   keyspaces are never evicted. See FMEA ST-38.
+  **The marker records why** (`eviction_marker.rs`, FMEA ST-63): one JSON
+  object `{version, trigger, source, written_at_unix_ms, generation_bytes,
+  total_bytes, max_bytes, min_bytes, projected_available, target_free}`.
+  `trigger` is `cache_cap`, `free_space`, `cache_cap_and_free_space`, or
+  `recovered` (written by a tool, not an eviction decision); `source` names the
+  writer (`ferrosa-storage evictor`, or `ferrosa-ctl sstable mark-evicted`). It
+  is written to a temp file, fsynced, renamed and the directory fsynced before
+  any component is deleted. Restore keys on the file's presence, never its
+  content: an EMPTY file is a legacy marker (evicted, reason unknown), and a
+  truncated or garbage file is also honoured as reason-unknown and reported
+  (`MarkerState::{Recorded, Legacy, Unreadable}`; restore logs one census line
+  and a WARN when any marker is unreadable). Unknown fields are ignored.
+  The evictor sizes candidates from the files on disk (never
+  `ManifestEntry::size`), counts each `(table, generation)` once, and logs one
+  WARN (edge only) when the manifest claims >= 1.5x and >= 16 MiB more bytes
+  than the same generations occupy on disk, or lists one twice (FMEA ST-64).
+  **Eviction audit** (`eviction_audit.rs`, FMEA ST-65): every pass that finds
+  pressure appends one JSON line to `<data_dir>/eviction-audit/audit.current.jsonl`
+  (trigger, `max_bytes`/`min_bytes`/`target_free`/`projected_available`, the
+  manifest's byte claim and the real on-disk total of the same set,
+  duplicate entries, generations and bytes evicted, pid, build). The files are
+  bounded by construction: `FERROSA_EVICTION_AUDIT_MAX_BYTES` (default 4 MiB,
+  clamped 16 KiB..32 MiB; under 0.8% of the default 512 MiB free-space reserve)
+  is split into 4 ring segments after a 4 KiB reserve, a record never lands in a
+  segment it does not fit, and the oldest rotated segment is deleted before the
+  current one is renamed, so no more than 4 files ever exist. Identical
+  consecutive passes coalesce into one record with a count. Writing it never
+  fails or delays an eviction: errors are reported on the edges (WARN when
+  writes start failing, INFO when they recover) and counted. The latest pass is
+  exposed as `ferrosa_storage_eviction_audit_*` metrics. Retention is the ring:
+  the newest segments that fit the cap. `FERROSA_EVICTION_AUDIT_OFFLOAD=true`
+  (off by default) uploads rotated segments to
+  `<prefix>/eviction-audit/<instance>/<segment>` through the engine's shared
+  throttled store, after the eviction, one segment per sync, one attempt with a
+  timeout, and removes the local copy only after the put succeeds. A failed
+  upload leaves the segment; the disk bound still wins, so the ring drops the
+  oldest un-uploaded segment by age if uploads keep failing.
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
@@ -310,7 +406,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   requests carry filtered predicates and clustering-column source metadata so
   remote sidecars match local builds. Existing SSTables and flush-time eager
   builds are marked pending in `IndexStateTracker` before async build
-  submission, giving read planners a real completeness signal.
+  submission, giving read planners a real completeness signal. Flush-time
+  builds run only when the flush published an SSTable
+  (`FlushOutcome::Published`); a flush with nothing to write touches neither
+  the tracker nor the pin accounting (ST-43).
   Registrations are dogfooded to `system_schema.indexes`; `unregister_table`
   (the DROP TABLE choke point for every DDL route) cascades tombstones over the
   dropped table's registrations via `write_index_tombstones_for_table` and
@@ -405,6 +504,32 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   indexed. Restore pulls every index artifact of a generation from S3
   completely before publishing it, and the S3 sync uploads sidecars built
   after their generation was already in the manifest.
+- **Index rebuild coverage** (`rebuild_index`, `index::orphan`, FMEA ST-53) —
+  a backfill walks the store's live SSTable set and classifies each generation
+  by its on-disk state, never by error text: `Data.db` present is built; an
+  eviction marker is rehydrated and built (restore failure fails it); `Data.db`
+  gone with the TOC surviving is `Vanished` (compacted away, discounted); a
+  generation with no files at all is `Failed` (stale enumeration). Completeness
+  needs zero failures AND every enumerated SSTable accounted for, a sidecar that
+  cannot be written, reopened or installed is a failure, and any failure leaves
+  the tracker stale so index reads are refused. `RebuildOutcome` reports
+  `sstables_failed`, and `add_partition_key_index` returns the same
+  `RebuildOutcome` (an incomplete backfill is a stale index, not an `Err`; the
+  CQL router and the startup reload log it at ERROR). A metadata-only
+  generation (TOC, no `Data.db`) is still discounted on the inference that
+  compaction removed it, but each one logs a WARN naming the generation and
+  calling the claim unverified; nothing records a retirement yet.
+  **Row-count reconciliation** (`index::orphan::ScanTally`, run inside
+  `LocalBackend::build`): the build compares the partitions it read with the
+  partition count the writer recorded in the SSTable footer, and, for a
+  partition-key index, the entries it produced with the partitions it owed one
+  to. Tolerance is zero and the cost is nil (counters on the pass the build
+  already makes). A mismatch fails the build, so the index stays stale. Cell and
+  clustering indexes get only the partition-walk check, because a null cell
+  legitimately yields no entry; the remote backend is not reconciled. An
+  entry-level check for those kinds would need a full table scan and is not done.
+  `ferrosa-ctl index rebuild` prints the failed count and exits non-zero when a
+  rebuild did not complete.
 - **Full-text search** (`fulltext_search(table, index, query, limit)`) —
   searches the memtable FTI + the `-FTI-{index}.db` sidecar of each **live**
   SSTable, found from the store view (`TableStore::fulltext_live_sidecars`),
@@ -420,7 +545,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   query, so a stable row is never dropped from `fts_match` (BUG-F-007 /
   t_0455c0a1). Before this, compaction wrote no sidecar and the fallback ran
   on every query for the life of every compacted SSTable — 7–13 s per replica
-  on a live cluster, past the coordinator's 3 s Bulk-lane budget (FMEA ST-24). Memory is
+  on a live cluster, past the coordinator's 3 s Bulk-lane budget (FMEA ST-58). Memory is
   bounded (t_ee98faa0 layer 2 — a broad `fts_match` used to OOM every
   replica): `limit` is the QUERY-derived `LIMIT k` pushed down by the
   coordinator (never a server cap) and bounds every per-source working set to
@@ -474,6 +599,79 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
   quarantines them under a safety rail.
+- **Replay without a schema degrades instead of exiting** (`replay_set_aside.rs`,
+  FMEA ST-52) — when no `schema.json`/`storage-schema.json` is usable, replay
+  buffers up to `FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA` mutations in memory
+  and appends the overflow to `<data_dir>/commitlog-unreplayed/*.unreplayed`
+  (CRC-framed, fsynced before the commit-log segment is deleted). The engine
+  opens, logs table ids/count/path at ERROR, bumps
+  `ferrosa_commitlog_replay_set_aside_mutations_total` and reports the unapplied
+  remainder through `StorageEngine::replay_set_aside_status()`, the
+  `ferrosa_commitlog_replay_set_aside_pending_mutations` gauge, and `/readyz`
+  (503, `waiting_for: "set_aside_mutations"`). Set-aside mutations are durable
+  but NOT visible to reads until re-ingested.
+- **Set-aside re-ingest** (`replay_set_aside.rs`, `StorageEngine::finish_construction`)
+  — every constructor finds `*.unreplayed` files: `StorageEngine` holds a
+  `SetAsideLedger` whose only constructor scans the data dir, so a constructor
+  cannot build the struct without adopting (and ends with `finish_construction`,
+  which re-ingests tables registered before the engine existed, as `open`'s are).
+  `every_public_constructor_adopts_a_pre_existing_set_aside_file` lists them all.
+  Each table registration (startup local schema, the
+  `open` schema, or DDL) re-ingests that table's frames. Frames stream one at a
+  time; each is applied through a strict path (a failed row aborts the file and
+  keeps it whole), the touched tables are flushed to SSTables, and only then
+  does the file shrink: frames for tables still unknown are copied to
+  `<file>.partial`, which atomically replaces the file, and a fully applied file
+  is removed. A crash at any point leaves the original, and re-applying a frame
+  rewrites identical cells, so a repeat adds no rows. Frames of a table that
+  was DROPPED after they were written are never applied to a re-created table of
+  the same name: `unregister_table` durably records each drop in
+  `<data_dir>/dropped-tables.json` (`table_drops.rs`; a drop that cannot be
+  recorded is refused), and a file created at or before a table's drop holds only
+  earlier-incarnation frames. Those are copied (fsynced) to
+  `<data_dir>/commitlog-quarantine/<file>.stale`, logged at ERROR, counted in
+  `replay_set_aside_stale_frames_total`, and only then leave the set-aside file.
+  The engine has no stable table id (the registry's UUID never reaches storage),
+  so a file created AFTER the drop that still holds pre-drop frames is not
+  detected. A torn or corrupt file is
+  never skipped or partly applied: it is reported (ERROR, `/readyz`
+  `unreadable_files`) and kept for the operator. Offline route:
+  `ferrosa-ctl commitlog set-aside <data-dir> [--apply]`
+  (`StorageEngine::reingest_set_aside_offline`). Replay also
+  expands legacy whole-value collection cells into element cells so the SSTable
+  writer's mixed-cell assertion cannot fire at the next flush.
+  Mutations for tables absent while a schema exists are held in memory up to
+  `FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS` (default 10000; invalid values fail
+  `open` naming the variable) and the overflow goes to the same set-aside file,
+  counted per table and logged at ERROR (FMEA ST-62).
+- **Range reads fail loud on an unreadable SSTable** (`store.rs`,
+  `with_retried_scan`, FMEA ST-41) — `read_range*`, `read_token_range[_bounded]`,
+  `walk_token_range[_for_digest]`, the time-series cursor and the full-text
+  sidecar-less scan never return a partial `Ok` when an SSTable in their view
+  cannot be opened or read (e.g. an evicted file whose S3 rehydrate failed).
+  They retry against a fresh view (compaction retired the input), then
+  quarantine the SSTable and return a typed `Error::CorruptSstable`.
+  A decode error AFTER the SSTable opened (mid-stream, in `walk_token_range[_for_digest]`
+  or the bounded-merge cascade) is attributed to the `MergeReader` that raised
+  it and takes the same path; a failure after the first row was delivered is
+  final (a retry would deliver twice), and an error from the caller's own row
+  callback is never mistaken for an SSTable failure. A generation whose open
+  failed is remembered for a short TTL (5 s, at most 256 entries — the
+  `MissingSstableCache` negative cache), so later reads and the eight retries
+  fail fast without reopening; it still returns the typed error, never a short
+  `Ok`. The entry is dropped when the generation is seeded (restored or
+  rewritten), when `resolve_sstable_quarantine` is called, or when it expires.
+  Counters: `missing_sstable_open_failures`, `missing_sstable_fast_fails`.
+- **Quarantine contract: never skipped** (`store.rs`, FMEA ST-56) — a quarantined
+  SSTable generation is not hidden from any read. Quarantine means "do not
+  re-open this file on every read"; a point, clustering-row, limited-row or
+  range read whose token lies in the generation's range keeps failing with the
+  typed `Error::CorruptSstable` until the generation leaves the view (repair, a
+  restore, compaction). A key resolved from the memtable or another SSTable does
+  not suppress the error, and secondary-index reads are refused while a
+  quarantined generation overlaps them. The coordinator fails over to a healthy
+  replica on the typed error. A transient compaction-retired-input window still
+  retries a fresh view and succeeds.
 - **Startup SSTable health** (`sstable_health.rs`) — decides whether a
   generation on disk can serve reads before it is loaded. A critical component
   (`Data.db`, `Partitions.db`) that is **missing**, **zero-byte**, or

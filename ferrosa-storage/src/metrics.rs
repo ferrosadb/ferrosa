@@ -346,6 +346,32 @@ pub fn register_write_admission_pressure(label: String, gauge: &Arc<AtomicU64>) 
         .push(Arc::downgrade(gauge));
 }
 
+/// Records one eviction audit pass. `written` is whether the durable record
+/// was written; the gauges reflect the pass either way, so the latest decision
+/// is visible even while the audit files are unwritable.
+pub fn observe_eviction_audit(record: &crate::eviction_audit::PassRecord, written: bool) {
+    EVICTION_AUDIT_PASSES_TOTAL.fetch_add(record.count, Ordering::Relaxed);
+    if !written {
+        EVICTION_AUDIT_WRITE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    EVICTION_AUDIT_LAST_UNIX_MS.store(record.last_unix_ms, Ordering::Relaxed);
+    EVICTION_AUDIT_LAST_TRIGGER.store(record.trigger as u64, Ordering::Relaxed);
+    EVICTION_AUDIT_LAST_EVICTED_GENERATIONS.store(record.evicted_generations, Ordering::Relaxed);
+    EVICTION_AUDIT_LAST_EVICTED_BYTES.store(record.evicted_bytes, Ordering::Relaxed);
+    EVICTION_AUDIT_LAST_MANIFEST_BYTES.store(record.manifest_bytes, Ordering::Relaxed);
+    EVICTION_AUDIT_LAST_DISK_BYTES.store(record.disk_bytes, Ordering::Relaxed);
+}
+
+/// Records the outcome of one audit offload attempt.
+pub fn observe_eviction_audit_offload(uploaded: bool, failed: bool) {
+    if uploaded {
+        EVICTION_AUDIT_OFFLOAD_UPLOADED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    if failed {
+        EVICTION_AUDIT_OFFLOAD_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn inc_write_admission_delayed() {
     WRITE_ADMISSION_DELAYED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -452,6 +478,19 @@ static WRITE_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURE_REASON_TOTAL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static SSTABLE_PUBLICATION_REFUSED_TOTAL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static WRITE_INLINE_FLUSH_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// Latest eviction-pass audit record (see `eviction_audit`), readable without
+// touching the audit files. Gauges hold the most recent recorded pass.
+static EVICTION_AUDIT_PASSES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_OFFLOAD_UPLOADED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_OFFLOAD_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_LAST_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_LAST_TRIGGER: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_LAST_EVICTED_GENERATIONS: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_LAST_EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_LAST_MANIFEST_BYTES: AtomicU64 = AtomicU64::new(0);
+static EVICTION_AUDIT_LAST_DISK_BYTES: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_SIZE_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_FLUSH_THRESHOLD_BYTES: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_BACKPRESSURE_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -950,6 +989,73 @@ pub fn render_prometheus() -> String {
             "ferrosa_storage_sstable_publication_refused_total{{reason=\"{}\"}} {}\n",
             reason.label(),
             SSTABLE_PUBLICATION_REFUSED_TOTAL[reason.idx()].load(Ordering::Relaxed)
+        ));
+    }
+    for (name, kind, help, value) in [
+        (
+            "passes_total",
+            "counter",
+            "Eviction passes with pressure that were audited.",
+            &EVICTION_AUDIT_PASSES_TOTAL,
+        ),
+        (
+            "write_failures_total",
+            "counter",
+            "Eviction audit records that could not be written.",
+            &EVICTION_AUDIT_WRITE_FAILURES_TOTAL,
+        ),
+        (
+            "offload_uploaded_total",
+            "counter",
+            "Audit segments uploaded to S3 and removed locally.",
+            &EVICTION_AUDIT_OFFLOAD_UPLOADED_TOTAL,
+        ),
+        (
+            "offload_failures_total",
+            "counter",
+            "Audit segment offload attempts that failed.",
+            &EVICTION_AUDIT_OFFLOAD_FAILURES_TOTAL,
+        ),
+        (
+            "last_unix_ms",
+            "gauge",
+            "Time of the latest audited eviction pass.",
+            &EVICTION_AUDIT_LAST_UNIX_MS,
+        ),
+        (
+            "last_trigger",
+            "gauge",
+            "Trigger of the latest audited pass: 0 cache_cap, 1 free_space, 2 both, 3 recovered.",
+            &EVICTION_AUDIT_LAST_TRIGGER,
+        ),
+        (
+            "last_evicted_generations",
+            "gauge",
+            "Generations evicted by the latest audited pass.",
+            &EVICTION_AUDIT_LAST_EVICTED_GENERATIONS,
+        ),
+        (
+            "last_evicted_bytes",
+            "gauge",
+            "Bytes evicted by the latest audited pass.",
+            &EVICTION_AUDIT_LAST_EVICTED_BYTES,
+        ),
+        (
+            "last_manifest_bytes",
+            "gauge",
+            "Bytes the manifest claimed for the eviction candidates in the latest audited pass.",
+            &EVICTION_AUDIT_LAST_MANIFEST_BYTES,
+        ),
+        (
+            "last_disk_bytes",
+            "gauge",
+            "Bytes those candidates occupied on disk in the latest audited pass.",
+            &EVICTION_AUDIT_LAST_DISK_BYTES,
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP ferrosa_storage_eviction_audit_{name} {help}\n# TYPE ferrosa_storage_eviction_audit_{name} {kind}\nferrosa_storage_eviction_audit_{name} {}\n",
+            value.load(Ordering::Relaxed)
         ));
     }
     out.push_str("# HELP ferrosa_storage_write_inline_flush_total StorageEngine::write calls that synchronously ran a memtable flush.\n");

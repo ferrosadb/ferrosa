@@ -1124,4 +1124,130 @@ mod tests {
             "single-threaded write should not show contention"
         );
     }
+
+    const UTF8: &str = "org.apache.cassandra.db.marshal.UTF8Type";
+    const LIST_OF_TEXT: &str =
+        "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.UTF8Type)";
+    const SET_OF_TEXT: &str =
+        "org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.UTF8Type)";
+
+    fn column(name: &str, type_name: &str) -> ColumnDefinition {
+        ColumnDefinition {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+        }
+    }
+
+    /// Ordinals: static `s` = 0, regular `a` = 1, regular `l` (list) = 2.
+    /// `l` is regular position 0 + 1 static, so a lookup that ignores the
+    /// static offset reads position 2 of `regular_columns` (out of range).
+    fn schema_static_text_regular_text_and_list() -> TableSchema {
+        TableSchema {
+            static_columns: vec![column("s", UTF8)],
+            regular_columns: vec![column("a", UTF8), column("l", LIST_OF_TEXT)],
+            ..test_schema()
+        }
+    }
+
+    /// A legacy whole-collection blob: `count`, then length-prefixed elements.
+    fn collection_blob(elements: &[&[u8]]) -> Vec<u8> {
+        let mut blob = (elements.len() as i32).to_be_bytes().to_vec();
+        for element in elements {
+            blob.extend_from_slice(&(element.len() as i32).to_be_bytes());
+            blob.extend_from_slice(element);
+        }
+        blob
+    }
+
+    fn legacy_blob_row(col: u16, elements: &[&[u8]], timestamp: i64) -> Row {
+        make_row(col, &collection_blob(elements), timestamp)
+    }
+
+    /// The merge normalizer must resolve a cell ordinal the way the schema
+    /// defines it (statics first, then regulars), or it expands a blob under
+    /// the wrong column's type -- or rejects it as "outside the regular
+    /// schema" -- on any table that has a static column.
+    #[test]
+    fn merge_expands_a_legacy_list_blob_on_a_table_with_static_columns() {
+        let schema = schema_static_text_regular_text_and_list();
+        let list_ordinal = schema.column_index("l").unwrap();
+        assert_eq!(list_ordinal, 2, "schema ordering contract: statics first");
+
+        let mut p = empty_partition();
+        merge_row_into_partition(
+            &mut p,
+            complex_row(list_ordinal, b"pA", b"first", 10),
+            &schema,
+        )
+        .unwrap();
+        merge_row_into_partition(
+            &mut p,
+            legacy_blob_row(list_ordinal, &[b"x", b"y"], 20),
+            &schema,
+        )
+        .unwrap();
+
+        let list_cells: Vec<_> = p.rows[0]
+            .cells
+            .iter()
+            .filter(|(idx, _)| *idx == list_ordinal)
+            .collect();
+        assert!(
+            list_cells
+                .iter()
+                .all(|(_, c)| c.path.is_some() || c.is_tombstone()),
+            "no pathless live cell may remain in a complex column: {list_cells:?}"
+        );
+        let live_values: Vec<_> = list_cells
+            .iter()
+            .filter(|(_, c)| c.path.is_some() && !c.is_tombstone() && c.timestamp == 20)
+            .map(|(_, c)| c.value.clone().unwrap())
+            .collect();
+        assert_eq!(live_values, vec![b"x".to_vec(), b"y".to_vec()]);
+    }
+
+    /// A collection in a STATIC column sits at an ordinal below
+    /// `static_columns.len()`, so it must be looked up in `static_columns`.
+    #[test]
+    fn merge_expands_a_legacy_set_blob_in_a_static_column() {
+        let schema = TableSchema {
+            static_columns: vec![column("ss", SET_OF_TEXT)],
+            regular_columns: vec![column("a", UTF8)],
+            ..test_schema()
+        };
+        let mut p = empty_partition();
+        merge_row_into_partition(&mut p, complex_row(0, b"k1", b"", 10), &schema).unwrap();
+        merge_row_into_partition(&mut p, legacy_blob_row(0, &[b"k2"], 20), &schema).unwrap();
+
+        let paths: Vec<_> = p.rows[0]
+            .cells
+            .iter()
+            .filter(|(idx, c)| *idx == 0 && !c.is_tombstone())
+            .map(|(_, c)| c.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![Some(b"k1".to_vec()), Some(b"k2".to_vec())],
+            "both set elements live under the static column"
+        );
+    }
+
+    /// Other columns' cells must come through the normalizer untouched, still
+    /// under their own ordinal.
+    #[test]
+    fn merge_normalization_leaves_other_columns_on_their_own_ordinals() {
+        let schema = schema_static_text_regular_text_and_list();
+        let mut p = empty_partition();
+        let mut first = complex_row(2, b"pA", b"first", 10);
+        first
+            .cells
+            .insert(0, (1, CellValue::live(b"text".to_vec(), 10)));
+        merge_row_into_partition(&mut p, first, &schema).unwrap();
+        merge_row_into_partition(&mut p, legacy_blob_row(2, &[b"x"], 20), &schema).unwrap();
+
+        let a_cells: Vec<_> = p.rows[0].cells.iter().filter(|(i, _)| *i == 1).collect();
+        assert_eq!(a_cells.len(), 1);
+        assert_eq!(a_cells[0].1.value.as_deref(), Some(b"text".as_slice()));
+        assert!(a_cells[0].1.path.is_none());
+    }
 }

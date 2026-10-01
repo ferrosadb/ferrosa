@@ -92,6 +92,18 @@ pub fn is_rate_limited(err: &object_store::Error) -> bool {
     text.contains("429") && text.contains("Too Many Requests")
 }
 
+/// Count of 429 responses seen by any [`ThrottledStore`] in this process.
+static RATE_LIMIT_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many 429 responses this process has seen. A download compares the
+/// value before and after a request to learn that the store pushed back,
+/// because the store layer retries a 429 itself and the caller sees success.
+/// The signal is process-wide, so it may shrink an object's concurrency for
+/// pressure another request caused; that errs toward backing off.
+pub fn rate_limit_events() -> u64 {
+    RATE_LIMIT_EVENTS.load(Ordering::Relaxed)
+}
+
 /// An [`ObjectStore`] that paces requests and retries rate-limited ones.
 pub struct ThrottledStore {
     inner: Arc<dyn ObjectStore>,
@@ -141,6 +153,8 @@ impl ThrottledStore {
             tries += 1;
             match attempt().await {
                 Err(e) if is_rate_limited(&e) && tries < self.retry.max_attempts => {
+                    RATE_LIMIT_EVENTS.fetch_add(1, Ordering::Relaxed);
+                    super::stats::record_retry(op);
                     if !self.throttled.swap(true, Ordering::Relaxed) {
                         tracing::warn!(
                             op,
@@ -154,6 +168,7 @@ impl ThrottledStore {
                     backoff = (backoff * 2).min(self.retry.max_backoff);
                 }
                 Err(e) if is_rate_limited(&e) => {
+                    RATE_LIMIT_EVENTS.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         op,
                         %location,

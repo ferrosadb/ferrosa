@@ -89,6 +89,8 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
     output.push_str(&ferrosa_cluster::coordinator::metrics::render_prometheus());
     output.push_str(&ferrosa_storage::commitlog::render_prometheus());
     output.push_str(&ferrosa_storage::metrics::render_prometheus());
+    // Empty unless FERROSA_S3_STATS=1; per-table labels exist only then.
+    output.push_str(&ferrosa_storage::upload::stats::render_prometheus());
 
     // Process memory metrics — critical for diagnosing memory leaks.
     // On Linux (containers), read from /proc/self/status.

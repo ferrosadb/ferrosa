@@ -2423,6 +2423,7 @@ dependencies = [
  "ferrosa-sstable",
  "ferrosa-storage",
  "ferrosa-udf",
+ "fs2",
  "futures",
  "object_store",
  "ratatui",
@@ -2633,6 +2634,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

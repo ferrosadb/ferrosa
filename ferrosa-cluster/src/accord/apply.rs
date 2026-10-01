@@ -683,7 +683,24 @@ impl DepWaitApplier {
         for dep in &deps {
             if !graph.is_applied(dep) {
                 waiting = true;
-                let _ = graph.register_wait(txn_id, *dep);
+                // A cycle is never silently dropped: the edge is not recorded,
+                // so carrying on would let this transaction apply ahead of (or
+                // park forever behind) a dependency. The state machine waives
+                // dependencies that execute after the waiter, so a cycle here
+                // means an ordering invariant broke — refuse the apply loudly.
+                if let Err(error) = graph.register_wait(txn_id, *dep) {
+                    graph.clear_waits(txn_id);
+                    tracing::error!(
+                        txn = txn_id.0.time,
+                        dep = dep.0.time,
+                        %error,
+                        "accord apply: dependency cycle among parked transactions — refusing the apply"
+                    );
+                    return Err(ApplyError {
+                        txn_id,
+                        reason: error.to_string(),
+                    });
+                }
             }
         }
 
@@ -719,13 +736,40 @@ impl DepWaitApplier {
     /// `Applied`. A waiter whose apply *fails* is left un-applied and is NOT in
     /// the returned list (fail loud; its dependents stay parked).
     fn cascade(&self, just_applied: TxnId) -> Vec<(TxnId, Vec<u8>)> {
-        let mut applied: Vec<(TxnId, Vec<u8>)> = Vec::new();
-        let mut queue: VecDeque<TxnId> = self
+        let queue: VecDeque<TxnId> = self
             .graph
             .lock()
             .mark_applied(just_applied)
             .into_iter()
             .collect();
+        self.apply_unblocked(queue)
+    }
+
+    /// The transactions parked waiting on `dep`.
+    pub fn waiters_on(&self, dep: &TxnId) -> Vec<TxnId> {
+        self.graph.lock().waiters_of(dep)
+    }
+
+    /// Release `waiter` from its wait on `dep`, which executes after it and so
+    /// must not hold it up (an Accord transaction waits only for dependencies
+    /// that execute BEFORE it). If that was its last wait, its parked write-set is
+    /// applied now and the cascade runs.
+    ///
+    /// Returns the `(txn_id, mutation_data)` of every transaction persisted, as
+    /// [`Self::notify_applied`] does; empty when `waiter` still waits on others.
+    pub fn waive_dependency(&self, waiter: TxnId, dep: TxnId) -> Vec<(TxnId, Vec<u8>)> {
+        let unblocked = self.graph.lock().waive(waiter, dep);
+        if !unblocked {
+            return Vec::new();
+        }
+        self.apply_unblocked(VecDeque::from([waiter]))
+    }
+
+    /// Apply every transaction in `queue` (each now has no unresolved
+    /// dependency), then everything its application unblocks, in dependency
+    /// order. See [`Self::cascade`] for the return value and failure handling.
+    fn apply_unblocked(&self, mut queue: VecDeque<TxnId>) -> Vec<(TxnId, Vec<u8>)> {
+        let mut applied: Vec<(TxnId, Vec<u8>)> = Vec::new();
         while let Some(waiter) = queue.pop_front() {
             // Pull the waiter's parked write-set (stored when it parked in
             // `try_apply_writeset`). If absent — e.g. a no-write finalize that
@@ -928,6 +972,31 @@ mod tests {
             "noop applier must record the application"
         );
         assert_eq!(noop.apply_count(), 1);
+    }
+
+    // A dependency cycle among parked transactions was swallowed
+    // (`let _ = register_wait`): the edge was dropped, so the second transaction
+    // either applied ahead of its dependency or parked with nothing to wake it.
+    #[test]
+    fn a_dependency_cycle_refuses_the_apply_and_leaves_no_half_registered_waits() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+        let (first, second, other) = (txn_id(1, 1000), txn_id(2, 1001), txn_id(3, 1002));
+
+        assert!(applier
+            .try_apply(first, mutation(vec![second]))
+            .unwrap()
+            .is_empty());
+        let refused = applier
+            .try_apply(second, mutation(vec![other, first]))
+            .expect_err("a cycle must be refused, not swallowed");
+
+        assert_eq!(refused.txn_id, second);
+        assert!(
+            applier.waiters_on(&other).is_empty(),
+            "the refused transaction must not stay registered on its other dependencies"
+        );
+        assert_eq!(noop.apply_count(), 0);
     }
 
     // -----------------------------------------------------------------------

@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use ferrosa_common::task_pool::TaskPool;
 use futures::TryStreamExt;
 use parking_lot::RwLock;
@@ -50,7 +49,7 @@ use crate::compaction::retry::CompactionRetryPolicy;
 use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
 use crate::flush::{FileFlushTarget, REQUIRED_SSTABLE_COMPONENTS};
-use crate::store::{TableStore, VectorIndexConfig, VectorIndexMethod};
+use crate::store::{FlushOutcome, TableStore, VectorIndexConfig, VectorIndexMethod};
 use crate::timeseries::aggregator::decode_typed_numeric;
 use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
 use crate::timeseries::consolidation::Accumulator;
@@ -422,18 +421,43 @@ pub struct RebuildOutcome {
     /// who can see 21 generations on disk and is told "1 of 1" needs the other
     /// twenty accounted for, or the smaller denominator reads as a lie.
     pub sstables_vanished: usize,
+    /// SSTables that should have been indexed and were not: absent entirely
+    /// (a stale enumeration), evicted and not restorable, or unreadable.
+    /// Any of these leaves the index short, so the index is NOT marked current.
+    pub sstables_failed: usize,
 }
 
 impl RebuildOutcome {
+    /// The outcome a backfill's [`Coverage`](crate::index::orphan::Coverage)
+    /// tally amounts to. One conversion for `rebuild_index` and
+    /// `add_partition_key_index`, so the two cannot report the same backfill
+    /// differently.
+    #[must_use]
+    pub fn from_coverage(coverage: &crate::index::orphan::Coverage) -> Self {
+        Self {
+            sstables_rebuilt: coverage.built,
+            sstables_total: coverage.expected,
+            sstables_vanished: coverage.vanished,
+            sstables_failed: coverage.failed,
+        }
+    }
+
     /// Whether every SSTable that HOLDS ROWS is now covered.
     ///
-    /// Vanished SSTables cannot leave an index incomplete: an index covering
-    /// every SSTable that has rows covers every row. Requiring them to be
-    /// "rebuilt" is what made a repaired index report failure forever, because
-    /// the data files were compacted away on purpose and are never coming back.
+    /// Vanished SSTables (data file gone, TOC and sidecars still present) cannot
+    /// leave an index incomplete: an index covering every SSTable that has rows
+    /// covers every row. Requiring them to be "rebuilt" is what made a repaired
+    /// index report failure forever, because the data files were compacted away
+    /// on purpose and are never coming back.
+    ///
+    /// Completeness is NOT derivable from "nothing failed" alone: every
+    /// enumerated SSTable must be accounted for as rebuilt, vanished or failed,
+    /// and none may have failed. A generation that fell through every bucket
+    /// would otherwise read as complete.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.sstables_rebuilt + self.sstables_vanished >= self.sstables_total
+        self.sstables_failed == 0
+            && self.sstables_rebuilt + self.sstables_vanished == self.sstables_total
     }
 
     /// SSTables that actually had rows to index.
@@ -443,6 +467,9 @@ impl RebuildOutcome {
     }
 }
 
+/// Default `FERROSA_CACHE_HOT_WINDOW_SECS`: 15 minutes.
+const DEFAULT_CACHE_HOT_WINDOW_SECS: u64 = 900;
+
 /// Composes sub-configurations for each component. Use `from_env()` for
 /// production (reads `FERROSA_*` env vars) or `test_config()` for tests.
 pub struct StorageEngineConfig {
@@ -450,6 +477,10 @@ pub struct StorageEngineConfig {
     pub compaction: CompactionConfig,
     pub object_store: Option<ObjectStoreConfig>,
     pub local_cache_max_bytes: u64,
+    /// Seconds a table counts as hot after a foreground read; hot tables'
+    /// uploaded SSTables are never evicted from the local cache. `0` disables
+    /// hotness (every table is evictable). `FERROSA_CACHE_HOT_WINDOW_SECS`.
+    pub cache_hot_window_secs: u64,
     /// Minimum free bytes to preserve on the local data filesystem before
     /// admitting a new write. When the filesystem is below this reserve, writes
     /// fail closed before appending to the commit log, so periodic fsync and
@@ -556,6 +587,129 @@ pub enum IncrementalCompactionSchedule {
     },
 }
 
+/// Failure injection for set-aside re-ingest crash tests.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SetAsideFaults {
+    /// Fail before applying the frame with this index.
+    pub(crate) fail_before_frame: Option<usize>,
+    /// Fail after the tables are flushed, before the file is rewritten.
+    pub(crate) fail_after_flush: bool,
+}
+
+/// Feeds set-aside frames into the engine's tables and makes them durable by
+/// flushing the tables they touched.
+struct EngineSetAsideSink<'a> {
+    engine: &'a StorageEngine,
+    /// When set, only this table's frames are applied; the rest are kept.
+    only: Option<&'a TableId>,
+    touched: std::collections::HashSet<TableId>,
+    faults: SetAsideFaults,
+    /// When the file was created: an upper bound on when each frame was written.
+    /// `None` when the file name carries no time.
+    file_created_ms: Option<u64>,
+    /// Latest recorded drop of each table name.
+    drops: crate::table_drops::DropLedger,
+    /// Tables already reported, so a table logs once per file, not per frame.
+    reported: std::collections::HashSet<TableId>,
+}
+
+impl<'a> EngineSetAsideSink<'a> {
+    fn new(
+        engine: &'a StorageEngine,
+        path: &Path,
+        only: Option<&'a TableId>,
+        faults: SetAsideFaults,
+    ) -> ferrosa_common::Result<Self> {
+        Ok(Self {
+            engine,
+            only,
+            touched: std::collections::HashSet::new(),
+            faults,
+            file_created_ms: crate::table_drops::set_aside_file_created_millis(path),
+            drops: crate::table_drops::load(&engine.config.data_dir)?,
+            reported: std::collections::HashSet::new(),
+        })
+    }
+
+    /// The drop time that proves this frame predates its table's current
+    /// incarnation: the table was dropped at or after the file was created, so
+    /// the frame was written before the drop.
+    fn dropped_after_written(&mut self, table_id: &TableId) -> Option<u64> {
+        let dropped = *self.drops.get(&crate::table_drops::ledger_key(
+            table_id.keyspace(),
+            table_id.table(),
+        ))?;
+        let Some(created) = self.file_created_ms else {
+            if self.reported.insert(table_id.clone()) {
+                tracing::warn!(
+                    table = %table_id,
+                    dropped_at_ms = dropped,
+                    "set-aside file name carries no creation time, so frames cannot be \
+                     compared with this table's recorded drop; applying them"
+                );
+            }
+            return None;
+        };
+        (created <= dropped).then_some(dropped)
+    }
+
+    fn report_stale(&mut self, table_id: &TableId, dropped_ms: u64) {
+        crate::replay_set_aside::count_stale_frame();
+        if !self.reported.insert(table_id.clone()) {
+            return;
+        }
+        tracing::error!(
+            table = %table_id,
+            frames_written_before_ms = self.file_created_ms,
+            live_table_dropped_at_ms = dropped_ms,
+            quarantine_dir = crate::replay_set_aside::STALE_QUARANTINE_DIR,
+            "set-aside frames belong to a previous table of this name (it was dropped \
+             after they were written) and are NOT applied to the live table; they are \
+             kept in the quarantine directory for an operator, and are not lost"
+        );
+    }
+}
+
+impl crate::replay_set_aside::SetAsideSink for EngineSetAsideSink<'_> {
+    fn apply(
+        &mut self,
+        index: usize,
+        mutation: &Mutation,
+    ) -> ferrosa_common::Result<crate::replay_set_aside::FrameFate> {
+        use crate::replay_set_aside::FrameFate;
+        if self.faults.fail_before_frame == Some(index) {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "injected set-aside re-ingest fault before frame {index}"
+            )));
+        }
+        let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        if self.only.is_some_and(|only| *only != table_id) {
+            return Ok(FrameFate::Keep);
+        }
+        if let Some(dropped_ms) = self.dropped_after_written(&table_id) {
+            self.report_stale(&table_id, dropped_ms);
+            return Ok(FrameFate::Stale);
+        }
+        if !StorageEngine::apply_replay_mutation_strict(&self.engine.tables, mutation)? {
+            return Ok(FrameFate::Keep);
+        }
+        self.touched.insert(table_id);
+        Ok(FrameFate::Applied)
+    }
+
+    fn make_durable(&mut self) -> ferrosa_common::Result<()> {
+        for table_id in self.touched.drain() {
+            self.engine.flush(&table_id)?;
+        }
+        if self.faults.fail_after_flush {
+            return Err(ferrosa_common::Error::InvalidData(
+                "injected set-aside re-ingest fault after the flush".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl StorageEngineConfig {
     /// Reads configuration from `FERROSA_*` environment variables.
     pub fn from_env() -> ferrosa_common::Result<Self> {
@@ -587,6 +741,19 @@ impl StorageEngineConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10 * 1024 * 1024 * 1024); // 10 GB default
+
+        let cache_hot_window_secs = match std::env::var("FERROSA_CACHE_HOT_WINDOW_SECS") {
+            Err(_) => DEFAULT_CACHE_HOT_WINDOW_SECS,
+            Ok(raw) => raw.parse().unwrap_or_else(|e| {
+                tracing::warn!(
+                    value = raw,
+                    error = %e,
+                    default = DEFAULT_CACHE_HOT_WINDOW_SECS,
+                    "FERROSA_CACHE_HOT_WINDOW_SECS is not a whole number of seconds; using the default"
+                );
+                DEFAULT_CACHE_HOT_WINDOW_SECS
+            }),
+        };
 
         let local_disk_free_reserve_bytes = std::env::var("FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES")
             .ok()
@@ -667,6 +834,7 @@ impl StorageEngineConfig {
             compaction,
             object_store,
             local_cache_max_bytes,
+            cache_hot_window_secs,
             local_disk_free_reserve_bytes,
             flush_threshold_bytes,
             memtable_backpressure_bytes,
@@ -692,11 +860,12 @@ impl StorageEngineConfig {
             commit_log: CommitLogConfig::test_config(dir),
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
-            local_cache_max_bytes: 1024 * 1024,    // 1 MB
-            local_disk_free_reserve_bytes: 0,      // disabled by default in tests
-            flush_threshold_bytes: 4096,           // 4 KB — triggers flush quickly in tests
+            local_cache_max_bytes: 1024 * 1024, // 1 MB
+            cache_hot_window_secs: DEFAULT_CACHE_HOT_WINDOW_SECS,
+            local_disk_free_reserve_bytes: 0, // disabled by default in tests
+            flush_threshold_bytes: 4096,      // 4 KB — triggers flush quickly in tests
             memtable_backpressure_bytes: u64::MAX, // disabled by default in tests; opt-in per test
-            flush_max_age_secs: 5,                 // 5s — fast age-based flush in tests
+            flush_max_age_secs: 5,            // 5s — fast age-based flush in tests
             data_dir: dir.to_path_buf(),
             index_backend: crate::index::IndexBackendConfig::Local,
             // Tests keep verification on — writer bugs surface
@@ -1103,6 +1272,14 @@ pub struct StorageEngine {
     /// Commitlog mutations replayed before their table schema is registered.
     /// These are applied lazily when the table is later registered.
     deferred_replay_mutations: parking_lot::Mutex<Vec<Mutation>>,
+    /// Mutations startup replay wrote to disk instead of a memtable because no
+    /// schema was available and the in-memory buffer was full, and that have
+    /// not been re-ingested yet. Empty when nothing is set aside. These rows
+    /// are invisible to reads, so `/readyz` reports them. See
+    /// [`crate::replay_set_aside`].
+    set_aside_status: crate::replay_set_aside::SetAsideLedger,
+    /// Serializes set-aside re-ingest runs (startup and table registration).
+    set_aside_reingest: parking_lot::Mutex<()>,
     /// Index registrations that arrived before their table was registered,
     /// applied when it is — the same lazy shape as
     /// `deferred_replay_mutations` directly above, for the same reason.
@@ -1152,6 +1329,13 @@ pub struct StorageEngine {
     /// sync, compaction retry, and operator-triggered syncs can otherwise race
     /// from the same manifest snapshot and re-upload the same SSTables.
     s3_sync_running: AtomicBool,
+    /// Edge state for the "hot tables alone keep the cache over its limit"
+    /// warning: true while the last eviction pass was blocked by hot data.
+    cache_hot_blocked: AtomicBool,
+    /// Edge flag for the manifest-vs-disk drift warning.
+    manifest_drift_flagged: AtomicBool,
+    /// Durable, bounded record of every eviction pass that found pressure.
+    eviction_audit: crate::eviction_audit::EvictionAudit,
     /// Set when write admission observes local disk pressure. The process
     /// maintenance loop consumes this flag to run an urgent S3 upload/eviction
     /// pass instead of waiting for the next normal flush tick.
@@ -1219,6 +1403,13 @@ struct TableState {
     write_pressure_percent: Arc<AtomicU64>,
     /// Tracks soft-zone edges so logs are emitted once per transition.
     in_write_soft_zone: AtomicBool,
+    /// Unix milliseconds of the last FOREGROUND read of this table; `0` means
+    /// never read since startup. The uploaded-SSTable cache evictor keys on it
+    /// so hot, rarely-written tables are not evicted. Anti-entropy repair
+    /// (`read_token_range*`, `walk_token_range*`), compaction and self-heal
+    /// deliberately never stamp it: they touch every table and would make
+    /// everything look hot. Lock-free so the read path pays one relaxed store.
+    last_foreground_read_unix_ms: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -1352,6 +1543,29 @@ impl IntoIterator for LocalTableSchemas {
 }
 
 impl TableState {
+    /// Records a foreground read of this table (see
+    /// `last_foreground_read_unix_ms`).
+    fn note_foreground_read(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            // A clock before 1970 is a host fault; stamp 1 ("read, at the
+            // epoch") rather than 0 ("never read") so the read is still seen.
+            .map_or(1, |d| (d.as_millis() as u64).max(1));
+        self.last_foreground_read_unix_ms
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Time of the last foreground read, `None` if never read since startup.
+    fn last_foreground_read(&self) -> Option<std::time::SystemTime> {
+        match self
+            .last_foreground_read_unix_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            ms => Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+        }
+    }
+
     fn time_series_timestamp_unit(&self) -> TimeSeriesTimestampUnit {
         self.schema
             .clustering_columns
@@ -1359,6 +1573,158 @@ impl TableState {
             .map(|column| TimeSeriesTimestampUnit::from_storage_type(&column.type_name))
             .unwrap_or(TimeSeriesTimestampUnit::Micros)
     }
+}
+
+/// What an evicted-SSTable restore has to do, counted from the eviction
+/// markers and the manifest before any download starts.
+#[derive(Debug, PartialEq, Eq)]
+struct RestoreWork {
+    /// Tables with at least one restorable generation.
+    tables: usize,
+    /// Marked generations the manifest lists (the ones that can be restored).
+    generations: usize,
+    /// Manifest-recorded bytes of those generations.
+    bytes: u64,
+}
+
+fn restore_work(
+    evicted: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    manifest: &crate::manifest::Manifest,
+) -> RestoreWork {
+    let mut work = RestoreWork {
+        tables: 0,
+        generations: 0,
+        bytes: 0,
+    };
+    for (dir_name, gens) in evicted {
+        let mut in_table = 0usize;
+        for entry in manifest.sstables.get(dir_name).into_iter().flatten() {
+            if gens.contains(&entry.id) {
+                in_table += 1;
+                work.bytes = work.bytes.saturating_add(entry.size);
+            }
+        }
+        work.generations += in_table;
+        work.tables += usize::from(in_table > 0);
+    }
+    work
+}
+
+/// Test seam between a rehydrated component's temp file being complete and its
+/// promotion by rename: the window in which a concurrent retirement used to
+/// sweep the temp file away (ST-61). Keyed by table directory so tests running
+/// in parallel only see their own.
+#[cfg(test)]
+mod rehydrate_promote_seam {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    type PromoteHook = Arc<dyn Fn(&Path) + Send + Sync>;
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, PromoteHook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn install(table_dir: &Path, hook: PromoteHook) {
+        HOOKS
+            .lock()
+            .expect("promote seam lock")
+            .insert(table_dir.to_path_buf(), hook);
+    }
+
+    pub(super) fn fire(tmp_path: &Path) {
+        let hook = tmp_path.parent().and_then(|dir| {
+            HOOKS
+                .lock()
+                .expect("promote seam lock")
+                .get(dir)
+                .map(Arc::clone)
+        });
+        if let Some(hook) = hook {
+            hook(tmp_path);
+        }
+    }
+}
+
+/// Environment variable bounding the commit-log replay's in-memory buffer of
+/// mutations whose table is absent from a schema that otherwise exists.
+const MAX_DEFERRED_REPLAY_ENV: &str = "FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS";
+
+/// Default for [`MAX_DEFERRED_REPLAY_ENV`].
+const DEFAULT_MAX_DEFERRED_REPLAY_MUTATIONS: usize = 10_000;
+
+/// Parses [`MAX_DEFERRED_REPLAY_ENV`]: unset or blank is the default, anything
+/// else must be a positive integer. An invalid value is an error naming the
+/// variable, never a silent fall back to the default.
+fn parse_max_deferred_replay_mutations(raw: Option<&str>) -> ferrosa_common::Result<usize> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_MAX_DEFERRED_REPLAY_MUTATIONS);
+    };
+    match raw.parse::<usize>() {
+        Ok(limit) if limit > 0 => Ok(limit),
+        _ => Err(ferrosa_common::Error::InvalidFormat(format!(
+            "{MAX_DEFERRED_REPLAY_ENV} must be a positive integer, got {raw:?}"
+        ))),
+    }
+}
+
+/// Progress is logged every 25 generations or every 30 seconds, whichever
+/// comes first.
+fn restore_progress_due(since_last_log: std::time::Duration, gens_since_last_log: usize) -> bool {
+    const EVERY_GENERATIONS: usize = 25;
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+    gens_since_last_log >= EVERY_GENERATIONS || since_last_log >= EVERY
+}
+
+/// Transition of the "hot data blocks cache eviction" condition.
+#[derive(Debug, PartialEq, Eq)]
+enum HotBlockEdge {
+    /// Not blocked before, blocked now.
+    Started,
+    /// Blocked before, not blocked now.
+    Cleared,
+    /// No change; nothing to report.
+    Unchanged,
+}
+
+/// Records `blocked_now` in `flag` and returns the edge, so the warning is
+/// logged when the block starts and when it clears, not on every sync.
+fn hot_block_edge(flag: &AtomicBool, blocked_now: bool) -> HotBlockEdge {
+    match (flag.swap(blocked_now, Ordering::Relaxed), blocked_now) {
+        (false, true) => HotBlockEdge::Started,
+        (true, false) => HotBlockEdge::Cleared,
+        _ => HotBlockEdge::Unchanged,
+    }
+}
+
+/// Result of [`StorageEngine::collect_uploaded_local_sstables`].
+#[derive(Default)]
+struct CollectedCandidates {
+    /// Locally present, uploaded, evictable generations, sized from disk.
+    candidates: Vec<crate::eviction_plan::EvictionCandidate>,
+    /// Sum of `ManifestEntry::size` over the eligible manifest entries,
+    /// present locally or not. A claim, not a measurement.
+    manifest_bytes: u64,
+    /// Entries skipped because the manifest lists the generation twice.
+    duplicate_entries: usize,
+}
+
+/// A manifest that claims at least this many times the bytes actually on disk
+/// for the same generations is reported as drifted (the observed 2026-09-30
+/// post-recovery gap was 1.6-2.2x).
+const MANIFEST_DRIFT_RATIO_NUM: u64 = 3;
+const MANIFEST_DRIFT_RATIO_DEN: u64 = 2;
+/// ...and only when the gap is at least this large, so a tiny cache with a
+/// large ratio does not warn.
+const MANIFEST_DRIFT_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Whether the manifest's claimed bytes exceed the real on-disk bytes by the
+/// documented threshold: at least 1.5x AND at least 16 MiB more. The eviction
+/// decision never uses the manifest figure; this is a diagnostic signal that
+/// the manifest lists generations that are retired or not local.
+fn manifest_drift(manifest_bytes: u64, disk_bytes: u64) -> bool {
+    manifest_bytes.saturating_sub(disk_bytes) >= MANIFEST_DRIFT_FLOOR_BYTES
+        && u128::from(manifest_bytes) * u128::from(MANIFEST_DRIFT_RATIO_DEN)
+            >= u128::from(disk_bytes) * u128::from(MANIFEST_DRIFT_RATIO_NUM)
 }
 
 /// Process-wide reference instant used as the base for
@@ -1818,7 +2184,7 @@ fn normalize_consolidation_type(type_name: &str) -> String {
 }
 
 impl StorageEngine {
-    fn block_on_rehydration<F, T>(future: F) -> T
+    pub(crate) fn block_on_rehydration<F, T>(future: F) -> T
     where
         F: Future<Output = T>,
     {
@@ -1843,7 +2209,7 @@ impl StorageEngine {
             .block_on(future)
     }
 
-    fn parse_local_sstable_component_path(
+    pub(crate) fn parse_local_sstable_component_path(
         data_dir: &Path,
         path: &Path,
     ) -> Option<(String, String, String)> {
@@ -1889,104 +2255,13 @@ impl StorageEngine {
             "CRC.db",
         ];
 
-        let rehydration_locks: Arc<DashMap<String, Arc<std::sync::Mutex<()>>>> =
-            Arc::new(DashMap::new());
-        {
-            let data_dir = data_dir.clone();
-            let prefix = prefix.clone();
-            let store = Arc::clone(&store);
-            ferrosa_sstable::io::register_file_read_range_hook(Arc::new(
-                move |path, offset, len| {
-                    let Some((table_id, sstable_id, component)) =
-                        Self::parse_local_sstable_component_path(&data_dir, path)
-                    else {
-                        return Ok(None);
-                    };
-                    if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
-                        return Ok(None);
-                    }
-                    if len == 0 {
-                        return Ok(Some(Vec::new()));
-                    }
-
-                    let start = usize::try_from(offset).map_err(|_| {
-                        ferrosa_common::Error::InvalidFormat(format!(
-                            "SSTable range read offset exceeds usize: {}",
-                            offset
-                        ))
-                    })?;
-                    let end = start.checked_add(len).ok_or_else(|| {
-                        ferrosa_common::Error::InvalidFormat(format!(
-                            "SSTable range read overflow: offset={} len={}",
-                            offset, len
-                        ))
-                    })?;
-                    let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
-                    let s3_path = crate::upload::manager::sstable_object_key(
-                        &prefix,
-                        &hex,
-                        &table_id,
-                        &sstable_id,
-                        &component,
-                    );
-                    let store = Arc::clone(&store);
-                    let result = Self::block_on_rehydration(async move {
-                        match store.get_range(&s3_path, start..end).await {
-                            Ok(bytes) => Ok(Some(bytes.to_vec())),
-                            Err(object_store::Error::NotFound { .. }) => Ok(None),
-                            Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
-                                "failed ranged SSTable component read {s3_path}: {e}"
-                            ))),
-                        }
-                    })?;
-                    if result.is_some() {
-                        tracing::debug!(
-                            local_path = %path.display(),
-                            table = table_id,
-                            sstable = sstable_id,
-                            component,
-                            offset,
-                            len,
-                            "served evicted SSTable component range from object storage"
-                        );
-                    }
-                    Ok(result)
-                },
-            ));
-        }
-        {
-            let data_dir = data_dir.clone();
-            let prefix = prefix.clone();
-            let store = Arc::clone(&store);
-            ferrosa_sstable::io::register_file_read_len_hook(Arc::new(move |path| {
-                let Some((table_id, sstable_id, component)) =
-                    Self::parse_local_sstable_component_path(&data_dir, path)
-                else {
-                    return Ok(None);
-                };
-                if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
-                    return Ok(None);
-                }
-                let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
-                let s3_path = crate::upload::manager::sstable_object_key(
-                    &prefix,
-                    &hex,
-                    &table_id,
-                    &sstable_id,
-                    &component,
-                );
-                let store = Arc::clone(&store);
-                Self::block_on_rehydration(async move {
-                    match store.head(&s3_path).await {
-                        Ok(meta) => Ok(Some(meta.size as u64)),
-                        Err(object_store::Error::NotFound { .. }) => Ok(None),
-                        Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
-                            "failed SSTable component head {s3_path}: {e}"
-                        ))),
-                    }
-                })
-            }));
-        }
+        // Ranged, paged read-through (ST-51): serves `Data.db` pages and
+        // lengths of evicted components without a whole-generation download.
+        crate::evicted_read::ensure_registered(
+            data_dir.clone(),
+            prefix.clone(),
+            Arc::clone(&store),
+        );
         ferrosa_sstable::io::register_file_read_rehydration_hook(Arc::new(move |path| {
             let Some((table_id, sstable_id, component)) =
                 Self::parse_local_sstable_component_path(&data_dir, path)
@@ -1999,16 +2274,24 @@ impl StorageEngine {
 
             crate::metrics::inc_sstable_rehydration_request();
             let started = Instant::now();
-            let lock_key = format!("{table_id}/{sstable_id}");
-            let rehydration_lock = Arc::clone(
-                rehydration_locks
-                    .entry(lock_key.clone())
-                    .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
-                    .value(),
+            // Shared with compaction's input retirement (ST-61): a retire of
+            // this generation cannot sweep our temp files mid-download, and a
+            // generation retired while we waited is not downloaded again.
+            let generation_slot = crate::generation_guard::slot(
+                &data_dir.join("sstables").join(&table_id),
+                &sstable_id,
             );
-            let _guard = rehydration_lock
-                .lock()
-                .expect("SSTable rehydration lock poisoned");
+            let generation = generation_slot.lock();
+            if generation.is_retired() {
+                tracing::warn!(
+                    local_path = %path.display(),
+                    table = table_id,
+                    sstable = sstable_id,
+                    "refusing to rehydrate an SSTable generation compaction has retired; \
+                     the caller's view of the table is stale"
+                );
+                return Ok(false);
+            }
             let Some(parent) = path.parent() else {
                 return Ok(false);
             };
@@ -2085,6 +2368,8 @@ impl StorageEngine {
                                 ))
                             })?;
                             drop(file);
+                            #[cfg(test)]
+                            rehydrate_promote_seam::fire(&tmp_path);
                             tokio::fs::rename(&tmp_path, &local_path)
                                 .await
                                 .map_err(|e| {
@@ -2622,6 +2907,10 @@ impl StorageEngine {
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
 
+        let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
+        let eviction_audit = crate::eviction_audit::EvictionAudit::new(
+            crate::eviction_audit::AuditConfig::from_env(&config.data_dir),
+        );
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -2637,6 +2926,8 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            set_aside_status,
+            set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -2664,6 +2955,9 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            cache_hot_blocked: AtomicBool::new(false),
+            manifest_drift_flagged: AtomicBool::new(false),
+            eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -2692,8 +2986,11 @@ impl StorageEngine {
         // disk pressure plus a restart emptied system_schema.indexes and most
         // agent_memory tables on all three memory-cluster nodes.
         engine.restore_evicted_sstables_blocking()?;
+        // Each registration re-ingests that table's set-aside mutations (see
+        // `replay_deferred_mutations_for_table`); the ledger already holds the
+        // files, found when the struct was built.
         engine.load_local_schema_if_present()?;
-        Ok(engine)
+        engine.finish_construction()
     }
 
     /// Probe the configured object store for conditional put support.
@@ -2847,7 +3144,11 @@ impl StorageEngine {
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
 
-        Ok(Self {
+        let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
+        let eviction_audit = crate::eviction_audit::EvictionAudit::new(
+            crate::eviction_audit::AuditConfig::from_env(&config.data_dir),
+        );
+        let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
             write_admission: WriteAdmissionSettings::from_env(),
@@ -2862,6 +3163,8 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            set_aside_status,
+            set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -2889,6 +3192,9 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            cache_hot_blocked: AtomicBool::new(false),
+            manifest_drift_flagged: AtomicBool::new(false),
+            eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -2897,7 +3203,8 @@ impl StorageEngine {
             reader_pool,
             #[cfg(test)]
             upload_store_override: None,
-        })
+        };
+        engine.finish_construction()
     }
 
     /// Opens an existing storage engine directory and replays uncommitted
@@ -2909,6 +3216,19 @@ impl StorageEngine {
     pub fn open(
         config: StorageEngineConfig,
         runtime: Option<&tokio::runtime::Handle>,
+    ) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
+        let max_deferred_absent_table = parse_max_deferred_replay_mutations(
+            std::env::var(MAX_DEFERRED_REPLAY_ENV).ok().as_deref(),
+        )?;
+        Self::open_with_deferred_limit(config, runtime, max_deferred_absent_table)
+    }
+
+    /// [`Self::open`] with the absent-table deferral bound passed in, so a
+    /// test can pick it without touching the process environment.
+    fn open_with_deferred_limit(
+        config: StorageEngineConfig,
+        runtime: Option<&tokio::runtime::Handle>,
+        max_deferred_absent_table: usize,
     ) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
@@ -2998,7 +3318,15 @@ impl StorageEngine {
         let max_pending_without_schema = config.max_pending_replay_mutations_without_schema;
         let mut seen_replay_ids: std::collections::HashSet<[u8; 16]> =
             std::collections::HashSet::new();
-        let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming(
+        // Overflow of the no-schema buffer is written here, durably, instead of
+        // refusing to open. The barrier fsyncs it before each segment is deleted.
+        let set_aside = parking_lot::Mutex::new(crate::replay_set_aside::ReplaySetAside::new(
+            &config.data_dir,
+        ));
+        // Absent-table overflow, per table id, for the ERROR below.
+        let mut absent_table_spilled: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming_with_barrier(
             config.commit_log.clone(),
             |mutation| {
                 if !mutation.has_legacy_id() && !seen_replay_ids.insert(mutation.mutation_id) {
@@ -3007,20 +3335,57 @@ impl StorageEngine {
 
                 if tables.read().is_empty() {
                     if pending_mutations.len() >= max_pending_without_schema {
-                        return Err(ferrosa_common::Error::InvalidData(format!(
-                            "commit-log replay schema unavailable and pending replay limit \
-                             ({max_pending_without_schema}) exceeded; restore local/S3 schema \
-                             before replay or raise FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA"
-                        )));
+                        return set_aside.lock().append(&mutation);
                     }
                     pending_mutations.push(mutation);
                 } else if !Self::apply_replay_mutation_to_tables(&tables, &mutation) {
-                    deferred_replay_mutations.lock().push(mutation);
+                    Self::defer_or_set_aside_absent_table_mutation(
+                        &deferred_replay_mutations,
+                        &set_aside,
+                        &mut absent_table_spilled,
+                        max_deferred_absent_table,
+                        mutation,
+                    )?;
                 }
                 Ok(())
             },
+            || set_aside.lock().sync(),
         )?;
+        let set_aside = set_aside.into_inner();
+        let absent_spilled_total: u64 = absent_table_spilled.values().sum();
+        let no_schema_spilled = set_aside.count().saturating_sub(absent_spilled_total);
+        let replay_set_aside = set_aside.into_report();
+        if let Some(report) = &replay_set_aside {
+            if no_schema_spilled > 0 {
+                tracing::error!(
+                    mutations = no_schema_spilled,
+                    tables = ?report.tables,
+                    path = %report.path.display(),
+                    limit = max_pending_without_schema,
+                    "commit-log replay had no table schema and its in-memory buffer was full \
+                     (FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA); the overflow was set aside on \
+                     disk, NOT replayed. Those mutations are invisible to reads until their \
+                     table schema is registered, when they are re-ingested automatically"
+                );
+            }
+            if absent_spilled_total > 0 {
+                tracing::error!(
+                    mutations = absent_spilled_total,
+                    tables = ?absent_table_spilled,
+                    path = %report.path.display(),
+                    limit = max_deferred_absent_table,
+                    "commit-log replay found mutations for tables absent from the schema and its \
+                     in-memory deferral buffer was full ({MAX_DEFERRED_REPLAY_ENV}); the overflow \
+                     was set aside on disk, NOT replayed. Those mutations are invisible to reads \
+                     unless the table is registered and the file is re-ingested"
+                );
+            }
+        }
 
+        let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
+        let eviction_audit = crate::eviction_audit::EvictionAudit::new(
+            crate::eviction_audit::AuditConfig::from_env(&config.data_dir),
+        );
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -3036,6 +3401,8 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations,
+            set_aside_status,
+            set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -3063,6 +3430,9 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            cache_hot_blocked: AtomicBool::new(false),
+            manifest_drift_flagged: AtomicBool::new(false),
+            eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -3073,6 +3443,7 @@ impl StorageEngine {
             upload_store_override: None,
         };
 
+        let engine = engine.finish_construction()?;
         Ok((engine, pending_mutations))
     }
 
@@ -3644,19 +4015,72 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Holds a mutation whose table is absent for a later `register_table`,
+    /// up to `max_deferred`; past that it is appended to the durable set-aside
+    /// store (fsynced by the replay barrier before its segment is deleted) and
+    /// counted per table in `spilled`, so startup memory stays bounded.
+    fn defer_or_set_aside_absent_table_mutation(
+        deferred: &parking_lot::Mutex<Vec<Mutation>>,
+        set_aside: &parking_lot::Mutex<crate::replay_set_aside::ReplaySetAside>,
+        spilled: &mut std::collections::BTreeMap<String, u64>,
+        max_deferred: usize,
+        mutation: Mutation,
+    ) -> ferrosa_common::Result<()> {
+        let mut deferred = deferred.lock();
+        if deferred.len() < max_deferred {
+            deferred.push(mutation);
+            return Ok(());
+        }
+        drop(deferred);
+        set_aside.lock().append(&mutation)?;
+        *spilled
+            .entry(format!("{}.{}", mutation.keyspace, mutation.table))
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
     fn apply_replay_mutation_if_registered(&self, mutation: &Mutation) -> bool {
         Self::apply_replay_mutation_to_tables(&self.tables, mutation)
     }
 
+    /// Commit-log replay: applies `mutation` if its table is registered.
+    ///
+    /// A row that fails to apply is logged per row at ERROR by the strict
+    /// path, and the commit-log segment still carries the mutation, so replay
+    /// does not abort. Returns whether the table was registered.
     fn apply_replay_mutation_to_tables(
         tables: &RwLock<HashMap<TableId, TableState>>,
         mutation: &Mutation,
     ) -> bool {
+        match Self::apply_replay_mutation_strict(tables, mutation) {
+            Ok(registered) => registered,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    keyspace = %mutation.keyspace,
+                    table = %mutation.table,
+                    "replay: a row of this mutation failed to apply (see the preceding errors)"
+                );
+                true
+            }
+        }
+    }
+
+    /// Applies `mutation` to its table's memtable. `Ok(false)` when the table
+    /// is not registered. A malformed row goes to the quarantine file and
+    /// counts as handled; any other row failure is returned (after every row
+    /// has been attempted), so a caller that is about to discard its only copy
+    /// of the mutation can refuse to.
+    fn apply_replay_mutation_strict(
+        tables: &RwLock<HashMap<TableId, TableState>>,
+        mutation: &Mutation,
+    ) -> ferrosa_common::Result<bool> {
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
         let tables = tables.read();
         let Some(state) = tables.get(&table_id) else {
-            return false;
+            return Ok(false);
         };
+        let mut first_error: Option<ferrosa_common::Error> = None;
         // Layer 3 of the timeuuid-flush-wedge fix: when the per-cell
         // length validator (run inside `Memtable::put`) rejects a row at
         // replay time, salvage the row to a quarantine JSONL file rather
@@ -3667,7 +4091,17 @@ impl StorageEngine {
         let mut quarantine_writer: Option<crate::quarantine::QuarantineWriter> = None;
         let mut quarantined_in_partition = 0usize;
         for row in &mutation.rows {
-            match state.store.write(&mutation.key, row.clone()) {
+            // Old segments may hold whole-value collection cells; expand them
+            // so the flush writer's mixed-cell assertion cannot fire later.
+            let normalized = {
+                let mut normalized = row.clone();
+                crate::memtable::expand_legacy_collection_blobs(
+                    &mut normalized,
+                    &state.store.schema(),
+                )
+                .map(|()| normalized)
+            };
+            match normalized.and_then(|normalized| state.store.write(&mutation.key, normalized)) {
                 Ok(()) => {}
                 Err(ferrosa_common::Error::InvalidData(reason)) => {
                     if quarantine_writer.is_none() {
@@ -3680,6 +4114,11 @@ impl StorageEngine {
                             Ok(qw) => quarantine_writer = Some(qw),
                             Err(e) => {
                                 tracing::error!(%e, %table_id, "replay: failed to open quarantine writer; row dropped");
+                                first_error.get_or_insert_with(|| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "{table_id}: quarantine writer unavailable, row dropped: {e}"
+                                    ))
+                                });
                                 continue;
                             }
                         }
@@ -3690,12 +4129,18 @@ impl StorageEngine {
                         qw.write_row(mutation.key.key.as_bytes(), row, &schema, &reason)
                     {
                         tracing::error!(%qe, %table_id, "replay: failed to write quarantine row");
+                        first_error.get_or_insert_with(|| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "{table_id}: could not quarantine a malformed row: {qe}"
+                            ))
+                        });
                     } else {
                         quarantined_in_partition += 1;
                     }
                 }
                 Err(e) => {
                     tracing::error!(%e, %table_id, "replay: failed to replay row");
+                    first_error.get_or_insert(e);
                 }
             }
         }
@@ -3710,10 +4155,14 @@ impl StorageEngine {
                 "replay: quarantined malformed rows — see quarantine file for forensic record"
             );
         }
-        true
+        match first_error {
+            None => Ok(true),
+            Some(e) => Err(e),
+        }
     }
 
     fn replay_deferred_mutations_for_table(&self, table_id: &TableId) {
+        self.reingest_set_aside_for_table(table_id);
         let pending = {
             let mut deferred = self.deferred_replay_mutations.lock();
             if deferred.is_empty() {
@@ -4013,6 +4462,7 @@ impl StorageEngine {
             write_pressure_notify: Arc::new(tokio::sync::Notify::new()),
             write_pressure_percent: Arc::new(AtomicU64::new(0)),
             in_write_soft_zone: AtomicBool::new(false),
+            last_foreground_read_unix_ms: AtomicU64::new(0),
         })
     }
 
@@ -4264,6 +4714,18 @@ impl StorageEngine {
     }
 
     fn unregister_table_quiesced(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        // Recorded BEFORE anything is removed, and a failure refuses the drop:
+        // without the record, set-aside frames of this table would later be
+        // applied to a re-created table of the same name. Only a registered
+        // table is a drop; a replayed DROP of an absent table records nothing.
+        if self.tables.read().contains_key(table_id) {
+            crate::table_drops::record_drop(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+                crate::table_drops::now_millis()?,
+            )?;
+        }
         self.clear_compaction_retry_state(table_id);
         if let Some(state) = self.tables.write().remove(table_id) {
             if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
@@ -4847,7 +5309,20 @@ impl StorageEngine {
                     );
                     return Ok(false);
                 }
-                self.add_partition_key_index(table_id, index_name, component, index_type)?;
+                let outcome =
+                    self.add_partition_key_index(table_id, index_name, component, index_type)?;
+                if !outcome.is_complete() {
+                    // Registered, not usable: the index is stale and refuses
+                    // reads until `ferrosa-ctl index rebuild` completes it.
+                    tracing::error!(
+                        keyspace = table_id.keyspace(),
+                        table = table_id.table(),
+                        index_name,
+                        ?outcome,
+                        "partition-key-column index registered {site} but its backfill did NOT \
+                         complete; it stays stale and refuses reads until rebuilt"
+                    );
+                }
                 tracing::info!(
                     keyspace = table_id.keyspace(),
                     table = table_id.table(),
@@ -5372,13 +5847,23 @@ impl StorageEngine {
     /// the same reason [`add_clustering_index`](Self::add_clustering_index)
     /// exists for the other half of the primary key. Writes extract the value
     /// from the composite partition key at `partition_key_component`.
+    ///
+    /// Returns the backfill's [`RebuildOutcome`]. An incomplete backfill is NOT
+    /// an `Err`: the index is registered and correctly stale (reads through it
+    /// are refused), and `ferrosa-ctl index rebuild` can finish the job. But the
+    /// caller must look at [`RebuildOutcome::is_complete`] rather than assume
+    /// `Ok` means the index covers the table.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the table is not registered.
     pub fn add_partition_key_index(
         &self,
         table_id: &TableId,
         index_name: &str,
         partition_key_component: usize,
         index_type: ferrosa_index::IndexType,
-    ) -> ferrosa_common::Result<()> {
+    ) -> ferrosa_common::Result<RebuildOutcome> {
         self.index_tracker
             .register_index(table_id.keyspace(), table_id.table(), index_name);
 
@@ -5404,7 +5889,7 @@ impl StorageEngine {
         //
         // Mark each SSTable pending BEFORE submitting, so a consult that finds
         // the index empty can only trust it once the backfill has completed.
-        self.backfill_partition_key_index(
+        let coverage = self.backfill_partition_key_index(
             state,
             table_id,
             index_name,
@@ -5412,7 +5897,7 @@ impl StorageEngine {
             index_type,
         );
 
-        Ok(())
+        Ok(RebuildOutcome::from_coverage(&coverage))
     }
 
     /// Build (or rebuild) the partition-key index sidecars for every SSTable
@@ -5423,7 +5908,10 @@ impl StorageEngine {
     /// build would be a second implementation of the thing that broke, and
     /// the two would drift.
     ///
-    /// Returns the number of SSTables successfully indexed.
+    /// Returns a [`Coverage`](crate::index::orphan::Coverage) accounting for
+    /// EVERY enumerated SSTable as built, vanished (TOC survives, data gone) or
+    /// failed. A generation with no files at all, or an evicted one that cannot
+    /// be restored, is failed and leaves the index stale.
     fn backfill_partition_key_index(
         &self,
         state: &mut TableState,
@@ -5432,9 +5920,12 @@ impl StorageEngine {
         partition_key_component: usize,
         index_type: ferrosa_index::IndexType,
     ) -> crate::index::orphan::Coverage {
-        let mut coverage = crate::index::orphan::Coverage::default();
+        use crate::index::orphan::BackfillOutcome;
+
         let pk_total = state.store.partition_key_column_count();
         let sstable_ids = state.store.sstable_generation_ids();
+        let mut coverage = crate::index::orphan::Coverage::expecting(sstable_ids.len());
+        let table_dir = self.table_sstable_dir(table_id);
         for sst_id in sstable_ids {
             self.index_tracker.mark_pending(
                 table_id.keyspace(),
@@ -5461,93 +5952,33 @@ impl StorageEngine {
                 }),
                 filter_predicate: None,
             };
-
-            // Build it HERE rather than handing it to the scheduler.
-            //
-            // The scheduler's worker writes the sidecar file and marks the
-            // SSTable indexed, but nothing installs the result into the live
-            // view — so an asynchronous backfill becomes visible only after a
-            // restart, and until then reads consult an index that is complete
-            // on disk and empty in memory. Building synchronously means
-            // `CREATE INDEX` returns when the index is actually usable, which
-            // is also what a caller reasonably expects it to mean.
-            let backend = crate::index::LocalBackend::new(self.config.data_dir.clone());
-            match crate::index::IndexBuildBackend::build(&backend, &job) {
-                Ok(result) => {
-                    for (built_index, entries) in &result.sidecar_entries {
-                        if entries.is_empty() {
-                            continue;
-                        }
-                        // Persist, so the backfill survives a restart.
-                        let path = crate::index::scheduler::sidecar_output_dir(
-                            &self.config.data_dir,
-                            &job,
-                        )
-                        .join(format!("{sst_id}-{built_index}.sidecar"));
-                        if let Err(e) = crate::index::sidecar::SidecarWriter::write(&path, entries)
-                        {
-                            tracing::error!(
-                                %e,
-                                path = %path.display(),
-                                "engine: partition-key index backfill built but could NOT be \
-                                 written; it will be lost on restart"
-                            );
-                        }
-                        // And install, so it is usable now.
-                        match crate::index::sidecar::SidecarReader::open(&path) {
-                            Ok(reader) => {
-                                if !state.store.install_sidecar(&sst_id, built_index, reader) {
-                                    tracing::warn!(
-                                        index_name,
-                                        sstable = %sst_id,
-                                        "engine: backfilled sidecar not installed — the SSTable \
-                                         left the view while the build ran (likely compacted)"
-                                    );
-                                }
-                            }
-                            Err(e) => tracing::error!(
-                                %e,
-                                path = %path.display(),
-                                "engine: partition-key index backfill wrote a sidecar that \
-                                 cannot be reopened; this index is INCOMPLETE for that SSTable"
-                            ),
-                        }
+            let settled = self
+                .settle_generation(&table_dir, &sst_id)
+                .unwrap_or_else(|| self.build_and_install_sidecar(state, &job));
+            let (keyspace, table) = (table_id.keyspace(), table_id.table());
+            match settled {
+                Ok(outcome) => {
+                    if outcome == BackfillOutcome::Vanished {
+                        // WARN, not info: "its TOC survives, so compaction took
+                        // it" is an inference, not a recorded fact. If it is
+                        // wrong, live rows are missing from the index and this
+                        // line is the only trace of which generation to look at.
+                        tracing::warn!(
+                            index_name,
+                            table = %table_id,
+                            sstable = %sst_id,
+                            "engine: SSTable {sst_id} is in the live set with a TOC but no data \
+                             file. Discounted as compacted away (unverified: nothing records a \
+                             retirement), so it is not counted against this index. If its rows \
+                             were not compacted into another SSTable they are missing from it."
+                        );
                     }
-                    self.index_tracker.mark_indexed(
-                        table_id.keyspace(),
-                        table_id.table(),
-                        index_name,
-                        &sst_id,
-                    );
-                    coverage.built += 1;
-                }
-                // An SSTable whose data file is GONE is not a failure. It was
-                // compacted away and only its TOC and sidecars survive, so it
-                // holds no rows and skipping it removes nothing from the index.
-                //
-                // Marking it failed is what wedged six indexes on the live
-                // cluster for a day: every retry re-read the same absent files,
-                // re-marked the same failure, and the server went on correctly
-                // refusing to read through an index that could never become
-                // current. Retrying cannot fix an SSTable that no longer exists.
-                Err(e) if crate::index::orphan::data_file_is_absent(&e) => {
-                    tracing::info!(
-                        index_name,
-                        table = %table_id,
-                        sstable = %sst_id,
-                        "engine: SSTable has no data file — compacted away with its metadata \
-                         left behind. Nothing to index; not counted against this index."
-                    );
-                    coverage.vanished += 1;
-                    // Cleared rather than left pending: the tracker asked about
-                    // an SSTable that does not exist, and leaving it pending
-                    // keeps the index short of a row count it can never reach.
-                    self.index_tracker.mark_indexed(
-                        table_id.keyspace(),
-                        table_id.table(),
-                        index_name,
-                        &sst_id,
-                    );
+                    // Built and vanished both clear the pending mark: a vanished
+                    // SSTable holds no rows, so leaving it pending would keep the
+                    // index short of a row count it can never reach.
+                    self.index_tracker
+                        .mark_indexed(keyspace, table, index_name, &sst_id);
+                    coverage.record(outcome);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -5559,18 +5990,123 @@ impl StorageEngine {
                          are not in the index and reads through it will be incomplete"
                     );
                     self.index_tracker.mark_failed(
-                        table_id.keyspace(),
-                        table_id.table(),
+                        keyspace,
+                        table,
                         index_name,
                         e,
                         std::time::Duration::from_secs(60),
                     );
-                    coverage.failed += 1;
+                    coverage.record(BackfillOutcome::Failed);
                 }
             }
         }
-
+        if !coverage.is_complete() {
+            tracing::error!(
+                index_name,
+                table = %table_id,
+                summary = %coverage.describe(),
+                "engine: index backfill is NOT complete; the index stays stale and refuses reads"
+            );
+        }
         coverage
+    }
+
+    /// Decide what a generation's on-disk state means before any build runs.
+    ///
+    /// `None` means build from it (data present, or an evicted generation that
+    /// was just restored). `Some(Ok(Vanished))` is the only discount, and only
+    /// when the TOC survives. Everything else that cannot be built is
+    /// `Some(Err(..))`: an absent generation (stale enumeration) or an evicted
+    /// one whose restore failed must never be read as "nothing to index".
+    fn settle_generation(
+        &self,
+        table_dir: &std::path::Path,
+        gen: &str,
+    ) -> Option<Result<crate::index::orphan::BackfillOutcome, String>> {
+        use crate::index::orphan::{BackfillOutcome, GenerationState};
+
+        let state_of = || {
+            GenerationState::from_files(
+                Self::generation_component_path(table_dir, gen, "Data.db").is_some(),
+                Self::evicted_marker_path(table_dir, gen).exists(),
+                Self::generation_component_path(table_dir, gen, "TOC.txt").is_some(),
+            )
+        };
+        let mut state = state_of();
+        if state == GenerationState::Evicted {
+            if let Err(e) = crate::flush::rehydrate_if_evicted(table_dir, gen) {
+                return Some(Err(format!(
+                    "evicted SSTable {gen} could not be rehydrated: {e}"
+                )));
+            }
+            state = state_of();
+            if state == GenerationState::Evicted {
+                return Some(Err(format!(
+                    "evicted SSTable {gen} could not be restored from the object store; \
+                     its rows are not in the index"
+                )));
+            }
+        }
+        match state.skip_outcome() {
+            Some(BackfillOutcome::Failed) => Some(Err(format!(
+                "SSTable {gen} is in the live set but no file of it exists in {} — a stale \
+                 enumeration or manifest entry, not a compaction leftover",
+                table_dir.display()
+            ))),
+            Some(outcome) => Some(Ok(outcome)),
+            None => None,
+        }
+    }
+
+    /// Build one SSTable's partition-key sidecar, persist it and install it
+    /// into the live view. Any step that fails is an `Err`: a sidecar that was
+    /// built but not persisted, not reopenable, or not installable leaves the
+    /// index short for that SSTable and must not be counted as built.
+    fn build_and_install_sidecar(
+        &self,
+        state: &TableState,
+        job: &crate::index::IndexBuildJob,
+    ) -> Result<crate::index::orphan::BackfillOutcome, String> {
+        // Build it HERE rather than handing it to the scheduler.
+        //
+        // The scheduler's worker writes the sidecar file and marks the
+        // SSTable indexed, but nothing installs the result into the live
+        // view — so an asynchronous backfill becomes visible only after a
+        // restart, and until then reads consult an index that is complete
+        // on disk and empty in memory. Building synchronously means
+        // `CREATE INDEX` returns when the index is actually usable, which
+        // is also what a caller reasonably expects it to mean.
+        let backend = crate::index::LocalBackend::new(self.config.data_dir.clone());
+        let result = crate::index::IndexBuildBackend::build(&backend, job)?;
+        let sst_id = &job.sstable_id;
+        for (built_index, entries) in &result.sidecar_entries {
+            if entries.is_empty() {
+                continue;
+            }
+            // Persist, so the backfill survives a restart.
+            let path = crate::index::scheduler::sidecar_output_dir(&self.config.data_dir, job)
+                .join(format!("{sst_id}-{built_index}.sidecar"));
+            crate::index::sidecar::SidecarWriter::write(&path, entries).map_err(|e| {
+                format!(
+                    "sidecar for {sst_id} built but could NOT be written to {}: {e}",
+                    path.display()
+                )
+            })?;
+            // And install, so it is usable now.
+            let reader = crate::index::sidecar::SidecarReader::open(&path).map_err(|e| {
+                format!(
+                    "sidecar for {sst_id} at {} cannot be reopened: {e}",
+                    path.display()
+                )
+            })?;
+            if !state.store.install_sidecar(sst_id, built_index, reader) {
+                return Err(format!(
+                    "backfilled sidecar for {sst_id} not installed — the SSTable left the \
+                     view while the build ran (likely compacted); rebuild again"
+                ));
+            }
+        }
+        Ok(crate::index::orphan::BackfillOutcome::Built)
     }
 
     /// Rebuild one index's sidecars over every SSTable this table holds.
@@ -5655,11 +6191,7 @@ impl StorageEngine {
             );
         }
 
-        Ok(RebuildOutcome {
-            sstables_rebuilt,
-            sstables_total,
-            sstables_vanished: coverage.vanished,
-        })
+        Ok(RebuildOutcome::from_coverage(&coverage))
     }
 
     /// Register a full-text index on a table.
@@ -6352,9 +6884,13 @@ impl StorageEngine {
         // (which does not know how to interpret a `.compaction-*.intent` file).
         Self::reconcile_compaction_intents(table_dir);
 
+        // Marked generations whose Data.db is remote (ST-51, t_6a2847c8).
+        let remote_backed = Self::remote_backed_generations(table_dir);
+
         // Collect all generation numbers by looking for Data.db files.
         let mut generations: Vec<u64> = {
-            let mut values = std::collections::HashSet::new();
+            let mut values: std::collections::HashSet<u64> =
+                remote_backed.iter().copied().collect();
 
             for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -6413,6 +6949,9 @@ impl StorageEngine {
             let probes: Vec<(&str, crate::sstable_health::ComponentProbe)> =
                 crate::sstable_health::CRITICAL_COMPONENTS
                     .iter()
+                    // A remote-backed generation's Data.db lives in the object
+                    // store; its other critical components must be local.
+                    .filter(|comp| !(remote_backed.contains(&gen) && **comp == "Data.db"))
                     .map(|comp| {
                         let path = Self::generation_component_path(table_dir, &gen_str, comp)
                             .unwrap_or_else(|| table_dir.join(format!("{gen_str}-{comp}")));
@@ -6477,7 +7016,17 @@ impl StorageEngine {
                     // readers so queries fail loud-at-load instead of returning
                     // truncated/garbage rows. Conservative: passes every healthy
                     // SSTable (see SSTableReader::validate_data_extent).
-                    if let Err(e) = reader.validate_data_extent() {
+                    // Both checks below walk Data.db; for a remote-backed
+                    // generation that would download it at startup. Its
+                    // bytes are verified per read instead (chunk CRC, CRC.db,
+                    // short-read errors; FMEA ST-51).
+                    let remote = remote_backed.contains(&gen);
+                    let extent = if remote {
+                        Ok(())
+                    } else {
+                        reader.validate_data_extent()
+                    };
+                    if let Err(e) = extent {
                         tracing::error!(
                             %e,
                             gen,
@@ -6501,7 +7050,7 @@ impl StorageEngine {
                         }
                         continue;
                     }
-                    if repair_mode != StartupSstableRepairMode::Off {
+                    if repair_mode != StartupSstableRepairMode::Off && !remote {
                         smoke_tested_count += 1;
                         if let Err(e) = Self::validate_sstable_for_startup_repair(&reader) {
                             match repair_mode {
@@ -8145,9 +8694,31 @@ impl StorageEngine {
         .entered();
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.read_limited_rows(key, row_limit),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.read_limited_rows(key, row_limit)
+            }
             None => Ok(None),
         }
+    }
+
+    /// When `table_id` was last read by a foreground query, `None` if it has
+    /// not been since startup (or is unregistered). The cache evictor's heat
+    /// signal; repair, compaction and self-heal reads never set it.
+    pub fn table_last_foreground_read(&self, table_id: &TableId) -> Option<std::time::SystemTime> {
+        self.tables
+            .read()
+            .get(table_id)
+            .and_then(|state| state.last_foreground_read())
+    }
+
+    #[cfg(test)]
+    fn clear_last_foreground_read_for_test(&self, table_id: &TableId) {
+        let tables = self.tables.read();
+        let state = tables.get(table_id).expect("table registered");
+        state
+            .last_foreground_read_unix_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Read at most `row_limit` rows strictly after `start_clustering` from one
@@ -8166,9 +8737,12 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<Option<Partition>> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .read_limited_rows_from(key, start_clustering, row_limit),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .read_limited_rows_from(key, start_clustering, row_limit)
+            }
             None => Ok(None),
         }
     }
@@ -8201,7 +8775,10 @@ impl StorageEngine {
         .entered();
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.read_clustering_row(key, clustering),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.read_clustering_row(key, clustering)
+            }
             None => Ok(None),
         }
     }
@@ -8346,9 +8923,12 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<Vec<Partition>> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .read_range_limited_rows(start, end, limit, row_limit),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .read_range_limited_rows(start, end, limit, row_limit)
+            }
             None => Ok(vec![]),
         }
     }
@@ -8378,7 +8958,10 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<u64> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.count_range_matching(start, end, matches),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.count_range_matching(start, end, matches)
+            }
             None => Ok(0),
         }
     }
@@ -8400,9 +8983,12 @@ impl StorageEngine {
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .range_iter_projected(wanted, partition_limit, start, end),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .range_iter_projected(wanted, partition_limit, start, end)
+            }
             None => Box::pin(futures::stream::empty()),
         }
     }
@@ -8426,7 +9012,10 @@ impl StorageEngine {
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.range_iter(start, end),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.range_iter(start, end)
+            }
             None => Box::pin(futures::stream::empty()),
         }
     }
@@ -8446,7 +9035,10 @@ impl StorageEngine {
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.range_iter_fragmented(start, end),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.range_iter_fragmented(start, end)
+            }
             None => Box::pin(futures::stream::empty()),
         }
     }
@@ -8464,9 +9056,12 @@ impl StorageEngine {
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .range_iter_projected_fragmented(wanted, start, end),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .range_iter_projected_fragmented(wanted, start, end)
+            }
             None => Box::pin(futures::stream::empty()),
         }
     }
@@ -8507,6 +9102,7 @@ impl StorageEngine {
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
+        state.note_foreground_read();
         state
             .store
             .read_by_index_each_after(index_name, key, after, visitor)
@@ -8601,9 +9197,12 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<Vec<Partition>> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .read_by_index_in_partition(index_name, key, partition_key),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .read_by_index_in_partition(index_name, key, partition_key)
+            }
             None => Err(ferrosa_common::Error::InvalidData(format!(
                 "read_by_index_in_partition: table {table_id:?} not registered"
             ))),
@@ -8625,7 +9224,10 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<Vec<Partition>> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.read_by_index_cell_ranges(index_name, ranges),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.read_by_index_cell_ranges(index_name, ranges)
+            }
             None => Ok(vec![]),
         }
     }
@@ -8700,6 +9302,7 @@ impl StorageEngine {
             let Some(state) = tables.get(table_id) else {
                 return Ok(vec![]);
             };
+            state.note_foreground_read();
             merge_hits(
                 &mut score_map,
                 state
@@ -8931,8 +9534,9 @@ impl StorageEngine {
             None => return Ok(()),
         };
 
-        if !self.tables.read().contains_key(table_id) {
-            return Ok(());
+        match self.tables.read().get(table_id) {
+            Some(state) => state.note_foreground_read(),
+            None => return Ok(()),
         }
 
         /// The shapes this path can walk a sidecar at a time.
@@ -9564,7 +10168,7 @@ impl StorageEngine {
         )
         .entered();
         // Flush + index submit under read lock, then release before write lock.
-        let (gen, is_pinned, cl_position) = {
+        let (gen, is_pinned, cl_position, flush_outcome) = {
             let tables = self.tables.read();
             let state = tables.get(table_id).ok_or_else(|| {
                 ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
@@ -9585,7 +10189,7 @@ impl StorageEngine {
             // moving discard_completed before this line, reintroduces the P0
             // "kill mid-flush loses both the torn SSTable and the WAL copy" bug.
             let pressure_notify = Arc::clone(&state.write_pressure_notify);
-            state
+            let flush_outcome = state
                 .store
                 .flush_with_swap_callback(|| pressure_notify.notify_waiters())?;
             let active_size = state.store.memtable_size() as u64;
@@ -9607,7 +10211,16 @@ impl StorageEngine {
             // Eager index build: submit high-priority index rebuild for the newly
             // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
             // 0-1 entries in steady state by ensuring sidecar indexes are current.
-            if let Some(ref scheduler) = self.index_scheduler {
+            //
+            // Only when this flush actually published an SSTable. A flush with
+            // nothing to write leaves `last_flush_generation()` naming an
+            // earlier SSTable (0 if this process never flushed the table, e.g.
+            // after its SSTables were evicted): building against that id
+            // queued a phantom pending SSTable per index and logged a false
+            // "cannot resolve ordinal layout" error for each (ST-43).
+            if let (Some(scheduler), FlushOutcome::Published) =
+                (self.index_scheduler.as_ref(), flush_outcome)
+            {
                 let gen = state.store.last_flush_generation();
                 let ck_total = state.store.clustering_column_count();
                 let pk_total = state.store.partition_key_column_count();
@@ -9712,7 +10325,7 @@ impl StorageEngine {
 
             let flushed_gen = state.store.last_flush_generation();
             let pinned = state.pin_config.is_some();
-            (flushed_gen, pinned, cl_position)
+            (flushed_gen, pinned, cl_position, flush_outcome)
         };
 
         // Advance commit log checkpoint: tell the commit log that this table's
@@ -9727,7 +10340,7 @@ impl StorageEngine {
 
         // For pinned tables: record the new SSTable and enforce max_bytes.
         // We do this outside the read lock so we can take a write lock.
-        if is_pinned {
+        if is_pinned && flush_outcome == FlushOutcome::Published {
             let table_dir = self
                 .config
                 .data_dir
@@ -9774,6 +10387,187 @@ impl StorageEngine {
     #[cfg(test)]
     pub(crate) fn compaction_executor_for_test(&self) -> &CompactionExecutor {
         &self.compaction_executor
+    }
+
+    /// Everything startup replay set aside on disk because no table schema was
+    /// available to bind it to, and that has not been re-ingested yet.
+    ///
+    /// Non-empty means mutations are durable under
+    /// `<data_dir>/commitlog-unreplayed/` but are NOT in any memtable: they are
+    /// invisible to reads until their table's schema is registered (automatic)
+    /// or an operator runs `ferrosa-ctl commitlog set-aside --apply`. `/readyz`
+    /// reports it; it is the engine's explicit degraded state.
+    pub fn replay_set_aside_status(&self) -> crate::replay_set_aside::SetAsideStatus {
+        self.set_aside_status.lock().clone()
+    }
+
+    /// The last step of every constructor. The set-aside files were found when
+    /// the struct was built (`SetAsideLedger::adopt` is the only way to fill its
+    /// `set_aside_status` field, so no constructor can skip the scan); this
+    /// re-ingests whatever the tables registered so far can take. Tables
+    /// registered later re-ingest through `replay_deferred_mutations_for_table`.
+    ///
+    /// A failure to re-ingest is logged and the frames stay set aside, reported
+    /// by `/readyz`; it does not fail construction.
+    fn finish_construction(self) -> ferrosa_common::Result<Self> {
+        if let Err(e) = self.reingest_set_aside_with_faults(None, SetAsideFaults::default()) {
+            tracing::error!(%e, "startup re-ingest of set-aside mutations is incomplete");
+        }
+        Ok(self)
+    }
+
+    /// Offline re-ingest for `ferrosa-ctl commitlog set-aside --apply`. The
+    /// node must be stopped.
+    ///
+    /// Opens a local-only engine over `data_dir` (its local schema registers
+    /// the tables, which re-ingests their set-aside frames and flushes them to
+    /// SSTables there) and returns what is still set aside. The engine runs
+    /// over `scratch_commit_log_dir`, never the node's own commit log, so the
+    /// node's un-flushed segments stay exactly as they were for its next
+    /// start. There is no object store: the flushed SSTables reach S3 through
+    /// the node's own sync after it restarts.
+    pub fn reingest_set_aside_offline(
+        data_dir: &Path,
+        scratch_commit_log_dir: &Path,
+    ) -> ferrosa_common::Result<crate::replay_set_aside::SetAsideStatus> {
+        let mut config = StorageEngineConfig::test_config(data_dir);
+        config.commit_log = CommitLogConfig::test_config(scratch_commit_log_dir);
+        config.local_cache_max_bytes = u64::MAX;
+        config.flush_threshold_bytes = 64 * 1024 * 1024;
+        config.flush_max_age_secs = 30;
+        let engine = Self::new(config, None)?;
+        let status = engine.replay_set_aside_status();
+        engine.shutdown()?;
+        Ok(status)
+    }
+
+    /// Re-ingests every set-aside mutation whose table is registered. Returns
+    /// the first failure after trying every file; the remainder stays set aside
+    /// and is reported by [`replay_set_aside_status`](Self::replay_set_aside_status).
+    pub fn reingest_set_aside(&self) -> ferrosa_common::Result<()> {
+        self.reingest_set_aside_with_faults(None, SetAsideFaults::default())
+    }
+
+    fn publish_set_aside_status(&self, status: crate::replay_set_aside::SetAsideStatus) {
+        self.set_aside_status.publish(status);
+    }
+
+    /// Called whenever a table becomes known: replays that table's set-aside
+    /// mutations. A failure is logged and leaves them set aside; it never fails
+    /// the registration, because `/readyz` already reports the remainder.
+    fn reingest_set_aside_for_table(&self, table_id: &TableId) {
+        let key = format!("{}.{}", table_id.keyspace(), table_id.table());
+        let pending = self
+            .set_aside_status
+            .lock()
+            .files
+            .iter()
+            .any(|f| f.error.is_none() && f.tables.contains_key(&key));
+        if !pending {
+            return;
+        }
+        if let Err(e) =
+            self.reingest_set_aside_with_faults(Some(table_id), SetAsideFaults::default())
+        {
+            tracing::error!(%e, table = %table_id, "set-aside mutations for this table stay set aside");
+        }
+    }
+
+    pub(crate) fn reingest_set_aside_with_faults(
+        &self,
+        only: Option<&TableId>,
+        faults: SetAsideFaults,
+    ) -> ferrosa_common::Result<()> {
+        let _serial = self.set_aside_reingest.lock();
+        let mut first_error = None;
+        for path in crate::replay_set_aside::list_set_aside_files(&self.config.data_dir)? {
+            if !self.set_aside_file_is_ready(&path, only) {
+                continue;
+            }
+            let mut sink = match EngineSetAsideSink::new(self, &path, only, faults) {
+                Ok(sink) => sink,
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        path = %path.display(),
+                        "cannot read the dropped-tables ledger, so set-aside frames cannot be \
+                         checked against table drops; the file is kept whole"
+                    );
+                    first_error.get_or_insert(e);
+                    continue;
+                }
+            };
+            match crate::replay_set_aside::reingest_file(&path, &mut sink) {
+                Ok(outcome) => self.record_set_aside_outcome(&path, &outcome),
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        path = %path.display(),
+                        "set-aside re-ingest failed; the file is kept whole and nothing in it \
+                         is lost"
+                    );
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Whether a re-ingest run should open `path`: a file known to be
+    /// unreadable is left to the operator, and a file none of whose tables is
+    /// registered (or targeted) has nothing to apply.
+    fn set_aside_file_is_ready(&self, path: &Path, only: Option<&TableId>) -> bool {
+        let status = self.set_aside_status.lock();
+        let Some(file) = status.files.iter().find(|f| f.path == path) else {
+            return true;
+        };
+        if file.error.is_some() {
+            return false;
+        }
+        let tables = self.tables.read();
+        file.tables.keys().any(|key| {
+            tables
+                .keys()
+                .any(|id| format!("{}.{}", id.keyspace(), id.table()) == *key)
+                && only.is_none_or(|o| format!("{}.{}", o.keyspace(), o.table()) == *key)
+        })
+    }
+
+    fn record_set_aside_outcome(
+        &self,
+        path: &Path,
+        outcome: &crate::replay_set_aside::FileOutcome,
+    ) {
+        if outcome.departed() == 0 {
+            return;
+        }
+        let mut status = self.set_aside_status.lock().clone();
+        status.files.retain(|f| f.path != path);
+        if !outcome.removed {
+            status
+                .files
+                .push(crate::replay_set_aside::SetAsideFileStatus {
+                    path: path.to_path_buf(),
+                    mutations: outcome.kept,
+                    tables: outcome.kept_tables.clone(),
+                    error: None,
+                });
+        }
+        if outcome.stale > 0 {
+            tracing::error!(
+                path = %path.display(),
+                stale = outcome.stale,
+                tables = ?outcome.stale_tables,
+                "set-aside frames of dropped tables were quarantined instead of applied"
+            );
+        }
+        tracing::info!(
+            path = %path.display(),
+            applied = outcome.applied,
+            still_set_aside = outcome.kept,
+            "re-ingested set-aside mutations; the rows are visible to reads again"
+        );
+        self.publish_set_aside_status(status);
     }
 
     #[cfg(test)]
@@ -10837,14 +11631,19 @@ impl StorageEngine {
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::SSTableComponents;
 
-        crate::flush::rehydrate_if_evicted(dir, gen)?;
-        let data = Self::generation_component_path(dir, gen, "Data.db").ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "missing required Data.db for sstable generation {gen} in {}",
-                dir.display()
-            ))
-        })?;
-        let data = FileReadAt::open(data)?;
+        // An evicted generation is opened for a query: index components local,
+        // Data.db by ranged reads (ST-51), never a whole-generation download.
+        let data = if crate::flush::prepare_evicted_for_query(dir, gen)? {
+            FileReadAt::open_evicted(dir.join(format!("{gen}-Data.db")))
+        } else {
+            let data = Self::generation_component_path(dir, gen, "Data.db").ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "missing required Data.db for sstable generation {gen} in {}",
+                    dir.display()
+                ))
+            })?;
+            FileReadAt::open(data)?
+        };
 
         let partitions =
             Self::generation_component_path(dir, gen, "Partitions.db").ok_or_else(|| {
@@ -11032,11 +11831,46 @@ impl StorageEngine {
         self.compaction_executor.await_result_available(timeout)
     }
 
+    /// Drives maintenance polls until `table_id` has no compaction task left
+    /// (every submitted task finished, was cancelled, or was finalized).
+    ///
+    /// The completion signal is the executor's own state transition: a task
+    /// stays registered until its claim is released, and every release or
+    /// result delivery wakes `changed()`. Nothing here depends on wall-clock
+    /// speed, so it is the load-independent replacement for "poll N times with
+    /// a short sleep". `hang_guard` only turns a stuck worker into a loud
+    /// failure; it is not a convergence budget.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn drive_compactions_until_idle(
+        &self,
+        table_id: &TableId,
+        hang_guard: std::time::Duration,
+    ) {
+        let settle = async {
+            loop {
+                // Enable before polling so a completion landing between the
+                // poll and the await is not missed.
+                let changed = self.compaction_executor.changed().notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                self.poll_compactions().await;
+                if !self.compaction_executor.table_has_tasks(table_id) {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        if tokio::time::timeout(hang_guard, settle).await.is_err() {
+            panic!("compaction for {table_id} did not settle within the {hang_guard:?} hang guard");
+        }
+    }
+
     /// bucketing or min_threshold.
     pub fn force_compact_all(&self) {
         let tables = self.tables.read();
         for (table_id, state) in tables.iter() {
             let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
+                tracing::warn!(%table_id, "force-compact: table not admitting compactions (paused or shut down); skipped");
                 continue;
             };
             let metadata = self.collect_sstable_metadata(table_id, state);
@@ -11050,11 +11884,19 @@ impl StorageEngine {
                     table_id: table_id.clone(),
                     purge,
                 };
-                if let Err(e) = self
+                match self
                     .compaction_executor
                     .try_submit_with_ticket(task, &ticket)
                 {
-                    tracing::error!(%e, %table_id, "force-compact: submit failed");
+                    Ok(true) => {}
+                    // Overlap with an in-flight claim, or a full worker queue:
+                    // nothing was submitted and force-compact never retries, so
+                    // say so rather than look like it worked.
+                    Ok(false) => tracing::warn!(
+                        %table_id,
+                        "force-compact: task not accepted (inputs already claimed or worker queue full)"
+                    ),
+                    Err(e) => tracing::error!(%e, %table_id, "force-compact: submit failed"),
                 }
             }
         }
@@ -11447,13 +12289,16 @@ impl StorageEngine {
         table_dir.join(format!("{gen}.evicted"))
     }
 
-    /// Durably record that `gen` is about to be evicted. Written and fsynced,
-    /// with its directory entry, BEFORE any component is deleted, so a crash
-    /// between the two can never lose track of an evicted SSTable.
-    fn record_eviction(table_dir: &std::path::Path, gen: &str) -> std::io::Result<()> {
-        let marker = Self::evicted_marker_path(table_dir, gen);
-        std::fs::File::create(&marker)?.sync_all()?;
-        std::fs::File::open(table_dir)?.sync_all()
+    /// Durably record that `gen` is about to be evicted, and why. The record
+    /// ([`crate::eviction_marker`]) is written and fsynced, with its directory
+    /// entry, BEFORE any component is deleted, so a crash between the two can
+    /// never lose track of an evicted SSTable.
+    fn record_eviction(
+        table_dir: &std::path::Path,
+        gen: &str,
+        record: &crate::eviction_marker::EvictionRecord,
+    ) -> std::io::Result<()> {
+        crate::eviction_marker::write_marker(table_dir, gen, record)
     }
 
     /// Deletes all on-disk files for an SSTable generation that is leaving the
@@ -11764,10 +12609,14 @@ impl StorageEngine {
             .object_store
             .as_ref()
             .ok_or_else(|| ferrosa_common::Error::InvalidFormat("S3 not configured".into()))?;
-        let store = match &self.object_store {
-            Some(store) => Arc::clone(store),
-            None => Arc::from(os_config.build_object_store()?),
-        };
+        // Every constructor builds the one shared client when an object store
+        // is configured. Building another here would open a second connection
+        // pool per call, so a missing client is an error, not a rebuild.
+        let store = self.object_store.as_ref().map(Arc::clone).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(
+                "object store is configured but the engine holds no shared client".into(),
+            )
+        })?;
         Ok((os_config, store))
     }
 
@@ -11800,16 +12649,16 @@ impl StorageEngine {
         self.commit_log.discard_completed_segments()
     }
 
+    /// Eviction candidates plus the manifest's own claim about the same set.
+    ///
+    /// `candidates` are sized from the files actually on disk, never from
+    /// `ManifestEntry::size`, and each `(table, generation)` appears once.
+    /// `manifest_bytes` is what the manifest claims for the eligible entries,
+    /// kept only to compare against the real total.
     fn collect_uploaded_local_sstables(
         &self,
         manifest: &crate::manifest::Manifest,
-    ) -> Vec<(
-        String,
-        String,
-        std::path::PathBuf,
-        u64,
-        std::time::SystemTime,
-    )> {
+    ) -> CollectedCandidates {
         // Generations still listed in the pending-upload log are flushed locally
         // but NOT yet confirmed durable in S3 (the entry is removed only after S3
         // confirms). Evicting their only local copy is the #235 data-loss path,
@@ -11828,11 +12677,14 @@ impl StorageEngine {
                         error = %e,
                         "s3-sync: cannot read pending-upload log; skipping uploaded-cache eviction to avoid deleting not-yet-durable SSTables"
                     );
-                    return Vec::new();
+                    return CollectedCandidates::default();
                 }
             };
 
         let mut entries = Vec::new();
+        let mut manifest_bytes = 0u64;
+        let mut duplicate_entries = 0usize;
+        let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
         for (table_id, manifest_entries) in &manifest.sstables {
             // System keyspaces (system_schema, system_auth, graph adjacency)
             // are read at startup to register indexes and seed auth, before
@@ -11851,8 +12703,20 @@ impl StorageEngine {
                 let Ok(gen) = entry.id.parse::<u64>() else {
                     continue;
                 };
+                if !seen.insert((table_id.as_str(), entry.id.as_str())) {
+                    // The same generation listed twice would be counted, and
+                    // evicted, twice over the same files.
+                    duplicate_entries += 1;
+                    continue;
+                }
+                manifest_bytes = manifest_bytes.saturating_add(entry.size);
                 let component_paths = Self::generation_component_paths(&table_dir, gen);
-                if component_paths.is_empty() {
+                // A remote-backed generation holds only its small index
+                // components locally: nothing worth evicting, and deleting
+                // them would only force a refetch on the next open.
+                if component_paths.is_empty()
+                    || Self::generation_component_path(&table_dir, &entry.id, "Data.db").is_none()
+                {
                     continue;
                 }
 
@@ -11869,19 +12733,81 @@ impl StorageEngine {
                 }
 
                 if size > 0 {
-                    entries.push((
-                        table_id.clone(),
-                        entry.id.clone(),
-                        table_dir.clone(),
+                    entries.push(crate::eviction_plan::EvictionCandidate {
+                        table: table_id.clone(),
+                        sstable_id: entry.id.clone(),
+                        table_dir: table_dir.clone(),
                         size,
                         last_modified,
-                    ));
+                    });
                 }
             }
         }
 
-        entries.sort_by_key(|(_, _, _, _, last_modified)| *last_modified);
-        entries
+        CollectedCandidates {
+            candidates: entries,
+            manifest_bytes,
+            duplicate_entries,
+        }
+    }
+
+    /// Last foreground read of every registered table, keyed by the manifest
+    /// table key (`TableId::to_string`). Tables never read are absent.
+    fn last_foreground_reads(&self) -> HashMap<String, std::time::SystemTime> {
+        self.tables
+            .read()
+            .iter()
+            .filter_map(|(id, state)| Some((id.to_string(), state.last_foreground_read()?)))
+            .collect()
+    }
+
+    /// Reports, on the edges only, that hot tables alone keep the cache over
+    /// its limit (or under the free-space target).
+    fn report_hot_cache_block(
+        &self,
+        blocked: bool,
+        order: &crate::eviction_plan::EvictionOrder,
+        total_bytes: u64,
+        max_bytes: u64,
+    ) {
+        match hot_block_edge(&self.cache_hot_blocked, blocked) {
+            HotBlockEdge::Started => tracing::warn!(
+                hot_bytes = order.hot_bytes,
+                hot_tables = ?order.hot_tables,
+                total_uploaded_cache_bytes = total_bytes,
+                max_uploaded_cache_bytes = max_bytes,
+                hot_window_secs = self.config.cache_hot_window_secs,
+                "s3-sync: uploaded local cache is over its limit or free target but every remaining SSTable belongs to a recently read table; not evicting hot data"
+            ),
+            HotBlockEdge::Cleared => {
+                tracing::info!("s3-sync: uploaded local cache no longer blocked by hot tables")
+            }
+            HotBlockEdge::Unchanged => {}
+        }
+    }
+
+    /// Reports, on the edges only, that the manifest claims far more bytes
+    /// than the generations it lists occupy on disk. The eviction decision
+    /// uses the on-disk figure only, so this cannot cause an eviction; it
+    /// flags a manifest that lists retired or non-local generations.
+    fn report_manifest_drift(&self, manifest_bytes: u64, disk_bytes: u64, duplicates: usize) {
+        let drifted = manifest_drift(manifest_bytes, disk_bytes) || duplicates > 0;
+        match hot_block_edge(&self.manifest_drift_flagged, drifted) {
+            HotBlockEdge::Started => tracing::warn!(
+                manifest_listed_bytes = manifest_bytes,
+                on_disk_bytes = disk_bytes,
+                duplicate_manifest_entries = duplicates,
+                "s3-sync: the S3 manifest claims far more bytes than its generations occupy on disk, \
+                 or lists a generation twice; the manifest is stale. Eviction uses the on-disk \
+                 figure and ignores the claim"
+            ),
+            HotBlockEdge::Cleared => tracing::info!(
+                manifest_listed_bytes = manifest_bytes,
+                on_disk_bytes = disk_bytes,
+                "s3-sync: the manifest and the disk agree again"
+            ),
+            HotBlockEdge::Unchanged => {}
+        }
     }
 
     fn enforce_uploaded_sstable_cache_limit(
@@ -11896,18 +12822,47 @@ impl StorageEngine {
         } else {
             0
         };
-        let candidates = self.collect_uploaded_local_sstables(manifest);
+        let collected = self.collect_uploaded_local_sstables(manifest);
+        let candidates = collected.candidates;
         let mut total_bytes = candidates
             .iter()
-            .fold(0u64, |acc, (_, _, _, size, _)| acc.saturating_add(*size));
+            .fold(0u64, |acc, c| acc.saturating_add(c.size));
+        self.report_manifest_drift(
+            collected.manifest_bytes,
+            total_bytes,
+            collected.duplicate_entries,
+        );
+        let order = crate::eviction_plan::order_for_eviction(
+            candidates,
+            &self.last_foreground_reads(),
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(self.config.cache_hot_window_secs),
+        );
+        let initial_trigger = crate::eviction_marker::Trigger::from_limits(
+            total_bytes > max_bytes,
+            target_free > 0 && projected_available < target_free,
+        );
+        let disk_bytes_at_start = total_bytes;
         let mut evicted = 0usize;
+        let mut evicted_bytes = 0u64;
+        let mut stopped_early = false;
 
-        for (table_id, sstable_id, table_dir, size, _) in candidates {
+        for crate::eviction_plan::EvictionCandidate {
+            table: table_id,
+            sstable_id,
+            table_dir,
+            size,
+            ..
+        } in order.cold.iter().cloned()
+        {
             let over_cache_limit = total_bytes > max_bytes;
             let under_free_target = target_free > 0 && projected_available < target_free;
-            if !over_cache_limit && !under_free_target {
+            let Some(trigger) =
+                crate::eviction_marker::Trigger::from_limits(over_cache_limit, under_free_target)
+            else {
+                stopped_early = true;
                 break;
-            }
+            };
             if total_bytes <= min_bytes {
                 tracing::warn!(
                     total_uploaded_cache_bytes = total_bytes,
@@ -11916,13 +12871,27 @@ impl StorageEngine {
                     target_free_bytes = target_free,
                     "s3-sync: uploaded local cache at floor; cannot evict more for disk pressure"
                 );
+                stopped_early = true;
                 break;
             }
 
             // Record the eviction durably first; without the record a restart
             // cannot tell this SSTable from a compacted-away one and would
             // leave it out of its table. No record, no eviction.
-            if let Err(e) = Self::record_eviction(&table_dir, &sstable_id) {
+            let record = crate::eviction_marker::EvictionRecord {
+                trigger,
+                generation_bytes: Some(size),
+                total_bytes: Some(total_bytes),
+                max_bytes: Some(max_bytes),
+                min_bytes: Some(min_bytes),
+                projected_available: Some(projected_available),
+                target_free: Some(target_free),
+                ..crate::eviction_marker::EvictionRecord::bare(
+                    trigger,
+                    crate::eviction_marker::SOURCE_EVICTOR,
+                )
+            };
+            if let Err(e) = Self::record_eviction(&table_dir, &sstable_id, &record) {
                 tracing::error!(
                     table = table_id,
                     sstable = sstable_id,
@@ -11935,6 +12904,7 @@ impl StorageEngine {
             total_bytes = total_bytes.saturating_sub(size);
             projected_available = projected_available.saturating_add(reclaimed);
             evicted += 1;
+            evicted_bytes = evicted_bytes.saturating_add(size);
             tracing::info!(
                 table = table_id,
                 sstable = sstable_id,
@@ -11948,6 +12918,42 @@ impl StorageEngine {
                 "s3-sync: evicted uploaded local SSTable from cache"
             );
         }
+
+        // The pass found pressure: leave a durable, bounded record of what it
+        // saw and did. This cannot fail or delay the eviction (it is after it).
+        if let Some(trigger) = initial_trigger {
+            let now = crate::eviction_audit::now_unix_ms();
+            self.eviction_audit
+                .record_pass(crate::eviction_audit::PassRecord {
+                    version: 1,
+                    first_unix_ms: now,
+                    last_unix_ms: now,
+                    count: 1,
+                    pid: std::process::id(),
+                    build: env!("CARGO_PKG_VERSION").to_string(),
+                    trigger,
+                    max_bytes,
+                    min_bytes,
+                    target_free,
+                    projected_available,
+                    manifest_bytes: collected.manifest_bytes,
+                    disk_bytes: disk_bytes_at_start,
+                    duplicate_entries: collected.duplicate_entries as u64,
+                    evicted_generations: evicted as u64,
+                    evicted_bytes,
+                });
+        }
+
+        // Every cold SSTable is gone (or was kept on a record failure, which is
+        // logged above) and pressure remains: only hot tables are left to blame.
+        let still_pressured =
+            total_bytes > max_bytes || (target_free > 0 && projected_available < target_free);
+        self.report_hot_cache_block(
+            !stopped_early && still_pressured && order.hot_bytes > 0,
+            &order,
+            total_bytes,
+            max_bytes,
+        );
 
         Ok(evicted)
     }
@@ -12153,8 +13159,16 @@ impl StorageEngine {
         }
 
         let evicted = self.enforce_uploaded_sstable_cache_limit(&manifest)?;
+        // Optional, off by default, strictly after the eviction and bounded:
+        // one segment, one attempt, a timeout, through the shared throttled store.
+        self.eviction_audit.offload_rotated(&store, &prefix).await;
         if uploaded > 0 || evicted > 0 {
             tracing::info!(uploaded, evicted, "s3-sync: SSTables synchronized");
+        }
+        // Degraded, not fatal: a hot table that fails to restore keeps being
+        // served by ranged reads. Say so; the next pass retries.
+        if let Err(e) = self.restore_hot_evicted_sstables().await {
+            tracing::error!(error = %e, "s3-sync: hot-table restore failed; those tables stay remote-backed until the next pass");
         }
 
         Ok(uploaded)
@@ -12251,6 +13265,7 @@ impl StorageEngine {
         if evicted.is_empty() {
             return Ok(0);
         }
+        crate::eviction_marker::log_census(&data_dir.join("sstables"));
         let (store, prefix) = store.ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "{} evicted SSTable table(s) need restoring from S3, but S3 is not configured",
@@ -12258,28 +13273,87 @@ impl StorageEngine {
             ))
         })?;
         let (manifest, _version) = crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+        let work = restore_work(&evicted, &manifest);
+        // A restore can run for minutes (R2 request throttling); say so up
+        // front and keep reporting, or startup looks hung.
+        tracing::info!(
+            tables = work.tables,
+            generations = work.generations,
+            bytes = work.bytes,
+            "storage-engine: restoring evicted SSTables from S3 before registering tables"
+        );
+        let cfg = crate::upload::download::config()?;
+        let started = Instant::now();
+        let mut last_log = started;
+        let mut gens_since_log = 0usize;
         let mut restored = 0usize;
-        for (dir_name, gens) in evicted {
+        let mut restored_bytes = 0u64;
+        // One job per evicted generation, run `restore_concurrency` at a time.
+        // Each job's marker is cleared as soon as that generation is on disk
+        // (never before), so a later failure does not redo finished work.
+        let mut jobs = Vec::new();
+        for (dir_name, gens) in &evicted {
             let Some((keyspace, table)) = dir_name.split_once('.') else {
                 continue;
             };
             let table_id = TableId::new(keyspace, table);
-            let mut marked = crate::manifest::Manifest::new();
-            for entry in manifest.sstables.get(&dir_name).into_iter().flatten() {
-                if gens.contains(&entry.id) {
-                    marked.add_sstable(&dir_name, entry.clone());
+            for entry in manifest.sstables.get(dir_name).into_iter().flatten() {
+                if !gens.contains(&entry.id) {
+                    continue;
                 }
+                let mut one = crate::manifest::Manifest::new();
+                one.add_sstable(dir_name, entry.clone());
+                jobs.push((dir_name.clone(), table_id.clone(), entry.clone(), one));
             }
-            restored +=
-                Self::download_sstables_into(data_dir, &store, &prefix, &table_id, &marked).await?;
-
+        }
+        let (store_ref, prefix_ref) = (&store, &prefix);
+        let mut running = futures::StreamExt::buffer_unordered(
+            futures::stream::iter(jobs.into_iter().map(
+                |(dir_name, table_id, entry, one)| async move {
+                    let downloaded = Self::download_sstables_into(
+                        data_dir, store_ref, prefix_ref, &table_id, &one,
+                    )
+                    .await?;
+                    Ok::<_, ferrosa_common::Error>((dir_name, entry, downloaded))
+                },
+            )),
+            cfg.restore_concurrency,
+        );
+        while let Some(done) = futures::StreamExt::next(&mut running).await {
+            let (dir_name, entry, downloaded) = done?;
+            restored += downloaded;
+            if downloaded > 0 {
+                restored_bytes = restored_bytes.saturating_add(entry.size);
+            }
             let table_dir = data_dir.join("sstables").join(&dir_name);
-            for gen in &gens {
+            if Self::generation_component_path(&table_dir, &entry.id, "Data.db").is_some() {
+                Self::clear_evicted_marker(&table_dir, &dir_name, &entry.id);
+            }
+            gens_since_log += 1;
+            if restore_progress_due(last_log.elapsed(), gens_since_log) {
+                tracing::info!(
+                    restored,
+                    total = work.generations,
+                    restored_bytes,
+                    total_bytes = work.bytes,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    concurrency = cfg.restore_concurrency,
+                    table = %dir_name,
+                    "storage-engine: restoring evicted SSTables from S3"
+                );
+                last_log = Instant::now();
+                gens_since_log = 0;
+            }
+        }
+        drop(running);
+
+        // Generations the manifest does not list, or whose objects are gone,
+        // are still missing; keep their markers and say so.
+        for (dir_name, gens) in &evicted {
+            let table_dir = data_dir.join("sstables").join(dir_name);
+            for gen in gens {
                 if Self::generation_component_path(&table_dir, gen, "Data.db").is_some() {
-                    if let Err(e) = std::fs::remove_file(Self::evicted_marker_path(&table_dir, gen))
-                    {
-                        tracing::warn!(table = %dir_name, sstable = %gen, error = %e, "storage-engine: restored an evicted SSTable but could not clear its marker");
-                    }
+                    Self::clear_evicted_marker(&table_dir, dir_name, gen);
                 } else {
                     tracing::error!(
                         table = %dir_name,
@@ -12292,8 +13366,276 @@ impl StorageEngine {
         if restored > 0 {
             tracing::warn!(
                 restored,
+                total = work.generations,
+                restored_bytes,
+                elapsed_secs = started.elapsed().as_secs(),
                 "storage-engine: restored evicted SSTables from S3 before registering tables"
             );
+        }
+        Ok(restored)
+    }
+
+    /// Remove an eviction marker once its generation is on disk. An absent
+    /// marker is fine (already cleared); any other failure is reported.
+    fn clear_evicted_marker(table_dir: &std::path::Path, dir_name: &str, gen: &str) {
+        match std::fs::remove_file(Self::evicted_marker_path(table_dir, gen)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(table = %dir_name, sstable = %gen, error = %e, "storage-engine: restored an evicted SSTable but could not clear its marker");
+            }
+        }
+    }
+
+    /// `FERROSA_RESTORE_EVICTED_MODE`: what startup does with evicted
+    /// generations. `remote` (default) fetches their index components and
+    /// serves `Data.db` by ranged reads (ST-51); `full` downloads every
+    /// component first, the pre-ST-51 behaviour, for operators who want the
+    /// disk warm before serving. An unrecognised value is reported and
+    /// replaced by `remote`.
+    fn restore_evicted_full_at_startup() -> bool {
+        match std::env::var("FERROSA_RESTORE_EVICTED_MODE") {
+            Err(_) => false,
+            Ok(value) if value.is_empty() || value.eq_ignore_ascii_case("remote") => false,
+            Ok(value) if value.eq_ignore_ascii_case("full") => true,
+            Ok(value) => {
+                tracing::error!(
+                    value = %value,
+                    "invalid FERROSA_RESTORE_EVICTED_MODE (expected `remote` or `full`); using `remote`"
+                );
+                false
+            }
+        }
+    }
+
+    /// Register every eviction-marked, manifest-listed generation as
+    /// remote-backed instead of downloading it (t_6a2847c8).
+    ///
+    /// Each generation's small index components are fetched (several at a
+    /// time) so table registration can open it; `Data.db` stays in the object
+    /// store and is read by ranged GETs. Markers are untouched. A marked
+    /// generation that is not in the manifest, or whose objects are gone, is an
+    /// ERROR for the whole startup: serving the table without it is the
+    /// 2026-09-29 data-loss shape. Returns the number of generations
+    /// registered.
+    async fn register_evicted_sstables_remote_in(
+        data_dir: &std::path::Path,
+        store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
+    ) -> ferrosa_common::Result<usize> {
+        use futures::StreamExt;
+        const FETCH_CONCURRENCY: usize = 16;
+        const LISTED_FAILURES: usize = 10;
+
+        let evicted = Self::evicted_generations(&data_dir.join("sstables"));
+        if evicted.is_empty() {
+            return Ok(0);
+        }
+        let (store, prefix) = store.ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "{} evicted SSTable table(s) must be served from S3, but S3 is not configured",
+                evicted.len()
+            ))
+        })?;
+        let (manifest, _version) = crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+        let work = restore_work(&evicted, &manifest);
+        let reads = crate::evicted_read::ensure_registered(
+            data_dir.to_path_buf(),
+            prefix,
+            Arc::clone(&store),
+        );
+        tracing::info!(
+            tables = work.tables,
+            generations = work.generations,
+            bytes = work.bytes,
+            "storage-engine: registering evicted SSTables as remote-backed (index components only, no Data.db download)"
+        );
+        let started = Instant::now();
+        // Only LISTED_FAILURES messages are ever shown, so retain exactly that
+        // many: a max-heap capped at LISTED_FAILURES yields the same lowest-N
+        // sorted sample the old `sort().take(N)` produced, in O(N) memory rather
+        // than one string per failed generation (352-373 per node on 2026-09-29).
+        // `failure_count` carries the true total into the error message.
+        let mut failures: std::collections::BinaryHeap<String> =
+            std::collections::BinaryHeap::new();
+        let mut failure_count = 0usize;
+        let note_failure =
+            |heap: &mut std::collections::BinaryHeap<String>, count: &mut usize, msg: String| {
+                *count += 1;
+                heap.push(msg);
+                if heap.len() > LISTED_FAILURES {
+                    heap.pop();
+                }
+            };
+        let mut jobs = Vec::new();
+        for (dir_name, gens) in &evicted {
+            let table_dir = data_dir.join("sstables").join(dir_name);
+            for gen in gens {
+                let listed = manifest
+                    .sstables
+                    .get(dir_name)
+                    .is_some_and(|entries| entries.iter().any(|e| &e.id == gen));
+                if Self::generation_component_path(&table_dir, gen, "Data.db").is_some() {
+                    // Already local (a restore finished but crashed before it
+                    // cleared the marker): the marker is stale.
+                    if let Err(e) = std::fs::remove_file(Self::evicted_marker_path(&table_dir, gen))
+                    {
+                        tracing::warn!(table = %dir_name, sstable = %gen, error = %e, "storage-engine: could not clear the marker of an evicted SSTable that is local again");
+                    }
+                } else if listed {
+                    jobs.push((dir_name.clone(), gen.clone(), table_dir.clone()));
+                } else {
+                    note_failure(
+                        &mut failures,
+                        &mut failure_count,
+                        format!("{dir_name} generation {gen}: not in the manifest"),
+                    );
+                }
+            }
+        }
+        let mut registered = 0usize;
+        let mut results = futures::stream::iter(jobs)
+            .map(|(dir_name, gen, table_dir)| {
+                let reads = Arc::clone(&reads);
+                async move {
+                    let outcome = reads.fetch_query_components_async(&table_dir, &gen).await;
+                    (dir_name, gen, outcome)
+                }
+            })
+            .buffer_unordered(FETCH_CONCURRENCY);
+        while let Some((dir_name, gen, outcome)) = results.next().await {
+            match outcome {
+                Ok(crate::evicted_read::QueryFetch::Ready) => registered += 1,
+                Ok(other) => note_failure(
+                    &mut failures,
+                    &mut failure_count,
+                    format!(
+                        "{dir_name} generation {gen}: objects unavailable in the store ({other:?})"
+                    ),
+                ),
+                Err(e) => note_failure(
+                    &mut failures,
+                    &mut failure_count,
+                    format!("{dir_name} generation {gen}: {e}"),
+                ),
+            }
+        }
+        if failure_count > 0 {
+            let mut shown = failures.into_sorted_vec();
+            shown.truncate(LISTED_FAILURES);
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "{} evicted SSTable generation(s) are neither local nor resolvable from the \
+                 object store; refusing to start and serve their tables without them: {}",
+                failure_count,
+                shown.join("; ")
+            )));
+        }
+        tracing::info!(
+            registered,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "storage-engine: evicted SSTables registered as remote-backed"
+        );
+        Ok(registered)
+    }
+
+    /// Fully restore the evicted SSTables of recently read (hot) tables, in
+    /// the background of a sync pass, so tables that are actually queried get
+    /// local `Data.db` again without a startup bulk download (t_6a2847c8).
+    ///
+    /// Bounded: at most 8 generations per call (`HOT_RESTORE_MAX_GENERATIONS`),
+    /// and it stops, never re-triggering eviction, when restoring the next
+    /// generation would leave free disk under the eviction free-space target
+    /// or push the uploaded-SSTable cache past `local_cache_max_bytes`.
+    /// `FERROSA_RESTORE_HOT_TABLES_ON_START=0` disables it. Returns the number
+    /// of generations restored.
+    pub async fn restore_hot_evicted_sstables(&self) -> ferrosa_common::Result<usize> {
+        const HOT_RESTORE_MAX_GENERATIONS: usize = 8;
+        if matches!(
+            std::env::var("FERROSA_RESTORE_HOT_TABLES_ON_START").as_deref(),
+            Ok("0" | "false")
+        ) {
+            return Ok(0);
+        }
+        let window = std::time::Duration::from_secs(self.config.cache_hot_window_secs);
+        if window.is_zero() {
+            return Ok(0);
+        }
+        let now = std::time::SystemTime::now();
+        let hot: std::collections::HashSet<String> = self
+            .last_foreground_reads()
+            .into_iter()
+            .filter(|(_, read)| now.duration_since(*read).is_ok_and(|age| age <= window))
+            .map(|(table, _)| table)
+            .collect();
+        let evicted: Vec<_> = Self::evicted_generations(&self.config.data_dir.join("sstables"))
+            .into_iter()
+            .filter(|(table, _)| hot.contains(table))
+            .collect();
+        let Some((store, prefix)) = self.resolve_store_and_prefix() else {
+            return Ok(0);
+        };
+        if evicted.is_empty() {
+            return Ok(0);
+        }
+        let (manifest, _version) = crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+        let max_bytes = self.config.local_cache_max_bytes;
+        let target_free = self.local_disk_eviction_target_free_bytes();
+        let mut cached = self
+            .collect_uploaded_local_sstables(&manifest)
+            .candidates
+            .iter()
+            .fold(0u64, |acc, c| acc.saturating_add(c.size));
+        let mut free = self.disk_free_bytes_cached();
+        let mut restored = 0usize;
+        for (dir_name, gens) in evicted {
+            let Some((keyspace, table)) = dir_name.split_once('.') else {
+                continue;
+            };
+            let table_id = TableId::new(keyspace, table);
+            let table_dir = self.config.data_dir.join("sstables").join(&dir_name);
+            for entry in manifest.sstables.get(&dir_name).into_iter().flatten() {
+                if !gens.contains(&entry.id) {
+                    continue;
+                }
+                let room = free >= entry.size.saturating_add(target_free)
+                    && cached.saturating_add(entry.size) <= max_bytes;
+                if restored >= HOT_RESTORE_MAX_GENERATIONS || !room {
+                    tracing::info!(
+                        restored,
+                        next_bytes = entry.size,
+                        free_bytes = free,
+                        target_free_bytes = target_free,
+                        uploaded_cache_bytes = cached,
+                        max_uploaded_cache_bytes = max_bytes,
+                        "storage-engine: hot-table restore paused (bounded per pass, or restoring more would re-trigger eviction)"
+                    );
+                    return Ok(restored);
+                }
+                let mut one = crate::manifest::Manifest::new();
+                one.add_sstable(&dir_name, entry.clone());
+                Self::download_sstables_into(
+                    &self.config.data_dir,
+                    &store,
+                    &prefix,
+                    &table_id,
+                    &one,
+                )
+                .await?;
+                if Self::generation_component_path(&table_dir, &entry.id, "Data.db").is_none() {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "hot-table restore of {dir_name} generation {} left no Data.db",
+                        entry.id
+                    )));
+                }
+                if let Err(e) =
+                    std::fs::remove_file(Self::evicted_marker_path(&table_dir, &entry.id))
+                {
+                    tracing::warn!(table = %dir_name, sstable = %entry.id, error = %e, "storage-engine: restored a hot SSTable but could not clear its marker");
+                }
+                restored += 1;
+                free = free.saturating_sub(entry.size);
+                cached = cached.saturating_add(entry.size);
+                tracing::info!(table = %dir_name, sstable = %entry.id, size_bytes = entry.size, "storage-engine: restored a hot table's evicted SSTable in the background");
+            }
         }
         Ok(restored)
     }
@@ -12315,7 +13657,31 @@ impl StorageEngine {
         if Self::evicted_generations(&data_dir.join("sstables")).is_empty() {
             return Ok(0);
         }
-        Self::block_on_rehydration(Self::restore_evicted_sstables_in(data_dir, store))
+        if Self::restore_evicted_full_at_startup() {
+            return Self::block_on_rehydration(Self::restore_evicted_sstables_in(data_dir, store));
+        }
+        Self::block_on_rehydration(Self::register_evicted_sstables_remote_in(data_dir, store))
+    }
+
+    /// Generations in `table_dir` that carry an eviction marker and have no
+    /// local `Data.db`: served remote-backed (ST-51). Startup registration
+    /// fetches their index components first.
+    fn remote_backed_generations(table_dir: &std::path::Path) -> std::collections::BTreeSet<u64> {
+        let mut out = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(gen) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".evicted"))
+                .and_then(|g| g.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if Self::generation_component_path(table_dir, &gen.to_string(), "Data.db").is_none() {
+                out.insert(gen);
+            }
+        }
+        out
     }
 
     /// `(table dir name, evicted generation ids)` for every table directory
@@ -12667,81 +14033,17 @@ impl StorageEngine {
         ))
     }
 
-    /// Download one component, retrying the whole object when a request or
-    /// its body fails partway. A 100 MB `Data.db` from R2 dropped mid-body
-    /// ("error decoding response body") and failed a node's entire restore
-    /// on 2026-09-29. Each retry starts a fresh request and truncates the
-    /// file, so a partial body is never kept. `NotFound` is not retried.
+    /// Download one component. Large objects are fetched as parallel ranged
+    /// parts and small ones with a single GET; a failed part is retried
+    /// alone, and `NotFound` is not retried. A half-written file never
+    /// outlives a failure. See [`crate::upload::download`].
     async fn download_sstable_component_to_path(
         store: &dyn object_store::ObjectStore,
         s3_path: &object_store::path::Path,
         local_path: &std::path::Path,
     ) -> ferrosa_common::Result<Option<u64>> {
-        const ATTEMPTS: u32 = 5;
-        let mut backoff = std::time::Duration::from_millis(500);
-        let mut attempt = 1;
-        loop {
-            match Self::download_sstable_component_once(store, s3_path, local_path).await {
-                Err(e) if attempt < ATTEMPTS => {
-                    tracing::warn!(
-                        path = %s3_path,
-                        attempt,
-                        error = %e,
-                        "SSTable component download failed; retrying the whole object"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
-                    attempt += 1;
-                }
-                result => return result,
-            }
-        }
-    }
-
-    async fn download_sstable_component_once(
-        store: &dyn object_store::ObjectStore,
-        s3_path: &object_store::path::Path,
-        local_path: &std::path::Path,
-    ) -> ferrosa_common::Result<Option<u64>> {
-        let result = match store.get(s3_path).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "S3 download failed for {s3_path}: {e}"
-                )));
-            }
-        };
-
-        let mut stream = result.into_stream();
-        let mut file = tokio::fs::File::create(local_path).await.map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to create SSTable download temp file {}: {e}",
-                local_path.display()
-            ))
-        })?;
-        use tokio::io::AsyncWriteExt;
-        let mut bytes = 0u64;
-        while let Some(chunk) = stream.try_next().await.map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to stream SSTable component {s3_path}: {e}"
-            ))
-        })? {
-            bytes = bytes.saturating_add(chunk.len() as u64);
-            file.write_all(&chunk).await.map_err(|e| {
-                ferrosa_common::Error::InvalidFormat(format!(
-                    "failed to write SSTable download temp file {}: {e}",
-                    local_path.display()
-                ))
-            })?;
-        }
-        file.sync_data().await.map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to sync SSTable download temp file {}: {e}",
-                local_path.display()
-            ))
-        })?;
-        Ok(Some(bytes))
+        let cfg = crate::upload::download::config()?;
+        crate::upload::download::download_component(store, s3_path, local_path, &cfg).await
     }
 
     fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
@@ -13363,6 +14665,10 @@ impl StorageEngine {
         let pump_sample_total_ns = (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free()
             * 1_000_000_000.0) as u64;
 
+        let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
+        let eviction_audit = crate::eviction_audit::EvictionAudit::new(
+            crate::eviction_audit::AuditConfig::from_env(&config.data_dir),
+        );
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -13371,6 +14677,8 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            set_aside_status,
+            set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -13398,6 +14706,9 @@ impl StorageEngine {
             object_store: Some(Arc::clone(&store)),
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            cache_hot_blocked: AtomicBool::new(false),
+            manifest_drift_flagged: AtomicBool::new(false),
+            eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -13413,7 +14724,7 @@ impl StorageEngine {
         // Mirror the production constructor: a restart restores evicted
         // SSTables before any table can register.
         engine.restore_evicted_sstables_blocking()?;
-        Ok(engine)
+        engine.finish_construction()
     }
 
     /// Test helper: uploads the engine's current SSTable inventory to the
@@ -13657,6 +14968,7 @@ impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
 #[cfg(test)]
 mod tests {
     include!("engine_wiring_tests.rs");
+    include!("engine_evicted_ranged_tests.rs");
 
     use super::*;
 
@@ -17536,6 +18848,61 @@ mod tests {
     /// repair needs to ask "give me everything in this Merkle leaf's
     /// token sub-range" — the existing key-bounded `read_range` cannot
     /// answer that question.
+    /// Cache eviction keys on read heat. A foreground read must stamp the
+    /// table; anti-entropy repair reads touch every table by design and must
+    /// not, or everything would look hot.
+    #[test]
+    fn foreground_reads_stamp_the_table_and_repair_reads_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        let dk = make_key("k1");
+        engine.write(&tid, &dk, make_row(b"v", 1000), 1000).unwrap();
+        assert_eq!(
+            engine.table_last_foreground_read(&tid),
+            None,
+            "a table never read starts cold"
+        );
+
+        // Repair primitives, compaction-free: no stamp.
+        engine
+            .read_token_range(&tid, i64::MIN, i64::MAX, 10)
+            .unwrap();
+        engine
+            .read_token_range_bounded(&tid, i64::MIN, i64::MAX, 10, 1 << 20)
+            .unwrap();
+        engine
+            .walk_token_range(&tid, i64::MIN, i64::MAX, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            engine.table_last_foreground_read(&tid),
+            None,
+            "repair reads must not make a table hot"
+        );
+
+        // Each foreground entry point stamps.
+        let before = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        let assert_stamps = |name: &str, read: &dyn Fn()| {
+            engine.clear_last_foreground_read_for_test(&tid);
+            read();
+            let stamp = engine
+                .table_last_foreground_read(&tid)
+                .unwrap_or_else(|| panic!("{name} must stamp the table"));
+            assert!(stamp >= before, "{name} stamped a stale time");
+        };
+        assert_stamps("read", &|| {
+            engine.read(&tid, &dk).unwrap();
+        });
+        assert_stamps("read_clustering_row", &|| {
+            engine.read_clustering_row(&tid, &dk, &[]).unwrap();
+        });
+        assert_stamps("read_range", &|| {
+            engine.read_range(&tid, None, None, 10).unwrap();
+        });
+    }
+
     #[test]
     fn read_token_range_filters_by_token_bounds() {
         let dir = tempfile::tempdir().unwrap();
@@ -21823,6 +23190,384 @@ mod tests {
         );
     }
 
+    // ---- t_e76b4d27: index rebuild over a table whose Data.db files are absent ----
+
+    /// Remove `gen`'s files under `table_dir` at any depth: every component, or
+    /// only `Data.db` when `only_data` (leaving TOC and sidecars, the
+    /// "compacted away with metadata left behind" shape).
+    fn remove_generation_files(table_dir: &std::path::Path, gen: &str, only_data: bool) -> usize {
+        let prefix = format!("{gen}-");
+        let mut removed = 0;
+        let mut stack = vec![table_dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&prefix) && (!only_data || name.ends_with("-Data.db")) {
+                    std::fs::remove_file(&path).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
+    /// A file-backed engine holding `n` SSTables of one row each (`k0`..),
+    /// with a partition-key index over all of them. Automatic compaction is
+    /// kept out of the way so the generation set is exactly what was flushed.
+    fn engine_with_indexed_generations(
+        n: usize,
+    ) -> (tempfile::TempDir, StorageEngine, TableId, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for i in 0..n {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+        engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        let gens = engine
+            .tables
+            .read()
+            .get(&tid)
+            .unwrap()
+            .store
+            .sstable_generation_ids();
+        assert_eq!(gens.len(), n, "fixture must hold {n} SSTables");
+        (dir, engine, tid, gens)
+    }
+
+    /// Rows the partition-key index returns for the partition `key`.
+    fn pk_index_rows(
+        engine: &StorageEngine,
+        tid: &TableId,
+        key: &str,
+    ) -> ferrosa_common::Result<usize> {
+        let found = collect_index_results(
+            engine,
+            tid,
+            "idx_pk",
+            &ferrosa_index::IndexKey(key.as_bytes().to_vec()),
+        )?;
+        Ok(found.iter().map(|p| p.rows.len()).sum())
+    }
+
+    /// Live failure, 2026-09-14: the rebuild was handed generations that exist
+    /// nowhere on disk (a stale enumeration), called them "compacted away" and
+    /// reported the index complete. A generation with NO files at all is not
+    /// metadata left behind: it is a stale manifest entry, and the index must
+    /// stay stale and refuse reads rather than answer from a fraction of the table.
+    #[test]
+    fn a_rebuild_over_a_generation_missing_entirely_fails_and_leaves_the_index_stale() {
+        let (dir, engine, tid, gens) = engine_with_indexed_generations(3);
+        let table_dir = engine.table_sstable_dir(&tid);
+        assert!(remove_generation_files(&table_dir, &gens[0], false) > 0);
+
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+
+        assert_eq!(outcome.sstables_failed, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.sstables_vanished, 0,
+            "an absent generation must never be discounted: {outcome:?}"
+        );
+        assert!(!outcome.is_complete(), "{outcome:?}");
+        assert!(
+            !engine.index_is_current(&tid, "idx_pk"),
+            "an index over a table with an unaccounted generation must not be current"
+        );
+        assert!(
+            pk_index_rows(&engine, &tid, "k0").is_err(),
+            "a stale index must refuse reads, not return a short count"
+        );
+        drop(dir);
+    }
+
+    /// `CREATE INDEX` backfills through `add_partition_key_index`. A failed
+    /// backfill used to be visible only through the stale tracker and an ERROR
+    /// log; the caller got `Ok(())`. It must see the outcome.
+    #[test]
+    fn add_partition_key_index_returns_the_outcome_of_a_failed_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for i in 0..3 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+        let gens = engine
+            .tables
+            .read()
+            .get(&tid)
+            .unwrap()
+            .store
+            .sstable_generation_ids();
+        let table_dir = engine.table_sstable_dir(&tid);
+        assert!(remove_generation_files(&table_dir, &gens[0], false) > 0);
+
+        let outcome = engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        assert_eq!(outcome.sstables_failed, 1, "{outcome:?}");
+        assert!(!outcome.is_complete(), "{outcome:?}");
+        assert!(!engine.index_is_current(&tid, "idx_pk"));
+    }
+
+    /// A clean backfill is reported complete to the caller.
+    #[test]
+    fn add_partition_key_index_reports_a_complete_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("k0"), make_row(b"v", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let outcome = engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        assert_eq!(outcome.sstables_rebuilt, 1, "{outcome:?}");
+        assert!(outcome.is_complete(), "{outcome:?}");
+    }
+
+    /// The legitimate #406 case must keep working: TOC and sidecars still
+    /// there, Data.db gone. Nothing to index; the rebuild completes.
+    #[test]
+    fn a_generation_with_metadata_but_no_data_file_is_vanished_and_the_rebuild_completes() {
+        let (dir, engine, tid, gens) = engine_with_indexed_generations(3);
+        let table_dir = engine.table_sstable_dir(&tid);
+        assert_eq!(remove_generation_files(&table_dir, &gens[0], true), 1);
+
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+
+        assert_eq!(outcome.sstables_vanished, 1, "{outcome:?}");
+        assert_eq!(outcome.sstables_rebuilt, 2, "{outcome:?}");
+        assert_eq!(outcome.sstables_failed, 0, "{outcome:?}");
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert!(engine.index_is_current(&tid, "idx_pk"));
+        drop(dir);
+    }
+
+    /// Reconciliation backstop. An index whose component does not exist in the
+    /// partition key decodes to nothing for every partition: the build "succeeds"
+    /// with an empty sidecar. Without reconciling indexed entries against the
+    /// partitions the build enumerated, that reads as a complete, current,
+    /// EMPTY index, which is the shape of the live 68% shortfall regardless of
+    /// how any generation was classified.
+    #[test]
+    fn a_build_that_indexes_fewer_partitions_than_it_enumerated_does_not_mark_the_index_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for i in 0..2 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        // Component 5 of a one-component key: every partition decodes to None.
+        let outcome = engine
+            .add_partition_key_index(&tid, "idx_bad", 5, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        assert_eq!(outcome.sstables_failed, 2, "{outcome:?}");
+        assert!(!outcome.is_complete(), "{outcome:?}");
+        assert!(
+            !engine.index_is_current(&tid, "idx_bad"),
+            "an index that covers 0 of the rows its build enumerated must not be current"
+        );
+    }
+
+    /// A live generation with a TOC and no `Data.db` is discounted on the
+    /// ASSUMPTION that compaction removed it. Nothing positively proves that,
+    /// so each such discount must be visible: a WARN naming the generation, not
+    /// an info line that scrolls past.
+    #[test]
+    fn a_metadata_only_generation_is_discounted_with_a_warn_naming_it() {
+        let (dir, engine, tid, gens) = engine_with_indexed_generations(3);
+        let table_dir = engine.table_sstable_dir(&tid);
+        assert_eq!(remove_generation_files(&table_dir, &gens[0], true), 1);
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            engine.rebuild_index(&tid, "idx_pk").unwrap()
+        });
+
+        assert_eq!(outcome.sstables_vanished, 1, "{outcome:?}");
+        let text = logs.text();
+        assert!(
+            text.contains("WARN") && text.contains(gens[0].as_str()),
+            "the discounted generation {} must be named in a WARN; got: {text}",
+            gens[0]
+        );
+        assert!(
+            text.contains("unverified"),
+            "the WARN must say the compaction claim is unverified: {text}"
+        );
+        drop(dir);
+    }
+
+    /// A rebuild walks the LIVE set. After a compaction retired older
+    /// generations, every live generation is enumerated and indexed, and the
+    /// retired ones are not named at all.
+    #[tokio::test]
+    async fn a_rebuild_enumerates_every_live_generation_after_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        let flush_key = |name: &str| {
+            engine
+                .write(&tid, &make_key(name), make_row(b"v", 1000), 1000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        };
+        for name in ["k0", "k1", "k2", "k3"] {
+            flush_key(name);
+        }
+        engine.force_compact_all();
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.sstable_count(&tid), 1, "compaction must swap in");
+        for name in ["k4", "k5"] {
+            flush_key(name);
+        }
+        engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+
+        assert_eq!(outcome.sstables_total, 3, "{outcome:?}");
+        assert_eq!(outcome.sstables_rebuilt, 3, "{outcome:?}");
+        assert!(outcome.is_complete(), "{outcome:?}");
+        for name in ["k0", "k1", "k2", "k3", "k4", "k5"] {
+            assert_eq!(
+                pk_index_rows(&engine, &tid, name).unwrap(),
+                1,
+                "partition {name} must be reachable through the rebuilt index"
+            );
+        }
+    }
+
+    /// Eviction removes `Data.db` while the generation stays live, with a
+    /// marker and the objects in S3. That is neither "compacted away" nor a
+    /// stale entry: it must be rehydrated and indexed. Discounting it as
+    /// vanished drops live rows from the index and reports it complete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_evicted_generation_is_rehydrated_and_indexed_not_discounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, keys) =
+            engine_with_evicted_sstable(dir.path(), "test-rebuild-evicted").await;
+        let tid = table_id();
+        assert!(StorageEngine::evicted_marker_path(&table_dir, &gen).exists());
+
+        engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        assert!(
+            engine.index_is_current(&tid, "idx_pk"),
+            "the evicted generation was indexed, so the index is current"
+        );
+        for key in &keys {
+            assert_eq!(
+                pk_index_rows(&engine, &tid, key).unwrap(),
+                1,
+                "row {key} of the evicted SSTable must be in the index"
+            );
+        }
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+        assert_eq!(outcome.sstables_vanished, 0, "{outcome:?}");
+        assert_eq!(outcome.sstables_rebuilt, 1, "{outcome:?}");
+        assert!(outcome.is_complete(), "{outcome:?}");
+        engine.shutdown().unwrap();
+    }
+
+    /// Same, but the objects are gone: the rebuild fails loud and the index is
+    /// NOT current. Never vanished.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_evicted_generation_that_cannot_be_rehydrated_fails_the_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable_in(dir.path(), "test-rebuild-evicted-gone", &store).await;
+        let tid = table_id();
+        delete_all_objects(&store).await;
+
+        engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+
+        assert_eq!(outcome.sstables_failed, 1, "{outcome:?}");
+        assert_eq!(outcome.sstables_vanished, 0, "{outcome:?}");
+        assert!(!outcome.is_complete(), "{outcome:?}");
+        assert!(!engine.index_is_current(&tid, "idx_pk"));
+        assert!(
+            pk_index_rows(&engine, &tid, "k0").is_err(),
+            "a stale index must refuse reads"
+        );
+        assert!(
+            StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
+            "the marker stays so a later rehydrate can still find the generation"
+        );
+        engine.shutdown().unwrap();
+    }
+
     /// An index on a PARTITION-KEY column must survive a restart (t_50c8bc7d).
     ///
     /// The live failure: `agent_memory.entity_store` is keyed
@@ -21889,6 +23634,56 @@ mod tests {
                 .iter()
                 .all(|mapped| *mapped),
             "the backfilled sidecar is mapped"
+        );
+    }
+
+    /// ST-43 catch-up path: an index re-registered over SSTables it has not
+    /// covered (what a restart does for every table) backfills them, and a
+    /// later no-op flush must not knock it back to pending with a phantom
+    /// SSTable — which would withhold the index from the planner for good.
+    #[test]
+    fn restart_backfill_survives_a_following_empty_flush() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        (0..5).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !engine.index_is_current(&tid, "val_idx") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "the backfill must complete"
+        );
+
+        engine.flush(&tid).unwrap();
+
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "a flush with nothing to write must leave a current index current"
+        );
+        assert_eq!(
+            collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+                .unwrap()
+                .len(),
+            5
         );
     }
 
@@ -27292,6 +29087,118 @@ mod tests {
         );
     }
 
+    /// A schema shaped like the live `agent_memory.mentioned_in` edge table:
+    /// three regular columns sorted by name, so the indexed `session_id` and
+    /// `tenant_id` sit at ordinals 1 and 2. Column types are text/int so
+    /// `make_key`/`make_row` rows validate; the ordinals are what matter here.
+    fn edge_table_schema() -> TableSchema {
+        let utf8 = "org.apache.cassandra.db.marshal.UTF8Type";
+        let col = |name: &str, type_name: &str| ColumnDefinition {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+        };
+        TableSchema {
+            keyspace: "agent_memory".to_string(),
+            table: "mentioned_in".to_string(),
+            key_type: utf8.to_string(),
+            clustering_columns: vec![col("fold_id", "org.apache.cassandra.db.marshal.Int32Type")],
+            static_columns: vec![],
+            regular_columns: vec![
+                col("created_at", utf8),
+                col("session_id", utf8),
+                col("tenant_id", utf8),
+            ],
+            extensions: Default::default(),
+        }
+    }
+
+    /// ST-43 (live: every `agent_memory` edge table, 2026-09-30): flushing a
+    /// table with NOTHING in its memtable published no SSTable, yet the eager
+    /// index build ran against `last_flush_generation()` — 0 for a table this
+    /// process has not flushed, e.g. after its SSTables were evicted. Each
+    /// index then marked a PHANTOM SSTable "0" pending and logged
+    /// "cannot resolve ordinal layout" because "0" is not in the live view.
+    #[test]
+    fn empty_flush_queues_no_eager_index_build_for_a_phantom_sstable() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let schema = edge_table_schema();
+        let table_id = TableId::new(&schema.keyspace, &schema.table);
+        engine.register_table(schema).unwrap();
+        engine
+            .add_index(
+                &table_id,
+                "idx_mentioned_in_by_session",
+                1,
+                IndexType::BTree,
+            )
+            .unwrap();
+        engine
+            .add_index(&table_id, "idx_mentioned_in_by_tenant", 2, IndexType::BTree)
+            .unwrap();
+
+        engine.flush(&table_id).unwrap();
+
+        for index_name in ["idx_mentioned_in_by_session", "idx_mentioned_in_by_tenant"] {
+            let (indexed, pending) =
+                engine
+                    .index_tracker()
+                    .get_coverage("agent_memory", "mentioned_in", index_name);
+            assert!(
+                pending.is_empty() && indexed.is_empty(),
+                "{index_name}: a flush that wrote no SSTable must not touch the index \
+                 tracker; indexed={indexed:?} pending={pending:?}"
+            );
+            assert!(
+                engine
+                    .index_tracker()
+                    .is_current("agent_memory", "mentioned_in", index_name),
+                "{index_name}: index must stay Current after a no-op flush"
+            );
+        }
+    }
+
+    /// Control for ST-43: a flush that DOES publish an SSTable still reaches
+    /// the eager index path, and records the real generation, not a stale one.
+    #[test]
+    fn publishing_flush_still_tracks_its_sstable_for_each_index() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let schema = edge_table_schema();
+        let table_id = TableId::new(&schema.keyspace, &schema.table);
+        engine.register_table(schema).unwrap();
+        engine
+            .add_index(&table_id, "idx_mentioned_in_by_tenant", 2, IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&table_id, &make_key("pk"), make_row(b"v", 1000), 1000)
+            .unwrap();
+
+        engine.flush(&table_id).unwrap();
+
+        let (indexed, pending) = engine.index_tracker().get_coverage(
+            "agent_memory",
+            "mentioned_in",
+            "idx_mentioned_in_by_tenant",
+        );
+        let tracked: HashSet<String> = indexed.union(&pending).cloned().collect();
+        assert_eq!(
+            tracked.len(),
+            1,
+            "exactly the one flushed SSTable must be tracked: {tracked:?}"
+        );
+        assert!(
+            !tracked.contains("0"),
+            "the tracked id must be the real flush generation: {tracked:?}"
+        );
+    }
+
     /// A Filtered (partial) index — its `FilterPredicate` persisted under the
     /// reserved `__filter_predicate` options key — must survive an engine
     /// restart. After `reload_indexes_from_system_schema`, the index is
@@ -27681,7 +29588,7 @@ mod tests {
     }
 
     #[test]
-    fn open_no_schema_fallback_fails_before_unbounded_pending_vec() {
+    fn open_no_schema_overflow_is_set_aside_on_disk_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let tid = TableId::new("test_ks", "test_table");
 
@@ -27714,17 +29621,696 @@ mod tests {
             memtable_num_shards: 64,
             ..StorageEngineConfig::test_config(dir.path())
         };
-        let err = match StorageEngine::open(config, None) {
-            Ok(_) => panic!(
-                "no-schema compatibility replay must fail closed instead of growing an unbounded pending Vec"
-            ),
-            Err(err) => err.to_string(),
-        };
+        // Two mutations against a limit of one: the second must be set aside
+        // durably, not abort startup (t_2db96eb9).
+        let (engine, pending) = StorageEngine::open(config, None)
+            .expect("a full no-schema replay buffer must degrade, not refuse to open");
+        assert_eq!(pending.len(), 1, "the buffered mutation is still returned");
 
-        assert!(
-            err.contains("schema unavailable") && err.contains("pending replay limit"),
-            "error must explain that schema must be restored before commit-log replay can continue; got: {err}"
+        let status = engine.replay_set_aside_status();
+        assert_eq!(
+            status.mutations(),
+            1,
+            "the overflowing mutation must be reported as set aside"
         );
+        assert_eq!(status.tables().get("test_ks.test_table"), Some(&1));
+        let set_aside =
+            crate::replay_set_aside::read_set_aside_file(&status.files[0].path).unwrap();
+        assert_eq!(set_aside.len(), 1, "the set-aside file holds the mutation");
+        assert_eq!(set_aside[0].table, "test_table");
+        assert!(
+            crate::replay_set_aside::replay_set_aside_mutations_total() >= 1,
+            "the loud counter must move"
+        );
+    }
+
+    #[test]
+    fn open_with_recoverable_schema_replays_past_the_no_schema_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "test_table");
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            // A flush persists storage-schema.json (register_table alone does
+            // not), which is the durable schema source replay binds to.
+            engine
+                .write(&tid, &make_key("anchor"), make_row(b"v", 9), 9)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+            for i in 0..3 {
+                engine
+                    .write(&tid, &make_key(&format!("k{i}")), make_row(b"v", i), i)
+                    .unwrap();
+            }
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        let config = StorageEngineConfig {
+            max_pending_replay_mutations_without_schema: 1,
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        assert!(pending.is_empty(), "durable schema binds replay directly");
+        assert!(engine.replay_set_aside_status().is_empty());
+        for i in 0..3 {
+            assert!(
+                engine
+                    .read(&tid, &make_key(&format!("k{i}")))
+                    .unwrap()
+                    .is_some(),
+                "mutation k{i} must be replayed from the durable schema"
+            );
+        }
+    }
+
+    /// Writes `keys` for `test_ks.test_table` into a fresh set-aside file under
+    /// `dir`, exactly as a startup replay with no schema would have.
+    fn set_aside_test_keys(dir: &std::path::Path, keys: &[&str]) -> std::path::PathBuf {
+        let mut aside = crate::replay_set_aside::ReplaySetAside::new(dir);
+        for (i, key) in keys.iter().enumerate() {
+            let ts = 100 + i as i64;
+            aside
+                .append(&Mutation::new(
+                    "test_ks".into(),
+                    "test_table".into(),
+                    make_key(key),
+                    vec![make_row(b"aside", ts)],
+                    ts,
+                ))
+                .unwrap();
+        }
+        aside.sync().unwrap();
+        aside.into_report().unwrap().path
+    }
+
+    fn assert_each_key_has_one_row(engine: &StorageEngine, keys: &[&str]) {
+        for key in keys {
+            let partition = engine
+                .read(&table_id(), &make_key(key))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{key} must be visible after re-ingest"));
+            assert_eq!(partition.rows.len(), 1, "{key} must have exactly one row");
+        }
+    }
+
+    #[test]
+    fn set_aside_mutations_reingest_when_their_table_is_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["a0", "a1", "a2"];
+        let path = set_aside_test_keys(dir.path(), &keys);
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let before = engine.replay_set_aside_status();
+        assert_eq!(before.mutations(), 3, "invisible rows must be counted");
+        assert_eq!(before.tables().get("test_ks.test_table"), Some(&3));
+        assert!(engine.read(&table_id(), &make_key("a0")).unwrap().is_none());
+
+        engine.register_table(test_schema()).unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists(), "the set-aside file is gone once applied");
+        assert!(engine.replay_set_aside_status().is_empty());
+    }
+
+    #[test]
+    fn open_reingests_set_aside_mutations_once_the_schema_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            // A flush persists storage-schema.json, the schema `open` binds to.
+            engine
+                .write(&table_id(), &make_key("anchor"), make_row(b"v", 9), 9)
+                .unwrap();
+            engine.flush(&table_id()).unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+        let keys = ["b0", "b1"];
+        let path = set_aside_test_keys(dir.path(), &keys);
+
+        let (engine, _pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists(), "the next boot with a schema self-heals");
+        assert!(engine.replay_set_aside_status().is_empty());
+    }
+
+    #[test]
+    fn set_aside_mutations_for_an_unknown_table_stay_and_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = set_aside_test_keys(dir.path(), &["c0", "c1"]);
+        let before = std::fs::read(&path).unwrap();
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(schema_with_a_static_column())
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), before, "file left intact");
+        let status = engine.replay_set_aside_status();
+        assert_eq!(status.mutations(), 2);
+        assert_eq!(status.tables().get("test_ks.test_table"), Some(&2));
+        assert!(
+            engine.read(&table_id(), &make_key("c0")).is_err()
+                || engine.read(&table_id(), &make_key("c0")).unwrap().is_none()
+        );
+    }
+
+    #[test]
+    fn a_crash_mid_reingest_before_the_flush_loses_and_duplicates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["d0", "d1", "d2", "d3", "d4"];
+        let path;
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            path = set_aside_test_keys(dir.path(), &keys);
+            let faults = SetAsideFaults {
+                fail_before_frame: Some(3),
+                ..SetAsideFaults::default()
+            };
+            engine
+                .reingest_set_aside_with_faults(None, faults)
+                .expect_err("the injected fault must surface, not be swallowed");
+            assert_eq!(
+                crate::replay_set_aside::read_set_aside_file(&path)
+                    .unwrap()
+                    .len(),
+                5,
+                "no frame is dropped before its mutation is durable"
+            );
+            // Dropping here is the crash: three rows were only in the memtable.
+        }
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_crash_after_the_flush_but_before_the_file_is_removed_duplicates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["e0", "e1", "e2"];
+        let path;
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            path = set_aside_test_keys(dir.path(), &keys);
+            let faults = SetAsideFaults {
+                fail_after_flush: true,
+                ..SetAsideFaults::default()
+            };
+            engine
+                .reingest_set_aside_with_faults(None, faults)
+                .expect_err("the injected fault must surface");
+            assert!(path.exists(), "the file outlives the crash");
+        }
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists());
+    }
+
+    /// Builds an engine over a directory that already holds a set-aside file of
+    /// two frames, and asserts that engine found it: the frames are counted as
+    /// pending at construction, and registering the table brings them back.
+    fn assert_constructor_adopts_set_aside(
+        label: &str,
+        build: impl FnOnce(&std::path::Path) -> StorageEngine,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["x0", "x1"];
+        let path = set_aside_test_keys(dir.path(), &keys);
+
+        let engine = build(dir.path());
+
+        assert_eq!(
+            engine.replay_set_aside_status().mutations(),
+            2,
+            "{label}: the constructor must find the set-aside file, or its rows are \
+             durable but invisible and nothing says so"
+        );
+        engine.register_table(test_schema()).unwrap();
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(
+            !path.exists(),
+            "{label}: the file is gone once its table registered"
+        );
+    }
+
+    /// The guard against the next constructor being added without adoption.
+    /// PR #468 wired its restore into `new` but not `open`; this wiring started
+    /// the same way. Every way to build a `StorageEngine` is listed here.
+    #[test]
+    fn every_public_constructor_adopts_a_pre_existing_set_aside_file() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        assert_constructor_adopts_set_aside("new", |dir| {
+            StorageEngine::new(StorageEngineConfig::test_config(dir), None).unwrap()
+        });
+        assert_constructor_adopts_set_aside("new_with_archive_store", |dir| {
+            StorageEngine::new_with_archive_store(
+                StorageEngineConfig::test_config(dir),
+                None,
+                None,
+                "adopt".into(),
+            )
+            .unwrap()
+        });
+        assert_constructor_adopts_set_aside("new_with_upload_store", |dir| {
+            StorageEngine::new_with_upload_store(
+                StorageEngineConfig::test_config(dir),
+                Arc::new(object_store::memory::InMemory::new()),
+                "adopt".into(),
+                rt.handle(),
+            )
+            .unwrap()
+        });
+        assert_constructor_adopts_set_aside("new_with_upload_store_and_queue_depth", |dir| {
+            StorageEngine::new_with_upload_store_and_queue_depth(
+                StorageEngineConfig::test_config(dir),
+                Arc::new(object_store::memory::InMemory::new()),
+                "adopt".into(),
+                rt.handle(),
+                4,
+            )
+            .unwrap()
+        });
+        assert_constructor_adopts_set_aside("open_from_snapshot_with_store", |dir| {
+            rt.block_on(restore_from_an_empty_snapshot(dir))
+        });
+
+        open_adopts_set_aside_for_a_table_it_already_knows();
+    }
+
+    /// `open_from_snapshot` and `open_from_snapshot_with_store` restore into the
+    /// data directory and then open it, so they inherit whatever `new` does.
+    async fn restore_from_an_empty_snapshot(dir: &std::path::Path) -> StorageEngine {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "adopt-node";
+        let manifest = crate::manifest::Manifest::new();
+        manifest
+            .save_with_retry(store.as_ref(), prefix)
+            .await
+            .unwrap();
+        crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+            .await
+            .unwrap();
+        let pos = crate::commitlog::CommitLogPosition {
+            segment_id: 1,
+            offset: 0,
+        };
+        crate::snapshot::SnapshotManager::new(Arc::clone(&store), prefix.to_string())
+            .create_snapshot("adopt-snap", &manifest, b"{}", pos, "node-1", None, false)
+            .await
+            .unwrap();
+        StorageEngine::open_from_snapshot_with_store(
+            StorageEngineConfig::test_config(dir),
+            "adopt-snap",
+            None,
+            "node-1",
+            false,
+            store,
+            prefix,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// `open` registers tables from the local schema before the engine exists,
+    /// so its adoption is a sweep rather than a per-registration trigger.
+    fn open_adopts_set_aside_for_a_table_it_already_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine
+                .write(&table_id(), &make_key("anchor"), make_row(b"v", 9), 9)
+                .unwrap();
+            engine.flush(&table_id()).unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+        let keys = ["y0", "y1"];
+        let path = set_aside_test_keys(dir.path(), &keys);
+        // A second file holds only a table nobody knows. The sweep has nothing
+        // to apply there and skips it, so only the scan at construction can
+        // report it.
+        let mut ghost = crate::replay_set_aside::ReplaySetAside::new(&dir.path().join("ghost"));
+        ghost
+            .append(&Mutation::new(
+                "test_ks".into(),
+                "ghost_table".into(),
+                make_key("g0"),
+                vec![make_row(b"aside", 200)],
+                200,
+            ))
+            .unwrap();
+        ghost.sync().unwrap();
+        let ghost_path = dir
+            .path()
+            .join(crate::replay_set_aside::SET_ASIDE_DIR)
+            .join("0-ghost.unreplayed");
+        std::fs::create_dir_all(ghost_path.parent().unwrap()).unwrap();
+        std::fs::rename(ghost.into_report().unwrap().path, &ghost_path).unwrap();
+
+        let (engine, _pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists(), "open: the sweep re-ingests and removes it");
+        let status = engine.replay_set_aside_status();
+        assert_eq!(
+            status.tables().get("test_ks.ghost_table"),
+            Some(&1),
+            "open: the frame for an unknown table is still reported, not lost"
+        );
+        assert_eq!(
+            status.mutations(),
+            1,
+            "open: only the ghost frame is pending"
+        );
+        assert!(ghost_path.exists());
+    }
+
+    fn pause_for_the_clock() {
+        // Set-aside file names and the drop ledger both carry milliseconds.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    fn assert_quarantined_not_applied(
+        engine: &StorageEngine,
+        path: &std::path::Path,
+        keys: &[&str],
+    ) {
+        for key in keys {
+            assert!(
+                engine.read(&table_id(), &make_key(key)).unwrap().is_none(),
+                "{key} belongs to a dropped table and must not appear in the new one"
+            );
+        }
+        assert!(
+            !path.exists(),
+            "the file is emptied: nothing is left pending"
+        );
+        assert!(engine.replay_set_aside_status().is_empty());
+        let held = crate::replay_set_aside::read_set_aside_file(
+            &crate::replay_set_aside::stale_quarantine_path(path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(held.len(), keys.len(), "withheld frames are kept, not lost");
+        assert!(
+            crate::replay_set_aside::replay_set_aside_stale_frames_total() >= keys.len() as u64
+        );
+    }
+
+    #[test]
+    fn frames_older_than_a_drop_are_quarantined_not_resurrected_into_a_recreated_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["s0", "s1"];
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let path = set_aside_test_keys(dir.path(), &keys);
+        pause_for_the_clock();
+
+        engine.unregister_table(&table_id()).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.reingest_set_aside().unwrap();
+
+        assert_quarantined_not_applied(&engine, &path, &keys);
+    }
+
+    #[test]
+    fn a_restart_after_the_drop_still_withholds_the_old_tables_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["r0", "r1", "r2"];
+        let path;
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            path = set_aside_test_keys(dir.path(), &keys);
+            pause_for_the_clock();
+            engine.unregister_table(&table_id()).unwrap();
+        }
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert_eq!(engine.replay_set_aside_status().mutations(), 3);
+        engine.register_table(test_schema()).unwrap();
+
+        assert_quarantined_not_applied(&engine, &path, &keys);
+    }
+
+    #[test]
+    fn frames_written_after_the_drop_belong_to_the_new_table_and_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["n0", "n1"];
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.unregister_table(&table_id()).unwrap();
+        pause_for_the_clock();
+        let path = set_aside_test_keys(dir.path(), &keys);
+        engine.register_table(test_schema()).unwrap();
+        engine.reingest_set_aside().unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_drop_that_cannot_be_recorded_is_refused_and_the_table_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        std::fs::write(
+            dir.path().join(crate::table_drops::DROPPED_TABLES_FILE),
+            b"{broken",
+        )
+        .unwrap();
+
+        let err = engine
+            .unregister_table(&table_id())
+            .expect_err("an unrecorded drop would let stale frames resurrect");
+        assert!(err.to_string().contains("does not parse"), "got: {err}");
+        assert!(engine.is_table_registered_for_test(&table_id()));
+    }
+
+    #[test]
+    fn a_torn_set_aside_file_is_reported_and_kept_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = set_aside_test_keys(dir.path(), &["f0", "f1"]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "file kept for the operator"
+        );
+        let status = engine.replay_set_aside_status();
+        let unreadable = status.unreadable();
+        assert_eq!(unreadable.len(), 1, "the torn file is named");
+        assert!(unreadable[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("torn frame"));
+    }
+
+    /// Writes `n` unflushed rows to a table that is then dropped, leaving its
+    /// mutations in the commit log while the persisted schema holds only the
+    /// surviving table. Returns the data dir holder.
+    fn data_dir_with_commit_log_for_a_dropped_table(n: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        let dropped = TableSchema {
+            table: "dropped_table".to_string(),
+            ..test_schema()
+        };
+        let dropped_id = TableId::new(&dropped.keyspace, &dropped.table);
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(dropped).unwrap();
+        for i in 0..n {
+            engine
+                .write(
+                    &dropped_id,
+                    &make_key(&format!("d{i}")),
+                    make_row(b"v", i as i64),
+                    i as i64,
+                )
+                .unwrap();
+        }
+        engine.unregister_table(&dropped_id).unwrap();
+        // A flush persists storage-schema.json, now without the dropped table.
+        engine
+            .write(&tid, &make_key("anchor"), make_row(b"v", 9), 9)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine.commit_log.shutdown().unwrap();
+        dir
+    }
+
+    /// t_f5a69b0b: mutations for a table absent from an existing schema were
+    /// held in an unbounded `Vec`, so a large commit log for a dropped table
+    /// could exhaust memory at startup. Past the bound they spill to the
+    /// durable set-aside store, counted per table.
+    #[test]
+    fn replay_spills_absent_table_mutations_past_the_deferral_bound() {
+        let dir = data_dir_with_commit_log_for_a_dropped_table(5);
+
+        let (engine, _pending) = StorageEngine::open_with_deferred_limit(
+            StorageEngineConfig::test_config(dir.path()),
+            None,
+            2,
+        )
+        .expect("an overfull deferral buffer must spill, not refuse to open");
+
+        assert_eq!(
+            engine.deferred_replay_mutation_count_for_test(),
+            2,
+            "memory stays bounded at the limit"
+        );
+        // `replay_set_aside_report()` became `replay_set_aside_status()`, which
+        // reports every set-aside file rather than one aggregate; this spill
+        // writes a single file, so that file IS the report.
+        let status = engine.replay_set_aside_status();
+        assert_eq!(status.files.len(), 1, "the overflow went to one file");
+        let report = &status.files[0];
+        assert_eq!(report.mutations, 3);
+        assert_eq!(report.tables.get("test_ks.dropped_table"), Some(&3));
+        let on_disk = crate::replay_set_aside::read_set_aside_file(&report.path).unwrap();
+        assert_eq!(on_disk.len(), 3, "the set-aside file holds the overflow");
+        assert!(on_disk.iter().all(|m| m.table == "dropped_table"));
+    }
+
+    #[test]
+    fn replay_defers_absent_table_mutations_under_the_bound_as_before() {
+        let dir = data_dir_with_commit_log_for_a_dropped_table(5);
+
+        let (engine, _pending) = StorageEngine::open_with_deferred_limit(
+            StorageEngineConfig::test_config(dir.path()),
+            None,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(engine.deferred_replay_mutation_count_for_test(), 5);
+        assert!(
+            engine.replay_set_aside_status().is_empty(),
+            "nothing is set aside while the buffer has room"
+        );
+    }
+
+    #[test]
+    fn deferred_replay_bound_tunable_rejects_invalid_values_naming_the_variable() {
+        assert_eq!(
+            parse_max_deferred_replay_mutations(None).unwrap(),
+            DEFAULT_MAX_DEFERRED_REPLAY_MUTATIONS
+        );
+        assert_eq!(
+            parse_max_deferred_replay_mutations(Some("  ")).unwrap(),
+            DEFAULT_MAX_DEFERRED_REPLAY_MUTATIONS
+        );
+        assert_eq!(parse_max_deferred_replay_mutations(Some("64")).unwrap(), 64);
+        for bad in ["0", "-1", "lots", "1.5"] {
+            let err = parse_max_deferred_replay_mutations(Some(bad))
+                .expect_err("an invalid bound must be rejected")
+                .to_string();
+            assert!(
+                err.contains("FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS") && err.contains(bad),
+                "error must name the variable and the value, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn replayed_legacy_collection_blob_does_not_panic_flush_beside_element_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "mixed_replay");
+        let list_type = "org.apache.cassandra.db.marshal.ListType(\
+                         org.apache.cassandra.db.marshal.UTF8Type)";
+        let live_row = |cell: CellValue, ts: i64| Row {
+            clustering: vec![],
+            cells: vec![(0, cell)],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+        };
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine
+                .register_table(collection_schema("test_ks", "mixed_replay", list_type))
+                .unwrap();
+            // An old commit log: a whole-value blob in one partition...
+            let blob = encode_cql_sequence(&[b"a", b"b"]);
+            engine
+                .write(
+                    &tid,
+                    &make_key("blob"),
+                    live_row(CellValue::live(blob, 1_000), 1_000),
+                    1_000,
+                )
+                .unwrap();
+            // ...and a per-element cell in another, so the flush is framed complex.
+            let element = CellValue::live(b"c".to_vec(), 2_000)
+                .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0));
+            engine
+                .write(&tid, &make_key("elem"), live_row(element, 2_000), 2_000)
+                .unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        // No schema file was ever persisted, so replay is handed back to the
+        // caller, exactly as `main.rs` does: register the table, then replay.
+        let (engine, pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert_eq!(pending.len(), 2);
+        engine
+            .register_table(collection_schema("test_ks", "mixed_replay", list_type))
+            .unwrap();
+        engine.replay_mutations(pending).unwrap();
+        engine.flush(&tid).expect(
+            "replayed legacy blob must be normalised so flush cannot hit the writer assertion",
+        );
+        for key in ["blob", "elem"] {
+            let partition = engine.read(&tid, &make_key(key)).unwrap().unwrap();
+            assert!(
+                partition.rows[0]
+                    .cells
+                    .iter()
+                    .all(|(_, c)| c.path.is_some() || c.is_tombstone()),
+                "{key}: no live path-less cell may survive on a complex column"
+            );
+        }
     }
 
     #[test]
@@ -27931,8 +30517,19 @@ mod tests {
         store: &Arc<dyn object_store::ObjectStore>,
         prefix: &str,
     ) -> StorageEngine {
+        evicting_s3_engine_with_hot_window(dir, store, prefix, 900)
+    }
+
+    /// [`evicting_s3_engine`] with an explicit hot window in seconds.
+    fn evicting_s3_engine_with_hot_window(
+        dir: &std::path::Path,
+        store: &Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+        hot_window_secs: u64,
+    ) -> StorageEngine {
         let mut config = StorageEngineConfig::test_config(dir);
         config.local_cache_max_bytes = 1;
+        config.cache_hot_window_secs = hot_window_secs;
         config.object_store = Some(crate::upload::ObjectStoreConfig {
             prefix: prefix.to_string(),
             ..crate::upload::ObjectStoreConfig::test_config()
@@ -27944,6 +30541,128 @@ mod tests {
             &tokio::runtime::Handle::current(),
         )
         .unwrap()
+    }
+
+    /// Two flushed tables over the cache limit; the first (`test_table`) is
+    /// read by a foreground query before the sync that evicts. Returns the
+    /// engine and the two tables' SSTable dirs, hot table first.
+    async fn sync_two_tables_reading_the_first(
+        dir: &std::path::Path,
+        hot_window_secs: u64,
+        prefix: &str,
+    ) -> (StorageEngine, std::path::PathBuf, std::path::PathBuf) {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let engine = evicting_s3_engine_with_hot_window(dir, &store, prefix, hot_window_secs);
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(test_schema_2()).unwrap();
+        for tid in [table_id(), table_id_2()] {
+            engine
+                .write(&tid, &make_key("k"), make_row(b"v", 1000), 1000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+        engine.read(&table_id(), &make_key("k")).unwrap();
+        assert!(engine.sync_sstables_to_s3().await.unwrap() >= 2);
+        let hot_dir = engine.table_sstable_dir(&table_id());
+        let other_dir = engine.table_sstable_dir(&table_id_2());
+        (engine, hot_dir, other_dir)
+    }
+
+    /// 2026-09-29: the evictor ordered by write age, so hot, rarely-written
+    /// tables (`schema_version`, `entity_store`) went first and reads failed.
+    /// A table read inside the hot window keeps its SSTables local while a
+    /// never-read table over the limit is evicted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cache_eviction_keeps_a_recently_read_table_local_and_evicts_the_cold_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, hot_dir, cold_dir) =
+            sync_two_tables_reading_the_first(dir.path(), 900, "test-hot-window").await;
+
+        assert!(
+            !StorageEngine::list_generations_in_dir(&hot_dir).is_empty(),
+            "the table read inside the hot window must stay local"
+        );
+        assert!(
+            StorageEngine::list_generations_in_dir(&cold_dir).is_empty(),
+            "the never-read table must be evicted"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// A hot window of zero disables hotness: the read table is evicted too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_hot_window_evicts_the_recently_read_table_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, hot_dir, cold_dir) =
+            sync_two_tables_reading_the_first(dir.path(), 0, "test-hot-window-zero").await;
+
+        assert!(StorageEngine::list_generations_in_dir(&hot_dir).is_empty());
+        assert!(StorageEngine::list_generations_in_dir(&cold_dir).is_empty());
+        engine.shutdown().unwrap();
+    }
+
+    /// The restore's start line reports what it will do: only marked
+    /// generations the manifest lists count, grouped by table.
+    #[test]
+    fn restore_work_counts_marked_manifest_generations() {
+        let entry = |id: &str, size: u64| crate::manifest::ManifestEntry {
+            id: id.to_string(),
+            size,
+            min_token: i64::MIN,
+            max_token: i64::MAX,
+            min_timestamp: 0,
+            max_timestamp: 0,
+        };
+        let mut manifest = crate::manifest::Manifest::new();
+        manifest.add_sstable("ks.a", entry("1", 100));
+        manifest.add_sstable("ks.a", entry("2", 200));
+        manifest.add_sstable("ks.a", entry("3", 400)); // not marked evicted
+        manifest.add_sstable("ks.b", entry("7", 1000));
+        let mut evicted = std::collections::BTreeMap::new();
+        evicted.insert(
+            "ks.a".to_string(),
+            ["1", "2"].map(String::from).into_iter().collect(),
+        );
+        evicted.insert(
+            "ks.b".to_string(),
+            ["7", "8"].map(String::from).into_iter().collect(), // 8 not in manifest
+        );
+        evicted.insert(
+            "ks.gone".to_string(),
+            ["9"].map(String::from).into_iter().collect(), // table not in manifest
+        );
+
+        assert_eq!(
+            restore_work(&evicted, &manifest),
+            RestoreWork {
+                tables: 2,
+                generations: 3,
+                bytes: 1300
+            }
+        );
+    }
+
+    #[test]
+    fn restore_progress_is_due_by_count_or_by_time() {
+        use std::time::Duration;
+        assert!(!restore_progress_due(Duration::from_secs(5), 3));
+        assert!(restore_progress_due(Duration::from_secs(5), 25));
+        assert!(restore_progress_due(Duration::from_secs(30), 1));
+        assert!(!restore_progress_due(Duration::from_secs(29), 24));
+    }
+
+    /// The "hot data keeps the cache over its limit" warning reports edges,
+    /// not every sync.
+    #[test]
+    fn hot_block_warning_fires_on_the_edges_only() {
+        let flag = AtomicBool::new(false);
+        assert_eq!(hot_block_edge(&flag, false), HotBlockEdge::Unchanged);
+        assert_eq!(hot_block_edge(&flag, true), HotBlockEdge::Started);
+        assert_eq!(hot_block_edge(&flag, true), HotBlockEdge::Unchanged);
+        assert_eq!(hot_block_edge(&flag, true), HotBlockEdge::Unchanged);
+        assert_eq!(hot_block_edge(&flag, false), HotBlockEdge::Cleared);
+        assert_eq!(hot_block_edge(&flag, false), HotBlockEdge::Unchanged);
     }
 
     /// Data loss on the live ferrosa-memory cluster, 2026-09-29.
@@ -28012,15 +30731,25 @@ mod tests {
     ) -> (StorageEngine, std::path::PathBuf, String, Vec<String>) {
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
+        engine_with_evicted_sstable_in(dir, prefix, &store).await
+    }
+
+    /// [`engine_with_evicted_sstable`] over a caller-held object store, so a
+    /// test can take the objects away after the eviction.
+    async fn engine_with_evicted_sstable_in(
+        dir: &std::path::Path,
+        prefix: &str,
+        store: &Arc<dyn object_store::ObjectStore>,
+    ) -> (StorageEngine, std::path::PathBuf, String, Vec<String>) {
         let tid = table_id();
-        let engine = evicting_s3_engine(dir, &store, prefix);
+        let engine = evicting_s3_engine(dir, store, prefix);
         // The test constructor does not install the read-through hook the
         // production constructors do. Hooks are process-global but keyed by
         // data dir, so this tempdir's hook ignores every other test's paths.
         StorageEngine::install_s3_file_read_rehydration_hook(
             dir.to_path_buf(),
             prefix.to_string(),
-            Arc::clone(&store),
+            Arc::clone(store),
         );
         engine.register_table(test_schema()).unwrap();
         let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
@@ -28048,8 +30777,10 @@ mod tests {
     /// eviction and the next restart, the read path could not reopen the
     /// evicted SSTable because the required-component `exists()` check failed
     /// BEFORE the S3 read-through hook could run, so reads returned partial
-    /// data. A marked generation must be rehydrated on reopen, and once it is
-    /// local again its marker must be cleared.
+    /// data. A marked generation must be reopenable. Since ST-51 a query open
+    /// reads it through ranged GETs instead of rehydrating the whole generation,
+    /// so `Data.db` stays remote and the marker stays (the generation is still
+    /// evicted; a restart or compaction restores it in full).
     #[tokio::test(flavor = "multi_thread")]
     async fn rows_of_an_evicted_sstable_are_readable_live_without_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -28064,13 +30795,88 @@ mod tests {
             );
         }
         assert!(
-            StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_some(),
-            "the reopen rehydrated the generation into the local cache"
+            StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_none(),
+            "a query open must not download Data.db (ST-51)"
         );
         assert!(
-            !StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
-            "a generation that is local again must not keep its eviction marker"
+            StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
+            "the generation is still evicted, so its marker stays"
         );
+        engine.shutdown().unwrap();
+    }
+
+    /// Remove every object from `store`: the evicted SSTable's S3 copy is gone
+    /// (object missing, bucket emptied), so a rehydrate cannot succeed.
+    async fn delete_all_objects(store: &Arc<dyn object_store::ObjectStore>) {
+        use futures::StreamExt;
+        let mut locations = Vec::new();
+        let mut listing = store.list(None);
+        while let Some(object) = listing.next().await {
+            locations.push(object.expect("listing the in-memory store").location);
+        }
+        drop(listing);
+        assert!(!locations.is_empty(), "the sync uploaded objects to remove");
+        for location in locations {
+            store
+                .delete(&location)
+                .await
+                .expect("deleting an in-memory object");
+        }
+    }
+
+    /// t_73659682: a range read over a table whose evicted SSTable cannot be
+    /// rehydrated must FAIL, not return the rows of the healthy sources as if
+    /// it were the whole table. Every range entry point is covered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_reads_fail_loud_when_an_evicted_sstable_cannot_be_rehydrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let (engine, _table_dir, gen, _keys) =
+            engine_with_evicted_sstable_in(dir.path(), "test-evicted-gone", &store).await;
+        let tid = table_id();
+        // A live memtable row, so a partial result would be non-empty and
+        // look like a complete answer.
+        engine
+            .write(&tid, &make_key("live"), make_row(b"v", 2000), 2000)
+            .unwrap();
+        delete_all_objects(&store).await;
+
+        let err = engine
+            .read_range(&tid, None, None, 100)
+            .expect_err("read_range must not return only the memtable row");
+        assert!(
+            err.corrupt_sstable_range().is_some() && err.to_string().contains(&gen),
+            "typed CorruptSstable naming gen {gen}, got: {err}"
+        );
+        engine
+            .read_token_range(&tid, i64::MIN, i64::MAX, 100)
+            .expect_err("read_token_range must fail loud");
+        engine
+            .read_token_range_bounded(&tid, i64::MIN, i64::MAX, 100, usize::MAX)
+            .expect_err("read_token_range_bounded must fail loud");
+        engine
+            .walk_token_range(&tid, i64::MIN, i64::MAX, |_| Ok(()))
+            .expect_err("walk_token_range must fail loud");
+        engine
+            .walk_token_range_for_digest(&tid, i64::MIN, i64::MAX, |_, _, _, _| Ok(()))
+            .expect_err("walk_token_range_for_digest must fail loud");
+        engine.shutdown().unwrap();
+    }
+
+    /// Counterpart: with the S3 objects present the same range read rehydrates
+    /// the evicted SSTable and returns every row, so the fail-loud path above
+    /// is not simply a range read that always errors on eviction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_reads_rehydrate_an_evicted_sstable_when_its_objects_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _table_dir, _gen, keys) =
+            engine_with_evicted_sstable(dir.path(), "test-evicted-range-ok").await;
+        let tid = table_id();
+        let rows = engine
+            .read_range(&tid, None, None, 100)
+            .expect("range read over an evicted SSTable rehydrates it");
+        assert_eq!(rows.len(), keys.len());
         engine.shutdown().unwrap();
     }
 
@@ -28107,7 +30913,8 @@ mod tests {
         let table_dir = dir.path().join("sstables").join(table_id().to_string());
         std::fs::create_dir_all(&table_dir).unwrap();
         std::fs::write(table_dir.join("42-Data.db"), b"x").unwrap();
-        StorageEngine::record_eviction(&table_dir, "42").unwrap();
+        StorageEngine::record_eviction(&table_dir, "42", &crate::eviction_marker::test_record())
+            .unwrap();
 
         StorageEngine::delete_sstable_files(&table_dir, "42");
 
@@ -28115,6 +30922,423 @@ mod tests {
             StorageEngine::evicted_generations(&dir.path().join("sstables")).is_empty(),
             "a retired generation must not keep an eviction marker"
         );
+    }
+
+    /// ST-61: compaction retired an evicted input without clearing its marker,
+    /// so every later start logged an ERROR per marker for rows that are
+    /// deliberately not served, training operators to ignore the message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_retiring_an_evicted_input_leaves_no_marker_for_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable(dir.path(), "test-retire-evicted-marker").await;
+        assert!(StorageEngine::evicted_marker_path(&table_dir, &gen).exists());
+
+        assert!(crate::compaction::retire::retire(&table_dir, &gen));
+
+        assert!(
+            StorageEngine::evicted_generations(&dir.path().join("sstables")).is_empty(),
+            "a start after the retirement has no marker to complain about"
+        );
+        assert_eq!(
+            StorageEngine::restore_evicted_sstables_blocking_in(dir.path(), None).unwrap(),
+            0
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// A generation compaction retired must not be pulled back from S3 by a
+    /// reader that still holds a stale view of the table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_generation_is_not_rehydrated_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable(dir.path(), "test-retired-not-rehydrated").await;
+        assert!(crate::compaction::retire::retire(&table_dir, &gen));
+
+        let rehydrated =
+            ferrosa_sstable::io::rehydrate_file(table_dir.join(format!("{gen}-Data.db"))).unwrap();
+
+        assert!(!rehydrated, "a retired generation is refused, not restored");
+        assert!(StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_none());
+        engine.shutdown().unwrap();
+    }
+
+    /// ST-61 (t_dfd7d1bd): one run logged `failed to promote SSTable
+    /// rehydration temp file ...rehydrate.tmp` beside `compaction: task failed
+    /// ... Data.db is missing`. Retirement sweeps every `<gen>-*` entry, temp
+    /// files included, so retiring a generation while a rehydrate of it was
+    /// between "temp file complete" and "rename" moved the temp file away.
+    ///
+    /// The seam fires in exactly that window and starts the retirement there.
+    /// The retirement must wait for the rehydrate, which then completes, and
+    /// only afterwards remove the generation: never a half-present generation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retiring_a_generation_while_it_is_promoting_waits_for_the_rehydrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable(dir.path(), "test-promote-vs-retire").await;
+
+        let retirement: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<bool>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let finished_inside_window = Arc::new(AtomicBool::new(false));
+        {
+            let retirement = Arc::clone(&retirement);
+            let finished_inside_window = Arc::clone(&finished_inside_window);
+            let (dir_for_retire, gen_for_retire) = (table_dir.clone(), gen.clone());
+            rehydrate_promote_seam::install(
+                &table_dir,
+                Arc::new(move |_tmp| {
+                    let mut slot = retirement.lock();
+                    if slot.is_some() {
+                        return;
+                    }
+                    let (dir, gen) = (dir_for_retire.clone(), gen_for_retire.clone());
+                    let handle =
+                        std::thread::spawn(move || crate::compaction::retire::retire(&dir, &gen));
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    finished_inside_window.store(handle.is_finished(), Ordering::SeqCst);
+                    *slot = Some(handle);
+                }),
+            );
+        }
+
+        let rehydrated =
+            ferrosa_sstable::io::rehydrate_file(table_dir.join(format!("{gen}-Data.db")))
+                .expect("the rehydrate must complete, not fail on a vanished temp file");
+
+        assert!(rehydrated);
+        assert!(
+            !finished_inside_window.load(Ordering::SeqCst),
+            "the retirement ran while the rehydrate was promoting"
+        );
+        let handle = retirement
+            .lock()
+            .take()
+            .expect("the seam started the retirement");
+        assert!(
+            handle.join().unwrap(),
+            "the retirement completes afterwards"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(gen.as_str()))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a retired generation leaves nothing behind, found {leftovers:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// Build an engine over `dir` holding generations `1` and `2` (80 bytes
+    /// each) that the manifest lists as uploaded, with the given cache cap and
+    /// disk-free reserve. Returns the engine, its table dir and the manifest.
+    fn engine_with_two_uploaded_sstables(
+        dir: &std::path::Path,
+        cache_max_bytes: u64,
+        free_reserve_bytes: u64,
+    ) -> (StorageEngine, std::path::PathBuf, crate::manifest::Manifest) {
+        let mut config = StorageEngineConfig::test_config(dir);
+        config.local_cache_max_bytes = cache_max_bytes;
+        config.local_disk_free_reserve_bytes = free_reserve_bytes;
+        let engine = StorageEngine::new(config, None).unwrap();
+        let table_id = table_id().to_string();
+        let table_dir = dir.join("sstables").join(&table_id);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let mut manifest = crate::manifest::Manifest::new();
+        for id in ["1", "2"] {
+            std::fs::write(table_dir.join(format!("{id}-Data.db")), vec![1u8; 80]).unwrap();
+            manifest.add_sstable(
+                &table_id,
+                crate::manifest::ManifestEntry {
+                    id: id.to_string(),
+                    size: 80,
+                    min_token: i64::MIN,
+                    max_token: i64::MAX,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+        }
+        (engine, table_dir, manifest)
+    }
+
+    /// The record of the eviction that saw the whole cache: the one with the
+    /// largest `total_bytes` among the markers in `table_dir`.
+    fn first_eviction_record(
+        table_dir: &std::path::Path,
+    ) -> crate::eviction_marker::EvictionRecord {
+        use crate::eviction_marker::{read_marker, MarkerState};
+        let records: Vec<_> = ["1", "2"]
+            .iter()
+            .filter_map(|gen| {
+                let marker = StorageEngine::evicted_marker_path(table_dir, gen);
+                marker.exists().then(|| read_marker(&marker))
+            })
+            .map(|state| match state {
+                MarkerState::Recorded(r) => r,
+                other => panic!("a fresh eviction must write a readable record, got {other:?}"),
+            })
+            .collect();
+        assert!(!records.is_empty(), "an eviction wrote a marker");
+        records
+            .into_iter()
+            .max_by_key(|r| r.total_bytes)
+            .expect("non-empty")
+    }
+
+    /// 2026-09-29: ~1000 SSTables were evicted and nobody could say why,
+    /// because the marker was empty and the reason lived in a rotated log. A
+    /// cache-cap eviction must name that trigger and the byte figures.
+    #[test]
+    fn a_cache_cap_eviction_marker_names_its_trigger_and_figures() {
+        use crate::eviction_marker::Trigger;
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, manifest) = engine_with_two_uploaded_sstables(dir.path(), 100, 0);
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+        assert!(evicted >= 1, "160 cached bytes over a 100 byte cap evicts");
+
+        let record = first_eviction_record(&table_dir);
+        assert_eq!(record.trigger, Trigger::CacheCap);
+        assert_eq!(record.source, "ferrosa-storage evictor");
+        assert_eq!(record.generation_bytes, Some(80));
+        assert_eq!(record.total_bytes, Some(160));
+        assert_eq!(record.max_bytes, Some(100));
+        assert_eq!(record.min_bytes, Some(0));
+        assert_eq!(record.target_free, Some(0));
+        assert!(record.written_at_unix_ms > 0);
+    }
+
+    /// A free-space eviction (cache well under its cap, disk under its free
+    /// target) names that trigger and carries the free-space figures.
+    #[test]
+    fn a_free_space_eviction_marker_names_its_trigger_and_figures() {
+        use crate::eviction_marker::Trigger;
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, manifest) =
+            engine_with_two_uploaded_sstables(dir.path(), 1024 * 1024, u64::MAX / 4);
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+        assert!(evicted >= 1);
+
+        let record = first_eviction_record(&table_dir);
+        assert_eq!(record.trigger, Trigger::FreeSpace);
+        assert_eq!(record.max_bytes, Some(1024 * 1024));
+        assert_eq!(record.total_bytes, Some(160));
+        assert!(record.target_free.unwrap() > record.projected_available.unwrap());
+    }
+
+    /// Every pass that finds pressure leaves a durable record naming what it
+    /// saw (manifest claim AND real disk total), what it did, and who wrote it.
+    #[test]
+    fn an_eviction_pass_leaves_a_durable_audit_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _table_dir, mut manifest) =
+            engine_with_two_uploaded_sstables(dir.path(), 100, 0);
+        // The manifest over-claims: 1000 bytes per entry against 80 on disk.
+        let listed = manifest.sstables.get_mut(&table_id().to_string()).unwrap();
+        listed.iter_mut().for_each(|entry| entry.size = 1000);
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+        assert_eq!(evicted, 1);
+
+        let text =
+            std::fs::read_to_string(dir.path().join("eviction-audit/audit.current.jsonl")).unwrap();
+        let record: crate::eviction_audit::PassRecord =
+            serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(record.trigger, crate::eviction_marker::Trigger::CacheCap);
+        assert_eq!(record.max_bytes, 100);
+        assert_eq!(record.min_bytes, 0);
+        assert_eq!(record.target_free, 0);
+        assert_eq!(record.manifest_bytes, 2000, "what the manifest claims");
+        assert_eq!(record.disk_bytes, 160, "what is on disk");
+        assert_eq!(record.evicted_generations, 1);
+        assert_eq!(record.evicted_bytes, 80);
+        assert_eq!(record.pid, std::process::id());
+        assert_eq!(record.build, env!("CARGO_PKG_VERSION"));
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    /// An audit that cannot be written must not stop the eviction or its
+    /// marker: durability of the marker outranks the audit record.
+    #[test]
+    fn an_unwritable_audit_does_not_prevent_an_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, manifest) = engine_with_two_uploaded_sstables(dir.path(), 100, 0);
+        // A regular file where the audit directory must go.
+        std::fs::write(dir.path().join("eviction-audit"), b"in the way").unwrap();
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        assert_eq!(evicted, 1, "the eviction proceeded");
+        let marked = ["1", "2"]
+            .iter()
+            .filter(|g| StorageEngine::evicted_marker_path(&table_dir, g).exists())
+            .count();
+        assert_eq!(marked, 1, "and its marker was written");
+        assert!(engine.eviction_audit.is_failing());
+        assert_eq!(engine.eviction_audit.write_failure_edges(), 1);
+    }
+
+    /// The latest pass is readable without touching the audit files.
+    #[test]
+    fn the_eviction_audit_is_exposed_as_metrics() {
+        let text = crate::metrics::render_prometheus();
+        let wanted = [
+            "ferrosa_storage_eviction_audit_last_unix_ms",
+            "ferrosa_storage_eviction_audit_last_manifest_bytes",
+            "ferrosa_storage_eviction_audit_last_disk_bytes",
+            "ferrosa_storage_eviction_audit_last_evicted_generations",
+            "ferrosa_storage_eviction_audit_write_failures_total",
+        ];
+        wanted
+            .iter()
+            .for_each(|name| assert!(text.contains(name), "{name} missing from the metrics"));
+    }
+
+    fn manifest_entry(id: &str, size: u64) -> crate::manifest::ManifestEntry {
+        crate::manifest::ManifestEntry {
+            id: id.to_string(),
+            size,
+            min_token: i64::MIN,
+            max_token: i64::MAX,
+            min_timestamp: 0,
+            max_timestamp: 0,
+        }
+    }
+
+    /// A manifest that lists the same generation twice (a re-upload pushes a
+    /// second entry) must not double the evictor's byte count or evict the
+    /// same files twice. The real bytes (160) are under the 170 byte cap; the
+    /// duplicate makes the manifest-derived sum 240, which is over it.
+    #[test]
+    fn a_duplicate_manifest_entry_does_not_drive_an_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, mut manifest) =
+            engine_with_two_uploaded_sstables(dir.path(), 170, 0);
+        manifest
+            .sstables
+            .get_mut(&table_id().to_string())
+            .unwrap()
+            .push(manifest_entry("1", 80));
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        assert_eq!(evicted, 0, "160 real bytes under a 170 byte cap");
+        assert!(
+            engine.manifest_drift_flagged.load(Ordering::Relaxed),
+            "a generation listed twice is reported"
+        );
+        assert!(table_dir.join("1-Data.db").exists());
+        assert!(table_dir.join("2-Data.db").exists());
+    }
+
+    /// Manifest entries for generations that are not on disk (retired
+    /// compaction inputs not yet dropped, or evicted ones) claim bytes that
+    /// are not there. They must not push the evictor over its cap when the
+    /// real on-disk total is far under it.
+    #[test]
+    fn manifest_entries_that_are_not_on_disk_do_not_drive_an_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, mut manifest) =
+            engine_with_two_uploaded_sstables(dir.path(), 1024 * 1024, 0);
+        let listed = manifest.sstables.get_mut(&table_id().to_string()).unwrap();
+        for gen in 100..110 {
+            listed.push(manifest_entry(&gen.to_string(), 10 * 1024 * 1024 * 1024));
+        }
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        assert_eq!(evicted, 0, "160 real bytes under a 1 MiB cap");
+        assert!(
+            engine.manifest_drift_flagged.load(Ordering::Relaxed),
+            "100 GiB claimed against 160 bytes on disk is reported as drift"
+        );
+        assert!(table_dir.join("1-Data.db").exists());
+        assert!(table_dir.join("2-Data.db").exists());
+    }
+
+    /// The drift signal: the manifest claims far more than is on disk.
+    #[test]
+    fn manifest_drift_needs_both_a_ratio_and_a_floor() {
+        const MIB: u64 = 1024 * 1024;
+        assert!(manifest_drift(4_840 * MIB, 2_940 * MIB), "1.65x of 2.9 GB");
+        assert!(manifest_drift(6_690 * MIB, 3_010 * MIB));
+        assert!(!manifest_drift(2_940 * MIB, 2_940 * MIB), "equal");
+        assert!(!manifest_drift(3_000 * MIB, 2_940 * MIB), "a little over");
+        assert!(
+            !manifest_drift(100, 10),
+            "10x of nothing is below the floor"
+        );
+        assert!(!manifest_drift(0, 0));
+    }
+
+    /// Markers written before the record existed are empty. They must keep
+    /// restoring, and be reported as "evicted, reason unknown".
+    #[test]
+    fn an_empty_legacy_marker_is_still_honoured_and_reason_unknown() {
+        use crate::eviction_marker::{read_marker, MarkerState};
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::File::create(StorageEngine::evicted_marker_path(&table_dir, "7")).unwrap();
+
+        let found = StorageEngine::evicted_generations(&dir.path().join("sstables"));
+        assert!(found.values().next().unwrap().contains("7"));
+        assert_eq!(
+            read_marker(&StorageEngine::evicted_marker_path(&table_dir, "7")),
+            MarkerState::Legacy
+        );
+    }
+
+    /// A truncated or garbage marker is still an eviction marker: restore
+    /// honours it, startup does not fail, and it reads as reason-unknown with
+    /// the parse error preserved.
+    #[test]
+    fn a_corrupt_marker_is_honoured_as_reason_unknown_not_an_error() {
+        use crate::eviction_marker::{read_marker, MarkerState};
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let full = serde_json::to_vec(&crate::eviction_marker::test_record()).unwrap();
+        std::fs::write(
+            StorageEngine::evicted_marker_path(&table_dir, "8"),
+            &full[..full.len() / 2],
+        )
+        .unwrap();
+        std::fs::write(
+            StorageEngine::evicted_marker_path(&table_dir, "9"),
+            [0xff, 0xfe, 0x00, 0x41],
+        )
+        .unwrap();
+
+        let found = StorageEngine::evicted_generations(&dir.path().join("sstables"));
+        let gens = found.values().next().unwrap();
+        assert!(gens.contains("8") && gens.contains("9"));
+        for gen in ["8", "9"] {
+            assert!(
+                matches!(
+                    read_marker(&StorageEngine::evicted_marker_path(&table_dir, gen)),
+                    MarkerState::Unreadable(_)
+                ),
+                "generation {gen}"
+            );
+        }
     }
 
     /// The same loss through the crash-recovery constructor.

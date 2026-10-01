@@ -771,34 +771,36 @@ impl UploadManager {
             .put_multipart(path)
             .await
             .map_err(UploadFileError::Store)?;
-        let mut buf = vec![0u8; S3_UPLOAD_PART_BYTES];
 
         loop {
-            let mut filled = 0;
-            while filled < buf.len() {
-                let bytes_read = reader
-                    .read(&mut buf[filled..])
-                    .await
-                    .map_err(UploadFileError::Read)?;
-                if bytes_read == 0 {
-                    break;
-                }
-                filled += bytes_read;
-            }
+            // Each part is read straight into a Vec sized for it and handed
+            // to the store as `Bytes` without a copy. (The earlier shape
+            // zero-filled one part-sized buffer and then copied every part out
+            // of it.) `take` bounds the read to one part and `read_to_end`
+            // coalesces short reads, so only the final part can be short.
+            let mut part = Vec::with_capacity(S3_UPLOAD_PART_BYTES);
+            let filled = (&mut *reader)
+                .take(S3_UPLOAD_PART_BYTES as u64)
+                .read_to_end(&mut part)
+                .await
+                .map_err(UploadFileError::Read)?;
 
             if filled == 0 {
                 break;
             }
 
-            if let Err(e) = upload
-                .put_part(Bytes::copy_from_slice(&buf[..filled]).into())
-                .await
-            {
-                let _ = upload.abort().await;
+            if let Err(e) = upload.put_part(Bytes::from(part).into()).await {
+                if let Err(abort_err) = upload.abort().await {
+                    tracing::warn!(
+                        path = %path,
+                        error = %abort_err,
+                        "could not abort a failed multipart upload"
+                    );
+                }
                 return Err(UploadFileError::Store(e));
             }
 
-            if filled < buf.len() {
+            if filled < S3_UPLOAD_PART_BYTES {
                 break;
             }
         }

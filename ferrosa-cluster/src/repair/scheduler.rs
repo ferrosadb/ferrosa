@@ -16,7 +16,7 @@
 //! the thundering-herd failure mode (FMEA #1) without an election: same ring →
 //! same single initiator, recomputed each tick so membership churn self-corrects.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -218,6 +218,38 @@ static AUTO_REPAIR_SESSIONS_FAILED: AtomicU64 = AtomicU64::new(0);
 static AUTO_REPAIR_PARTITIONS_STREAMED: AtomicU64 = AtomicU64::new(0);
 static AUTO_REPAIR_TIMESTAMP_TIES: AtomicU64 = AtomicU64::new(0);
 static AUTO_REPAIR_SKIPPED_NOT_READY: AtomicU64 = AtomicU64::new(0);
+static AUTO_REPAIR_TABLES_FAILED: AtomicU64 = AtomicU64::new(0);
+static AUTO_REPAIR_TABLES_NO_SESSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// How one table's repair cycle ended, derived from its session results.
+///
+/// `Converged` is a positive claim ("replicas agree") and so requires at least
+/// one successful session, no failures and no divergence. A cycle in which
+/// nothing ran, or in which sessions failed, must never read as converged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairOutcome {
+    /// No sessions were attempted (e.g. no peers / no initiated ranges).
+    NoSessionsAttempted,
+    /// Every attempted session failed.
+    AllFailed { failed: u64 },
+    /// Some sessions succeeded and some failed.
+    PartialFailure { ok: u64, failed: u64 },
+    /// All sessions succeeded and divergence was found and reconciled.
+    DivergenceReconciled,
+    /// All sessions succeeded and found no divergence.
+    Converged,
+}
+
+/// Pure classification of a table's session tallies into a [`RepairOutcome`].
+pub fn classify_repair_outcome(ok: u64, failed: u64, divergent: bool) -> RepairOutcome {
+    match (ok, failed) {
+        (0, 0) => RepairOutcome::NoSessionsAttempted,
+        (0, failed) => RepairOutcome::AllFailed { failed },
+        (ok, failed) if failed > 0 => RepairOutcome::PartialFailure { ok, failed },
+        _ if divergent => RepairOutcome::DivergenceReconciled,
+        _ => RepairOutcome::Converged,
+    }
+}
 
 /// Increment the per-tick counter (one per `run_tick`, ready or not).
 pub fn inc_auto_repair_tick() {
@@ -248,7 +280,13 @@ pub fn render_prometheus() -> String {
          ferrosa_auto_repair_timestamp_ties_total {}\n\
          # HELP ferrosa_auto_repair_skipped_not_ready_total Ticks skipped because the node was not ring-ready.\n\
          # TYPE ferrosa_auto_repair_skipped_not_ready_total counter\n\
-         ferrosa_auto_repair_skipped_not_ready_total {}\n",
+         ferrosa_auto_repair_skipped_not_ready_total {}\n\
+         # HELP ferrosa_auto_repair_tables_failed_total Table repair cycles with at least one failed session.\n\
+         # TYPE ferrosa_auto_repair_tables_failed_total counter\n\
+         ferrosa_auto_repair_tables_failed_total {}\n\
+         # HELP ferrosa_auto_repair_tables_no_sessions_total Table repair cycles in which no session was attempted.\n\
+         # TYPE ferrosa_auto_repair_tables_no_sessions_total counter\n\
+         ferrosa_auto_repair_tables_no_sessions_total {}\n",
         AUTO_REPAIR_TICKS.load(Ordering::Relaxed),
         AUTO_REPAIR_TABLES_REPAIRED.load(Ordering::Relaxed),
         AUTO_REPAIR_SESSIONS_OK.load(Ordering::Relaxed),
@@ -256,6 +294,8 @@ pub fn render_prometheus() -> String {
         AUTO_REPAIR_PARTITIONS_STREAMED.load(Ordering::Relaxed),
         AUTO_REPAIR_TIMESTAMP_TIES.load(Ordering::Relaxed),
         AUTO_REPAIR_SKIPPED_NOT_READY.load(Ordering::Relaxed),
+        AUTO_REPAIR_TABLES_FAILED.load(Ordering::Relaxed),
+        AUTO_REPAIR_TABLES_NO_SESSIONS.load(Ordering::Relaxed),
     )
 }
 
@@ -314,6 +354,8 @@ pub struct AutoRepairScheduler {
     cursor: usize,
     /// Tables a tick is actively repairing; cleared as each table completes.
     in_flight: HashSet<TableId>,
+    /// Most recent cycle outcome per table (failures stay visible here).
+    last_outcome: HashMap<TableId, RepairOutcome>,
 }
 
 impl AutoRepairScheduler {
@@ -331,6 +373,7 @@ impl AutoRepairScheduler {
             cfg,
             cursor: 0,
             in_flight: HashSet::new(),
+            last_outcome: HashMap::new(),
         }
     }
 
@@ -404,15 +447,36 @@ impl AutoRepairScheduler {
                 .coord
                 .repair_initiated(executor.clone(), &ring, local_node_id, rf, &table)
                 .await;
-            Self::observe(&table, &results);
+            let outcome = Self::observe(&table, &results);
 
             self.in_flight.remove(&table);
-            AUTO_REPAIR_TABLES_REPAIRED.fetch_add(1, Ordering::Relaxed);
+            // Only a cycle that actually compared replicas counts as repaired;
+            // failures and empty cycles have their own counters and stay
+            // visible in `last_outcome`. The round-robin cursor revisits the
+            // table next cycle, which is its retry.
+            match outcome {
+                RepairOutcome::Converged | RepairOutcome::DivergenceReconciled => {
+                    AUTO_REPAIR_TABLES_REPAIRED.fetch_add(1, Ordering::Relaxed);
+                }
+                RepairOutcome::AllFailed { .. } | RepairOutcome::PartialFailure { .. } => {
+                    AUTO_REPAIR_TABLES_FAILED.fetch_add(1, Ordering::Relaxed);
+                }
+                RepairOutcome::NoSessionsAttempted => {
+                    AUTO_REPAIR_TABLES_NO_SESSIONS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.last_outcome.insert(table, outcome);
         }
     }
 
-    /// Aggregate + loudly report one table's session results (FMEA #7).
-    fn observe(table: &TableId, results: &[SessionResult]) {
+    /// The outcome of the most recent repair cycle for `table`, if one ran.
+    pub fn last_outcome(&self, table: &TableId) -> Option<&RepairOutcome> {
+        self.last_outcome.get(table)
+    }
+
+    /// Aggregate + loudly report one table's session results (FMEA #7) and
+    /// return the classified outcome.
+    fn observe(table: &TableId, results: &[SessionResult]) -> RepairOutcome {
         let mut ok = 0u64;
         let mut failed = 0u64;
         let mut streamed = 0u64;
@@ -443,26 +507,45 @@ impl AutoRepairScheduler {
         AUTO_REPAIR_PARTITIONS_STREAMED.fetch_add(streamed, Ordering::Relaxed);
         AUTO_REPAIR_TIMESTAMP_TIES.fetch_add(ties, Ordering::Relaxed);
 
-        if streamed > 0 || ties > 0 {
-            // Divergence found — WARN so a recurring divergence is operator-visible.
-            tracing::warn!(
-                keyspace = table.keyspace(),
-                table = table.table(),
+        let outcome = classify_repair_outcome(ok, failed, streamed > 0 || ties > 0);
+        let (keyspace, tbl) = (table.keyspace(), table.table());
+        match outcome {
+            RepairOutcome::NoSessionsAttempted => tracing::warn!(
+                keyspace,
+                table = tbl,
+                "auto-repair: no repair sessions attempted for table (no peers or no initiated ranges); replica agreement NOT verified"
+            ),
+            RepairOutcome::AllFailed { failed } => tracing::error!(
+                keyspace,
+                table = tbl,
+                sessions_failed = failed,
+                "auto-repair: ALL sessions failed for table; replicas NOT verified, will retry next cycle"
+            ),
+            RepairOutcome::PartialFailure { ok, failed } => tracing::warn!(
+                keyspace,
+                table = tbl,
                 sessions_ok = ok,
                 sessions_failed = failed,
                 partitions_streamed = streamed,
                 timestamp_ties = ties,
-                "auto-repair: DIVERGENCE reconciled for table"
-            );
-        } else {
-            tracing::info!(
-                keyspace = table.keyspace(),
-                table = table.table(),
+                "auto-repair: PARTIAL failure for table; not converged, will retry next cycle"
+            ),
+            RepairOutcome::DivergenceReconciled => tracing::warn!(
+                keyspace,
+                table = tbl,
                 sessions_ok = ok,
-                sessions_failed = failed,
+                partitions_streamed = streamed,
+                timestamp_ties = ties,
+                "auto-repair: DIVERGENCE reconciled for table"
+            ),
+            RepairOutcome::Converged => tracing::info!(
+                keyspace,
+                table = tbl,
+                sessions_ok = ok,
                 "auto-repair: table converged (no divergence)"
-            );
+            ),
         }
+        outcome
     }
 
     /// Sub-tick period that covers the whole table set once per `interval`:
@@ -953,5 +1036,136 @@ mod tests {
         assert!(text.contains("ferrosa_auto_repair_ticks_total"));
         assert!(text.contains("ferrosa_auto_repair_sessions_failed_total"));
         assert!(text.contains("ferrosa_auto_repair_skipped_not_ready_total"));
+        assert!(text.contains("ferrosa_auto_repair_tables_failed_total"));
+        assert!(text.contains("ferrosa_auto_repair_tables_no_sessions_total"));
+    }
+
+    /// Only >=1 success with zero failures and no divergence is "converged".
+    #[test]
+    fn classify_converged_requires_a_success_and_no_failures() {
+        assert_eq!(
+            classify_repair_outcome(3, 0, false),
+            RepairOutcome::Converged
+        );
+        // Zero sessions is NOT convergence: nothing was compared.
+        assert_eq!(
+            classify_repair_outcome(0, 0, false),
+            RepairOutcome::NoSessionsAttempted
+        );
+        // Zero sessions with a (nonsensical) divergent flag is still no sessions.
+        assert_eq!(
+            classify_repair_outcome(0, 0, true),
+            RepairOutcome::NoSessionsAttempted
+        );
+    }
+
+    #[test]
+    fn classify_failures_are_never_converged() {
+        assert_eq!(
+            classify_repair_outcome(0, 4, false),
+            RepairOutcome::AllFailed { failed: 4 }
+        );
+        assert_eq!(
+            classify_repair_outcome(0, 1, true),
+            RepairOutcome::AllFailed { failed: 1 }
+        );
+        assert_eq!(
+            classify_repair_outcome(2, 1, false),
+            RepairOutcome::PartialFailure { ok: 2, failed: 1 }
+        );
+        assert_eq!(
+            classify_repair_outcome(2, 1, true),
+            RepairOutcome::PartialFailure { ok: 2, failed: 1 }
+        );
+    }
+
+    #[test]
+    fn classify_divergence_reconciled_when_all_ok() {
+        assert_eq!(
+            classify_repair_outcome(2, 0, true),
+            RepairOutcome::DivergenceReconciled
+        );
+    }
+
+    /// Executor whose every session fails.
+    struct FailingExecutor;
+
+    #[async_trait]
+    impl SessionExecutor for FailingExecutor {
+        async fn run_session(
+            &self,
+            _table: &TableId,
+            _range_start: i64,
+            _range_end: i64,
+            _peer: u64,
+        ) -> Result<crate::repair::SessionStats, String> {
+            Err("peer unreachable".to_string())
+        }
+    }
+
+    struct FailingContext {
+        ring: TokenRing,
+        tables: Vec<(TableId, usize)>,
+    }
+
+    impl RepairContext for FailingContext {
+        fn token_ring(&self) -> Option<TokenRing> {
+            Some(self.ring.clone())
+        }
+        fn local_node_id(&self) -> Option<u64> {
+            Some(1)
+        }
+        fn build_executor(&self) -> Option<Arc<dyn SessionExecutor>> {
+            Some(Arc::new(FailingExecutor))
+        }
+        fn user_tables(&self) -> Vec<(TableId, usize)> {
+            self.tables.clone()
+        }
+    }
+
+    /// A tick where every session fails must record failure for the table,
+    /// not "converged", and must not count the table as repaired.
+    #[tokio::test]
+    async fn run_tick_records_failure_when_all_sessions_fail() {
+        let t = tid("app", "failing");
+        let ctx = Arc::new(FailingContext {
+            ring: three_node_ring(),
+            tables: vec![(t.clone(), 3)],
+        });
+        let mut sched = AutoRepairScheduler::new(
+            RepairCoordinator::default(),
+            ctx,
+            AutoRepairConfig::default(),
+        );
+        let failed_before = AUTO_REPAIR_TABLES_FAILED.load(Ordering::Relaxed);
+
+        sched.run_tick().await;
+
+        match sched.last_outcome(&t) {
+            Some(RepairOutcome::AllFailed { failed }) => {
+                assert!(*failed > 0, "failure count must be reported")
+            }
+            other => panic!("expected AllFailed, got {other:?}"),
+        }
+        assert!(
+            AUTO_REPAIR_TABLES_FAILED.load(Ordering::Relaxed) > failed_before,
+            "tables_failed metric must increase"
+        );
+    }
+
+    /// A healthy tick records Converged for the table.
+    #[tokio::test]
+    async fn run_tick_records_converged_when_sessions_succeed() {
+        let t = tid("app", "ok");
+        let (ctx, _exec) = ready_ctx(vec![(t.clone(), 3)]);
+        let mut sched = AutoRepairScheduler::new(
+            RepairCoordinator::default(),
+            ctx,
+            AutoRepairConfig::default(),
+        );
+
+        sched.run_tick().await;
+
+        assert_eq!(sched.last_outcome(&t), Some(&RepairOutcome::Converged));
     }
 }

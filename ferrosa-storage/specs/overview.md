@@ -56,7 +56,7 @@ without changing the process environment. Digest verification is unconditional.
 | `flush` | `FlushTarget` trait + `FileFlushTarget`/`InMemoryFlushTarget`; serialization-header construction |
 | `merge`, `range_merger` | Read-path cell-level LWW merge; streaming range/token-range merge |
 | `compaction/` | `CompactionExecutor`, STCS + UCS strategies, `CompactionGate`, validator (oracle + differential) |
-| `upload/` | `UploadManager` (tokio task), `ObjectStoreConfig`, pending-upload log + replay across flat and generation-dir SSTable layouts |
+| `upload/` | `UploadManager` (tokio task), `ObjectStoreConfig` (the one client + connection-pool settings), pending-upload log + replay across flat and generation-dir SSTable layouts; `download` (ranged-part component downloads, `FERROSA_S3_DOWNLOAD_PART_*`, `FERROSA_RESTORE_CONCURRENCY`); `stats` (optional `FERROSA_S3_STATS` layer, Prometheus + `system_observability.object_store_*` tables) |
 | `cache`, `pin_config` | `LocalCache` LRU + pinning; NVMe `PinMode` |
 | `index/` | Index state tracker (registered/pending/current completeness), build scheduler, local/remote/off backends, artifact manifest, virtual table; `LocalBackend` resolves flat and engine table-dir SSTable layouts and writes sidecars beside table SSTables |
 | `snapshot/`, `restore/` | S3 snapshot manager + restore manager + validation (PITR); `restore/intent.rs` carries the restore-on-boot intent (`FERROSA_RESTORE_*`) and the apply-once marker that keeps a reboot-surviving env var from re-restoring on every start |
@@ -102,6 +102,17 @@ volume or changing query results.
 
 1. **S3 is authoritative; local disk is a write-behind cache.** Cache eviction
    must never delete the only copy — manifest-pinned entries are never evicted.
+   Uploaded-SSTable eviction is read-aware: a table read by a foreground query
+   within `FERROSA_CACHE_HOT_WINDOW_SECS` (default 900; `0` disables) is never
+   a candidate, and the rest go never-read first, then least recently read,
+   then oldest write (FMEA ST-40). Anti-entropy repair reads do not count.
+   A query over an evicted SSTable reads `Data.db` by paged ranged GETs and
+   fetches only the small index components; it never downloads the whole
+   generation (FMEA ST-51). Startup registers evicted generations
+   remote-backed the same way (index components only; `Data.db` stays in the
+   store) and a bounded background pass restores hot tables' generations while
+   free disk allows. Compaction inputs and `FERROSA_RESTORE_EVICTED_MODE=full`
+   still rehydrate in full.
    Periodic S3 sync skips incomplete generations before upload or manifest
    publication: all four required components (`Data.db`, `Partitions.db`,
    `Rows.db`, and `Filter.db`) must be present. This is a presence check;

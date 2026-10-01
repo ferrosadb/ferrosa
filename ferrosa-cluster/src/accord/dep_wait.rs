@@ -222,6 +222,63 @@ impl DepWaitGraph {
         woken
     }
 
+    /// Forget every wait `waiter` registered (its forward edges only; others
+    /// waiting on `waiter` keep waiting). Used when a transaction's apply is
+    /// refused part-way through registering its waits, so no half-registered
+    /// waiter is later woken with nothing parked to apply.
+    pub fn clear_waits(&mut self, waiter: TxnId) {
+        if let Some(deps) = self.waiting_on.remove(&waiter) {
+            for dep in deps {
+                if let Some(waiters) = self.waited_by.get_mut(&dep) {
+                    waiters.remove(&waiter);
+                    if waiters.is_empty() {
+                        self.waited_by.remove(&dep);
+                    }
+                }
+            }
+        }
+        self.wait_start.remove(&waiter);
+    }
+
+    /// The transactions currently parked waiting on `dep`.
+    pub fn waiters_of(&self, dep: &TxnId) -> Vec<TxnId> {
+        self.waited_by
+            .get(dep)
+            .map(|waiters| waiters.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop `waiter`'s wait on `dep` WITHOUT marking `dep` applied: the caller
+    /// has established that `dep` executes after `waiter`, so `waiter` must not
+    /// wait for it. Returns `true` when that was `waiter`'s last wait, i.e. it is
+    /// now unblocked (its graph entries are cleared, as for a woken waiter).
+    /// Returns `false` when `waiter` still waits on others or was not waiting on
+    /// `dep` at all.
+    pub fn waive(&mut self, waiter: TxnId, dep: TxnId) -> bool {
+        let removed = self
+            .waiting_on
+            .get_mut(&waiter)
+            .is_some_and(|deps| deps.remove(&dep));
+        if !removed {
+            return false;
+        }
+        if let Some(waiters) = self.waited_by.get_mut(&dep) {
+            waiters.remove(&waiter);
+            if waiters.is_empty() {
+                self.waited_by.remove(&dep);
+            }
+        }
+        let unblocked = self
+            .waiting_on
+            .get(&waiter)
+            .is_some_and(|deps| deps.is_empty());
+        if unblocked {
+            self.waiting_on.remove(&waiter);
+            self.wait_start.remove(&waiter);
+        }
+        unblocked
+    }
+
     /// Check if a transaction has been applied.
     pub fn is_applied(&self, txn_id: &TxnId) -> bool {
         self.applied.contains_key(txn_id)
@@ -761,6 +818,55 @@ mod tests {
             graph.waiting_count(),
             0,
             "no transactions should be waiting after D is applied",
+        );
+    }
+
+    #[test]
+    fn waiving_the_last_wait_unblocks_the_waiter_without_applying_the_dependency() {
+        let mut graph = DepWaitGraph::new();
+        let (waiter, dep) = (txn(1), txn(2));
+        graph.register_wait(waiter, dep).expect("no cycle");
+
+        assert!(graph.waive(waiter, dep), "the last wait was waived");
+
+        assert!(!graph.is_waiting(&waiter));
+        assert!(graph.waiters_of(&dep).is_empty());
+        assert!(
+            !graph.is_applied(&dep),
+            "a waived dependency has not applied; later waiters must still wait for it"
+        );
+    }
+
+    #[test]
+    fn waiving_one_of_several_waits_leaves_the_waiter_blocked() {
+        let mut graph = DepWaitGraph::new();
+        let (waiter, waived, kept) = (txn(1), txn(2), txn(3));
+        graph.register_wait(waiter, waived).expect("no cycle");
+        graph.register_wait(waiter, kept).expect("no cycle");
+
+        assert!(!graph.waive(waiter, waived), "another wait remains");
+        assert!(!graph.waive(waiter, waived), "waiving twice is a no-op");
+        assert!(!graph.waive(txn(9), kept), "not that transaction's wait");
+
+        assert_eq!(graph.waiters_of(&kept), vec![waiter]);
+        assert_eq!(graph.mark_applied(kept), vec![waiter]);
+    }
+
+    #[test]
+    fn clearing_waits_drops_only_the_forward_edges() {
+        let mut graph = DepWaitGraph::new();
+        let (waiter, dep, dependent) = (txn(1), txn(2), txn(3));
+        graph.register_wait(waiter, dep).expect("no cycle");
+        graph.register_wait(dependent, waiter).expect("no cycle");
+
+        graph.clear_waits(waiter);
+
+        assert!(!graph.is_waiting(&waiter));
+        assert!(graph.waiters_of(&dep).is_empty());
+        assert_eq!(
+            graph.waiters_of(&waiter),
+            vec![dependent],
+            "transactions waiting on the cleared one keep waiting"
         );
     }
 }

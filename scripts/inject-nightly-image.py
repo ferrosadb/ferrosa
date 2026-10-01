@@ -3,6 +3,9 @@
 Inject `image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}` above the
 existing `build:` block for every Ferrosa node service in Docker Compose files.
 Keeps the `build` block as a local fallback when the env var is unset.
+
+Mutating, but only the repo's Compose files named on the command line, rewritten
+in place. It takes no data directory and never touches node data.
 """
 import re, sys
 

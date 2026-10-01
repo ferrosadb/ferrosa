@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """rf_evidence.py — replication-factor evidence harness for ferrosa.
 
+STATUS: test harness. It starts throwaway nodes under a scratch `--data-root`
+it owns (and `rm -rf`s node dirs there on a fresh start). Never point
+`--data-root` at a real node's data. Not a recovery tool.
+
 WHY THIS EXISTS
 ---------------
 P0 defect t_891840e7: RF=3 was silently behaving as RF=2 (and RF=1 for some
@@ -713,7 +717,7 @@ def main() -> int:
     ap.add_argument("--nodes", type=int, default=4)
     ap.add_argument("--base-port", type=int, default=49200)
     ap.add_argument("--binary", default="target/release/ferrosa")
-    ap.add_argument("--data-root", default=None)
+    ap.add_argument("--data-root", default=None)  # data-dir-write-ok: scratch dir this harness creates and owns for its own throwaway nodes
     ap.add_argument("--rf", default="1,3,5")
     ap.add_argument("--rows", type=int, default=150)
     ap.add_argument("--fault-rows", type=int, default=40)

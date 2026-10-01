@@ -94,15 +94,11 @@ mod tests {
         (oracle, input_gens)
     }
 
-    /// Drives `poll_compactions` for up to `attempts` short waits — enough
-    /// for a submitted task to either finish or be cancelled, and for its
-    /// result to be drained.
-    async fn drive_poll_compactions(engine: &StorageEngine, attempts: usize) {
-        for _ in 0..attempts {
-            engine.poll_compactions().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
+    /// Upper bound on a compaction that never settles. A hang guard that turns
+    /// a stuck worker into a loud failure, not a convergence budget: settling
+    /// is awaited on the executor's own state transitions, so how slow the host
+    /// is never decides whether these tests pass.
+    const SETTLE_HANG_GUARD: Duration = Duration::from_secs(120);
 
     /// CS1 + CS14 for one checkpoint: installs a hook that cancels exactly
     /// at `point`, drives the task to its (cancelled) conclusion, and
@@ -136,7 +132,9 @@ mod tests {
         );
 
         engine.force_compact_all();
-        drive_poll_compactions(&engine, 300).await;
+        engine
+            .drive_compactions_until_idle(&tid, SETTLE_HANG_GUARD)
+            .await;
         // The hook must not fire again during the CS14 re-compaction below,
         // or that compaction would be cancelled too and never converge.
         drop(guard);
@@ -169,17 +167,12 @@ mod tests {
         // CS14 / I5 liveness: the claim was released, so the same inputs
         // compact again and converge to identical content.
         reopened.force_compact_all();
-        let mut done = false;
-        for _ in 0..500 {
-            reopened.poll_compactions().await;
-            if reopened.sstable_count(&tid) == 1 {
-                done = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            done,
+        reopened
+            .drive_compactions_until_idle(&tid, SETTLE_HANG_GUARD)
+            .await;
+        assert_eq!(
+            reopened.sstable_count(&tid),
+            1,
             "re-compaction after cancel at {point} did not converge"
         );
         let mismatches = oracle.diff_against_engine(&reopened, &tid);
@@ -187,6 +180,58 @@ mod tests {
             mismatches.is_empty(),
             "re-compaction after cancel at {point} changed content: {mismatches:?}"
         );
+    }
+
+    /// ST-57: a re-compaction whose worker is slower than any fixed poll
+    /// budget (a loaded host: fsync-bound merge, descheduled worker thread)
+    /// still converges, because the test waits on the executor settling, not
+    /// on a count of 10 ms polls. The hook stalls the worker once at its first
+    /// checkpoint, well past the old 500 x 10 ms poll budget.
+    #[cfg(feature = "slow-tests")]
+    mod slow {
+        use super::*;
+
+        const STALL: Duration = Duration::from_secs(12);
+
+        #[tokio::test]
+        async fn cancel_token_recompaction_converges_with_stalled_worker() {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None)
+                .expect("engine open");
+            let tid = TableId::new("ks", "cancel_token_stalled_worker");
+            engine
+                .register_table(test_schema("cancel_token_stalled_worker"))
+                .expect("register table");
+            let (oracle, _input_gens) = seed_two_inputs(&engine, &tid, 2);
+
+            let stalled = Arc::new(AtomicBool::new(false));
+            let hook_stalled = Arc::clone(&stalled);
+            let _guard = CancelHookGuard::install(
+                tid.to_string(),
+                Arc::new(move |p| {
+                    if p == CancelPoint::InputOpen && !hook_stalled.swap(true, Ordering::SeqCst) {
+                        std::thread::sleep(STALL);
+                    }
+                }),
+            );
+
+            engine.force_compact_all();
+            engine
+                .drive_compactions_until_idle(&tid, SETTLE_HANG_GUARD)
+                .await;
+
+            assert!(
+                stalled.load(Ordering::SeqCst),
+                "the stall hook never fired; the test did not exercise a slow worker"
+            );
+            assert_eq!(
+                engine.sstable_count(&tid),
+                1,
+                "compaction with a stalled worker did not converge"
+            );
+            let mismatches = oracle.diff_against_engine(&engine, &tid);
+            assert!(mismatches.is_empty(), "content changed: {mismatches:?}");
+        }
     }
 
     #[tokio::test]

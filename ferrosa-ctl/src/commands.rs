@@ -17,10 +17,16 @@ use ferrosa_cql::client::{CqlClient, QueryResult};
 use ferrosa_cql::error::CqlError;
 
 pub mod compaction;
+pub mod evicted;
 /// Index health and rebuild (`ferrosa-ctl index ...`). Names the same two
 /// states the query planner already distinguishes when it withholds an index
 /// and takes a scan instead.
 pub mod index;
+
+/// Inspect and replay set-aside commit-log mutations
+/// (`ferrosa-ctl commitlog set-aside ...`). Operates on a data directory with
+/// no network connection.
+pub mod set_aside;
 
 /// Offline SSTable analysis & recovery (`ferrosa-ctl sstable ...`). Operates on
 /// an on-disk table directory with no network connection.

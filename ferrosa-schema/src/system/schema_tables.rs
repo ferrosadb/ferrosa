@@ -262,6 +262,8 @@ fn system_table_rows() -> Vec<TableRow> {
         ("system_observability", "rrd_runtime_settings"),
         ("system_observability", "storage_stats"),
         ("system_observability", "secondary_indexes"),
+        ("system_observability", "object_store_stats"),
+        ("system_observability", "object_store_ops"),
         ("system_observability", "archive_status"),
         ("system_observability", "snapshots"),
     ];
@@ -576,6 +578,57 @@ fn system_column_rows() -> Vec<ColumnRow> {
                 "none".to_string()
             },
         });
+    }
+
+    // system_observability.object_store_stats and object_store_ops columns
+    let object_store_stats_cols: &[(&str, &str, &str, i32)] = &[
+        ("table_name", "partition_key", "text", 0),
+        ("component", "clustering", "text", 0),
+        ("get_whole", "regular", "bigint", -1),
+        ("get_ranged", "regular", "bigint", -1),
+        ("put_requests", "regular", "bigint", -1),
+        ("bytes_fetched", "regular", "bigint", -1),
+        ("bytes_requested", "regular", "bigint", -1),
+        ("bytes_put", "regular", "bigint", -1),
+        ("objects_seen", "regular", "bigint", -1),
+        ("object_size_max_bytes", "regular", "bigint", -1),
+        ("object_size_sum_bytes", "regular", "bigint", -1),
+        ("downloads", "regular", "bigint", -1),
+        ("ranged_downloads", "regular", "bigint", -1),
+        ("download_mb_per_sec", "regular", "double", -1),
+        ("part_retries", "regular", "bigint", -1),
+        ("read_amplification", "regular", "double", -1),
+    ];
+    let object_store_ops_cols: &[(&str, &str, &str, i32)] = &[
+        ("op", "partition_key", "text", 0),
+        ("requests", "regular", "bigint", -1),
+        ("bytes", "regular", "bigint", -1),
+        ("errors", "regular", "bigint", -1),
+        ("rate_limited", "regular", "bigint", -1),
+        ("retries", "regular", "bigint", -1),
+        ("p50_ms", "regular", "bigint", -1),
+        ("p99_ms", "regular", "bigint", -1),
+        ("total_ms", "regular", "double", -1),
+    ];
+    for (table, cols) in [
+        ("object_store_stats", object_store_stats_cols),
+        ("object_store_ops", object_store_ops_cols),
+    ] {
+        for (name, kind, cql_type, pos) in cols {
+            rows.push(ColumnRow {
+                keyspace_name: "system_observability".to_string(),
+                table_name: table.to_string(),
+                column_name: name.to_string(),
+                kind: kind.to_string(),
+                position: *pos,
+                column_type: cql_type.to_string(),
+                clustering_order: if *kind == "clustering" {
+                    "asc".to_string()
+                } else {
+                    "none".to_string()
+                },
+            });
+        }
     }
 
     // system_observability.archive_status columns

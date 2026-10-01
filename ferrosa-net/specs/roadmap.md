@@ -48,9 +48,6 @@ this roadmap is gap- and risk-driven rather than scraped from the code.
   `rpc/handler.rs` test currently asserts the *bug* (a `RaftVote` arriving before
   registration is dropped). Once the `ferrosa-cluster` fix lands, flip the
   assertion to expect successful dispatch and remove the documented-bug comment.
-- **Tunable dormant probe interval.** `DORMANT_PROBE_INTERVAL` is a hard-coded
-  5 minutes; a genuine transient outage incurs up to that latency before a lane
-  re-probes. Make it env-tunable like the lane channel/stream capacities already are.
 
 ## Later
 

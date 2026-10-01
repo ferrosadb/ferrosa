@@ -381,6 +381,12 @@ impl IndexBuildBackend for LocalBackend {
         // is inherently O(indexed rows) — a sidecar must index every row, so it
         // is not capped here (dropping entries would silently corrupt the
         // index); the win is not holding the full row payloads alongside it.
+        // Reconciliation counters (see `orphan::ScanTally`): the partition
+        // count the writer recorded, read BEFORE the iterator borrows the
+        // reader, against what the walk below actually reads.
+        let partitions_declared = reader.key_count();
+        let mut partitions_scanned: u64 = 0;
+        let mut partitions_to_index: u64 = 0;
         let mut iter = reader
             .partitions_iter()
             .map_err(|e| format!("open partition iterator: {e}"))?;
@@ -391,7 +397,9 @@ impl IndexBuildBackend for LocalBackend {
             .next_partition()
             .map_err(|e| format!("read partition: {e}"))?
         {
+            partitions_scanned += 1;
             let pk_bytes = partition.key.key.as_bytes().to_vec();
+            let mut counted_for_index = false;
             for row in &partition.rows {
                 // Partial (filtered) index: skip rows that do not satisfy the
                 // predicate. For a multi-column conjunction, EVERY clause's
@@ -410,6 +418,13 @@ impl IndexBuildBackend for LocalBackend {
                     if !matches {
                         continue;
                     }
+                }
+
+                // A partition-key index owes this partition exactly one entry
+                // once a row passes the predicate (see `ScanTally`).
+                if job.partition_key_source.is_some() && !counted_for_index {
+                    counted_for_index = true;
+                    partitions_to_index += 1;
                 }
 
                 // Extract the indexed value: a clustering-column index reads
@@ -461,6 +476,21 @@ impl IndexBuildBackend for LocalBackend {
                 }
             }
         }
+
+        // Reconcile before handing the entries over: a build that read fewer
+        // partitions than the SSTable declares, or indexed fewer than it owed,
+        // is a failed build, not a smaller index.
+        crate::index::orphan::ScanTally {
+            partitions_declared,
+            partitions_scanned,
+            entries_expected: job
+                .partition_key_source
+                .is_some()
+                .then_some(partitions_to_index),
+            entries_indexed: entries.len() as u64,
+        }
+        .verify()
+        .map_err(|e| format!("{e} (sstable {})", job.sstable_id))?;
 
         let mut sidecar_entries = HashMap::new();
         if !entries.is_empty() {

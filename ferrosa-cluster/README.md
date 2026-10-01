@@ -318,7 +318,16 @@ early acknowledgement.
   its dependencies have applied locally (otherwise it parks and the cascade
   applies it in order). An explicit no-write Apply also resolves an absent local
   dependency and cascades parked dependents; this handles merged dependencies
-  learned from another replica without falsely acknowledging real writes.
+  learned from another replica without falsely acknowledging real writes. A
+  transaction waits only for dependencies that execute **before** it: its
+  dependency set is computed from `t0`, so a dependency committed with a later
+  `t` is waived (at apply time, or when that dependency's commit lands). Without
+  this, two transactions whose PreAccepts crossed each waited on the other until
+  the 5 s dependency wait failed both, with every replica live (FMEA CL-28). A
+  dependency cycle among parked transactions is refused loudly, never dropped.
+  `accord/quorum_availability.rs` drives real replicas through the real committer
+  to pin the criterion: a live quorum commits while one replica is paused, and a
+  lost quorum fails promptly naming the quorum.
 - `recovery.rs` — Paxos-style recovery selecting by highest `accepted_ballot`.
 - `transaction_commit.rs` — `AccordTransactionCommitter`: the cluster-side
   implementation of `ferrosa_storage`'s `TransactionCommitter` seam (ADR-021). CQL/
@@ -367,6 +376,21 @@ early acknowledgement.
   never be pooled under another node's id. `PeerFireSink` (range-stream
   replies) also refuses to stream to the local host_id with a specific error
   instead of a bare "unknown peer" (t_b78e8e9a).
+- **Streaming range reads serve the local replica locally.** A ring entry that
+  carries this node's own host_id (under any node id) is the local replica, not
+  a remote: `range_read_remotes` (and the fulltext fan-out) drop it, so the
+  local-engine stream answers it and a node started alone or with peers down
+  still serves CL ONE/LOCAL_ONE. `spawn_replica_fragment_stream` errors rather
+  than firing to the local host_id.
+- **Auto-repair never claims convergence it did not observe.**
+  `classify_repair_outcome` maps a table's session tallies to a `RepairOutcome`:
+  `Converged` needs at least one successful session, no failures and no
+  divergence. All-failed logs ERROR (table + failure count), partial failure
+  WARNs, and zero sessions WARNs that agreement was not verified. Failed and
+  empty cycles increment `ferrosa_auto_repair_tables_failed_total` /
+  `ferrosa_auto_repair_tables_no_sessions_total`, are not counted as repaired,
+  and are readable via `AutoRepairScheduler::last_outcome`; the round-robin
+  cursor retries them.
 
 ## Dependencies
 

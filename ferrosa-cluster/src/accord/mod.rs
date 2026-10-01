@@ -31,6 +31,8 @@ pub mod perf;
 #[cfg(feature = "perf-tests")]
 pub mod perf_regression;
 pub mod proptests;
+#[cfg(test)]
+mod quorum_availability;
 pub mod recovery;
 pub mod recovery_scenarios;
 pub mod reorder_buffer;

@@ -139,7 +139,12 @@ impl RpcClient {
         tls_connector: Option<&tokio_rustls::TlsConnector>,
         task_pool: TaskPool,
     ) -> Result<Self> {
-        let tcp_stream = TcpStream::connect(peer_addr).await?;
+        // Bounded: an unroutable or SYN-dropping peer would otherwise hang here
+        // for the OS connect timeout (minutes), stalling every retry loop.
+        let tcp_stream =
+            tokio::time::timeout(config.connect_timeout, TcpStream::connect(peer_addr))
+                .await
+                .map_err(|_| NetError::Timeout(format!("tcp connect to {peer_addr}")))??;
 
         // Perform the protocol handshake (and TLS if configured) using a helper
         // that handles the stream type generically.
@@ -251,17 +256,23 @@ impl RpcClient {
                     }
                 }
             }
-            // Stream ended — peer is gone. Notify subscribers; if no one is
-            // listening (no lane is currently using this connection), fall
-            // back to a debug log so the situation is observable but not
-            // alarming.
-            if alive_tx_clone.send(false).is_err() {
+            // Stream ended — peer is gone. Record it unconditionally with
+            // `send_replace`: `send` discards the value when no receiver
+            // exists, and a lane subscribes only after the client is built (or
+            // after a reconnected client has sat in the actor's mailbox), so a
+            // connection that dies in that gap would read as alive to every
+            // later subscriber and its lane would never reconnect.
+            let had_subscribers = alive_tx_clone.receiver_count() > 0;
+            alive_tx_clone.send_replace(false);
+            if had_subscribers {
+                tracing::info!(peer = %read_loop_peer, "RPC peer connection closed");
+            } else {
+                // Not alarming: the state is recorded and a later subscriber
+                // sees it.
                 tracing::debug!(
                     peer = %read_loop_peer,
-                    "alive=false delivered to no subscribers (no active lanes on this connection)"
+                    "alive=false recorded with no subscribers (no active lanes on this connection)"
                 );
-            } else {
-                tracing::info!(peer = %read_loop_peer, "RPC peer connection closed");
             }
         });
 
@@ -334,7 +345,11 @@ impl RpcClient {
             // notifying the lane watcher so a dead connection cannot retain
             // a phantom in-flight request or keep dispatching new work.
             self.pending.remove(&stream_id);
-            let _ = self.alive_tx.send(false);
+            // `send_replace`, not `send`, for the reason given at the read
+            // loop above: `send` discards the value when no receiver exists
+            // yet, so a lane subscribing later would read this dead client as
+            // alive and never reconnect.
+            self.alive_tx.send_replace(false);
             return Err(NetError::Protocol("connection closed".into()));
         }
 
@@ -381,7 +396,9 @@ impl RpcClient {
             body: body.freeze(),
         };
         if self.tx.send(frame).await.is_err() {
-            let _ = self.alive_tx.send(false);
+            // `send_replace`, not `send`: see the read loop. A discarded value
+            // would leave a later subscriber believing this client is alive.
+            self.alive_tx.send_replace(false);
             return Err(NetError::Protocol("connection closed".into()));
         }
         Ok(())

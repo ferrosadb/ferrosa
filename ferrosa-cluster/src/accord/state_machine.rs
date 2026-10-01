@@ -692,6 +692,10 @@ impl AccordStateMachine {
             self.last_notified = waiters;
         }
 
+        // Anything parked on this transaction that executes before it no longer
+        // needs to wait for it.
+        self.release_waiters_ordered_before(txn_id, t);
+
         SmResponse::None
     }
 
@@ -771,6 +775,14 @@ impl AccordStateMachine {
             }
         };
 
+        // Wait only for dependencies that execute BEFORE this transaction. The
+        // dependency set was computed from `t0`, so it can name a transaction
+        // whose final `t` was bumped past ours; that one waits for us (CL-28).
+        let deps: Vec<TxnId> = deps
+            .into_iter()
+            .filter(|dep| !self.executes_after(dep, &t))
+            .collect();
+
         // Drop no-write entries (empty payloads): a key the replica owns but for
         // which this txn writes no row.
         let writes: Vec<Vec<u8>> = writes.into_iter().filter(|d| !d.is_empty()).collect();
@@ -819,6 +831,35 @@ impl AccordStateMachine {
         // by TxnId so each txn is marked Applied / fsynced exactly once.
         self.bookkeep_applied_dedup(applied);
         SmResponse::None
+    }
+
+    /// Whether `dep` is committed with an execution timestamp later than `t`, so
+    /// it executes after a transaction at `t` and that transaction must not wait
+    /// for it. A dependency whose final `t` is not yet known may still execute
+    /// first, so it is not waived here; [`Self::release_waiters_ordered_before`]
+    /// waives it when its commit lands.
+    fn executes_after(&self, dep: &TxnId, t: &Timestamp) -> bool {
+        self.txn_states
+            .get(dep)
+            .is_some_and(|state| state.phase == TxnPhase::Committed && state.t > *t)
+    }
+
+    /// `dep` just committed at `dep_t`. Every transaction parked on it that
+    /// executes earlier (`t < dep_t`) is released from that wait and applied if it
+    /// was its last (CL-28). Two transactions that each list the other as a
+    /// dependency would otherwise wait on each other until a timeout failed both.
+    fn release_waiters_ordered_before(&mut self, dep: TxnId, dep_t: Timestamp) {
+        let mut released: Vec<(TxnId, Vec<u8>)> = Vec::new();
+        for waiter in self.apply_engine.waiters_on(&dep) {
+            let executes_before = self
+                .txn_states
+                .get(&waiter)
+                .is_some_and(|state| state.phase == TxnPhase::Committed && state.t < dep_t);
+            if executes_before {
+                released.extend(self.apply_engine.waive_dependency(waiter, dep));
+            }
+        }
+        self.bookkeep_applied_dedup(released);
     }
 
     /// Run [`bookkeep_applied`] **once per distinct `TxnId`** in `applied`.
@@ -1406,6 +1447,99 @@ mod tests {
             "an absent dependency finalized as no-write must release dependent writes"
         );
         assert_eq!(capturing.captured(), [(waiting_txn, mutation, ts(1002))]);
+    }
+
+    // -----------------------------------------------------------------------
+    // CL-28 — a dependency that executes AFTER a transaction is not waited on.
+    //
+    // A transaction's dependency set is computed from `t0`, but it executes at
+    // its final `t`. A dependency whose `t0` is earlier yet whose final `t` was
+    // bumped past ours is ordered AFTER us; it waits for us, so we must not wait
+    // for it. Waiting on every dependency regardless made two crossing
+    // transactions wait on each other until the 5 s dependency wait failed both.
+    // -----------------------------------------------------------------------
+
+    /// `(waiting, later)`: `waiting` has the later `t0` and the earlier final
+    /// `t`, and lists `later` — whose `t0` is earlier but whose final `t` is
+    /// later — as a dependency.
+    fn crossed_pair() -> (TxnId, TxnId) {
+        (txn(1, 1001), txn(2, 1000))
+    }
+
+    #[test]
+    fn apply_does_not_wait_for_a_dependency_that_executes_after_it() {
+        let capturing = Arc::new(CapturingApplier::new());
+        let mut sm =
+            AccordStateMachine::with_applier(1, Arc::new(MockSyncWriter::new()), capturing.clone());
+        let (waiting, later) = crossed_pair();
+        sm.handle_preaccept(later, ts(1000), b"key", BallotNumber(0), 0);
+        sm.handle_commit(later, ts(1000), ts(2000), vec![]);
+        sm.handle_preaccept(waiting, ts(1001), b"key", BallotNumber(0), 0);
+        sm.handle_commit(waiting, ts(1001), ts(1002), vec![later]);
+
+        sm.handle_apply_writeset(waiting, vec![b"write".to_vec()]);
+
+        assert_eq!(
+            sm.get_state(&waiting).unwrap().phase,
+            TxnPhase::Applied,
+            "a dependency that executes after this transaction must not block its apply"
+        );
+        assert_eq!(
+            capturing.captured(),
+            [(waiting, b"write".to_vec(), ts(1002))]
+        );
+    }
+
+    #[test]
+    fn a_parked_apply_is_released_when_its_dependency_commits_after_it() {
+        let capturing = Arc::new(CapturingApplier::new());
+        let mut sm =
+            AccordStateMachine::with_applier(1, Arc::new(MockSyncWriter::new()), capturing.clone());
+        let (waiting, later) = crossed_pair();
+        sm.handle_preaccept(later, ts(1000), b"key", BallotNumber(0), 0);
+        sm.handle_preaccept(waiting, ts(1001), b"key", BallotNumber(0), 0);
+        sm.handle_commit(waiting, ts(1001), ts(1002), vec![later]);
+        sm.handle_apply_writeset(waiting, vec![b"write".to_vec()]);
+        assert_eq!(
+            sm.get_state(&waiting).unwrap().phase,
+            TxnPhase::Committed,
+            "while the dependency's execution time is unknown it may still run first"
+        );
+
+        sm.handle_commit(later, ts(1000), ts(2000), vec![]);
+
+        assert_eq!(
+            sm.get_state(&waiting).unwrap().phase,
+            TxnPhase::Applied,
+            "the dependency committed after this transaction, so the wait is waived"
+        );
+        assert_eq!(
+            capturing.captured(),
+            [(waiting, b"write".to_vec(), ts(1002))]
+        );
+    }
+
+    #[test]
+    fn apply_still_waits_for_a_dependency_that_executes_before_it() {
+        let capturing = Arc::new(CapturingApplier::new());
+        let mut sm =
+            AccordStateMachine::with_applier(1, Arc::new(MockSyncWriter::new()), capturing.clone());
+        let (waiting, earlier) = crossed_pair();
+        sm.handle_preaccept(earlier, ts(1000), b"key", BallotNumber(0), 0);
+        sm.handle_commit(earlier, ts(1000), ts(1001), vec![]);
+        sm.handle_preaccept(waiting, ts(1001), b"key", BallotNumber(0), 0);
+        sm.handle_commit(waiting, ts(1001), ts(1002), vec![earlier]);
+
+        sm.handle_apply_writeset(waiting, vec![b"write".to_vec()]);
+        assert_eq!(
+            sm.get_state(&waiting).unwrap().phase,
+            TxnPhase::Committed,
+            "a dependency that executes before this transaction must still be waited on"
+        );
+        assert!(capturing.captured().is_empty());
+
+        sm.handle_apply_writeset(earlier, Vec::new());
+        assert_eq!(sm.get_state(&waiting).unwrap().phase, TxnPhase::Applied);
     }
 
     #[test]

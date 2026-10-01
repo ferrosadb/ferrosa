@@ -483,6 +483,9 @@ impl crate::ClusterCoordinator {
                 continue;
             }
             match ring.get_node(id) {
+                // An alias of this node (own host_id under another node id) is
+                // the local walk, not a remote (t_b78e8e9a).
+                Some(n) if n.host_id == self.peer_manager.local_host_id() => {}
                 Some(n) => remotes.push((n.host_id, n.addr.clone())),
                 None => {
                     return Err(crate::error::ClusterError::Internal(format!(

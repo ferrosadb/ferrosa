@@ -42,7 +42,7 @@ open work lives in specs and the items below.
     in-flight compaction early (shutdown still joins every worker and waits
     out the merge) — the crash-sweep only proves what a *crash* leaves
     behind, not that a *voluntary* cancel is fast or possible at all.
-- **Remove index artifacts with the generation they index (FMEA ST-24).**
+- **Remove index artifacts with the generation they index (FMEA ST-58).**
   T-024 now removes all sidecars during compaction. The separate
   `delete_sstable_files` eviction path and historical debris still require
   investigation; previously each retired generation left its

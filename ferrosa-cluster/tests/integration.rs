@@ -31,6 +31,7 @@ fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         write_verify: false,
         max_pending_replay_mutations_without_schema: 1024,
         memtable_num_shards: 64,
+        cache_hot_window_secs: 900,
     };
     Arc::new(StorageEngine::new(config, None).unwrap())
 }

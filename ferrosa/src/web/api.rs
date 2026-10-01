@@ -188,6 +188,9 @@ async fn index_rebuild_handler(
                 // behind. Reported so a caller seeing a smaller denominator
                 // than the generation count on disk can account for the rest.
                 "sstables_vanished": outcome.sstables_vanished,
+                // SSTables that should have been indexed and were not. Non-zero
+                // means the index stays stale and refuses reads.
+                "sstables_failed": outcome.sstables_failed,
                 "sstables_indexable": outcome.sstables_indexable(),
                 "complete": outcome.is_complete(),
             });
@@ -855,6 +858,7 @@ mod tests {
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
+            cache_hot_window_secs: 900,
         };
         let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage engine"));
         let registry = Arc::new(HandlerRegistry::new());
@@ -1643,6 +1647,7 @@ mod tests {
                 auth_warn: false,
                 max_pending_replay_mutations_without_schema: 1024,
                 memtable_num_shards: 64,
+                cache_hot_window_secs: 900,
             };
             let storage = Arc::new(
                 ferrosa_storage::StorageEngine::new(storage_config, None).expect("storage engine"),

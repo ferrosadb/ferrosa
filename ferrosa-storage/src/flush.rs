@@ -1736,6 +1736,26 @@ pub(crate) fn rehydrate_if_evicted(dir: &Path, gen: &str) -> Result<()> {
     if data.exists() || !marker.exists() {
         return Ok(());
     }
+    match crate::eviction_marker::read_marker(&marker) {
+        crate::eviction_marker::MarkerState::Recorded(record) => tracing::info!(
+            dir = %dir.display(),
+            gen,
+            trigger = ?record.trigger,
+            source = %record.source,
+            "rehydrating an evicted SSTable"
+        ),
+        crate::eviction_marker::MarkerState::Legacy => tracing::info!(
+            dir = %dir.display(),
+            gen,
+            "rehydrating an evicted SSTable (legacy marker: reason unknown)"
+        ),
+        crate::eviction_marker::MarkerState::Unreadable(why) => tracing::warn!(
+            dir = %dir.display(),
+            gen,
+            error = %why,
+            "rehydrating an evicted SSTable (marker unreadable: reason unknown)"
+        ),
+    }
     if !ferrosa_sstable::io::rehydrate_file(&data)? {
         tracing::error!(
             dir = %dir.display(),
@@ -1757,6 +1777,41 @@ pub(crate) fn rehydrate_if_evicted(dir: &Path, gen: &str) -> Result<()> {
     Ok(())
 }
 
+/// Prepare an evicted generation for a QUERY open (ST-51): fetch only the
+/// small index components a reader needs, leaving `Data.db` to ranged
+/// read-through, instead of downloading the whole generation. Returns `true`
+/// when `Data.db` is to be read remotely.
+///
+/// Gate: only a generation carrying an eviction marker (`<gen>.evicted`,
+/// fsynced BEFORE the evictor deletes anything) whose `Data.db` is absent. An
+/// unmarked generation with missing components was compacted away: restoring
+/// it would resurrect purged rows, and its open error drives the read path's
+/// view-retry, so it is left to fail loud in the caller. The marker stays: the generation is still evicted, and
+/// a restart or compaction restores it in full. When the object store lacks
+/// the generation or no store owns the path, this logs and returns `false`, so
+/// the open fails on the missing `Data.db` exactly as before.
+pub(crate) fn prepare_evicted_for_query(dir: &Path, gen: &str) -> Result<bool> {
+    let data = dir.join(format!("{gen}-Data.db"));
+    let marker = crate::engine::StorageEngine::evicted_marker_path(dir, gen);
+    if data.exists() || !marker.exists() {
+        return Ok(false);
+    }
+    match crate::evicted_read::fetch_query_components(dir, gen)? {
+        crate::evicted_read::QueryFetch::Ready => Ok(true),
+        outcome @ (crate::evicted_read::QueryFetch::NotOwned
+        | crate::evicted_read::QueryFetch::Missing) => {
+            tracing::error!(
+                dir = %dir.display(),
+                gen,
+                ?outcome,
+                "evicted SSTable cannot be opened for a ranged read (no object store owns it, \
+                 or its objects are missing); the open will fail. Marker kept"
+            );
+            Ok(false)
+        }
+    }
+}
+
 /// Open a file-backed SSTable reader from component files for generation `gen`
 /// in `dir`. Shared by [`FileFlushTarget::open_reader`] and the engine's
 /// startup/load path so on-demand reopens go through one code path.
@@ -1767,7 +1822,7 @@ pub(crate) fn rehydrate_if_evicted(dir: &Path, gen: &str) -> Result<()> {
 /// fail loud (see the inline comment at the read). Genuinely-optional components
 /// (`Statistics.db`, `CompressionInfo.db`) default to empty/absent when missing.
 pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileReadAt>> {
-    rehydrate_if_evicted(dir, gen)?;
+    let remote_data = prepare_evicted_for_query(dir, gen)?;
     let [data_component, partitions_component, rows_component, filter_component] =
         REQUIRED_SSTABLE_COMPONENTS;
     let required = |suffix: &str| -> Result<PathBuf> {
@@ -1782,7 +1837,11 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
         }
     };
 
-    let data = FileReadAt::open(required(data_component)?)?;
+    let data = if remote_data {
+        FileReadAt::open_evicted(dir.join(format!("{gen}-{data_component}")))
+    } else {
+        FileReadAt::open(required(data_component)?)?
+    };
     let partitions = FileReadAt::open(required(partitions_component)?)?;
     let rows = FileReadAt::open(required(rows_component)?)?;
 

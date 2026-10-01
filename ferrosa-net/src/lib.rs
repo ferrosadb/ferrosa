@@ -22,3 +22,6 @@ pub mod skew;
 pub mod stream_router;
 pub mod task_pool;
 pub mod tls;
+
+#[cfg(test)]
+mod slow_retry_tests;

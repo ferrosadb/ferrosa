@@ -536,6 +536,7 @@ mod tests {
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
+            cache_hot_window_secs: 900,
         };
         let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage"));
         let rpc_registry = Arc::new(HandlerRegistry::new());
@@ -593,6 +594,9 @@ mod tests {
             delete_workers: 1,
             max_requests_per_second: None,
             max_concurrent_requests: None,
+            request_timeout: std::time::Duration::from_secs(
+                ferrosa_storage::upload::config::DEFAULT_S3_REQUEST_TIMEOUT_SECS,
+            ),
         };
         let storage_config = StorageEngineConfig {
             commit_log: CommitLogConfig {
@@ -615,6 +619,7 @@ mod tests {
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
+            cache_hot_window_secs: 900,
         };
         let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage"));
         let rpc_registry = Arc::new(HandlerRegistry::new());

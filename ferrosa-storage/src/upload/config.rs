@@ -55,6 +55,10 @@ pub struct ObjectStoreConfig {
     /// Client-side cap on object-store requests in flight
     /// (`FERROSA_S3_MAX_CONCURRENT_REQUESTS`); `None` is uncapped.
     pub max_concurrent_requests: Option<usize>,
+    /// Per-request timeout, covering the whole response body
+    /// (`FERROSA_S3_REQUEST_TIMEOUT_SECS`, default
+    /// [`DEFAULT_S3_REQUEST_TIMEOUT_SECS`]).
+    pub request_timeout: std::time::Duration,
 }
 
 impl ObjectStoreConfig {
@@ -91,6 +95,17 @@ impl ObjectStoreConfig {
                 .ok()
                 .as_deref(),
         )?;
+        let request_timeout = parse_request_timeout(
+            std::env::var("FERROSA_S3_REQUEST_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        )?;
+        // Validate the download tunables and the stats switch up front so a
+        // typo fails startup instead of the first restore. Both are read once
+        // per process; `build_object_store` and the download path use them.
+        super::download::config()?;
+        super::pool::config()?;
+        super::stats::enabled_from_env()?;
 
         // Local file:// backend takes precedence when its path is set.
         if let Ok(local_path) = std::env::var("FERROSA_LOCAL_STORE_PATH") {
@@ -111,6 +126,7 @@ impl ObjectStoreConfig {
                     delete_workers,
                     max_requests_per_second,
                     max_concurrent_requests,
+                    request_timeout,
                 });
             }
         }
@@ -153,7 +169,42 @@ impl ObjectStoreConfig {
             delete_workers,
             max_requests_per_second,
             max_concurrent_requests,
+            request_timeout,
         })
+    }
+
+    /// HTTP client options for the S3 client. The timeout spans the whole
+    /// response, body included, so it is what bounds a large download.
+    ///
+    /// `allow_http` lives here too: installing client options replaces the
+    /// builder's own, so an `allow_http` set on the builder alone is lost.
+    ///
+    /// This is the one place connection-pool settings live, so every path
+    /// that shares the client (uploads, deletes, restore, rehydrate, ranged
+    /// reads) inherits them. See [`Self::pool_max_idle_per_host`].
+    pub fn client_options(&self) -> ferrosa_common::Result<object_store::ClientOptions> {
+        let pool = super::pool::config()?;
+        Ok(object_store::ClientOptions::new()
+            .with_allow_http(self.allow_http)
+            .with_timeout(self.request_timeout)
+            .with_connect_timeout(pool.connect_timeout)
+            .with_pool_max_idle_per_host(self.pool_max_idle_per_host()?)
+            .with_pool_idle_timeout(pool.idle_timeout))
+    }
+
+    /// Cap on concurrent object-store requests: `FERROSA_S3_MAX_CONCURRENT_REQUESTS`
+    /// when set, else [`super::pool::DEFAULT_MAX_IN_FLIGHT`], which is sized for
+    /// a WAN link (bandwidth x round-trip time), not for this machine's cores.
+    pub fn effective_max_in_flight(&self) -> usize {
+        self.max_concurrent_requests
+            .unwrap_or(super::pool::DEFAULT_MAX_IN_FLIGHT)
+    }
+
+    /// Idle connections kept per host: `FERROSA_S3_POOL_MAX_IDLE_PER_HOST`
+    /// when set, else the in-flight limit. Never smaller than the in-flight
+    /// limit, because a pool below peak in-flight reconnects on every burst.
+    pub fn pool_max_idle_per_host(&self) -> ferrosa_common::Result<usize> {
+        super::pool::config()?.max_idle_per_host(self.effective_max_in_flight())
     }
 
     /// Whether this configuration targets the local `file://` backend.
@@ -203,7 +254,8 @@ impl ObjectStoreConfig {
             .with_bucket_name(&self.bucket)
             .with_region(&self.region)
             .with_allow_http(self.allow_http)
-            .with_conditional_put(S3ConditionalPut::ETagMatch);
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .with_client_options(self.client_options()?);
 
         if let Some(ref key_id) = self.access_key_id {
             builder = builder.with_access_key_id(key_id);
@@ -216,20 +268,33 @@ impl ObjectStoreConfig {
             ferrosa_common::Error::InvalidFormat(format!("failed to build S3 client: {e}"))
         })?;
 
+        // Stats sit innermost so they see every real request (each 429 retry
+        // as its own) and latency without client-side pacing. Off unless
+        // FERROSA_S3_STATS enabled the process-wide stats.
+        let store: std::sync::Arc<dyn ObjectStore> = match super::stats::global() {
+            Some(stats) => std::sync::Arc::new(super::stats::StatsStore::new(
+                std::sync::Arc::new(store),
+                std::sync::Arc::clone(stats),
+            )),
+            None => std::sync::Arc::new(store),
+        };
         // Every path shares this one store, so the caps here bound uploads,
         // deletes, rehydration and restore together. 429 retry is always on:
         // object_store does not retry client errors.
-        let store: std::sync::Arc<dyn ObjectStore> = match self.max_concurrent_requests {
-            Some(max) => std::sync::Arc::new(object_store::limit::LimitStore::new(store, max)),
-            None => std::sync::Arc::new(store),
-        };
-        if self.max_requests_per_second.is_some() || self.max_concurrent_requests.is_some() {
-            tracing::info!(
-                max_requests_per_second = ?self.max_requests_per_second,
-                max_concurrent_requests = ?self.max_concurrent_requests,
-                "object store requests are throttled"
-            );
-        }
+        let max_in_flight = self.effective_max_in_flight();
+        let store: std::sync::Arc<dyn ObjectStore> =
+            std::sync::Arc::new(object_store::limit::LimitStore::new(store, max_in_flight));
+        let pool_max_idle = self.pool_max_idle_per_host()?;
+        let pool = super::pool::config()?;
+        super::stats::record_pool_settings(max_in_flight, pool_max_idle);
+        tracing::info!(
+            max_in_flight,
+            pool_max_idle_per_host = pool_max_idle,
+            pool_idle_timeout_secs = pool.idle_timeout.as_secs(),
+            connect_timeout_secs = pool.connect_timeout.as_secs(),
+            max_requests_per_second = ?self.max_requests_per_second,
+            "object store client built"
+        );
         Ok(Box::new(super::throttle::ThrottledStore::new(
             store,
             self.max_requests_per_second,
@@ -256,6 +321,7 @@ impl ObjectStoreConfig {
             delete_workers: 2,
             max_requests_per_second: None,
             max_concurrent_requests: None,
+            request_timeout: std::time::Duration::from_secs(DEFAULT_S3_REQUEST_TIMEOUT_SECS),
         }
     }
 }
@@ -384,9 +450,57 @@ where
     }
 }
 
+/// Default per-request timeout for object-store calls, in seconds.
+///
+/// It covers the whole response body, so it must fit the largest SSTable
+/// component at the slowest link we expect: a 525 MB `Data.db` at under
+/// 1 MB/s. object_store's own default is 30 s, which cut off every large
+/// restore on 2026-09-30.
+pub const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 900;
+
+/// Parse `FERROSA_S3_REQUEST_TIMEOUT_SECS`. Unset or empty means the default;
+/// anything else must be a positive whole number of seconds, and a bad value
+/// is rejected naming the variable rather than quietly using the default.
+pub fn parse_request_timeout(value: Option<&str>) -> ferrosa_common::Result<std::time::Duration> {
+    let secs = parse_request_limit::<u64>("FERROSA_S3_REQUEST_TIMEOUT_SECS", value)?
+        .unwrap_or(DEFAULT_S3_REQUEST_TIMEOUT_SECS);
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pool_is_sized_from_in_flight_and_ignores_workers_and_cores() {
+        let cfg = ObjectStoreConfig::test_config();
+        assert_eq!(
+            cfg.effective_max_in_flight(),
+            super::super::pool::DEFAULT_MAX_IN_FLIGHT
+        );
+        assert_eq!(
+            cfg.pool_max_idle_per_host().unwrap(),
+            cfg.effective_max_in_flight()
+        );
+
+        let busy = ObjectStoreConfig {
+            upload_workers: 500,
+            delete_workers: 500,
+            ..ObjectStoreConfig::test_config()
+        };
+        assert_eq!(
+            busy.pool_max_idle_per_host().unwrap(),
+            cfg.pool_max_idle_per_host().unwrap(),
+            "worker counts must not move the pool"
+        );
+
+        let wide = ObjectStoreConfig {
+            max_concurrent_requests: Some(300),
+            ..ObjectStoreConfig::test_config()
+        };
+        assert_eq!(wide.effective_max_in_flight(), 300);
+        assert_eq!(wide.pool_max_idle_per_host().unwrap(), 300);
+    }
 
     #[test]
     fn s3_required_parsing_is_strict() {
@@ -535,6 +649,114 @@ mod tests {
         let store = cfg.build_object_store().unwrap().to_string();
         assert!(store.starts_with("ThrottledStore("), "{store}");
         assert!(store.contains("LimitStore(4"), "{store}");
+    }
+
+    /// An HTTP server that answers every request with a 10-byte body sent one
+    /// byte every `gap`, so the whole response takes about `10 * gap`.
+    async fn slow_body_server(gap: std::time::Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if sock.read(&mut buf).await.is_err() {
+                        return;
+                    }
+                    let head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"e\"\r\n\
+                                Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n";
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for b in b"0123456789" {
+                        tokio::time::sleep(gap).await;
+                        if sock.write_all(&[*b]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn s3_against(endpoint: &str, timeout_secs: u64) -> object_store::aws::AmazonS3 {
+        let mut cfg = ObjectStoreConfig::test_config();
+        cfg.request_timeout = std::time::Duration::from_secs(timeout_secs);
+        object_store::aws::AmazonS3Builder::new()
+            .with_endpoint(endpoint)
+            .with_bucket_name("b")
+            .with_region("us-east-1")
+            .with_access_key_id("k")
+            .with_secret_access_key("s")
+            // allow_http comes only from client_options(), as in production.
+            .with_client_options(cfg.client_options().unwrap())
+            .with_retry(object_store::RetryConfig {
+                max_retries: 0,
+                retry_timeout: std::time::Duration::from_secs(1),
+                ..Default::default()
+            })
+            .build()
+            .unwrap()
+    }
+
+    /// 2026-09-30: restoring a 479 MB evicted Data.db from R2 failed four
+    /// times with "error decoding response body" and the node exited. The
+    /// client had no options, so object_store's 30 s default request timeout
+    /// — which covers the body — cut off every download that took longer.
+    /// The timeout must be the configured one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_download_slower_than_the_request_timeout_fails_and_a_longer_timeout_completes_it() {
+        use object_store::ObjectStore;
+        let endpoint = slow_body_server(std::time::Duration::from_millis(200)).await;
+        let path = object_store::path::Path::from("big-Data.db");
+
+        let short = s3_against(&endpoint, 1);
+        let cut_off = match short.get(&path).await {
+            Ok(r) => r.bytes().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        // It must fail on the body timeout, not on anything earlier (a bad
+        // scheme or refused connection would pass a bare is_err()).
+        let err = format!(
+            "{:?}",
+            cut_off.expect_err("a 2 s body must not fit a 1 s timeout")
+        );
+        // reqwest Decode -> Body -> TimedOut: the "error decoding response
+        // body" that ended the live restore.
+        assert!(
+            err.contains("Decode") && err.contains("TimedOut"),
+            "expected a body timeout, got {err}"
+        );
+
+        let long = s3_against(&endpoint, 10);
+        let body = long.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(&body[..], b"0123456789");
+    }
+
+    #[test]
+    fn the_request_timeout_defaults_long_enough_for_large_sstables() {
+        assert_eq!(
+            parse_request_timeout(None).unwrap(),
+            std::time::Duration::from_secs(DEFAULT_S3_REQUEST_TIMEOUT_SECS)
+        );
+        const { assert!(DEFAULT_S3_REQUEST_TIMEOUT_SECS >= 600) };
+        assert_eq!(
+            parse_request_timeout(Some("120")).unwrap(),
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn an_invalid_request_timeout_is_rejected_naming_the_variable() {
+        for bad in ["0", "-5", "soon", "1.5"] {
+            let err = parse_request_timeout(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains("FERROSA_S3_REQUEST_TIMEOUT_SECS"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

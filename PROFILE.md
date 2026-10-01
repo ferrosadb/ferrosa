@@ -75,6 +75,25 @@ process starts.
 | `/api/debug/flamechart?seconds=N` | Duration of the authenticated tracing activity chart | Default `5` seconds, capped at `60` |
 | `RUST_LOG` | Runtime tracing log filter | For example, `info` or `ferrosa=debug` |
 
+### Internode reconnect (ferrosa-net)
+
+A lane whose peer connection drops retries quickly, then slowly and
+indefinitely, until the peer returns or the peer is removed. A peer whose pool
+could not be replaced is re-dialed by the heartbeat loop on the same schedule.
+These are read when a retry cycle or probe is scheduled, so a changed value
+applies to the next one. A value that is not a positive integer is ignored with
+one warning per setting and the default is used.
+
+| Environment variable | What it changes | Default |
+|---|---|---:|
+| `FERROSA_NET_RECONNECT_FAST_ATTEMPTS` | Connect attempts per fast-phase cycle (exponential backoff 1 s doubling to 30 s). After three exhausted cycles the lane enters slow-retry | `10` |
+| `FERROSA_CONNECT_TIMEOUT_MS` | Bound on DNS resolution and on the TCP connect, each, for every outbound dial (fast reconnect, slow-retry probe, peer re-dial). The handshake keeps its own `FERROSA_HANDSHAKE_TIMEOUT_SECS`. One lane dial is therefore bounded by 2 x this + the handshake timeout (15 s at defaults), below the 30 s slow interval; the next probe is scheduled only after the previous dial ends, so cadence is interval + dial time, never stuck behind a hung connect | `5000` ms |
+| `FERROSA_NET_RECONNECT_SLOW_INTERVAL_MS` | Interval between single-attempt probes in slow-retry, and the cap on a pool-less peer's re-dial backoff. Up to 25% random jitter is added so nodes do not dial in lockstep | `30000` ms |
+
+Logging is edge-only: one line when a lane drops into slow-retry and one when
+it reconnects, however long the outage. Per-attempt detail is DEBUG, and every
+attempt is counted by `ferrosa_net::reconnect::total_reconnect_attempts`.
+
 ### CQL Accord transaction bounds
 
 These per-node CQL settings bound open Accord transaction state. They take effect
@@ -162,10 +181,28 @@ worker is initialized. Byte values are bytes unless the name says otherwise.
 | `FERROSA_MEMTABLE_BACKPRESSURE_BYTES` | Active memtable limit before writes are backpressured/rejected; defaults to `max(4 × flush threshold, 64 MiB)` | `268435456` (256 MiB with the default flush threshold) |
 | `FERROSA_MEMTABLE_NUM_SHARDS` | Number of memtable shards | `64` |
 | `FERROSA_FLUSH_MAX_AGE_SECS` | Maximum age before a memtable is flushed | `30` |
+| `FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS` | Startup commit-log replay: most mutations held in memory for tables that are absent while a schema exists. Overflow is written to `<data_dir>/commitlog-unreplayed/` and logged at ERROR with table ids and counts. Must be a positive integer; an invalid value fails startup. | `10000` |
 | `FERROSA_FLUSH_PARALLELISM` | Shared flush worker count | Host available parallelism, clamped to `1..64` |
 | `FERROSA_CACHE_MAX_BYTES` | Maximum local SSTable cache size | `10737418240` (10 GiB) |
+| `FERROSA_CACHE_HOT_WINDOW_SECS` | Seconds after a foreground read during which a table's uploaded SSTables are never evicted from the local cache. `0` disables hotness. | `900` |
+| `FERROSA_S3_REQUEST_TIMEOUT_SECS` | Per-request object-store timeout, covering the whole response body; must fit the largest SSTable component download | `900` |
+| `FERROSA_S3_MAX_CONCURRENT_REQUESTS` | The in-flight target: the cap on concurrent object-store requests (one `LimitStore` shared by uploads, deletes, restore and reads) and the floor for the connection pool. It is a property of the link, not of this machine: in-flight data to fill a wire is bandwidth x round-trip time, so `requests = bandwidth x RTT / request size`. Never derived from cores or worker counts. Positive integer | `64` (WAN: assumes 1 Gbit/s to R2/S3 at 100 ms RTT = 12.5 MB in flight / ~256 KiB per request ~ 50, rounded up). Counted in requests, not bytes, because `object_store` exposes no byte limiter; convert with the formula. Read observed RTT and throughput from `ferrosa_s3_request_duration_seconds` and `system_observability.object_store_stats` (`FERROSA_S3_STATS=1`) to tune it. **Raising this alone does nothing for downloads:** they put at most `FERROSA_S3_DOWNLOAD_PART_CONCURRENCY` x `FERROSA_RESTORE_CONCURRENCY` (default 4 x 4 = 16) requests in flight, so the target is unreachable until those two are raised too |
+| `FERROSA_S3_POOL_MAX_IDLE_PER_HOST` | Idle connections kept per host. Overrides the derived value, which is the in-flight target above. Rejected at startup if below the in-flight target (a smaller pool reconnects on every burst). Effective value is logged at store construction ("object store client built") and exported as `ferrosa_s3_pool_max_idle_per_host` and `ferrosa_s3_max_in_flight` when `FERROSA_S3_STATS=1` | the in-flight target (`64`) |
+| `FERROSA_S3_POOL_IDLE_TIMEOUT_SECS` | How long an idle pooled connection is kept | `90` |
+| `FERROSA_S3_CONNECT_TIMEOUT_SECS` | Object-store TCP+TLS dial timeout. This is NOT `FERROSA_CONNECT_TIMEOUT_MS`, which governs internode connections; the two are unrelated | `10` |
+| `FERROSA_S3_DOWNLOAD_PART_BYTES` | Size of one ranged GET when downloading a component; objects at or below it use a single GET. Positive integer; invalid values stop startup | `16777216` (16 MiB) |
+| `FERROSA_S3_DOWNLOAD_PART_CONCURRENCY` | Ranged parts in flight per object. All parts share the one store, so `FERROSA_S3_MAX_*` caps still apply. A 429 shrinks that object's concurrency by one slot | `4` |
+| `FERROSA_RESTORE_CONCURRENCY` | SSTable generations restored at once at startup | `4` |
+| `FERROSA_S3_STATS` | `1`/`true` collects object-store stats (per-operation counts, bytes, latency, 429s; per-table/component bytes, object sizes, throughput, read amplification) and exposes them as `ferrosa_s3_*` Prometheus series and `system_observability.object_store_stats` / `object_store_ops`. Per-table labels exist only when on | off |
+| `FERROSA_S3_STATS_MAX_KEYS` | Distinct `(table, component)` label pairs the stats layer tracks. This bounds metric label CARDINALITY, not query results: further pairs fold into `component=overflow` (logged once) so no observation is dropped, and a read of `system_observability.object_store_stats` still returns every tracked row. Raise it if a tenant has more than ~4,000 table/component pairs and the overflow bucket is in use. Read once at first use; a non-positive or malformed value warns and uses the default | `4096` |
+| `FERROSA_S3_READ_PAGE_BYTES` | Page size for ranged reads of an evicted SSTable's `Data.db` (compressed tables round up to whole chunks). Minimum 4096; an invalid value logs a warning and uses the default. Larger pages mean fewer requests and more bytes per point read. | `1048576` |
+| `FERROSA_S3_PAGE_CACHE_BYTES` | Memory the evicted-SSTable page cache may hold. `0` disables caching (every read refetches). | `268435456` |
+| `FERROSA_RESTORE_EVICTED_MODE` | Startup handling of evicted SSTables: `remote` registers them with index components only and reads `Data.db` by ranged GETs; `full` downloads every component first. | `remote` |
+| `FERROSA_RESTORE_HOT_TABLES_ON_START` | `0` disables the background pass that fully restores recently read tables' evicted SSTables (it stops before free disk drops under the eviction target). | `1` |
 | `FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES` | Free space reserved on the data filesystem; writes fail closed below it | `536870912` (512 MiB) |
 | `FERROSA_CACHE_MIN_BYTES` | Minimum local cache target | `0` |
+| `FERROSA_EVICTION_AUDIT_MAX_BYTES` | Hard cap on the on-disk eviction audit (`<data_dir>/eviction-audit/`), split into 4 ring segments after a 4 KiB reserve; clamped to 16 KiB..32 MiB. Under 0.8% of the default free-space reserve | `4194304` (4 MiB) |
+| `FERROSA_EVICTION_AUDIT_OFFLOAD` | `true` uploads rotated audit segments to `<prefix>/eviction-audit/<instance>/` through the throttled object store: one segment per sync, one attempt, local copy removed only after the upload succeeds | off |
 | `FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES` | Free-space point that starts local SSTable eviction | `2 × FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES` |
 | `FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES` | Free-space target after eviction | `max(low water, 3 × reserve)` |
 | `FERROSA_SSTABLE_READER_CACHE_CAP` | Maximum idle SSTable readers retained in the shared LRU pool | `256` |
@@ -183,6 +220,16 @@ worker is initialized. Byte values are bytes unless the name says otherwise.
 | `FERROSA_DATA_RUNTIME_THREADS` | Data runtime worker threads | `8` |
 | `FERROSA_CQL_RUNTIME_THREADS` | CQL runtime worker threads | `8` |
 | `FERROSA_BACKGROUND_RUNTIME_THREADS` | Background runtime worker threads | `2` |
+
+The eviction audit answers "why did the cache evict?" after the log has rotated.
+Each eviction pass that finds pressure appends one JSON line: trigger, cache cap,
+floor, free-space target, projected free space, the manifest's byte claim and the
+real on-disk total of the same generations (the gap is the signal), how many
+generations were evicted and their size, and the writer's pid and build.
+Identical consecutive passes coalesce into one record with a count. The latest
+pass is on `/metrics` as `ferrosa_storage_eviction_audit_*` gauges. Retention is
+the ring itself: the newest segments that fit the cap, oldest dropped first;
+offload is the only way to keep more.
 
 Direct I/O has separate switches for SSTable writes and compaction input scans.
 `FERROSA_SSTABLE_DIRECT_IO` controls immutable `Data.db` writes. Compaction input

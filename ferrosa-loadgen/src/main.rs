@@ -254,6 +254,9 @@ fn main() {
         delete_workers: 2,
         max_requests_per_second: None,
         max_concurrent_requests: None,
+        request_timeout: std::time::Duration::from_secs(
+            ferrosa_storage::upload::config::DEFAULT_S3_REQUEST_TIMEOUT_SECS,
+        ),
     });
 
     let config = StorageEngineConfig {
@@ -281,6 +284,7 @@ fn main() {
         auth_warn: false,
         max_pending_replay_mutations_without_schema: 1024,
         memtable_num_shards: 64,
+        cache_hot_window_secs: 900,
         write_verify: false,
     };
 

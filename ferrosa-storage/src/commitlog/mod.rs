@@ -128,6 +128,18 @@ pub fn render_prometheus() -> String {
         "ferrosa_commitlog_appends_total {}\n",
         COMMITLOG_APPENDS_TOTAL.load(Ordering::Relaxed)
     ));
+    out.push_str("# HELP ferrosa_commitlog_replay_set_aside_mutations_total Mutations set aside on disk at startup because no schema was available to replay them.\n");
+    out.push_str("# TYPE ferrosa_commitlog_replay_set_aside_mutations_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_replay_set_aside_mutations_total {}\n",
+        crate::replay_set_aside::replay_set_aside_mutations_total()
+    ));
+    out.push_str("# HELP ferrosa_commitlog_replay_set_aside_pending_mutations Set-aside mutations not yet re-ingested; non-zero means rows are on disk but invisible to reads.\n");
+    out.push_str("# TYPE ferrosa_commitlog_replay_set_aside_pending_mutations gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_replay_set_aside_pending_mutations {}\n",
+        crate::replay_set_aside::replay_set_aside_pending_mutations()
+    ));
     out.push_str("# HELP ferrosa_commitlog_append_bytes_total Total bytes reserved for commit-log entries.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_bytes_total counter\n");
     out.push_str(&format!(
@@ -539,10 +551,27 @@ impl CommitLog {
     /// See `specs/todo/bug-commitlog-replay-oom-on-large-log.md`.
     pub fn open_and_replay_streaming<F>(
         config: Config,
-        mut on_mutation: F,
+        on_mutation: F,
     ) -> ferrosa_common::Result<Self>
     where
         F: FnMut(Mutation) -> ferrosa_common::Result<()>,
+    {
+        Self::open_and_replay_streaming_with_barrier(config, on_mutation, || Ok(()))
+    }
+
+    /// Like [`open_and_replay_streaming`](Self::open_and_replay_streaming), but
+    /// calls `segment_done` after every entry of a segment has been delivered
+    /// and BEFORE that segment file is deleted. A caller that persists
+    /// mutations elsewhere (the no-schema set-aside) makes them durable there;
+    /// if `segment_done` fails, replay stops and the segment stays on disk.
+    pub fn open_and_replay_streaming_with_barrier<F, B>(
+        config: Config,
+        mut on_mutation: F,
+        mut segment_done: B,
+    ) -> ferrosa_common::Result<Self>
+    where
+        F: FnMut(Mutation) -> ferrosa_common::Result<()>,
+        B: FnMut() -> ferrosa_common::Result<()>,
     {
         let checkpoint = CommitLogCheckpoint::load(&config.checkpoint_dir)?;
         let max_checkpoint_segment_id = checkpoint.values().map(|pos| pos.segment_id).max();
@@ -625,6 +654,7 @@ impl CommitLog {
                 }
             }
 
+            segment_done()?;
             if let Err(e) = fs::remove_file(path) {
                 tracing::warn!(%e, "commitlog: failed to remove segment file");
             }
