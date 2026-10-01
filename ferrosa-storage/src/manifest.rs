@@ -270,12 +270,16 @@ impl Manifest {
         unreachable!()
     }
 
-    /// Adds an SSTable entry to the manifest.
+    /// Adds an SSTable entry to the manifest. An entry with the same id
+    /// replaces the existing one (as [`Self::merge_into`] does), so a re-upload
+    /// of a generation never lists it twice: a duplicate would be counted twice
+    /// by anything that sums the manifest, the cache evictor included.
     pub fn add_sstable(&mut self, table_id: &str, entry: ManifestEntry) {
-        self.sstables
-            .entry(table_id.to_string())
-            .or_default()
-            .push(entry);
+        let listed = self.sstables.entry(table_id.to_string()).or_default();
+        match listed.iter().position(|e| e.id == entry.id) {
+            Some(pos) => listed[pos] = entry,
+            None => listed.push(entry),
+        }
     }
 
     /// Merge this manifest's entries into `base`, producing a new manifest
@@ -413,6 +417,24 @@ mod tests {
             min_timestamp: 1000,
             max_timestamp: 2000,
         }
+    }
+
+    #[test]
+    fn adding_an_sstable_twice_replaces_the_entry_instead_of_listing_it_twice() {
+        let mut manifest = Manifest::new();
+        let entry = |size| ManifestEntry {
+            id: "7".to_string(),
+            size,
+            min_token: 0,
+            max_token: 1,
+            min_timestamp: 0,
+            max_timestamp: 0,
+        };
+        manifest.add_sstable("ks.t", entry(100));
+        manifest.add_sstable("ks.t", entry(250));
+        let listed = &manifest.sstables["ks.t"];
+        assert_eq!(listed.len(), 1, "one entry per generation id");
+        assert_eq!(listed[0].size, 250, "the newer entry wins");
     }
 
     #[test]

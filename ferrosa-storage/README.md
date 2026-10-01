@@ -342,6 +342,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   truncated or garbage file is also honoured as reason-unknown and reported
   (`MarkerState::{Recorded, Legacy, Unreadable}`; restore logs one census line
   and a WARN when any marker is unreadable). Unknown fields are ignored.
+  The evictor sizes candidates from the files on disk (never
+  `ManifestEntry::size`), counts each `(table, generation)` once, and logs one
+  WARN (edge only) when the manifest claims >= 1.5x and >= 16 MiB more bytes
+  than the same generations occupy on disk, or lists one twice (FMEA ST-64).
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —

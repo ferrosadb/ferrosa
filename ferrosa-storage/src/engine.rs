@@ -1332,6 +1332,8 @@ pub struct StorageEngine {
     /// Edge state for the "hot tables alone keep the cache over its limit"
     /// warning: true while the last eviction pass was blocked by hot data.
     cache_hot_blocked: AtomicBool,
+    /// Edge flag for the manifest-vs-disk drift warning.
+    manifest_drift_flagged: AtomicBool,
     /// Set when write admission observes local disk pressure. The process
     /// maintenance loop consumes this flag to run an urgent S3 upload/eviction
     /// pass instead of waiting for the next normal flush tick.
@@ -1690,6 +1692,37 @@ fn hot_block_edge(flag: &AtomicBool, blocked_now: bool) -> HotBlockEdge {
         (true, false) => HotBlockEdge::Cleared,
         _ => HotBlockEdge::Unchanged,
     }
+}
+
+/// Result of [`StorageEngine::collect_uploaded_local_sstables`].
+#[derive(Default)]
+struct CollectedCandidates {
+    /// Locally present, uploaded, evictable generations, sized from disk.
+    candidates: Vec<crate::eviction_plan::EvictionCandidate>,
+    /// Sum of `ManifestEntry::size` over the eligible manifest entries,
+    /// present locally or not. A claim, not a measurement.
+    manifest_bytes: u64,
+    /// Entries skipped because the manifest lists the generation twice.
+    duplicate_entries: usize,
+}
+
+/// A manifest that claims at least this many times the bytes actually on disk
+/// for the same generations is reported as drifted (the observed 2026-09-30
+/// post-recovery gap was 1.6-2.2x).
+const MANIFEST_DRIFT_RATIO_NUM: u64 = 3;
+const MANIFEST_DRIFT_RATIO_DEN: u64 = 2;
+/// ...and only when the gap is at least this large, so a tiny cache with a
+/// large ratio does not warn.
+const MANIFEST_DRIFT_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Whether the manifest's claimed bytes exceed the real on-disk bytes by the
+/// documented threshold: at least 1.5x AND at least 16 MiB more. The eviction
+/// decision never uses the manifest figure; this is a diagnostic signal that
+/// the manifest lists generations that are retired or not local.
+fn manifest_drift(manifest_bytes: u64, disk_bytes: u64) -> bool {
+    manifest_bytes.saturating_sub(disk_bytes) >= MANIFEST_DRIFT_FLOOR_BYTES
+        && u128::from(manifest_bytes) * u128::from(MANIFEST_DRIFT_RATIO_DEN)
+            >= u128::from(disk_bytes) * u128::from(MANIFEST_DRIFT_RATIO_NUM)
 }
 
 /// Process-wide reference instant used as the base for
@@ -3007,6 +3040,7 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             cache_hot_blocked: AtomicBool::new(false),
+            manifest_drift_flagged: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -3239,6 +3273,7 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             cache_hot_blocked: AtomicBool::new(false),
+            manifest_drift_flagged: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -3472,6 +3507,7 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             cache_hot_blocked: AtomicBool::new(false),
+            manifest_drift_flagged: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -12666,10 +12702,16 @@ impl StorageEngine {
         self.commit_log.discard_completed_segments()
     }
 
+    /// Eviction candidates plus the manifest's own claim about the same set.
+    ///
+    /// `candidates` are sized from the files actually on disk, never from
+    /// `ManifestEntry::size`, and each `(table, generation)` appears once.
+    /// `manifest_bytes` is what the manifest claims for the eligible entries,
+    /// kept only to compare against the real total.
     fn collect_uploaded_local_sstables(
         &self,
         manifest: &crate::manifest::Manifest,
-    ) -> Vec<crate::eviction_plan::EvictionCandidate> {
+    ) -> CollectedCandidates {
         // Generations still listed in the pending-upload log are flushed locally
         // but NOT yet confirmed durable in S3 (the entry is removed only after S3
         // confirms). Evicting their only local copy is the #235 data-loss path,
@@ -12688,11 +12730,14 @@ impl StorageEngine {
                         error = %e,
                         "s3-sync: cannot read pending-upload log; skipping uploaded-cache eviction to avoid deleting not-yet-durable SSTables"
                     );
-                    return Vec::new();
+                    return CollectedCandidates::default();
                 }
             };
 
         let mut entries = Vec::new();
+        let mut manifest_bytes = 0u64;
+        let mut duplicate_entries = 0usize;
+        let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
         for (table_id, manifest_entries) in &manifest.sstables {
             // System keyspaces (system_schema, system_auth, graph adjacency)
             // are read at startup to register indexes and seed auth, before
@@ -12711,6 +12756,13 @@ impl StorageEngine {
                 let Ok(gen) = entry.id.parse::<u64>() else {
                     continue;
                 };
+                if !seen.insert((table_id.as_str(), entry.id.as_str())) {
+                    // The same generation listed twice would be counted, and
+                    // evicted, twice over the same files.
+                    duplicate_entries += 1;
+                    continue;
+                }
+                manifest_bytes = manifest_bytes.saturating_add(entry.size);
                 let component_paths = Self::generation_component_paths(&table_dir, gen);
                 if component_paths.is_empty() {
                     continue;
@@ -12740,7 +12792,11 @@ impl StorageEngine {
             }
         }
 
-        entries
+        CollectedCandidates {
+            candidates: entries,
+            manifest_bytes,
+            duplicate_entries,
+        }
     }
 
     /// Last foreground read of every registered table, keyed by the manifest
@@ -12778,6 +12834,30 @@ impl StorageEngine {
         }
     }
 
+    /// Reports, on the edges only, that the manifest claims far more bytes
+    /// than the generations it lists occupy on disk. The eviction decision
+    /// uses the on-disk figure only, so this cannot cause an eviction; it
+    /// flags a manifest that lists retired or non-local generations.
+    fn report_manifest_drift(&self, manifest_bytes: u64, disk_bytes: u64, duplicates: usize) {
+        let drifted = manifest_drift(manifest_bytes, disk_bytes) || duplicates > 0;
+        match hot_block_edge(&self.manifest_drift_flagged, drifted) {
+            HotBlockEdge::Started => tracing::warn!(
+                manifest_listed_bytes = manifest_bytes,
+                on_disk_bytes = disk_bytes,
+                duplicate_manifest_entries = duplicates,
+                "s3-sync: the S3 manifest claims far more bytes than its generations occupy on disk, \
+                 or lists a generation twice; the manifest is stale. Eviction uses the on-disk \
+                 figure and ignores the claim"
+            ),
+            HotBlockEdge::Cleared => tracing::info!(
+                manifest_listed_bytes = manifest_bytes,
+                on_disk_bytes = disk_bytes,
+                "s3-sync: the manifest and the disk agree again"
+            ),
+            HotBlockEdge::Unchanged => {}
+        }
+    }
+
     fn enforce_uploaded_sstable_cache_limit(
         &self,
         manifest: &crate::manifest::Manifest,
@@ -12790,10 +12870,16 @@ impl StorageEngine {
         } else {
             0
         };
-        let candidates = self.collect_uploaded_local_sstables(manifest);
+        let collected = self.collect_uploaded_local_sstables(manifest);
+        let candidates = collected.candidates;
         let mut total_bytes = candidates
             .iter()
             .fold(0u64, |acc, c| acc.saturating_add(c.size));
+        self.report_manifest_drift(
+            collected.manifest_bytes,
+            total_bytes,
+            collected.duplicate_entries,
+        );
         let order = crate::eviction_plan::order_for_eviction(
             candidates,
             &self.last_foreground_reads(),
@@ -14349,6 +14435,7 @@ impl StorageEngine {
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
             cache_hot_blocked: AtomicBool::new(false),
+            manifest_drift_flagged: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -30736,6 +30823,87 @@ mod tests {
         assert_eq!(record.max_bytes, Some(1024 * 1024));
         assert_eq!(record.total_bytes, Some(160));
         assert!(record.target_free.unwrap() > record.projected_available.unwrap());
+    }
+
+    fn manifest_entry(id: &str, size: u64) -> crate::manifest::ManifestEntry {
+        crate::manifest::ManifestEntry {
+            id: id.to_string(),
+            size,
+            min_token: i64::MIN,
+            max_token: i64::MAX,
+            min_timestamp: 0,
+            max_timestamp: 0,
+        }
+    }
+
+    /// A manifest that lists the same generation twice (a re-upload pushes a
+    /// second entry) must not double the evictor's byte count or evict the
+    /// same files twice. The real bytes (160) are under the 170 byte cap; the
+    /// duplicate makes the manifest-derived sum 240, which is over it.
+    #[test]
+    fn a_duplicate_manifest_entry_does_not_drive_an_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, mut manifest) =
+            engine_with_two_uploaded_sstables(dir.path(), 170, 0);
+        manifest
+            .sstables
+            .get_mut(&table_id().to_string())
+            .unwrap()
+            .push(manifest_entry("1", 80));
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        assert_eq!(evicted, 0, "160 real bytes under a 170 byte cap");
+        assert!(
+            engine.manifest_drift_flagged.load(Ordering::Relaxed),
+            "a generation listed twice is reported"
+        );
+        assert!(table_dir.join("1-Data.db").exists());
+        assert!(table_dir.join("2-Data.db").exists());
+    }
+
+    /// Manifest entries for generations that are not on disk (retired
+    /// compaction inputs not yet dropped, or evicted ones) claim bytes that
+    /// are not there. They must not push the evictor over its cap when the
+    /// real on-disk total is far under it.
+    #[test]
+    fn manifest_entries_that_are_not_on_disk_do_not_drive_an_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, mut manifest) =
+            engine_with_two_uploaded_sstables(dir.path(), 1024 * 1024, 0);
+        let listed = manifest.sstables.get_mut(&table_id().to_string()).unwrap();
+        for gen in 100..110 {
+            listed.push(manifest_entry(&gen.to_string(), 10 * 1024 * 1024 * 1024));
+        }
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        assert_eq!(evicted, 0, "160 real bytes under a 1 MiB cap");
+        assert!(
+            engine.manifest_drift_flagged.load(Ordering::Relaxed),
+            "100 GiB claimed against 160 bytes on disk is reported as drift"
+        );
+        assert!(table_dir.join("1-Data.db").exists());
+        assert!(table_dir.join("2-Data.db").exists());
+    }
+
+    /// The drift signal: the manifest claims far more than is on disk.
+    #[test]
+    fn manifest_drift_needs_both_a_ratio_and_a_floor() {
+        const MIB: u64 = 1024 * 1024;
+        assert!(manifest_drift(4_840 * MIB, 2_940 * MIB), "1.65x of 2.9 GB");
+        assert!(manifest_drift(6_690 * MIB, 3_010 * MIB));
+        assert!(!manifest_drift(2_940 * MIB, 2_940 * MIB), "equal");
+        assert!(!manifest_drift(3_000 * MIB, 2_940 * MIB), "a little over");
+        assert!(
+            !manifest_drift(100, 10),
+            "10x of nothing is below the floor"
+        );
+        assert!(!manifest_drift(0, 0));
     }
 
     /// Markers written before the record existed are empty. They must keep
