@@ -472,11 +472,16 @@ const ROW_DATA_IDENTS: &[&str] = &[
     "fragments",
 ];
 
-/// Type idents that carry row data. A local/param declared with one of these
-/// (possibly behind `&`/`Vec`/`Option`/`Box`/`Arc`/slice) is row data no matter
-/// what the binding is called — this closes the renamed-binding blind spot
-/// (`let part = partition; part.clone()`).
-const ROW_DATA_TYPE_IDENTS: &[&str] = &["Partition", "Row", "Cell", "CellValue"];
+/// Struct type idents that carry a RESULT SET. A local/param declared with one
+/// of these (possibly behind `&`/`Vec`/`Option`/`Box`/`Arc`/slice) is row data no
+/// matter what the binding is called — this closes the renamed-binding blind
+/// spot (`let part = partition; part.clone()`).
+///
+/// `Cell`/`CellValue` are deliberately NOT here: a `CellValue` is a single scalar
+/// (an 8-byte-ish value), not a result set. Copying one cell value is a value
+/// copy, not a per-row scan copy; `Vec<Cell>`/`Vec<CellValue>` are still caught
+/// by `is_vec_of_row_data`.
+const ROW_DATA_STRUCT_IDENTS: &[&str] = &["Partition", "Row", "VirtualRow"];
 
 /// Copying method names that materialize a clone of row data.
 fn is_copying_method(method: &str) -> bool {
@@ -521,6 +526,36 @@ fn receiver_trailing_ident(expr: &syn::Expr) -> Option<String> {
         syn::Expr::Try(t) => receiver_trailing_ident(&t.expr),
         _ => None,
     }
+}
+
+/// The receiver expression with outer `&`/`*`/parens looked through, so a
+/// field access can be recognised (`(&self.cells).clone()` -> `self.cells`).
+fn unwrap_receiver(expr: &syn::Expr) -> &syn::Expr {
+    match expr {
+        syn::Expr::Reference(r) => unwrap_receiver(&r.expr),
+        syn::Expr::Paren(p) => unwrap_receiver(&p.expr),
+        syn::Expr::Group(g) => unwrap_receiver(&g.expr),
+        _ => expr,
+    }
+}
+
+/// Fn-name keywords for byte codecs: their `extend_from_slice`/`with_capacity`
+/// calls serialise/parse BYTES, so their arguments are wire data, not row
+/// objects. Distinct from `is_fixed_length_fn` (which also covers encoders like
+/// a phonetic coder).
+fn is_byte_codec_fn(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "encode",
+        "decode",
+        "serialize",
+        "deserialize",
+        "from_bytes",
+        "to_bytes",
+        "parse",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
 }
 
 /// Every named link in a method-call chain: root idents, field names, and
@@ -585,7 +620,7 @@ fn is_row_data_type(ty: &syn::Type) -> bool {
                 return false;
             };
             let name = seg.ident.to_string();
-            if ROW_DATA_TYPE_IDENTS.contains(&name.as_str()) {
+            if ROW_DATA_STRUCT_IDENTS.contains(&name.as_str()) {
                 return true;
             }
             // Wrapper types: recurse into the single meaningful generic arg.
@@ -682,9 +717,71 @@ struct Auditor<'a> {
     findings: Vec<Finding>,
     /// Name of the fn currently being visited (for symbol attribution).
     current_fn: String,
-    /// Idents bound to a row-data TYPE in the current fn (params + typed
-    /// locals) — row data regardless of what the binding is called.
+    /// Shape facts about the fn currently being visited (see `FnState`).
+    fns: FnState,
+}
+
+/// Facts about the fn currently being visited that decide whether a copy/collect
+/// is row-data materialization or a bounded/borrowed operation. Recomputed on
+/// entry and restored on exit, so nothing leaks between fns.
+#[derive(Default, Clone)]
+struct FnState {
+    /// Idents bound to a row-data TYPE (params + typed locals) — row data
+    /// regardless of what the binding is called.
     row_typed: std::collections::HashSet<String>,
+    /// Fn encodes/decodes a fixed-length value (phonetic code, UUID/blob): a
+    /// `truncate(<len>)` bounds the value's length, not a result set.
+    fixed_length_fn: bool,
+    /// Fn is a byte codec (encode/decode/serialize): `extend_from_slice` args
+    /// are wire bytes, `.copied()` copies references, capacities size buffers.
+    byte_codec_fn: bool,
+    /// Fn drains a stream to a caller-supplied sink (`stream.pump(.., out)`):
+    /// rows leave incrementally; a returned Vec is the bounded command tail.
+    pumps_to_sink: bool,
+    /// Fn's parameters are a slice (`&[&CellValue]`, `&[E]`), so `.iter()` there
+    /// is over references and `.copied()` flattens pointers, not data.
+    borrowed_cell_fn: bool,
+    /// Fn builds one row per input row (`*_to_rows*`): a `&row.cells` grouping is
+    /// per-row, bounded by that row's columns, never a table scan.
+    cell_row_ty_fn: bool,
+    /// Fn returns a `Vec<RowPosition>` — an index of positions, not row data.
+    index_position_value_fn: bool,
+    /// Fn's params include a collection (`cells`, `entries`): a
+    /// `.chunks(..).to_vec()` there is a view of the existing collection.
+    collection_chunks_fn: bool,
+    /// Fn's params include a collection (`cells`, `entries`) that is `.into_iter()`d
+    /// into a local; chained `.cloned()` there is over owned elements.
+    collection_into_iters_fn: bool,
+    /// Idents bound from a wire length read (`count = u32::from_le_bytes(..)`); a
+    /// `Vec::with_capacity(count.min(4096))` using one is a pre-alloc guard.
+    decoded_len_idents: Vec<String>,
+    /// Idents derived from the current fn's already-materialized row-data params
+    /// (`it = partitions.into_iter()`); a `collect()` from one re-chunks.
+    rechunk_idents: Vec<String>,
+    /// Idents derived from a `cells_by_col`-style grouping local (a container of
+    /// borrowed cells); a `.iter().copied()` over one copies references.
+    cell_idents: Vec<String>,
+    /// Loop vars bound by `for chunk in <collection>.chunks(n)` — a borrowed view
+    /// of a collection the fn already holds.
+    chunk_loop_vars: Vec<String>,
+    /// Idents holding an owned/Arc element of a collection (an `Arc::clone` local
+    /// or a `.values()` map-closure param); copying one is per-element, not a
+    /// table-scale scan copy.
+    arc_handle_idents: Vec<String>,
+    /// Idents bound to an `Option` of row data (`Option<&Row>`): the binding
+    /// holds zero-or-one element, so a `.cloned()`/`.copied()` on it extracts
+    /// that one element — never a per-element stream copy.
+    option_row_idents: Vec<String>,
+    /// Idents of params declared as a SINGLE `Partition` (`partition:
+    /// &Partition`). A `.rows` copy off one is bounded by that one partition
+    /// (clustering match / `row_limit`), never a table scan. A `Vec<Partition>`
+    /// param is deliberately absent, so cross-partition scans stay flagged.
+    single_partition_idents: Vec<String>,
+    /// Idents bound by `for (col, cells) in groups` where `groups` is one of
+    /// this fn's local collection groupings (`cells_by_col`). The loop yields ONE
+    /// column's cells at a time — a per-row/per-column arity bound, never a
+    /// table scan.
+    per_row_grouping_vars: Vec<String>,
 }
 
 impl<'a> Auditor<'a> {
@@ -693,14 +790,14 @@ impl<'a> Auditor<'a> {
             path,
             findings: Vec::new(),
             current_fn: String::new(),
-            row_typed: std::collections::HashSet::new(),
+            fns: FnState::default(),
         }
     }
 
     /// True if this receiver/arg ident is row data: by name, or by the type it
     /// was bound with in the current fn.
     fn is_row_data(&self, ident: &str) -> bool {
-        is_row_data_ident(ident) || self.row_typed.contains(ident)
+        is_row_data_ident(ident) || self.fns.row_typed.contains(ident)
     }
 
     /// True if any named link of a method-call chain is row data, or the chain
@@ -718,6 +815,38 @@ impl<'a> Auditor<'a> {
                 .any(|id| id.contains("stream") || id == "range_iter")
     }
 
+    /// Set up all per-fn state and return the previous state for `exit_fn`.
+    fn enter_fn(&mut self, sig: &syn::Signature, block: &syn::Block) -> FnState {
+        let prev = std::mem::take(&mut self.fns);
+        let name = sig.ident.to_string();
+        self.fns.pumps_to_sink = block_pumps_to_sink(block);
+        self.fns.fixed_length_fn = is_fixed_length_fn(&name);
+        self.fns.byte_codec_fn = is_byte_codec_fn(&name);
+        self.fns.borrowed_cell_fn = fn_has_slice_param(sig);
+        self.fns.cell_row_ty_fn = is_cell_row_fn(&name);
+        self.fns.index_position_value_fn = is_index_position_value_fn(&name);
+        self.fns.collection_chunks_fn = fn_has_collection_param(sig, block, &["cells", "entries"]);
+        self.fns.collection_into_iters_fn =
+            block_into_iters_collection(block, &["cells", "entries"]);
+        self.collect_row_typed_params(sig);
+        self.fns.decoded_len_idents = decoded_len_idents(block);
+        let seeds = collection_row_params(sig);
+        self.fns.rechunk_idents = rechunk_derived_idents(block, &seeds);
+        self.fns.cell_idents = rechunk_derived_idents(block, &["cells_by_col".to_string()]);
+        self.fns.chunk_loop_vars = chunk_loop_vars(block);
+        self.fns.arc_handle_idents = arc_handle_idents(block);
+        self.fns.option_row_idents = option_row_param_idents(sig);
+        self.fns.single_partition_idents = single_partition_param_idents(sig);
+        self.fns.per_row_grouping_vars = for_loop_vars_over_idents(block, &self.fns.cell_idents);
+        self.check_signature(sig);
+        prev
+    }
+
+    fn exit_fn(&mut self, prev_fn: String, prev: FnState) {
+        self.current_fn = prev_fn;
+        self.fns = prev;
+    }
+
     /// Collect row-typed param idents from a fn signature into `row_typed`.
     fn collect_row_typed_params(&mut self, sig: &syn::Signature) {
         for input in &sig.inputs {
@@ -725,7 +854,7 @@ impl<'a> Auditor<'a> {
                 if is_row_data_type(&pt.ty) {
                     let mut ids = Vec::new();
                     pat_idents(&pt.pat, &mut ids);
-                    self.row_typed.extend(ids);
+                    self.fns.row_typed.extend(ids);
                 }
             }
         }
@@ -753,8 +882,10 @@ impl<'a> Auditor<'a> {
         let name = sig.ident.to_string();
         let Some(ret) = return_type(sig) else { return };
 
-        // Rule (a): a `stream`-named fn returning a Vec.
-        if name.contains("stream") && yields_vec(ret) {
+        // Rule (a): a `stream`-named fn returning a Vec. A fn that PUMPS a
+        // stream to a caller-supplied sink streams its rows; the returned Vec is
+        // the bounded command tail (CommandComplete/ErrorResponse), not the rows.
+        if name.contains("stream") && yields_vec(ret) && !self.fns.pumps_to_sink {
             let line = sig.ident.span().start().line;
             self.push(
                 line,
@@ -803,7 +934,13 @@ impl<'a> Auditor<'a> {
         // Rule (c): Vec::with_capacity(<paging cap>).
         if last == Some("with_capacity") && segs.iter().any(|s| s == "Vec") {
             if let Some(arg) = node.args.first() {
-                if is_paging_capacity_arg(arg) {
+                // A length read off the wire (`count`) or derived from one is a
+                // decode pre-allocation guard against an untrusted count — the
+                // loop still reads every element — never a result cap. A byte
+                // codec's capacity likewise sizes a serialisation buffer.
+                let decoded_len =
+                    expr_uses_len_ident(arg) || expr_uses_idents(arg, &self.fns.decoded_len_idents);
+                if is_paging_capacity_arg(arg) && !decoded_len && !self.fns.byte_codec_fn {
                     self.push(
                         node.span().start().line,
                         rule::WITH_CAPACITY_LIMIT,
@@ -829,10 +966,21 @@ impl<'a> Auditor<'a> {
         if last == Some("clone") {
             let type_seg_is_row = segs
                 .iter()
-                .any(|s| ROW_DATA_TYPE_IDENTS.contains(&s.as_str()));
+                .any(|s| ROW_DATA_STRUCT_IDENTS.contains(&s.as_str()));
             let arg_ident = node.args.first().and_then(receiver_trailing_ident);
             let arg_is_row = arg_ident.as_deref().is_some_and(|id| self.is_row_data(id));
-            if type_seg_is_row || arg_is_row {
+            // `Partition::clone(arc)` where `arc` is an owned/Arc element of a
+            // collection the fn already holds (an `Arc::clone` local or a
+            // `.values()` closure param) is a per-element copy of a shared
+            // handle, not a table-scale scan copy.
+            let arg_is_handle = arg_ident.as_deref().is_some_and(|id| {
+                self.fns.arc_handle_idents.iter().any(|a| a == id)
+                    || self.fns.chunk_loop_vars.iter().any(|a| a == id)
+            });
+            if (type_seg_is_row || arg_is_row)
+                && !self.fns.index_position_value_fn
+                && !arg_is_handle
+            {
                 let sym = arg_ident.unwrap_or_else(|| segs.join("::"));
                 self.push_with_symbol(
                     node.span().start().line,
@@ -866,11 +1014,14 @@ impl<'a> Auditor<'a> {
         // bindings already covered by the return-type rule.
         if init.is_some_and(expr_is_collect_call) {
             if let Some(elem) = vec_partition_or_row_elem(ty) {
-                self.push(
-                    line,
-                    rule::COLLECT_VEC_PARTITION_OR_ROW,
-                    format!("collect into a Vec<{elem}>-typed binding materializes the scan"),
-                );
+                let rechunk = init.is_some_and(|e| expr_uses_idents(e, &self.fns.rechunk_idents));
+                if !rechunk {
+                    self.push(
+                        line,
+                        rule::COLLECT_VEC_PARTITION_OR_ROW,
+                        format!("collect into a Vec<{elem}>-typed binding materializes the scan"),
+                    );
+                }
             }
         }
         if is_cqlvalue_row_matrix(ty) {
@@ -886,6 +1037,592 @@ impl<'a> Auditor<'a> {
 /// True if `expr` is (or ends in) a `.collect()` method call.
 fn expr_is_collect_call(expr: &syn::Expr) -> bool {
     matches!(expr, syn::Expr::MethodCall(mc) if mc.method == "collect")
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-arity / algorithm-length refinements
+// ---------------------------------------------------------------------------
+//
+// A "result cap" is only a cap when it bounds a RESULT SET. One shape looks
+// like a cap to the AST but is not: a fixed-length CODE — e.g. Caverphone's
+// `word.truncate(10)`, where 10 is the algorithm's canonical code length (a
+// property of ONE value), not a count of results. It is detected from the
+// ENCLOSING fn (the encoder), which is the only place the constant's meaning is
+// knowable.
+
+/// Fn-name keywords identifying a fixed-length/algorithmic encoder or a
+/// fixed-size binary decoder, whose literal length constants describe a VALUE's
+/// or a struct's shape — never a result count.
+const FIXED_LENGTH_FN_KEYWORDS: &[&str] = &[
+    "phonetic",
+    "caverphone",
+    "metaphone",
+    "soundex",
+    "encode",
+    "fingerprint",
+    "hash",
+    "checksum",
+    "digest",
+    "decode",
+    "parse",
+    "deserialize",
+];
+
+/// Method/path names that READ a length off the wire (a decoded element
+/// count). A bound derived from such a value is a decode pre-allocation guard,
+/// not a server-computed result cap.
+const WIRE_LEN_READERS: &[&str] = &[
+    "from_le_bytes",
+    "from_be_bytes",
+    "from_ne_bytes",
+    "get_u8",
+    "get_u16",
+    "get_u32",
+    "get_u64",
+    "get_i8",
+    "get_i16",
+    "get_i32",
+    "get_i64",
+];
+
+/// True if `expr` reads a length off the wire (`u32::from_le_bytes(..)`,
+/// `body.get_u32()`).
+fn is_wire_length_init(expr: &syn::Expr) -> bool {
+    struct WireLenFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for WireLenFinder {
+        fn visit_expr_method_call(&mut self, n: &'ast syn::ExprMethodCall) {
+            if WIRE_LEN_READERS.iter().any(|w| n.method == w) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_method_call(self, n);
+        }
+        fn visit_expr_call(&mut self, n: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*n.func {
+                if let Some(seg) = p.path.segments.last() {
+                    if WIRE_LEN_READERS.iter().any(|w| seg.ident == w) {
+                        self.found = true;
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, n);
+        }
+    }
+    let mut f = WireLenFinder { found: false };
+    f.visit_expr(expr);
+    f.found
+}
+
+/// True if `block` contains a `.pump(..)` call — the fn drains a stream to a
+/// caller-supplied sink, so its rows leave incrementally.
+fn block_pumps_to_sink(block: &syn::Block) -> bool {
+    struct PumpFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for PumpFinder {
+        fn visit_expr_method_call(&mut self, n: &'ast syn::ExprMethodCall) {
+            if n.method == "pump" {
+                self.found = true;
+            }
+            syn::visit::visit_expr_method_call(self, n);
+        }
+    }
+    let mut f = PumpFinder { found: false };
+    f.visit_block(block);
+    f.found
+}
+
+/// Idents in the fn body bound from a wire length read (`let count = ..get_u32()..`).
+fn decoded_len_idents(block: &syn::Block) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in &block.stmts {
+        if let syn::Stmt::Local(local) = stmt {
+            if let Some(init) = &local.init {
+                if is_wire_length_init(&init.expr) {
+                    let mut ids = Vec::new();
+                    pat_idents(&local.pat, &mut ids);
+                    out.extend(ids);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True if `ty` is an owned `Vec` of row data (`Vec<Partition>`, `Vec<Row>`,
+/// `Vec<CellValue>`, `Vec<VirtualRow>`) — a collection the caller already
+/// materialized.
+fn is_vec_of_row_data(ty: &syn::Type) -> bool {
+    let Some(inner) = vec_inner(ty) else {
+        return false;
+    };
+    match last_segment_ident(inner).as_deref() {
+        Some(id) => {
+            ROW_DATA_STRUCT_IDENTS.contains(&id)
+                || matches!(id, "VirtualRow" | "Cell" | "CellValue")
+        }
+        None => false,
+    }
+}
+
+/// Owned `Vec`-of-row-data parameters of a fn — its already-materialized inputs.
+fn collection_row_params(sig: &syn::Signature) -> Vec<String> {
+    let mut out = Vec::new();
+    for input in &sig.inputs {
+        if let syn::FnArg::Typed(pt) = input {
+            if is_vec_of_row_data(&pt.ty) {
+                let mut ids = Vec::new();
+                pat_idents(&pt.pat, &mut ids);
+                out.extend(ids);
+            }
+        }
+    }
+    out
+}
+
+/// The root ident of a method-call chain: `it.by_ref().take(n)` -> `it`.
+fn chain_root_ident(expr: &syn::Expr) -> Option<String> {
+    chain_idents(expr).first().cloned()
+}
+
+/// True if `ty` is an `Option` OF a SINGLE row-data element (`Option<&Row>`,
+/// `Option<Partition>`, `Option<Box<Row>>`).
+///
+/// An `Option` is a zero-or-one CONTAINER: a `.cloned()`/`.copied()` on one
+/// extracts the single contained element, so it is an accessor, never a
+/// per-element stream copy. The wrapper may sit behind any number of
+/// `&`/`&mut` (a `&Option<&Row>` receiver derefs to the same one element).
+///
+/// An `Option<Vec<Row>>` is deliberately NOT covered: cloning that copies the
+/// whole collection, so it keeps firing.
+fn is_option_of_row_data(ty: &syn::Type) -> bool {
+    let mut t = ty;
+    loop {
+        t = match t {
+            syn::Type::Reference(r) => &r.elem,
+            syn::Type::Paren(p) => &p.elem,
+            syn::Type::Group(g) => &g.elem,
+            _ => break,
+        };
+    }
+    let syn::Type::Path(tp) = t else {
+        return false;
+    };
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    if seg.ident != "Option" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return false;
+    };
+    args.args.iter().any(|a| match a {
+        syn::GenericArgument::Type(t) => option_inner_is_single_element(t),
+        _ => false,
+    })
+}
+
+/// The element type inside an `Option`: `&Row`/`Row`/`Box<Row>` (a SINGLE
+/// row-data element), but not `Vec<Row>`/`&[Row]` (a collection, whose clone is a
+/// real materialization).
+fn option_inner_is_single_element(ty: &syn::Type) -> bool {
+    let mut t = ty;
+    loop {
+        t = match t {
+            syn::Type::Reference(r) => &r.elem,
+            syn::Type::Paren(p) => &p.elem,
+            syn::Type::Group(g) => &g.elem,
+            _ => break,
+        };
+    }
+    let syn::Type::Path(tp) = t else {
+        return false;
+    };
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    let name = seg.ident.to_string();
+    // A shared single element unwraps further; a Vec/Slice does NOT qualify.
+    if matches!(name.as_str(), "Box" | "Arc" | "Rc") {
+        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+            return args.args.iter().any(
+                |a| matches!(a, syn::GenericArgument::Type(t) if option_inner_is_single_element(t)),
+            );
+        }
+    }
+    ROW_DATA_STRUCT_IDENTS.contains(&name.as_str())
+}
+
+/// Idents of the fn's params declared as an `Option` of row data (`static_row:
+/// Option<&Row>`). A `.cloned()` on one extracts zero-or-one element.
+fn option_row_param_idents(sig: &syn::Signature) -> Vec<String> {
+    let mut out = Vec::new();
+    for input in &sig.inputs {
+        if let syn::FnArg::Typed(pt) = input {
+            if is_option_of_row_data(&pt.ty) {
+                pat_idents(&pt.pat, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// True if `expr` is a `.filter(..)` chain rooted at a single-`Partition` param
+/// and reading its `.rows` — the bounded single-partition read shape
+/// (`partition.rows.iter().filter(..).cloned()`), bounded by that partition's
+/// clustering match / `row_limit`.
+///
+/// Requires BOTH a `.filter` link (the predicate bounds the read) and the `.rows`
+/// field, so an unbounded `partition.rows.iter().cloned()` (no filter) and a
+/// cross-partition `partitions.iter().flat_map(|p| p.rows..)` chain stay flagged.
+fn chain_is_single_partition_rows_filter(
+    expr: &syn::Expr,
+    single_partition_idents: &[String],
+) -> bool {
+    let ids = chain_idents(expr);
+    let root_ok =
+        chain_root_ident(expr).is_some_and(|r| single_partition_idents.iter().any(|p| p == &r));
+    root_ok && ids.iter().any(|c| c == "filter") && ids.iter().any(|c| c == "rows")
+}
+
+/// True if `ty` is a SINGLE `Partition` (or `&Partition`/`&mut Partition`) —
+/// never a collection of them (`Vec<Partition>`, `Partitions`).
+fn type_is_single_partition(ty: &syn::Type) -> bool {
+    let mut t = ty;
+    loop {
+        t = match t {
+            syn::Type::Reference(r) => &r.elem,
+            syn::Type::Paren(p) => &p.elem,
+            syn::Type::Group(g) => &g.elem,
+            _ => break,
+        };
+    }
+    matches!(t, syn::Type::Path(tp)
+        if tp.path.segments.last().is_some_and(|s| s.ident == "Partition"))
+}
+
+/// Idents of the fn's params declared as a SINGLE `Partition` (`partition:
+/// &Partition`). A `.rows` read off one is bounded by that one partition, never
+/// a table scan. `Vec<Partition>`/`Partitions` params do NOT qualify, so a
+/// cross-partition `partitions.iter().flat_map(|p| p.rows...)` chain stays
+/// flagged.
+fn single_partition_param_idents(sig: &syn::Signature) -> Vec<String> {
+    let mut out = Vec::new();
+    for input in &sig.inputs {
+        if let syn::FnArg::Typed(pt) = input {
+            if type_is_single_partition(&pt.ty) {
+                pat_idents(&pt.pat, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Idents bound by a `for .. in <ident>` loop whose iterated value is one of
+/// `over` (e.g. `for (col, cells) in cells_by_col`).
+///
+/// A `cells_by_col` grouping holds ONE row's cells bucketed by column, so the
+/// loop yields one column's cells at a time: a `.iter().copied()` on the binding
+/// is bounded by that row's column arity, never a table scan. Scoped to `over` so
+/// an unrelated `for x in <whatever>` does not qualify.
+fn for_loop_vars_over_idents(block: &syn::Block, over: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in &block.stmts {
+        collect_for_loop_vars_over(stmt, over, &mut out);
+    }
+    out
+}
+
+fn collect_for_loop_vars_over(stmt: &syn::Stmt, over: &[String], out: &mut Vec<String>) {
+    struct Finder<'a> {
+        over: &'a [String],
+        out: &'a mut Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_for_loop(&mut self, n: &'ast syn::ExprForLoop) {
+            if chain_root_ident(&n.expr).is_some_and(|r| self.over.iter().any(|o| o == &r)) {
+                pat_idents(&n.pat, self.out);
+            }
+            syn::visit::visit_expr_for_loop(self, n);
+        }
+    }
+    let mut f = Finder { over, out };
+    f.visit_stmt(stmt);
+}
+
+/// Idents that transitively derive from a fn's already-materialized row-data
+/// params (`let it = partitions.into_iter();`). A `collect()` drawn from one of
+/// these re-chunks an existing collection; it does not materialize a scan.
+fn rechunk_derived_idents(block: &syn::Block, seeds: &[String]) -> Vec<String> {
+    let mut derived: Vec<String> = seeds.to_vec();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for stmt in &block.stmts {
+            if let syn::Stmt::Local(local) = stmt {
+                if let Some(init) = &local.init {
+                    if chain_root_ident(&init.expr).is_some_and(|r| derived.contains(&r)) {
+                        let mut ids = Vec::new();
+                        pat_idents(&local.pat, &mut ids);
+                        for id in ids {
+                            if !derived.contains(&id) {
+                                derived.push(id);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    derived
+}
+
+/// True if any ident in `expr`'s chain is in `idents`.
+fn expr_uses_idents(expr: &syn::Expr, idents: &[String]) -> bool {
+    chain_idents(expr)
+        .iter()
+        .any(|c| idents.iter().any(|i| c == i))
+}
+
+/// True if any ident in `expr`'s chain is a bare LENGTH/value count
+/// (`count`/`len`/`n`, or a `*_len`/`*_count`) — a size, not a query LIMIT.
+/// Deliberately excludes `limit`: that is exactly the paging bound Rule (c)
+/// exists to flag.
+fn expr_uses_len_ident(expr: &syn::Expr) -> bool {
+    chain_idents(expr).iter().any(|c| {
+        matches!(c.as_str(), "count" | "len" | "n") || c.ends_with("_len") || c.ends_with("_count")
+    })
+}
+
+/// True if any fn parameter is a slice OF REFERENCES (`&[&CellValue]`,
+/// `&[&Row]`) — so `.iter()` yields `&&T` and `.copied()` flattens an 8-byte
+/// pointer, never the data. A slice of owned values (`&[R]`) does NOT qualify:
+/// copying an element there is a real value copy.
+fn fn_has_slice_param(sig: &syn::Signature) -> bool {
+    fn type_is_ref_slice(ty: &syn::Type) -> bool {
+        let mut t = ty;
+        loop {
+            t = match t {
+                syn::Type::Reference(r) => &r.elem,
+                syn::Type::Paren(p) => &p.elem,
+                syn::Type::Group(g) => &g.elem,
+                _ => break,
+            };
+        }
+        matches!(t, syn::Type::Slice(s) if matches!(&*s.elem, syn::Type::Reference(_)))
+    }
+    sig.inputs.iter().any(|input| match input {
+        syn::FnArg::Typed(pt) => type_is_ref_slice(&pt.ty),
+        syn::FnArg::Receiver(_) => false,
+    })
+}
+
+/// True if the fn builds one OUTPUT ROW per input row (`*_to_rows*`): its
+/// `&row.cells` grouping is per-row, bounded by that row's column count, never
+/// a table scan.
+fn is_cell_row_fn(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower.contains("to_rows") || lower.contains("to_row")) && lower.contains("partition")
+}
+
+/// True if the fn's name signals it returns index POSITIONS
+/// (`search`/`query`), where a `Vec<RowPosition>` value is an index, not rows.
+fn is_index_position_value_fn(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["search", "query", "nearest", "knn"]
+        .iter()
+        .any(|k| lower.contains(k))
+}
+
+/// True if `expr` mentions one of `names` as a field/ident somewhere in the fn
+/// body (a collection the fn is reading a `.chunks(..)` view of).
+fn block_uses_idents(block: &syn::Block, names: &[&str]) -> bool {
+    struct UseFinder<'a> {
+        names: &'a [&'a str],
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for UseFinder<'_> {
+        fn visit_expr_field(&mut self, n: &'ast syn::ExprField) {
+            if let syn::Member::Named(id) = &n.member {
+                if self.names.iter().any(|x| id == x) {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_expr_field(self, n);
+        }
+        fn visit_path(&mut self, n: &'ast syn::Path) {
+            if let Some(seg) = n.segments.last() {
+                if self.names.iter().any(|x| seg.ident == x) {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_path(self, n);
+        }
+    }
+    let mut f = UseFinder {
+        names,
+        found: false,
+    };
+    f.visit_block(block);
+    f.found
+}
+
+/// True if the fn takes (or holds) a COLLECTION parameter named `names` and
+/// `.chunks(..)` it — a view over an existing collection, so `.to_vec()` there
+/// re-materializes already-owned index slices.
+fn fn_has_collection_param(sig: &syn::Signature, block: &syn::Block, names: &[&str]) -> bool {
+    let param = || {
+        sig.inputs.iter().any(|input| match input {
+            syn::FnArg::Typed(pt) => {
+                let mut ids = Vec::new();
+                pat_idents(&pt.pat, &mut ids);
+                ids.iter().any(|i| names.contains(&i.as_str()))
+            }
+            syn::FnArg::Receiver(_) => false,
+        })
+    };
+    param() && block_uses_idents(block, names)
+}
+
+/// True if a local is bound from `into_iter()` over one of `names`
+/// (`let it = partitions.into_iter();`), so chained `.cloned()` is over owned
+/// elements of that collection.
+fn block_into_iters_collection(block: &syn::Block, names: &[&str]) -> bool {
+    block.stmts.iter().any(|stmt| {
+        let syn::Stmt::Local(local) = stmt else {
+            return false;
+        };
+        let Some(init) = &local.init else {
+            return false;
+        };
+        matches!(&*init.expr, syn::Expr::MethodCall(mc)
+            if mc.method == "into_iter"
+                && chain_idents(&mc.receiver).iter().any(|c| names.contains(&c.as_str())))
+    })
+}
+
+/// Idents bound as the loop pattern of a `for .. in <expr>.chunks(..)` loop —
+/// borrowed views of a collection the fn already holds, so copying one is not a
+/// scan materialization.
+fn chunk_loop_vars(block: &syn::Block) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in &block.stmts {
+        collect_chunk_loop_vars_stmt(stmt, &mut out);
+    }
+    out
+}
+
+fn collect_chunk_loop_vars_stmt(stmt: &syn::Stmt, out: &mut Vec<String>) {
+    struct LoopFinder<'o> {
+        out: &'o mut Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for LoopFinder<'_> {
+        fn visit_expr_for_loop(&mut self, n: &'ast syn::ExprForLoop) {
+            let iter = &n.expr;
+            if matches!(&**iter, syn::Expr::MethodCall(mc)
+                if chain_idents(&mc.receiver).iter().any(|c| c == "chunks"))
+                || matches!(&**iter, syn::Expr::MethodCall(mc) if mc.method == "chunks")
+            {
+                pat_idents(&n.pat, self.out);
+            }
+            syn::visit::visit_expr_for_loop(self, n);
+        }
+    }
+    let mut f = LoopFinder { out };
+    f.visit_stmt(stmt);
+}
+
+/// Method-chain links that EXTRACT a single element/option from a collection
+/// (`.find`, `.get`, `.first`, `.last`, `.next`, `.pop`). A clone/copy after one
+/// of these touches ONE element, not every element of the stream.
+fn chain_has_single_element_extractor(expr: &syn::Expr) -> bool {
+    chain_idents(expr).iter().any(|c| {
+        matches!(
+            c.as_str(),
+            "find" | "get" | "first" | "last" | "next" | "pop" | "as_deref" | "as_ref"
+        )
+    })
+}
+
+/// Idents holding an owned/Arc element of a collection the fn already holds:
+/// a local bound from an `Arc::clone`/`Rc::clone`, or a closure param of an
+/// iterator adapter over a map's `.values()`/`.iter()`. Copying one is a
+/// per-element materialization of a shared/owned element, not a table-scale
+/// scan copy.
+fn arc_handle_idents(block: &syn::Block) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in &block.stmts {
+        let syn::Stmt::Local(local) = stmt else {
+            continue;
+        };
+        let Some(init) = &local.init else { continue };
+        let ids = chain_idents(&init.expr);
+        let ufcs_arc = matches!(&*init.expr, syn::Expr::Call(c)
+            if matches!(&*c.func, syn::Expr::Path(fp)
+                if fp.path.segments.iter().any(|s| matches!(s.ident.to_string().as_str(), "Arc" | "Rc"))
+                    && fp.path.segments.last().is_some_and(|s| s.ident == "clone")));
+        if (ids.iter().any(|c| c == "clone") && ids.iter().any(|c| c == "Arc" || c == "Rc"))
+            || ufcs_arc
+        {
+            pat_idents(&local.pat, &mut out);
+        }
+    }
+    struct ValuesClosureFinder<'o> {
+        out: &'o mut Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for ValuesClosureFinder<'_> {
+        fn visit_expr_method_call(&mut self, n: &'ast syn::ExprMethodCall) {
+            let m = n.method.to_string();
+            if matches!(m.as_str(), "map" | "filter_map" | "for_each" | "inspect")
+                && chain_idents(&n.receiver)
+                    .iter()
+                    .any(|c| c == "values" || c == "iter")
+            {
+                for arg in &n.args {
+                    if let syn::Expr::Closure(cl) = arg {
+                        for p in &cl.inputs {
+                            pat_idents(p, self.out);
+                        }
+                    }
+                }
+            }
+            syn::visit::visit_expr_method_call(self, n);
+        }
+    }
+    let mut f = ValuesClosureFinder { out: &mut out };
+    f.visit_block(block);
+    out
+}
+
+/// True if the method chain contains a `.take(<query-derived>)` — a copy bounded
+/// by the query's own LIMIT, not a server-side cap. A `.take(<literal>)` is a
+/// cap (see `result_cap_arg`) and does NOT exempt.
+fn chain_has_query_bounded_take(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::MethodCall(mc) => {
+            if mc.method == "take" {
+                if let Some(arg) = mc.args.first() {
+                    if result_cap_arg(arg).is_none() {
+                        return true;
+                    }
+                }
+            }
+            chain_has_query_bounded_take(&mc.receiver)
+        }
+        syn::Expr::Reference(r) => chain_has_query_bounded_take(&r.expr),
+        syn::Expr::Paren(p) => chain_has_query_bounded_take(&p.expr),
+        syn::Expr::Group(g) => chain_has_query_bounded_take(&g.expr),
+        _ => false,
+    }
+}
+
+/// True if the fn name signals a fixed-length encoder or a fixed-size decoder.
+fn is_fixed_length_fn(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    FIXED_LENGTH_FN_KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
 /// Copy sites of a closure param inside a closure body: `(line, param, method)`
@@ -920,22 +1657,16 @@ fn closure_param_copy_sites(body: &syn::Expr, params: &[String]) -> Vec<(usize, 
 impl<'ast> Visit<'ast> for Auditor<'_> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         let prev = std::mem::replace(&mut self.current_fn, node.sig.ident.to_string());
-        let prev_typed = std::mem::take(&mut self.row_typed);
-        self.collect_row_typed_params(&node.sig);
-        self.check_signature(&node.sig);
+        let prev_state = self.enter_fn(&node.sig, &node.block);
         syn::visit::visit_item_fn(self, node);
-        self.current_fn = prev;
-        self.row_typed = prev_typed;
+        self.exit_fn(prev, prev_state);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         let prev = std::mem::replace(&mut self.current_fn, node.sig.ident.to_string());
-        let prev_typed = std::mem::take(&mut self.row_typed);
-        self.collect_row_typed_params(&node.sig);
-        self.check_signature(&node.sig);
+        let prev_state = self.enter_fn(&node.sig, &node.block);
         syn::visit::visit_impl_item_fn(self, node);
-        self.current_fn = prev;
-        self.row_typed = prev_typed;
+        self.exit_fn(prev, prev_state);
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
@@ -954,12 +1685,17 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
         }
 
         // Rule 1 (collect): `.collect::<Vec<Partition>>()` turbofish form.
+        // A collect drawn from an already-materialized row collection (a fn
+        // param, or a local derived from one) re-chunks that collection; it
+        // does not materialize a scan.
         if let Some(elem) = collect_turbofish_partition_or_row(node) {
-            self.push(
-                line,
-                rule::COLLECT_VEC_PARTITION_OR_ROW,
-                format!(".collect::<Vec<{elem}>>() materializes the scan into a Vec"),
-            );
+            if !expr_uses_idents(&node.receiver, &self.fns.rechunk_idents) {
+                self.push(
+                    line,
+                    rule::COLLECT_VEC_PARTITION_OR_ROW,
+                    format!(".collect::<Vec<{elem}>>() materializes the scan into a Vec"),
+                );
+            }
         }
 
         // Rule 1 (extend): `.extend(<stream-source expr>)`.
@@ -1001,8 +1737,38 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
         // Matches by NAME (partition/rows/chunk/…) or by TYPE (any ident the
         // current fn bound to a row-data type — closes the renamed-binding gap).
         if is_copying_method(&method) {
+            // A `.chunks(..).to_vec()` over a fn's own collection param
+            // (`entries`, `cells`) is a view of an existing collection, not a
+            // scan materialization.
+            if self.fns.collection_chunks_fn {
+                if let Some(recv) = receiver_trailing_ident(&node.receiver) {
+                    if matches!(recv.as_str(), "chunk" | "chunks") {
+                        syn::visit::visit_expr_method_call(self, node);
+                        return;
+                    }
+                }
+            }
+            // A copy of a FIELD whose name is a row-data type (`x.value` where
+            // `value: CellValue`) copies one cell value, not a stream of rows.
+            let field_named_row_type = matches!(
+                unwrap_receiver(&node.receiver),
+                syn::Expr::Field(f) if matches!(&f.member, syn::Member::Named(id)
+                    if ROW_DATA_STRUCT_IDENTS.contains(&id.to_string().as_str()))
+            );
+            let is_chunk_loop_var = self
+                .fns
+                .chunk_loop_vars
+                .iter()
+                .any(|v| Some(v) == chain_root_ident(&node.receiver).as_ref());
+            let is_arc_handle = chain_root_ident(&node.receiver)
+                .is_some_and(|r| self.fns.arc_handle_idents.contains(&r));
             if let Some(recv) = receiver_trailing_ident(&node.receiver) {
-                if self.is_row_data(&recv) {
+                if self.is_row_data(&recv)
+                    && !field_named_row_type
+                    && !self.fns.borrowed_cell_fn
+                    && !is_chunk_loop_var
+                    && !is_arc_handle
+                {
                     self.push_with_symbol(
                         line,
                         rule::CLONE_ON_ROW_DATA,
@@ -1015,7 +1781,49 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
 
         // Rule 6: `.cloned()` / `.copied()` iterator adapters over row data or
         // a streaming source — clones EVERY element of the stream.
-        if (method == "cloned" || method == "copied") && self.chain_is_row_data(&node.receiver) {
+        // A `.copied()/.cloned()` over a slice of BORROWED cells (a fn whose
+        // params are `&[&CellValue]`) flattens references — an 8-byte pointer
+        // copy, never cell data. Likewise over a local grouping of borrowed
+        // cells (`cells_by_col`) or a collection `.into_iter()`d from a param.
+        let borrowed_cell_chain = self.fns.borrowed_cell_fn
+            || expr_uses_idents(&node.receiver, &self.fns.cell_idents)
+            || (self.fns.collection_into_iters_fn
+                && chain_idents(&node.receiver)
+                    .iter()
+                    .any(|c| c == "cloned" || c == "copied"));
+        // A `.find(..).cloned()` / `.take(limit).cloned()` chain touches ONE
+        // element (or a query-bounded window), not every element of the stream.
+        let single_element = chain_has_single_element_extractor(&node.receiver)
+            || chain_has_query_bounded_take(&node.receiver);
+        // (a) `.cloned()` on an `Option<&Row>` PARAM extracts zero-or-one
+        // element (`static_row.cloned()`): an accessor, not a stream copy.
+        let option_row_chain = chain_root_ident(&node.receiver)
+            .is_some_and(|r| self.fns.option_row_idents.contains(&r))
+            && !chain_idents(&node.receiver)
+                .iter()
+                .any(|c| matches!(c.as_str(), "iter" | "into_iter" | "values" | "rows"));
+        // (b) `.iter().copied()` over the cells of ONE row's column grouping
+        // (`for (table_idx, cells) in cells_by_col`) is bounded by that row's
+        // column arity, never a table scan.
+        let per_row_grouping_chain = chain_root_ident(&node.receiver)
+            .is_some_and(|r| self.fns.per_row_grouping_vars.contains(&r));
+        // (c) `.filter(..).cloned()` over a SINGLE `Partition`'s `.rows`
+        // (`partition.rows.iter().filter(..).cloned()`) is a bounded
+        // single-partition read (clustering match / row_limit). Scoped to a
+        // single-`Partition` param — a cross-partition `flat_map` stays flagged.
+        let single_partition_rows_chain = chain_is_single_partition_rows_filter(
+            &node.receiver,
+            &self.fns.single_partition_idents,
+        );
+        if (method == "cloned" || method == "copied")
+            && self.chain_is_row_data(&node.receiver)
+            && !self.fns.byte_codec_fn
+            && !borrowed_cell_chain
+            && !single_element
+            && !option_row_chain
+            && !per_row_grouping_chain
+            && !single_partition_rows_chain
+        {
             let sym = chain_idents(&node.receiver)
                 .first()
                 .cloned()
@@ -1033,7 +1841,11 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
 
         // Rule 7: clone of the closure param inside an iterator adapter over
         // row data (`rows.iter().map(|r| r.clone())`) — a per-element copy.
-        if is_element_closure_adapter(&method) && self.chain_is_row_data(&node.receiver) {
+        if is_element_closure_adapter(&method)
+            && self.chain_is_row_data(&node.receiver)
+            && !self.fns.borrowed_cell_fn
+            && !chain_has_single_element_extractor(&node.receiver)
+        {
             for arg in &node.args {
                 let syn::Expr::Closure(cl) = arg else {
                     continue;
@@ -1063,16 +1875,22 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
         // materialization that should stream. `take(1)` (single-element
         // accessor) is exempt.
         if method == "take" || method == "truncate" {
-            if let Some(cap) = node.args.first().and_then(result_cap_arg) {
-                self.push_with_symbol(
-                    line,
-                    rule::SERVER_SIDE_RESULT_CAP,
-                    format!(
-                        "`.{method}({cap})` imposes a server-side result bound not derived from \
-                         the query's LIMIT/paging (caps mask materialization that should stream)"
-                    ),
-                    &cap,
-                );
+            // A `truncate(<len>)` inside a fixed-length encoder bounds the
+            // encoded VALUE's length (e.g. Caverphone's canonical 10-char code),
+            // never a result set. `take` stays a result adapter even there.
+            let value_shape_truncate = method == "truncate" && self.fns.fixed_length_fn;
+            if !value_shape_truncate {
+                if let Some(cap) = node.args.first().and_then(result_cap_arg) {
+                    self.push_with_symbol(
+                        line,
+                        rule::SERVER_SIDE_RESULT_CAP,
+                        format!(
+                            "`.{method}({cap})` imposes a server-side result bound not derived from \
+                             the query's LIMIT/paging (caps mask materialization that should stream)"
+                        ),
+                        &cap,
+                    );
+                }
             }
         }
         if method == "clamp" || method == "min" {
@@ -1081,8 +1899,20 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
             } else {
                 node.args.first()
             };
+            // A `min` clamping a bare length (`count`, `n`, a decoded wire
+            // length) or a collection's extent (`arcs.len`) is a memory-safety
+            // guard on an untrusted/actual size — not a server-side result cap.
+            let recv_root = chain_root_ident(&node.receiver);
+            let len_or_decoded = chain_idents(&node.receiver)
+                .iter()
+                .any(|c| matches!(c.as_str(), "count" | "len" | "n"))
+                || recv_root
+                    .as_ref()
+                    .is_some_and(|r| self.fns.decoded_len_idents.contains(r))
+                || chain_idents(&node.receiver).last().map(String::as_str) == Some("len");
             let recv_is_bound = receiver_trailing_ident(&node.receiver)
-                .is_some_and(|r| is_query_bound_receiver(&r));
+                .is_some_and(|r| is_query_bound_receiver(&r))
+                && !len_or_decoded;
             if recv_is_bound {
                 if let Some(cap) = bound_arg.and_then(result_cap_arg) {
                     self.push_with_symbol(
@@ -1103,7 +1933,10 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
         if method == "extend_from_slice" {
             if let Some(arg) = node.args.first() {
                 if let Some(id) = receiver_trailing_ident(arg) {
-                    if self.is_row_data(&id) {
+                    if self.is_row_data(&id)
+                        && !self.fns.byte_codec_fn
+                        && !self.fns.borrowed_cell_fn
+                    {
                         self.push_with_symbol(
                             line,
                             rule::COPIES_ROW_DATA_ARG,
@@ -1136,7 +1969,7 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
             if is_row_data_type(&pt.ty) {
                 let mut ids = Vec::new();
                 pat_idents(&pt.pat, &mut ids);
-                self.row_typed.extend(ids);
+                self.fns.row_typed.extend(ids);
             }
         }
         syn::visit::visit_local(self, node);
@@ -1145,8 +1978,12 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
         // Rule 10: a result-count cap CONSTANT is a materialization confession
         // — the code needs a ceiling precisely because something accumulates.
-        if int_literal_value(&node.expr).is_some() && is_result_cap_name(&node.ident.to_string()) {
-            let name = node.ident.to_string();
+        let const_name = node.ident.to_string();
+        if int_literal_value(&node.expr).is_some()
+            && is_result_cap_name(&const_name)
+            && !is_input_limit_name(&const_name)
+        {
+            let name = const_name;
             self.push_with_symbol(
                 node.ident.span().start().line,
                 rule::SERVER_SIDE_RESULT_CAP,
@@ -1279,11 +2116,24 @@ const MEMORY_SHAPE_EXEMPT: &[&str] = &[
     "CACHE",
     // *_LEN bounds the length of one value (bytes/chars), not a result count
     "LEN",
+    // *_KEY_LIST bounds the number of keys in ONE input argument — the jsonb D14
+    // `max_key_list_length` cap on a `?|`/`?&` key list. That bounds INPUT, not a
+    // result set, so it is a shape bound like LEN, never a result cap.
+    "KEY_LIST",
 ];
 
 fn is_memory_shape_name(name: &str) -> bool {
     let up = name.to_ascii_uppercase();
     MEMORY_SHAPE_EXEMPT.iter().any(|e| up.contains(e))
+}
+
+/// True if a const NAME denotes an INPUT/request limit rather than a
+/// result-count cap: `*_KEY_LIST` (jsonb D14 `max_key_list_length`, the keys in
+/// ONE `?|`/`?&` argument). An input limit bounds what the client may send, so
+/// no query RESULT is capped by it.
+fn is_input_limit_name(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    up.contains("KEY_LIST")
 }
 
 /// True if a const NAME denotes a server-side RESULT-COUNT cap: cap-ish
@@ -1492,8 +2342,35 @@ pub fn audit_source(path: &str, src: &str, allow: &Allowlist) -> Vec<Finding> {
         .collect()
 }
 
+/// Path-component tokens that mark a source file as test/tooling code the audit
+/// must not scan.
+///
+/// The audit already strips `#[cfg(test)]` items and `#[test]` fns *inside* a
+/// file, but a whole *file* of test/tooling code — `*_tests.rs`,
+/// `test_support.rs`, the feature-gated compaction `validator/` — carries no
+/// `#[cfg(test)]` attribute of its own, so its fixture copies would otherwise be
+/// reported as production materialization. Matching is by whole `_`-delimited
+/// token, so `latest.rs`/`contest.rs` are untouched.
+const TEST_TOOLING_TOKENS: &[&str] = &[
+    "test",
+    "tests",
+    "support",
+    "fixture",
+    "fixtures",
+    "validator",
+    "stub",
+    "mock",
+];
+
+/// True if a path component names test/tooling code (see `TEST_TOOLING_TOKENS`).
+fn is_test_tooling_component(component: &str) -> bool {
+    let stem = component.trim_end_matches(".rs").to_ascii_lowercase();
+    stem.split(['_', '-', '.'])
+        .any(|tok| TEST_TOOLING_TOKENS.contains(&tok))
+}
+
 /// True if a path should be scanned: a `.rs` file under a `src/` dir, not in
-/// `tests/` or `benches/`.
+/// `tests/`/`benches/`, and not itself test/tooling code.
 fn is_scannable(path: &Path) -> bool {
     if path.extension().and_then(|e| e.to_str()) != Some("rs") {
         return false;
@@ -1504,7 +2381,8 @@ fn is_scannable(path: &Path) -> bool {
         .collect();
     let in_src = comps.iter().any(|c| c == "src");
     let in_excluded = comps.iter().any(|c| c == "tests" || c == "benches");
-    in_src && !in_excluded
+    let test_tooling = comps.iter().any(|c| is_test_tooling_component(c));
+    in_src && !in_excluded && !test_tooling
 }
 
 /// Audit every scannable file under `roots`. IO happens here; detection is
@@ -2246,6 +3124,130 @@ mod tests {
         );
     }
 
+    // -- Rule refinement: proven-bounded copy shapes (Option / per-row / single
+    //    partition). Each exemption ships with a NEGATIVE test so it cannot
+    //    silently grow into a blanket pass.
+    #[test]
+    fn rule_cloned_stream_elements_exempts_option_cloned_one_element() {
+        // `.cloned()` on an `Option<&Row>` param extracts ONE element (the
+        // zero-or-one static row), not every element of a stream.
+        let src = r#"
+            fn new(static_row: Option<&Row>, token: i64) {
+                let static_wire = static_row.cloned().map(RowWire::from);
+                let _ = (static_wire, token);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::CLONED_STREAM_ELEMENTS),
+            "Option<&Row> .cloned() extracts one element, must not fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_cloned_stream_elements_fires_on_option_of_collection_cloned() {
+        // The Option exemption is scoped to a SINGLE element: an
+        // `Option<&Vec<Row>>` cloned copies the whole collection, so it fires.
+        let src = r#"
+            fn a(rows: Option<&Vec<Row>>) {
+                let v = rows.cloned();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            f.iter().any(|x| x.rule == rule::CLONED_STREAM_ELEMENTS),
+            "cloning an Option of a collection materializes it and must fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_cloned_stream_elements_exempts_per_row_grouped_cells() {
+        // `.iter().copied()` over the `cells` of ONE row's column grouping
+        // (`for (table_idx, cells) in cells_by_col`) is bounded by that row's
+        // column arity, never a table scan.
+        let src = r#"
+            fn partition_to_rows(row: Row) {
+                let mut cells_by_col: BTreeMap<usize, Vec<&CellValue>> = BTreeMap::new();
+                for (col_index, cell) in &row.cells {
+                    cells_by_col.entry(*col_index).or_default().push(cell);
+                }
+                for (table_idx, cells) in cells_by_col {
+                    let newest = cells.iter().copied().max_by_key(|c| c.timestamp).unwrap();
+                    let _ = (table_idx, newest);
+                }
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::CLONED_STREAM_ELEMENTS),
+            "a per-row grouped column's cells are arity-bounded, must not fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_cloned_stream_elements_fires_on_unbounded_cells_copied() {
+        // The per-row exemption keys on the `cells_by_col` grouping loop var. A
+        // `cells` collection NOT drawn from one still fires — `.iter().copied()`
+        // over a stream of cells materializes every element.
+        let src = r#"
+            fn a(cells: Vec<CellValue>) {
+                let v = cells.iter().copied();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            f.iter().any(|x| x.rule == rule::CLONED_STREAM_ELEMENTS),
+            "copied() over an ungrouped cells collection must fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_cloned_stream_elements_exempts_single_partition_filter_cloned() {
+        // `.filter(..).cloned()` over a SINGLE `Partition`'s `.rows` is bounded
+        // by that partition's clustering match / row_limit.
+        let src = r#"
+            fn partition_with_matching_clustering(partition: &Partition, clustering: &[u8]) -> Vec<Row> {
+                partition
+                    .rows
+                    .iter()
+                    .filter(|row| row.clustering == clustering)
+                    .cloned()
+                    .collect()
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::CLONED_STREAM_ELEMENTS),
+            "a bounded single-partition filtered clone must not fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_cloned_stream_elements_fires_on_cross_partition_rows_cloned() {
+        // The single-partition exemption requires the `.filter` bound AND a
+        // single-`Partition` receiver. An unfiltered copy of one partition's rows
+        // and a cross-partition `flat_map` both stay flagged.
+        let src = r#"
+            fn unfiltered(partition: &Partition) {
+                let all = partition.rows.iter().cloned();
+                let _ = all;
+            }
+            fn cross_partition(partitions: Vec<Partition>) {
+                let all = partitions.iter().flat_map(|p| p.rows.iter()).cloned();
+                let _ = all;
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CLONED_STREAM_ELEMENTS)
+            .count();
+        assert_eq!(
+            count, 2,
+            "unfiltered single-partition and cross-partition clones must fire: {f:?}"
+        );
+    }
+
     // -- Rule 7: clone-in-scan-closure (`.map(|r| r.clone())`) --------------
     #[test]
     fn rule_clone_in_scan_closure_fires_on_map_clone_over_row_data() {
@@ -2489,6 +3491,63 @@ mod tests {
         assert!(
             !f.iter().any(|x| x.rule == rule::COPY_DERIVE_LARGE_TYPE),
             "small Copy types and non-Copy big types must not fire: {f:?}"
+        );
+    }
+    // -- Rule refinement: fixed-arity / algorithm-length bounds --------------
+    //
+    // A truncate inside a fixed-length encoder bounds the encoded VALUE's
+    // length, not a result count; a loop bounded by a fixed-size structure's
+    // arity (a 16-byte TimeUUID, a [u8; 4] const table) is a decode bound.
+    #[test]
+    fn rule_result_cap_exempts_algorithm_length_truncate() {
+        let src = r#"
+            impl PhoneticEncoder for CaverphoneEncoder {
+                fn encode(&self, input: &str) -> String {
+                    let mut word = input.to_string();
+                    while word.len() < 10 {
+                        word.push('1');
+                    }
+                    word.truncate(10);
+                    word.to_uppercase()
+                }
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP),
+            "a phonetic encoder's fixed code length is a value shape, not a cap: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_result_cap_still_fires_on_truncate_outside_encoders() {
+        // The refinement is scoped to fixed-length fns: a plain fn truncating a
+        // result vector is still a server-side cap.
+        let src = r#"
+            fn limit_results(mut rows: Vec<R>) -> Vec<R> {
+                rows.truncate(10);
+                rows
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            f.iter().any(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP),
+            "truncate outside an encoder must still fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_result_cap_exempts_input_key_list_const() {
+        // `DEFAULT_MAX_KEY_LIST` bounds the keys in ONE ?|/?& INPUT argument
+        // (jsonb D14), not a result set.
+        let src = r#"
+            const DEFAULT_MAX_KEY_LIST: u64 = 1000;
+            const CEILING_KEY_LIST: u64 = 1_000_000;
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP),
+            "an input key-list length is a shape bound, not a result cap: {f:?}"
         );
     }
 }
