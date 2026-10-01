@@ -2782,12 +2782,67 @@ impl ModeController {
                     tracing::error!(
                         peers = peers.len(),
                         deadline_secs = formation_deadline_secs,
-                        "raft leader election timed out — reverting to Pair mode \
-                         (this is a fail-loud signal: cluster formation did not complete)"
+                        "raft leader election timed out — cluster formation did not complete"
                     );
-                    // Revert to Pair mode — formation failed. The Raft instance
-                    // is stored but non-functional (no leader).
-                    mode_swap.store(Arc::new(DeploymentMode::Pair));
+                    // NO automatic downgrade to Pair.
+                    //
+                    // This used to store `DeploymentMode::Pair` directly, via the
+                    // raw `mode_swap` handle -- bypassing `try_transition_mode`
+                    // and with it the state machine, which forbids
+                    // `Cluster -> Pair` (see `DeploymentMode::can_transition_to`
+                    // and the note on `next_mode`). The bypass shipped because
+                    // the guard in `tests.rs` looked for the literal
+                    // `mode.store(` while this line says `mode_swap.store(`: the
+                    // rule was correct, consulted, and evaded by an alias.
+                    //
+                    // Moving a node out of a Raft cluster is a change of the
+                    // system's guarantees: a pair replicates point-to-point and
+                    // accepts writes a quorum would have refused, while the rest
+                    // of the cluster keeps committing through Raft. So it is an
+                    // operator action, exactly like promoting a secondary to
+                    // primary -- not something a timeout decides.
+                    //
+                    // Degrading keeps those guarantees intact, so it is still
+                    // automatic: the node stops serving as a healthy cluster
+                    // member until it has a quorum, which is the failure this
+                    // timeout actually represents.
+                    //
+                    // The durable marker decides which way down. A node that has
+                    // EVER been a committed cluster member must never become a
+                    // pair again -- that is the rule `DeploymentMode` already
+                    // documents, and the marker is how it survives the fact that
+                    // mode itself lives only in memory. node2 (2026-10-01) proved
+                    // the gap: it started `degraded-cluster` from the marker,
+                    // timed out, and this line demoted it to `Pair` anyway.
+                    //
+                    // So: a former member degrades and needs an operator to go
+                    // further. A node that never was a member is still forming
+                    // for the first time with too few peers (its seeds are
+                    // unreachable, say), and there it is legitimate to fall back
+                    // to Pair -- no multi-node cluster ever existed, which is the
+                    // same reason `Forming -> Pair` is legal in the state
+                    // machine. `Forming -> DegradedPair` is the shape for that
+                    // case: it keeps the peer context for recovery, exactly as
+                    // `Pair -> DegradedPair` does, and leaves no way to reach
+                    // `Pair` for a node that was ever a member.
+                    let raft_dir = configured_raft_dir(&config_for_promotion);
+                    let was_member = raft_dir
+                        .as_deref()
+                        .map(DeploymentMode::was_cluster_member)
+                        .unwrap_or(false);
+                    let fallback = if was_member {
+                        DeploymentMode::DegradedCluster
+                    } else {
+                        DeploymentMode::DegradedPair
+                    };
+                    super::try_transition_mode_swap(&mode_swap, fallback);
+                    tracing::warn!(
+                        was_cluster_member = was_member,
+                        target = %fallback,
+                        "cluster formation timed out. A node that has ever been a \
+                         cluster member never becomes a pair again; a downgrade is \
+                         an operator action (see ferrosa-ctl), not a timeout."
+                    );
                     // Restore DDL path from Blocked to Direct (single-node fallback).
                     // Without this, DDL stays blocked indefinitely after failed formation.
                     ddl_path.store(Arc::new(DdlPath::Direct {

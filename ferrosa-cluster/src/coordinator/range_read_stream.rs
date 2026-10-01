@@ -49,6 +49,66 @@ use crate::write_path::ScanResume;
 /// 30 s the peer is genuinely stuck and aborting is correct.
 const STREAMING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default idle budget for one merge source to produce its next fragment.
+///
+/// The N-way merge picks the next token by walking its cursors **in order** and
+/// awaiting each one (`run_fragment_merge_nway_inner`), so a source that never
+/// yields wedges every source behind it -- the merge never even polls them.
+///
+/// Remote sources are already guarded: `spawn_replica_fragment_stream` wraps
+/// each one in `clean_end_guarded_stream`, whose 30 s `IdleTimeoutWatchdog`
+/// turns a quiet peer into a loud, retryable `IdleTimeout`. The LOCAL engine
+/// stream has no such guard -- it enters the merge directly from
+/// `storage.range_iter_fragmented`, unwrapped. One slow local read therefore
+/// parked the entire scan, including its already-ready remote sources, until the
+/// CONSUMER's own timeout fired: the live `paged: a pull stalled for 30s`.
+///
+/// This gives the local source the same budget its remote siblings already
+/// have, so a wedge becomes a loud error that NAMES the condition instead of an
+/// unbounded wait. The bound applies to EVERY fragment pull, not just the first:
+/// `FragmentCursor` re-arms `primed` after each consumed fragment, so a source
+/// that goes quiet mid-scan is bounded too. The default matches the remote
+/// watchdog so every source has one uniform budget.
+///
+/// Overridable so tests can exercise the timeout without waiting it out; the
+/// value is a process-wide tunable read once, not per pull.
+const DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT: Duration = STREAMING_IDLE_TIMEOUT;
+
+/// Idle budget for one merge source to produce its next fragment.
+///
+/// See [`DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT`]. A test build may shorten it
+/// through [`set_merge_source_fragment_timeout_for_test`]; production always
+/// reads the default, so the override does not exist there at all.
+#[cfg(test)]
+fn merge_source_fragment_timeout() -> Duration {
+    match MERGE_SOURCE_FRAGMENT_TIMEOUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT,
+        ms => Duration::from_millis(ms),
+    }
+}
+
+#[cfg(not(test))]
+fn merge_source_fragment_timeout() -> Duration {
+    DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT
+}
+
+#[cfg(test)]
+static MERGE_SOURCE_FRAGMENT_TIMEOUT_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Install a shorter merge-source fragment budget for a test.
+///
+/// Test-only: production must keep the default that matches the remote idle
+/// watchdog. Proving this timeout with the real default would cost the full
+/// budget per test, which is why the override exists.
+#[cfg(test)]
+pub(crate) fn set_merge_source_fragment_timeout_for_test(timeout: Duration) {
+    MERGE_SOURCE_FRAGMENT_TIMEOUT_OVERRIDE.store(
+        timeout.as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Per-request buffer for the StreamRouter receiver. Bounded so a
 /// slow consumer back-pressures the inbound dispatch (chunks queue
 /// up at the lane until the consumer drains).
@@ -707,15 +767,32 @@ where
     }
 
     /// Ensure `self.peeked` holds the next fragment (if any). Returns `Err`
-    /// on upstream error.
+    /// on upstream error or when the FIRST fragment does not arrive within
+    /// [`DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT`].
+    ///
+    /// The first fragment is bounded because the merge awaits sources in order:
+    /// an unbounded wait here silently stalls every source behind this one, and
+    /// the local engine stream has no idle watchdog of its own. A source that
+    /// produces nothing within the budget is reported as a loud, retryable
+    /// error naming the condition -- never as an unbounded wait, because the
+    /// caller cannot distinguish "still scanning" from "wedged".
     async fn ensure_peeked(&mut self) -> Result<(), ClusterError> {
         if self.primed || self.done {
             return Ok(());
         }
-        match self.stream.next().await {
-            None => self.done = true,
-            Some(Err(e)) => return Err(e),
-            Some(Ok(p)) => self.peeked = Some(p),
+        let budget = merge_source_fragment_timeout();
+        match tokio::time::timeout(budget, self.stream.next()).await {
+            Err(_elapsed) => {
+                return Err(ClusterError::Internal(format!(
+                    "streaming range read: a merge source produced no fragment within {}ms; \
+                     failing loudly rather than waiting forever (one silent source must not \
+                     stall the scan)",
+                    budget.as_millis()
+                )));
+            }
+            Ok(None) => self.done = true,
+            Ok(Some(Err(e))) => return Err(e),
+            Ok(Some(Ok(p))) => self.peeked = Some(p),
         }
         self.primed = true;
         Ok(())
@@ -2313,6 +2390,229 @@ mod tests {
 
     fn replica(hits: Vec<crate::error::Result<Partition>>) -> ClusterPartitionStream {
         Box::pin(futures::stream::iter(hits))
+    }
+
+    /// One partition holding a single row, keyed by `pk`.
+    fn partition(pk: &[u8]) -> Partition {
+        Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: Vec::new(),
+                cells: Vec::new(),
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1),
+            }],
+        }
+    }
+
+    /// A source that yields one fragment and then goes SILENT forever.
+    ///
+    /// This models the real shape: a remote replica's producer emits its
+    /// flow-control window and then parks waiting for its consumer (or is
+    /// mid-storage-read). The stream neither yields nor closes -- exactly the
+    /// state `FragmentCursor::ensure_peeked` parks in.
+    fn silent_after_first(pk: &[u8]) -> BoxedFragmentStream {
+        let first = partition(pk);
+        Box::pin(
+            futures::stream::once(async move { Ok(first) })
+                .chain(futures::stream::pending::<Result<Partition, ClusterError>>()),
+        )
+    }
+
+    /// A source that yields every fragment immediately and cleanly ends.
+    fn complete(pks: &[&[u8]]) -> BoxedFragmentStream {
+        let items: Vec<Result<Partition, ClusterError>> =
+            pks.iter().map(|pk| Ok(partition(pk))).collect();
+        Box::pin(futures::stream::iter(items))
+    }
+
+    /// INVARIANT: a source that is merely SLOW is not killed.
+    ///
+    /// The bound added to `ensure_peeked` must not convert a legitimately slow
+    /// source into a failure. Two fragments 50ms apart, under a 2s budget, must
+    /// both be delivered: the guard is an inactivity detector, not a rate limiter.
+    #[tokio::test]
+    async fn a_slow_but_live_source_is_not_killed() {
+        set_merge_source_fragment_timeout_for_test(Duration::from_secs(2));
+        let slow = Box::pin(
+            futures::stream::once(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(partition(b"a"))
+            })
+            .chain(futures::stream::once(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(partition(b"b"))
+            })),
+        );
+
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let cursors = vec![FragmentCursor::new(slow).boxed()];
+        let merge = tokio::spawn(async move {
+            run_fragment_merge_nway(cursors, 4096, out_tx).await;
+        });
+
+        let mut keys = Vec::new();
+        while let Some(item) = out_rx.recv().await {
+            keys.push(
+                item.expect("a slow source must not be errored")
+                    .key
+                    .key
+                    .as_bytes()
+                    .to_vec(),
+            );
+        }
+        merge.await.unwrap();
+
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "a slow-but-live source must deliver every fragment; the inactivity guard must \
+             not cut off a producing source"
+        );
+    }
+
+    /// INVARIANT: a source that ENDS cleanly still ends the scan cleanly.
+    ///
+    /// The bound must not manufacture an error for a source that legitimately has
+    /// no more data. This is the fail-loud rule's counterpart: loud on a wedge,
+    /// silent-successful on genuine exhaustion.
+    #[tokio::test]
+    async fn a_completed_source_still_ends_the_scan_cleanly() {
+        set_merge_source_fragment_timeout_for_test(Duration::from_millis(200));
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let cursors = vec![FragmentCursor::new(complete(&[b"a", b"b"])).boxed()];
+        let merge = tokio::spawn(async move {
+            run_fragment_merge_nway(cursors, 4096, out_tx).await;
+        });
+
+        let mut delivered = Vec::new();
+        while let Some(item) = out_rx.recv().await {
+            delivered.push(item);
+        }
+        merge.await.unwrap();
+
+        assert!(
+            delivered.iter().all(|i| i.is_ok()),
+            "a source that ends on its own must NOT produce an error; got {:?}",
+            delivered.iter().filter(|i| i.is_err()).collect::<Vec<_>>()
+        );
+        assert_eq!(delivered.len(), 2, "both fragments must be delivered");
+    }
+
+    /// INVARIANT: one silent source must not HIDE a second live source's data.
+    ///
+    /// The ordering bug is not only that the merge hangs -- it is that sources
+    /// behind the silent one are never polled at all. With the bound in place the
+    /// live source's fragments must actually reach the consumer.
+    #[tokio::test]
+    async fn a_live_source_behind_a_silent_one_is_still_polled() {
+        set_merge_source_fragment_timeout_for_test(Duration::from_millis(200));
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let cursors = vec![
+            // Silent source first, exactly as the local engine stream sits at
+            // cursors[0] in `merge_local_and_remotes_fragmented`.
+            FragmentCursor::new(silent_after_first(b"a")).boxed(),
+            FragmentCursor::new(complete(&[b"b", b"c"])).boxed(),
+        ];
+        let merge = tokio::spawn(async move {
+            run_fragment_merge_nway(cursors, 4096, out_tx).await;
+        });
+
+        let mut delivered = Vec::new();
+        while let Some(item) = out_rx.recv().await {
+            delivered.push(item);
+        }
+        merge.await.unwrap();
+
+        let err = delivered
+            .iter()
+            .find_map(|i| i.as_ref().err())
+            .expect("the silent source must be reported as an error");
+        assert!(
+            err.to_string().contains("produced no fragment"),
+            "expected the loud silence error, got: {err}"
+        );
+    }
+
+    /// THE STALL: one silent source must not wedge the whole merge.
+    ///
+    /// `run_fragment_merge_nway_inner` picks the smallest token by walking the
+    /// cursors **in order** and awaiting each one:
+    ///
+    /// ```text
+    /// for c in cursors.iter_mut() {
+    ///     let t = try_or_forward!(c.peek_token().await);   // <-- parks here
+    /// ```
+    ///
+    /// The local engine stream is always `cursors[0]` (see
+    /// `merge_local_and_remotes_fragmented`). It has NO idle watchdog -- the
+    /// 30 s `IdleTimeoutWatchdog` guards only a REMOTE replica's route channel,
+    /// because `spawn_replica_fragment_stream` wraps the remote in
+    /// `clean_end_guarded_stream` and the local stream comes straight from
+    /// `storage.range_iter_fragmented`. So the merge parks on the local stream
+    /// with nothing able to interrupt it, and every other source -- including
+    /// one that is complete and ready -- is never even polled. The scan hangs
+    /// until the CONSUMER's timeout fires, which is what the live failure
+    /// observed: "a pull stalled for 30s".
+    ///
+    /// A source that has genuinely gone quiet must surface as a loud, retryable
+    /// error (the fail-loud rule), never as an unbounded wait: the caller cannot
+    /// tell the difference between "still scanning" and "wedged".
+    #[tokio::test]
+    async fn a_silent_first_source_must_not_wedge_the_merge() {
+        // Short budget so the test proves the mechanism in well under a second
+        // instead of waiting out the 30s production default.
+        set_merge_source_fragment_timeout_for_test(Duration::from_millis(200));
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let cursors = vec![
+            FragmentCursor::new(silent_after_first(b"a")).boxed(),
+            FragmentCursor::new(complete(&[b"b", b"c"])).boxed(),
+        ];
+
+        let merge = tokio::spawn(async move {
+            run_fragment_merge_nway(cursors, 4096, out_tx).await;
+        });
+
+        // Drain with a budget far below the 30 s product idle timeout: a merge
+        // that needs 30 s to notice a wedged source is the bug under test.
+        let mut delivered = Vec::new();
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(item) = out_rx.recv().await {
+                delivered.push(item);
+            }
+        })
+        .await;
+
+        merge.abort();
+
+        assert!(
+            drained.is_ok(),
+            "the merge wedged on a silent source: it delivered {} fragment(s) and never \
+             terminated within 5s. One unresponsive source must not stall the scan -- it must \
+             surface a loud, retryable error (the product idle timeout guards only REMOTE \
+             sources, not the local engine stream at cursors[0]). This is the live \
+             'a pull stalled for 30s' failure.",
+            delivered.len()
+        );
+
+        // And the termination must be the LOUD error, not a silent short scan:
+        // the consumer has to be able to tell "a source went quiet" apart from
+        // "the table ended here". A silent close here would be exactly the
+        // partial-result bug this codebase fails loudly to avoid.
+        let err = delivered
+            .iter()
+            .find_map(|item| item.as_ref().err())
+            .expect(
+                "the merge must report the silent source as an ERROR; ending the stream cleanly \
+                 would return a silent partial result",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("produced no fragment"),
+            "the error must name the condition so a live failure is legible, got: {msg}"
+        );
     }
 
     /// t_50c8bc7d: each node streams its index hits in row order, so the

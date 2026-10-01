@@ -43,6 +43,45 @@ impl ModeController {
         peer_addr: SocketAddr,
         need_reverse: bool,
     ) {
+        self.transition_to_pair_inner(peer_host_id, peer_addr, need_reverse, false)
+    }
+
+    /// [`Self::transition_to_pair`], but an OPERATOR has waived the
+    /// state-machine check that forbids `Cluster -> Pair`.
+    ///
+    /// Waiving that one check is the smallest possible override, which is the
+    /// point. Entering pair mode is refused for a cluster member because the
+    /// shapes commit differently, so the refusal has to be lifted for an
+    /// operator to be able to downgrade at all. Everything else stays
+    /// unconditional, because the machinery is what makes pair mode correct
+    /// once you are in it:
+    ///
+    /// - the T-300 jsonb check still runs (no departure from standalone with
+    ///   jsonb columns present);
+    /// - a peer_manager is still required, because installing a pair write path
+    ///   with no peer to replicate to would accept writes nothing could mirror;
+    /// - the real pair coordinator/handlers/write path are still installed --
+    ///   this does NOT simply declare `Pair` and leave a cluster write path in
+    ///   place, which is the split brain T8b exists to prevent.
+    ///
+    /// The mode is then set by `force_mode_override`, which is deliberately
+    /// unguarded and logs at WARN with both modes, so an override can never be
+    /// mistaken for a normal transition when reading logs afterwards.
+    pub(super) fn transition_to_pair_operator_override(
+        &self,
+        peer_host_id: Uuid,
+        peer_addr: SocketAddr,
+    ) {
+        self.transition_to_pair_inner(peer_host_id, peer_addr, true, true)
+    }
+
+    fn transition_to_pair_inner(
+        &self,
+        peer_host_id: Uuid,
+        peer_addr: SocketAddr,
+        need_reverse: bool,
+        operator_override: bool,
+    ) {
         // Refuse before touching anything, not after.
         //
         // This function installs `WritePath::pair(...)` -- which accepts writes
@@ -62,7 +101,7 @@ impl ModeController {
             return;
         }
         let current = **self.mode.load();
-        if !current.can_transition_to(DeploymentMode::Pair) {
+        if !operator_override && !current.can_transition_to(DeploymentMode::Pair) {
             tracing::error!(
                 %current,
                 "refused illegal transition to pair; write path left untouched"
@@ -163,13 +202,18 @@ impl ModeController {
             peer_addr,
         });
 
-        self.try_transition_mode(DeploymentMode::Pair);
+        if operator_override {
+            self.force_mode_override(DeploymentMode::Pair, "operator downgrade: cluster -> pair");
+        } else {
+            self.try_transition_mode(DeploymentMode::Pair);
+        }
         tracing::info!(
             %role,
             peer = %peer_host_id,
             promoted = was_promoted,
             promote_epoch = local_epoch,
-            "mode transition: standalone → pair"
+            operator_override,
+            "mode transition: -> pair"
         );
 
         // When triggered by an inbound peer connection, our peer_manager doesn't

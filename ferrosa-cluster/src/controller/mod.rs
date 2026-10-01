@@ -1031,26 +1031,47 @@ impl ModeController {
     }
 
     pub(super) fn try_transition_mode(&self, target: DeploymentMode) -> bool {
-        let current = **self.mode.load();
-        if current == target {
-            return true;
-        }
-        if !current.can_transition_to(target) {
-            tracing::error!(
-                %current,
-                %target,
-                "refused illegal mode transition; staying in the current mode"
-            );
-            return false;
-        }
         // T-300 backstop: leaving standalone with jsonb present is refused.
+        // Kept here rather than in the free function below because it needs
+        // `self` (the schema), while the state-machine check below does not.
         if !self.leaving_standalone_permitted(target) {
             return false;
         }
-        self.mode.store(Arc::new(target));
-        tracing::info!(%current, %target, "mode transition");
-        true
+        try_transition_mode_swap(&self.mode, target)
     }
+}
+
+/// Move `mode` to `target`, refusing any transition the state machine forbids.
+///
+/// A free function rather than a method so it can be called from code that
+/// cannot name `&self` — notably inside the `async move` task spawned by
+/// `transition_to_cluster`, which owns its captures and holds no borrow of the
+/// controller. Taking the `ArcSwap` handle directly is deliberate: a caller
+/// that has only the handle must still be forced through the guard, which is
+/// the entire point. Every automatic mode change reaches the store through
+/// here, so no second code path can set the mode unchecked.
+///
+/// Returns whether the move happened. A refusal is logged at ERROR and leaves
+/// the mode untouched.
+pub(super) fn try_transition_mode_swap(
+    mode: &ArcSwap<DeploymentMode>,
+    target: DeploymentMode,
+) -> bool {
+    let current = **mode.load();
+    if current == target {
+        return true;
+    }
+    if !current.can_transition_to(target) {
+        tracing::error!(
+            %current,
+            %target,
+            "refused illegal mode transition; staying in the current mode"
+        );
+        return false;
+    }
+    mode.store(Arc::new(target));
+    tracing::info!(%current, %target, "mode transition");
+    true
 }
 
 #[cfg(test)]

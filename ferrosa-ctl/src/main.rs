@@ -580,6 +580,17 @@ enum ClusterAction {
         host_id: String,
     },
 
+    /// Take this node OUT of a Raft cluster and back into pair mode.
+    ///
+    /// The deliberate operator action the node's warning log refers to. The
+    /// automatic lifecycle never does this: a multi-node Raft cluster does not
+    /// revert to a pair on its own, because a pair replicates point-to-point
+    /// and accepts writes a quorum would have refused while the rest of the
+    /// cluster keeps committing through Raft. The node must have a connected
+    /// peer to replicate to. After it succeeds, that node no longer commits
+    /// through Raft; rejoin the cluster to restore quorum semantics.
+    DowngradeToPair,
+
     /// W8.5 — Demote a voter to a learner (ADR-014).
     ///
     /// If the target is the current Raft leader, leadership is
@@ -740,6 +751,9 @@ async fn main() {
             ClusterAction::DemoteToLearner { host_id } => {
                 commands::cluster_demote_to_learner(&web_host, web_port, &host_id).await
             }
+            ClusterAction::DowngradeToPair => {
+                commands::cluster_downgrade_to_pair(&web_host, web_port).await
+            }
         },
         Commands::Restore {
             snapshot_name,
@@ -845,10 +859,27 @@ mod tests {
 
     use super::*;
 
-    /// Verify that the CLI definition itself is internally consistent.
+    /// Verify the CLI definition itself is internally consistent.
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `cluster downgrade-to-pair` must be reachable from the CLI.
+    ///
+    /// The node's formation-timeout log tells operators to use this action, so a
+    /// rename or a misplaced variant would make that message point at a command
+    /// that does not exist. It takes no arguments: the node picks the peer it is
+    /// connected to, and refuses if there is none.
+    #[test]
+    fn parse_cluster_downgrade_to_pair() {
+        let cli = Cli::try_parse_from(["ferrosa-ctl", "cluster", "downgrade-to-pair"]).unwrap();
+        match cli.command {
+            Commands::Cluster {
+                action: ClusterAction::DowngradeToPair,
+            } => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     /// Verify default host value is parsed correctly.
