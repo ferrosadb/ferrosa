@@ -482,6 +482,14 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
   quarantines them under a safety rail.
+- **Range reads fail loud on an unreadable SSTable** (`store.rs`,
+  `with_retried_scan`, FMEA ST-41) — `read_range*`, `read_token_range[_bounded]`,
+  `walk_token_range[_for_digest]`, the time-series cursor and the full-text
+  sidecar-less scan never return a partial `Ok` when an SSTable in their view
+  cannot be opened or read (e.g. an evicted file whose S3 rehydrate failed).
+  They retry against a fresh view (compaction retired the input), then
+  quarantine the SSTable and return a typed `Error::CorruptSstable`. Quarantined
+  SSTables are not skipped by range reads: their rows are still missing.
 - **Startup SSTable health** (`sstable_health.rs`) — decides whether a
   generation on disk can serve reads before it is loaded. A critical component
   (`Data.db`, `Partitions.db`) that is **missing**, **zero-byte**, or

@@ -28470,15 +28470,25 @@ mod tests {
     ) -> (StorageEngine, std::path::PathBuf, String, Vec<String>) {
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
+        engine_with_evicted_sstable_in(dir, prefix, &store).await
+    }
+
+    /// [`engine_with_evicted_sstable`] over a caller-held object store, so a
+    /// test can take the objects away after the eviction.
+    async fn engine_with_evicted_sstable_in(
+        dir: &std::path::Path,
+        prefix: &str,
+        store: &Arc<dyn object_store::ObjectStore>,
+    ) -> (StorageEngine, std::path::PathBuf, String, Vec<String>) {
         let tid = table_id();
-        let engine = evicting_s3_engine(dir, &store, prefix);
+        let engine = evicting_s3_engine(dir, store, prefix);
         // The test constructor does not install the read-through hook the
         // production constructors do. Hooks are process-global but keyed by
         // data dir, so this tempdir's hook ignores every other test's paths.
         StorageEngine::install_s3_file_read_rehydration_hook(
             dir.to_path_buf(),
             prefix.to_string(),
-            Arc::clone(&store),
+            Arc::clone(store),
         );
         engine.register_table(test_schema()).unwrap();
         let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
@@ -28529,6 +28539,81 @@ mod tests {
             !StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
             "a generation that is local again must not keep its eviction marker"
         );
+        engine.shutdown().unwrap();
+    }
+
+    /// Remove every object from `store`: the evicted SSTable's S3 copy is gone
+    /// (object missing, bucket emptied), so a rehydrate cannot succeed.
+    async fn delete_all_objects(store: &Arc<dyn object_store::ObjectStore>) {
+        use futures::StreamExt;
+        let mut locations = Vec::new();
+        let mut listing = store.list(None);
+        while let Some(object) = listing.next().await {
+            locations.push(object.expect("listing the in-memory store").location);
+        }
+        drop(listing);
+        assert!(!locations.is_empty(), "the sync uploaded objects to remove");
+        for location in locations {
+            store
+                .delete(&location)
+                .await
+                .expect("deleting an in-memory object");
+        }
+    }
+
+    /// t_73659682: a range read over a table whose evicted SSTable cannot be
+    /// rehydrated must FAIL, not return the rows of the healthy sources as if
+    /// it were the whole table. Every range entry point is covered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_reads_fail_loud_when_an_evicted_sstable_cannot_be_rehydrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let (engine, _table_dir, gen, _keys) =
+            engine_with_evicted_sstable_in(dir.path(), "test-evicted-gone", &store).await;
+        let tid = table_id();
+        // A live memtable row, so a partial result would be non-empty and
+        // look like a complete answer.
+        engine
+            .write(&tid, &make_key("live"), make_row(b"v", 2000), 2000)
+            .unwrap();
+        delete_all_objects(&store).await;
+
+        let err = engine
+            .read_range(&tid, None, None, 100)
+            .expect_err("read_range must not return only the memtable row");
+        assert!(
+            err.corrupt_sstable_range().is_some() && err.to_string().contains(&gen),
+            "typed CorruptSstable naming gen {gen}, got: {err}"
+        );
+        engine
+            .read_token_range(&tid, i64::MIN, i64::MAX, 100)
+            .expect_err("read_token_range must fail loud");
+        engine
+            .read_token_range_bounded(&tid, i64::MIN, i64::MAX, 100, usize::MAX)
+            .expect_err("read_token_range_bounded must fail loud");
+        engine
+            .walk_token_range(&tid, i64::MIN, i64::MAX, |_| Ok(()))
+            .expect_err("walk_token_range must fail loud");
+        engine
+            .walk_token_range_for_digest(&tid, i64::MIN, i64::MAX, |_, _, _, _| Ok(()))
+            .expect_err("walk_token_range_for_digest must fail loud");
+        engine.shutdown().unwrap();
+    }
+
+    /// Counterpart: with the S3 objects present the same range read rehydrates
+    /// the evicted SSTable and returns every row, so the fail-loud path above
+    /// is not simply a range read that always errors on eviction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_reads_rehydrate_an_evicted_sstable_when_its_objects_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _table_dir, _gen, keys) =
+            engine_with_evicted_sstable(dir.path(), "test-evicted-range-ok").await;
+        let tid = table_id();
+        let rows = engine
+            .read_range(&tid, None, None, 100)
+            .expect("range read over an evicted SSTable rehydrates it");
+        assert_eq!(rows.len(), keys.len());
         engine.shutdown().unwrap();
     }
 

@@ -985,6 +985,10 @@ struct MergeReader<F: FlushTarget> {
     /// `Some` for an ephemeral spill run — the temp dir to remove on drop.
     /// `None` for a pooled reader (the pool owns its lifecycle).
     cleanup_dir: Option<std::path::PathBuf>,
+    /// The durable SSTable this reader serves, so a failure reading it can
+    /// name it in a typed error. `None` for an ephemeral spill run, which is
+    /// this process's own scratch file, not a table SSTable.
+    source: Option<SstableDescriptor>,
 }
 
 /// One input to a cascade level: either an unopened durable SSTable
@@ -1042,7 +1046,10 @@ where
         };
         let mut smallest_key: Option<DecoratedKey> = None;
         for iter in iters.iter_mut() {
-            if let Ok(Some(k)) = iter.peek_partition_key() {
+            // A peek error is an unreadable SSTable: propagate it. Treating it
+            // as "exhausted" would silently drop every later partition of
+            // that source from the merge.
+            if let Some(k) = iter.peek_partition_key()? {
                 if k.token.0 >= end_token {
                     continue;
                 }
@@ -1057,7 +1064,7 @@ where
 
         let mut group: Vec<Partition> = Vec::new();
         for (idx, iter) in iters.iter_mut().enumerate() {
-            if matches!(iter.peek_partition_key(), Ok(Some(k)) if k == key) {
+            if matches!(iter.peek_partition_key()?, Some(k) if k == key) {
                 if let Some(mut p) = iter.next_partition()? {
                     mappings[idx].remap_partition(&mut p);
                     group.push(p);
@@ -1072,6 +1079,33 @@ where
             m
         };
         emit(merged)?;
+    }
+    Ok(())
+}
+
+/// Park `iter` at the first partition with `token >= start_token`.
+///
+/// `seek_to_token` is an optimisation (O(log N) via the token-offset cache):
+/// if it fails the iterator is still at the start, and the linear skip below
+/// reaches the same position, so that failure is a logged fallback. A failure
+/// of the skip or the peek is an unreadable SSTable and is returned — the
+/// caller must not treat the source as exhausted.
+fn position_iter_at_token<R: ReadAt + Send + Sync + 'static>(
+    iter: &mut ferrosa_sstable::reader::PartitionIter<'_, R>,
+    start_token: i64,
+) -> Result<()> {
+    if let Err(e) = iter.seek_to_token(start_token) {
+        tracing::warn!(
+            %e,
+            start_token,
+            "seek_to_token failed; falling back to a linear skip to the first in-range partition"
+        );
+    }
+    while let Some(k) = iter.peek_partition_key()? {
+        if k.token.0 >= start_token {
+            break;
+        }
+        iter.skip_to_next_partition()?;
     }
     Ok(())
 }
@@ -2147,6 +2181,118 @@ impl<F: FlushTarget> TableStore<F> {
         unreachable!("read retry loop returns within MAX_VIEW_RETRIES")
     }
 
+    /// Run a range/scan `attempt` under the fresh-view retry policy.
+    ///
+    /// Unlike a point read, a range read has no "healthy source resolved it"
+    /// escape: a missing SSTable means missing rows, which reads as the rows
+    /// not existing. So an SSTable that cannot be opened or read
+    /// ([`Self::unreadable_sstable`], surfaced as a typed
+    /// [`ferrosa_common::Error::CorruptSstable`]) is retried against a freshly
+    /// loaded view — the transient compaction window retires the input and the
+    /// merged output serves the rows — and once the bound is exhausted the
+    /// SSTable is quarantined for anti-entropy repair and the typed error is
+    /// returned. Never a partial `Ok`.
+    ///
+    /// `attempt` must load its own view (so each retry sees a fresh one) and
+    /// must not deliver results to its caller before it can fail with this
+    /// error: every SSTable is opened before any row is produced.
+    fn with_retried_scan<R>(
+        &self,
+        op: &'static str,
+        attempt: impl FnMut() -> Result<R>,
+    ) -> Result<R> {
+        self.with_retried_scan_guarded(op, &std::cell::Cell::new(false), attempt)
+    }
+
+    /// [`Self::with_retried_scan`] for streaming walks that hand rows to a
+    /// callback. Once `delivered` is set the attempt has already produced
+    /// output, so a retry would deliver rows twice: a failure from then on is
+    /// final (quarantine and error immediately).
+    fn with_retried_scan_guarded<R>(
+        &self,
+        op: &'static str,
+        delivered: &std::cell::Cell<bool>,
+        mut attempt: impl FnMut() -> Result<R>,
+    ) -> Result<R> {
+        const MAX_VIEW_RETRIES: usize = 8;
+        let mut retries = 0;
+        loop {
+            let err = match attempt() {
+                Ok(v) => return Ok(v),
+                Err(e) => e,
+            };
+            let ferrosa_common::Error::CorruptSstable {
+                ref gen,
+                min_token,
+                max_token,
+            } = err
+            else {
+                return Err(err);
+            };
+            if retries < MAX_VIEW_RETRIES && !delivered.get() {
+                retries += 1;
+                continue;
+            }
+            self.view_retry_exhausted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let corrupt = CorruptSstableId {
+                gen: gen.clone(),
+                dir: std::path::PathBuf::new(),
+                min_token,
+                max_token,
+            };
+            self.quarantine_sstable(&corrupt);
+            tracing::error!(
+                op,
+                corrupt = %corrupt,
+                retries = MAX_VIEW_RETRIES,
+                "range read exhausted view retries with an unreadable SSTable — failing \
+                 loud rather than returning a partial result (quarantined for repair)"
+            );
+            return Err(err);
+        }
+    }
+
+    /// Failure reading a [`MergeReader`]: typed (retriable, quarantinable) when
+    /// it serves a table SSTable, the raw error for a spill run (our own
+    /// scratch file — not retriable against a fresh view).
+    fn merge_reader_failure(
+        &self,
+        op: &'static str,
+        stage: &'static str,
+        mr: &MergeReader<F>,
+        cause: ferrosa_common::Error,
+    ) -> ferrosa_common::Error {
+        match mr.source.as_ref() {
+            Some(desc) => self.unreadable_sstable(op, stage, desc, &cause),
+            None => cause,
+        }
+    }
+
+    /// Build the typed error for an SSTable that belongs to a range read's
+    /// view but could not be opened or read. Logs and meters the failure;
+    /// the caller returns the error, and [`Self::with_retried_scan`] decides
+    /// whether to retry against a fresh view or give up.
+    fn unreadable_sstable(
+        &self,
+        op: &'static str,
+        stage: &'static str,
+        desc: &SstableDescriptor,
+        cause: &ferrosa_common::Error,
+    ) -> ferrosa_common::Error {
+        tracing::warn!(
+            op,
+            stage,
+            gen = %desc.gen,
+            %cause,
+            "SSTable in the read's view could not be consulted; retrying against a fresh \
+             view, then failing the read (a range read never returns a partial result)"
+        );
+        self.sstable_read_errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ferrosa_common::Error::corrupt_sstable(desc.gen.clone(), desc.min_token, desc.max_token)
+    }
+
     /// Record `corrupt`'s generation in the quarantine set. Idempotent: a
     /// generation already present is left as-is (it is still skipped on every
     /// read until repair swaps it out of the view).
@@ -2501,6 +2647,10 @@ impl<F: FlushTarget> TableStore<F> {
     /// SSTable rows are decoded through `PartitionIter::next_clustered_row`,
     /// keeping only one row per source in memory while preserving cell-level
     /// last-write-wins across overlapping memtable/SSTable sources.
+    ///
+    /// An SSTable covering the partition that cannot be opened or read fails
+    /// the visit (typed [`ferrosa_common::Error::CorruptSstable`]); a window
+    /// recomputed from a subset of its sources would be silently wrong.
     pub fn visit_time_series_window_rows<Cb>(
         &self,
         key: &DecoratedKey,
@@ -2515,7 +2665,31 @@ impl<F: FlushTarget> TableStore<F> {
         if window_start_ts >= window_end_ts {
             return Ok(0);
         }
+        let delivered = std::cell::Cell::new(false);
+        self.with_retried_scan_guarded("visit_time_series_window_rows", &delivered, || {
+            self.visit_time_series_window_rows_once(
+                key,
+                window_start_ts,
+                window_end_ts,
+                timestamp_unit,
+                &delivered,
+                &mut cb,
+            )
+        })
+    }
 
+    fn visit_time_series_window_rows_once<Cb>(
+        &self,
+        key: &DecoratedKey,
+        window_start_ts: i64,
+        window_end_ts: i64,
+        timestamp_unit: crate::timeseries::TimeSeriesTimestampUnit,
+        delivered: &std::cell::Cell<bool>,
+        mut cb: Cb,
+    ) -> Result<usize>
+    where
+        Cb: FnMut(&Row) -> Result<()>,
+    {
         let guard = self.view.load();
         let schema = self.schema.load();
         let mut partition_delete_at = ferrosa_sstable::types::DeletionTime::LIVE;
@@ -2546,31 +2720,25 @@ impl<F: FlushTarget> TableStore<F> {
         // key. Hold the `Arc`s for the lifetime of the borrowed iterators so
         // the pool cannot evict a reader mid-scan (FMEA #5/#10).
         let token = key.token.0;
-        let mut sst_readers: Vec<Arc<SSTableReader<F::Reader>>> = Vec::new();
+        let mut sst_readers: Vec<(Arc<SSTableReader<F::Reader>>, &SstableDescriptor)> = Vec::new();
         for desc in guard.sstables.iter() {
             if token < desc.min_token || token > desc.max_token {
                 continue;
             }
-            match self.open_reader(desc) {
-                Ok(r) => sst_readers.push(r),
-                Err(e) => {
-                    tracing::warn!(%e, gen = %desc.gen, "time-series cursor: failed to open SSTable reader");
-                }
-            }
+            let reader = self.open_reader(desc).map_err(|e| {
+                self.unreadable_sstable("visit_time_series_window_rows", "open", desc, &e)
+            })?;
+            sst_readers.push((reader, desc));
         }
 
         let mut sst_sources: Vec<(
             ferrosa_sstable::reader::PartitionIter<'_, F::Reader>,
             ColumnOrdinalMapping,
         )> = Vec::new();
-        for sstable in sst_readers.iter() {
-            let mut iter = match sstable.partitions_iter() {
-                Ok(iter) => iter,
-                Err(e) => {
-                    tracing::warn!(%e, key = ?key.key.as_bytes(), "time-series cursor: skipping unreadable SSTable iterator");
-                    continue;
-                }
-            };
+        for (sstable, desc) in sst_readers.iter() {
+            let mut iter = sstable.partitions_iter().map_err(|e| {
+                self.unreadable_sstable("visit_time_series_window_rows", "iter", desc, &e)
+            })?;
             // Walk partition metadata until the exact key instead of using
             // `seek_to_token`; this cursor only needs one partition and must
             // not depend on the SSTable token-offset cache hot path.
@@ -2671,6 +2839,7 @@ impl<F: FlushTarget> TableStore<F> {
 
             if let Some(ts) = time_series_row_timestamp(&row, timestamp_unit) {
                 if ts >= window_start_ts && ts < window_end_ts {
+                    delivered.set(true);
                     cb(&row)?;
                     visited += 1;
                 }
@@ -4133,6 +4302,17 @@ impl<F: FlushTarget> TableStore<F> {
         if start_token >= end_token || limit == 0 {
             return Ok(Vec::new());
         }
+        self.with_retried_scan("read_token_range", || {
+            self.read_token_range_once(start_token, end_token, limit)
+        })
+    }
+
+    fn read_token_range_once(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        limit: usize,
+    ) -> Result<Vec<Partition>> {
         let guard = self.view.load();
         let schema = self.schema.load();
         let in_range = |t: i64| t >= start_token && t < end_token;
@@ -4182,29 +4362,13 @@ impl<F: FlushTarget> TableStore<F> {
             if !desc.overlaps_token_range(start_token, end_token) {
                 continue;
             }
-            let sstable = match self.open_reader(desc) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(gen = %desc.gen, "read_token_range: failed to open SSTable reader: {e}");
-                    continue;
-                }
-            };
+            let sstable = self
+                .open_reader(desc)
+                .map_err(|e| self.unreadable_sstable("read_token_range", "open", desc, &e))?;
             let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
-            let mut iter = match sstable.partitions_iter() {
-                Ok(it) => it,
-                Err(e) => {
-                    let id = guard
-                        .sstable_ids
-                        .get(i)
-                        .map(|(gen, dir)| format!("{}/{gen}", dir.display()))
-                        .unwrap_or_else(|| format!("index={i}"));
-                    tracing::warn!(
-                        sstable = %id,
-                        "read_token_range: skipping SSTable with broken iterator: {e}"
-                    );
-                    continue;
-                }
-            };
+            let mut iter = sstable
+                .partitions_iter()
+                .map_err(|e| self.unreadable_sstable("read_token_range", "iter", desc, &e))?;
             if let Err(e) = iter.seek_to_token(start_token) {
                 let id = guard
                     .sstable_ids
@@ -4232,8 +4396,12 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                     Ok(None) => break, // EOF.
                     Err(e) => {
-                        tracing::warn!("read_token_range: SSTable partition decode error: {e}");
-                        break;
+                        return Err(self.unreadable_sstable(
+                            "read_token_range",
+                            "decode",
+                            desc,
+                            &e,
+                        ));
                     }
                 }
             }
@@ -4316,6 +4484,18 @@ impl<F: FlushTarget> TableStore<F> {
         if start_token >= end_token || max_partitions == 0 {
             return Ok((Vec::new(), None));
         }
+        self.with_retried_scan("read_token_range_bounded", || {
+            self.read_token_range_bounded_once(start_token, end_token, max_partitions, max_bytes)
+        })
+    }
+
+    fn read_token_range_bounded_once(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        max_partitions: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<Partition>, Option<i64>)> {
         let guard = self.view.load();
         let schema = self.schema.load();
         let in_range = |t: i64| t >= start_token && t < end_token;
@@ -4366,34 +4546,27 @@ impl<F: FlushTarget> TableStore<F> {
             .collect();
 
         let mut sst_readers: Vec<Arc<SSTableReader<F::Reader>>> = Vec::new();
-        for desc in overlapping {
-            match self.open_reader(desc) {
-                Ok(r) => sst_readers.push(r),
-                Err(e) => {
-                    tracing::warn!(gen = %desc.gen, "read_token_range_bounded: failed to open SSTable reader: {e}");
-                }
-            }
+        for desc in overlapping.iter() {
+            sst_readers.push(self.open_reader(desc).map_err(|e| {
+                self.unreadable_sstable("read_token_range_bounded", "open", desc, &e)
+            })?);
         }
 
         let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
             Vec::with_capacity(sst_readers.len());
         let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(sst_readers.len());
-        for sstable in sst_readers.iter() {
-            let mut iter = match sstable.partitions_iter() {
-                Ok(it) => it,
-                Err(_) => continue,
-            };
-            let _ = iter.seek_to_token(start_token);
-            while let Ok(Some(k)) = iter.peek_partition_key() {
-                if k.token.0 < start_token {
-                    if iter.skip_to_next_partition().is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                break;
-            }
+        // Parallel to `sst_iters`: names the SSTable behind each iterator so a
+        // mid-merge failure is a typed, retriable error rather than a raw one.
+        let mut sst_descs: Vec<&SstableDescriptor> = Vec::with_capacity(sst_readers.len());
+        for (sstable, desc) in sst_readers.iter().zip(overlapping.iter()) {
+            let mut iter = sstable.partitions_iter().map_err(|e| {
+                self.unreadable_sstable("read_token_range_bounded", "iter", desc, &e)
+            })?;
+            position_iter_at_token(&mut iter, start_token).map_err(|e| {
+                self.unreadable_sstable("read_token_range_bounded", "position", desc, &e)
+            })?;
             sst_iters.push(iter);
+            sst_descs.push(*desc);
             sst_mappings.push(ColumnOrdinalMapping::for_header(&schema, sstable.header()));
         }
 
@@ -4413,8 +4586,11 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                 }
             }
-            for iter in sst_iters.iter_mut() {
-                if let Ok(Some(k)) = iter.peek_partition_key() {
+            for (iter, desc) in sst_iters.iter_mut().zip(sst_descs.iter()) {
+                let peeked = iter.peek_partition_key().map_err(|e| {
+                    self.unreadable_sstable("read_token_range_bounded", "peek", desc, &e)
+                })?;
+                if let Some(k) = peeked {
                     if k.token.0 >= end_token {
                         continue;
                     }
@@ -4441,8 +4617,15 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
             for (i, iter) in sst_iters.iter_mut().enumerate() {
-                if matches!(iter.peek_partition_key(), Ok(Some(k)) if k == key) {
-                    if let Some(mut p) = iter.next_partition()? {
+                let desc = sst_descs[i];
+                let peeked = iter.peek_partition_key().map_err(|e| {
+                    self.unreadable_sstable("read_token_range_bounded", "peek", desc, &e)
+                })?;
+                if matches!(peeked, Some(k) if k == key) {
+                    let next = iter.next_partition().map_err(|e| {
+                        self.unreadable_sstable("read_token_range_bounded", "decode", desc, &e)
+                    })?;
+                    if let Some(mut p) = next {
                         sst_mappings[i].remap_partition(&mut p);
                         sources.push(p);
                     }
@@ -4532,15 +4715,16 @@ impl<F: FlushTarget> TableStore<F> {
         for input in inputs.into_iter() {
             match input {
                 MergeInput::Run(mr) => readers.push(mr),
-                MergeInput::Descriptor(desc) => match self.open_reader(&desc) {
-                    Ok(reader) => readers.push(MergeReader {
+                MergeInput::Descriptor(desc) => {
+                    let reader = self
+                        .open_reader(&desc)
+                        .map_err(|e| self.unreadable_sstable("bounded_merge", "open", &desc, &e))?;
+                    readers.push(MergeReader {
                         reader,
                         cleanup_dir: None,
-                    }),
-                    Err(e) => {
-                        tracing::warn!(gen = %desc.gen, "bounded merge: failed to open SSTable reader: {e}");
-                    }
-                },
+                        source: Some(desc),
+                    });
+                }
             }
         }
         Ok(readers)
@@ -4603,15 +4787,16 @@ impl<F: FlushTarget> TableStore<F> {
         for input in batch.into_iter() {
             match input {
                 MergeInput::Run(mr) => batch_readers.push(mr),
-                MergeInput::Descriptor(desc) => match self.open_reader(&desc) {
-                    Ok(reader) => batch_readers.push(MergeReader {
+                MergeInput::Descriptor(desc) => {
+                    let reader = self.open_reader(&desc).map_err(|e| {
+                        self.unreadable_sstable("bounded_merge", "open_batch", &desc, &e)
+                    })?;
+                    batch_readers.push(MergeReader {
                         reader,
                         cleanup_dir: None,
-                    }),
-                    Err(e) => {
-                        tracing::warn!(gen = %desc.gen, "bounded merge: failed to open batch reader: {e}");
-                    }
-                },
+                        source: Some(desc),
+                    });
+                }
             }
         }
 
@@ -4622,20 +4807,12 @@ impl<F: FlushTarget> TableStore<F> {
             Vec::with_capacity(batch_readers.len());
         let mut mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(batch_readers.len());
         for mr in batch_readers.iter() {
-            let mut iter = match mr.reader.partitions_iter() {
-                Ok(it) => it,
-                Err(_) => continue,
-            };
-            let _ = iter.seek_to_token(start_token);
-            while let Ok(Some(k)) = iter.peek_partition_key() {
-                if k.token.0 < start_token {
-                    if iter.skip_to_next_partition().is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                break;
-            }
+            let mut iter = mr
+                .reader
+                .partitions_iter()
+                .map_err(|e| self.merge_reader_failure("bounded_merge", "iter", mr, e))?;
+            position_iter_at_token(&mut iter, start_token)
+                .map_err(|e| self.merge_reader_failure("bounded_merge", "position", mr, e))?;
             iters.push(iter);
             mappings.push(ColumnOrdinalMapping::for_header(schema, mr.reader.header()));
         }
@@ -4669,6 +4846,7 @@ impl<F: FlushTarget> TableStore<F> {
         runs.push(MergeInput::Run(MergeReader {
             reader: Arc::new(reader),
             cleanup_dir,
+            source: None,
         }));
         Ok(())
     }
@@ -4721,6 +4899,12 @@ impl<F: FlushTarget> TableStore<F> {
     /// path; only triggers for keys with cross-source content
     /// (active writes / pre-compaction state) — settled replicas
     /// stay on the hot path.
+    ///
+    /// An SSTable in the view that cannot be opened or read fails the walk
+    /// (typed [`ferrosa_common::Error::CorruptSstable`]) rather than hashing a
+    /// partial range. Open-stage failures retry against a fresh view before
+    /// any callback has run; once `cb` has been invoked a failure is final,
+    /// since a retry would deliver partitions twice.
     pub fn walk_token_range_for_digest<Cb>(
         &self,
         start_token: i64,
@@ -4738,6 +4922,27 @@ impl<F: FlushTarget> TableStore<F> {
         if start_token >= end_token {
             return Ok(());
         }
+        let delivered = std::cell::Cell::new(false);
+        self.with_retried_scan_guarded("walk_token_range_for_digest", &delivered, || {
+            self.walk_token_range_for_digest_once(start_token, end_token, &delivered, &mut cb)
+        })
+    }
+
+    fn walk_token_range_for_digest_once<Cb>(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        delivered: &std::cell::Cell<bool>,
+        mut cb: Cb,
+    ) -> Result<()>
+    where
+        Cb: FnMut(
+            &DecoratedKey,
+            ferrosa_sstable::types::DeletionTime,
+            Option<&ferrosa_sstable::types::Row>,
+            &mut dyn FnMut(&mut dyn FnMut(&ferrosa_sstable::types::Row) -> Result<()>) -> Result<()>,
+        ) -> Result<()>,
+    {
         let guard = self.view.load();
         let schema = self.schema.load();
 
@@ -4785,20 +4990,12 @@ impl<F: FlushTarget> TableStore<F> {
             Vec::with_capacity(merge_readers.len());
         let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(merge_readers.len());
         for mr in merge_readers.iter() {
-            let mut iter = match mr.reader.partitions_iter() {
-                Ok(it) => it,
-                Err(_) => continue,
-            };
-            let _ = iter.seek_to_token(start_token);
-            while let Ok(Some(k)) = iter.peek_partition_key() {
-                if k.token.0 < start_token {
-                    if iter.skip_to_next_partition().is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                break;
-            }
+            let mut iter = mr.reader.partitions_iter().map_err(|e| {
+                self.merge_reader_failure("walk_token_range_for_digest", "iter", mr, e)
+            })?;
+            position_iter_at_token(&mut iter, start_token).map_err(|e| {
+                self.merge_reader_failure("walk_token_range_for_digest", "position", mr, e)
+            })?;
             sst_iters.push(iter);
             sst_mappings.push(ColumnOrdinalMapping::for_header(
                 &schema,
@@ -4820,7 +5017,7 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
             for iter in sst_iters.iter_mut() {
-                if let Ok(Some(k)) = iter.peek_partition_key() {
+                if let Some(k) = iter.peek_partition_key()? {
                     if k.token.0 >= end_token {
                         continue;
                     }
@@ -4842,14 +5039,12 @@ impl<F: FlushTarget> TableStore<F> {
                     _ => None,
                 })
                 .collect();
-            let sst_match_indices: Vec<usize> = sst_iters
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(i, iter)| match iter.peek_partition_key() {
-                    Ok(Some(k)) if k == key => Some(i),
-                    _ => None,
-                })
-                .collect();
+            let mut sst_match_indices: Vec<usize> = Vec::new();
+            for (i, iter) in sst_iters.iter_mut().enumerate() {
+                if matches!(iter.peek_partition_key()?, Some(k) if k == key) {
+                    sst_match_indices.push(i);
+                }
+            }
             let total_sources = vec_match_indices.len() + sst_match_indices.len();
 
             if total_sources == 1 && sst_match_indices.len() == 1 {
@@ -4880,6 +5075,7 @@ impl<F: FlushTarget> TableStore<F> {
                         })
                     }
                 };
+                delivered.set(true);
                 cb(&decoded_key, deletion, static_row.as_ref(), &mut emit_rows)?;
             } else {
                 // Multi-source streaming merge. The header (deletion,
@@ -5027,6 +5223,7 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                     Ok(())
                 };
+                delivered.set(true);
                 cb(
                     &merged_key,
                     merged_deletion,
@@ -5038,6 +5235,9 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(())
     }
 
+    /// Walk merged partitions in `[start_token, end_token)`. Same fail-loud
+    /// contract as [`Self::walk_token_range_for_digest`]: an unreadable SSTable
+    /// fails the walk; it is never skipped.
     pub fn walk_token_range<Cb>(&self, start_token: i64, end_token: i64, mut cb: Cb) -> Result<()>
     where
         Cb: FnMut(&Partition) -> Result<()>,
@@ -5045,6 +5245,22 @@ impl<F: FlushTarget> TableStore<F> {
         if start_token >= end_token {
             return Ok(());
         }
+        let delivered = std::cell::Cell::new(false);
+        self.with_retried_scan_guarded("walk_token_range", &delivered, || {
+            self.walk_token_range_once(start_token, end_token, &delivered, &mut cb)
+        })
+    }
+
+    fn walk_token_range_once<Cb>(
+        &self,
+        start_token: i64,
+        end_token: i64,
+        delivered: &std::cell::Cell<bool>,
+        mut cb: Cb,
+    ) -> Result<()>
+    where
+        Cb: FnMut(&Partition) -> Result<()>,
+    {
         let guard = self.view.load();
         let schema = self.schema.load();
 
@@ -5100,27 +5316,15 @@ impl<F: FlushTarget> TableStore<F> {
             Vec::with_capacity(merge_readers.len());
         let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(merge_readers.len());
         for mr in merge_readers.iter() {
-            let mut iter = match mr.reader.partitions_iter() {
-                Ok(it) => it,
-                Err(_) => continue,
-            };
-            // seek_to_token can leave us BEFORE start_token (cache
-            // build failed → no-op) — the per-cycle key compare
-            // handles that, but skip any partition with token <
-            // start_token here to keep the peek-key honest.
-            let _ = iter.seek_to_token(start_token);
-            // Advance past any pre-range partitions left over from
-            // a cache-build-failure fallback.
-            while let Ok(Some(k)) = iter.peek_partition_key() {
-                if k.token.0 < start_token {
-                    // skip past this partition
-                    if iter.skip_to_next_partition().is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                break;
-            }
+            let mut iter = mr
+                .reader
+                .partitions_iter()
+                .map_err(|e| self.merge_reader_failure("walk_token_range", "iter", mr, e))?;
+            // seek_to_token can leave us BEFORE start_token (cache build
+            // failed); the helper skips any pre-range partition so the
+            // peeked key stays honest.
+            position_iter_at_token(&mut iter, start_token)
+                .map_err(|e| self.merge_reader_failure("walk_token_range", "position", mr, e))?;
             sst_iters.push(iter);
             sst_mappings.push(ColumnOrdinalMapping::for_header(
                 &schema,
@@ -5143,7 +5347,7 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
             for iter in sst_iters.iter_mut() {
-                if let Ok(Some(k)) = iter.peek_partition_key() {
+                if let Some(k) = iter.peek_partition_key()? {
                     if k.token.0 >= end_token {
                         // sstable is past the range; treat as exhausted
                         continue;
@@ -5168,17 +5372,16 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
             for (idx, iter) in sst_iters.iter_mut().enumerate() {
-                let matches = matches!(iter.peek_partition_key(), Ok(Some(k)) if k == key);
+                let matches = matches!(iter.peek_partition_key()?, Some(k) if k == key);
                 if !matches {
                     continue;
                 }
-                match iter.next_partition() {
-                    Ok(Some(mut p)) => {
-                        sst_mappings[idx].remap_partition(&mut p);
-                        group.push(p);
-                    }
-                    Ok(None) => {}
-                    Err(_) => {}
+                // A decode error here is an unreadable SSTable: propagate it.
+                // Dropping this source's copy of the key would hand the
+                // callback a stale or empty merge as if it were complete.
+                if let Some(mut p) = iter.next_partition()? {
+                    sst_mappings[idx].remap_partition(&mut p);
+                    group.push(p);
                 }
             }
 
@@ -5189,12 +5392,16 @@ impl<F: FlushTarget> TableStore<F> {
                 crate::merge::apply_deletions(&mut m);
                 m
             };
+            delivered.set(true);
             cb(&merged)?;
             drop(merged);
         }
         Ok(())
     }
 
+    /// Materializing range read. An SSTable in the view that cannot be opened
+    /// or read fails the read (typed [`ferrosa_common::Error::CorruptSstable`])
+    /// after the fresh-view retry bound; it never returns fewer rows as `Ok`.
     pub fn read_range_limited_rows(
         &self,
         start: Option<&DecoratedKey>,
@@ -5207,7 +5414,18 @@ impl<F: FlushTarget> TableStore<F> {
                 "range read limit {limit} exceeds materialization cap {RANGE_READ_MATERIALIZATION_CAP}; use a paged/streaming read path"
             )));
         }
+        self.with_retried_scan("read_range_limited_rows", || {
+            self.read_range_limited_rows_once(start, end, limit, row_limit)
+        })
+    }
 
+    fn read_range_limited_rows_once(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        limit: usize,
+        row_limit: usize,
+    ) -> Result<Vec<Partition>> {
         let guard = self.view.load();
         let schema = self.schema.load();
 
@@ -5244,39 +5462,23 @@ impl<F: FlushTarget> TableStore<F> {
         // SSTables — read only the remaining budget from each, and when a row
         // cap is requested skip unretained rows while decoding instead of
         // materializing full wide partitions and truncating afterwards.
-        for (i, desc) in guard.sstables.iter().enumerate() {
+        for desc in guard.sstables.iter() {
             let remaining = limit.saturating_sub(all_partitions.len());
             if remaining == 0 {
                 break;
             }
             // One reader open at a time — opened, drained, dropped per loop.
-            let sstable = match self.open_reader(desc) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(gen = %desc.gen, "read_range: failed to open SSTable reader: {e}");
-                    continue;
-                }
-            };
-            match sstable.read_partitions_limited_rows(remaining, row_limit) {
-                Ok(mut parts) => {
-                    let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
-                    for partition in &mut parts {
-                        mapping.remap_partition(partition);
-                    }
-                    all_partitions.extend(parts);
-                }
-                Err(e) => {
-                    let id = guard
-                        .sstable_ids
-                        .get(i)
-                        .map(|(gen, dir)| format!("{}/{gen}", dir.display()))
-                        .unwrap_or_else(|| format!("index={i}"));
-                    tracing::warn!(
-                        sstable = %id,
-                        "read_range: skipping corrupted SSTable: {e}"
-                    );
-                }
+            let sstable = self
+                .open_reader(desc)
+                .map_err(|e| self.unreadable_sstable("read_range", "open", desc, &e))?;
+            let mut parts = sstable
+                .read_partitions_limited_rows(remaining, row_limit)
+                .map_err(|e| self.unreadable_sstable("read_range", "read", desc, &e))?;
+            let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
+            for partition in &mut parts {
+                mapping.remap_partition(partition);
             }
+            all_partitions.extend(parts);
         }
 
         // Deduplicate and merge partitions with the same key
@@ -6189,6 +6391,24 @@ impl<F: FlushTarget> TableStore<F> {
         covered_gens: &std::collections::HashSet<String>,
         limit: Option<usize>,
     ) -> ferrosa_common::Result<Vec<(Vec<u8>, f64)>> {
+        self.with_retried_scan("fulltext_sstable_scan_missing_sidecar", || {
+            self.fulltext_sstable_scan_missing_sidecar_once(index_name, query, covered_gens, limit)
+        })
+    }
+
+    /// One attempt of [`Self::fulltext_sstable_scan_missing_sidecar`]. A
+    /// sidecar-less SSTable that cannot be opened or indexed fails the scan
+    /// (typed `CorruptSstable`): its rows would otherwise be missing from the
+    /// search with nothing telling the caller. Quarantined SSTables are NOT
+    /// skipped either — they remain in the view, so their rows remain missing
+    /// until repair swaps them out, and the search must say so.
+    fn fulltext_sstable_scan_missing_sidecar_once(
+        &self,
+        index_name: &str,
+        query: &str,
+        covered_gens: &std::collections::HashSet<String>,
+        limit: Option<usize>,
+    ) -> ferrosa_common::Result<Vec<(Vec<u8>, f64)>> {
         use ferrosa_index::fulltext::query::parse_fts_query;
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
 
@@ -6211,28 +6431,19 @@ impl<F: FlushTarget> TableStore<F> {
         for desc in guard.sstables.iter() {
             // SSTables with a sidecar are already covered by the engine's direct
             // sidecar search; only scan the ones that are (transiently) missing.
-            if covered_gens.contains(&desc.gen) || self.is_sstable_quarantined(&desc.gen) {
+            if covered_gens.contains(&desc.gen) {
                 continue;
             }
             #[cfg(test)]
             crate::engine::FTS_SSTABLE_FULL_SCANS.with(|c| c.set(c.get() + 1));
-            let sstable = match self.open_reader(desc) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(%e, gen = %desc.gen, "fts sidecar-less scan: open reader failed");
-                    continue;
-                }
-            };
+            let sstable = self
+                .open_reader(desc)
+                .map_err(|e| self.unreadable_sstable("fts_sidecarless_scan", "open", desc, &e))?;
             // One transient FTI per SSTable, dropped before the next one is
             // scanned — peak stays O(this SSTable's indexed column), not
             // O(every uncovered SSTable at once).
-            let fti = match build_sstable_fti(&sstable, &schema, col_pos) {
-                Ok(fti) => fti,
-                Err(e) => {
-                    tracing::warn!(%e, gen = %desc.gen, "fts sidecar-less scan: SSTable could not be indexed; its rows are missing from this search");
-                    continue;
-                }
-            };
+            let fti = build_sstable_fti(&sstable, &schema, col_pos)
+                .map_err(|e| self.unreadable_sstable("fts_sidecarless_scan", "index", desc, &e))?;
             if fti.doc_count == 0 {
                 continue;
             }
@@ -6329,9 +6540,21 @@ impl<F: FlushTarget> TableStore<F> {
                 continue;
             }
             // An SSTable that cannot be opened is left to the fallback scan,
-            // which reports the same failure for every query that misses it.
-            let Ok(reader) = self.open_reader(desc) else {
-                continue;
+            // which now fails every full-text query that needs it (typed
+            // CorruptSstable) — so this skip only defers the sidecar build,
+            // it hides nothing. Logged so the cause is visible on its own.
+            let reader = match self.open_reader(desc) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        gen = %desc.gen,
+                        index_name,
+                        "fts sidecar plan: SSTable could not be opened; sidecar not built \
+                         (full-text queries over it will fail until it is readable)"
+                    );
+                    continue;
+                }
             };
             plan.jobs.push(FulltextSidecarJob {
                 gen: desc.gen.clone(),
@@ -9130,6 +9353,294 @@ mod tests {
             store.is_sstable_quarantined("corrupt-gen-2"),
             "a corrupt SSTable detected during a resolvable read is still quarantined for repair"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Range/scan reads must fail loud when an SSTable in their view cannot be
+    // opened or read (t_73659682). A partial result returned as success reads
+    // as the missing rows not existing.
+    // -------------------------------------------------------------------------
+
+    /// Publish `healthy` (seeded in the reader pool) and an SSTable `gen`
+    /// that holds `missing_keys` but whose reader cannot be opened: it is in
+    /// the view, yet the flush target retains no components for it — the
+    /// shape of an evicted local file whose S3 rehydrate failed.
+    fn store_with_unopenable_sstable(
+        healthy_keys: &[&str],
+        missing_keys: &[&str],
+    ) -> TableStore<InMemoryFlushTarget> {
+        let store = test_store();
+        let schema = test_schema();
+        let mut descs = Vec::new();
+        let healthy_parts: Vec<Partition> = healthy_keys
+            .iter()
+            .map(|k| make_partition(k, b"healthy", 1000))
+            .collect();
+        let healthy = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &healthy_parts,
+            None,
+        ));
+        let healthy_desc = SstableDescriptor::from_reader(
+            "healthy-gen".to_string(),
+            std::path::PathBuf::new(),
+            &healthy,
+        );
+        store.seed_reader(&healthy_desc, healthy);
+        descs.push(healthy_desc);
+
+        let missing_parts: Vec<Partition> = missing_keys
+            .iter()
+            .map(|k| make_partition(k, b"missing", 1000))
+            .collect();
+        let missing = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &missing_parts,
+            None,
+        ));
+        // Deliberately NOT seeded: opening it must go to the flush target,
+        // which has nothing for this generation.
+        descs.push(SstableDescriptor::from_reader(
+            "missing-gen".to_string(),
+            std::path::PathBuf::new(),
+            &missing,
+        ));
+        install_descriptors(&store, descs);
+        store
+    }
+
+    fn install_descriptors(store: &TableStore<InMemoryFlushTarget>, descs: Vec<SstableDescriptor>) {
+        let current = store.view.load_full();
+        let ids: Vec<(String, std::path::PathBuf)> = descs
+            .iter()
+            .map(|d| (d.gen.clone(), std::path::PathBuf::new()))
+            .collect();
+        let sidecars = descs.iter().map(|_| Arc::new(HashMap::new())).collect();
+        store.view.store(Arc::new(StoreView {
+            active: new_memtable(),
+            flushing: None,
+            sstables: Arc::new(descs),
+            sstable_ids: Arc::new(ids),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::new(sidecars),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        }));
+    }
+
+    /// Like [`store_with_unopenable_sstable`] but the second SSTable opens and
+    /// then fails mid-read (Data.db truncated), the residual compaction window.
+    fn store_with_truncated_sstable() -> TableStore<InMemoryFlushTarget> {
+        let store = test_store();
+        let schema = test_schema();
+        let healthy = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("a", b"healthy", 1000)],
+            None,
+        ));
+        let healthy_desc = SstableDescriptor::from_reader(
+            "healthy-gen".to_string(),
+            std::path::PathBuf::new(),
+            &healthy,
+        );
+        store.seed_reader(&healthy_desc, healthy);
+        let truncated = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("c", b"missing", 1000)],
+            Some(8),
+        ));
+        let truncated_desc = SstableDescriptor::from_reader(
+            "truncated-gen".to_string(),
+            std::path::PathBuf::new(),
+            &truncated,
+        );
+        store.seed_reader(&truncated_desc, truncated);
+        install_descriptors(&store, vec![healthy_desc, truncated_desc]);
+        store
+    }
+
+    fn assert_names_sstable(err: &ferrosa_common::Error, gen: &str) {
+        assert!(
+            err.corrupt_sstable_range().is_some() && err.to_string().contains(gen),
+            "expected a typed CorruptSstable error naming {gen}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_range_limited_rows_fails_loud_on_unopenable_sstable() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let err = store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect_err("a range read missing an SSTable must not return a partial Ok");
+        assert_names_sstable(&err, "missing-gen");
+        assert!(store.is_sstable_quarantined("missing-gen"));
+    }
+
+    #[test]
+    fn read_range_limited_rows_fails_loud_on_mid_read_error() {
+        let store = store_with_truncated_sstable();
+        let err = store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect_err("a mid-read SSTable error must not return a partial Ok");
+        assert_names_sstable(&err, "truncated-gen");
+    }
+
+    #[test]
+    fn read_token_range_fails_loud_on_unopenable_sstable() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let err = store
+            .read_token_range(i64::MIN, i64::MAX, 100)
+            .expect_err("a token-range read missing an SSTable must not return a partial Ok");
+        assert_names_sstable(&err, "missing-gen");
+        assert!(store.is_sstable_quarantined("missing-gen"));
+    }
+
+    #[test]
+    fn read_token_range_fails_loud_on_mid_read_error() {
+        let store = store_with_truncated_sstable();
+        let err = store
+            .read_token_range(i64::MIN, i64::MAX, 100)
+            .expect_err("a decode error must not return a partial Ok");
+        assert_names_sstable(&err, "truncated-gen");
+    }
+
+    #[test]
+    fn read_token_range_bounded_fails_loud_on_unopenable_sstable() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let err = store
+            .read_token_range_bounded(i64::MIN, i64::MAX, 100, usize::MAX)
+            .expect_err("a bounded read missing an SSTable must not return a partial Ok");
+        assert_names_sstable(&err, "missing-gen");
+    }
+
+    #[test]
+    fn read_token_range_bounded_fails_loud_on_mid_read_error() {
+        let store = store_with_truncated_sstable();
+        let err = store
+            .read_token_range_bounded(i64::MIN, i64::MAX, 100, usize::MAX)
+            .expect_err("a decode error must not return a partial Ok");
+        assert_names_sstable(&err, "truncated-gen");
+    }
+
+    #[test]
+    fn walk_token_range_fails_loud_on_unopenable_sstable() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let mut seen = 0usize;
+        let err = store
+            .walk_token_range(i64::MIN, i64::MAX, |_| {
+                seen += 1;
+                Ok(())
+            })
+            .expect_err("a token walk missing an SSTable must not complete as Ok");
+        assert_names_sstable(&err, "missing-gen");
+        assert_eq!(
+            seen, 0,
+            "no partial results may be delivered before the error"
+        );
+    }
+
+    #[test]
+    fn walk_token_range_fails_loud_on_mid_read_error() {
+        let store = store_with_truncated_sstable();
+        store
+            .walk_token_range(i64::MIN, i64::MAX, |_| Ok(()))
+            .expect_err("a decode error mid-walk must surface, not be skipped");
+    }
+
+    #[test]
+    fn walk_token_range_for_digest_fails_loud_on_unopenable_sstable() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let err = store
+            .walk_token_range_for_digest(i64::MIN, i64::MAX, |_, _, _, _| Ok(()))
+            .expect_err("a digest walk missing an SSTable must not hash a partial range");
+        assert_names_sstable(&err, "missing-gen");
+    }
+
+    #[test]
+    fn time_series_cursor_fails_loud_on_unopenable_sstable() {
+        let store = store_with_unopenable_sstable(&["a"], &["ts-key"]);
+        let err = store
+            .visit_time_series_window_rows(
+                &make_key("ts-key"),
+                0,
+                i64::MAX,
+                crate::timeseries::TimeSeriesTimestampUnit::Millis,
+                |_| Ok(()),
+            )
+            .expect_err("a cursor missing an SSTable must not visit a partial window");
+        assert_names_sstable(&err, "missing-gen");
+    }
+
+    #[test]
+    fn fulltext_sidecarless_scan_fails_loud_on_unopenable_sstable() {
+        let mut store = store_with_unopenable_sstable(&["a"], &["c"]);
+        store.add_fulltext_index("fts_idx".to_string(), 0);
+        let err = store
+            .fulltext_sstable_scan_missing_sidecar(
+                "fts_idx",
+                "missing",
+                &std::collections::HashSet::new(),
+                None,
+            )
+            .expect_err("a full-text scan missing an SSTable must not return partial hits");
+        assert_names_sstable(&err, "missing-gen");
+    }
+
+    #[test]
+    fn range_reads_do_not_skip_quarantined_sstables() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect_err("first read fails and quarantines");
+        assert!(store.is_sstable_quarantined("missing-gen"));
+        store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect_err("a quarantined SSTable still belongs to the view: never skip it");
+    }
+
+    #[test]
+    fn fulltext_scan_does_not_skip_quarantined_sstables() {
+        let mut store = store_with_unopenable_sstable(&["a"], &["c"]);
+        store.add_fulltext_index("fts_idx".to_string(), 0);
+        let covered = std::collections::HashSet::new();
+        store
+            .fulltext_sstable_scan_missing_sidecar("fts_idx", "x", &covered, None)
+            .expect_err("first scan fails and quarantines");
+        assert!(store.is_sstable_quarantined("missing-gen"));
+        store
+            .fulltext_sstable_scan_missing_sidecar("fts_idx", "x", &covered, None)
+            .expect_err("a quarantined SSTable's rows are still missing: never skip it");
+    }
+
+    #[test]
+    fn scan_retry_succeeds_when_failure_was_transient() {
+        let store = test_store();
+        let mut calls = 0;
+        let out = store
+            .with_retried_scan("test_op", || {
+                calls += 1;
+                if calls == 1 {
+                    Err(ferrosa_common::Error::corrupt_sstable("g", 0, 1))
+                } else {
+                    Ok(42)
+                }
+            })
+            .expect("a failure that clears on a fresh view must not surface");
+        assert_eq!(out, 42);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn scan_retry_does_not_retry_other_errors() {
+        let store = test_store();
+        let mut calls = 0;
+        let err = store
+            .with_retried_scan::<()>("test_op", || {
+                calls += 1;
+                Err(ferrosa_common::Error::InvalidData("boom".into()))
+            })
+            .expect_err("non-SSTable errors propagate");
+        assert_eq!(calls, 1);
+        assert!(err.to_string().contains("boom"));
     }
 
     // -------------------------------------------------------------------------
