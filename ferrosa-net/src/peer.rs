@@ -520,6 +520,12 @@ impl PeerManager {
             .await
             .remove(&host_id);
         if let Some(state) = removed {
+            // Retire the pool's lane actors; dropping the map entry alone
+            // leaves their tasks and reconnect watchers running forever
+            // (t_b4d09b65).
+            if let Some(pool) = &state.pool {
+                pool.shutdown().await;
+            }
             self.listener.on_peer_disconnected(state.peer_id);
         }
     }
@@ -899,6 +905,44 @@ mod tests {
         assert!(pm.get_peer_cql_broadcast(host_id).await.is_none());
         assert!(!pm.has_peer(host_id));
         assert_eq!(listener.disconnected_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// t_b4d09b65: removing a peer must retire its pool, or the lane-actor
+    /// tasks (and their reconnect watchers) leak for the life of the process.
+    #[tokio::test]
+    async fn remove_peer_shuts_down_the_pool_lane_actors() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+        let pm = PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            Arc::new(TestListener::new()),
+        );
+        pm.ensure_peer(server_id, &addr.to_string()).await.unwrap();
+        let (_, pool) = pm.pool_for_peer(server_id).await.unwrap();
+        assert_eq!(
+            pool.all_lanes_resolved().await,
+            LaneOutcome::AllConnected,
+            "precondition: the pool is live while registered"
+        );
+
+        pm.remove_peer(server_id).await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), pool.all_lanes_resolved())
+                .await
+                .expect("lane status query must not hang after remove_peer"),
+            LaneOutcome::AnyFailed,
+            "remove_peer must shut the pool's lane actors down, not just drop the map entry"
+        );
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
