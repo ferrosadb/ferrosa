@@ -430,6 +430,24 @@ proposed once on the leader and every node must build the index and answer an
 indexed read) and, on a real cluster, `replicated_jsonb_index_live` (feature
 `live-infra-tests` + `FERROSA_TEST_CLUSTER_NODES`, panics when unset).
 
+The Accord `ReorderBuffer` drain is guarded without a wall-clock bound.
+`accord::perf_regression::perf_regression_suite` measures the 1000-message drain
+RELATIVE to a same-run CPU reference loop (the load-independent form of the
+absolute `< 10 ms` it used to assert — the absolute form ejected a docs-only PR
+at 52.8 ms, `forge t_430e21f7`, and the nightly fuzz lane at 56.7 ms on
+2026-09-30 while the dedicated perf job passed in the same workflow). The
+deterministic half lives in `tests/reorder_buffer_drain_budget.rs`: it counts
+allocations under a `#[global_allocator]` hook (the drain must make ONE output
+allocation regardless of message count — measured 1 allocation / 32 bytes per
+message, constant from 1000 to 4000 messages) and asserts the per-message drain
+cost stays linear. On an idle box the drain is ~0.16 ms for 1000 messages, and
+the drain/reference-loop ratio holds at 0.72–0.80 from 0 to 576 competing
+threads on an 18-core host, which is why the ratio form does not flake. The
+structural invariants (completeness, `t0` order, arrival order within equal
+`t0`, contiguous ready prefix, capacity/`len`) are pinned in
+`src/accord/reorder_buffer.rs`, including a differential test against a flat
+reference model.
+
 The multi-node `TestCluster` harness (`tests/common/raft_harness.rs`) runs
 openraft with short timers (50 ms heartbeat, 200–400 ms election). To keep
 election convergence deterministic when `cargo test` runs many runtime-heavy test
