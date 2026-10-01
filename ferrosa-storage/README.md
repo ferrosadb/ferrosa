@@ -416,6 +416,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   indexed. Restore pulls every index artifact of a generation from S3
   completely before publishing it, and the S3 sync uploads sidecars built
   after their generation was already in the manifest.
+- **Index rebuild coverage** (`rebuild_index`, `index::orphan`, FMEA ST-53) —
+  a backfill walks the store's live SSTable set and classifies each generation
+  by its on-disk state, never by error text: `Data.db` present is built; an
+  eviction marker is rehydrated and built (restore failure fails it); `Data.db`
+  gone with the TOC surviving is `Vanished` (compacted away, discounted); a
+  generation with no files at all is `Failed` (stale enumeration). Completeness
+  needs zero failures AND every enumerated SSTable accounted for, a sidecar that
+  cannot be written, reopened or installed is a failure, and any failure leaves
+  the tracker stale so index reads are refused. `RebuildOutcome` reports
+  `sstables_failed`.
 - **Full-text search** (`fulltext_search(table, index, query, limit)`) —
   searches the memtable FTI + the `-FTI-{index}.db` sidecar of each **live**
   SSTable, found from the store view (`TableStore::fulltext_live_sidecars`),

@@ -422,18 +422,29 @@ pub struct RebuildOutcome {
     /// who can see 21 generations on disk and is told "1 of 1" needs the other
     /// twenty accounted for, or the smaller denominator reads as a lie.
     pub sstables_vanished: usize,
+    /// SSTables that should have been indexed and were not: absent entirely
+    /// (a stale enumeration), evicted and not restorable, or unreadable.
+    /// Any of these leaves the index short, so the index is NOT marked current.
+    pub sstables_failed: usize,
 }
 
 impl RebuildOutcome {
     /// Whether every SSTable that HOLDS ROWS is now covered.
     ///
-    /// Vanished SSTables cannot leave an index incomplete: an index covering
-    /// every SSTable that has rows covers every row. Requiring them to be
-    /// "rebuilt" is what made a repaired index report failure forever, because
-    /// the data files were compacted away on purpose and are never coming back.
+    /// Vanished SSTables (data file gone, TOC and sidecars still present) cannot
+    /// leave an index incomplete: an index covering every SSTable that has rows
+    /// covers every row. Requiring them to be "rebuilt" is what made a repaired
+    /// index report failure forever, because the data files were compacted away
+    /// on purpose and are never coming back.
+    ///
+    /// Completeness is NOT derivable from "nothing failed" alone: every
+    /// enumerated SSTable must be accounted for as rebuilt, vanished or failed,
+    /// and none may have failed. A generation that fell through every bucket
+    /// would otherwise read as complete.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.sstables_rebuilt + self.sstables_vanished >= self.sstables_total
+        self.sstables_failed == 0
+            && self.sstables_rebuilt + self.sstables_vanished == self.sstables_total
     }
 
     /// SSTables that actually had rows to index.
@@ -5578,7 +5589,10 @@ impl StorageEngine {
     /// build would be a second implementation of the thing that broke, and
     /// the two would drift.
     ///
-    /// Returns the number of SSTables successfully indexed.
+    /// Returns a [`Coverage`](crate::index::orphan::Coverage) accounting for
+    /// EVERY enumerated SSTable as built, vanished (TOC survives, data gone) or
+    /// failed. A generation with no files at all, or an evicted one that cannot
+    /// be restored, is failed and leaves the index stale.
     fn backfill_partition_key_index(
         &self,
         state: &mut TableState,
@@ -5587,9 +5601,12 @@ impl StorageEngine {
         partition_key_component: usize,
         index_type: ferrosa_index::IndexType,
     ) -> crate::index::orphan::Coverage {
-        let mut coverage = crate::index::orphan::Coverage::default();
+        use crate::index::orphan::BackfillOutcome;
+
         let pk_total = state.store.partition_key_column_count();
         let sstable_ids = state.store.sstable_generation_ids();
+        let mut coverage = crate::index::orphan::Coverage::expecting(sstable_ids.len());
+        let table_dir = self.table_sstable_dir(table_id);
         for sst_id in sstable_ids {
             self.index_tracker.mark_pending(
                 table_id.keyspace(),
@@ -5616,93 +5633,27 @@ impl StorageEngine {
                 }),
                 filter_predicate: None,
             };
-
-            // Build it HERE rather than handing it to the scheduler.
-            //
-            // The scheduler's worker writes the sidecar file and marks the
-            // SSTable indexed, but nothing installs the result into the live
-            // view — so an asynchronous backfill becomes visible only after a
-            // restart, and until then reads consult an index that is complete
-            // on disk and empty in memory. Building synchronously means
-            // `CREATE INDEX` returns when the index is actually usable, which
-            // is also what a caller reasonably expects it to mean.
-            let backend = crate::index::LocalBackend::new(self.config.data_dir.clone());
-            match crate::index::IndexBuildBackend::build(&backend, &job) {
-                Ok(result) => {
-                    for (built_index, entries) in &result.sidecar_entries {
-                        if entries.is_empty() {
-                            continue;
-                        }
-                        // Persist, so the backfill survives a restart.
-                        let path = crate::index::scheduler::sidecar_output_dir(
-                            &self.config.data_dir,
-                            &job,
-                        )
-                        .join(format!("{sst_id}-{built_index}.sidecar"));
-                        if let Err(e) = crate::index::sidecar::SidecarWriter::write(&path, entries)
-                        {
-                            tracing::error!(
-                                %e,
-                                path = %path.display(),
-                                "engine: partition-key index backfill built but could NOT be \
-                                 written; it will be lost on restart"
-                            );
-                        }
-                        // And install, so it is usable now.
-                        match crate::index::sidecar::SidecarReader::open(&path) {
-                            Ok(reader) => {
-                                if !state.store.install_sidecar(&sst_id, built_index, reader) {
-                                    tracing::warn!(
-                                        index_name,
-                                        sstable = %sst_id,
-                                        "engine: backfilled sidecar not installed — the SSTable \
-                                         left the view while the build ran (likely compacted)"
-                                    );
-                                }
-                            }
-                            Err(e) => tracing::error!(
-                                %e,
-                                path = %path.display(),
-                                "engine: partition-key index backfill wrote a sidecar that \
-                                 cannot be reopened; this index is INCOMPLETE for that SSTable"
-                            ),
-                        }
+            let settled = self
+                .settle_generation(&table_dir, &sst_id)
+                .unwrap_or_else(|| self.build_and_install_sidecar(state, &job));
+            let (keyspace, table) = (table_id.keyspace(), table_id.table());
+            match settled {
+                Ok(outcome) => {
+                    if outcome == BackfillOutcome::Vanished {
+                        tracing::info!(
+                            index_name,
+                            table = %table_id,
+                            sstable = %sst_id,
+                            "engine: SSTable has no data file but its metadata survives — \
+                             compacted away. Nothing to index; not counted against this index."
+                        );
                     }
-                    self.index_tracker.mark_indexed(
-                        table_id.keyspace(),
-                        table_id.table(),
-                        index_name,
-                        &sst_id,
-                    );
-                    coverage.built += 1;
-                }
-                // An SSTable whose data file is GONE is not a failure. It was
-                // compacted away and only its TOC and sidecars survive, so it
-                // holds no rows and skipping it removes nothing from the index.
-                //
-                // Marking it failed is what wedged six indexes on the live
-                // cluster for a day: every retry re-read the same absent files,
-                // re-marked the same failure, and the server went on correctly
-                // refusing to read through an index that could never become
-                // current. Retrying cannot fix an SSTable that no longer exists.
-                Err(e) if crate::index::orphan::data_file_is_absent(&e) => {
-                    tracing::info!(
-                        index_name,
-                        table = %table_id,
-                        sstable = %sst_id,
-                        "engine: SSTable has no data file — compacted away with its metadata \
-                         left behind. Nothing to index; not counted against this index."
-                    );
-                    coverage.vanished += 1;
-                    // Cleared rather than left pending: the tracker asked about
-                    // an SSTable that does not exist, and leaving it pending
-                    // keeps the index short of a row count it can never reach.
-                    self.index_tracker.mark_indexed(
-                        table_id.keyspace(),
-                        table_id.table(),
-                        index_name,
-                        &sst_id,
-                    );
+                    // Built and vanished both clear the pending mark: a vanished
+                    // SSTable holds no rows, so leaving it pending would keep the
+                    // index short of a row count it can never reach.
+                    self.index_tracker
+                        .mark_indexed(keyspace, table, index_name, &sst_id);
+                    coverage.record(outcome);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -5714,18 +5665,123 @@ impl StorageEngine {
                          are not in the index and reads through it will be incomplete"
                     );
                     self.index_tracker.mark_failed(
-                        table_id.keyspace(),
-                        table_id.table(),
+                        keyspace,
+                        table,
                         index_name,
                         e,
                         std::time::Duration::from_secs(60),
                     );
-                    coverage.failed += 1;
+                    coverage.record(BackfillOutcome::Failed);
                 }
             }
         }
-
+        if !coverage.is_complete() {
+            tracing::error!(
+                index_name,
+                table = %table_id,
+                summary = %coverage.describe(),
+                "engine: index backfill is NOT complete; the index stays stale and refuses reads"
+            );
+        }
         coverage
+    }
+
+    /// Decide what a generation's on-disk state means before any build runs.
+    ///
+    /// `None` means build from it (data present, or an evicted generation that
+    /// was just restored). `Some(Ok(Vanished))` is the only discount, and only
+    /// when the TOC survives. Everything else that cannot be built is
+    /// `Some(Err(..))`: an absent generation (stale enumeration) or an evicted
+    /// one whose restore failed must never be read as "nothing to index".
+    fn settle_generation(
+        &self,
+        table_dir: &std::path::Path,
+        gen: &str,
+    ) -> Option<Result<crate::index::orphan::BackfillOutcome, String>> {
+        use crate::index::orphan::{BackfillOutcome, GenerationState};
+
+        let state_of = || {
+            GenerationState::from_files(
+                Self::generation_component_path(table_dir, gen, "Data.db").is_some(),
+                Self::evicted_marker_path(table_dir, gen).exists(),
+                Self::generation_component_path(table_dir, gen, "TOC.txt").is_some(),
+            )
+        };
+        let mut state = state_of();
+        if state == GenerationState::Evicted {
+            if let Err(e) = crate::flush::rehydrate_if_evicted(table_dir, gen) {
+                return Some(Err(format!(
+                    "evicted SSTable {gen} could not be rehydrated: {e}"
+                )));
+            }
+            state = state_of();
+            if state == GenerationState::Evicted {
+                return Some(Err(format!(
+                    "evicted SSTable {gen} could not be restored from the object store; \
+                     its rows are not in the index"
+                )));
+            }
+        }
+        match state.skip_outcome() {
+            Some(BackfillOutcome::Failed) => Some(Err(format!(
+                "SSTable {gen} is in the live set but no file of it exists in {} — a stale \
+                 enumeration or manifest entry, not a compaction leftover",
+                table_dir.display()
+            ))),
+            Some(outcome) => Some(Ok(outcome)),
+            None => None,
+        }
+    }
+
+    /// Build one SSTable's partition-key sidecar, persist it and install it
+    /// into the live view. Any step that fails is an `Err`: a sidecar that was
+    /// built but not persisted, not reopenable, or not installable leaves the
+    /// index short for that SSTable and must not be counted as built.
+    fn build_and_install_sidecar(
+        &self,
+        state: &TableState,
+        job: &crate::index::IndexBuildJob,
+    ) -> Result<crate::index::orphan::BackfillOutcome, String> {
+        // Build it HERE rather than handing it to the scheduler.
+        //
+        // The scheduler's worker writes the sidecar file and marks the
+        // SSTable indexed, but nothing installs the result into the live
+        // view — so an asynchronous backfill becomes visible only after a
+        // restart, and until then reads consult an index that is complete
+        // on disk and empty in memory. Building synchronously means
+        // `CREATE INDEX` returns when the index is actually usable, which
+        // is also what a caller reasonably expects it to mean.
+        let backend = crate::index::LocalBackend::new(self.config.data_dir.clone());
+        let result = crate::index::IndexBuildBackend::build(&backend, job)?;
+        let sst_id = &job.sstable_id;
+        for (built_index, entries) in &result.sidecar_entries {
+            if entries.is_empty() {
+                continue;
+            }
+            // Persist, so the backfill survives a restart.
+            let path = crate::index::scheduler::sidecar_output_dir(&self.config.data_dir, job)
+                .join(format!("{sst_id}-{built_index}.sidecar"));
+            crate::index::sidecar::SidecarWriter::write(&path, entries).map_err(|e| {
+                format!(
+                    "sidecar for {sst_id} built but could NOT be written to {}: {e}",
+                    path.display()
+                )
+            })?;
+            // And install, so it is usable now.
+            let reader = crate::index::sidecar::SidecarReader::open(&path).map_err(|e| {
+                format!(
+                    "sidecar for {sst_id} at {} cannot be reopened: {e}",
+                    path.display()
+                )
+            })?;
+            if !state.store.install_sidecar(sst_id, built_index, reader) {
+                return Err(format!(
+                    "backfilled sidecar for {sst_id} not installed — the SSTable left the \
+                     view while the build ran (likely compacted); rebuild again"
+                ));
+            }
+        }
+        Ok(crate::index::orphan::BackfillOutcome::Built)
     }
 
     /// Rebuild one index's sidecars over every SSTable this table holds.
@@ -5814,6 +5870,7 @@ impl StorageEngine {
             sstables_rebuilt,
             sstables_total,
             sstables_vanished: coverage.vanished,
+            sstables_failed: coverage.failed,
         })
     }
 
@@ -22201,6 +22258,248 @@ mod tests {
             "after a commanded rebuild the index must answer for every row: \
              {tenant_a_rows} exist for this tenant"
         );
+    }
+
+    // ---- t_e76b4d27: index rebuild over a table whose Data.db files are absent ----
+
+    /// Remove `gen`'s files under `table_dir` at any depth: every component, or
+    /// only `Data.db` when `only_data` (leaving TOC and sidecars, the
+    /// "compacted away with metadata left behind" shape).
+    fn remove_generation_files(table_dir: &std::path::Path, gen: &str, only_data: bool) -> usize {
+        let prefix = format!("{gen}-");
+        let mut removed = 0;
+        let mut stack = vec![table_dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&prefix) && (!only_data || name.ends_with("-Data.db")) {
+                    std::fs::remove_file(&path).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
+    /// A file-backed engine holding `n` SSTables of one row each (`k0`..),
+    /// with a partition-key index over all of them. Automatic compaction is
+    /// kept out of the way so the generation set is exactly what was flushed.
+    fn engine_with_indexed_generations(
+        n: usize,
+    ) -> (tempfile::TempDir, StorageEngine, TableId, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for i in 0..n {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+        engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        let gens = engine
+            .tables
+            .read()
+            .get(&tid)
+            .unwrap()
+            .store
+            .sstable_generation_ids();
+        assert_eq!(gens.len(), n, "fixture must hold {n} SSTables");
+        (dir, engine, tid, gens)
+    }
+
+    /// Rows the partition-key index returns for the partition `key`.
+    fn pk_index_rows(
+        engine: &StorageEngine,
+        tid: &TableId,
+        key: &str,
+    ) -> ferrosa_common::Result<usize> {
+        let found = collect_index_results(
+            engine,
+            tid,
+            "idx_pk",
+            &ferrosa_index::IndexKey(key.as_bytes().to_vec()),
+        )?;
+        Ok(found.iter().map(|p| p.rows.len()).sum())
+    }
+
+    /// Live failure, 2026-09-14: the rebuild was handed generations that exist
+    /// nowhere on disk (a stale enumeration), called them "compacted away" and
+    /// reported the index complete. A generation with NO files at all is not
+    /// metadata left behind: it is a stale manifest entry, and the index must
+    /// stay stale and refuse reads rather than answer from a fraction of the table.
+    #[test]
+    fn a_rebuild_over_a_generation_missing_entirely_fails_and_leaves_the_index_stale() {
+        let (dir, engine, tid, gens) = engine_with_indexed_generations(3);
+        let table_dir = engine.table_sstable_dir(&tid);
+        assert!(remove_generation_files(&table_dir, &gens[0], false) > 0);
+
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+
+        assert_eq!(outcome.sstables_failed, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.sstables_vanished, 0,
+            "an absent generation must never be discounted: {outcome:?}"
+        );
+        assert!(!outcome.is_complete(), "{outcome:?}");
+        assert!(
+            !engine.index_is_current(&tid, "idx_pk"),
+            "an index over a table with an unaccounted generation must not be current"
+        );
+        assert!(
+            pk_index_rows(&engine, &tid, "k0").is_err(),
+            "a stale index must refuse reads, not return a short count"
+        );
+        drop(dir);
+    }
+
+    /// The legitimate #406 case must keep working: TOC and sidecars still
+    /// there, Data.db gone. Nothing to index; the rebuild completes.
+    #[test]
+    fn a_generation_with_metadata_but_no_data_file_is_vanished_and_the_rebuild_completes() {
+        let (dir, engine, tid, gens) = engine_with_indexed_generations(3);
+        let table_dir = engine.table_sstable_dir(&tid);
+        assert_eq!(remove_generation_files(&table_dir, &gens[0], true), 1);
+
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+
+        assert_eq!(outcome.sstables_vanished, 1, "{outcome:?}");
+        assert_eq!(outcome.sstables_rebuilt, 2, "{outcome:?}");
+        assert_eq!(outcome.sstables_failed, 0, "{outcome:?}");
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert!(engine.index_is_current(&tid, "idx_pk"));
+        drop(dir);
+    }
+
+    /// A rebuild walks the LIVE set. After a compaction retired older
+    /// generations, every live generation is enumerated and indexed, and the
+    /// retired ones are not named at all.
+    #[tokio::test]
+    async fn a_rebuild_enumerates_every_live_generation_after_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        let flush_key = |name: &str| {
+            engine
+                .write(&tid, &make_key(name), make_row(b"v", 1000), 1000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        };
+        for name in ["k0", "k1", "k2", "k3"] {
+            flush_key(name);
+        }
+        engine.force_compact_all();
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.sstable_count(&tid), 1, "compaction must swap in");
+        for name in ["k4", "k5"] {
+            flush_key(name);
+        }
+        engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+
+        assert_eq!(outcome.sstables_total, 3, "{outcome:?}");
+        assert_eq!(outcome.sstables_rebuilt, 3, "{outcome:?}");
+        assert!(outcome.is_complete(), "{outcome:?}");
+        for name in ["k0", "k1", "k2", "k3", "k4", "k5"] {
+            assert_eq!(
+                pk_index_rows(&engine, &tid, name).unwrap(),
+                1,
+                "partition {name} must be reachable through the rebuilt index"
+            );
+        }
+    }
+
+    /// Eviction removes `Data.db` while the generation stays live, with a
+    /// marker and the objects in S3. That is neither "compacted away" nor a
+    /// stale entry: it must be rehydrated and indexed. Discounting it as
+    /// vanished drops live rows from the index and reports it complete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_evicted_generation_is_rehydrated_and_indexed_not_discounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, keys) =
+            engine_with_evicted_sstable(dir.path(), "test-rebuild-evicted").await;
+        let tid = table_id();
+        assert!(StorageEngine::evicted_marker_path(&table_dir, &gen).exists());
+
+        engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        assert!(
+            engine.index_is_current(&tid, "idx_pk"),
+            "the evicted generation was indexed, so the index is current"
+        );
+        for key in &keys {
+            assert_eq!(
+                pk_index_rows(&engine, &tid, key).unwrap(),
+                1,
+                "row {key} of the evicted SSTable must be in the index"
+            );
+        }
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+        assert_eq!(outcome.sstables_vanished, 0, "{outcome:?}");
+        assert_eq!(outcome.sstables_rebuilt, 1, "{outcome:?}");
+        assert!(outcome.is_complete(), "{outcome:?}");
+        engine.shutdown().unwrap();
+    }
+
+    /// Same, but the objects are gone: the rebuild fails loud and the index is
+    /// NOT current. Never vanished.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_evicted_generation_that_cannot_be_rehydrated_fails_the_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable_in(dir.path(), "test-rebuild-evicted-gone", &store).await;
+        let tid = table_id();
+        delete_all_objects(&store).await;
+
+        engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        let outcome = engine.rebuild_index(&tid, "idx_pk").unwrap();
+
+        assert_eq!(outcome.sstables_failed, 1, "{outcome:?}");
+        assert_eq!(outcome.sstables_vanished, 0, "{outcome:?}");
+        assert!(!outcome.is_complete(), "{outcome:?}");
+        assert!(!engine.index_is_current(&tid, "idx_pk"));
+        assert!(
+            pk_index_rows(&engine, &tid, "k0").is_err(),
+            "a stale index must refuse reads"
+        );
+        assert!(
+            StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
+            "the marker stays so a later rehydrate can still find the generation"
+        );
+        engine.shutdown().unwrap();
     }
 
     /// An index on a PARTITION-KEY column must survive a restart (t_50c8bc7d).

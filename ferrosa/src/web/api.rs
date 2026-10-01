@@ -188,6 +188,9 @@ async fn index_rebuild_handler(
                 // behind. Reported so a caller seeing a smaller denominator
                 // than the generation count on disk can account for the rest.
                 "sstables_vanished": outcome.sstables_vanished,
+                // SSTables that should have been indexed and were not. Non-zero
+                // means the index stays stale and refuses reads.
+                "sstables_failed": outcome.sstables_failed,
                 "sstables_indexable": outcome.sstables_indexable(),
                 "complete": outcome.is_complete(),
             });

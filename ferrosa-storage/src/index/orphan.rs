@@ -45,78 +45,95 @@
 pub enum BackfillOutcome {
     /// Indexed.
     Built,
-    /// The SSTable's data file is absent. It was compacted away and only its
-    /// metadata survives, so there are no rows to index and nothing is missing
-    /// from the index by skipping it.
+    /// The SSTable's data file is absent but its TOC and sidecars survive. It
+    /// was compacted away and only its metadata remains, so there are no rows
+    /// to index and nothing is missing from the index by skipping it.
     Vanished,
-    /// A real failure: the data is there and could not be indexed. Reads
-    /// through this index are genuinely incomplete.
+    /// A real failure: the data is (or should be) there and could not be
+    /// indexed. Reads through this index are genuinely incomplete.
     Failed,
 }
 
-/// Whether a build error means the SSTable's data file is simply not there.
+/// What a generation looks like on disk, judged from its files and not from
+/// the text of an error.
 ///
-/// Conservative by construction: anything not recognised as "absent" is a real
-/// failure. Being wrong that way costs a loud error about a healthy SSTable.
-/// Being wrong the other way silently drops rows from an index and reports the
-/// index complete, which is the failure mode this whole area exists to prevent.
+/// "Data.db is absent" has three unrelated causes, and an error string cannot
+/// tell them apart (`No such file or directory` is what all three produce):
 ///
-/// Matching on TEXT because `IndexBuildBackend::build` returns `String`. That
-/// is brittle by nature, so the wordings below are pinned by tests rather than
-/// assumed, and an unrecognised wording fails safe.
-#[must_use]
-pub fn data_file_is_absent(error: &str) -> bool {
-    let lowered = error.to_lowercase();
-    // The canonical io::ErrorKind::NotFound renderings, plus the raw errno.
-    // A permission or corruption error must NOT match any of these.
-    lowered.contains("no such file or directory")
-        || mentions_errno(&lowered, 2)
-        || lowered.contains("entity not found")
+/// 1. compacted away with its metadata left behind: the TOC survives;
+/// 2. a stale enumeration or manifest entry: no file of the generation exists;
+/// 3. EVICTED to the object store: the data is intact in S3 and a durable
+///    `<gen>.evicted` marker records it.
+///
+/// Only the first holds no rows. Treating the others as the first silently
+/// drops live rows from an index and reports it complete, which is the failure
+/// mode this module exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationState {
+    /// `Data.db` is on disk: build from it.
+    DataPresent,
+    /// No local `Data.db`, but an eviction marker: restore it, then build.
+    Evicted,
+    /// No `Data.db`, no marker, but the TOC survives: compacted away.
+    MetadataOnly,
+    /// No `Data.db`, no marker, no TOC: the generation does not exist on disk.
+    Absent,
 }
 
-/// Whether the text names exactly this errno, and not one that merely starts
-/// with its digits.
-///
-/// `contains("os error 2")` also matches `os error 21` (EISDIR) and `os error
-/// 28` (ENOSPC) — a disk-full error would have been read as "the file is gone"
-/// and its SSTable silently dropped from the index. Caught by the test that
-/// lists real errors; the digits have to end where the number ends.
-fn mentions_errno(lowered: &str, errno: u32) -> bool {
-    let needle = format!("os error {errno}");
-    let mut from = 0;
-    while let Some(at) = lowered[from..].find(&needle) {
-        let end = from + at + needle.len();
-        match lowered.as_bytes().get(end) {
-            Some(next) if next.is_ascii_digit() => from = end,
-            _ => return true,
+impl GenerationState {
+    /// Classify from which files exist. The marker outranks the TOC because an
+    /// evicted generation may keep its TOC too.
+    #[must_use]
+    pub fn from_files(data: bool, evicted_marker: bool, toc: bool) -> Self {
+        if data {
+            Self::DataPresent
+        } else if evicted_marker {
+            Self::Evicted
+        } else if toc {
+            Self::MetadataOnly
+        } else {
+            Self::Absent
         }
     }
-    false
-}
 
-/// Classify one attempt.
-#[must_use]
-pub fn classify(result: Result<(), &str>) -> BackfillOutcome {
-    match result {
-        Ok(()) => BackfillOutcome::Built,
-        Err(error) if data_file_is_absent(error) => BackfillOutcome::Vanished,
-        Err(_) => BackfillOutcome::Failed,
+    /// The outcome when no build can run for this state, or `None` when one
+    /// should (`DataPresent`, and `Evicted` once restored).
+    #[must_use]
+    pub fn skip_outcome(self) -> Option<BackfillOutcome> {
+        match self {
+            Self::DataPresent | Self::Evicted => None,
+            Self::MetadataOnly => Some(BackfillOutcome::Vanished),
+            Self::Absent => Some(BackfillOutcome::Failed),
+        }
     }
 }
 
 /// What a rebuild covered, once vanished SSTables are discounted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Coverage {
+    /// SSTables the rebuild was asked to cover (the live set it enumerated).
+    pub expected: usize,
     /// SSTables actually indexed.
     pub built: usize,
-    /// SSTables whose data was gone. Not failures, and not coverage either —
-    /// they hold no rows.
+    /// SSTables whose data was gone but whose metadata survives. Not
+    /// failures, and not coverage either: they hold no rows.
     pub vanished: usize,
     /// SSTables that should have been indexed and were not.
     pub failed: usize,
 }
 
 impl Coverage {
+    /// Start a tally for a rebuild that enumerated `expected` SSTables.
+    #[must_use]
+    pub fn expecting(expected: usize) -> Self {
+        Self {
+            expected,
+            built: 0,
+            vanished: 0,
+            failed: 0,
+        }
+    }
+
     /// Fold one outcome in.
     pub fn record(&mut self, outcome: BackfillOutcome) {
         match outcome {
@@ -136,13 +153,23 @@ impl Coverage {
         self.built + self.failed
     }
 
+    /// Every enumerated SSTable was either built, discounted as vanished, or
+    /// failed. Anything else fell through and is unaccounted for.
+    #[must_use]
+    pub fn unaccounted(&self) -> usize {
+        self.expected
+            .saturating_sub(self.built + self.vanished + self.failed)
+    }
+
     /// Whether reads through this index are complete.
     ///
-    /// A vanished SSTable cannot make an index incomplete: an index that
-    /// covers every SSTable holding rows covers every row.
+    /// Requires BOTH that nothing failed and that every enumerated SSTable is
+    /// accounted for. `failed == 0` alone is not enough: it is also true when
+    /// generations were skipped for a reason that was never recorded as a
+    /// failure, which is how a rebuild reported 1 of 21 SSTables as complete.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.failed == 0
+        self.failed == 0 && self.unaccounted() == 0
     }
 
     /// What to tell the operator, naming vanished SSTables explicitly.
@@ -169,6 +196,12 @@ impl Coverage {
                 self.vanished
             ));
         }
+        if self.unaccounted() > 0 {
+            text.push_str(&format!(
+                " ({} enumerated SSTables were never accounted for)",
+                self.unaccounted()
+            ));
+        }
         text
     }
 }
@@ -177,120 +210,108 @@ impl Coverage {
 mod tests {
     use super::*;
 
-    /// The live error, verbatim from node1 on 2026-09-13.
-    const ABSENT: &str = "open data: I/O error: No such file or directory (os error 2)";
-
-    /// The whole point: an SSTable that is gone is not a failure.
-    #[test]
-    fn a_missing_data_file_is_vanished_not_failed() {
-        assert_eq!(classify(Err(ABSENT)), BackfillOutcome::Vanished);
+    fn tally(built: usize, vanished: usize, failed: usize) -> Coverage {
+        let mut coverage = Coverage::expecting(built + vanished + failed);
+        for _ in 0..built {
+            coverage.record(BackfillOutcome::Built);
+        }
+        for _ in 0..vanished {
+            coverage.record(BackfillOutcome::Vanished);
+        }
+        for _ in 0..failed {
+            coverage.record(BackfillOutcome::Failed);
+        }
+        coverage
     }
 
-    /// A real failure stays a failure.
-    ///
-    /// Conservative on purpose. Treating a readable-but-broken SSTable as
-    /// "vanished" would drop its rows from the index and then report the index
-    /// complete — a silent wrong answer, which is worse than the loud one.
+    /// The legitimate #406 case: the TOC survives, the data file is gone.
     #[test]
-    fn a_real_error_is_never_mistaken_for_a_vanished_sstable() {
-        for error in [
-            "open data: I/O error: Permission denied (os error 13)",
-            "corrupt sstable: checksum mismatch at offset 4096",
-            "unexpected end of file while reading Rows.db",
-            "decompression failed",
-            "",
-            "os error 21",
-        ] {
-            assert_eq!(
-                classify(Err(error)),
-                BackfillOutcome::Failed,
-                "{error:?} must be treated as a real failure"
-            );
+    fn metadata_without_a_data_file_is_vanished() {
+        let state = GenerationState::from_files(false, false, true);
+        assert_eq!(state, GenerationState::MetadataOnly);
+        assert_eq!(state.skip_outcome(), Some(BackfillOutcome::Vanished));
+    }
+
+    /// The live bug: a generation with no file at all was discounted as
+    /// "compacted away" because its open error read "No such file or directory".
+    #[test]
+    fn a_generation_with_no_files_at_all_is_a_failure_never_vanished() {
+        let state = GenerationState::from_files(false, false, false);
+        assert_eq!(state, GenerationState::Absent);
+        assert_eq!(state.skip_outcome(), Some(BackfillOutcome::Failed));
+    }
+
+    /// Eviction leaves the data intact in the object store; it must be
+    /// restored and built, never skipped, even if its TOC is also gone.
+    #[test]
+    fn an_evicted_generation_is_never_skipped() {
+        for toc in [true, false] {
+            let state = GenerationState::from_files(false, true, toc);
+            assert_eq!(state, GenerationState::Evicted);
+            assert_eq!(state.skip_outcome(), None);
         }
     }
 
-    /// Success is success.
+    /// A generation whose data is on disk is built, whatever else is true.
     #[test]
-    fn a_built_sstable_is_built() {
-        assert_eq!(classify(Ok(())), BackfillOutcome::Built);
+    fn a_generation_with_data_is_built() {
+        for marker in [true, false] {
+            for toc in [true, false] {
+                let state = GenerationState::from_files(true, marker, toc);
+                assert_eq!(state, GenerationState::DataPresent);
+                assert_eq!(state.skip_outcome(), None);
+            }
+        }
     }
 
     /// The denominator counts SSTables that HAD rows, not metadata.
-    ///
-    /// The live rebuild reported "only 1 of 21 SSTables" and exited non-zero.
-    /// Twenty of those twenty-one had no data file. The honest reading is
-    /// "1 of 1, and twenty sets of leftover metadata".
     #[test]
     fn vanished_sstables_do_not_count_against_coverage() {
-        let mut coverage = Coverage::default();
-        coverage.record(BackfillOutcome::Built);
-        for _ in 0..20 {
-            coverage.record(BackfillOutcome::Vanished);
-        }
-
+        let coverage = tally(1, 20, 0);
         assert_eq!(coverage.indexable(), 1, "only one SSTable held rows");
-        assert!(
-            coverage.is_complete(),
-            "every SSTable with rows was indexed, so reads are complete"
-        );
+        assert!(coverage.is_complete());
     }
 
-    /// But one genuine failure still makes it incomplete.
+    /// One genuine failure still makes it incomplete.
     #[test]
     fn a_single_real_failure_keeps_the_index_incomplete() {
-        let mut coverage = Coverage::default();
-        coverage.record(BackfillOutcome::Built);
-        coverage.record(BackfillOutcome::Vanished);
-        coverage.record(BackfillOutcome::Failed);
-
+        let coverage = tally(1, 1, 1);
         assert_eq!(coverage.indexable(), 2);
         assert!(!coverage.is_complete());
     }
 
+    /// `failed == 0` is not completeness: an enumerated SSTable that was
+    /// never recorded in any bucket leaves the index short.
+    #[test]
+    fn an_unaccounted_sstable_is_not_complete_even_with_no_failures() {
+        let mut coverage = Coverage::expecting(21);
+        coverage.record(BackfillOutcome::Built);
+        assert_eq!(coverage.failed, 0);
+        assert_eq!(coverage.unaccounted(), 20);
+        assert!(!coverage.is_complete());
+        assert!(coverage.describe().contains("never accounted for"));
+    }
+
     /// Vanished SSTables are REPORTED, never silently discounted.
-    ///
-    /// An operator who can see twenty-one generations on disk and is told
-    /// "1 of 1" will assume the tool is lying. Naming them is what makes the
-    /// smaller denominator believable.
     #[test]
     fn the_report_explains_the_missing_sstables() {
-        let mut coverage = Coverage::default();
-        coverage.record(BackfillOutcome::Built);
-        for _ in 0..20 {
-            coverage.record(BackfillOutcome::Vanished);
-        }
-
-        let text = coverage.describe();
+        let text = tally(1, 20, 0).describe();
         assert!(text.contains("1 of 1"), "{text}");
-        assert!(
-            text.contains("20"),
-            "the vanished ones must be named: {text}"
-        );
+        assert!(text.contains("20"), "{text}");
         assert!(text.contains("compacted"), "{text}");
     }
 
-    /// And an incomplete rebuild still says so first.
+    /// An incomplete rebuild still says so first.
     #[test]
     fn an_incomplete_rebuild_leads_with_the_bad_news() {
-        let mut coverage = Coverage::default();
-        coverage.record(BackfillOutcome::Failed);
-        coverage.record(BackfillOutcome::Vanished);
-
-        let text = coverage.describe();
+        let text = tally(0, 1, 1).describe();
         assert!(text.contains("STILL incomplete"), "{text}");
     }
 
-    /// An all-vanished table is complete, not failed.
-    ///
-    /// Every SSTable compacted away and nothing left to index: the index covers
-    /// all zero rows that exist. Reporting that as a failure would keep an
-    /// index permanently stale over an empty table.
+    /// An all-vanished table is complete: it holds zero rows.
     #[test]
     fn a_table_whose_sstables_all_vanished_is_complete() {
-        let mut coverage = Coverage::default();
-        for _ in 0..5 {
-            coverage.record(BackfillOutcome::Vanished);
-        }
+        let coverage = tally(0, 5, 0);
         assert_eq!(coverage.indexable(), 0);
         assert!(coverage.is_complete());
     }
@@ -312,6 +333,7 @@ mod outcome_tests {
             sstables_rebuilt: 1,
             sstables_total: 21,
             sstables_vanished: 20,
+            sstables_failed: 0,
         };
         assert!(outcome.is_complete());
         assert_eq!(outcome.sstables_indexable(), 1);
@@ -324,6 +346,7 @@ mod outcome_tests {
             sstables_rebuilt: 3,
             sstables_total: 21,
             sstables_vanished: 15,
+            sstables_failed: 3,
         };
         // 3 built + 15 vanished = 18 of 21; three SSTables hold rows and were
         // not indexed.
@@ -338,12 +361,14 @@ mod outcome_tests {
             sstables_rebuilt: 17,
             sstables_total: 17,
             sstables_vanished: 0,
+            sstables_failed: 0,
         }
         .is_complete());
         assert!(!RebuildOutcome {
             sstables_rebuilt: 16,
             sstables_total: 17,
             sstables_vanished: 0,
+            sstables_failed: 0,
         }
         .is_complete());
     }
