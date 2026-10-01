@@ -443,6 +443,9 @@ impl RebuildOutcome {
     }
 }
 
+/// Default `FERROSA_CACHE_HOT_WINDOW_SECS`: 15 minutes.
+const DEFAULT_CACHE_HOT_WINDOW_SECS: u64 = 900;
+
 /// Composes sub-configurations for each component. Use `from_env()` for
 /// production (reads `FERROSA_*` env vars) or `test_config()` for tests.
 pub struct StorageEngineConfig {
@@ -450,6 +453,10 @@ pub struct StorageEngineConfig {
     pub compaction: CompactionConfig,
     pub object_store: Option<ObjectStoreConfig>,
     pub local_cache_max_bytes: u64,
+    /// Seconds a table counts as hot after a foreground read; hot tables'
+    /// uploaded SSTables are never evicted from the local cache. `0` disables
+    /// hotness (every table is evictable). `FERROSA_CACHE_HOT_WINDOW_SECS`.
+    pub cache_hot_window_secs: u64,
     /// Minimum free bytes to preserve on the local data filesystem before
     /// admitting a new write. When the filesystem is below this reserve, writes
     /// fail closed before appending to the commit log, so periodic fsync and
@@ -588,6 +595,19 @@ impl StorageEngineConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10 * 1024 * 1024 * 1024); // 10 GB default
 
+        let cache_hot_window_secs = match std::env::var("FERROSA_CACHE_HOT_WINDOW_SECS") {
+            Err(_) => DEFAULT_CACHE_HOT_WINDOW_SECS,
+            Ok(raw) => raw.parse().unwrap_or_else(|e| {
+                tracing::warn!(
+                    value = raw,
+                    error = %e,
+                    default = DEFAULT_CACHE_HOT_WINDOW_SECS,
+                    "FERROSA_CACHE_HOT_WINDOW_SECS is not a whole number of seconds; using the default"
+                );
+                DEFAULT_CACHE_HOT_WINDOW_SECS
+            }),
+        };
+
         let local_disk_free_reserve_bytes = std::env::var("FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -667,6 +687,7 @@ impl StorageEngineConfig {
             compaction,
             object_store,
             local_cache_max_bytes,
+            cache_hot_window_secs,
             local_disk_free_reserve_bytes,
             flush_threshold_bytes,
             memtable_backpressure_bytes,
@@ -692,11 +713,12 @@ impl StorageEngineConfig {
             commit_log: CommitLogConfig::test_config(dir),
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
-            local_cache_max_bytes: 1024 * 1024,    // 1 MB
-            local_disk_free_reserve_bytes: 0,      // disabled by default in tests
-            flush_threshold_bytes: 4096,           // 4 KB — triggers flush quickly in tests
+            local_cache_max_bytes: 1024 * 1024, // 1 MB
+            cache_hot_window_secs: DEFAULT_CACHE_HOT_WINDOW_SECS,
+            local_disk_free_reserve_bytes: 0, // disabled by default in tests
+            flush_threshold_bytes: 4096,      // 4 KB — triggers flush quickly in tests
             memtable_backpressure_bytes: u64::MAX, // disabled by default in tests; opt-in per test
-            flush_max_age_secs: 5,                 // 5s — fast age-based flush in tests
+            flush_max_age_secs: 5,            // 5s — fast age-based flush in tests
             data_dir: dir.to_path_buf(),
             index_backend: crate::index::IndexBackendConfig::Local,
             // Tests keep verification on — writer bugs surface
@@ -1152,6 +1174,9 @@ pub struct StorageEngine {
     /// sync, compaction retry, and operator-triggered syncs can otherwise race
     /// from the same manifest snapshot and re-upload the same SSTables.
     s3_sync_running: AtomicBool,
+    /// Edge state for the "hot tables alone keep the cache over its limit"
+    /// warning: true while the last eviction pass was blocked by hot data.
+    cache_hot_blocked: AtomicBool,
     /// Set when write admission observes local disk pressure. The process
     /// maintenance loop consumes this flag to run an urgent S3 upload/eviction
     /// pass instead of waiting for the next normal flush tick.
@@ -1388,6 +1413,27 @@ impl TableState {
             .first()
             .map(|column| TimeSeriesTimestampUnit::from_storage_type(&column.type_name))
             .unwrap_or(TimeSeriesTimestampUnit::Micros)
+    }
+}
+
+/// Transition of the "hot data blocks cache eviction" condition.
+#[derive(Debug, PartialEq, Eq)]
+enum HotBlockEdge {
+    /// Not blocked before, blocked now.
+    Started,
+    /// Blocked before, not blocked now.
+    Cleared,
+    /// No change; nothing to report.
+    Unchanged,
+}
+
+/// Records `blocked_now` in `flag` and returns the edge, so the warning is
+/// logged when the block starts and when it clears, not on every sync.
+fn hot_block_edge(flag: &AtomicBool, blocked_now: bool) -> HotBlockEdge {
+    match (flag.swap(blocked_now, Ordering::Relaxed), blocked_now) {
+        (false, true) => HotBlockEdge::Started,
+        (true, false) => HotBlockEdge::Cleared,
+        _ => HotBlockEdge::Unchanged,
     }
 }
 
@@ -2694,6 +2740,7 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            cache_hot_blocked: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -2919,6 +2966,7 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            cache_hot_blocked: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -3093,6 +3141,7 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            cache_hot_blocked: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -11889,13 +11938,7 @@ impl StorageEngine {
     fn collect_uploaded_local_sstables(
         &self,
         manifest: &crate::manifest::Manifest,
-    ) -> Vec<(
-        String,
-        String,
-        std::path::PathBuf,
-        u64,
-        std::time::SystemTime,
-    )> {
+    ) -> Vec<crate::eviction_plan::EvictionCandidate> {
         // Generations still listed in the pending-upload log are flushed locally
         // but NOT yet confirmed durable in S3 (the entry is removed only after S3
         // confirms). Evicting their only local copy is the #235 data-loss path,
@@ -11955,19 +11998,53 @@ impl StorageEngine {
                 }
 
                 if size > 0 {
-                    entries.push((
-                        table_id.clone(),
-                        entry.id.clone(),
-                        table_dir.clone(),
+                    entries.push(crate::eviction_plan::EvictionCandidate {
+                        table: table_id.clone(),
+                        sstable_id: entry.id.clone(),
+                        table_dir: table_dir.clone(),
                         size,
                         last_modified,
-                    ));
+                    });
                 }
             }
         }
 
-        entries.sort_by_key(|(_, _, _, _, last_modified)| *last_modified);
         entries
+    }
+
+    /// Last foreground read of every registered table, keyed by the manifest
+    /// table key (`TableId::to_string`). Tables never read are absent.
+    fn last_foreground_reads(&self) -> HashMap<String, std::time::SystemTime> {
+        self.tables
+            .read()
+            .iter()
+            .filter_map(|(id, state)| Some((id.to_string(), state.last_foreground_read()?)))
+            .collect()
+    }
+
+    /// Reports, on the edges only, that hot tables alone keep the cache over
+    /// its limit (or under the free-space target).
+    fn report_hot_cache_block(
+        &self,
+        blocked: bool,
+        order: &crate::eviction_plan::EvictionOrder,
+        total_bytes: u64,
+        max_bytes: u64,
+    ) {
+        match hot_block_edge(&self.cache_hot_blocked, blocked) {
+            HotBlockEdge::Started => tracing::warn!(
+                hot_bytes = order.hot_bytes,
+                hot_tables = ?order.hot_tables,
+                total_uploaded_cache_bytes = total_bytes,
+                max_uploaded_cache_bytes = max_bytes,
+                hot_window_secs = self.config.cache_hot_window_secs,
+                "s3-sync: uploaded local cache is over its limit or free target but every remaining SSTable belongs to a recently read table; not evicting hot data"
+            ),
+            HotBlockEdge::Cleared => {
+                tracing::info!("s3-sync: uploaded local cache no longer blocked by hot tables")
+            }
+            HotBlockEdge::Unchanged => {}
+        }
     }
 
     fn enforce_uploaded_sstable_cache_limit(
@@ -11985,13 +12062,28 @@ impl StorageEngine {
         let candidates = self.collect_uploaded_local_sstables(manifest);
         let mut total_bytes = candidates
             .iter()
-            .fold(0u64, |acc, (_, _, _, size, _)| acc.saturating_add(*size));
+            .fold(0u64, |acc, c| acc.saturating_add(c.size));
+        let order = crate::eviction_plan::order_for_eviction(
+            candidates,
+            &self.last_foreground_reads(),
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(self.config.cache_hot_window_secs),
+        );
         let mut evicted = 0usize;
+        let mut stopped_early = false;
 
-        for (table_id, sstable_id, table_dir, size, _) in candidates {
+        for crate::eviction_plan::EvictionCandidate {
+            table: table_id,
+            sstable_id,
+            table_dir,
+            size,
+            ..
+        } in order.cold.iter().cloned()
+        {
             let over_cache_limit = total_bytes > max_bytes;
             let under_free_target = target_free > 0 && projected_available < target_free;
             if !over_cache_limit && !under_free_target {
+                stopped_early = true;
                 break;
             }
             if total_bytes <= min_bytes {
@@ -12002,6 +12094,7 @@ impl StorageEngine {
                     target_free_bytes = target_free,
                     "s3-sync: uploaded local cache at floor; cannot evict more for disk pressure"
                 );
+                stopped_early = true;
                 break;
             }
 
@@ -12034,6 +12127,17 @@ impl StorageEngine {
                 "s3-sync: evicted uploaded local SSTable from cache"
             );
         }
+
+        // Every cold SSTable is gone (or was kept on a record failure, which is
+        // logged above) and pressure remains: only hot tables are left to blame.
+        let still_pressured =
+            total_bytes > max_bytes || (target_free > 0 && projected_available < target_free);
+        self.report_hot_cache_block(
+            !stopped_early && still_pressured && order.hot_bytes > 0,
+            &order,
+            total_bytes,
+            max_bytes,
+        );
 
         Ok(evicted)
     }
@@ -13484,6 +13588,7 @@ impl StorageEngine {
             object_store: Some(Arc::clone(&store)),
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            cache_hot_blocked: AtomicBool::new(false),
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -17641,7 +17746,9 @@ mod tests {
         );
 
         // Repair primitives, compaction-free: no stamp.
-        engine.read_token_range(&tid, i64::MIN, i64::MAX, 10).unwrap();
+        engine
+            .read_token_range(&tid, i64::MIN, i64::MAX, 10)
+            .unwrap();
         engine
             .read_token_range_bounded(&tid, i64::MIN, i64::MAX, 10, 1 << 20)
             .unwrap();
@@ -17656,34 +17763,23 @@ mod tests {
 
         // Each foreground entry point stamps.
         let before = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
-        let reads: Vec<(&str, Box<dyn Fn()>)> = vec![
-            (
-                "read",
-                Box::new(|| {
-                    engine.read(&tid, &dk).unwrap();
-                }),
-            ),
-            (
-                "read_clustering_row",
-                Box::new(|| {
-                    engine.read_clustering_row(&tid, &dk, &[]).unwrap();
-                }),
-            ),
-            (
-                "read_range",
-                Box::new(|| {
-                    engine.read_range(&tid, None, None, 10).unwrap();
-                }),
-            ),
-        ];
-        for (name, read) in &reads {
+        let assert_stamps = |name: &str, read: &dyn Fn()| {
             engine.clear_last_foreground_read_for_test(&tid);
             read();
             let stamp = engine
                 .table_last_foreground_read(&tid)
                 .unwrap_or_else(|| panic!("{name} must stamp the table"));
             assert!(stamp >= before, "{name} stamped a stale time");
-        }
+        };
+        assert_stamps("read", &|| {
+            engine.read(&tid, &dk).unwrap();
+        });
+        assert_stamps("read_clustering_row", &|| {
+            engine.read_clustering_row(&tid, &dk, &[]).unwrap();
+        });
+        assert_stamps("read_range", &|| {
+            engine.read_range(&tid, None, None, 10).unwrap();
+        });
     }
 
     #[test]
@@ -28081,8 +28177,19 @@ mod tests {
         store: &Arc<dyn object_store::ObjectStore>,
         prefix: &str,
     ) -> StorageEngine {
+        evicting_s3_engine_with_hot_window(dir, store, prefix, 900)
+    }
+
+    /// [`evicting_s3_engine`] with an explicit hot window in seconds.
+    fn evicting_s3_engine_with_hot_window(
+        dir: &std::path::Path,
+        store: &Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+        hot_window_secs: u64,
+    ) -> StorageEngine {
         let mut config = StorageEngineConfig::test_config(dir);
         config.local_cache_max_bytes = 1;
+        config.cache_hot_window_secs = hot_window_secs;
         config.object_store = Some(crate::upload::ObjectStoreConfig {
             prefix: prefix.to_string(),
             ..crate::upload::ObjectStoreConfig::test_config()
@@ -28094,6 +28201,78 @@ mod tests {
             &tokio::runtime::Handle::current(),
         )
         .unwrap()
+    }
+
+    /// Two flushed tables over the cache limit; the first (`test_table`) is
+    /// read by a foreground query before the sync that evicts. Returns the
+    /// engine and the two tables' SSTable dirs, hot table first.
+    async fn sync_two_tables_reading_the_first(
+        dir: &std::path::Path,
+        hot_window_secs: u64,
+        prefix: &str,
+    ) -> (StorageEngine, std::path::PathBuf, std::path::PathBuf) {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let engine = evicting_s3_engine_with_hot_window(dir, &store, prefix, hot_window_secs);
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(test_schema_2()).unwrap();
+        for tid in [table_id(), table_id_2()] {
+            engine
+                .write(&tid, &make_key("k"), make_row(b"v", 1000), 1000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+        engine.read(&table_id(), &make_key("k")).unwrap();
+        assert!(engine.sync_sstables_to_s3().await.unwrap() >= 2);
+        let hot_dir = engine.table_sstable_dir(&table_id());
+        let other_dir = engine.table_sstable_dir(&table_id_2());
+        (engine, hot_dir, other_dir)
+    }
+
+    /// 2026-09-29: the evictor ordered by write age, so hot, rarely-written
+    /// tables (`schema_version`, `entity_store`) went first and reads failed.
+    /// A table read inside the hot window keeps its SSTables local while a
+    /// never-read table over the limit is evicted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cache_eviction_keeps_a_recently_read_table_local_and_evicts_the_cold_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, hot_dir, cold_dir) =
+            sync_two_tables_reading_the_first(dir.path(), 900, "test-hot-window").await;
+
+        assert!(
+            !StorageEngine::list_generations_in_dir(&hot_dir).is_empty(),
+            "the table read inside the hot window must stay local"
+        );
+        assert!(
+            StorageEngine::list_generations_in_dir(&cold_dir).is_empty(),
+            "the never-read table must be evicted"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// A hot window of zero disables hotness: the read table is evicted too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_hot_window_evicts_the_recently_read_table_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, hot_dir, cold_dir) =
+            sync_two_tables_reading_the_first(dir.path(), 0, "test-hot-window-zero").await;
+
+        assert!(StorageEngine::list_generations_in_dir(&hot_dir).is_empty());
+        assert!(StorageEngine::list_generations_in_dir(&cold_dir).is_empty());
+        engine.shutdown().unwrap();
+    }
+
+    /// The "hot data keeps the cache over its limit" warning reports edges,
+    /// not every sync.
+    #[test]
+    fn hot_block_warning_fires_on_the_edges_only() {
+        let flag = AtomicBool::new(false);
+        assert_eq!(hot_block_edge(&flag, false), HotBlockEdge::Unchanged);
+        assert_eq!(hot_block_edge(&flag, true), HotBlockEdge::Started);
+        assert_eq!(hot_block_edge(&flag, true), HotBlockEdge::Unchanged);
+        assert_eq!(hot_block_edge(&flag, true), HotBlockEdge::Unchanged);
+        assert_eq!(hot_block_edge(&flag, false), HotBlockEdge::Cleared);
+        assert_eq!(hot_block_edge(&flag, false), HotBlockEdge::Unchanged);
     }
 
     /// Data loss on the live ferrosa-memory cluster, 2026-09-29.

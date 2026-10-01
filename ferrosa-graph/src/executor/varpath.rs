@@ -515,6 +515,7 @@ mod tests {
             auth_warn: false,
             max_pending_replay_mutations_without_schema: 1024,
             memtable_num_shards: 64,
+            cache_hot_window_secs: 900,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
     }

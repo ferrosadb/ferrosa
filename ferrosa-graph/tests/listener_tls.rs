@@ -170,6 +170,7 @@ fn graph_engine() -> (
         auth_warn: false,
         max_pending_replay_mutations_without_schema: 1024,
         memtable_num_shards: 64,
+        cache_hot_window_secs: 900,
     };
     let storage = Arc::new(ferrosa_storage::StorageEngine::new(storage_config, None).unwrap());
     let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
