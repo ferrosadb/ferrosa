@@ -30,6 +30,11 @@ pub mod metrics;
 pub mod perf;
 #[cfg(feature = "perf-tests")]
 pub mod perf_regression;
+// Load-independent measurement primitive (same-run CPU reference loop) shared
+// by the benchmarks above. Available to any unit-test build (cross_shard uses
+// it) and to the `perf-tests` benchmarks.
+#[cfg(any(test, feature = "perf-tests"))]
+pub mod perf_support;
 pub mod proptests;
 #[cfg(test)]
 mod quorum_availability;
