@@ -3234,11 +3234,10 @@ impl StorageEngine {
             build_index_scheduler(&config, &tables, &pending_index_uploads);
 
         let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
-        let engine = Self {
         let eviction_audit = crate::eviction_audit::EvictionAudit::new(
             crate::eviction_audit::AuditConfig::from_env(&config.data_dir),
         );
-        Ok(Self {
+        let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
             write_admission: WriteAdmissionSettings::from_env(),
@@ -29751,10 +29750,44 @@ mod tests {
         }
         let keys = ["y0", "y1"];
         let path = set_aside_test_keys(dir.path(), &keys);
+        // A second file holds only a table nobody knows. The sweep has nothing
+        // to apply there and skips it, so only the scan at construction can
+        // report it.
+        let mut ghost = crate::replay_set_aside::ReplaySetAside::new(&dir.path().join("ghost"));
+        ghost
+            .append(&Mutation::new(
+                "test_ks".into(),
+                "ghost_table".into(),
+                make_key("g0"),
+                vec![make_row(b"aside", 200)],
+                200,
+            ))
+            .unwrap();
+        ghost.sync().unwrap();
+        let ghost_path = dir
+            .path()
+            .join(crate::replay_set_aside::SET_ASIDE_DIR)
+            .join("0-ghost.unreplayed");
+        std::fs::create_dir_all(ghost_path.parent().unwrap()).unwrap();
+        std::fs::rename(ghost.into_report().unwrap().path, &ghost_path).unwrap();
+
         let (engine, _pending) =
             StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+
         assert_each_key_has_one_row(&engine, &keys);
         assert!(!path.exists(), "open: the sweep re-ingests and removes it");
+        let status = engine.replay_set_aside_status();
+        assert_eq!(
+            status.tables().get("test_ks.ghost_table"),
+            Some(&1),
+            "open: the frame for an unknown table is still reported, not lost"
+        );
+        assert_eq!(
+            status.mutations(),
+            1,
+            "open: only the ghost frame is pending"
+        );
+        assert!(ghost_path.exists());
     }
 
     fn pause_for_the_clock() {
