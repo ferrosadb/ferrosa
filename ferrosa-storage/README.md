@@ -441,7 +441,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   query, so a stable row is never dropped from `fts_match` (BUG-F-007 /
   t_0455c0a1). Before this, compaction wrote no sidecar and the fallback ran
   on every query for the life of every compacted SSTable — 7–13 s per replica
-  on a live cluster, past the coordinator's 3 s Bulk-lane budget (FMEA ST-24). Memory is
+  on a live cluster, past the coordinator's 3 s Bulk-lane budget (FMEA ST-58). Memory is
   bounded (t_ee98faa0 layer 2 — a broad `fts_match` used to OOM every
   replica): `limit` is the QUERY-derived `LIMIT k` pushed down by the
   coordinator (never a server cap) and bounds every per-source working set to
