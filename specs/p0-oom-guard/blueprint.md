@@ -117,6 +117,30 @@ the rules after per-site triage, each with a unit test:
   declaration in a parent file (`test_support.rs`, compiled only under the
   `test-generators` feature, and `compaction/validator/`, compiled only under
   `cfg(test)` / `compaction-validator`); neither enters the serving library.
+**Warn ahead of an expiry (2026-10 addition).** An allow entry was silently
+fine until the instant it blocked every PR: nine entries dated 2026-09-30
+expired together and turned `main` red on the next push, in an unrelated PR,
+because nothing reported an entry that lapses in a week. `expiring_allow_warnings`
+now returns one WARNING per entry whose `expires` falls inside a warn-ahead
+window — `--warn-within DAYS`, default `21`, inclusive of an entry expiring
+today — naming owner, rule, path, expiry and days remaining. Warnings are
+advisory and never touch the exit code; the failure half
+(`expired_allow_findings`, `expires < today`) is unchanged, and an expired entry
+is never *also* warned about. A malformed `expires` (not a real `YYYY-MM-DD`) is
+reported as `unparseable-allow-expiry`: the lexicographic expiry compare can only
+be trusted for ISO dates, and such an entry is otherwise immortal. `--warn-within`
+fails loud on a non-numeric value. Days remaining are exact Gregorian calendar
+days; a test pins the historical lexicographic compare against them on every
+shipped entry.
+
+**A daily run, so `main` notices first.** `.github/workflows/oom-audit-daily.yml`
+runs the *same* enforced audit as the Clippy job once a day, because the expiry
+check is driven by the run date and not by any code change: without it a
+date-triggered failure is only ever discovered by whichever PR happens to run
+next. It is a dedicated workflow (not a `schedule:` on `ci.yml`) so it runs the
+audit and nothing else. `tests/ci/test_oom_audit_daily_workflow.py` pins the
+schedule, the byte-identical command, the SHA pins, `contents: read` and the
+absence of any secret, and is itself wired into `ci.yml`'s `fmt` job.
 
 **Move-based-streaming Clone/Copy rules (2026-07 extension).** The original
 `clone-on-row-data` matched only literal `partition/rows/cells` receivers; six
