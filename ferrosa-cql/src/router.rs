@@ -28560,6 +28560,306 @@ mod tests {
 
     // ── BUG-008: Logged batch atomicity ─────────────────────────────────
 
+    // ── Conditional statements inside BATCH ─────────────────────────────
+    //
+    // Regression tests for the class of bug that produced a production 500 in
+    // ferrosa-dbaas org creation: a conditional statement placed inside a BATCH
+    // had its condition silently DROPPED and the mutation applied
+    // unconditionally (`route_logged_batch` / `route_unlogged_batch` route
+    // through the unconditional `materialize_*` helpers). A client that used a
+    // batch to get uniqueness therefore got an unconditional overwrite with no
+    // error — the "looks like a control but does not gate" failure mode.
+    //
+    // The guard that rejects these lives in `route_batch`. These tests assert
+    // the OUTCOME (no corruption) rather than the error variant alone, so they
+    // stay meaningful whether the engine rejects or one day implements them.
+
+    /// A conditional INSERT inside a LOGGED batch must never overwrite an
+    /// existing row. On the buggy engine the condition was dropped and the row
+    /// was clobbered while the batch reported success.
+    #[tokio::test]
+    async fn batch_conditional_insert_logged_does_not_overwrite_existing_row() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        let ks = crate::parser::parse(
+            "CREATE KEYSPACE cb WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, ks).await.unwrap();
+
+        let table = crate::parser::parse("CREATE TABLE cb.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, table).await.unwrap();
+
+        // Seed the original value with a standalone INSERT (that path gates
+        // correctly and is not under test here).
+        let seed = crate::parser::parse("INSERT INTO cb.t (k, v) VALUES (1, 'original')").unwrap();
+        route(&state, &ctx, seed).await.unwrap();
+
+        // The row now exists. A conditional batch insert must NOT replace it.
+        let batch = crate::parser::parse(
+            "BEGIN BATCH \
+               INSERT INTO cb.t (k, v) VALUES (1, 'clobbered') IF NOT EXISTS; \
+             APPLY BATCH",
+        )
+        .unwrap();
+        let _ = route(&state, &ctx, batch).await;
+
+        // Whatever the engine returns, the stored value must be untouched.
+        let select = crate::parser::parse("SELECT v FROM cb.t WHERE k = 1").unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, select).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("clobbered"),
+            "a conditional INSERT inside a logged batch overwrote an existing \
+             row: the IF NOT EXISTS condition was ignored. Rows: {text}"
+        );
+        assert!(
+            text.contains("original"),
+            "the original row must survive a refused conditional batch insert. Rows: {text}"
+        );
+    }
+
+    /// The same corruption is reachable through an UNLOGGED batch, which has its
+    /// own routing path. Both are rejected up front on a correct engine.
+    #[tokio::test]
+    async fn batch_conditional_insert_unlogged_does_not_overwrite_existing_row() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        let ks = crate::parser::parse(
+            "CREATE KEYSPACE cu WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, ks).await.unwrap();
+
+        let table = crate::parser::parse("CREATE TABLE cu.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, table).await.unwrap();
+
+        let seed = crate::parser::parse("INSERT INTO cu.t (k, v) VALUES (1, 'original')").unwrap();
+        route(&state, &ctx, seed).await.unwrap();
+
+        let batch = crate::parser::parse(
+            "BEGIN UNLOGGED BATCH \
+               INSERT INTO cu.t (k, v) VALUES (1, 'clobbered') IF NOT EXISTS; \
+             APPLY BATCH",
+        )
+        .unwrap();
+        let _ = route(&state, &ctx, batch).await;
+
+        let select = crate::parser::parse("SELECT v FROM cu.t WHERE k = 1").unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, select).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("clobbered"),
+            "a conditional INSERT inside an unlogged batch overwrote an existing \
+             row: the IF NOT EXISTS condition was ignored. Rows: {text}"
+        );
+    }
+
+    /// A refused conditional batch must not half-apply: the *non-conditional*
+    /// sibling in the same batch must not land either. This is the dbaas
+    /// failure shape, where the state row landed while its audit row did not.
+    #[tokio::test]
+    async fn batch_conditional_refusal_leaves_no_partial_write() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        let ks = crate::parser::parse(
+            "CREATE KEYSPACE cp WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, ks).await.unwrap();
+
+        let table = crate::parser::parse("CREATE TABLE cp.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, table).await.unwrap();
+
+        // k=1 exists (so the conditional member will refuse), k=2 does not.
+        let seed = crate::parser::parse("INSERT INTO cp.t (k, v) VALUES (1, 'original')").unwrap();
+        route(&state, &ctx, seed).await.unwrap();
+
+        // First member is plain and would succeed; second is conditional and
+        // must refuse. A correct engine rejects the batch before writing, so
+        // the plain member must NOT appear.
+        let batch = crate::parser::parse(
+            "BEGIN BATCH \
+               INSERT INTO cp.t (k, v) VALUES (2, 'sibling'); \
+               INSERT INTO cp.t (k, v) VALUES (1, 'clobbered') IF NOT EXISTS; \
+             APPLY BATCH",
+        )
+        .unwrap();
+        let _ = route(&state, &ctx, batch).await;
+
+        let select = crate::parser::parse("SELECT k, v FROM cp.t").unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, select).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("sibling"),
+            "a refused conditional batch half-applied its unconditional sibling: \
+             the batch must be refused before anything is written. Rows: {text}"
+        );
+        assert!(
+            !text.contains("clobbered"),
+            "the conditional member must not apply. Rows: {text}"
+        );
+    }
+
+    /// Guard against over-rejection: an unconditional logged batch must still
+    /// apply normally.
+    #[tokio::test]
+    async fn batch_unconditional_still_applies() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        let ks = crate::parser::parse(
+            "CREATE KEYSPACE cu2 WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, ks).await.unwrap();
+
+        let table = crate::parser::parse("CREATE TABLE cu2.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, table).await.unwrap();
+
+        let batch = crate::parser::parse(
+            "BEGIN BATCH \
+               INSERT INTO cu2.t (k, v) VALUES (1, 'a'); \
+               INSERT INTO cu2.t (k, v) VALUES (2, 'b'); \
+             APPLY BATCH",
+        )
+        .unwrap();
+        route(&state, &ctx, batch)
+            .await
+            .expect("an unconditional logged batch must still apply");
+
+        let select = crate::parser::parse("SELECT k, v FROM cu2.t").unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, select).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains('a') && text.contains('b'),
+            "both unconditional batch members must land. Rows: {text}"
+        );
+    }
+
+    /// A STANDALONE conditional UPDATE must evaluate its condition. On main,
+    /// `route_update` returns `encode_void()` and never consults `if_conditions`,
+    /// so `UPDATE ... IF version = ?` applies unconditionally and a caller
+    /// relying on the compare-and-set guard silently loses it.
+    ///
+    /// This is the non-batch counterpart of the conditional-batch bug: the same
+    /// "condition ignored" class, reachable without any batch at all. It is the
+    /// property ferrosa-dbaas compare_and_set depends on.
+    #[tokio::test]
+    async fn standalone_conditional_update_does_not_apply_when_condition_is_false() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        let ks = crate::parser::parse(
+            "CREATE KEYSPACE cw WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, ks).await.unwrap();
+
+        let table =
+            crate::parser::parse("CREATE TABLE cw.t (k int PRIMARY KEY, v text, version bigint)")
+                .unwrap();
+        route(&state, &ctx, table).await.unwrap();
+
+        // Seed at version 1.
+        let seed =
+            crate::parser::parse("INSERT INTO cw.t (k, v, version) VALUES (1, 'v1', 1)").unwrap();
+        route(&state, &ctx, seed).await.unwrap();
+
+        // The condition is FALSE (stored version is 1, we ask for 99). The write
+        // must not land.
+        let cas = crate::parser::parse(
+            "UPDATE cw.t SET v = 'clobbered', version = 2 WHERE k = 1 IF version = 99",
+        )
+        .unwrap();
+        let _ = route(&state, &ctx, cas).await;
+
+        let select = crate::parser::parse("SELECT v, version FROM cw.t WHERE k = 1").unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, select).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("clobbered"),
+            "a standalone conditional UPDATE applied while its IF condition was \
+             false: the compare-and-set guard was ignored. Rows: {text}"
+        );
+        assert!(
+            !text.contains('2'),
+            "the version must not advance past a refused CAS. Rows: {text}"
+        );
+    }
+
+    /// The true branch must still apply: the guard must not over-reject.
+    #[tokio::test]
+    async fn standalone_conditional_update_applies_when_condition_is_true() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        let ks = crate::parser::parse(
+            "CREATE KEYSPACE cwt WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, ks).await.unwrap();
+
+        let table =
+            crate::parser::parse("CREATE TABLE cwt.t (k int PRIMARY KEY, v text, version bigint)")
+                .unwrap();
+        route(&state, &ctx, table).await.unwrap();
+
+        let seed =
+            crate::parser::parse("INSERT INTO cwt.t (k, v, version) VALUES (1, 'v1', 1)").unwrap();
+        route(&state, &ctx, seed).await.unwrap();
+
+        // Condition TRUE: stored version is 1.
+        let cas = crate::parser::parse(
+            "UPDATE cwt.t SET v = 'applied', version = 2 WHERE k = 1 IF version = 1",
+        )
+        .unwrap();
+        route(&state, &ctx, cas)
+            .await
+            .expect("a satisfied conditional UPDATE must apply");
+
+        let select = crate::parser::parse("SELECT v FROM cwt.t WHERE k = 1").unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, select).await.unwrap() else {
+            panic!("expected a result set");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("applied"),
+            "a satisfied conditional UPDATE must land. Rows: {text}"
+        );
+    }
+
     /// A logged batch where one statement targets a non-existent table
     /// should not leave earlier statements committed.
     #[tokio::test]
