@@ -23,7 +23,7 @@ use crate::codec::{InternodeCodec, Lane};
 use crate::config::NetConfig;
 use crate::handshake::accept_handshake;
 use crate::lane_actor::{spawn_lane_actor, ActorReconnectContext, LaneHandle, LaneStatusReport};
-use crate::reconnect::{total_reconnect_attempts, LaneState};
+use crate::reconnect::LaneState;
 use crate::rpc::client::RpcClient;
 use crate::task_pool::TaskPool;
 
@@ -68,6 +68,37 @@ pub(crate) fn spawn_fake_peer(
         serve(listener, id, up_for, false, counter).await;
     });
     FakePeer { accepted }
+}
+
+/// A node that accepts TCP connections and never answers the handshake, held
+/// open from `start_after` until `until` (the clock's offset from now), then
+/// closed. Each accept is one dial of the peer, so the count is a peer-scoped
+/// dial counter: unlike the process-wide `total_reconnect_attempts` it cannot
+/// be moved by other tests running in parallel threads. A dial against it
+/// lasts the handshake timeout (5 s) before the client gives up.
+pub(crate) fn spawn_blackhole(
+    addr: SocketAddr,
+    start_after: Duration,
+    until: Duration,
+) -> Arc<AtomicUsize> {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        tokio::time::sleep(start_after).await;
+        let listener = TcpListener::bind(addr).await.expect("blackhole bind");
+        let end = tokio::time::Instant::now() + (until - start_after);
+        let mut held = Vec::new();
+        loop {
+            tokio::select! {
+                res = listener.accept() => {
+                    held.push(res.expect("blackhole accept").0);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                () = tokio::time::sleep_until(end) => break,
+            }
+        }
+    });
+    accepted
 }
 
 /// Like [`spawn_fake_peer`] but on an already-bound listener, so the first
@@ -353,22 +384,26 @@ async fn slow_retry_logs_the_drop_and_the_recovery_once_each() {
     let addr = free_addr();
     let peer_id = Uuid::new_v4();
     let handle = lane_whose_peer_just_died(addr, peer_id).await;
-    let _returned = spawn_fake_peer(addr, peer_id, 60 * MINUTE, None);
+    // The node is up but never answers until minute 60, so each dial is counted
+    // at the peer (peer-scoped, see `spawn_blackhole`), then the real peer binds.
+    let dials = spawn_blackhole(addr, Duration::from_secs(5), 60 * MINUTE);
+    let _returned = spawn_fake_peer(addr, peer_id, 60 * MINUTE + Duration::from_secs(1), None);
 
     // The fast phase (three cycles) ends by minute 12 at the latest. Count the
-    // attempts made between minute 13 and minute 58: with a probe every 30 s
-    // plus up to 25% jitter that is at least 2700 / 37.5 = 72. The log
-    // assertions below only mean something if many probes happened silently, so
-    // require most of them (60) rather than any.
+    // dials made between minute 13 and minute 58. A cycle is the wait (30 s plus
+    // up to 25% jitter) plus the 5 s handshake timeout the blackhole forces, at
+    // most 42.5 s, so 2700 / 42.5 = 63 dials at worst. The log assertions below
+    // only mean something if many probes happened silently, so require most of
+    // them (60) rather than any.
     run_for(13 * MINUTE).await;
-    let attempts_at_13m = total_reconnect_attempts();
+    let dials_at_13m = dials.load(Ordering::SeqCst);
     run_for(45 * MINUTE).await;
-    let slow_attempts = total_reconnect_attempts() - attempts_at_13m;
+    let slow_dials = dials.load(Ordering::SeqCst) - dials_at_13m;
     assert!(
-        slow_attempts >= 60,
-        "expected a probe about every 30 s over 45 minutes, saw {slow_attempts}"
+        slow_dials >= 60,
+        "expected a probe about every 30 s over 45 minutes, saw {slow_dials}"
     );
-    run_for(4 * MINUTE).await;
+    run_for(6 * MINUTE).await;
     assert_eq!(status(&handle).await, LaneStatusReport::Connected);
 
     let lines = logs.lines();
@@ -409,6 +444,8 @@ async fn shutdown_during_slow_retry_stops_attempts_and_leaks_no_task() {
     // Binds five seconds after the shutdown below, so any dial the lane made
     // after being shut down would reach it and show in `accepted()`.
     let returned = spawn_fake_peer(addr, peer_id, 25 * MINUTE + Duration::from_secs(5), None);
+    // Counts the lane's dials until minute 25, the moment of shutdown below.
+    let dials = spawn_blackhole(addr, Duration::from_secs(5), 25 * MINUTE);
     let tasks_before_lane = tokio::runtime::Handle::current()
         .metrics()
         .num_alive_tasks();
@@ -419,14 +456,15 @@ async fn shutdown_during_slow_retry_stops_attempts_and_leaks_no_task() {
     let handle = connected_lane(addr).await;
     tokio::time::pause(); // after the connect; see `lane_whose_peer_just_died`
     run_for(13 * MINUTE).await;
-    let attempts_at_13m = total_reconnect_attempts();
+    let dials_at_13m = dials.load(Ordering::SeqCst);
     run_for(12 * MINUTE).await;
-    // Without live probing the "no further attempts after shutdown" check below
-    // would hold trivially: 12 minutes at one probe per <= 37.5 s is >= 19.
-    let slow_attempts = total_reconnect_attempts() - attempts_at_13m;
+    // Without live probing the "no dial after shutdown" check below would hold
+    // trivially: 12 minutes at one probe per <= 42.5 s (wait plus the 5 s
+    // handshake timeout) is >= 16.
+    let slow_dials = dials.load(Ordering::SeqCst) - dials_at_13m;
     assert!(
-        slow_attempts >= 15,
-        "the lane was not probing before shutdown: {slow_attempts} attempts in 12 minutes"
+        slow_dials >= 15,
+        "the lane was not probing before shutdown: {slow_dials} dials in 12 minutes"
     );
     assert_ne!(status(&handle).await, LaneStatusReport::Connected);
     assert_eq!(first.accepted(), 1);
