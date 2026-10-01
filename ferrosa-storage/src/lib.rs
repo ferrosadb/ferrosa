@@ -23,6 +23,7 @@ pub mod data_store;
 pub mod engine;
 pub mod eviction_audit;
 pub mod eviction_marker;
+pub(crate) mod evicted_read;
 pub(crate) mod eviction_plan;
 pub mod external_sort;
 pub mod flush;

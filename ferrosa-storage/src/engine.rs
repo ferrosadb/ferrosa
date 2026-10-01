@@ -2184,7 +2184,7 @@ fn normalize_consolidation_type(type_name: &str) -> String {
 }
 
 impl StorageEngine {
-    fn block_on_rehydration<F, T>(future: F) -> T
+    pub(crate) fn block_on_rehydration<F, T>(future: F) -> T
     where
         F: Future<Output = T>,
     {
@@ -2209,7 +2209,7 @@ impl StorageEngine {
             .block_on(future)
     }
 
-    fn parse_local_sstable_component_path(
+    pub(crate) fn parse_local_sstable_component_path(
         data_dir: &Path,
         path: &Path,
     ) -> Option<(String, String, String)> {
@@ -2255,102 +2255,11 @@ impl StorageEngine {
             "CRC.db",
         ];
 
-        {
-            let data_dir = data_dir.clone();
-            let prefix = prefix.clone();
-            let store = Arc::clone(&store);
-            ferrosa_sstable::io::register_file_read_range_hook(Arc::new(
-                move |path, offset, len| {
-                    let Some((table_id, sstable_id, component)) =
-                        Self::parse_local_sstable_component_path(&data_dir, path)
-                    else {
-                        return Ok(None);
-                    };
-                    if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
-                        return Ok(None);
-                    }
-                    if len == 0 {
-                        return Ok(Some(Vec::new()));
-                    }
-
-                    let start = usize::try_from(offset).map_err(|_| {
-                        ferrosa_common::Error::InvalidFormat(format!(
-                            "SSTable range read offset exceeds usize: {}",
-                            offset
-                        ))
-                    })?;
-                    let end = start.checked_add(len).ok_or_else(|| {
-                        ferrosa_common::Error::InvalidFormat(format!(
-                            "SSTable range read overflow: offset={} len={}",
-                            offset, len
-                        ))
-                    })?;
-                    let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
-                    let s3_path = crate::upload::manager::sstable_object_key(
-                        &prefix,
-                        &hex,
-                        &table_id,
-                        &sstable_id,
-                        &component,
-                    );
-                    let store = Arc::clone(&store);
-                    let result = Self::block_on_rehydration(async move {
-                        match store.get_range(&s3_path, start..end).await {
-                            Ok(bytes) => Ok(Some(bytes.to_vec())),
-                            Err(object_store::Error::NotFound { .. }) => Ok(None),
-                            Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
-                                "failed ranged SSTable component read {s3_path}: {e}"
-                            ))),
-                        }
-                    })?;
-                    if result.is_some() {
-                        tracing::debug!(
-                            local_path = %path.display(),
-                            table = table_id,
-                            sstable = sstable_id,
-                            component,
-                            offset,
-                            len,
-                            "served evicted SSTable component range from object storage"
-                        );
-                    }
-                    Ok(result)
-                },
-            ));
-        }
-        {
-            let data_dir = data_dir.clone();
-            let prefix = prefix.clone();
-            let store = Arc::clone(&store);
-            ferrosa_sstable::io::register_file_read_len_hook(Arc::new(move |path| {
-                let Some((table_id, sstable_id, component)) =
-                    Self::parse_local_sstable_component_path(&data_dir, path)
-                else {
-                    return Ok(None);
-                };
-                if !SSTABLE_COMPONENTS.contains(&component.as_str()) {
-                    return Ok(None);
-                }
-                let hex = crate::upload::manager::hex_prefix_for(&sstable_id);
-                let s3_path = crate::upload::manager::sstable_object_key(
-                    &prefix,
-                    &hex,
-                    &table_id,
-                    &sstable_id,
-                    &component,
-                );
-                let store = Arc::clone(&store);
-                Self::block_on_rehydration(async move {
-                    match store.head(&s3_path).await {
-                        Ok(meta) => Ok(Some(meta.size as u64)),
-                        Err(object_store::Error::NotFound { .. }) => Ok(None),
-                        Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
-                            "failed SSTable component head {s3_path}: {e}"
-                        ))),
-                    }
-                })
-            }));
-        }
+        let rehydration_locks: Arc<DashMap<String, Arc<std::sync::Mutex<()>>>> =
+            Arc::new(DashMap::new());
+        // Ranged, paged read-through (ST-51): serves `Data.db` pages and
+        // lengths of evicted components without a whole-generation download.
+        crate::evicted_read::register(data_dir.clone(), prefix.clone(), Arc::clone(&store));
         ferrosa_sstable::io::register_file_read_rehydration_hook(Arc::new(move |path| {
             let Some((table_id, sstable_id, component)) =
                 Self::parse_local_sstable_component_path(&data_dir, path)
@@ -14748,6 +14657,7 @@ impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
 #[cfg(test)]
 mod tests {
     include!("engine_wiring_tests.rs");
+    include!("engine_evicted_ranged_tests.rs");
 
     use super::*;
 
@@ -30556,8 +30466,10 @@ mod tests {
     /// eviction and the next restart, the read path could not reopen the
     /// evicted SSTable because the required-component `exists()` check failed
     /// BEFORE the S3 read-through hook could run, so reads returned partial
-    /// data. A marked generation must be rehydrated on reopen, and once it is
-    /// local again its marker must be cleared.
+    /// data. A marked generation must be reopenable. Since ST-51 a query open
+    /// reads it through ranged GETs instead of rehydrating the whole generation,
+    /// so `Data.db` stays remote and the marker stays (the generation is still
+    /// evicted; a restart or compaction restores it in full).
     #[tokio::test(flavor = "multi_thread")]
     async fn rows_of_an_evicted_sstable_are_readable_live_without_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -30572,12 +30484,12 @@ mod tests {
             );
         }
         assert!(
-            StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_some(),
-            "the reopen rehydrated the generation into the local cache"
+            StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_none(),
+            "a query open must not download Data.db (ST-51)"
         );
         assert!(
-            !StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
-            "a generation that is local again must not keep its eviction marker"
+            StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
+            "the generation is still evicted, so its marker stays"
         );
         engine.shutdown().unwrap();
     }

@@ -331,6 +331,21 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   marked generation between eviction and restart rehydrates it from S3 first
   (`flush::rehydrate_if_evicted`, called by `open_file_sstable` and
   `open_sstable_from_dir`) and then clears the marker; an unmarked missing
+  restoring it would resurrect purged rows. Retiring a generation
+  (`delete_sstable_files`) removes its marker. A live QUERY that reopens a
+  marked generation between eviction and restart does not download it
+  (ST-51, `evicted_read.rs`): `open_file_sstable` fetches only the small index
+  components (`Partitions.db`, `Rows.db`, `Filter.db`, `Statistics.db`,
+  `CompressionInfo.db`, `TOC.txt`, digests) and serves `Data.db` through ranged
+  GETs. Pages follow compression-chunk boundaries (else
+  `FERROSA_S3_READ_PAGE_BYTES`, default 1 MiB), sit in a bounded LRU
+  (`FERROSA_S3_PAGE_CACHE_BYTES`, default 256 MiB), concurrent readers of a page
+  share one fetch, and adjacent misses become one ranged GET. All requests use
+  the engine's one shared object-store client. The marker stays, the per-chunk
+  CRC / `CRC.db` checks run on the ranged bytes, and a short or failed ranged
+  read is an error (ST-41). Whole-generation rehydrate
+  (`flush::rehydrate_if_evicted`, `open_sstable_from_dir`) remains for
+  compaction inputs, and clears the marker once the generation is local; an unmarked missing
   generation still fails to open so the read path's view-retry fires. System
   keyspaces are never evicted. See FMEA ST-38.
   **The marker records why** (`eviction_marker.rs`, FMEA ST-63): one JSON

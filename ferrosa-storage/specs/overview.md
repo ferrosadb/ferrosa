@@ -106,6 +106,10 @@ volume or changing query results.
    within `FERROSA_CACHE_HOT_WINDOW_SECS` (default 900; `0` disables) is never
    a candidate, and the rest go never-read first, then least recently read,
    then oldest write (FMEA ST-40). Anti-entropy repair reads do not count.
+   A query over an evicted SSTable reads `Data.db` by paged ranged GETs and
+   fetches only the small index components; it never downloads the whole
+   generation (FMEA ST-51). Compaction inputs and startup restore still
+   rehydrate in full.
    Periodic S3 sync skips incomplete generations before upload or manifest
    publication: all four required components (`Data.db`, `Partitions.db`,
    `Rows.db`, and `Filter.db`) must be present. This is a presence check;
