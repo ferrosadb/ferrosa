@@ -21,6 +21,7 @@ pub mod commitlog;
 pub mod compaction;
 pub mod data_store;
 pub mod engine;
+pub(crate) mod eviction_plan;
 pub mod external_sort;
 pub mod flush;
 pub(crate) mod flush_executor;
