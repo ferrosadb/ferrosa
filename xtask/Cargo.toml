@@ -21,3 +21,8 @@ walkdir = "2.5.0"
 toml = "0.8.23"
 serde = { version = "1.0.228", features = ["derive"] }
 anyhow = "1.0.102"
+
+[dev-dependencies]
+# The out-of-line `#[cfg(test)] mod` skip is a filesystem behaviour (module
+# resolution against real paths), so its test plants real files.
+tempfile = "3"

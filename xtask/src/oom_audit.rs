@@ -2620,18 +2620,97 @@ fn is_scannable(path: &Path) -> bool {
     in_src && !in_excluded && !test_tooling
 }
 
+/// Files holding an OUT-OF-LINE `#[cfg(test)]` module, i.e. the targets of a
+/// `#[cfg(test)] mod foo;` declaration with no inline body.
+///
+/// [`strip_test_items`] removes `#[cfg(test)]` code from the file it is parsing,
+/// but a `#[cfg(test)] mod foo;` declaration puts the gate in the DECLARING file
+/// while the code lives in another one. Scanning that other file on its own sees
+/// no `cfg(test)` attribute and audits a test harness as if it were a production
+/// read path — which is a false positive, since a test harness legitimately reads
+/// a whole table and accumulates rows to compare against its model. This closes
+/// that gap so the documented rule ("the audit never inspects test code") holds
+/// for out-of-line modules too. It cannot hide production code: a file reachable
+/// only through a `#[cfg(test)]` declaration is not compiled into the binary.
+fn out_of_line_test_module_files(roots: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
+    let mut skip = std::collections::HashSet::new();
+    for root in roots {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+        {
+            let decl = entry.path();
+            if !is_scannable(decl) {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(decl) else {
+                continue;
+            };
+            let Ok(parsed) = syn::parse_file(&src) else {
+                continue;
+            };
+            let Some(dir) = decl.parent() else {
+                continue;
+            };
+            for item in &parsed.items {
+                let syn::Item::Mod(m) = item else { continue };
+                // Only a declaration (`mod foo;`); an inline `mod foo { .. }` is
+                // already handled by `strip_test_items`.
+                if m.content.is_some() || !has_cfg_test(&m.attrs) {
+                    continue;
+                }
+                let name = m.ident.to_string();
+                // An explicit `#[path = "..."]` wins; otherwise Rust looks for
+                // `<name>.rs` beside the declaring file and, for a non-`mod.rs`
+                // file, in `<declaring stem>/<name>.rs`.
+                if let Some(explicit) = mod_path_attr(&m.attrs) {
+                    skip.insert(dir.join(explicit));
+                    continue;
+                }
+                skip.insert(dir.join(format!("{name}.rs")));
+                if let Some(stem) = decl.file_stem().and_then(|s| s.to_str()) {
+                    if stem != "mod" && stem != "lib" && stem != "main" {
+                        skip.insert(dir.join(stem).join(format!("{name}.rs")));
+                    }
+                }
+            }
+        }
+    }
+    skip
+}
+
+/// The value of a `#[path = "..."]` attribute, if present.
+fn mod_path_attr(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|a| {
+        if !a.path().is_ident("path") {
+            return None;
+        }
+        match &a.meta {
+            syn::Meta::NameValue(nv) => match &nv.value {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) => Some(s.value()),
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
 /// Audit every scannable file under `roots`. IO happens here; detection is
 /// delegated to `audit_source`. Does not apply expired-entry findings (the CLI
 /// adds those once, with its `--today`).
 pub fn audit_paths(roots: &[PathBuf], allow: &Allowlist) -> Vec<Finding> {
     let mut findings = Vec::new();
+    let test_module_files = out_of_line_test_module_files(roots);
     for root in roots {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
             .filter_map(std::result::Result::ok)
         {
             let p = entry.path();
-            if !is_scannable(p) {
+            if !is_scannable(p) || test_module_files.contains(p) {
                 continue;
             }
             match std::fs::read_to_string(p) {
@@ -2658,6 +2737,53 @@ mod tests {
 
     fn no_allow() -> Allowlist {
         Allowlist::default()
+    }
+
+    /// A `#[cfg(test)] mod foo;` declaration gates code that lives in ANOTHER
+    /// file, so scanning that file alone sees no `cfg(test)` and audits a test
+    /// harness as a production read path. Both module layouts Rust accepts are
+    /// covered: `<name>.rs` beside the declaring file, and
+    /// `<declaring stem>/<name>.rs` (which is how `engine.rs` reaches
+    /// `engine/cache_invariants.rs`).
+    ///
+    /// The planted body is an unbounded full-table read, which the audit flags
+    /// on a production path; it must raise nothing from either test module and
+    /// must still raise from a non-test sibling, so the skip is scoped and has
+    /// not simply switched the rule off.
+    #[test]
+    fn out_of_line_cfg_test_modules_are_not_audited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("engine")).expect("mkdir");
+
+        let offending = "fn scan(e: &E) { let _ = e.read_range(None, None, 0); }\n";
+
+        std::fs::write(
+            src.join("engine.rs"),
+            "#[cfg(test)]\nmod cache_invariants;\n#[cfg(test)]\n#[path = \"engine_extra.rs\"]\nmod extra;\n",
+        )
+        .expect("write engine.rs");
+        std::fs::write(src.join("engine").join("cache_invariants.rs"), offending)
+            .expect("write nested module");
+        std::fs::write(src.join("engine_extra.rs"), offending).expect("write path-attr module");
+        // Not gated by any declaration: must still be audited.
+        std::fs::write(src.join("production.rs"), offending).expect("write production");
+
+        let findings = audit_paths(&[dir.path().to_path_buf()], &no_allow());
+        let flagged: Vec<&str> = findings.iter().map(|f| f.path.as_str()).collect();
+
+        assert!(
+            !flagged.iter().any(|p| p.contains("cache_invariants.rs")),
+            "an out-of-line #[cfg(test)] module reached by <stem>/<name>.rs must not be audited, got {flagged:?}"
+        );
+        assert!(
+            !flagged.iter().any(|p| p.contains("engine_extra.rs")),
+            "an out-of-line #[cfg(test)] module reached by #[path] must not be audited, got {flagged:?}"
+        );
+        assert!(
+            flagged.iter().any(|p| p.contains("production.rs")),
+            "a file that is NOT a declared test module must still be audited, got {flagged:?}"
+        );
     }
 
     /// Repo root: `xtask/`'s parent is the workspace root.
