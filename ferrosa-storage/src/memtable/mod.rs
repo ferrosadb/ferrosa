@@ -224,6 +224,55 @@ pub(crate) fn normalize_collection_rows_for_merge(
     Ok(())
 }
 
+/// Collection kind of the column at cell index `idx` (statics first, then
+/// regulars, per `TableSchema`'s contract), or `None` for a non-collection,
+/// frozen or out-of-range column.
+fn collection_kind_at(schema: &TableSchema, idx: u16) -> Option<RawCollectionKind> {
+    let idx = idx as usize;
+    let static_count = schema.static_columns.len();
+    let column = if idx < static_count {
+        schema.static_columns.get(idx)
+    } else {
+        schema.regular_columns.get(idx - static_count)
+    }?;
+    raw_collection_kind(&column.type_name)
+}
+
+/// Expand every legacy whole-value collection cell (live, `path == None`, on a
+/// non-frozen list/set/map column) into a deletion sentinel plus per-element
+/// cells, in place. `row` is untouched when an error is returned.
+///
+/// Commit-log segments written before collection writes were normalised can
+/// still carry such cells. Replayed as-is they reach the flush writer, which
+/// asserts `path == None` cells on a complex column are tombstones whenever
+/// ANY cell in the same flush has a path — so one old blob beside an element
+/// write on another partition panics the flush. Normalising at the replay
+/// producer keeps the writer's assertion intact.
+pub(crate) fn expand_legacy_collection_blobs(row: &mut Row, schema: &TableSchema) -> Result<()> {
+    let is_blob = |cell: &CellValue| cell.path.is_none() && !cell.is_tombstone();
+    if !row
+        .cells
+        .iter()
+        .any(|(idx, cell)| is_blob(cell) && collection_kind_at(schema, *idx).is_some())
+    {
+        return Ok(());
+    }
+    let mut cells = Vec::with_capacity(row.cells.len() + 1);
+    for (idx, cell) in &row.cells {
+        match collection_kind_at(schema, *idx).filter(|_| is_blob(cell)) {
+            Some(kind) => cells.extend(
+                expand_legacy_collection_cell(kind, cell)?
+                    .into_iter()
+                    .map(|element| (*idx, element)),
+            ),
+            None => cells.push((*idx, cell.clone())),
+        }
+    }
+    cells.sort_by(|(a_idx, a), (b_idx, b)| (a_idx, &a.path).cmp(&(b_idx, &b.path)));
+    row.cells = cells;
+    Ok(())
+}
+
 pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Result<()> {
     // Clustering shape: production wedge was an 8-byte clustering on a
     // TimeUUID-clustered table. Catching this at the memtable boundary

@@ -482,6 +482,17 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
   quarantines them under a safety rail.
+- **Replay without a schema degrades instead of exiting** (`replay_set_aside.rs`,
+  FMEA ST-52) — when no `schema.json`/`storage-schema.json` is usable, replay
+  buffers up to `FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA` mutations in memory
+  and appends the overflow to `<data_dir>/commitlog-unreplayed/*.unreplayed`
+  (CRC-framed, fsynced before the commit-log segment is deleted). The engine
+  opens, logs table ids/count/path at ERROR, bumps
+  `ferrosa_commitlog_replay_set_aside_mutations_total` and reports it through
+  `StorageEngine::replay_set_aside_report()`. Set-aside mutations are durable but
+  NOT visible to reads, and are not re-ingested automatically. Replay also
+  expands legacy whole-value collection cells into element cells so the SSTable
+  writer's mixed-cell assertion cannot fire at the next flush.
 - **Range reads fail loud on an unreadable SSTable** (`store.rs`,
   `with_retried_scan`, FMEA ST-41) — `read_range*`, `read_token_range[_bounded]`,
   `walk_token_range[_for_digest]`, the time-series cursor and the full-text

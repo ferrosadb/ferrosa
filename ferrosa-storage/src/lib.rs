@@ -37,6 +37,7 @@ pub mod quantized_range_cache;
 pub mod quarantine;
 pub mod range_merger;
 pub mod reader_pool;
+pub mod replay_set_aside;
 pub mod restore;
 pub(crate) mod runtime_tuning;
 pub mod schema_snapshot;

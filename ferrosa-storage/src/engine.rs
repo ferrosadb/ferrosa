@@ -1125,6 +1125,10 @@ pub struct StorageEngine {
     /// Commitlog mutations replayed before their table schema is registered.
     /// These are applied lazily when the table is later registered.
     deferred_replay_mutations: parking_lot::Mutex<Vec<Mutation>>,
+    /// Mutations startup replay wrote to disk instead of a memtable because no
+    /// schema was available and the in-memory buffer was full. `None` when
+    /// nothing was set aside. See [`crate::replay_set_aside`].
+    replay_set_aside: Option<crate::replay_set_aside::ReplaySetAsideReport>,
     /// Index registrations that arrived before their table was registered,
     /// applied when it is — the same lazy shape as
     /// `deferred_replay_mutations` directly above, for the same reason.
@@ -2756,6 +2760,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            replay_set_aside: None,
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -2982,6 +2987,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            replay_set_aside: None,
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -3119,7 +3125,12 @@ impl StorageEngine {
         let max_pending_without_schema = config.max_pending_replay_mutations_without_schema;
         let mut seen_replay_ids: std::collections::HashSet<[u8; 16]> =
             std::collections::HashSet::new();
-        let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming(
+        // Overflow of the no-schema buffer is written here, durably, instead of
+        // refusing to open. The barrier fsyncs it before each segment is deleted.
+        let set_aside = parking_lot::Mutex::new(crate::replay_set_aside::ReplaySetAside::new(
+            &config.data_dir,
+        ));
+        let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming_with_barrier(
             config.commit_log.clone(),
             |mutation| {
                 if !mutation.has_legacy_id() && !seen_replay_ids.insert(mutation.mutation_id) {
@@ -3128,11 +3139,7 @@ impl StorageEngine {
 
                 if tables.read().is_empty() {
                     if pending_mutations.len() >= max_pending_without_schema {
-                        return Err(ferrosa_common::Error::InvalidData(format!(
-                            "commit-log replay schema unavailable and pending replay limit \
-                             ({max_pending_without_schema}) exceeded; restore local/S3 schema \
-                             before replay or raise FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA"
-                        )));
+                        return set_aside.lock().append(&mutation);
                     }
                     pending_mutations.push(mutation);
                 } else if !Self::apply_replay_mutation_to_tables(&tables, &mutation) {
@@ -3140,7 +3147,21 @@ impl StorageEngine {
                 }
                 Ok(())
             },
+            || set_aside.lock().sync(),
         )?;
+        let replay_set_aside = set_aside.into_inner().into_report();
+        if let Some(report) = &replay_set_aside {
+            tracing::error!(
+                mutations = report.mutations,
+                tables = ?report.tables,
+                path = %report.path.display(),
+                limit = max_pending_without_schema,
+                "commit-log replay had no table schema and its in-memory buffer was full \
+                 (FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA); the overflow was set aside on \
+                 disk, NOT replayed. Those mutations are invisible to reads until the schema \
+                 is restored and the file is re-ingested"
+            );
+        }
 
         let engine = Self {
             config,
@@ -3157,6 +3178,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations,
+            replay_set_aside,
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -3789,7 +3811,17 @@ impl StorageEngine {
         let mut quarantine_writer: Option<crate::quarantine::QuarantineWriter> = None;
         let mut quarantined_in_partition = 0usize;
         for row in &mutation.rows {
-            match state.store.write(&mutation.key, row.clone()) {
+            // Old segments may hold whole-value collection cells; expand them
+            // so the flush writer's mixed-cell assertion cannot fire later.
+            let normalized = {
+                let mut normalized = row.clone();
+                crate::memtable::expand_legacy_collection_blobs(
+                    &mut normalized,
+                    &state.store.schema(),
+                )
+                .map(|()| normalized)
+            };
+            match normalized.and_then(|normalized| state.store.write(&mutation.key, normalized)) {
                 Ok(()) => {}
                 Err(ferrosa_common::Error::InvalidData(reason)) => {
                     if quarantine_writer.is_none() {
@@ -9954,6 +9986,19 @@ impl StorageEngine {
         &self.compaction_executor
     }
 
+    /// What startup replay set aside on disk because no table schema was
+    /// available to bind it to, or `None` if nothing was set aside.
+    ///
+    /// A `Some` means mutations are durable under `<data_dir>/commitlog-unreplayed/`
+    /// but are NOT in any memtable: they are invisible to reads until an
+    /// operator restores the schema and re-ingests them. Surface it in status
+    /// output; it is the engine's explicit degraded state.
+    pub fn replay_set_aside_report(
+        &self,
+    ) -> Option<&crate::replay_set_aside::ReplaySetAsideReport> {
+        self.replay_set_aside.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn deferred_replay_mutation_count_for_test(&self) -> usize {
         self.deferred_replay_mutations.lock().len()
@@ -13640,6 +13685,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            replay_set_aside: None,
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -28006,7 +28052,7 @@ mod tests {
     }
 
     #[test]
-    fn open_no_schema_fallback_fails_before_unbounded_pending_vec() {
+    fn open_no_schema_overflow_is_set_aside_on_disk_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let tid = TableId::new("test_ks", "test_table");
 
@@ -28039,17 +28085,125 @@ mod tests {
             memtable_num_shards: 64,
             ..StorageEngineConfig::test_config(dir.path())
         };
-        let err = match StorageEngine::open(config, None) {
-            Ok(_) => panic!(
-                "no-schema compatibility replay must fail closed instead of growing an unbounded pending Vec"
-            ),
-            Err(err) => err.to_string(),
-        };
+        // Two mutations against a limit of one: the second must be set aside
+        // durably, not abort startup (t_2db96eb9).
+        let (engine, pending) = StorageEngine::open(config, None)
+            .expect("a full no-schema replay buffer must degrade, not refuse to open");
+        assert_eq!(pending.len(), 1, "the buffered mutation is still returned");
 
+        let report = engine
+            .replay_set_aside_report()
+            .expect("the overflowing mutation must be reported as set aside");
+        assert_eq!(report.mutations, 1);
+        assert_eq!(report.tables.get("test_ks.test_table"), Some(&1));
+        let set_aside = crate::replay_set_aside::read_set_aside_file(&report.path).unwrap();
+        assert_eq!(set_aside.len(), 1, "the set-aside file holds the mutation");
+        assert_eq!(set_aside[0].table, "test_table");
         assert!(
-            err.contains("schema unavailable") && err.contains("pending replay limit"),
-            "error must explain that schema must be restored before commit-log replay can continue; got: {err}"
+            crate::replay_set_aside::replay_set_aside_mutations_total() >= 1,
+            "the loud counter must move"
         );
+    }
+
+    #[test]
+    fn open_with_recoverable_schema_replays_past_the_no_schema_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "test_table");
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            // A flush persists storage-schema.json (register_table alone does
+            // not), which is the durable schema source replay binds to.
+            engine
+                .write(&tid, &make_key("anchor"), make_row(b"v", 9), 9)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+            for i in 0..3 {
+                engine
+                    .write(&tid, &make_key(&format!("k{i}")), make_row(b"v", i), i)
+                    .unwrap();
+            }
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        let config = StorageEngineConfig {
+            max_pending_replay_mutations_without_schema: 1,
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        assert!(pending.is_empty(), "durable schema binds replay directly");
+        assert!(engine.replay_set_aside_report().is_none());
+        for i in 0..3 {
+            assert!(
+                engine
+                    .read(&tid, &make_key(&format!("k{i}")))
+                    .unwrap()
+                    .is_some(),
+                "mutation k{i} must be replayed from the durable schema"
+            );
+        }
+    }
+
+    #[test]
+    fn replayed_legacy_collection_blob_does_not_panic_flush_beside_element_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "mixed_replay");
+        let list_type = "org.apache.cassandra.db.marshal.ListType(\
+                         org.apache.cassandra.db.marshal.UTF8Type)";
+        let live_row = |cell: CellValue, ts: i64| Row {
+            clustering: vec![],
+            cells: vec![(0, cell)],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+        };
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine
+                .register_table(collection_schema("test_ks", "mixed_replay", list_type))
+                .unwrap();
+            // An old commit log: a whole-value blob in one partition...
+            let blob = encode_cql_sequence(&[b"a", b"b"]);
+            engine
+                .write(
+                    &tid,
+                    &make_key("blob"),
+                    live_row(CellValue::live(blob, 1_000), 1_000),
+                    1_000,
+                )
+                .unwrap();
+            // ...and a per-element cell in another, so the flush is framed complex.
+            let element = CellValue::live(b"c".to_vec(), 2_000)
+                .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0));
+            engine
+                .write(&tid, &make_key("elem"), live_row(element, 2_000), 2_000)
+                .unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        // No schema file was ever persisted, so replay is handed back to the
+        // caller, exactly as `main.rs` does: register the table, then replay.
+        let (engine, pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert_eq!(pending.len(), 2);
+        engine
+            .register_table(collection_schema("test_ks", "mixed_replay", list_type))
+            .unwrap();
+        engine.replay_mutations(pending).unwrap();
+        engine.flush(&tid).expect(
+            "replayed legacy blob must be normalised so flush cannot hit the writer assertion",
+        );
+        for key in ["blob", "elem"] {
+            let partition = engine.read(&tid, &make_key(key)).unwrap().unwrap();
+            assert!(
+                partition.rows[0]
+                    .cells
+                    .iter()
+                    .all(|(_, c)| c.path.is_some() || c.is_tombstone()),
+                "{key}: no live path-less cell may survive on a complex column"
+            );
+        }
     }
 
     #[test]
