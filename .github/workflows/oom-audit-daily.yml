@@ -1,0 +1,105 @@
+name: OOM Audit (daily)
+
+# A date-triggered audit failure must be seen on `main` FIRST — never discovered
+# by whichever unrelated PR happens to run next.
+#
+# Why this exists. The gate's allow-entry expiry check is driven by the RUN DATE,
+# not by any code change. Nine entries dated 2026-09-30 expired together and
+# turned `main` red on the next push, ambushing an unrelated PR; nothing on
+# `main` had noticed on the day itself, because ci.yml triggers the audit only
+# on push-to-main / pull_request / merge_group. A pending expiry is invisible on
+# a quiet repo, and a red main is how it finally announces itself. This workflow
+# makes `main` the first to notice, daily.
+#
+# Scope: the AUDIT ONLY. It does not re-run the test suite, build images, or
+# touch Docker — ci.yml still owns the per-PR gate, and the point of a daily job
+# is that it is cheap enough to run every day. tests/ci/
+# test_oom_audit_daily_workflow.py pins the schedule, the SHA pins, the cache
+# policy, the credential surface, and the exact audit command.
+#
+# The audit also prints a WARNING for any allow entry expiring inside the next
+# 21 days (tunable with `--warn-within DAYS`). Those warnings never affect the
+# exit code; they exist so an approaching expiry is visible before it fails.
+
+on:
+  schedule:
+    # Deliberately NOT a slot another nightly already occupies — nightly-fuzz
+    # 03:00, driver-tests 03:30, nightly-slow-tests 04:00, nightly-sim 05:00,
+    # jepsen-multi-dc 06:00, elle 07:00 (all UTC). A signal that lands while the
+    # long nightlies are competing for runners is a signal nobody reads.
+    - cron: '0 8 * * *' # 8 AM UTC daily
+  workflow_dispatch: # a human can run it on demand
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Build cache policy (tests/ci/test_ci_cache_workflow.py pins it): rust-cache
+  # is the only cache layer. It RESTORES on every ref but SAVES only from main
+  # on a hosted runner — GitHub scopes a cache to the ref that saved it, so a
+  # save from anywhere else can never be restored by main and only evicts
+  # main's. CARGO_INCREMENTAL=0: every run starts from a fresh checkout, so
+  # incremental state is never reused and only inflates the cache.
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: P0 OOM guard (allowlist expiry vs today)
+    # Small on purpose: compiling `xtask` from a restored dependency cache is
+    # the whole cost, so the daily cadence is affordable.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: oom-audit
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+
+      - name: P0 OOM guard — AST read-path materialization audit
+        # The SAME command as the Clippy job in ci.yml, character for character
+        # (tests/ci/test_oom_audit_daily_workflow.py asserts the equality): this
+        # job exists to run the per-PR gate against `main` on a date, not to run
+        # a different one. `--today` is the run date, so an entry that expired
+        # makes THE DAY ITSELF red here — on main, where a date-triggered
+        # failure belongs, instead of in a stranger's pull request.
+        run: cargo run --quiet -p xtask --all-features -- p0-oom-audit --enforce --today "$(date -u +%F)"
+
+      - name: Escalation note (the audit failed)
+        # A red scheduled run is the signal; this makes it readable without
+        # opening the log, and names the fix. No token, no new permission — the
+        # job summary is part of the run itself.
+        if: failure()
+        run: |
+          {
+            echo "## P0 OOM guard: the daily audit FAILED"
+            echo
+            echo "\`main\` has at least one non-whitelisted materialization finding"
+            echo "or an EXPIRED allowlist entry (\`expired-allow-entry\`)."
+            echo
+            echo "This is a date-driven failure: it is not caused by the commit that"
+            echo "appears next to it, and it is not caused by whoever opens the next PR."
+            echo
+            echo "Fix one of:"
+            echo
+            echo "1. **Land the fix** the exemption was waiting on, then delete the"
+            echo "   \`[[allow]]\` entry from \`specs/p0-oom-guard/oom-audit-allow.toml\`."
+            echo "2. **Renew the exemption** — a new, later \`expires\` and an updated"
+            echo "   \`reason\` that says what is still owed and by which task — if the"
+            echo "   materialization is genuinely still accepted."
+            echo
+            echo "Then confirm locally:"
+            echo
+            echo '```'
+            echo 'cargo run -p xtask --all-features -- p0-oom-audit --enforce --today "$(date -u +%F)"'
+            echo '```'
+            echo
+            echo "The audit also warns about entries expiring inside the next 21 days"
+            echo "(\`expiring-allow-entry\`); warnings do not fail the gate, but they are"
+            echo "the advance notice that keeps this job from firing in the first place."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -70,6 +70,13 @@ real backlog is structural and security-shaped.
   - Step 1: the *projected* full-scan arm in `router.rs` consumes the uncapped
     streaming variant `range_read_projected_stream_all_with` (move-only, no
     `Vec<Partition>` materialization), bounded solely by the query's `LIMIT`.
+  - Step 8 (landed): the last fail-loud refusal on the degraded SELECT scan arm
+    is gone. A `DISTINCT` over a non-partition-key column, a per-row function
+    projection, or any other full `ALLOW FILTERING` scan with no user bound now
+    **streams** the uncapped scan (moved row-by-row, never a full-table `Vec`),
+    with `DISTINCT` de-duplicated through the spill-backed `SpillingDedup` set.
+    Every shape the engine can answer is served; results are bounded only by the
+    query's own `LIMIT`, never a server-side row cap.
   - Step 2: the `DEFAULT_RANGE_READ_LIMIT` (10_000) **result cap** is removed
     from the O(1)-streamable shapes. `SELECT SUM/MIN/MAX/AVG` over a full scan
     now folds through an O(1) streaming accumulator
@@ -90,8 +97,10 @@ real backlog is structural and security-shaped.
     `ferrosa_storage::ExternalSorter` (bounded-memory external merge sort with
     cascade k-way merge; RAM-budget reader + 50%-default spill threshold in
     `ferrosa_storage::spill_budget`). Complete, correctly ordered, memory bounded
-    by the threshold, no cap other than the query's `LIMIT`. `DISTINCT`/aggregate/
-    function-projection keep their `range_read_limited_rows_checked` fail-loud cap.
+    by the threshold, no cap other than the query's `LIMIT`. The `DISTINCT`
+    (non-partition-key), function-projection and remaining full-scan shapes now
+    **stream** too — no shape fail-louds on a query the engine can answer,
+    `DISTINCT` de-duplicating through the spill-backed set.
     Remaining: per-group spill when `GROUP BY` lands (deferred; not yet parsed).
   - `fts_match` arm bounded (t_ee98faa0, landed): the full-text branch no longer
     accumulates every matching row before LIMIT (the live `hybrid_search` OOM

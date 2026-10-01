@@ -1628,7 +1628,7 @@ impl ClusterCoordinator {
     /// This is used by full-table CQL scans whose result must be complete
     /// (`ALLOW FILTERING`, `SELECT DISTINCT`, and uncapped `SELECT *`). The
     /// legacy materializing range RPC is intentionally not used here because it
-    /// applies `DEFAULT_RANGE_READ_LIMIT` and would silently return partial
+    /// applies a per-replica message window and would silently return partial
     /// query results.
     pub async fn coordinate_range_read_stream_all(
         &self,
@@ -1741,13 +1741,43 @@ impl ClusterCoordinator {
                 fanout.last_error.as_deref().unwrap_or("no replica tried")
             )));
         }
+        // A partial fan-out is NOT a degraded-but-usable answer: the merge below
+        // would run with fewer sources than the consistency level the caller
+        // asked for, and the rows it returns are indistinguishable from a real
+        // quorum read. That is a silent read below the requested CL, so it is
+        // refused rather than warned about.
+        //
+        // Reachable deterministically (not just under load): RF=5 with QUORUM
+        // needs 3 sources (2 remotes + the local read); if only one remote is
+        // reachable the merge would still have produced a full page from the
+        // local replica plus that one remote. See
+        // `quorum_scan_refuses_instead_of_serving_a_partial_fanout`.
+        //
+        // The error is the same shape as the total-failure case below so callers
+        // see one contract: `every replica fire failed` reports how many were
+        // tried when none worked, this reports the shortfall when some did.
         if fanout.streams.len() < replicas.needed {
             tracing::warn!(
                 failed = fanout.fire_failures,
                 succeeded = fanout.streams.len(),
                 needed = replicas.needed,
-                "paged streaming range read: partial fan-out — some replicas could not be reached"
+                "paged streaming range read: partial fan-out — refusing to serve below \
+                 the requested consistency level"
             );
+            return Err(ClusterError::Internal(format!(
+                "paged streaming range read: partial fan-out — reached {} of {} \
+                 required replicas ({:?} fired, {} live); refusing to serve a read \
+                 below the requested consistency level{}",
+                fanout.streams.len(),
+                replicas.needed,
+                fanout.fire_failures,
+                fanout.streams.len(),
+                fanout
+                    .last_error
+                    .as_deref()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            )));
         }
 
         let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
@@ -2113,12 +2143,11 @@ impl ClusterCoordinator {
         limit: usize,
         row_limit: usize,
     ) -> crate::error::Result<Vec<Partition>> {
-        // `limit` is the caller's own bound (a user `LIMIT N`, or the
-        // `DEFAULT_RANGE_READ_LIMIT + 1` probe of the truncation-detecting
-        // checked reader) — NOT a server-side result cap. Do not re-clamp it to
-        // 10_000: a user `LIMIT 20000` must return up to 20000 rows. Memory is
-        // bounded by the caller's chosen `limit`. Floor at 1 (a 0-limit bounded
-        // read is meaningless).
+        // `limit` is the caller's own bound (a user `LIMIT N`) — NOT a
+        // server-side result cap. Do not re-clamp it to 10_000: a user
+        // `LIMIT 20000` must return up to 20000 rows. Memory is bounded by the
+        // caller's chosen `limit`. Floor at 1 (a 0-limit bounded read is
+        // meaningless).
         let limit = limit.max(1);
 
         // BOUNDED-STREAMING CONSUME PATH (`t_ee98faa0` / `t_3fc6be3c`).

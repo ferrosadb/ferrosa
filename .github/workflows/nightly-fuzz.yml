@@ -15,6 +15,13 @@ env:
 permissions:
   contents: write
   pull-requests: write
+  # A red scheduled run must be VISIBLE. On 2026-09-30 this workflow failed and
+  # nobody noticed for a day: the run's red dot is not a notification, and the
+  # only escalation here (the regression-file PR) fires on a different
+  # condition. The `fuzz` job therefore files a tracking issue when it fails,
+  # the same mechanism nightly-sim and the Elle cert already use. `issues:
+  # write` is the whole added surface — no new secret, no new service.
+  issues: write
 
 jobs:
   fuzz:
@@ -211,12 +218,40 @@ jobs:
           labels: bug,testing
 
       - name: Fail if tests failed
+        # Unchanged verdict: this step is what makes the run red. The issue filer
+        # below is a SIGNAL, never a replacement for the failing run.
         run: |
           status=$(cat cargo-test-status 2>/dev/null || echo 1)
           if [ "$status" -ne 0 ]; then
             echo "::error::Property test command failed with exit status $status — check test-output artifact and regression files"
             exit "$status"
           fi
+
+      - name: File an issue on failure
+        # The visible signal, on the path the verdict step above just failed.
+        # A failed scheduled run otherwise announces itself only by a red dot
+        # nobody is watching — which is how the 2026-09-30 failure went
+        # unnoticed for a day. Same shape as nightly-sim's and the Elle cert's
+        # escalation: a tracking issue naming the artifacts and the run.
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh issue create \
+            --title "Nightly fuzz FAILED ($(date -u +%F))" \
+            --label bug \
+            --body "The nightly property-fuzz session failed (see the 'Fail if tests failed' step for the exit status).
+
+          Run: ${run_url}
+
+          Artefacts on that run: \`test-output\` (ranked test log) and
+          \`proptest-regressions\` if any regression files were found.
+
+          This is the scheduled signal for \`nightly-fuzz.yml\`; it is not a
+          per-PR gate. Investigate the named failing property test, fix it, and
+          keep any regression files the run committed." \
+            || echo "::warning::could not file the tracking issue (gh issue create failed); the red run itself stands"
 
   smoke-test:
     name: Docker Smoke Test (Pair Mode)

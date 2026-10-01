@@ -866,12 +866,15 @@ impl CdcPublishingApplier {
             ferrosa_storage::accord::decode_postgres_mvcc_mutation(&mutation.data)?;
         let m = Mutation::deserialize_from_rebinding_list_paths(storage_data, mutation.t)
             .map_err(|error| format!("decode applied mutation for CDC: {error}"))?;
+        // `m` is a freshly-decoded local used only to build the event, so its
+        // fields are MOVED in rather than cloned — the row set in particular is
+        // the whole payload of the event.
         Ok(Some(ferrosa_cdc::CdcEvent {
             stream: ferrosa_cdc::CdcStream::CommittedToCluster,
-            keyspace: m.keyspace.clone(),
-            table: m.table.clone(),
-            key: m.key.clone(),
-            rows: m.rows.clone(),
+            keyspace: m.keyspace,
+            table: m.table,
+            key: m.key,
+            rows: m.rows,
             timestamp: m.timestamp,
             accord_ts: Some(mutation.t),
             mutation_id: m.mutation_id,
@@ -2251,6 +2254,62 @@ mod engine_applier_tests {
             got.is_none(),
             "a cell written at a later agreed t must not be visible to a read at an earlier t"
         );
+    }
+
+    /// Data integrity of the `committed_event` move fix: the event moved out of
+    /// the decoded mutation must carry EXACTLY the same field values the clone
+    /// path produced. The row set (the event's whole payload) must be preserved
+    /// byte-for-byte — rows must not be dropped, reordered, or re-timestamped by
+    /// moving instead of cloning `m.rows`.
+    #[test]
+    fn committed_event_moves_the_row_set_byte_identical() {
+        let (engine, _dir) = make_engine();
+        let bus = ferrosa_cdc::CdcBus::new(64);
+        engine.set_cdc_bus(bus.clone());
+        let applier = CdcPublishingApplier::new(Arc::new(EngineStorageApplier::new(engine)), bus);
+        let mut sub = applier
+            .cdc
+            .subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
+
+        let key = make_key("move-pk");
+        let t = accord_ts(4_242);
+        // Two rows at distinct clusterings so an order/content change is visible.
+        let mut m = Mutation::new(
+            KS.to_string(),
+            TABLE.to_string(),
+            key.clone(),
+            vec![make_row(b"first", 1_000)],
+            1_000,
+        );
+        m.rows.push(make_row(b"second", 2_000));
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        let am = ApplyMutation {
+            data: buf,
+            t,
+            deps: vec![],
+        };
+
+        applier.apply(txn(1, 4_242), am).expect("accord apply");
+
+        let ev = sub.try_recv().expect("CommittedToCluster delivered");
+        assert_eq!(ev.stream, ferrosa_cdc::CdcStream::CommittedToCluster);
+        assert_eq!(ev.keyspace, KS);
+        assert_eq!(ev.table, TABLE);
+        assert_eq!(ev.key, key, "moved key must equal the mutation's key");
+        assert_eq!(ev.timestamp, m.timestamp);
+        assert_eq!(ev.accord_ts, Some(t));
+        assert_eq!(
+            ev.rows.len(),
+            m.rows.len(),
+            "the move must carry EVERY row, none dropped"
+        );
+        for (i, (ev_row, src_row)) in ev.rows.iter().zip(m.rows.iter()).enumerate() {
+            assert_eq!(
+                ev_row, src_row,
+                "row {i} must survive the move byte-for-byte and in order"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

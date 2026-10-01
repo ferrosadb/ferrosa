@@ -37,10 +37,35 @@ use crate::merge;
 /// keeping resident memory comfortably under any sane cgroup cap.
 pub const DEFAULT_ROWS_PER_FRAGMENT: usize = 4_096;
 
-/// Resolve the fragment row cap `K` from the environment, falling back to
-/// [`DEFAULT_ROWS_PER_FRAGMENT`]. A value of `0` or an unparseable value is
-/// treated as the default (never zero — a zero cap would loop forever).
-pub fn rows_per_fragment() -> usize {
+/// Resolved fragment row cap `K`.
+///
+/// `None` means "not resolved yet": the value is read from the environment on
+/// first use and cached, rather than calling `std::env::var` on every fragment
+/// flush. Both this crate's merger and `ferrosa_cluster`'s wire-frame chunker
+/// must agree on `K` (a frame must be able to carry one full fragment), so this
+/// is the ONE resolver; the cluster-side helper delegates here rather than
+/// re-reading the variable.
+///
+/// `ArcSwap` rather than a plain atomic because the override is a set-once
+/// configuration action, and a scan in flight must observe a consistent value
+/// for its lifetime: it loads the current cap once per flush and keeps using
+/// it, which is exactly `ArcSwap`'s read-mostly shape. It also removes the
+/// process-global mutation the tests previously had to serialize with a
+/// `static Mutex` — a lock that cannot work at all under nextest, which runs
+/// one process per test.
+static ROWS_PER_FRAGMENT: std::sync::OnceLock<arc_swap::ArcSwap<usize>> =
+    std::sync::OnceLock::new();
+
+fn slot() -> &'static arc_swap::ArcSwap<usize> {
+    ROWS_PER_FRAGMENT
+        .get_or_init(|| arc_swap::ArcSwap::from_pointee(resolve_rows_per_fragment_from_env()))
+}
+
+/// Read the configured cap from the environment, or the default.
+///
+/// A value of `0` or an unparseable value is treated as the default (never
+/// zero — a zero cap would loop forever).
+fn resolve_rows_per_fragment_from_env() -> usize {
     match std::env::var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT") {
         Ok(v) => match v.trim().parse::<usize>() {
             Ok(n) if n >= 1 => n,
@@ -48,6 +73,35 @@ pub fn rows_per_fragment() -> usize {
         },
         Err(_) => DEFAULT_ROWS_PER_FRAGMENT,
     }
+}
+
+/// The fragment row cap `K` in force for this process.
+pub fn rows_per_fragment() -> usize {
+    **slot().load()
+}
+
+/// Override the fragment row cap for this process.
+///
+/// The supported way to change `K`. Tests call this instead of mutating the
+/// process environment, so they no longer depend on cross-test mutual
+/// exclusion to be correct — and a test that sets a cap cannot corrupt a scan
+/// running in another test. A value of `0` is refused (it would loop forever);
+/// pass the default explicitly if that is what you want.
+///
+/// Process-global by nature: `K` bounds a wire frame, so every scan in the
+/// process must agree. Making it per-scan would require threading it through
+/// the coordinator, the storage engine and the stream handlers — a much wider
+/// change for no additional safety.
+pub fn set_rows_per_fragment(cap: usize) {
+    assert!(cap >= 1, "a fragment row cap of 0 would loop forever");
+    slot().store(std::sync::Arc::new(cap));
+}
+
+/// Put the cap back to whatever the environment says (or the default).
+///
+/// For tests that must not leak their override into a later test.
+pub fn reset_rows_per_fragment() {
+    slot().store(std::sync::Arc::new(resolve_rows_per_fragment_from_env()));
 }
 
 /// One bounded slice of a merged partition emitted by [`RangeMerger`].
@@ -1793,7 +1847,8 @@ mod tests {
 
     use super::{
         group_disjoint_runs, group_disjoint_runs_by_key, merger_for_projected_sources,
-        merger_for_sources,
+        merger_for_sources, reset_rows_per_fragment, resolve_rows_per_fragment_from_env,
+        rows_per_fragment, set_rows_per_fragment, DEFAULT_ROWS_PER_FRAGMENT,
     };
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
     use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
@@ -2550,6 +2605,68 @@ mod tests {
                 || err.to_string().contains("unexpected EOF")
                 || err.to_string().contains("UnexpectedEof"),
             "error should identify the SSTable read failure, got: {err}"
+        );
+    }
+    // ── the fragment row cap resolver ─────────────────────────────────────────
+
+    /// The override is honoured, and it is what `rows_per_fragment` returns.
+    ///
+    /// This replaces mutating `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` via
+    /// `env::set_var`. The env route is process-global mutable state that a scan
+    /// in flight reads on every fragment flush, so tests using it had to be
+    /// mutually excluded -- which a `static Mutex` cannot do under nextest (one
+    /// process per test). The explicit setter has no such coupling.
+    #[test]
+    fn set_rows_per_fragment_overrides_the_value_in_force() {
+        set_rows_per_fragment(1);
+        assert_eq!(rows_per_fragment(), 1);
+        set_rows_per_fragment(37);
+        assert_eq!(rows_per_fragment(), 37);
+        reset_rows_per_fragment();
+    }
+
+    /// A cap of zero is refused rather than accepted.
+    ///
+    /// Zero is not a small cap, it is a non-terminating one: the fragment loop
+    /// emits up to `K` rows, so `K = 0` never advances. The assert makes that a
+    /// loud programming error at the call site instead of a hang under load.
+    #[test]
+    #[should_panic(expected = "loop forever")]
+    fn a_zero_cap_is_refused() {
+        set_rows_per_fragment(0);
+    }
+
+    /// `reset` restores the environment-derived value, not the override.
+    #[test]
+    fn reset_returns_to_the_configured_value() {
+        set_rows_per_fragment(1);
+        assert_eq!(rows_per_fragment(), 1);
+        reset_rows_per_fragment();
+        let expected = resolve_rows_per_fragment_from_env();
+        assert_eq!(
+            rows_per_fragment(),
+            expected,
+            "reset must fall back to the environment, not leave the override in place"
+        );
+    }
+
+    /// The env-derived resolver always produces a terminating cap.
+    ///
+    /// Driven through the pure resolver rather than by mutating the process
+    /// environment, which is the point of this refactor: a test that sets a
+    /// process-global value needs cross-test exclusion to be correct, and a
+    /// `static Mutex` cannot provide that under nextest.
+    #[test]
+    fn the_resolved_cap_is_always_usable() {
+        let resolved = resolve_rows_per_fragment_from_env();
+        assert!(
+            resolved >= 1,
+            "a cap of 0 would never advance the fragment loop; resolved {resolved}"
+        );
+        assert_eq!(
+            resolved.min(DEFAULT_ROWS_PER_FRAGMENT),
+            resolved.min(4_096),
+            "the resolver must agree with the documented default when no override is set"
         );
     }
 }

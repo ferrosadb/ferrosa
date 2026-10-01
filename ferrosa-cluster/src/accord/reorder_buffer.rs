@@ -329,11 +329,13 @@ mod tests {
     /// (forge t_430e21f7) — and `ci.yml` skips that module in the per-PR lane
     /// for exactly this reason.
     ///
-    /// The timing guard is not lost: `perf_regression` already asserts the
-    /// identical bound (1000-message drain under 10 ms) on the nightly
-    /// `perf-regression` job, where a threshold trip can be investigated
-    /// without blocking a merge. This test keeps the deterministic half —
-    /// completeness and ordering — which is what belongs in the merge lane.
+    /// The timing guard is not lost: `perf_regression` measures the identical
+    /// drain against a same-run CPU reference loop on the nightly
+    /// `perf-regression` job, and the deterministic guards (one output
+    /// allocation, linear per-message cost) in
+    /// `tests/reorder_buffer_drain_budget.rs` run in the default suite. This
+    /// test keeps the other deterministic half — completeness and ordering —
+    /// which is what belongs in the merge lane.
     #[test]
     fn reorder_buffer_drains_medium_batch_completely_and_in_t0_order() {
         let timing = default_timing();
@@ -346,5 +348,288 @@ mod tests {
 
         assert_eq!(drained.len(), 1_000);
         assert!(drained.windows(2).all(|w| w[0].t0 <= w[1].t0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Invariant tests. The ReorderBuffer sits on the consensus message path,
+    // so dropping, duplicating or reordering a message is a CORRECTNESS
+    // failure, not a perf one. Each invariant below is pinned independently,
+    // and the differential test is the oracle for any future change to the
+    // internal structure.
+    // -----------------------------------------------------------------------
+
+    /// A deliberately simple reference model of the buffer's observable
+    /// behaviour: a flat arrival-ordered list. It is O(n log n) and obviously
+    /// correct, which is the point — it is the ORACLE the ordered
+    /// `BTreeMap` implementation is differentially tested against. A change
+    /// to the internal structure that alters what `drain_ready` returns
+    /// (ordering, completeness, deadline gating) fails against it.
+    struct ReferenceModel {
+        /// `(t0, arrival_seq, message)` in arrival order.
+        entries: Vec<(Timestamp, u64, Message)>,
+        next_seq: u64,
+    }
+
+    impl ReferenceModel {
+        fn new() -> Self {
+            Self {
+                entries: Vec::new(),
+                next_seq: 0,
+            }
+        }
+
+        fn push(&mut self, msg: Message) {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.entries.push((msg.t0, seq, msg));
+        }
+
+        fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        /// Everything whose deadline has passed, ordered by `(t0, arrival_seq)`.
+        fn drain_ready(&mut self, now: Timestamp, timing: &TimingConfig) -> Vec<Message> {
+            let all = std::mem::take(&mut self.entries);
+            let (mut ready, kept): (Vec<_>, Vec<_>) = all
+                .into_iter()
+                .partition(|(t0, _, _)| timing.deadline(*t0) <= now);
+            self.entries = kept;
+            ready.sort_by_key(|(t0, seq, _)| (*t0, *seq));
+            ready.into_iter().map(|(_, _, m)| m).collect()
+        }
+
+        /// Everything, ordered by `(t0, arrival_seq)`.
+        fn drain_all(&mut self) -> Vec<Message> {
+            let mut all = std::mem::take(&mut self.entries);
+            all.sort_by_key(|(t0, seq, _)| (*t0, *seq));
+            all.into_iter().map(|(_, _, m)| m).collect()
+        }
+    }
+
+    /// Deterministic xorshift so the differential test is reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// Order-independent fingerprint of a message set, for multiset equality.
+    fn multiset(mut msgs: Vec<Message>) -> Vec<(Timestamp, Vec<u8>)> {
+        msgs.sort_by(|a, b| (a.t0, &a.payload).cmp(&(b.t0, &b.payload)));
+        msgs.into_iter().map(|m| (m.t0, m.payload)).collect()
+    }
+
+    /// INVARIANT (a) COMPLETENESS — every pushed message is returned exactly
+    /// once across interleaved drains: nothing lost, nothing duplicated.
+    #[test]
+    fn reorder_buffer_returns_every_message_exactly_once_across_interleaved_drains() {
+        let timing = default_timing(); // deadline = t0 + 25_000
+        let mut buf = ReorderBuffer::new(4_000, timing);
+
+        // Distinct t0 buckets *and* duplicate t0 values, with payloads drawn
+        // from a small range so a dropped/duplicated message is detectable.
+        let pushed: Vec<Message> = (0..3_000i64)
+            .map(|i| msg((i % 17) * 1_000, (i % 251) as u8))
+            .collect();
+        for m in &pushed {
+            buf.push(m.clone()).unwrap();
+        }
+
+        let mut drained: Vec<Message> = Vec::new();
+        for step in 0..20i64 {
+            // t0 in {0,1000..16000} => deadline in {25000..41000}; this walks
+            // the ready prefix across the whole set.
+            let now = step * 1_500 + 25_000;
+            drained.extend(buf.drain_ready(now));
+        }
+        drained.extend(buf.drain_all());
+
+        assert_eq!(drained.len(), 3_000, "every message must come back");
+        assert_eq!(
+            multiset(drained),
+            multiset(pushed),
+            "the drained multiset must equal the pushed multiset exactly"
+        );
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+    }
+
+    /// INVARIANT (b) ORDERING — arrival order is preserved within equal t0,
+    /// even when those messages are interleaved with a different key's
+    /// arrivals (stronger than the same-key-only test above).
+    #[test]
+    fn reorder_buffer_preserves_arrival_order_within_equal_t0_across_interleaved_keys() {
+        let timing = default_timing();
+        let mut buf = ReorderBuffer::new(100, timing);
+
+        buf.push(msg(100, 1)).unwrap();
+        buf.push(msg(50, 9)).unwrap();
+        buf.push(msg(100, 2)).unwrap();
+        buf.push(msg(100, 3)).unwrap();
+        buf.push(msg(50, 8)).unwrap();
+        buf.push(msg(100, 4)).unwrap();
+
+        let out = buf.drain_all();
+        assert!(out.windows(2).all(|w| w[0].t0 <= w[1].t0), "t0 ascending");
+        let at_100: Vec<u8> = out
+            .iter()
+            .filter(|m| m.t0 == 100)
+            .map(|m| m.payload[0])
+            .collect();
+        let at_50: Vec<u8> = out
+            .iter()
+            .filter(|m| m.t0 == 50)
+            .map(|m| m.payload[0])
+            .collect();
+        assert_eq!(at_100, vec![1, 2, 3, 4], "arrival order within t0=100");
+        assert_eq!(at_50, vec![9, 8], "arrival order within t0=50");
+    }
+
+    /// INVARIANT (c) PREFIX GATING — `drain_ready(now)` releases exactly the
+    /// contiguous ready prefix and no message whose deadline has not passed.
+    #[test]
+    fn reorder_buffer_drain_ready_releases_exactly_the_contiguous_ready_prefix() {
+        // deadline = t0 + 2*10 + 5 = t0 + 25.
+        let timing = TimingConfig {
+            skew_max_us: 10,
+            rtt_p99_us: 5,
+        };
+        let mut buf = ReorderBuffer::new(100, timing);
+        for k in [0i64, 10, 20, 30, 40] {
+            buf.push(msg(k, k as u8)).unwrap();
+        }
+
+        // now = 45: deadline(20) = 45 is ready (<= now); deadline(30) = 55 is not.
+        let ready = buf.drain_ready(45);
+        assert_eq!(
+            ready.iter().map(|m| m.t0).collect::<Vec<_>>(),
+            vec![0, 10, 20],
+            "only the ready prefix is released"
+        );
+        assert_eq!(buf.len(), 2);
+
+        // The not-ready suffix is untouched and still ordered.
+        let rest = buf.drain_all();
+        assert_eq!(rest.iter().map(|m| m.t0).collect::<Vec<_>>(), vec![30, 40]);
+
+        // And nothing is released before its deadline.
+        let mut buf2 = ReorderBuffer::new(100, timing);
+        buf2.push(msg(100, 1)).unwrap(); // deadline 125
+        assert!(buf2.drain_ready(124).is_empty(), "must not release early");
+        assert_eq!(buf2.len(), 1);
+    }
+
+    /// INVARIANT (d) CAPACITY + LEN ACCOUNTING — the `Overloaded` contract and
+    /// exact `len` accounting are unchanged, including after a drain and after
+    /// a refused push.
+    #[test]
+    fn reorder_buffer_len_and_capacity_are_accounted_exactly() {
+        let timing = default_timing();
+        let mut buf = ReorderBuffer::new(3, timing);
+
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+
+        buf.push(msg(100, 1)).unwrap();
+        assert_eq!(buf.len(), 1);
+        assert!(!buf.is_empty());
+
+        // A duplicate t0 shares a bucket but still counts one message each.
+        buf.push(msg(100, 2)).unwrap();
+        assert_eq!(buf.len(), 2);
+        buf.push(msg(200, 3)).unwrap();
+        assert_eq!(buf.len(), 3);
+
+        // At capacity: refused, and `len` must not move.
+        assert_eq!(buf.push(msg(300, 4)), Err(Overloaded));
+        assert_eq!(buf.len(), 3);
+
+        // Draining a ready prefix decrements by exactly the drained count.
+        let ready = buf.drain_ready(1_000_000); // every deadline has passed
+        assert_eq!(ready.len(), 3);
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+
+        // A refused push left no phantom entry behind: capacity is available.
+        buf.push(msg(400, 5)).unwrap();
+        assert_eq!(buf.len(), 1);
+    }
+
+    /// INVARIANT (e) DIFFERENTIAL — over randomized push/drain sequences the
+    /// implementation is output-identical to the flat reference model, for
+    /// both `drain_ready` and `drain_all`, including `len` and the
+    /// `Overloaded` boundary. This is the guard that makes an internal
+    /// restructuring safe: any structural optimization must move no observable
+    /// row relative to the model.
+    #[test]
+    fn reorder_buffer_matches_reference_model_over_randomized_push_drain_sequences() {
+        // deadline = t0 + 25, so `now` drawn from 0..=70 straddles the ready
+        // prefix boundary for t0 drawn from 0..40.
+        let timing = TimingConfig {
+            skew_max_us: 10,
+            rtt_p99_us: 5,
+        };
+        let capacity = 120usize;
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut buf = ReorderBuffer::new(capacity, timing);
+        let mut model = ReferenceModel::new();
+        let mut ever_drained: Vec<Message> = Vec::new();
+
+        for step in 0..2_000u64 {
+            if rng.next_u64().is_multiple_of(2) {
+                let t0 = (rng.next_u64() % 40) as Timestamp;
+                let tag = (rng.next_u64() % 4) as u8;
+                let m = msg(t0, tag);
+                let before = model.len();
+                let result = buf.push(m.clone());
+                if before < capacity {
+                    assert!(
+                        result.is_ok(),
+                        "step {step}: push under capacity must succeed"
+                    );
+                    model.push(m);
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(Overloaded),
+                        "step {step}: push at capacity must be refused"
+                    );
+                }
+            } else {
+                let now = (rng.next_u64() % 71) as Timestamp;
+                let got = buf.drain_ready(now);
+                let want = model.drain_ready(now, &timing);
+                assert_eq!(
+                    multiset(got.clone()),
+                    multiset(want),
+                    "step {step}: drain_ready({now}) diverged from the reference model"
+                );
+                ever_drained.extend(got);
+            }
+            assert_eq!(
+                buf.len(),
+                model.len(),
+                "step {step}: len accounting diverged from the reference model"
+            );
+        }
+
+        // Final flush must agree too, and the whole run must be complete.
+        let got = buf.drain_all();
+        assert_eq!(multiset(got.clone()), multiset(model.drain_all()));
+        ever_drained.extend(got);
+        assert!(buf.is_empty());
+        assert_eq!(
+            ever_drained.len(),
+            model.next_seq as usize,
+            "every pushed message must be returned exactly once"
+        );
     }
 }

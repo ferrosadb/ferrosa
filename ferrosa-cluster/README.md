@@ -173,12 +173,15 @@ early acknowledgement.
   `WritePath::range_read_projected` wrapper has been removed, so projected
   scans use `range_read_projected_stream_all_*` directly (default; legacy capped
   path behind `FERROSA_BULK_STREAMING_RANGE_READ=0`).
-  `DEFAULT_RANGE_READ_LIMIT` (10_000) is **not** a result cap on streamable
-  shapes: `range_read_limited_rows` and `coordinate_range_read_stream_limited_rows`
-  honor the caller's own bound (a user `LIMIT N`) uncapped; the const now only
-  bounds the truncation-detecting `range_read_limited_rows_checked` probe (for the
-  still-accumulating `ORDER BY` shape, until spill-to-disk lands) and the legacy
-  degraded RPC (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
+  `DEFAULT_RANGE_READ_LIMIT` — the old 10_000-row *result* cap — is gone; the
+  value survives as `LEGACY_RANGE_READ_REPLICA_WINDOW`, a **resource** bound on
+  one legacy single-shot range RPC message, never a result bound.
+  `range_read_limited_rows` and `coordinate_range_read_stream_limited_rows`
+  honor the caller's own bound (a user `LIMIT N`) uncapped, and
+  `range_read_limited_rows_checked` now probes exactly one partition past the
+  caller's own bound instead of a hard cap; no query path selects it. The window
+  is never applied as a result cap on a streaming `*_stream_all_*` scan
+  (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
   The same bounded Bulk frames now carry global secondary-index walks, in row
   order — `(partition key, clustering)` — from an optional cursor carried in
   the request's `start_key` + `start_clustering` (resume strictly after that
@@ -429,6 +432,24 @@ Replicated `CREATE INDEX` (FM-70 / CL-18, `t_1f2741a0`) is guarded end to end by
 proposed once on the leader and every node must build the index and answer an
 indexed read) and, on a real cluster, `replicated_jsonb_index_live` (feature
 `live-infra-tests` + `FERROSA_TEST_CLUSTER_NODES`, panics when unset).
+
+The Accord `ReorderBuffer` drain is guarded without a wall-clock bound.
+`accord::perf_regression::perf_regression_suite` measures the 1000-message drain
+RELATIVE to a same-run CPU reference loop (the load-independent form of the
+absolute `< 10 ms` it used to assert — the absolute form ejected a docs-only PR
+at 52.8 ms, `forge t_430e21f7`, and the nightly fuzz lane at 56.7 ms on
+2026-09-30 while the dedicated perf job passed in the same workflow). The
+deterministic half lives in `tests/reorder_buffer_drain_budget.rs`: it counts
+allocations under a `#[global_allocator]` hook (the drain must make ONE output
+allocation regardless of message count — measured 1 allocation / 32 bytes per
+message, constant from 1000 to 4000 messages) and asserts the per-message drain
+cost stays linear. On an idle box the drain is ~0.16 ms for 1000 messages, and
+the drain/reference-loop ratio holds at 0.72–0.80 from 0 to 576 competing
+threads on an 18-core host, which is why the ratio form does not flake. The
+structural invariants (completeness, `t0` order, arrival order within equal
+`t0`, contiguous ready prefix, capacity/`len`) are pinned in
+`src/accord/reorder_buffer.rs`, including a differential test against a flat
+reference model.
 
 The multi-node `TestCluster` harness (`tests/common/raft_harness.rs`) runs
 openraft with short timers (50 ms heartbeat, 200–400 ms election). To keep

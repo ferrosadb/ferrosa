@@ -24,61 +24,6 @@
 # ---------------------------------------------------------------------------
 
 [[allow]]
-path = "ferrosa-cluster/src/write_path.rs"
-rule = "returns-vec-partition-or-row"
-symbol = "range_read_limited_rows"
-reason = "t_15417b35: SELECT-arm streaming fix removes this materializing range_read_limited_rows."
-owner = "storage"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/write_path.rs"
-rule = "limited-rows-call-site"
-symbol = "range_read_limited_rows"
-reason = "t_15417b35: write_path dispatch into the materializing range read; removed by SELECT-arm fix."
-owner = "storage"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/write_path.rs"
-rule = "limited-rows-call-site"
-symbol = "coordinate_range_read_limited_rows"
-reason = "t_15417b35: write_path -> coordinator materializing range read; removed by SELECT-arm fix."
-owner = "storage"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cql/src/router.rs"
-rule = "limited-rows-call-site"
-symbol = "range_read_limited_rows"
-reason = "t_15417b35: degraded IndexScanWithFilter/SingleIndex arm call sites; removed by SELECT-arm streaming fix."
-owner = "storage"
-expires = "2026-10-02"
-
-# NOTE (t_ee98faa0 / t_3fc6be3c, consume-path bounded-streaming refactor):
-# `read_local_range_stream_limited_rows` and `dedup_by_token` were DELETED — the
-# limited-rows coordinator now drinks the bounded token-deduped N-way merge
-# stream instead of reading a local Vec + accumulating remote partitions. Their
-# former allow entries (with-capacity-limit / stream-returns-vec /
-# returns-vec-partition-or-row) are removed with the symbols.
-
-# ---------------------------------------------------------------------------
-# Group 2 — pre-existing materialization predating the guard (epic t_110dd8a5)
-# Warn-mode first (FMEA: existing unfixed code must not block). Each path is
-# migrated to streaming under the epic; expiry 2026-12-31 forces re-review.
-# ---------------------------------------------------------------------------
-
-# -- ferrosa-cluster coordinator: range read / index read materialization ----
-# `coordinate_range_read_stream_limited_rows` returns a `Vec<Partition>` bounded
-# by the CALLER's own `limit` (a user `LIMIT N` / page probe) — NOT the whole
-# table. Post the consume-path bounded-streaming refactor (t_ee98faa0/t_3fc6be3c)
-# it drinks the bounded token-deduped N-way merge stream and folds `<= limit`
-# whole partitions; the accumulation is O(limit result), never O(table). These
-# three entries cover the `Vec`-returning signature (stream-returns-vec /
-# returns-vec-partition-or-row) and the bounded stream-drain fold
-# (stream-push-accumulation) inherent to that signature. Retire when the callers
-# (t_480c91fe) are migrated to page-by-page streaming and the fn is deleted.
-[[allow]]
 path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
 rule = "stream-returns-vec"
 symbol = "coordinate_range_read_stream_limited_rows"
@@ -132,20 +77,6 @@ expires = "2026-12-31"
 
 # -- ferrosa-cluster pair / repair --------------------------------------------
 [[allow]]
-path = "ferrosa-cluster/src/pair/catchup.rs"
-rule = "with-capacity-limit"
-reason = "t_110dd8a5: pair catchup pre-allocation over a bounded catchup batch."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-cluster/src/pair/coordinator.rs"
-rule = "with-capacity-limit"
-reason = "t_110dd8a5: pair coordinator pre-allocation over a bounded batch."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
 path = "ferrosa-cluster/src/repair/executor.rs"
 rule = "returns-vec-partition-or-row"
 reason = "t_110dd8a5: repair executor range/snapshot reads; repair operates over bounded token ranges."
@@ -190,35 +121,6 @@ owner = "storage"
 expires = "2026-12-31"
 
 [[allow]]
-path = "ferrosa-cql/src/router.rs"
-rule = "returns-vec-partition-or-row"
-reason = "t_110dd8a5: router index-intersection helpers materialize bounded partition sets."
-owner = "storage"
-expires = "2026-12-31"
-
-# -- ferrosa-storage engine / store / memtable -------------------------------
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/driver.rs"
-rule = "stream-returns-vec"
-reason = "t_110dd8a5: compaction validator (test/validation oracle path), not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/driver.rs"
-rule = "returns-vec-partition-or-row"
-reason = "t_110dd8a5: compaction validator oracle, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/oracle.rs"
-rule = "returns-vec-partition-or-row"
-reason = "t_110dd8a5: compaction validation oracle, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
 path = "ferrosa-storage/src/data_store.rs"
 rule = "returns-vec-partition-or-row"
 reason = "t_110dd8a5: storage data_store read_range materialization; migrate with the streaming engine API."
@@ -229,13 +131,6 @@ expires = "2026-12-31"
 path = "ferrosa-storage/src/engine.rs"
 rule = "returns-vec-partition-or-row"
 reason = "t_110dd8a5: storage engine range/index/ann read materialization; migrate with the streaming engine API."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-storage/src/index/sidecar.rs"
-rule = "with-capacity-limit"
-reason = "t_110dd8a5: index sidecar pre-allocation over a bounded result set."
 owner = "storage"
 expires = "2026-12-31"
 
@@ -260,30 +155,6 @@ reason = "t_110dd8a5: storage store range/index/ann read materialization; migrat
 owner = "storage"
 expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/test_support.rs"
-rule = "returns-vec-partition-or-row"
-reason = "t_110dd8a5: test_support merge helper used only by tests/harness, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
-
-# ===========================================================================
-# Extended rules (collect / unbounded-range-read / materializing-call-site /
-# cqlvalue-row-accumulation / clone-on-row-data). Added with the second rule
-# batch. Same policy: the SELECT-arm scan site t_15417b35 removes gets the
-# short expiry; everything else is pre-existing under epic t_110dd8a5.
-# ===========================================================================
-
-# -- Group 1b: SELECT-arm site removed by t_15417b35 (expiry 2026-09-30) ------
-[[allow]]
-path = "ferrosa-cql/src/router.rs"
-rule = "materializing-range-read-call-site"
-symbol = "range_read_projected"
-reason = "t_15417b35: degraded SELECT scan arm range_read_projected call (router.rs:4670), adjacent to the range_read_limited_rows sites; removed by the SELECT-arm streaming fix."
-owner = "storage"
-expires = "2026-10-02"
-
-# -- Group 2b: rule `collect-vec-partition-or-row` (epic t_110dd8a5) ----------
 [[allow]]
 path = "ferrosa-cluster/src/accord/apply.rs"
 rule = "collect-vec-partition-or-row"
@@ -320,20 +191,6 @@ owner = "storage"
 expires = "2026-12-31"
 
 [[allow]]
-path = "ferrosa-storage/src/compaction/validator/corpus.rs"
-rule = "collect-vec-partition-or-row"
-reason = "t_110dd8a5 (collect-vec-partition-or-row): compaction validator corpus builder, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/soak.rs"
-rule = "collect-vec-partition-or-row"
-reason = "t_110dd8a5 (collect-vec-partition-or-row): compaction validator soak harness, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
 path = "ferrosa-storage/src/store.rs"
 rule = "collect-vec-partition-or-row"
 reason = "t_110dd8a5 (collect-vec-partition-or-row): storage store collects bounded partition/row sets; migrate with the streaming engine API."
@@ -341,61 +198,12 @@ owner = "storage"
 expires = "2026-12-31"
 
 [[allow]]
-path = "ferrosa-storage/src/test_support.rs"
-rule = "collect-vec-partition-or-row"
-reason = "t_110dd8a5 (collect-vec-partition-or-row): test_support helpers used only by tests/harness."
-owner = "storage"
-expires = "2026-12-31"
-
-# -- Group 2b: rule `unbounded-range-read` (epic t_110dd8a5) ------------------
-[[allow]]
-path = "ferrosa-cluster/src/controller/cluster.rs"
-rule = "unbounded-range-read"
-reason = "t_110dd8a5 (unbounded-range-read): bootstrap reads a system/control table over a bounded keyspace at startup."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/read.rs"
-rule = "unbounded-range-read"
-reason = "t_110dd8a5 (unbounded-range-read): coordinator local read_range(None,None) under an explicit partition limit; migrate with streaming rework."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-cluster/src/system_table_loader.rs"
-rule = "unbounded-range-read"
-reason = "t_110dd8a5 (unbounded-range-read): system-table loader scans small bounded system tables at startup."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-storage/src/engine.rs"
-rule = "unbounded-range-read"
-reason = "t_110dd8a5 (unbounded-range-read): engine-internal read_range(None,None) under an explicit limit; migrate with the streaming engine API."
-owner = "storage"
-expires = "2026-12-31"
-
-# -- Group 2b: rule `cqlvalue-row-accumulation` (epic t_110dd8a5) -------------
-[[allow]]
 path = "ferrosa-cql/src/router.rs"
 rule = "cqlvalue-row-accumulation"
 reason = "t_110dd8a5 (cqlvalue-row-accumulation): CQL result-row encoding materializes the row matrix per query; convert to row streaming with the broader SELECT streaming work."
 owner = "storage"
 expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-row-bridge/src/row.rs"
-rule = "cqlvalue-row-accumulation"
-reason = "t_110dd8a5 (cqlvalue-row-accumulation): row-bridge value conversion materializes a bounded row matrix."
-owner = "storage"
-expires = "2026-12-31"
-
-# -- Group 2b: rule `clone-on-row-data` (epic t_110dd8a5) ---------------------
-# Acknowledged false-positive-prone (per-partition-boundary key/partition clones
-# in the streaming merge are legitimate). Suppressed per file while the move-based
-# scan-path audit is calibrated; clone-on-row-data stays an enforced rule so any
-# NEW file accumulating row clones surfaces in warn mode and fails enforce.
 [[allow]]
 path = "ferrosa-cluster/src/accord/apply.rs"
 rule = "clone-on-row-data"
@@ -484,20 +292,6 @@ expires = "2026-12-31"
 path = "ferrosa-storage/src/commitlog/mod.rs"
 rule = "clone-on-row-data"
 reason = "t_110dd8a5 (clone-on-row-data): commitlog row clone on the write/replay path, not a broad scan."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/driver.rs"
-rule = "clone-on-row-data"
-reason = "t_110dd8a5 (clone-on-row-data): compaction validator clone, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
-
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/oracle.rs"
-rule = "clone-on-row-data"
-reason = "t_110dd8a5 (clone-on-row-data): compaction validation oracle clones, not a serving read path."
 owner = "storage"
 expires = "2026-12-31"
 
@@ -634,141 +428,6 @@ expires = "2026-10-01"
 # (b) inherent-by-design: retained-source reads must hand out owned copies.
 [[allow]]
 path = "ferrosa-storage/src/store.rs"
-rule = "cloned-stream-elements"
-symbol = "partition"
-reason = "point/limited read returns owned rows from a partition the store retains; bounded by clustering match / row_limit."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-storage/src/memtable/mem_index.rs"
-rule = "clone-on-row-data"
-symbol = "value"
-reason = "memtable index retains owned CellValue keys; insert/read must copy (single cell values, bounded)."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-storage/src/memtable/sharded.rs"
-rule = "copies-row-data-arg"
-symbol = "arc"
-reason = "memtable snapshot materializes Partition from Arc for flush; bounded by the flush threshold."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-cluster/src/hints/segment.rs"
-rule = "copies-row-data-arg"
-symbol = "row"
-reason = "hint segment encodes record bytes into the frame buffer — byte-level serialization, not a row-object clone."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-cluster/src/raft/handlers.rs"
-rule = "cloned-stream-elements"
-symbol = "static_row"
-reason = "zero-or-one static row cloned per partition for wire encoding — negligible, documented at the site."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-storage/src/engine.rs"
-rule = "clone-in-scan-closure"
-symbol = "bytes"
-reason = "single-cell accessor returns owned bytes of one column value — not a per-row scan copy."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-index/src/geo/rtree.rs"
-rule = "clone-on-row-data"
-symbol = "chunk"
-reason = "R-tree bulk-load chunks are Vec<usize> indices, not row payloads."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-index/src/vector/quantized/ivf_staged.rs"
-rule = "clone-on-row-data"
-symbol = "chunk"
-reason = "staged IVF chunks are index slices, not row payloads."
-owner = "bkearns"
-expires = "2027-07-01"
-
-# (b) tooling / test fixtures living under src/.
-[[allow]]
-path = "ferrosa-storage/src/test_support.rs"
-rule = "clone-on-row-data"
-symbol = "base"
-reason = "test-support fixture derives replica variants from a base partition — test-only code."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/streaming_e2e_tests.rs"
-rule = "cloned-stream-elements"
-reason = "in-crate e2e test stub clones fixture partitions to build a stream — test-only code."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/soak.rs"
-rule = "cloned-stream-elements"
-reason = "soak validator tooling flattens fixture groups; not a production read path."
-owner = "bkearns"
-expires = "2027-07-01"
-
-# (b) newly-scoped ferrosa-net: peer-list capacity is bounded by cluster size.
-[[allow]]
-path = "ferrosa-net/src/message.rs"
-rule = "with-capacity-limit"
-reason = "decoded peer COUNT is bounded by cluster membership size, not a row/paging cap."
-owner = "bkearns"
-expires = "2027-07-01"
-
-# ---------------------------------------------------------------------------
-# Group 4 — server-side-result-cap (2026-07 sweep). The principle: results are
-# bounded ONLY by the inbound query's LIMIT/paging; every server-side cap is a
-# materialization confession. Genuine caps carry SHORT expiry + a forge task;
-# by-design/pre-alloc bounds are documented.
-# ---------------------------------------------------------------------------
-
-# The P0 DEFAULT_RANGE_READ_LIMIT family — removed by the streaming epic.
-[[allow]]
-path = "ferrosa-cluster/src/write_path.rs"
-rule = "server-side-result-cap"
-reason = "t_15417b35/t_480c91fe: DEFAULT_RANGE_READ_LIMIT const + clamps, removed as the SELECT-arm/callers stream."
-owner = "bkearns"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/read.rs"
-rule = "server-side-result-cap"
-symbol = "DEFAULT_RANGE_READ_LIMIT"
-reason = "t_15417b35/t_480c91fe: legacy coordinated read clamp, removed as callers stream."
-owner = "bkearns"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
-rule = "server-side-result-cap"
-symbol = "DEFAULT_RANGE_READ_LIMIT"
-reason = "t_15417b35/t_480c91fe: legacy limited-rows clamp, removed as callers stream."
-owner = "bkearns"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/raft/handlers.rs"
-rule = "server-side-result-cap"
-symbol = "DEFAULT_RANGE_READ_LIMIT"
-reason = "documented intentional per-replica cap on the legacy non-streaming RPC (FERROSA_BULK_STREAMING_RANGE_READ=0 opt-out); retire with the legacy path (t_15417b35)."
-owner = "bkearns"
-expires = "2026-10-02"
-
-# Genuine caps with tracked removal tasks.
-[[allow]]
-path = "ferrosa-storage/src/store.rs"
 rule = "server-side-result-cap"
 reason = "t_1f2485ef: INDEX_RESULT_CAP + RANGE_READ_MATERIALIZATION_CAP fail-loud refusal caps; stream instead."
 owner = "bkearns"
@@ -796,86 +455,6 @@ owner = "bkearns"
 expires = "2026-10-01"
 
 # By-design bounds (not result caps in context).
-[[allow]]
-path = "ferrosa-storage/src/accord/entries.rs"
-rule = "server-side-result-cap"
-reason = "count.min(4096) bounds the with_capacity PRE-ALLOCATION only (untrusted wire count); the loop still reads all `count` entries — a memory-safety guard, not a result cap."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-storage/src/accord/sidecar.rs"
-rule = "server-side-result-cap"
-reason = "count.min(4096) bounds the with_capacity PRE-ALLOCATION only; loop reads all entries — memory-safety guard, not a result cap."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-index/src/phonetic/caverphone.rs"
-rule = "server-side-result-cap"
-reason = "truncate(10) is the Caverphone ALGORITHM's fixed code length (a value's length, not a result count)."
-owner = "bkearns"
-expires = "2027-07-01"
-
-# (b) complex-column assembly read path: `.copied()` flattens a `&[&CellValue]`
-# (already reconciled to one live-or-tombstone cell per path by the memtable /
-# merge_rows merge) down to `&CellValue`. It copies the 8-byte REFERENCE, never
-# the CellValue itself — the cells are borrowed in place, which is the whole
-# point of the borrow-only assembly. Removing `.copied()` is not possible without
-# a readability regression: the `Vec<&CellValue>` collect at collection.rs:337
-# needs it, and the max_by_key bindings would otherwise carry a `&&CellValue`.
-# Scoped by symbol `cells` — the only copied/cloned chain root in these files.
-[[allow]]
-path = "ferrosa-row-bridge/src/collection.rs"
-rule = "cloned-stream-elements"
-symbol = "cells"
-reason = "complex-column assembly: `.copied()` flattens `&[&CellValue]` -> `&CellValue` (8-byte reference copy of already-reconciled borrowed cells, NOT cell data); required by the Vec<&CellValue> collect + single-ref max_by_key bindings."
-owner = "bkearns"
-expires = "2027-07-01"
-
-[[allow]]
-path = "ferrosa-cql/src/bridge.rs"
-rule = "cloned-stream-elements"
-symbol = "cells"
-reason = "column-meta assembly: `.copied()` flattens a grouped column's `&CellValue` cells for max_by_key; copies the reference, not the CellValue."
-owner = "bkearns"
-expires = "2027-07-01"
-
-# ---------------------------------------------------------------------------
-# Flush sharding — parallel encode of an already-materialized memtable snapshot
-# ---------------------------------------------------------------------------
-# `split_sorted_partitions_into_shards` receives an ALREADY-materialized,
-# bounded `Vec<Partition>` (the memtable's flush working set, bounded by the
-# flush threshold — the caller `TableStore::flush` sorts and owns it) and
-# re-chunks it into disjoint per-shard `Vec<Partition>` so each shard's SSTable
-# encode runs on its own rayon worker (the flush-encode parallelism win). The
-# `collect()` introduces no new scan materialization beyond the caller's
-# already-bounded Vec; owned per-shard Vecs are inherent to handing chunks to
-# separate threads (rayon has no borrow-across-threads streaming alternative
-# here). Bounded + intentional.
-[[allow]]
-path = "ferrosa-storage/src/flush.rs"
-rule = "collect-vec-partition-or-row"
-symbol = "split_sorted_partitions_into_shards"
-reason = "re-chunks an already-materialized, flush-threshold-bounded Vec<Partition> into disjoint per-shard owned Vecs for parallel rayon SSTable encode; no new scan materialization, owned chunks inherent to cross-thread hand-off."
-owner = "bkearns"
-expires = "2027-07-01"
-
-# ---------------------------------------------------------------------------
-# Group 3 — baseline for crates that entered audit scope in t_2487eeb7
-#
-# `AUDIT_CRATES` went from 6 crates to 15, and the `returns-vec-partition-or-row`
-# rule gained the `Vec<VirtualRow>` shape. Together those surfaced 82 findings.
-# They are PRE-EXISTING materialization that the gate simply could not see — not
-# new regressions introduced by this change.
-#
-# These entries are deliberately marked NOT INDIVIDUALLY TRIAGED. They do not
-# assert the sites are safe; they record that the gate now sees them and that
-# classification is owed. The expiry is short (2026-10-01) so they fail the gate
-# rather than becoming a permanent rubber stamp. Triage is forge t_a49d88c3;
-# the one confirmed class-A site is forge t_250fa355.
-# ---------------------------------------------------------------------------
-
 [[allow]]
 path = "ferrosa-cql/src/observability.rs"
 rule = "collect-vec-partition-or-row"
@@ -1196,22 +775,4 @@ expires = "2026-10-01"
 # ---------------------------------------------------------------------------
 # jsonb (feat/jsonb, #467) — audited false positives. None bounds a result set.
 # ---------------------------------------------------------------------------
-
-[[allow]]
-path = "ferrosa-jsonb/src/limits.rs"
-rule = "server-side-result-cap"
-symbol = "DEFAULT_MAX_KEY_LIST"
-reason = "Input limit, not a result cap: the maximum number of keys ONE ?|/?& argument may carry (jsonb D14, POC cassandra.jsonb.max_key_list_length). Refusing oversize input is a typed error at ingest; no query result is bounded by it."
-owner = "bkearns"
-expires = "2027-07-01"
-
-
-
-[[allow]]
-path = "ferrosa-postgres/src/query.rs"
-rule = "stream-returns-vec"
-symbol = "execute_query_streaming"
-reason = "Rows stream to the ReplySink as the executor yields them (t_f348ba0b); the returned Vec holds only the bounded tail (CommandComplete or the terminating ErrorResponse)."
-owner = "bkearns"
-expires = "2027-07-01"
 

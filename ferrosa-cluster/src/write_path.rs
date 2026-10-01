@@ -22,26 +22,22 @@ use crate::error::ClusterError;
 use crate::pair::coordinator::PairCoordinator;
 use crate::ring::strategy::ReplicationStrategy;
 
-/// Default partition bound for the two range-read shapes that still need a
-/// hard bound — NOT a result cap on the streamable shapes.
+/// Per-replica scan window for the LEGACY single-shot range RPC.
 ///
-/// After the streaming-range-reads work (spec: `streaming-range-reads-no-cap`),
-/// the O(1)-streamable shapes (simple `WHERE … ALLOW FILTERING` scans, streaming
-/// scalar aggregates, `SELECT DISTINCT <partition key>`, and any user `LIMIT N`)
-/// are bounded ONLY by the query's own `LIMIT` — never by this constant. The
-/// two remaining users of this bound are:
+/// This is a **resource** bound, not a result bound: the legacy
+/// `RangeReadRequest` RPC ships one replica's whole slice in a single message,
+/// so a per-replica window is what keeps that one message finite. It is used
+/// only by the documented degraded mixed-version opt-out
+/// (`FERROSA_BULK_STREAMING_RANGE_READ=0`); the streaming path every query uses
+/// by default is uncapped and bounds memory instead, not result count.
 ///
-/// 1. `range_read_limited_rows_checked` — the truncation-detecting probe for the
-///    still-accumulating complex shapes (`ORDER BY` global sort / function
-///    projection) that must fail loud rather than compute a wrong answer over a
-///    clipped window, until spill-to-disk lands (spec step 5).
-/// 2. The legacy non-streaming coordinated range RPC selected by
-///    `FERROSA_BULK_STREAMING_RANGE_READ=0` (a documented, degraded
-///    mixed-version-upgrade opt-out), where it caps per-replica partitions.
-///
-/// It is NOT applied as a result cap on `range_read_limited_rows` (a user/page
-/// bound) nor on the streaming `*_stream_all_*` scans.
-pub const DEFAULT_RANGE_READ_LIMIT: usize = 10_000;
+/// It is **never** applied as a server-side result cap on a query path: not on
+/// `range_read_limited_rows` (a user/page bound), nor on the streaming
+/// `*_stream_all_*` scans. `DEFAULT_RANGE_READ_LIMIT` — the old 10_000-row
+/// *result* cap — is gone; the value survives under this name only as the
+/// legacy replica window and as the historical reference the regression tests
+/// compare against.
+pub const LEGACY_RANGE_READ_REPLICA_WINDOW: usize = 10_000;
 
 pub type PartitionResultStream =
     Pin<Box<dyn Stream<Item = crate::error::Result<Partition>> + Send>>;
@@ -1000,8 +996,8 @@ impl WritePath {
     ///
     /// This lets CQL `LIMIT` and protocol page-size produce the first page
     /// promptly instead of materializing the full default scan window before
-    /// applying row-level bounds. `limit` is the caller's OWN bound and is no
-    /// longer re-clamped to `DEFAULT_RANGE_READ_LIMIT`; the storage layer's
+    /// applying row-level bounds. `limit` is the caller's OWN bound and is
+    /// never re-clamped to a server-side cap; the storage layer's
     /// Vec-materialization OOM guard fail-louds if a caller asks this
     /// `Vec`-returning API for more than it can safely materialize, so large
     /// user `LIMIT`s route through the streaming scan instead.
@@ -1025,22 +1021,17 @@ impl WritePath {
     ) -> crate::error::Result<Vec<Partition>> {
         // The `limit` here is the caller's OWN bound — a user `LIMIT N` or the
         // protocol page size — so it must NOT be re-clamped to a server-side
-        // `DEFAULT_RANGE_READ_LIMIT` result cap. A user asking for `LIMIT 20000`
-        // must receive up to 20000 rows; memory is bounded by the caller's
-        // chosen `limit`, not a magic 10_000. `limit == 0` is meaningless for a
-        // bounded read, so floor it at 1. (The truncation-detecting
-        // `range_read_limited_rows_checked` keeps its own bound for the
-        // still-accumulating complex shapes until spill lands — step 5.)
+        // result cap. A user asking for `LIMIT 20000` must receive up to 20000
+        // rows; memory is bounded by the caller's chosen `limit`, not a magic
+        // 10_000. `limit == 0` is meaningless for a bounded read, so floor it
+        // at 1.
         let limit = limit.max(1);
         self.range_read_partitions_inner(table_id, limit, row_limit)
             .await
     }
 
     /// Shared range-read dispatch with an explicit partition `limit` and no
-    /// hard-cap clamping. Callers are responsible for bounding `limit`. This
-    /// exists so [`Self::range_read_limited_rows_checked`] can probe exactly one
-    /// partition past the hard cap to detect truncation, which the public
-    /// clamping wrapper cannot express.
+    /// hard-cap clamping. Callers are responsible for bounding `limit`.
     async fn range_read_partitions_inner(
         &self,
         table_id: &TableId,
@@ -1070,27 +1061,24 @@ impl WritePath {
     ///
     /// Reads up to `limit + 1` partitions internally and returns at most the
     /// first `limit`, plus a `truncated` flag that is `true` when more than
-    /// `limit` partitions existed (i.e. the cap clipped the result). Callers
-    /// that must not silently truncate — complex query shapes (ORDER BY /
-    /// DISTINCT / aggregate / function projection over a full scan) where the
-    /// cap is the engine's `DEFAULT_RANGE_READ_LIMIT` rather than a user
-    /// `LIMIT` — use this to fail loud instead of computing a wrong answer over
-    /// a clipped set.
+    /// `limit` partitions existed (i.e. the bound clipped the result). Retained
+    /// for callers that need an explicit truncation signal on an
+    /// intentionally-bounded read.
     ///
-    /// The internal probe of `limit + 1` is still bounded by
-    /// `DEFAULT_RANGE_READ_LIMIT + 1`; this method does not widen the hard cap.
+    /// No query path uses this any more. Every full-scan shape is served by
+    /// streaming (and, where it must buffer, spilling) rather than by refusing
+    /// a query: a refusal is not a correctness guarantee, it is an outage for a
+    /// query the engine can answer. Kept as a bounded reader for callers that
+    /// genuinely want `limit` partitions and a truncation flag.
+    ///
+    /// The internal probe of `limit + 1` is bounded only by `limit` itself.
     pub async fn range_read_limited_rows_checked(
         &self,
         table_id: &TableId,
         limit: usize,
         row_limit: usize,
     ) -> crate::error::Result<(Vec<Partition>, bool)> {
-        // Apply the same hard cap the public reader uses, then probe exactly one
-        // partition past it via the unclamped inner dispatch. This distinguishes
-        // "the table has at most `effective_limit` partitions" from "the table
-        // has more and we are about to clip it" even when `limit` is the hard
-        // cap itself (the silent-truncation case we exist to catch).
-        let effective_limit = limit.clamp(1, DEFAULT_RANGE_READ_LIMIT);
+        let effective_limit = limit.max(1);
         let probe_limit = effective_limit.saturating_add(1);
         let mut partitions = self
             .range_read_partitions_inner(table_id, probe_limit, row_limit)
@@ -1496,7 +1484,7 @@ mod tests {
     #[tokio::test]
     async fn direct_write_path_delegates_to_storage() {
         assert_eq!(
-            DEFAULT_RANGE_READ_LIMIT, 10_000,
+            LEGACY_RANGE_READ_REPLICA_WINDOW, 10_000,
             "cluster range reads must not use the historical 1M materialization window"
         );
 

@@ -306,6 +306,7 @@ impl CrossShardCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accord::perf_support::assert_min_op_in_reference_loops;
     use ferrosa_common::accord::TxnPhase;
     use ferrosa_storage::accord::sync_writer::MockSyncWriter;
     use std::time::Instant;
@@ -421,43 +422,47 @@ mod tests {
     /// wall-clock time is bounded by the max single-shard time, not the sum.
     #[test]
     fn cross_shard_execute_parallel() {
-        let mut coord = make_coordinator(&[1, 2, 3]);
-        let tid = txn(1, 3000);
-        let t0 = ts(3000);
         let ballot = BallotNumber(1);
 
-        let shard_keys: Vec<(ShardId, Vec<u8>)> = vec![
-            (1, b"key_a".to_vec()),
-            (2, b"key_b".to_vec()),
-            (3, b"key_c".to_vec()),
-        ];
+        // Latency check: sequential execution of 3 shards with no sleep should
+        // complete near-instantly. This verifies no artificial serialization
+        // barrier was introduced. In production the shards would run on
+        // different threads/cores.
+        //
+        // The bound is a same-run ratio against a CPU reference loop, NOT an
+        // absolute `< 100 ms`. An absolute figure measures the runner: a
+        // contended box deschedules the measured thread and the "latency" is
+        // the deschedule gap. The MINIMUM cost of one execution over a
+        // reference loop is load-independent, and an artificial serialization
+        // barrier (a sleep, a lock hand-off) is orders of magnitude over it.
+        let _ = assert_min_op_in_reference_loops("cross_shard::execute (3 shards)", 1.0, 5, || {
+            let mut coord = make_coordinator(&[1, 2, 3]);
+            let tid = txn(1, 3000);
+            let t0 = ts(3000);
+            let shard_keys: Vec<(ShardId, Vec<u8>)> = vec![
+                (1, b"key_a".to_vec()),
+                (2, b"key_b".to_vec()),
+                (3, b"key_c".to_vec()),
+            ];
 
-        // Track per-shard execution to verify independence.
-        let mut executed_shards = Vec::new();
+            // Track per-shard execution to verify independence.
+            let mut executed_shards = Vec::new();
 
-        let start = Instant::now();
-        let outcome = coord.execute(tid, t0, &shard_keys, ballot, |shard_id, _sm, key| {
-            executed_shards.push(shard_id);
-            ShardResult::Ok(key.to_vec())
+            let start = Instant::now();
+            let outcome = coord.execute(tid, t0, &shard_keys, ballot, |shard_id, _sm, key| {
+                executed_shards.push(shard_id);
+                ShardResult::Ok(key.to_vec())
+            });
+            let dt = start.elapsed().as_nanos();
+
+            // Deterministic half: all shards executed and the txn committed.
+            assert_eq!(executed_shards.len(), 3, "all three shards must execute");
+            assert!(
+                matches!(outcome, CrossShardOutcome::Committed(_)),
+                "transaction must commit"
+            );
+            dt
         });
-        let elapsed = start.elapsed();
-
-        // All shards executed.
-        assert_eq!(executed_shards.len(), 3, "all three shards must execute");
-        assert!(
-            matches!(outcome, CrossShardOutcome::Committed(_)),
-            "transaction must commit"
-        );
-
-        // Latency check: sequential execution of 3 shards with no sleep
-        // should complete near-instantly. This verifies no artificial
-        // serialization barrier was introduced. In production the shards
-        // would run on different threads/cores.
-        assert!(
-            elapsed.as_millis() < 100,
-            "parallel execution should be fast, took {}ms",
-            elapsed.as_millis()
-        );
     }
 
     /// A6.3-T4: Each shard waits for its own dependencies independently.
