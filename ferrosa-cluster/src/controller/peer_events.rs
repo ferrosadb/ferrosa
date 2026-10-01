@@ -194,6 +194,18 @@ impl ModeController {
                     {
                         join_enqueued_invite = Some(host_id);
                     }
+                    // A peer that was away longer than the Raft log's retained
+                    // window cannot recover the schema it missed by log replay:
+                    // those entries have been snapshotted and purged, so it comes
+                    // back permanently diverged, re-offering the schema it already
+                    // has. Push it the cluster's schema.
+                    //
+                    // The Raft state-machine snapshot is not sufficient on its own
+                    // -- it carries table metadata for the state machine, while the
+                    // CQL-visible registry is restored by a separate path -- so a
+                    // node restored from a purged log still answers "unconfigured
+                    // table" for tables it never learned.
+                    self.spawn_schema_snapshot_push(host_id);
                 }
                 PeerEventAction::SendClusterInvite { host_id, force: _ } => {
                     invite_sent = true;
@@ -228,6 +240,66 @@ impl ModeController {
                 self.send_cluster_invite_to(host_id);
             }
         }
+    }
+
+    /// Push this node's schema to a peer that has just (re)joined.
+    ///
+    /// Leader-only, and deliberately so: the receiving handler treats tables its
+    /// own schema holds that the incoming snapshot lacks as dropped, and deletes
+    /// them. A stale sender would therefore destroy the receiver's newer tables.
+    /// See [`super::cluster::should_send_schema_snapshot`].
+    fn spawn_schema_snapshot_push(&self, peer_id: uuid::Uuid) {
+        let local_host_id = self.local_host_id;
+        let schema = self.schema.clone();
+        // Read the node-id -> host-id map by value now: the spawned task cannot
+        // borrow `self`, and the map must be the one that exists at send time
+        // rather than re-read through a live controller borrow.
+        let raft_node_map = self
+            .raft_node_map
+            .load_full()
+            .map(|m| m.read().unwrap_or_else(|e| e.into_inner()).clone());
+        let Some(raft) = self.raft() else {
+            return;
+        };
+        let peer_manager = match &**self.peer_manager.load() {
+            Some(pm) => pm.clone(),
+            None => {
+                tracing::warn!(%peer_id, "schema snapshot push skipped: peer_manager not set");
+                return;
+            }
+        };
+
+        self.spawn_tracked(async move {
+            let leader_node_id = match raft.current_leader().await {
+                Some(lid) => lid,
+                None => {
+                    tracing::warn!(
+                        %peer_id,
+                        "schema snapshot push skipped: no raft leader known"
+                    );
+                    return;
+                }
+            };
+            // The map was captured by value, not read through `self` inside the
+            // task: the task outlives the borrow of `self`.
+            let leader_host_id = raft_node_map
+                .as_ref()
+                .and_then(|map| map.get(&leader_node_id).copied());
+            if !super::cluster::should_send_schema_snapshot(local_host_id, leader_host_id) {
+                tracing::debug!(
+                    %peer_id,
+                    ?leader_host_id,
+                    "schema snapshot push skipped: this node is not the raft leader"
+                );
+                return;
+            }
+
+            tracing::info!(
+                %peer_id,
+                "pushing the cluster schema to a (re)joining peer"
+            );
+            super::token::send_schema_sync_to_peer(&peer_manager, peer_id, &schema).await;
+        });
     }
 
     fn spawn_hint_delivery(&self, peer_id: uuid::Uuid) {
