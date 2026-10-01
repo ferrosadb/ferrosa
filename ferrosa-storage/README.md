@@ -287,7 +287,15 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   durable copy.
 - **Uploaded-SSTable cache eviction** (`enforce_uploaded_sstable_cache_limit`) —
   under disk pressure or over `local_cache_max_bytes`, deletes the local copy of
-  manifest-listed SSTables, oldest first. Before deleting, it writes and fsyncs a
+  manifest-listed SSTables of tables that are not hot, never-read tables first,
+  then least recently read (`eviction_plan::order_for_eviction`, a pure
+  function). A table is hot for `FERROSA_CACHE_HOT_WINDOW_SECS` (default 900,
+  `0` disables) after a foreground read; the per-table stamp is set by the
+  engine's point, range, index and full-text read entry points and never by
+  anti-entropy repair, compaction or self-heal. When only hot tables keep the
+  cache over its limit, one WARN names `hot_bytes` and the hot tables (and one
+  INFO when it clears). Startup restore of evicted SSTables logs its plan and
+  progress. Before deleting, it writes and fsyncs a
   `<gen>.evicted` marker; the engine constructors restore every marked generation
   from S3 before any table registers (`restore_evicted_sstables`), because
   generation discovery reads local files only. Only marked generations are

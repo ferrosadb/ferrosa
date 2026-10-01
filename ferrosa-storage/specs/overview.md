@@ -102,6 +102,10 @@ volume or changing query results.
 
 1. **S3 is authoritative; local disk is a write-behind cache.** Cache eviction
    must never delete the only copy — manifest-pinned entries are never evicted.
+   Uploaded-SSTable eviction is read-aware: a table read by a foreground query
+   within `FERROSA_CACHE_HOT_WINDOW_SECS` (default 900; `0` disables) is never
+   a candidate, and the rest go never-read first, then least recently read,
+   then oldest write (FMEA ST-40). Anti-entropy repair reads do not count.
    Periodic S3 sync skips incomplete generations before upload or manifest
    publication: all four required components (`Data.db`, `Partitions.db`,
    `Rows.db`, and `Filter.db`) must be present. This is a presence check;
