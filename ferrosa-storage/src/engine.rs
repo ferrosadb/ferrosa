@@ -30849,7 +30849,7 @@ mod tests {
 
         let record = first_eviction_record(&table_dir);
         assert_eq!(record.trigger, Trigger::CacheCap);
-        assert_eq!(record.source, crate::eviction_marker::SOURCE_EVICTOR);
+        assert_eq!(record.source, "ferrosa-storage evictor");
         assert_eq!(record.generation_bytes, Some(80));
         assert_eq!(record.total_bytes, Some(160));
         assert_eq!(record.max_bytes, Some(100));

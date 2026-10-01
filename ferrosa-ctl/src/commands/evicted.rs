@@ -354,7 +354,7 @@ mod tests {
             let MarkerState::Recorded(record) = read_marker(&marker(dir.path(), gen)) else {
                 panic!("generation {gen} must carry a readable record");
             };
-            assert_eq!(record.source, SOURCE);
+            assert_eq!(record.source, "ferrosa-ctl sstable mark-evicted");
             assert_eq!(record.trigger, Trigger::Recovered);
         }
         assert!(
