@@ -1334,6 +1334,8 @@ pub struct StorageEngine {
     cache_hot_blocked: AtomicBool,
     /// Edge flag for the manifest-vs-disk drift warning.
     manifest_drift_flagged: AtomicBool,
+    /// Durable, bounded record of every eviction pass that found pressure.
+    eviction_audit: crate::eviction_audit::EvictionAudit,
     /// Set when write admission observes local disk pressure. The process
     /// maintenance loop consumes this flag to run an urgent S3 upload/eviction
     /// pass instead of waiting for the next normal flush tick.
@@ -2995,6 +2997,9 @@ impl StorageEngine {
             build_index_scheduler(&config, &tables, &pending_index_uploads);
 
         let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
+        let eviction_audit = crate::eviction_audit::EvictionAudit::new(
+            crate::eviction_audit::AuditConfig::from_env(&config.data_dir),
+        );
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -3041,6 +3046,7 @@ impl StorageEngine {
             s3_sync_running: AtomicBool::new(false),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
+            eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -3229,6 +3235,10 @@ impl StorageEngine {
 
         let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
         let engine = Self {
+        let eviction_audit = crate::eviction_audit::EvictionAudit::new(
+            crate::eviction_audit::AuditConfig::from_env(&config.data_dir),
+        );
+        Ok(Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
             write_admission: WriteAdmissionSettings::from_env(),
@@ -3274,6 +3284,7 @@ impl StorageEngine {
             s3_sync_running: AtomicBool::new(false),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
+            eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -3462,6 +3473,9 @@ impl StorageEngine {
         }
 
         let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
+        let eviction_audit = crate::eviction_audit::EvictionAudit::new(
+            crate::eviction_audit::AuditConfig::from_env(&config.data_dir),
+        );
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -3508,6 +3522,7 @@ impl StorageEngine {
             s3_sync_running: AtomicBool::new(false),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
+            eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -12886,7 +12901,13 @@ impl StorageEngine {
             std::time::SystemTime::now(),
             std::time::Duration::from_secs(self.config.cache_hot_window_secs),
         );
+        let initial_trigger = crate::eviction_marker::Trigger::from_limits(
+            total_bytes > max_bytes,
+            target_free > 0 && projected_available < target_free,
+        );
+        let disk_bytes_at_start = total_bytes;
         let mut evicted = 0usize;
+        let mut evicted_bytes = 0u64;
         let mut stopped_early = false;
 
         for crate::eviction_plan::EvictionCandidate {
@@ -12946,6 +12967,7 @@ impl StorageEngine {
             total_bytes = total_bytes.saturating_sub(size);
             projected_available = projected_available.saturating_add(reclaimed);
             evicted += 1;
+            evicted_bytes = evicted_bytes.saturating_add(size);
             tracing::info!(
                 table = table_id,
                 sstable = sstable_id,
@@ -12958,6 +12980,31 @@ impl StorageEngine {
                 target_free_bytes = target_free,
                 "s3-sync: evicted uploaded local SSTable from cache"
             );
+        }
+
+        // The pass found pressure: leave a durable, bounded record of what it
+        // saw and did. This cannot fail or delay the eviction (it is after it).
+        if let Some(trigger) = initial_trigger {
+            let now = crate::eviction_audit::now_unix_ms();
+            self.eviction_audit
+                .record_pass(crate::eviction_audit::PassRecord {
+                    version: 1,
+                    first_unix_ms: now,
+                    last_unix_ms: now,
+                    count: 1,
+                    pid: std::process::id(),
+                    build: env!("CARGO_PKG_VERSION").to_string(),
+                    trigger,
+                    max_bytes,
+                    min_bytes,
+                    target_free,
+                    projected_available,
+                    manifest_bytes: collected.manifest_bytes,
+                    disk_bytes: disk_bytes_at_start,
+                    duplicate_entries: collected.duplicate_entries as u64,
+                    evicted_generations: evicted as u64,
+                    evicted_bytes,
+                });
         }
 
         // Every cold SSTable is gone (or was kept on a record failure, which is
@@ -13175,6 +13222,9 @@ impl StorageEngine {
         }
 
         let evicted = self.enforce_uploaded_sstable_cache_limit(&manifest)?;
+        // Optional, off by default, strictly after the eviction and bounded:
+        // one segment, one attempt, a timeout, through the shared throttled store.
+        self.eviction_audit.offload_rotated(&store, &prefix).await;
         if uploaded > 0 || evicted > 0 {
             tracing::info!(uploaded, evicted, "s3-sync: SSTables synchronized");
         }
@@ -14397,6 +14447,9 @@ impl StorageEngine {
             * 1_000_000_000.0) as u64;
 
         let set_aside_status = crate::replay_set_aside::SetAsideLedger::adopt(&config.data_dir)?;
+        let eviction_audit = crate::eviction_audit::EvictionAudit::new(
+            crate::eviction_audit::AuditConfig::from_env(&config.data_dir),
+        );
         let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
@@ -14436,6 +14489,7 @@ impl StorageEngine {
             s3_sync_running: AtomicBool::new(false),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
+            eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
@@ -30823,6 +30877,78 @@ mod tests {
         assert_eq!(record.max_bytes, Some(1024 * 1024));
         assert_eq!(record.total_bytes, Some(160));
         assert!(record.target_free.unwrap() > record.projected_available.unwrap());
+    }
+
+    /// Every pass that finds pressure leaves a durable record naming what it
+    /// saw (manifest claim AND real disk total), what it did, and who wrote it.
+    #[test]
+    fn an_eviction_pass_leaves_a_durable_audit_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _table_dir, mut manifest) =
+            engine_with_two_uploaded_sstables(dir.path(), 100, 0);
+        // The manifest over-claims: 1000 bytes per entry against 80 on disk.
+        let listed = manifest.sstables.get_mut(&table_id().to_string()).unwrap();
+        listed.iter_mut().for_each(|entry| entry.size = 1000);
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+        assert_eq!(evicted, 1);
+
+        let text =
+            std::fs::read_to_string(dir.path().join("eviction-audit/audit.current.jsonl")).unwrap();
+        let record: crate::eviction_audit::PassRecord =
+            serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(record.trigger, crate::eviction_marker::Trigger::CacheCap);
+        assert_eq!(record.max_bytes, 100);
+        assert_eq!(record.min_bytes, 0);
+        assert_eq!(record.target_free, 0);
+        assert_eq!(record.manifest_bytes, 2000, "what the manifest claims");
+        assert_eq!(record.disk_bytes, 160, "what is on disk");
+        assert_eq!(record.evicted_generations, 1);
+        assert_eq!(record.evicted_bytes, 80);
+        assert_eq!(record.pid, std::process::id());
+        assert_eq!(record.build, env!("CARGO_PKG_VERSION"));
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    /// An audit that cannot be written must not stop the eviction or its
+    /// marker: durability of the marker outranks the audit record.
+    #[test]
+    fn an_unwritable_audit_does_not_prevent_an_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, manifest) = engine_with_two_uploaded_sstables(dir.path(), 100, 0);
+        // A regular file where the audit directory must go.
+        std::fs::write(dir.path().join("eviction-audit"), b"in the way").unwrap();
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        assert_eq!(evicted, 1, "the eviction proceeded");
+        let marked = ["1", "2"]
+            .iter()
+            .filter(|g| StorageEngine::evicted_marker_path(&table_dir, g).exists())
+            .count();
+        assert_eq!(marked, 1, "and its marker was written");
+        assert!(engine.eviction_audit.is_failing());
+        assert_eq!(engine.eviction_audit.write_failure_edges(), 1);
+    }
+
+    /// The latest pass is readable without touching the audit files.
+    #[test]
+    fn the_eviction_audit_is_exposed_as_metrics() {
+        let text = crate::metrics::render_prometheus();
+        let wanted = [
+            "ferrosa_storage_eviction_audit_last_unix_ms",
+            "ferrosa_storage_eviction_audit_last_manifest_bytes",
+            "ferrosa_storage_eviction_audit_last_disk_bytes",
+            "ferrosa_storage_eviction_audit_last_evicted_generations",
+            "ferrosa_storage_eviction_audit_write_failures_total",
+        ];
+        wanted
+            .iter()
+            .for_each(|name| assert!(text.contains(name), "{name} missing from the metrics"));
     }
 
     fn manifest_entry(id: &str, size: u64) -> crate::manifest::ManifestEntry {

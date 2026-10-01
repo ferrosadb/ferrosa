@@ -192,6 +192,8 @@ worker is initialized. Byte values are bytes unless the name says otherwise.
 | `FERROSA_S3_STATS` | `1`/`true` collects object-store stats (per-operation counts, bytes, latency, 429s; per-table/component bytes, object sizes, throughput, read amplification) and exposes them as `ferrosa_s3_*` Prometheus series and `system_observability.object_store_stats` / `object_store_ops`. Per-table labels exist only when on | off |
 | `FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES` | Free space reserved on the data filesystem; writes fail closed below it | `536870912` (512 MiB) |
 | `FERROSA_CACHE_MIN_BYTES` | Minimum local cache target | `0` |
+| `FERROSA_EVICTION_AUDIT_MAX_BYTES` | Hard cap on the on-disk eviction audit (`<data_dir>/eviction-audit/`), split into 4 ring segments after a 4 KiB reserve; clamped to 16 KiB..32 MiB. Under 0.8% of the default free-space reserve | `4194304` (4 MiB) |
+| `FERROSA_EVICTION_AUDIT_OFFLOAD` | `true` uploads rotated audit segments to `<prefix>/eviction-audit/<instance>/` through the throttled object store: one segment per sync, one attempt, local copy removed only after the upload succeeds | off |
 | `FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES` | Free-space point that starts local SSTable eviction | `2 × FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES` |
 | `FERROSA_LOCAL_DISK_EVICTION_TARGET_FREE_BYTES` | Free-space target after eviction | `max(low water, 3 × reserve)` |
 | `FERROSA_SSTABLE_READER_CACHE_CAP` | Maximum idle SSTable readers retained in the shared LRU pool | `256` |
@@ -209,6 +211,16 @@ worker is initialized. Byte values are bytes unless the name says otherwise.
 | `FERROSA_DATA_RUNTIME_THREADS` | Data runtime worker threads | `8` |
 | `FERROSA_CQL_RUNTIME_THREADS` | CQL runtime worker threads | `8` |
 | `FERROSA_BACKGROUND_RUNTIME_THREADS` | Background runtime worker threads | `2` |
+
+The eviction audit answers "why did the cache evict?" after the log has rotated.
+Each eviction pass that finds pressure appends one JSON line: trigger, cache cap,
+floor, free-space target, projected free space, the manifest's byte claim and the
+real on-disk total of the same generations (the gap is the signal), how many
+generations were evicted and their size, and the writer's pid and build.
+Identical consecutive passes coalesce into one record with a count. The latest
+pass is on `/metrics` as `ferrosa_storage_eviction_audit_*` gauges. Retention is
+the ring itself: the newest segments that fit the cap, oldest dropped first;
+offload is the only way to keep more.
 
 Direct I/O has separate switches for SSTable writes and compaction input scans.
 `FERROSA_SSTABLE_DIRECT_IO` controls immutable `Data.db` writes. Compaction input

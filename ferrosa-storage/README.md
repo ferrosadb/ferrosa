@@ -346,6 +346,27 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `ManifestEntry::size`), counts each `(table, generation)` once, and logs one
   WARN (edge only) when the manifest claims >= 1.5x and >= 16 MiB more bytes
   than the same generations occupy on disk, or lists one twice (FMEA ST-64).
+  **Eviction audit** (`eviction_audit.rs`, FMEA ST-65): every pass that finds
+  pressure appends one JSON line to `<data_dir>/eviction-audit/audit.current.jsonl`
+  (trigger, `max_bytes`/`min_bytes`/`target_free`/`projected_available`, the
+  manifest's byte claim and the real on-disk total of the same set,
+  duplicate entries, generations and bytes evicted, pid, build). The files are
+  bounded by construction: `FERROSA_EVICTION_AUDIT_MAX_BYTES` (default 4 MiB,
+  clamped 16 KiB..32 MiB; under 0.8% of the default 512 MiB free-space reserve)
+  is split into 4 ring segments after a 4 KiB reserve, a record never lands in a
+  segment it does not fit, and the oldest rotated segment is deleted before the
+  current one is renamed, so no more than 4 files ever exist. Identical
+  consecutive passes coalesce into one record with a count. Writing it never
+  fails or delays an eviction: errors are reported on the edges (WARN when
+  writes start failing, INFO when they recover) and counted. The latest pass is
+  exposed as `ferrosa_storage_eviction_audit_*` metrics. Retention is the ring:
+  the newest segments that fit the cap. `FERROSA_EVICTION_AUDIT_OFFLOAD=true`
+  (off by default) uploads rotated segments to
+  `<prefix>/eviction-audit/<instance>/<segment>` through the engine's shared
+  throttled store, after the eviction, one segment per sync, one attempt with a
+  timeout, and removes the local copy only after the put succeeds. A failed
+  upload leaves the segment; the disk bound still wins, so the ring drops the
+  oldest un-uploaded segment by age if uploads keep failing.
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
