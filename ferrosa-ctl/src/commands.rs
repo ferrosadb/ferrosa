@@ -400,6 +400,11 @@ fn promote_to_voter_body(host_id: &str) -> serde_json::Value {
     serde_json::json!({ "host_id": host_id })
 }
 
+/// Build the `downgrade-to-pair` URL.
+fn downgrade_to_pair_url(host: &str, web_port: u16) -> String {
+    format!("http://{}:{}/api/cluster/downgrade-to-pair", host, web_port)
+}
+
 /// Build the `demote-to-learner` URL.
 fn demote_to_learner_url(host: &str, web_port: u16) -> String {
     format!("http://{}:{}/api/cluster/demote-to-learner", host, web_port)
@@ -408,6 +413,50 @@ fn demote_to_learner_url(host: &str, web_port: u16) -> String {
 /// Build the JSON body for `demote-to-learner`.
 fn demote_to_learner_body(host_id: &str) -> serde_json::Value {
     serde_json::json!({ "host_id": host_id })
+}
+
+/// Operator downgrade: take a node out of a Raft cluster and back into pair
+/// mode.
+///
+/// Exists because the automatic lifecycle deliberately will NOT do this. A
+/// multi-node Raft cluster never reverts to a pair on its own -- the two shapes
+/// commit differently, and silently swapping a quorum for a point-to-point
+/// primary accepts writes a quorum would have refused. Only a formation
+/// timeout, a peer event, or an operator can move a node's mode, and that
+/// timeout no longer downgrades. So this command is the whole of the "operator
+/// action" the node's warning log refers to.
+///
+/// Issues `POST /api/cluster/downgrade-to-pair`. The node must have a connected
+/// peer, since pair mode replicates to one; the server refuses otherwise and
+/// says which peers it could see.
+pub async fn cluster_downgrade_to_pair(host: &str, web_port: u16) -> Result<(), WebError> {
+    let url = downgrade_to_pair_url(host, web_port);
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).send().await?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!("Node downgraded to pair mode.");
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        // Say plainly what just changed, so the operator is not left thinking
+        // this was a routine transition.
+        println!(
+            "NOTE: this node no longer commits through Raft. It replicates              point-to-point to the peer named above; writes it accepts are not              quorum-acknowledged. Rejoin the cluster to restore quorum semantics."
+        );
+        Ok(())
+    } else if status.as_u16() == 404 {
+        Err(format!(
+            "cluster downgrade-to-pair: server endpoint not wired (HTTP {status}). \
+             The node's binary predates this command. Body: {text}"
+        )
+        .into())
+    } else {
+        Err(format!("cluster downgrade-to-pair failed (HTTP {status}): {text}").into())
+    }
 }
 
 /// W8.5 — Add a long-lived learner replica to the cluster.
@@ -1269,6 +1318,18 @@ mod tests {
 
         let body = super::promote_to_voter_body("host-promote");
         assert_eq!(body["host_id"], "host-promote");
+    }
+
+    /// `ferrosa-ctl cluster downgrade-to-pair` must POST to
+    /// `/api/cluster/downgrade-to-pair`.
+    ///
+    /// The URL is the whole contract between the CLI and the node, and getting
+    /// it wrong fails at runtime rather than compile time -- a 404 that reads
+    /// like "endpoint not wired" when in fact the path was misspelled.
+    #[test]
+    fn ferrosa_ctl_cluster_downgrade_to_pair() {
+        let url = super::downgrade_to_pair_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/downgrade-to-pair");
     }
 
     /// W8.5 RED. `ferrosa-ctl cluster demote-to-learner <host_id>` must

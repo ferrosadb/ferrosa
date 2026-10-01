@@ -4202,3 +4202,116 @@ async fn internode_broadcast_hostname_is_advertised_and_committed_not_a_frozen_i
          test would be vacuous"
     );
 }
+// Operator downgrade: cluster -> pair, on request only.
+//
+// The automatic lifecycle never moves a cluster back to a pair. These tests pin
+// the operator path that does it, and the refusals that keep it from becoming a
+// second silent downgrade route.
+// ---------------------------------------------------------------------------
+
+/// Build a controller whose mode is a committed cluster, as an operator would
+/// find it before deciding to downgrade.
+fn cluster_mode_controller(dir: &std::path::Path) -> Arc<ModeController> {
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.join("raft")),
+        ..ClusterConfig::default()
+    });
+    let (controller, _handles) = ModeController::new(
+        config,
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(dir),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(
+        Arc::new(NetConfig::default()),
+        controller.host_id(),
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+    controller.set_mode_for_test(DeploymentMode::Cluster);
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+    controller
+}
+
+/// Refused when there is no peer to replicate to.
+///
+/// This is the refusal that keeps the command honest. Pair mode replicates to
+/// exactly one peer; declaring it with nothing connected would leave a node that
+/// reports "pair" and has nowhere to send a write, which is worse than refusing.
+#[test]
+fn downgrade_to_pair_is_refused_with_no_connected_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    assert!(controller.connected_peers.lock().is_empty());
+
+    let err = controller
+        .downgrade_to_pair()
+        .expect_err("no connected peer must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("connected peer"),
+        "the refusal must name the missing peer, got: {msg}"
+    );
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Cluster,
+        "a refused downgrade must leave the node untouched"
+    );
+}
+
+/// Succeeds for a committed cluster with a connected peer, and it is the MODE
+/// that moves -- not merely the reported string.
+///
+/// The automatic state machine forbids `Cluster -> Pair`, which is exactly why
+/// this needs an operator override: without lifting that one check the action
+/// could not exist at all. Asserting the mode after the call is what separates
+/// "the operator authorised it" from "the override silently did nothing".
+/// Async: the pair transition installs handlers and spawns its reverse-pool
+/// task, so it needs a reactor -- the same reason the neighbouring
+/// `on_peer_connected` tests are `#[tokio::test]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_moves_a_cluster_member_when_a_peer_is_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let peer = Uuid::new_v4();
+    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    controller.connected_peers.lock().push((peer, addr));
+
+    let peer_host_id = controller
+        .downgrade_to_pair()
+        .expect("a cluster with a connected peer must accept an operator downgrade");
+
+    assert_eq!(
+        peer_host_id, peer,
+        "the returned peer is the replication target"
+    );
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "the operator override must actually move the mode"
+    );
+}
+
+/// The automatic path still cannot do this.
+///
+/// The override must not have widened the normal transition. If it had, the
+/// formation timeout would be able to downgrade again and the whole fix would be
+/// undone -- so this asserts the guard is still shut for the automatic call.
+#[test]
+fn the_automatic_pair_transition_is_still_refused_for_a_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+
+    controller.transition_to_pair(Uuid::new_v4(), addr, false);
+
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Cluster,
+        "transition_to_pair must still refuse Cluster -> Pair; only the operator \
+         entry point may cross that line"
+    );
+}

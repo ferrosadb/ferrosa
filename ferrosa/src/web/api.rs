@@ -103,6 +103,7 @@ pub fn cluster_routes() -> Router<WebAppState> {
     Router::new()
         .route("/status", get(cluster_status))
         .route("/promote", post(cluster_promote))
+        .route("/downgrade-to-pair", post(cluster_downgrade_to_pair))
         .route("/switchover", post(cluster_switchover))
         .route("/add-node", post(add_node_handler))
         .route("/decommission", post(decommission_handler))
@@ -385,6 +386,33 @@ async fn cluster_promote(State(mc): State<Arc<ModeController>>) -> (StatusCode, 
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Operator downgrade from cluster to pair mode.
+///
+/// The automatic lifecycle never does this: a multi-node Raft cluster does not
+/// revert to a pair on its own, because the shapes commit differently. The
+/// endpoint is the deliberate operator action that authorises it, so it is a
+/// POST with an explicit path rather than anything a health check can trigger.
+async fn cluster_downgrade_to_pair(
+    State(mc): State<Arc<ModeController>>,
+) -> (StatusCode, Json<Value>) {
+    match mc.downgrade_to_pair() {
+        Ok(peer_host_id) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "downgraded to pair mode",
+                "mode": mc.mode().to_string(),
+                "peer": peer_host_id.to_string(),
+                "warning": "this node no longer commits through Raft; it replicates \
+                            point-to-point to the named peer",
+            })),
+        ),
+        Err(e) => (
+            StatusCode::CONFLICT,
             Json(json!({ "error": e.to_string() })),
         ),
     }
@@ -1587,6 +1615,42 @@ mod tests {
     }
 
     // ---- Switchover endpoint tests ------------------------------------
+
+    /// The operator downgrade endpoint reports a refusal as 409, not 500.
+    ///
+    /// A node with no connected peer cannot become a pair -- there would be
+    /// nothing to replicate to -- and that is an operator-visible precondition
+    /// failure (conflict), not a server fault. The node must also be left
+    /// untouched, which the body lets a caller confirm.
+    #[tokio::test]
+    async fn api_downgrade_to_pair_returns_409_without_a_connected_peer() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/downgrade-to-pair")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CONFLICT,
+            "a downgrade with no connected peer is a conflict, not a server error"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            error.contains("connected peer"),
+            "the error must name the missing peer, got: {error}"
+        );
+    }
 
     /// Switchover in standalone mode should return 409 Conflict (not 500).
     #[tokio::test]

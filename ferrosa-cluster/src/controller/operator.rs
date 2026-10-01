@@ -2,6 +2,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::ddl_path::DdlPath;
 use crate::error::{ClusterError, Result};
@@ -34,6 +35,58 @@ impl ModeController {
         self.connected_peers.lock().clear();
         tracing::info!(epoch, "force promoted to standalone primary");
         Ok(())
+    }
+
+    /// Operator downgrade: take this node out of a Raft cluster and into pair
+    /// mode, replicating to one named peer.
+    ///
+    /// The automatic lifecycle never does this. `DeploymentMode` already
+    /// documents that a multi-node Raft cluster does not become a pair again,
+    /// because the shapes commit differently and silently swapping a quorum for
+    /// a point-to-point primary accepts writes a quorum would have refused. So
+    /// the move is an explicit operator decision, in the same class as
+    /// [`Self::force_promote`] -- and like that one it is reachable only through
+    /// this deliberate call, never from a timeout or a peer event.
+    ///
+    /// Refused, leaving the node untouched, when:
+    ///
+    /// - `peer` is not a currently connected peer: a pair needs somewhere to
+    ///   replicate, and a mode change alone would be a lie. The message names
+    ///   the connected peers so the operator can see what was actually available.
+    /// - the T-300 jsonb guard refuses leaving standalone (checked inside the
+    ///   pair transition, so it cannot be bypassed by going through here).
+    /// - no peer manager is installed.
+    ///
+    /// On success the real pair machinery is installed (coordinator, DDL path,
+    /// write path, pair state), not merely the mode -- so the node genuinely
+    /// behaves as a pair afterwards rather than reporting pair mode while still
+    /// writing through the cluster path.
+    pub fn downgrade_to_pair(&self) -> Result<Uuid> {
+        let peers = self.connected_peers.lock().clone();
+        let Some((peer_host_id, peer_addr)) = peers.first().copied() else {
+            return Err(ClusterError::ModeTransitionRejected(
+                "downgrade to pair requires a connected peer to replicate to; none is \
+                 connected — is the intended peer running and reachable?"
+                    .into(),
+            ));
+        };
+        {
+            // Hold `transition_guard` across the transition so the mode cannot
+            // move underneath the check-and-install in `transition_to_pair`.
+            let _guard = self.transition_guard.lock();
+            self.transition_to_pair_operator_override(peer_host_id, peer_addr);
+        }
+        if **self.mode.load() != DeploymentMode::Pair {
+            return Err(ClusterError::ModeTransitionRejected(
+                "the pair transition was refused (see the node log); the node is                  unchanged"
+                    .into(),
+            ));
+        }
+        tracing::warn!(
+            %peer_host_id,
+            "OPERATOR ACTION: downgraded from cluster to pair mode. This node now              replicates point-to-point and no longer commits through Raft."
+        );
+        Ok(peer_host_id)
     }
 
     /// Returns the current promote epoch (Lamport counter).
