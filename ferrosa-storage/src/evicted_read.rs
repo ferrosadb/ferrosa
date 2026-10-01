@@ -274,7 +274,7 @@ pub(crate) struct EvictedReadStore {
     /// and then hit the cache.
     page_loads: DashMap<PageKey, Arc<Mutex<()>>>,
     /// One lock per generation whose index components are being downloaded.
-    gen_loads: DashMap<String, Arc<Mutex<()>>>,
+    gen_loads: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     gets: AtomicU64,
     page_bytes_fetched: AtomicU64,
     index_bytes_fetched: AtomicU64,
@@ -283,13 +283,8 @@ pub(crate) struct EvictedReadStore {
 static REGISTRY: RwLock<Vec<Arc<EvictedReadStore>>> = RwLock::new(Vec::new());
 static HOOKS: Once = Once::new();
 
-/// Register (or replace) the ranged-read store for `data_dir`, with settings
-/// from the environment, and make sure the process-wide hooks exist.
-pub(crate) fn register(data_dir: PathBuf, prefix: String, store: Arc<dyn ObjectStore>) {
-    register_with_config(data_dir, prefix, store, EvictedReadConfig::from_env());
-}
-
-/// [`register`] with explicit settings.
+/// Register (or replace) the ranged-read store for `data_dir` and make sure
+/// the process-wide hooks exist, with explicit settings.
 pub(crate) fn register_with_config(
     data_dir: PathBuf,
     prefix: String,
@@ -304,6 +299,27 @@ pub(crate) fn register_with_config(
     }
     HOOKS.call_once(install_hooks);
     entry
+}
+
+/// The store registered for `data_dir`, registering one first if none is, or
+/// if the registered one wraps a different object store. Keeps the layout and
+/// page caches a startup registration filled when the engine's own hook
+/// installation follows.
+pub(crate) fn ensure_registered(
+    data_dir: PathBuf,
+    prefix: String,
+    store: Arc<dyn ObjectStore>,
+) -> Arc<EvictedReadStore> {
+    {
+        let registry = REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = registry
+            .iter()
+            .find(|e| e.data_dir == data_dir && e.prefix == prefix && Arc::ptr_eq(&e.store, &store))
+        {
+            return Arc::clone(existing);
+        }
+    }
+    register_with_config(data_dir, prefix, store, EvictedReadConfig::from_env())
 }
 
 /// The store owning `path`, if any data directory registered one.
@@ -425,12 +441,16 @@ impl EvictedReadStore {
             size,
             page_starts: self.page_layout(loc, size)?,
         });
+        self.remember_object(cache_key, Arc::clone(&info));
+        Ok(Some(info))
+    }
+
+    fn remember_object(&self, cache_key: String, info: Arc<ObjectInfo>) {
         if self.objects.len() >= MAX_OBJECT_INFOS {
             // Layouts are cheap to rebuild; bounding the table bounds memory.
             self.objects.clear();
         }
-        self.objects.insert(cache_key, Arc::clone(&info));
-        Ok(Some(info))
+        self.objects.insert(cache_key, info);
     }
 
     /// Chunk-aligned page starts for a compressed `Data.db` whose
@@ -656,31 +676,43 @@ impl EvictedReadStore {
 
     /// Download the index components of generation `gen` into `dir`.
     pub(crate) fn fetch_query_components(&self, dir: &Path, gen: &str) -> Result<QueryFetch> {
+        StorageEngine::block_on_rehydration(self.fetch_query_components_async(dir, gen))
+    }
+
+    /// [`Self::fetch_query_components`] for callers already on an async
+    /// runtime (startup registers many generations concurrently).
+    pub(crate) async fn fetch_query_components_async(
+        &self,
+        dir: &Path,
+        gen: &str,
+    ) -> Result<QueryFetch> {
         let data_path = dir.join(format!("{gen}-Data.db"));
         let Some(data_loc) = self.locate(&data_path) else {
             return Ok(QueryFetch::NotOwned);
         };
         let lock_key = data_loc.key.to_string();
         let lock = Arc::clone(self.gen_loads.entry(lock_key.clone()).or_default().value());
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let outcome = self.fetch_query_components_locked(dir, gen, &data_loc);
+        let _guard = lock.lock().await;
+        let outcome = self
+            .fetch_query_components_locked(dir, gen, &data_loc)
+            .await;
         self.gen_loads.remove(&lock_key);
         outcome
     }
 
-    fn fetch_query_components_locked(
+    async fn fetch_query_components_locked(
         &self,
         dir: &Path,
         gen: &str,
         data_loc: &ObjectLocation,
     ) -> Result<QueryFetch> {
-        if self.object_info(data_loc)?.is_none() {
+        let Some(size) = self.head_size(&data_loc.key).await? else {
             tracing::error!(
                 object = %data_loc.key,
                 "evicted SSTable has no Data.db object in the store; it cannot be opened"
             );
             return Ok(QueryFetch::Missing);
-        }
+        };
         std::fs::create_dir_all(dir)?;
         let mut fetched_bytes = 0u64;
         for (component, required) in QUERY_COMPONENTS {
@@ -689,7 +721,7 @@ impl EvictedReadStore {
                 continue;
             }
             let key = self.component_key(data_loc, component);
-            match self.download_small_component(&key, &local)? {
+            match self.download_small_component(&key, &local).await? {
                 Some(bytes) => fetched_bytes += bytes,
                 None if *required => {
                     tracing::error!(
@@ -705,14 +737,32 @@ impl EvictedReadStore {
             sync_dir(dir)?;
             self.index_bytes_fetched
                 .fetch_add(fetched_bytes, Ordering::Relaxed);
-            tracing::info!(
+            tracing::debug!(
                 dir = %dir.display(),
                 sstable = gen,
                 index_bytes = fetched_bytes,
                 "opened an evicted SSTable for ranged reads: fetched its index components only"
             );
         }
+        // Seed the layout cache now that `CompressionInfo.db` is local, so the
+        // first read neither re-HEADs the object nor falls back to fixed pages.
+        let info = Arc::new(ObjectInfo {
+            size,
+            page_starts: self.page_layout(data_loc, size)?,
+        });
+        self.remember_object(data_loc.key.to_string(), info);
         Ok(QueryFetch::Ready)
+    }
+
+    /// Size of an object, `None` when it does not exist.
+    async fn head_size(&self, key: &ObjectPath) -> Result<Option<u64>> {
+        match self.store.head(key).await {
+            Ok(meta) => Ok(Some(meta.size as u64)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(Error::InvalidFormat(format!(
+                "failed SSTable component head {key}: {e}"
+            ))),
+        }
     }
 
     fn component_key(&self, loc: &ObjectLocation, component: &str) -> ObjectPath {
@@ -728,18 +778,17 @@ impl EvictedReadStore {
 
     /// Download one small component to `local` atomically (temp file, fsync,
     /// rename). `Ok(None)` when the object does not exist.
-    fn download_small_component(&self, key: &ObjectPath, local: &Path) -> Result<Option<u64>> {
-        let store = Arc::clone(&self.store);
-        let get_key = key.clone();
-        let fetched = StorageEngine::block_on_rehydration(async move {
-            match store.get(&get_key).await {
-                Ok(result) => result.bytes().await.map(Some),
-                Err(e) => Err(e),
-            }
-        });
+    async fn download_small_component(
+        &self,
+        key: &ObjectPath,
+        local: &Path,
+    ) -> Result<Option<u64>> {
+        let fetched = match self.store.get(key).await {
+            Ok(result) => result.bytes().await,
+            Err(e) => Err(e),
+        };
         let bytes = match fetched {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
+            Ok(bytes) => bytes,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(e) => {
                 return Err(Error::InvalidFormat(format!(

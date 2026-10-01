@@ -108,8 +108,11 @@ volume or changing query results.
    then oldest write (FMEA ST-40). Anti-entropy repair reads do not count.
    A query over an evicted SSTable reads `Data.db` by paged ranged GETs and
    fetches only the small index components; it never downloads the whole
-   generation (FMEA ST-51). Compaction inputs and startup restore still
-   rehydrate in full.
+   generation (FMEA ST-51). Startup registers evicted generations
+   remote-backed the same way (index components only; `Data.db` stays in the
+   store) and a bounded background pass restores hot tables' generations while
+   free disk allows. Compaction inputs and `FERROSA_RESTORE_EVICTED_MODE=full`
+   still rehydrate in full.
    Periodic S3 sync skips incomplete generations before upload or manifest
    publication: all four required components (`Data.db`, `Partitions.db`,
    `Rows.db`, and `Filter.db`) must be present. This is a presence check;

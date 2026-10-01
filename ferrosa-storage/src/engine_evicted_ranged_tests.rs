@@ -464,3 +464,203 @@ async fn a_restart_after_ranged_reads_still_restores_the_marked_generation() {
     assert_eq!(partition_values(&partitions), all_written_values());
     engine.shutdown().unwrap();
 }
+
+// ---- Startup registers evicted generations remote-backed (t_6a2847c8) ----
+
+impl CountingStore {
+    fn reset_counters(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.data_db_bytes.store(0, SeqCst);
+        self.data_db_gets.store(0, SeqCst);
+        self.other_bytes.store(0, SeqCst);
+    }
+}
+
+/// [`evicting_s3_engine_with_hot_window`] with an explicit cache limit and
+/// a fallible constructor.
+fn try_restart_engine(
+    dir: &std::path::Path,
+    store: &Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+    hot_window_secs: u64,
+    cache_max_bytes: u64,
+) -> ferrosa_common::Result<StorageEngine> {
+    let mut config = StorageEngineConfig::test_config(dir);
+    config.local_cache_max_bytes = cache_max_bytes;
+    config.cache_hot_window_secs = hot_window_secs;
+    config.object_store = Some(crate::upload::ObjectStoreConfig {
+        prefix: prefix.to_string(),
+        ..crate::upload::ObjectStoreConfig::test_config()
+    });
+    StorageEngine::new_with_upload_store(
+        config,
+        Arc::clone(store),
+        prefix.to_string(),
+        &tokio::runtime::Handle::current(),
+    )
+}
+
+/// The 2026-09-30 incident: a restart downloaded ~345 evicted SSTables before
+/// serving, refilling the disk the evictor had just freed. Startup must now
+/// fetch index components only, register every generation remote-backed, and
+/// still serve every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_registers_evicted_generations_remote_backed_without_downloading_data() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let dir = tempfile::tempdir().unwrap();
+    let big = big_evicted_sstable(dir.path(), "test-startup-remote", "lz4").await;
+    let counting = Arc::clone(&big.store);
+    let (table_dir, gen) = (big.table_dir.clone(), big.gen.clone());
+    let data_len = big.data_db_object_len().await;
+    big.engine.shutdown().unwrap();
+    drop(big);
+    counting.reset_counters();
+
+    let store: Arc<dyn object_store::ObjectStore> = counting.clone();
+    let engine = try_restart_engine(dir.path(), &store, "test-startup-remote", 900, 1).unwrap();
+
+    assert_eq!(
+        counting.data_db_bytes.load(SeqCst),
+        0,
+        "startup must not download Data.db ({data_len} bytes)"
+    );
+    assert_eq!(counting.data_db_gets.load(SeqCst), 0);
+    assert!(
+        counting.other_bytes.load(SeqCst) < 1024 * 1024,
+        "startup fetched {} non-Data bytes; only index components may be fetched",
+        counting.other_bytes.load(SeqCst)
+    );
+    engine.register_table(test_schema()).unwrap();
+    let rows = engine
+        .read_range(&table_id(), None, None, RANGED_ROWS + 10)
+        .unwrap();
+    assert_eq!(rows.len(), RANGED_ROWS, "every row is served remote-backed");
+    assert_eq!(partition_values(&rows), all_written_values());
+    assert!(
+        counting.data_db_bytes.load(SeqCst) > 0,
+        "the rows came from ranged reads of the object store"
+    );
+    assert!(
+        !table_dir.join(format!("{gen}-Data.db")).exists(),
+        "Data.db must still be remote"
+    );
+    assert!(
+        StorageEngine::evicted_marker_path(&table_dir, &gen).exists(),
+        "the marker keeps its meaning"
+    );
+    engine.shutdown().unwrap();
+}
+
+/// A marked generation that is neither local nor resolvable remotely must stop
+/// startup with an error, not be dropped from its table (the 2026-09-29
+/// data-loss shape).
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_fails_loud_when_an_evicted_generation_is_gone_from_the_store() {
+    use object_store::ObjectStore;
+    let dir = tempfile::tempdir().unwrap();
+    let big = big_evicted_sstable(dir.path(), "test-startup-gone", "lz4").await;
+    let counting = Arc::clone(&big.store);
+    counting.delete(&big.component_key("Data.db")).await.unwrap();
+    big.engine.shutdown().unwrap();
+    drop(big);
+
+    let store: Arc<dyn ObjectStore> = counting;
+    let outcome = try_restart_engine(dir.path(), &store, "test-startup-gone", 900, 1);
+
+    let err = match outcome {
+        Ok(_) => panic!("startup must fail when an evicted generation cannot be resolved"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("evicted"),
+        "the error must name the evicted generation: {err}"
+    );
+}
+
+/// Two evicted tables after a restart; the hot one (read within the window)
+/// is fully restored in the background, the cold one stays remote.
+async fn restart_with_two_evicted_tables(
+    dir: &std::path::Path,
+    prefix: &str,
+    cache_max_bytes: u64,
+) -> (StorageEngine, std::path::PathBuf, std::path::PathBuf) {
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    {
+        let engine = evicting_s3_engine_with_hot_window(dir, &store, prefix, 0);
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(test_schema_2()).unwrap();
+        for tid in [table_id(), table_id_2()] {
+            engine
+                .write(&tid, &make_key("k"), make_row(b"v", 1000), 1000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+        assert!(engine.sync_sstables_to_s3().await.unwrap() >= 2);
+        engine.shutdown().unwrap();
+    }
+    let engine = try_restart_engine(dir, &store, prefix, 900, cache_max_bytes).unwrap();
+    engine.register_table(test_schema()).unwrap();
+    engine.register_table(test_schema_2()).unwrap();
+    let hot = engine.table_sstable_dir(&table_id());
+    let cold = engine.table_sstable_dir(&table_id_2());
+    (engine, hot, cold)
+}
+
+fn has_local_data(table_dir: &std::path::Path) -> bool {
+    !StorageEngine::list_generations_in_dir(table_dir).is_empty()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hot_table_is_restored_in_the_background_and_a_cold_one_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, hot, cold) =
+        restart_with_two_evicted_tables(dir.path(), "test-hot-restore", u64::MAX / 4).await;
+    engine.set_disk_free_cache_for_test(u64::MAX / 4);
+    assert!(!has_local_data(&hot) && !has_local_data(&cold), "precondition");
+    engine.read(&table_id(), &make_key("k")).unwrap().expect("hot row");
+
+    let restored = engine.restore_hot_evicted_sstables().await.unwrap();
+
+    assert_eq!(restored, 1, "exactly the hot table's generation is restored");
+    assert!(has_local_data(&hot), "the hot table is local again");
+    assert!(
+        StorageEngine::evicted_generations(&dir.path().join("sstables"))
+            .keys()
+            .all(|t| *t != table_id().to_string()),
+        "the restored generation's marker is cleared"
+    );
+    assert!(!has_local_data(&cold), "the cold table stays remote-backed");
+    assert!(engine.read(&table_id_2(), &make_key("k")).unwrap().is_some());
+    engine.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_restore_stops_when_free_space_nears_the_eviction_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, hot, _cold) =
+        restart_with_two_evicted_tables(dir.path(), "test-hot-restore-low", u64::MAX / 4).await;
+    engine.set_disk_free_cache_for_test(0);
+    engine.read(&table_id(), &make_key("k")).unwrap().expect("hot row");
+
+    let restored = engine.restore_hot_evicted_sstables().await.unwrap();
+
+    assert_eq!(restored, 0, "no free space, no restore");
+    assert!(!has_local_data(&hot), "the hot table stays remote-backed");
+    engine.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_restore_respects_the_uploaded_cache_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    // A one-byte cache limit: restoring would immediately re-trigger eviction.
+    let (engine, hot, _cold) = restart_with_two_evicted_tables(dir.path(), "test-hot-cache", 1).await;
+    engine.set_disk_free_cache_for_test(u64::MAX / 4);
+    engine.read(&table_id(), &make_key("k")).unwrap().expect("hot row");
+
+    let restored = engine.restore_hot_evicted_sstables().await.unwrap();
+
+    assert_eq!(restored, 0);
+    assert!(!has_local_data(&hot));
+    engine.shutdown().unwrap();
+}

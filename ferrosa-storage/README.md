@@ -332,7 +332,17 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   (`flush::rehydrate_if_evicted`, called by `open_file_sstable` and
   `open_sstable_from_dir`) and then clears the marker; an unmarked missing
   restoring it would resurrect purged rows. Retiring a generation
-  (`delete_sstable_files`) removes its marker. A live QUERY that reopens a
+  (`delete_sstable_files`) removes its marker. **Startup no longer bulk
+  downloads** (t_6a2847c8): `register_evicted_sstables_remote_in` fetches each
+  marked generation's index components (16 at a time) and the table loader
+  registers it remote-backed (`remote_backed_generations`; the Data.db walk and
+  smoke test are skipped, since reads verify checksums). A marked generation
+  missing from the manifest or the store fails startup. The pre-ST-51 behaviour
+  is `FERROSA_RESTORE_EVICTED_MODE=full` or `restore_evicted_sstables()`. After
+  each sync, `restore_hot_evicted_sstables` fully restores hot tables'
+  generations (8 per pass, only while free disk stays above the eviction target
+  and the uploaded cache under its limit; `FERROSA_RESTORE_HOT_TABLES_ON_START=0`
+  disables). A live QUERY that reopens a
   marked generation between eviction and restart does not download it
   (ST-51, `evicted_read.rs`): `open_file_sstable` fetches only the small index
   components (`Partitions.db`, `Rows.db`, `Filter.db`, `Statistics.db`,
@@ -344,8 +354,8 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   the engine's one shared object-store client. The marker stays, the per-chunk
   CRC / `CRC.db` checks run on the ranged bytes, and a short or failed ranged
   read is an error (ST-41). Whole-generation rehydrate
-  (`flush::rehydrate_if_evicted`, `open_sstable_from_dir`) remains for
-  compaction inputs, and clears the marker once the generation is local; an unmarked missing
+  (the `FileReadAt` read-through hook, `rehydrate_file`) remains for
+  compaction inputs; an unmarked missing
   generation still fails to open so the read path's view-retry fires. System
   keyspaces are never evicted. See FMEA ST-38.
   **The marker records why** (`eviction_marker.rs`, FMEA ST-63): one JSON

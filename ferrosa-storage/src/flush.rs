@@ -1779,15 +1779,18 @@ pub(crate) fn rehydrate_if_evicted(dir: &Path, gen: &str) -> Result<()> {
 
 /// Prepare an evicted generation for a QUERY open (ST-51): fetch only the
 /// small index components a reader needs, leaving `Data.db` to ranged
-/// read-through, instead of [`rehydrate_if_evicted`]'s whole-generation
-/// download. Returns `true` when `Data.db` is to be read remotely.
+/// read-through, instead of downloading the whole generation. Returns `true`
+/// when `Data.db` is to be read remotely.
 ///
-/// Same gate as `rehydrate_if_evicted`: only a marked generation whose
-/// `Data.db` is absent. The marker stays: the generation is still evicted, and
+/// Gate: only a generation carrying an eviction marker (`<gen>.evicted`,
+/// fsynced BEFORE the evictor deletes anything) whose `Data.db` is absent. An
+/// unmarked generation with missing components was compacted away: restoring
+/// it would resurrect purged rows, and its open error drives the read path's
+/// view-retry, so it is left to fail loud in the caller. The marker stays: the generation is still evicted, and
 /// a restart or compaction restores it in full. When the object store lacks
 /// the generation or no store owns the path, this logs and returns `false`, so
 /// the open fails on the missing `Data.db` exactly as before.
-fn prepare_evicted_for_query(dir: &Path, gen: &str) -> Result<bool> {
+pub(crate) fn prepare_evicted_for_query(dir: &Path, gen: &str) -> Result<bool> {
     let data = dir.join(format!("{gen}-Data.db"));
     let marker = crate::engine::StorageEngine::evicted_marker_path(dir, gen);
     if data.exists() || !marker.exists() {

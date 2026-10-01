@@ -2255,11 +2255,13 @@ impl StorageEngine {
             "CRC.db",
         ];
 
-        let rehydration_locks: Arc<DashMap<String, Arc<std::sync::Mutex<()>>>> =
-            Arc::new(DashMap::new());
         // Ranged, paged read-through (ST-51): serves `Data.db` pages and
         // lengths of evicted components without a whole-generation download.
-        crate::evicted_read::register(data_dir.clone(), prefix.clone(), Arc::clone(&store));
+        crate::evicted_read::ensure_registered(
+            data_dir.clone(),
+            prefix.clone(),
+            Arc::clone(&store),
+        );
         ferrosa_sstable::io::register_file_read_rehydration_hook(Arc::new(move |path| {
             let Some((table_id, sstable_id, component)) =
                 Self::parse_local_sstable_component_path(&data_dir, path)
@@ -6882,9 +6884,13 @@ impl StorageEngine {
         // (which does not know how to interpret a `.compaction-*.intent` file).
         Self::reconcile_compaction_intents(table_dir);
 
+        // Marked generations whose Data.db is remote (ST-51, t_6a2847c8).
+        let remote_backed = Self::remote_backed_generations(table_dir);
+
         // Collect all generation numbers by looking for Data.db files.
         let mut generations: Vec<u64> = {
-            let mut values = std::collections::HashSet::new();
+            let mut values: std::collections::HashSet<u64> =
+                remote_backed.iter().copied().collect();
 
             for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -6943,6 +6949,9 @@ impl StorageEngine {
             let probes: Vec<(&str, crate::sstable_health::ComponentProbe)> =
                 crate::sstable_health::CRITICAL_COMPONENTS
                     .iter()
+                    // A remote-backed generation's Data.db lives in the object
+                    // store; its other critical components must be local.
+                    .filter(|comp| !(remote_backed.contains(&gen) && **comp == "Data.db"))
                     .map(|comp| {
                         let path = Self::generation_component_path(table_dir, &gen_str, comp)
                             .unwrap_or_else(|| table_dir.join(format!("{gen_str}-{comp}")));
@@ -7007,7 +7016,17 @@ impl StorageEngine {
                     // readers so queries fail loud-at-load instead of returning
                     // truncated/garbage rows. Conservative: passes every healthy
                     // SSTable (see SSTableReader::validate_data_extent).
-                    if let Err(e) = reader.validate_data_extent() {
+                    // Both checks below walk Data.db; for a remote-backed
+                    // generation that would download it at startup. Its
+                    // bytes are verified per read instead (chunk CRC, CRC.db,
+                    // short-read errors; FMEA ST-51).
+                    let remote = remote_backed.contains(&gen);
+                    let extent = if remote {
+                        Ok(())
+                    } else {
+                        reader.validate_data_extent()
+                    };
+                    if let Err(e) = extent {
                         tracing::error!(
                             %e,
                             gen,
@@ -7031,7 +7050,7 @@ impl StorageEngine {
                         }
                         continue;
                     }
-                    if repair_mode != StartupSstableRepairMode::Off {
+                    if repair_mode != StartupSstableRepairMode::Off && !remote {
                         smoke_tested_count += 1;
                         if let Err(e) = Self::validate_sstable_for_startup_repair(&reader) {
                             match repair_mode {
@@ -11612,14 +11631,19 @@ impl StorageEngine {
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::SSTableComponents;
 
-        crate::flush::rehydrate_if_evicted(dir, gen)?;
-        let data = Self::generation_component_path(dir, gen, "Data.db").ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "missing required Data.db for sstable generation {gen} in {}",
-                dir.display()
-            ))
-        })?;
-        let data = FileReadAt::open(data)?;
+        // An evicted generation is opened for a query: index components local,
+        // Data.db by ranged reads (ST-51), never a whole-generation download.
+        let data = if crate::flush::prepare_evicted_for_query(dir, gen)? {
+            FileReadAt::open_evicted(dir.join(format!("{gen}-Data.db")))
+        } else {
+            let data = Self::generation_component_path(dir, gen, "Data.db").ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "missing required Data.db for sstable generation {gen} in {}",
+                    dir.display()
+                ))
+            })?;
+            FileReadAt::open(data)?
+        };
 
         let partitions =
             Self::generation_component_path(dir, gen, "Partitions.db").ok_or_else(|| {
@@ -12687,7 +12711,12 @@ impl StorageEngine {
                 }
                 manifest_bytes = manifest_bytes.saturating_add(entry.size);
                 let component_paths = Self::generation_component_paths(&table_dir, gen);
-                if component_paths.is_empty() {
+                // A remote-backed generation holds only its small index
+                // components locally: nothing worth evicting, and deleting
+                // them would only force a refetch on the next open.
+                if component_paths.is_empty()
+                    || Self::generation_component_path(&table_dir, &entry.id, "Data.db").is_none()
+                {
                     continue;
                 }
 
@@ -13136,6 +13165,11 @@ impl StorageEngine {
         if uploaded > 0 || evicted > 0 {
             tracing::info!(uploaded, evicted, "s3-sync: SSTables synchronized");
         }
+        // Degraded, not fatal: a hot table that fails to restore keeps being
+        // served by ranged reads. Say so; the next pass retries.
+        if let Err(e) = self.restore_hot_evicted_sstables().await {
+            tracing::error!(error = %e, "s3-sync: hot-table restore failed; those tables stay remote-backed until the next pass");
+        }
 
         Ok(uploaded)
     }
@@ -13353,6 +13387,232 @@ impl StorageEngine {
         }
     }
 
+    /// `FERROSA_RESTORE_EVICTED_MODE`: what startup does with evicted
+    /// generations. `remote` (default) fetches their index components and
+    /// serves `Data.db` by ranged reads (ST-51); `full` downloads every
+    /// component first, the pre-ST-51 behaviour, for operators who want the
+    /// disk warm before serving. An unrecognised value is reported and
+    /// replaced by `remote`.
+    fn restore_evicted_full_at_startup() -> bool {
+        match std::env::var("FERROSA_RESTORE_EVICTED_MODE") {
+            Err(_) => false,
+            Ok(value) if value.is_empty() || value.eq_ignore_ascii_case("remote") => false,
+            Ok(value) if value.eq_ignore_ascii_case("full") => true,
+            Ok(value) => {
+                tracing::error!(
+                    value = %value,
+                    "invalid FERROSA_RESTORE_EVICTED_MODE (expected `remote` or `full`); using `remote`"
+                );
+                false
+            }
+        }
+    }
+
+    /// Register every eviction-marked, manifest-listed generation as
+    /// remote-backed instead of downloading it (t_6a2847c8).
+    ///
+    /// Each generation's small index components are fetched (several at a
+    /// time) so table registration can open it; `Data.db` stays in the object
+    /// store and is read by ranged GETs. Markers are untouched. A marked
+    /// generation that is not in the manifest, or whose objects are gone, is an
+    /// ERROR for the whole startup: serving the table without it is the
+    /// 2026-09-29 data-loss shape. Returns the number of generations
+    /// registered.
+    async fn register_evicted_sstables_remote_in(
+        data_dir: &std::path::Path,
+        store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
+    ) -> ferrosa_common::Result<usize> {
+        use futures::StreamExt;
+        const FETCH_CONCURRENCY: usize = 16;
+        const LISTED_FAILURES: usize = 10;
+
+        let evicted = Self::evicted_generations(&data_dir.join("sstables"));
+        if evicted.is_empty() {
+            return Ok(0);
+        }
+        let (store, prefix) = store.ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "{} evicted SSTable table(s) must be served from S3, but S3 is not configured",
+                evicted.len()
+            ))
+        })?;
+        let (manifest, _version) = crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+        let work = restore_work(&evicted, &manifest);
+        let reads = crate::evicted_read::ensure_registered(
+            data_dir.to_path_buf(),
+            prefix,
+            Arc::clone(&store),
+        );
+        tracing::info!(
+            tables = work.tables,
+            generations = work.generations,
+            bytes = work.bytes,
+            "storage-engine: registering evicted SSTables as remote-backed (index components only, no Data.db download)"
+        );
+        let started = Instant::now();
+        let mut failures: Vec<String> = Vec::new();
+        let mut jobs = Vec::new();
+        for (dir_name, gens) in &evicted {
+            let table_dir = data_dir.join("sstables").join(dir_name);
+            for gen in gens {
+                let listed = manifest
+                    .sstables
+                    .get(dir_name)
+                    .is_some_and(|entries| entries.iter().any(|e| &e.id == gen));
+                if Self::generation_component_path(&table_dir, gen, "Data.db").is_some() {
+                    // Already local (a restore finished but crashed before it
+                    // cleared the marker): the marker is stale.
+                    if let Err(e) = std::fs::remove_file(Self::evicted_marker_path(&table_dir, gen))
+                    {
+                        tracing::warn!(table = %dir_name, sstable = %gen, error = %e, "storage-engine: could not clear the marker of an evicted SSTable that is local again");
+                    }
+                } else if listed {
+                    jobs.push((dir_name.clone(), gen.clone(), table_dir.clone()));
+                } else {
+                    failures.push(format!("{dir_name} generation {gen}: not in the manifest"));
+                }
+            }
+        }
+        let mut registered = 0usize;
+        let mut results = futures::stream::iter(jobs)
+            .map(|(dir_name, gen, table_dir)| {
+                let reads = Arc::clone(&reads);
+                async move {
+                    let outcome = reads.fetch_query_components_async(&table_dir, &gen).await;
+                    (dir_name, gen, outcome)
+                }
+            })
+            .buffer_unordered(FETCH_CONCURRENCY);
+        while let Some((dir_name, gen, outcome)) = results.next().await {
+            match outcome {
+                Ok(crate::evicted_read::QueryFetch::Ready) => registered += 1,
+                Ok(other) => failures.push(format!(
+                    "{dir_name} generation {gen}: objects unavailable in the store ({other:?})"
+                )),
+                Err(e) => failures.push(format!("{dir_name} generation {gen}: {e}")),
+            }
+        }
+        if !failures.is_empty() {
+            failures.sort();
+            let shown: Vec<_> = failures.iter().take(LISTED_FAILURES).cloned().collect();
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "{} evicted SSTable generation(s) are neither local nor resolvable from the \
+                 object store; refusing to start and serve their tables without them: {}",
+                failures.len(),
+                shown.join("; ")
+            )));
+        }
+        tracing::info!(
+            registered,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "storage-engine: evicted SSTables registered as remote-backed"
+        );
+        Ok(registered)
+    }
+
+    /// Fully restore the evicted SSTables of recently read (hot) tables, in
+    /// the background of a sync pass, so tables that are actually queried get
+    /// local `Data.db` again without a startup bulk download (t_6a2847c8).
+    ///
+    /// Bounded: at most [`HOT_RESTORE_MAX_GENERATIONS`] generations per call,
+    /// and it stops, never re-triggering eviction, when restoring the next
+    /// generation would leave free disk under the eviction free-space target
+    /// or push the uploaded-SSTable cache past `local_cache_max_bytes`.
+    /// `FERROSA_RESTORE_HOT_TABLES_ON_START=0` disables it. Returns the number
+    /// of generations restored.
+    pub async fn restore_hot_evicted_sstables(&self) -> ferrosa_common::Result<usize> {
+        const HOT_RESTORE_MAX_GENERATIONS: usize = 8;
+        if matches!(
+            std::env::var("FERROSA_RESTORE_HOT_TABLES_ON_START").as_deref(),
+            Ok("0" | "false")
+        ) {
+            return Ok(0);
+        }
+        let window = std::time::Duration::from_secs(self.config.cache_hot_window_secs);
+        if window.is_zero() {
+            return Ok(0);
+        }
+        let now = std::time::SystemTime::now();
+        let hot: std::collections::HashSet<String> = self
+            .last_foreground_reads()
+            .into_iter()
+            .filter(|(_, read)| now.duration_since(*read).is_ok_and(|age| age <= window))
+            .map(|(table, _)| table)
+            .collect();
+        let evicted: Vec<_> = Self::evicted_generations(&self.config.data_dir.join("sstables"))
+            .into_iter()
+            .filter(|(table, _)| hot.contains(table))
+            .collect();
+        let Some((store, prefix)) = self.resolve_store_and_prefix() else {
+            return Ok(0);
+        };
+        if evicted.is_empty() {
+            return Ok(0);
+        }
+        let (manifest, _version) = crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+        let max_bytes = self.config.local_cache_max_bytes;
+        let target_free = self.local_disk_eviction_target_free_bytes();
+        let mut cached = self
+            .collect_uploaded_local_sstables(&manifest)
+            .candidates
+            .iter()
+            .fold(0u64, |acc, c| acc.saturating_add(c.size));
+        let mut free = self.disk_free_bytes_cached();
+        let mut restored = 0usize;
+        for (dir_name, gens) in evicted {
+            let Some((keyspace, table)) = dir_name.split_once('.') else {
+                continue;
+            };
+            let table_id = TableId::new(keyspace, table);
+            let table_dir = self.config.data_dir.join("sstables").join(&dir_name);
+            for entry in manifest.sstables.get(&dir_name).into_iter().flatten() {
+                if !gens.contains(&entry.id) {
+                    continue;
+                }
+                let room = free >= entry.size.saturating_add(target_free)
+                    && cached.saturating_add(entry.size) <= max_bytes;
+                if restored >= HOT_RESTORE_MAX_GENERATIONS || !room {
+                    tracing::info!(
+                        restored,
+                        next_bytes = entry.size,
+                        free_bytes = free,
+                        target_free_bytes = target_free,
+                        uploaded_cache_bytes = cached,
+                        max_uploaded_cache_bytes = max_bytes,
+                        "storage-engine: hot-table restore paused (bounded per pass, or restoring more would re-trigger eviction)"
+                    );
+                    return Ok(restored);
+                }
+                let mut one = crate::manifest::Manifest::new();
+                one.add_sstable(&dir_name, entry.clone());
+                Self::download_sstables_into(
+                    &self.config.data_dir,
+                    &store,
+                    &prefix,
+                    &table_id,
+                    &one,
+                )
+                .await?;
+                if Self::generation_component_path(&table_dir, &entry.id, "Data.db").is_none() {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "hot-table restore of {dir_name} generation {} left no Data.db",
+                        entry.id
+                    )));
+                }
+                if let Err(e) =
+                    std::fs::remove_file(Self::evicted_marker_path(&table_dir, &entry.id))
+                {
+                    tracing::warn!(table = %dir_name, sstable = %entry.id, error = %e, "storage-engine: restored a hot SSTable but could not clear its marker");
+                }
+                restored += 1;
+                free = free.saturating_sub(entry.size);
+                cached = cached.saturating_add(entry.size);
+                tracing::info!(table = %dir_name, sstable = %entry.id, size_bytes = entry.size, "storage-engine: restored a hot table's evicted SSTable in the background");
+            }
+        }
+        Ok(restored)
+    }
+
     /// [`Self::restore_evicted_sstables`] called from the synchronous
     /// constructors. Blocks only when an eviction marker exists, so an engine
     /// with nothing to restore never enters a nested runtime.
@@ -13370,7 +13630,31 @@ impl StorageEngine {
         if Self::evicted_generations(&data_dir.join("sstables")).is_empty() {
             return Ok(0);
         }
-        Self::block_on_rehydration(Self::restore_evicted_sstables_in(data_dir, store))
+        if Self::restore_evicted_full_at_startup() {
+            return Self::block_on_rehydration(Self::restore_evicted_sstables_in(data_dir, store));
+        }
+        Self::block_on_rehydration(Self::register_evicted_sstables_remote_in(data_dir, store))
+    }
+
+    /// Generations in `table_dir` that carry an eviction marker and have no
+    /// local `Data.db`: served remote-backed (ST-51). Startup registration
+    /// fetches their index components first.
+    fn remote_backed_generations(table_dir: &std::path::Path) -> std::collections::BTreeSet<u64> {
+        let mut out = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(gen) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".evicted"))
+                .and_then(|g| g.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if Self::generation_component_path(table_dir, &gen.to_string(), "Data.db").is_none() {
+                out.insert(gen);
+            }
+        }
+        out
     }
 
     /// `(table dir name, evicted generation ids)` for every table directory
