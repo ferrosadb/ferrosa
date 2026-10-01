@@ -1816,6 +1816,17 @@ pub(crate) fn prepare_evicted_for_query(dir: &Path, gen: &str) -> Result<bool> {
     }
     match crate::evicted_read::fetch_query_components(dir, gen)? {
         crate::evicted_read::QueryFetch::Ready => Ok(true),
+        // The typed error: the read path's view retry and the coordinator's
+        // replica failover key on it. The token range is not known at this
+        // layer, so it claims the whole ring, which can only over-fail over.
+        crate::evicted_read::QueryFetch::IndexArtifactsLost(message) => {
+            tracing::error!(dir = %dir.display(), gen, "{message}");
+            Err(ferrosa_common::Error::corrupt_sstable(
+                gen,
+                i64::MIN,
+                i64::MAX,
+            ))
+        }
         outcome @ (crate::evicted_read::QueryFetch::NotOwned
         | crate::evicted_read::QueryFetch::Missing) => {
             tracing::error!(

@@ -658,6 +658,9 @@ pub struct TableStore<F: FlushTarget> {
     /// replica. Keyed by `gen`; the covered range is recovered from the live
     /// descriptor (still in the view until repair swaps it out).
     quarantined_sstables: parking_lot::RwLock<std::collections::HashSet<String>>,
+    /// Generations whose secondary-index sidecars could not all be opened.
+    /// Their data is intact and still read; only index consults refuse them.
+    index_unavailable_sstables: parking_lot::RwLock<std::collections::HashSet<String>>,
     /// Generations whose object recently failed to open: they fail fast for a
     /// short TTL instead of costing a reopen per retry per read.
     missing_sstables: MissingSstableCache,
@@ -1699,6 +1702,7 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             missing_sstables: MissingSstableCache::default(),
             fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
@@ -1903,6 +1907,7 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             missing_sstables: MissingSstableCache::default(),
             fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
@@ -1986,6 +1991,7 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             missing_sstables: MissingSstableCache::default(),
             fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
@@ -2558,6 +2564,23 @@ impl<F: FlushTarget> TableStore<F> {
         inserted
     }
 
+    /// Record that `gen`'s sidecars could not all be opened at load. Index
+    /// consults over a view holding it fail with the typed corrupt-SSTable
+    /// error; data reads are unaffected (FMEA ST-59).
+    pub(crate) fn mark_index_unavailable(&self, gen: &str) {
+        if self
+            .index_unavailable_sstables
+            .write()
+            .insert(gen.to_string())
+        {
+            tracing::error!(
+                gen,
+                "secondary-index sidecars of this SSTable could not be opened; index consults \
+                 over it fail until it is rebuilt, repaired or compacted away"
+            );
+        }
+    }
+
     /// Mark `gen`'s quarantine resolved (repair refilled or restored it): it
     /// leaves the quarantine set and the negative open cache, so the next read
     /// probes it for real. Returns whether it was quarantined.
@@ -2610,11 +2633,14 @@ impl<F: FlushTarget> TableStore<F> {
         token: Option<i64>,
         op: &'static str,
     ) -> Result<()> {
-        if self.quarantined_sstables.read().is_empty() {
+        if self.quarantined_sstables.read().is_empty()
+            && self.index_unavailable_sstables.read().is_empty()
+        {
             return Ok(());
         }
         let overlapping = view.sstables.iter().find(|desc| {
-            self.is_sstable_quarantined(&desc.gen)
+            (self.is_sstable_quarantined(&desc.gen)
+                || self.index_unavailable_sstables.read().contains(&desc.gen))
                 && token.is_none_or(|t| t >= desc.min_token && t <= desc.max_token)
         });
         let Some(desc) = overlapping else {

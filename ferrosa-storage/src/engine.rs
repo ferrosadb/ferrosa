@@ -2192,6 +2192,12 @@ fn normalize_consolidation_type(type_name: &str) -> String {
     .to_ascii_lowercase()
 }
 
+/// Test seam: table directories whose index-artifact listing fails, so a test
+/// can make one generation's listing fail without touching file permissions.
+#[cfg(test)]
+static FAIL_ARTIFACT_LISTING: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
 impl StorageEngine {
     pub(crate) fn block_on_rehydration<F, T>(future: F) -> T
     where
@@ -4440,11 +4446,14 @@ impl StorageEngine {
         // SSTables no longer materializes O(count) readers at startup (the
         // observed startup OOM). The pool is reused as this table's pool below,
         // so the readers validated last stay warm for the first reads.
+        let mut index_failures = Vec::new();
         let (existing_descriptors, existing_sidecars, existing_ids) =
-            Self::load_existing_sstables_and_sidecars(
+            Self::load_existing_sstables_and_sidecars_reporting(
                 &table_dir,
                 &reader_pool,
                 &table_id.to_string(),
+                Self::startup_sstable_repair_mode(),
+                &mut index_failures,
             );
 
         let flush_target = FileFlushTarget::new_starting_at(table_dir)?;
@@ -4478,6 +4487,9 @@ impl StorageEngine {
         // set of readers validated last during the transient startup loop above,
         // keyed by this same `table_id`, so they remain cache-warm.
         store.attach_reader_pool(reader_pool, table_id.to_string());
+        for gen in &index_failures {
+            store.mark_index_unavailable(gen);
+        }
 
         Ok(TableState {
             schema,
@@ -6604,6 +6616,7 @@ impl StorageEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn load_existing_sstables_and_sidecars(
         table_dir: &std::path::Path,
         reader_pool: &crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
@@ -6883,11 +6896,40 @@ impl StorageEngine {
         }
     }
 
+    /// [`Self::load_existing_sstables_and_sidecars_reporting`] for callers with
+    /// no store to mark: the generations whose sidecars could not be opened are
+    /// logged at ERROR inside the load and are not returned.
+    #[cfg(test)]
     fn load_existing_sstables_and_sidecars_with_repair_mode(
         table_dir: &std::path::Path,
         reader_pool: &crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
         pool_table_key: &str,
         repair_mode: StartupSstableRepairMode,
+    ) -> (
+        Vec<crate::store::SstableDescriptor>,
+        Vec<SSTableSidecarMap>,
+        Vec<(String, std::path::PathBuf)>,
+    ) {
+        let mut index_failures = Vec::new();
+        Self::load_existing_sstables_and_sidecars_reporting(
+            table_dir,
+            reader_pool,
+            pool_table_key,
+            repair_mode,
+            &mut index_failures,
+        )
+    }
+
+    /// Load a table's SSTables and sidecars. Every generation whose sidecars
+    /// could not all be opened is pushed to `index_failures`: the caller marks
+    /// it on the store so index consults over it fail instead of answering
+    /// with the postings that remained.
+    fn load_existing_sstables_and_sidecars_reporting(
+        table_dir: &std::path::Path,
+        reader_pool: &crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
+        pool_table_key: &str,
+        repair_mode: StartupSstableRepairMode,
+        index_failures: &mut Vec<String>,
     ) -> (
         Vec<crate::store::SstableDescriptor>,
         Vec<SSTableSidecarMap>,
@@ -7132,7 +7174,11 @@ impl StorageEngine {
                         sstable_dir.clone(),
                         &reader,
                     ));
-                    sidecars.push(Arc::new(Self::load_sidecars_for_generation(table_dir, gen)));
+                    sidecars.push(Arc::new(Self::load_sidecars_for_generation(
+                        table_dir,
+                        gen,
+                        index_failures,
+                    )));
                     ids.push((gen_str.clone(), sstable_dir));
                 }
                 Err(e) => match repair_mode {
@@ -7204,15 +7250,16 @@ impl StorageEngine {
     /// Looks for files matching `{gen}-*.sidecar`. Each successfully opened
     /// sidecar is added to the returned map keyed by index name.
     ///
-    /// A sidecar that fails to open is EXCLUDED from the returned map and
-    /// logged. Excluding it is the correct outcome — reads then degrade to a
-    /// full scan and still return every row, which is slow and right rather
-    /// than fast and wrong — but it must never be quiet: an index that
-    /// silently stops existing looks exactly like a table that has no matching
-    /// rows. Every path out of this function that drops an index says so.
+    /// A sidecar that fails to open is never admitted as an index (its bytes
+    /// are garbage), and `gen` is pushed to `index_failures`. Index consults
+    /// read postings from sidecars only, so dropping one quietly makes them
+    /// answer `Ok` with the rows that remained; the caller marks the
+    /// generation so those consults fail instead (ST-59). Data reads do not
+    /// touch sidecars and keep working.
     fn load_sidecars_for_generation(
         table_dir: &std::path::Path,
         gen: u64,
+        index_failures: &mut Vec<String>,
     ) -> HashMap<String, crate::index::sidecar::SidecarReader> {
         use crate::index::sidecar::SidecarReader;
 
@@ -7240,8 +7287,9 @@ impl StorageEngine {
                     dir = %dir.display(),
                     "storage-engine: cannot read table directory to load secondary \
                      index sidecars; EVERY index on this generation is unavailable \
-                     and its reads will degrade to full scans"
+                     and its consults will fail"
                 );
+                index_failures.push(gen.to_string());
                 return sidecars;
             }
         };
@@ -7256,7 +7304,8 @@ impl StorageEngine {
                         sidecars.insert(index_name.to_string(), reader);
                     }
                     Err(e) => {
-                        tracing::warn!(%e, %name, dir = %table_dir.display(), "storage-engine: skipping corrupt sidecar");
+                        tracing::error!(%e, %name, gen, dir = %table_dir.display(), "storage-engine: excluding corrupt sidecar; index consults over this generation will fail");
+                        index_failures.push(gen.to_string());
                     }
                 }
             }
@@ -12350,30 +12399,36 @@ impl StorageEngine {
     /// Index artifacts (component names after `{gen}-`) generation `gen` holds
     /// locally, sorted. Recorded in its eviction marker so a restore can tell
     /// a lost artifact from one that never existed.
-    fn local_index_artifacts(table_dir: &std::path::Path, gen: &str) -> Vec<String> {
+    fn local_index_artifacts(
+        table_dir: &std::path::Path,
+        gen: &str,
+    ) -> std::io::Result<Vec<String>> {
+        #[cfg(test)]
+        if FAIL_ARTIFACT_LISTING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|dir| table_dir.starts_with(dir))
+        {
+            return Err(std::io::Error::other("injected listing failure"));
+        }
         let dir = if table_dir.join(gen).is_dir() {
             table_dir.join(gen)
         } else {
             table_dir.to_path_buf()
         };
         let prefix = format!("{gen}-");
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::error!(dir = %dir.display(), gen, error = %e, "evictor: cannot list the generation's index artifacts; its marker will not record them");
-                return Vec::new();
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if let Some(component) = name.strip_prefix(&prefix) {
+                if Self::is_index_artifact(component) {
+                    names.push(component.to_string());
+                }
             }
-        };
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name().into_string().ok()?;
-                let component = name.strip_prefix(&prefix)?;
-                Self::is_index_artifact(component).then(|| component.to_string())
-            })
-            .collect();
+        }
         names.sort();
-        names
+        Ok(names)
     }
 
     /// Deletes all on-disk component files for an SSTable generation, leaving
@@ -12934,6 +12989,22 @@ impl StorageEngine {
             // Record the eviction durably first; without the record a restart
             // cannot tell this SSTable from a compacted-away one and would
             // leave it out of its table. No record, no eviction.
+            // "No artifacts" and "could not list the artifacts" are different
+            // facts. A marker must never claim an artifact set the engine does
+            // not know, or a later lost artifact goes undetected (ST-59): skip
+            // this generation and let the next pass retry.
+            let index_artifacts = match Self::local_index_artifacts(&table_dir, &sstable_id) {
+                Ok(names) => names,
+                Err(e) => {
+                    tracing::error!(
+                        table = table_id,
+                        sstable = sstable_id,
+                        error = %e,
+                        "s3-sync: cannot list the generation's index artifacts; not evicting it (retried next sync)"
+                    );
+                    continue;
+                }
+            };
             let record = crate::eviction_marker::EvictionRecord {
                 trigger,
                 generation_bytes: Some(size),
@@ -12942,7 +13013,7 @@ impl StorageEngine {
                 min_bytes: Some(min_bytes),
                 projected_available: Some(projected_available),
                 target_free: Some(target_free),
-                index_artifacts: Some(Self::local_index_artifacts(&table_dir, &sstable_id)),
+                index_artifacts: Some(index_artifacts),
                 ..crate::eviction_marker::EvictionRecord::bare(
                     trigger,
                     crate::eviction_marker::SOURCE_EVICTOR,
@@ -13562,6 +13633,11 @@ impl StorageEngine {
         while let Some((dir_name, gen, outcome)) = results.next().await {
             match outcome {
                 Ok(crate::evicted_read::QueryFetch::Ready) => registered += 1,
+                Ok(crate::evicted_read::QueryFetch::IndexArtifactsLost(message)) => note_failure(
+                    &mut failures,
+                    &mut failure_count,
+                    format!("{dir_name} generation {gen}: {message}"),
+                ),
                 Ok(other) => note_failure(
                     &mut failures,
                     &mut failure_count,

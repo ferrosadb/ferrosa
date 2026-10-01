@@ -1302,3 +1302,132 @@ async fn a_lost_fulltext_object_fails_startup_loud() {
     )
     .await;
 }
+
+/// At a LIVE open the lost artifact must be the typed corrupt-SSTable error:
+/// the read path's view retry and the coordinator's replica failover key on
+/// that type, and a plain error would never fail over to a healthy replica.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_index_artifact_at_a_live_open_is_the_typed_corrupt_sstable_error() {
+    let mut params = Params::default_with(0);
+    params.cache_cap = 1;
+    let mut h = Harness::new("inv-live-typed", params);
+    h.write_cycle();
+    h.flush_and_sync().await;
+    let indexed = &h.models[1];
+    let table_dir = h.engine().table_sstable_dir(&indexed.tid);
+    let evicted = StorageEngine::evicted_generations(&h.dir.path().join("sstables"));
+    let gen = evicted
+        .get(&indexed.tid.to_string())
+        .and_then(|gens| gens.iter().next())
+        .expect("the indexed table's generation is evicted")
+        .clone();
+    let lost = delete_index_objects(&h.store, |name| name.ends_with(".sidecar")).await;
+    assert!(lost >= 1, "precondition: the store held sidecar objects");
+
+    let err = match crate::flush::open_file_sstable(&table_dir, &gen) {
+        Ok(_) => panic!("a generation whose sidecar is gone from the store opened"),
+        Err(e) => e,
+    };
+
+    assert!(
+        err.corrupt_sstable_range().is_some(),
+        "a live open must fail with the typed corrupt-SSTable error, got: {err}"
+    );
+    h.engine().shutdown().unwrap();
+}
+
+/// If the evictor cannot list a generation's index artifacts it must not
+/// evict it: a marker claiming an artifact set the engine does not know would
+/// make a later lost artifact undetectable. The next pass retries.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_eviction_pass_that_cannot_list_a_generations_artifacts_leaves_it_local() {
+    let mut params = Params::default_with(0);
+    params.cache_cap = 1;
+    let mut h = Harness::new("inv-evict-unknown", params);
+    h.write_cycle();
+    h.flush_all();
+    let indexed_dir = h.engine().table_sstable_dir(&h.models[1].tid);
+    super::FAIL_ARTIFACT_LISTING
+        .lock()
+        .unwrap()
+        .push(indexed_dir.clone());
+
+    h.sync().await;
+
+    let sstables = h.dir.path().join("sstables");
+    let evicted = StorageEngine::evicted_generations(&sstables);
+    assert!(
+        !evicted.contains_key(&h.models[1].tid.to_string()),
+        "the generation whose artifacts could not be listed was evicted: {evicted:?}"
+    );
+    assert!(
+        h.local_generations(&h.models[1]) > 0,
+        "it must stay local, whole"
+    );
+    assert_eq!(
+        h.local_generations(&h.models[0]),
+        0,
+        "other tables still evict"
+    );
+
+    super::FAIL_ARTIFACT_LISTING.lock().unwrap().clear();
+    h.sync().await;
+
+    let evicted = StorageEngine::evicted_generations(&sstables);
+    let gen = evicted
+        .get(&h.models[1].tid.to_string())
+        .and_then(|gens| gens.iter().next())
+        .expect("the next pass evicts it")
+        .clone();
+    let recorded = crate::eviction_marker::expected_index_artifacts(
+        &crate::eviction_marker::marker_path(&indexed_dir, &gen),
+    );
+    assert!(
+        recorded.is_some_and(|names| names.iter().any(|n| n.ends_with(".sidecar"))),
+        "the marker must record the sidecar the generation held"
+    );
+    h.engine().shutdown().unwrap();
+}
+
+/// A sidecar that is present but will not open used to be dropped with a WARN
+/// and the consult answered `Ok` with the rows that remained. The data is
+/// intact, so data reads must keep working; the index consult must fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sidecar_that_fails_to_open_fails_index_consults_but_not_data_reads() {
+    let params = Params::default_with(0);
+    let mut h = Harness::new("inv-bad-sidecar", params);
+    h.write_cycle();
+    h.flush_all();
+    let table_dir = h.engine().table_sstable_dir(&h.models[1].tid);
+    let mut corrupted = 0;
+    for entry in std::fs::read_dir(&table_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "sidecar") {
+            let len = std::fs::metadata(&path).unwrap().len() as usize;
+            std::fs::write(&path, vec![0u8; len]).unwrap();
+            corrupted += 1;
+        }
+    }
+    assert!(corrupted >= 1, "precondition: the flush wrote a sidecar");
+
+    h.restart();
+
+    let model = &h.models[1];
+    let reader = Reader {
+        engine: h.engine(),
+        model,
+    };
+    assert_eq!(
+        judge(reader.point(), &model.rows),
+        Outcome::Match,
+        "the data is intact and must stay readable"
+    );
+    let err = reader
+        .index()
+        .expect_err("an index whose sidecar cannot be opened must fail its consult");
+    assert!(
+        err.corrupt_sstable_range().is_some(),
+        "expected the typed corrupt-SSTable error, got: {err}"
+    );
+    h.engine().shutdown().unwrap();
+}

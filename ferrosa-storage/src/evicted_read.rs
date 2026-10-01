@@ -132,7 +132,7 @@ fn env_u64(name: &str, default: u64, min: u64) -> u64 {
 }
 
 /// What [`EvictedReadStore::fetch_query_components`] found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum QueryFetch {
     /// The index components are local; `Data.db` is served by ranged reads.
     Ready,
@@ -141,6 +141,10 @@ pub(crate) enum QueryFetch {
     /// The object store lacks the generation (its `Data.db` or a required
     /// component), so it cannot be opened.
     Missing,
+    /// The generation's marker lists index artifacts the object store no
+    /// longer has. The message names them. Startup refuses to start on this; a
+    /// live open reports it as the typed corrupt-SSTable error.
+    IndexArtifactsLost(String),
 }
 
 type PageKey = (String, u64);
@@ -744,8 +748,12 @@ impl EvictedReadStore {
                 "opened an evicted SSTable for ranged reads: fetched its index components only"
             );
         }
-        self.fetch_index_artifacts(dir, gen, data_loc, fetched_bytes > 0)
-            .await?;
+        if let Some(lost) = self
+            .fetch_index_artifacts(dir, gen, data_loc, fetched_bytes > 0)
+            .await?
+        {
+            return Ok(QueryFetch::IndexArtifactsLost(lost));
+        }
         // Seed the layout cache now that `CompressionInfo.db` is local, so the
         // first read neither re-HEADs the object nor falls back to fixed pages.
         let info = Arc::new(ObjectInfo {
@@ -773,7 +781,7 @@ impl EvictedReadStore {
         gen: &str,
         data_loc: &ObjectLocation,
         components_just_fetched: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let expected = crate::eviction_marker::expected_index_artifacts(
             &crate::eviction_marker::marker_path(dir, gen),
         );
@@ -783,7 +791,7 @@ impl EvictedReadStore {
             None => components_just_fetched,
         };
         if !needed {
-            return Ok(());
+            return Ok(None);
         }
         let hex = crate::upload::manager::hex_prefix_for(&data_loc.sstable_id);
         StorageEngine::pull_index_artifacts(
@@ -801,14 +809,14 @@ impl EvictedReadStore {
             .filter(|name| !local(name))
             .collect();
         if !missing.is_empty() {
-            return Err(Error::InvalidFormat(format!(
+            return Ok(Some(format!(
                 "evicted generation {gen} of {}: index artifact(s) {missing:?} are gone from the \
                  object store, so its secondary and full-text index reads would answer with \
                  missing postings; refusing to serve it",
                 data_loc.table_id
             )));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Size of an object, `None` when it does not exist.
