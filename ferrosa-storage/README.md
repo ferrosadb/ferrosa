@@ -650,8 +650,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   sidecar-less scan never return a partial `Ok` when an SSTable in their view
   cannot be opened or read (e.g. an evicted file whose S3 rehydrate failed).
   They retry against a fresh view (compaction retired the input), then
-  quarantine the SSTable and return a typed `Error::CorruptSstable`. Quarantined
-  SSTables are not skipped by range reads: their rows are still missing.
+  quarantine the SSTable and return a typed `Error::CorruptSstable`.
   A decode error AFTER the SSTable opened (mid-stream, in `walk_token_range[_for_digest]`
   or the bounded-merge cascade) is attributed to the `MergeReader` that raised
   it and takes the same path; a failure after the first row was delivered is
@@ -663,6 +662,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `Ok`. The entry is dropped when the generation is seeded (restored or
   rewritten), when `resolve_sstable_quarantine` is called, or when it expires.
   Counters: `missing_sstable_open_failures`, `missing_sstable_fast_fails`.
+- **Quarantine contract: never skipped** (`store.rs`, FMEA ST-56) — a quarantined
+  SSTable generation is not hidden from any read. Quarantine means "do not
+  re-open this file on every read"; a point, clustering-row, limited-row or
+  range read whose token lies in the generation's range keeps failing with the
+  typed `Error::CorruptSstable` until the generation leaves the view (repair, a
+  restore, compaction). A key resolved from the memtable or another SSTable does
+  not suppress the error, and secondary-index reads are refused while a
+  quarantined generation overlaps them. The coordinator fails over to a healthy
+  replica on the typed error. A transient compaction-retired-input window still
+  retries a fresh view and succeeds.
 - **Startup SSTable health** (`sstable_health.rs`) — decides whether a
   generation on disk can serve reads before it is loaded. A critical component
   (`Data.db`, `Partitions.db`) that is **missing**, **zero-byte**, or

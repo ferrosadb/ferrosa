@@ -2330,19 +2330,19 @@ impl<F: FlushTarget> TableStore<F> {
     /// re-fetches the file. Bounded by `MAX_VIEW_RETRIES`. If a fresh reopen
     /// against the current view still fails after the bound, the file is
     /// genuinely corrupt (a transient compaction window resolves within the
-    /// bound): the SSTable is **quarantined** (so later reads skip it and
-    /// anti-entropy repair can target its range) and then —
-    ///
-    /// - if the key was still resolved from a healthy source, the result is
-    ///   returned (`Ok(Some)`) and the corruption logged/metered;
-    /// - if nothing resolved, the read **fails loud** with an error naming the
-    ///   corrupt SSTable (never a silent `Ok(None)`).
+    /// bound): the SSTable is **quarantined** (so later reads fail fast without
+    /// re-opening it and anti-entropy repair can target its range) and the read
+    /// **fails loud** with a typed error naming it — never a silent `Ok(None)`
+    /// and never a short `Ok(Some)`. A quarantined generation is not skipped by
+    /// later reads: each read whose token lies in its range keeps failing until
+    /// the generation leaves the view (FMEA ST-56).
     fn with_retried_view<R>(
         &self,
         op: &'static str,
         mut attempt: impl FnMut(&StoreView) -> Result<(Option<R>, Option<CorruptSstableId>)>,
     ) -> Result<Option<R>> {
         const MAX_VIEW_RETRIES: usize = 8;
+        let mut previous: Option<Arc<StoreView>> = None;
         for n in 0..=MAX_VIEW_RETRIES {
             let view = self.view.load_full();
 
@@ -2356,49 +2356,53 @@ impl<F: FlushTarget> TableStore<F> {
                 // No snapshotted SSTable failed to be consulted — clean attempt.
                 return Ok(result);
             };
-            if n < MAX_VIEW_RETRIES {
+            // Another attempt can only help if the view can change: a
+            // generation that is already quarantined and still sits in the
+            // very view we just read will fail identically, so fail now.
+            let pointless = self.is_sstable_quarantined(&corrupt.gen)
+                && previous.as_ref().is_some_and(|p| Arc::ptr_eq(p, &view));
+            if n < MAX_VIEW_RETRIES && !pointless {
                 // A snapshotted SSTable could not be consulted. In the common
                 // case this is the transient compaction window: reload and retry
                 // against a fresh view. ONLY exhaustion (below) is treated as
                 // genuine corruption — a transient window resolves within the
                 // bound and never reaches the quarantine/fail-loud path.
+                previous = Some(view);
                 continue;
             }
 
-            // Bound exhausted with the SSTable still failing: genuine
-            // corruption. Quarantine it so later reads skip it (no re-fail, no
-            // repeated retry storm) and so anti-entropy repair can target its
-            // covered token range to refill from a healthy replica.
+            // Still failing: genuine corruption, or the generation's objects
+            // are gone. Quarantine it (no retry storm, and anti-entropy repair
+            // can target its covered token range) — but NEVER skip it: this
+            // read's token lies in the generation's range, so its result could
+            // be missing rows or cells that live only there. A key resolved
+            // from the memtable or another SSTable is not proof of
+            // completeness, so there is no "healthy source" escape: the read
+            // fails with the typed error and the coordinator fails over to a
+            // replica. See FMEA ST-56.
             self.view_retry_exhausted
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.quarantine_sstable(&corrupt);
-
-            if result.is_some() {
-                // Data was still resolvable from a healthy source (memtable or
-                // another SSTable) — serve it. The corrupt file is quarantined
-                // for background repair, but the read itself succeeds.
+            let newly_quarantined = self.quarantine_sstable(&corrupt);
+            if newly_quarantined {
                 tracing::error!(
                     op,
                     corrupt = %corrupt,
-                    retries = MAX_VIEW_RETRIES,
-                    "read served from a healthy source despite a corrupt SSTable; \
-                     corrupt SSTable quarantined for anti-entropy repair"
+                    retries = n,
+                    resolved_locally = result.is_some(),
+                    "read overlaps an unreadable SSTable — failing loud rather than \
+                     returning a possibly incomplete result (quarantined; reads over \
+                     its token range keep failing until repair, a restore or a \
+                     compaction removes it from the view)"
                 );
-                return Ok(result);
+            } else {
+                // Already reported when it was quarantined; this fires once
+                // per read, so it stays below ERROR (edges, not events).
+                tracing::debug!(
+                    op,
+                    corrupt = %corrupt,
+                    "read refused: it overlaps an already-quarantined SSTable"
+                );
             }
-
-            // Nothing resolved AND a source was corrupt: fail loud. Returning
-            // Ok(None) here would be silent data loss — the key may live only in
-            // the corrupt SSTable. The error names the SSTable so the
-            // coordinator can fail over to a replica and repair can refill its
-            // range.
-            tracing::error!(
-                op,
-                corrupt = %corrupt,
-                retries = MAX_VIEW_RETRIES,
-                "read exhausted view retries with a corrupt SSTable and no healthy \
-                 source resolved the key — failing loud (quarantined for repair)"
-            );
             // Typed signal (never string-matched): carries the corrupt
             // SSTable's generation and covered token range so the read
             // coordinator can fail over to a replica and target anti-entropy
@@ -2531,9 +2535,14 @@ impl<F: FlushTarget> TableStore<F> {
     }
 
     /// Record `corrupt`'s generation in the quarantine set. Idempotent: a
-    /// generation already present is left as-is (it is still skipped on every
-    /// read until repair swaps it out of the view).
-    fn quarantine_sstable(&self, corrupt: &CorruptSstableId) {
+    /// generation already present is left as-is. Returns whether it was newly
+    /// inserted, so callers report the edge once rather than per read.
+    ///
+    /// Quarantine does NOT hide the generation from reads: every read whose
+    /// token range overlaps it fails with the typed error until the
+    /// generation leaves the view (FMEA ST-56). What it buys is that those
+    /// reads fail fast instead of re-opening the file on each attempt.
+    fn quarantine_sstable(&self, corrupt: &CorruptSstableId) -> bool {
         let inserted = self
             .quarantined_sstables
             .write()
@@ -2541,10 +2550,12 @@ impl<F: FlushTarget> TableStore<F> {
         if inserted {
             tracing::warn!(
                 corrupt = %corrupt,
-                "quarantined corrupt SSTable: subsequent reads skip it and anti-entropy \
-                 repair will refill its token range from a healthy replica"
+                "quarantined unreadable SSTable: reads over its token range fail with a typed \
+                 error until anti-entropy repair, a restore or a compaction removes it from \
+                 the view"
             );
         }
+        inserted
     }
 
     /// Mark `gen`'s quarantine resolved (repair refilled or restored it): it
@@ -2570,7 +2581,7 @@ impl<F: FlushTarget> TableStore<F> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Whether `gen` is currently quarantined (and therefore skipped by reads).
+    /// Whether `gen` is currently quarantined (reads overlapping it fail fast).
     /// Used by the repair path to target the SSTable's range and by tests.
     pub fn is_sstable_quarantined(&self, gen: &str) -> bool {
         self.quarantined_sstables.read().contains(gen)
@@ -2581,6 +2592,44 @@ impl<F: FlushTarget> TableStore<F> {
     /// refill from a healthy replica.
     pub fn quarantined_sstable_gens(&self) -> Vec<String> {
         self.quarantined_sstables.read().iter().cloned().collect()
+    }
+
+    /// Refuse an index consult while a generation overlapping it is
+    /// quarantined. `token` narrows the check to one partition's token; `None`
+    /// means the consult spans every token, so ANY quarantined generation in
+    /// `view` counts.
+    ///
+    /// An index's postings come from sidecars, which are not the SSTables the
+    /// rows live in. A generation whose objects are lost can leave its
+    /// sidecar readable (or absent) and the postings pointing at rows the
+    /// store can no longer read: the consult then reports zero or fewer rows
+    /// as success. Refuse it the way a stale index is refused (FMEA ST-56).
+    fn refuse_index_read_over_quarantine(
+        &self,
+        view: &StoreView,
+        token: Option<i64>,
+        op: &'static str,
+    ) -> Result<()> {
+        if self.quarantined_sstables.read().is_empty() {
+            return Ok(());
+        }
+        let overlapping = view.sstables.iter().find(|desc| {
+            self.is_sstable_quarantined(&desc.gen)
+                && token.is_none_or(|t| t >= desc.min_token && t <= desc.max_token)
+        });
+        let Some(desc) = overlapping else {
+            return Ok(());
+        };
+        tracing::debug!(
+            op,
+            gen = %desc.gen,
+            "index read refused: a quarantined SSTable overlaps it, so its result could be short"
+        );
+        Err(ferrosa_common::Error::corrupt_sstable(
+            desc.gen.clone(),
+            desc.min_token,
+            desc.max_token,
+        ))
     }
 
     /// One attempt of [`read_limited_rows`] against a fixed `view` snapshot.
@@ -2659,12 +2708,16 @@ impl<F: FlushTarget> TableStore<F> {
         // format-incompatible SSTable should not prevent reading data
         // that exists in other SSTables or the memtable (FRSA-BUG-026).
         for (i, desc) in guard.sstables.iter().enumerate() {
-            // Skip SSTables a previous read already quarantined as corrupt: they
-            // re-error every attempt, so reopening them would only re-incur the
-            // retry storm. The data they held is being refilled by anti-entropy
-            // repair; until then we serve from the remaining healthy sources.
-            if self.is_sstable_quarantined(&desc.gen) {
-                sstable_pruned += 1;
+            // A quarantined generation is never skipped (FMEA ST-56): when this
+            // key's token lies in its range the read cannot be known complete,
+            // so report it without re-opening the file and let
+            // `with_retried_view` fail the read (or retry onto a view that no
+            // longer holds it).
+            if self.is_sstable_quarantined(&desc.gen)
+                && key.token.0 >= desc.min_token
+                && key.token.0 <= desc.max_token
+            {
+                corrupt = Some(CorruptSstableId::from_descriptor(desc));
                 continue;
             }
             // Token-prune by descriptor bounds first (no reader open). The
@@ -2827,8 +2880,12 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         for (i, desc) in guard.sstables.iter().enumerate() {
-            // Skip already-quarantined corrupt SSTables (see `read_with_view`).
-            if self.is_sstable_quarantined(&desc.gen) {
+            // A quarantined generation is never skipped (see `read_with_view`).
+            if self.is_sstable_quarantined(&desc.gen)
+                && key.token.0 >= desc.min_token
+                && key.token.0 <= desc.max_token
+            {
+                corrupt = Some(CorruptSstableId::from_descriptor(desc));
                 continue;
             }
             let token = key.token.0;
@@ -5874,6 +5931,7 @@ impl<F: FlushTarget> TableStore<F> {
         };
 
         let guard = self.view.load();
+        self.refuse_index_read_over_quarantine(&guard, None, "read_by_index_each_after")?;
         let memtable = guard
             .indexes
             .get(index_name)
@@ -6096,6 +6154,16 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let guard = self.view.load();
+        let partition_token = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+            partition_key.to_vec(),
+        ))
+        .token
+        .0;
+        self.refuse_index_read_over_quarantine(
+            &guard,
+            Some(partition_token),
+            "read_by_index_in_partition",
+        )?;
 
         // Same per-type key encoding as `read_by_index` (see there for why a
         // phonetic index must be probed by code, not raw bytes).
@@ -6200,6 +6268,7 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let guard = self.view.load();
+        self.refuse_index_read_over_quarantine(&guard, None, "read_by_index_cell_ranges")?;
 
         let mut positions: Vec<RowPosition> = Vec::new();
         let mut append_positions = |batch: Vec<RowPosition>| -> Result<()> {
@@ -9580,33 +9649,32 @@ mod tests {
             "the corrupt SSTable must be quarantined so later reads can target/skip it"
         );
 
-        // Second read of the same key: the quarantined SSTable is skipped, so
-        // we no longer re-fail on it. With nothing else holding the key the
-        // result is a clean Ok(None) (the data is genuinely gone locally;
-        // repair refills it in the background).
-        let again = store.read(&key).expect(
-            "after quarantine the corrupt SSTable is skipped, so the read no longer errors",
-        );
+        // Second read of the same key: the quarantined SSTable is NOT skipped
+        // (FMEA ST-56). Its data is gone locally, so the read keeps failing
+        // typed, fast and without re-opening the file, rather than reading as
+        // the key not existing.
+        let again = store
+            .read(&key)
+            .expect_err("a quarantined generation over the key's token must keep failing");
         assert!(
-            again.is_none(),
-            "no healthy local source holds the key after the corrupt SSTable is quarantined"
+            again.corrupt_sstable_range().is_some() && again.to_string().contains("corrupt-gen"),
+            "expected the typed error naming corrupt-gen, got: {again}"
         );
     }
 
-    /// A read whose data IS resolvable from a healthy source (here the memtable)
-    /// must still return `Ok(Some)` even though a corrupt SSTable in the same
-    /// token range errors on every attempt. Fail-loud applies ONLY when nothing
-    /// was resolved. The corrupt SSTable is still quarantined for repair.
+    /// A key held in the memtable is NOT proof the read is complete: the
+    /// corrupt SSTable over its token range may hold older cells or rows of the
+    /// same partition. With no known healthy replica the read fails typed
+    /// (FMEA ST-56); the coordinator is what fails over to a replica. The
+    /// generation is quarantined so repair can refill its range.
     #[test]
-    fn corrupt_sstable_resolvable_from_memtable_returns_ok_some() {
+    fn corrupt_sstable_with_memtable_copy_still_fails_loud() {
         let store = test_store();
         let schema = test_schema();
         let key = make_key("k-resolvable");
 
-        // Live, healthy copy in the active memtable.
         store.write(&key, make_row(b"live", 2000)).unwrap();
 
-        // A corrupt SSTable that also covers this key's token range.
         let truncated = Arc::new(sstable_reader_from_partitions(
             &schema,
             &[make_partition("k-resolvable", b"stale", 1000)],
@@ -9634,22 +9702,18 @@ mod tests {
             vector_indexes: Arc::clone(&current.vector_indexes),
         }));
 
-        let result = store
+        let err = store
             .read(&key)
-            .expect("a read resolvable from the memtable must succeed despite a corrupt SSTable");
-        let partition = result.expect("the memtable copy must be returned");
-        assert_eq!(
-            partition.rows[0].cells[0].1.value.as_deref(),
-            Some(b"live".as_slice()),
-            "the healthy memtable value must be served"
-        );
-
-        // Even though the read succeeded, the corrupt SSTable is quarantined so
-        // anti-entropy repair can refill its range in the background.
+            .expect_err("a memtable copy cannot vouch for a corrupt SSTable's rows");
+        assert_names_sstable(&err, "corrupt-gen-2");
         assert!(
             store.is_sstable_quarantined("corrupt-gen-2"),
-            "a corrupt SSTable detected during a resolvable read is still quarantined for repair"
+            "the corrupt SSTable is quarantined so anti-entropy repair can refill its range"
         );
+        let again = store
+            .read(&key)
+            .expect_err("quarantine must not turn the failure into a short Ok");
+        assert_names_sstable(&again, "corrupt-gen-2");
     }
 
     // -------------------------------------------------------------------------
@@ -10223,6 +10287,153 @@ mod tests {
         store
             .fulltext_sstable_scan_missing_sidecar("fts_idx", "x", &covered, None)
             .expect_err("a quarantined SSTable's rows are still missing: never skip it");
+    }
+
+    // -------------------------------------------------------------------------
+    // Quarantine contract (FMEA ST-56): a quarantined generation is never
+    // skipped. A read whose token overlaps it keeps failing with the typed
+    // error until the generation leaves the view (repair, compaction, restore).
+    // -------------------------------------------------------------------------
+
+    /// Drop `gen` from the published view, as a completed repair or a
+    /// compaction that retired it would.
+    fn remove_generation_from_view(store: &TableStore<InMemoryFlushTarget>, gen: &str) {
+        let current = store.view.load_full();
+        let keep: Vec<usize> = (0..current.sstables.len())
+            .filter(|i| current.sstables[*i].gen != gen)
+            .collect();
+        store.view.store(Arc::new(StoreView {
+            active: Arc::clone(&current.active),
+            flushing: current.flushing.clone(),
+            sstables: Arc::new(keep.iter().map(|i| current.sstables[*i].clone()).collect()),
+            sstable_ids: Arc::new(
+                keep.iter()
+                    .map(|i| current.sstable_ids[*i].clone())
+                    .collect(),
+            ),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::new(
+                keep.iter()
+                    .map(|i| Arc::clone(&current.sidecar_indexes[*i]))
+                    .collect(),
+            ),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        }));
+    }
+
+    fn quarantine_via_point_read(store: &TableStore<InMemoryFlushTarget>) {
+        store
+            .read(&make_key("c"))
+            .expect_err("the first read fails and quarantines the generation");
+        assert!(store.is_sstable_quarantined("missing-gen"));
+    }
+
+    #[test]
+    fn point_read_over_quarantined_generation_keeps_failing_typed() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        quarantine_via_point_read(&store);
+        for _ in 0..3 {
+            let err = store
+                .read(&make_key("c"))
+                .expect_err("a quarantined generation must not read as the key being absent");
+            assert_names_sstable(&err, "missing-gen");
+        }
+    }
+
+    #[test]
+    fn read_limited_rows_over_quarantined_generation_keeps_failing_typed() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        quarantine_via_point_read(&store);
+        let err = store
+            .read_limited_rows(&make_key("c"), 10)
+            .expect_err("a limited read must not skip the quarantined generation");
+        assert_names_sstable(&err, "missing-gen");
+        let err = store
+            .read_limited_rows_from(&make_key("c"), &1i32.to_be_bytes(), 10)
+            .expect_err("a resumed limited read must not skip the quarantined generation");
+        assert_names_sstable(&err, "missing-gen");
+    }
+
+    #[test]
+    fn clustering_row_read_over_quarantined_generation_keeps_failing_typed() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        quarantine_via_point_read(&store);
+        let err = store
+            .read_clustering_row(&make_key("c"), &1i32.to_be_bytes())
+            .expect_err("a clustering-row read must not skip the quarantined generation");
+        assert_names_sstable(&err, "missing-gen");
+    }
+
+    #[test]
+    fn read_outside_quarantined_token_range_is_still_served() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        quarantine_via_point_read(&store);
+        let served = store
+            .read(&make_key("a"))
+            .expect("a key outside the quarantined range is unaffected");
+        assert!(served.is_some(), "the healthy generation still serves `a`");
+    }
+
+    #[test]
+    fn index_read_with_quarantined_generation_fails_typed_not_empty() {
+        let mut store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        quarantine_via_point_read(&store);
+        let err = collect_index_results(&store, "val_idx", &IndexKey(b"missing".to_vec()))
+            .expect_err("an index read over a table with a quarantined generation must not be Ok");
+        assert_names_sstable(&err, "missing-gen");
+        let err = store
+            .read_by_index_in_partition("val_idx", &IndexKey(b"missing".to_vec()), b"c")
+            .expect_err("a partition-scoped index read must refuse too");
+        assert_names_sstable(&err, "missing-gen");
+        let err = store
+            .read_by_index_cell_ranges("val_idx", &[(0, u64::MAX)])
+            .expect_err("a cell-range index read must refuse too");
+        assert_names_sstable(&err, "missing-gen");
+    }
+
+    #[test]
+    fn reads_recover_once_the_quarantined_generation_leaves_the_view() {
+        let mut store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        quarantine_via_point_read(&store);
+        remove_generation_from_view(&store, "missing-gen");
+        store
+            .read(&make_key("c"))
+            .expect("repair removed the generation: the read is answerable again");
+        collect_index_results(&store, "val_idx", &IndexKey(b"x".to_vec()))
+            .expect("index reads are answerable once the generation is gone");
+    }
+
+    /// A failure that clears on a fresh view (a compaction retiring the input
+    /// mid-read) is retried and succeeds; only exhaustion reaches quarantine.
+    #[test]
+    fn view_retry_succeeds_when_failure_was_transient() {
+        let store = test_store();
+        let mut calls = 0;
+        let out = store
+            .with_retried_view("test_op", |_| {
+                calls += 1;
+                if calls == 1 {
+                    Ok((
+                        None::<u32>,
+                        Some(CorruptSstableId {
+                            gen: "g".to_string(),
+                            dir: std::path::PathBuf::new(),
+                            min_token: 0,
+                            max_token: 1,
+                        }),
+                    ))
+                } else {
+                    Ok((Some(7), None))
+                }
+            })
+            .expect("a failure that clears on a fresh view must not surface");
+        assert_eq!(out, Some(7));
+        assert!(
+            !store.is_sstable_quarantined("g"),
+            "a transient window must not quarantine"
+        );
     }
 
     #[test]
