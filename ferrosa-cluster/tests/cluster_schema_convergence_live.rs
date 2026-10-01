@@ -227,7 +227,13 @@ fn cql_retrying(node: &(String, String), statement: &str, timeout: Duration) -> 
 /// Invariant: a table created while this node was down is visible on it once it
 /// rejoins. A node that re-offers only the schema it already has can never
 /// satisfy this, which is the bug.
+///
+/// `#[ignore]` because it needs a live cluster, matching the repo's convention
+/// for cluster-gated tests (`--ignored` selects it). The cluster must be brought
+/// up with a small `FERROSA_RAFT_SNAPSHOT_LOGS`, which the compose file sets, so
+/// the missed DDL can be pushed outside the retained log.
 #[test]
+#[ignore = "needs a live cluster (FERROSA_TEST_CLUSTER_NODES); run with -- --ignored"]
 fn rejoining_node_learns_a_table_created_while_it_was_down() {
     let nodes = nodes();
     // `nodes[1]` is node 2 -- deliberately NOT `nodes[2]`, which is the node this

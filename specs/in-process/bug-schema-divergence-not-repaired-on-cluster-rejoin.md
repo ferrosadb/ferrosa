@@ -101,6 +101,22 @@ behind), and the receiver must be the one that was behind. Any implementation
 that pushes a *rejoining* node's schema outward must not reuse this handler
 unmodified.
 
+## Verification plan (in flight)
+
+1. **GREEN** — bring the cluster up with the fixed image and a deliberately small
+   snapshot window (`FERROSA_RAFT_SNAPSHOT_LOGS`), run
+   `cluster_schema_convergence_live` (stop → DDL → fill the log past the window so
+   the DDL is snapshotted and PURGED → restart → assert the table is visible on
+   the node that was away). Expect PASS.
+2. **RED** — with the same setup, disable the sender (`should_send_schema_snapshot`
+   forced false) and confirm the same test FAILS. Without this the test is not
+   evidence: an earlier version of it passed against the *unfixed* code because a
+   short outage is healed by Raft log replay, so it never reached the condition
+   the fix addresses.
+
+A GREEN without a RED would repeat the mistake this work item already documents
+twice: reasoning about the mechanism instead of proving it.
+
 ## Progress
 
 - [x] Root cause identified and evidenced.
