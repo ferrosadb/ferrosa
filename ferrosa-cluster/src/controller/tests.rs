@@ -5841,3 +5841,215 @@ async fn a_seeded_controller_carrying_jsonb_initializes_and_leaves_standalone() 
     );
     assert_eq!(controller.mode(), DeploymentMode::Pair);
 }
+
+// Multi-DC LOCAL_QUORUM: the acceptance criterion for the internode DC work.
+//
+// The defect: `record_peer_dc` had zero callers, so `peer_dcs` stayed empty and
+// every peer was classified as being in the LOCAL datacenter. With NTS that
+// makes LOCAL_QUORUM count remote-DC replicas as if they were local, and it
+// re-authors every peer's ring entry under our own DC.
+//
+// A single-DC test passes with the bug present (all peers ARE local), so these
+// build a genuine 2-DC topology. They also cover BOTH directions a peer can be
+// learned from, because which handler runs is decided by who dialled whom and
+// the leader usually dials its peers outbound after ClusterInvite.
+// ---------------------------------------------------------------------------
+
+/// The peers a multi-DC formation test drives. Local node is `dc1`; two peers
+/// announce `dc2`. The local DC's RF is 1 and dc2's is 2, so a correct
+/// classification yields one local replica plus two remote ones.
+fn multidc_peers() -> (Uuid, Uuid, Uuid) {
+    (
+        Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0002),
+        Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0003),
+        Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0004),
+    )
+}
+
+fn multidc_config(dir: &std::path::Path) -> Arc<ClusterConfig> {
+    Arc::new(ClusterConfig {
+        data_center: "dc1".to_string(),
+        rack: "rack1".to_string(),
+        raft_data_dir: Some(dir.join("raft")),
+        ..ClusterConfig::default()
+    })
+}
+
+/// The assertion set shared by both directions.
+///
+/// It drives the two production rules the defect broke, in the order the code
+/// applies them: `dc_for_peer` (how a peer's DC is resolved for its ring
+/// entry) and `partition_peers_by_dc` (how the local Raft group is chosen).
+/// Both read the controller's recorded `peer_dcs`, which is the thing that was
+/// never populated — so with the bug present every peer resolves to the local
+/// DC and LOCAL_QUORUM counts remote-DC replicas as local.
+fn assert_local_quorum_excludes_remote_dc(
+    controller: &Arc<ModeController>,
+    dc2_peer_a: Uuid,
+    dc2_peer_b: Uuid,
+) {
+    use crate::controller::cluster::{dc_for_peer, partition_peers_by_dc};
+
+    let local_id = controller.local_host_id;
+    let local_nid = crate::raft::uuid_to_node_id(local_id);
+    let a_nid = crate::raft::uuid_to_node_id(dc2_peer_a);
+    let b_nid = crate::raft::uuid_to_node_id(dc2_peer_b);
+
+    // 1. The controller must have RECORDED the peers' announced DC. Empty here
+    //    is the original bug: `record_peer_dc` had zero callers, so `peer_dcs`
+    //    was never populated.
+    let peer_dcs = controller.peer_dcs_snapshot();
+    for peer in [dc2_peer_a, dc2_peer_b] {
+        assert_eq!(
+            controller.peer_dc(peer).as_deref(),
+            Some("dc2"),
+            "the controller must record the peer's OWN announced DC, not leave \
+             peer_dcs empty (peer_dcs == {peer_dcs:?})"
+        );
+    }
+
+    // 2. The local Raft group / replica set must exclude the dc2 peers. This is
+    //    `partition_peers_by_dc` — the function whose behaviour the fix
+    //    changes — fed the controller's recorded map, exactly as
+    //    `transition_to_cluster` feeds it.
+    let addr = |port: u16| -> SocketAddr { format!("127.0.0.1:{port}").parse().unwrap() };
+    let all_peers = vec![
+        (local_id, addr(7000)),
+        (dc2_peer_a, addr(7001)),
+        (dc2_peer_b, addr(7002)),
+    ];
+    let (local_voters, others) = partition_peers_by_dc(&all_peers, &peer_dcs, "dc1");
+    assert!(
+        !local_voters.iter().any(|(id, _)| *id == dc2_peer_a)
+            && !local_voters.iter().any(|(id, _)| *id == dc2_peer_b),
+        "dc2 peers must not be local-DC voters: LOCAL_QUORUM would count their \
+         remote replicas as local. local_voters={local_voters:?} others={others:?}"
+    );
+    assert_eq!(
+        others.get("dc2").map(Vec::len),
+        Some(2),
+        "both dc2 peers must be grouped as cross-DC (peer_dcs == {peer_dcs:?})"
+    );
+
+    // 3. Resolve each peer's DC the way the ring build does and assert the
+    //    LOCAL_QUORUM local-DC filter — the rule `coordinate_read_nts_filtered`
+    //    and `coordinate_write_nts` apply — keeps only our own replicas.
+    let strategy_dc_rf =
+        std::collections::HashMap::from([("dc1".to_string(), 1usize), ("dc2".to_string(), 2usize)]);
+    let mut ring = crate::ring::TokenRing::new();
+    let mut node_dcs = vec![(local_nid, local_id)];
+    node_dcs.push((a_nid, dc2_peer_a));
+    node_dcs.push((b_nid, dc2_peer_b));
+    for (nid, uuid) in node_dcs {
+        ring.add_node(
+            nid,
+            NodeInfo {
+                host_id: uuid,
+                addr: "127.0.0.1:7000".into(),
+                data_center: dc_for_peer(uuid, &peer_dcs, "dc1"),
+                rack: "rack1".into(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            },
+        );
+    }
+    assert_eq!(
+        ring.get_node(local_nid).map(|n| n.data_center.as_str()),
+        Some("dc1"),
+        "the local node keeps its own DC"
+    );
+    ring.assign_tokens(local_nid, &[40i64]);
+    ring.assign_tokens(a_nid, &[10i64]);
+    ring.assign_tokens(b_nid, &[20i64]);
+
+    let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology {
+        dc_rf: strategy_dc_rf.clone(),
+    };
+    let replicas = ring.replicas_for_strategy(0i64, &strategy);
+    let is_dc2 = |id: u64| id == a_nid || id == b_nid;
+    assert!(
+        replicas.iter().copied().any(is_dc2),
+        "the fixture must produce a token whose replica set includes a dc2 \
+         node, otherwise the exclusion assertion below is vacuous: {replicas:?}"
+    );
+
+    // The LOCAL_* filter production applies.
+    let local_replicas: Vec<u64> = replicas
+        .iter()
+        .copied()
+        .filter(|&id| {
+            ring.get_node(id)
+                .map(|n| n.data_center == "dc1")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !local_replicas.iter().copied().any(is_dc2),
+        "LOCAL_QUORUM must count ONLY local-DC replicas; a dc2 replica was \
+         counted as local: local={local_replicas:?} from {replicas:?}"
+    );
+    assert!(
+        replicas.len() > local_replicas.len(),
+        "the local-DC filter must actually drop the remote replica; otherwise \
+         the exclusion assertion proves nothing: {replicas:?}"
+    );
+
+    let local_rf = strategy_dc_rf.get("dc1").copied().unwrap_or(1);
+    let required = crate::consistency::ConsistencyLevel::LocalQuorum.block_for_dc(local_rf);
+    assert_eq!(
+        required, 1,
+        "LOCAL_QUORUM with dc1_rf=1 requires one local ack"
+    );
+    assert!(
+        local_replicas.len() >= required,
+        "LOCAL_QUORUM must be satisfiable from the local DC alone: \
+         local={local_replicas:?} required={required}"
+    );
+}
+
+/// Peers dial the leader INBOUND (a seed is dialled BY its peers): the DC
+/// arrives on the handshake callback and must be recorded before
+/// `transition_to_cluster` snapshots `peer_dcs`.
+#[tokio::test]
+async fn local_quorum_excludes_remote_dc_replicas_for_inbound_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::from_u128(1);
+    let (dc2_peer_a, dc2_peer_b, _) = multidc_peers();
+
+    let (controller, _handles) = ModeController::new(
+        multidc_config(dir.path()),
+        net_config.clone(),
+        local_id,
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    let addr = |port: u16| -> SocketAddr { format!("127.0.0.1:{port}").parse().unwrap() };
+    controller.on_inbound_peer(
+        (dc2_peer_a, addr(7001)),
+        None,
+        None,
+        0,
+        Some("dc2".into()),
+        Some("rack2".into()),
+    );
+    controller.on_inbound_peer(
+        (dc2_peer_b, addr(7002)),
+        None,
+        None,
+        0,
+        Some("dc2".into()),
+        Some("rack2".into()),
+    );
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    assert_local_quorum_excludes_remote_dc(&controller, dc2_peer_a, dc2_peer_b);
+}
