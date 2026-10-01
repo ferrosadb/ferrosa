@@ -19,11 +19,17 @@
 dir = "target/nextest"
 
 [test-groups]
+
 # Tests that assert ABSOLUTE wall-clock or memory bounds measure the machine,
 # not the code. Under nextest's default full parallelism they contend with other
 # tests and flake; this group pins them to a single slot so their budgets stay
 # meaningful while everything else still runs wide.
 timing-sensitive = { max-threads = 1 }
+
+# Cross-process mutual exclusion. max-threads = 1 means the group owns a single
+# slot; threads-required = "num-test-threads" (set in the override) makes each
+# test claim that whole slot, so tests in this group never run concurrently.
+serial-range-scans = { max-threads = 1 }
 
 # Tests that invoke a heavy compiler (AssemblyScript's `asc`, loom's model
 # checker) in-process. These are CORRECTNESS tests, not perf tests, but their
@@ -41,6 +47,32 @@ timing-sensitive = { max-threads = 1 }
 # ~125-240s in debug; a single slot is far cheaper than the timeout they caused.
 compile-bound = { max-threads = 1 }
 
+
+# ── serial-range-scans: process-global env, and a mutex that cannot protect it ──
+# `range_scan_multi_replica_paging`'s tests set/remove the process-global
+# `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT`, and the scans they drive read it
+# DYNAMICALLY (`stream_chunk_row_cap()` calls `std::env::var` on every fragment
+# flush -- it is not cached at startup). So the value must not change while any
+# test in that binary is mid-scan, which is what the file's `static SERIAL:
+# Mutex<()>` tried to guarantee.
+#
+# It cannot. A `static Mutex` excludes only within one process, and nextest runs
+# ONE PROCESS PER TEST, so under nextest every test in this file takes its own
+# private lock and they all run concurrently -- the guard is a no-op precisely
+# where CI runs it. Observed consequence: `quorum_scan_reads_from_a_live_replica
+# _when_the_first_is_down` stalled for the full 30s stream idle timeout
+# (30.271s on 2026-10-01, 30.318s on 2026-09-30) while passing in 0.24s in
+# isolation, and ejected two PRs from the merge queue. This binary is also the
+# slowest in the suite that the default profile was sized against (158.7s), so
+# running its tests one at a time costs less than it looks.
+#
+# This group is the cross-process serialization the mutex was reaching for.
+# `threads-required = "num-test-threads"` takes the whole group's slot so no two
+# of these ever overlap.
+[[profile.default.overrides]]
+filter = "binary(range_scan_multi_replica_paging)"
+test-group = "serial-range-scans"
+slow-timeout = { period = "300s", terminate-after = 2 }
 [[profile.default.overrides]]
 # The sidecar memory-bound tests arm a global-allocator hook and write 64k
 # postings one at a time. They are correctness-critical (they police the

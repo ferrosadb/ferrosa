@@ -75,15 +75,27 @@ const TBL: &str = "test_tbl";
 /// bytes against a clustering-less schema would silently lose them on flush.
 const TBL_WIDE: &str = "test_wide";
 
-/// File-level serialization guard. Two tests in this binary mutate the process-
-/// global `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` env var to force a small
-/// fragment (and thus many stream windows). Cargo runs integration-test fns
-/// concurrently on threads in ONE process, so an env mutation in one test would
-/// corrupt the fragment size another test reads mid-scan. Every test in this
-/// file acquires this lock first, so they run serially and no test observes
-/// another's env mutation. (These are heavy loopback-cluster tests; serial
-/// execution is acceptable.) Poisoning is recovered — a panicking test still
-/// releases a usable lock for the next.
+/// File-level serialization guard, kept with a corrected rationale.
+///
+/// The ORIGINAL reason was that tests mutated the process-global
+/// `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` env var, so a mutation in one test
+/// could corrupt a scan another test was running. That env mutation is gone:
+/// tests now call `ferrosa_storage::range_merger::set_rows_per_fragment`, which
+/// is the supported single entry point.
+///
+/// The guard is still required, though — and removing it proved it, rather than
+/// reasoning about it. The cap remains PROCESS-GLOBAL by nature (it bounds a
+/// wire frame, so every scan in the process must agree on it), and `cargo test`
+/// runs all functions of one test binary on THREADS in a single process. So two
+/// tests that set different caps still interleave and corrupt each other: with
+/// the guard deleted, `multi_replica_paged_projected_scan_returns_all_rows_across_pages`
+/// and `quorum_scan_reads_from_a_live_replica_when_the_first_is_down` failed with
+/// `paged scan delivered duplicates`.
+///
+/// What the guard CANNOT do is protect across processes, which is why
+/// `.config/nextest.toml` also puts this binary in `serial-range-scans`:
+/// under nextest (one process per test) this mutex is a no-op, and the group is
+/// the real cross-process exclusion. The two mechanisms cover the two runners.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial_guard() -> MutexGuard<'static, ()> {
@@ -901,14 +913,14 @@ fn multi_replica_many_small_partitions_paged_scan_completes() {
 /// exhaustion; a premature short page is silent data loss.
 #[test]
 fn multi_replica_many_windows_per_page_scan_is_not_silently_truncated() {
+    let _serial = serial_guard();
     // Serialize against every other test in this binary before mutating the
     // process-global fragment-size env var (cargo runs test fns concurrently
     // in one process).
-    let _serial = serial_guard();
     // Force tiny windows: 1 row per fragment ⇒ 1 row per chunk ⇒ a 16-chunk
     // window is ~16 rows, so a wide partition spans hundreds of windows and the
     // continuation loop is exercised heavily.
-    std::env::set_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT", "1");
+    ferrosa_storage::range_merger::set_rows_per_fragment(1);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -967,7 +979,7 @@ fn multi_replica_many_windows_per_page_scan_is_not_silently_truncated() {
         cluster.shutdown().await;
     });
 
-    std::env::remove_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT");
+    ferrosa_storage::range_merger::reset_rows_per_fragment();
 }
 
 /// Seed a chosen subset of wide partitions on one replica. Models the live
@@ -993,7 +1005,7 @@ fn seed_wide_pks(engine: &StorageEngine, pks: &[&str], rows_per: usize) {
 #[test]
 fn multi_replica_disjoint_data_many_windows_scan_unions_completely() {
     let _serial = serial_guard();
-    std::env::set_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT", "1");
+    ferrosa_storage::range_merger::set_rows_per_fragment(1);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -1092,7 +1104,7 @@ fn multi_replica_disjoint_data_many_windows_scan_unions_completely() {
          could look complete while rows remained (t_a0f922a3 bug #2)"
     );
 
-    std::env::remove_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT");
+    ferrosa_storage::range_merger::reset_rows_per_fragment();
 }
 
 /// A replica node whose streaming range-read handler is backed by a REAL
@@ -1457,5 +1469,128 @@ fn quorum_scan_reads_from_a_live_replica_when_the_first_is_down() {
         srv3.shutdown(Duration::from_millis(50)).await;
         coord_srv.shutdown(Duration::from_millis(50)).await;
         drop((dir_local, dir3));
+    });
+}
+
+/// A QUORUM scan must NOT silently serve a page it could not make quorate.
+///
+/// `fan_out_remote_fragment_streams` walks the candidates in ring order and
+/// moves past any it cannot fire to. When it ends with FEWER live streams than
+/// the consistency level needs, it logs `"partial fan-out"` and **proceeds**
+/// (range_read_stream.rs, the `if fanout.streams.len() < replicas.needed` arm).
+/// The merge then runs with fewer sources than the CL asked for and the caller
+/// gets that page with no error -- a silent read below the requested
+/// consistency level, indistinguishable from a real quorum read.
+///
+/// Deterministic reach of the partial state: RF=5 over a 5-node ring, so
+/// QUORUM needs 3 sources (2 remotes + the local read); only ONE remote has a
+/// live listener and the other two are unreachable ring members. The dead ones
+/// fail fast (`unknown peer`), the live one succeeds, so the fan-out ends with
+/// `streams = 1 < needed = 2` -- the exact `partial fan-out` arm -- without any
+/// timing dependence.
+///
+/// RED today: the read succeeds, so the assertion fails with the row count.
+#[test]
+fn quorum_scan_refuses_instead_of_serving_a_partial_fanout() {
+    let _serial = serial_guard();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        const N: usize = 100;
+        let seed = |storage: &StorageEngine| seed_local(storage, N);
+        let dir_local = tempfile::tempdir().unwrap();
+        let dir_live = tempfile::tempdir().unwrap();
+        let storage = engine(dir_local.path());
+        seed(&storage);
+
+        let coord_id = uuid::Uuid::new_v4();
+        let dead_a = uuid::Uuid::new_v4();
+        let dead_b = uuid::Uuid::new_v4();
+        let live_id = uuid::Uuid::new_v4();
+
+        // Only `live_id` has a listener and a pool.
+        let (live_srv, live_addr, live_back) =
+            spawn_storage_replica_seeded(live_id, dir_live.path(), &seed).await;
+
+        // RF=5 so QUORUM = 5/2 + 1 = 3 including the local read, i.e. 2 remote
+        // streams are needed. Only 1 is reachable.
+        let mut ring = TokenRing::new();
+        ring.add_node(1, ring_node(coord_id, "127.0.0.1:1"));
+        ring.add_node(2, ring_node(dead_a, "127.0.0.1:2"));
+        ring.add_node(3, ring_node(dead_b, "127.0.0.1:3"));
+        ring.add_node(4, ring_node(live_id, &live_addr.to_string()));
+        ring.add_node(5, ring_node(uuid::Uuid::new_v4(), "127.0.0.1:5"));
+        ring.assign_tokens(1, &[i64::MIN]);
+        ring.assign_tokens(2, &[-4_611_686_018_427_387_904]);
+        ring.assign_tokens(3, &[0]);
+        ring.assign_tokens(4, &[4_611_686_018_427_387_904]);
+        ring.assign_tokens(5, &[i64::MAX]);
+
+        let peers = Arc::new(PeerManager::new(
+            Arc::new(net_config()),
+            coord_id,
+            Arc::new(NoopListener),
+        ));
+        peers
+            .ensure_peer(live_id, &live_addr.to_string())
+            .await
+            .unwrap();
+
+        let coordinator = Arc::new(ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            peers,
+            1,
+            storage,
+            5,
+            ConsistencyLevel::All,
+        ));
+        let frame_router = Arc::new(StreamFrameRouter::new(coordinator.stream_router()));
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::RangeReadStreamChunk, frame_router.clone());
+        registry.register(MsgType::RangeReadStreamHeartbeat, frame_router.clone());
+        registry.register(MsgType::RangeReadStreamDone, frame_router.clone());
+        let coord_srv = Arc::new(RpcServer::new(net_config(), coord_id, registry));
+        let coord_addr = coord_srv.start_and_get_addr().await.unwrap();
+        live_back
+            .ensure_peer(coord_id, &coord_addr.to_string())
+            .await
+            .unwrap();
+        let wp = WritePath::cluster(coordinator);
+
+        let table_id = TableId::new(KS, TBL);
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 5,
+        };
+
+        let result = wp
+            .range_read_projected_stream_all_from(
+                &table_id,
+                vec![0],
+                None,
+                ConsistencyLevel::Quorum,
+                &strategy,
+            )
+            .await;
+
+        match result {
+            Err(_) => {} // correct: refused a partial fan-out
+            Ok(stream) => {
+                let keys = drain_partition_keys(stream, "partial").await;
+                panic!(
+                    "a QUORUM scan served {} rows from a PARTIAL fan-out: only 1 remote \
+                     stream could be opened but QUORUM needs 2. This is a silent read \
+                     below the requested consistency level; it must refuse instead.",
+                    keys.len()
+                );
+            }
+        }
+
+        live_srv.shutdown(Duration::from_millis(50)).await;
+        coord_srv.shutdown(Duration::from_millis(50)).await;
+        drop((dir_local, dir_live));
     });
 }

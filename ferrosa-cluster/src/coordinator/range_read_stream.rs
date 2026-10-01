@@ -1741,13 +1741,43 @@ impl ClusterCoordinator {
                 fanout.last_error.as_deref().unwrap_or("no replica tried")
             )));
         }
+        // A partial fan-out is NOT a degraded-but-usable answer: the merge below
+        // would run with fewer sources than the consistency level the caller
+        // asked for, and the rows it returns are indistinguishable from a real
+        // quorum read. That is a silent read below the requested CL, so it is
+        // refused rather than warned about.
+        //
+        // Reachable deterministically (not just under load): RF=5 with QUORUM
+        // needs 3 sources (2 remotes + the local read); if only one remote is
+        // reachable the merge would still have produced a full page from the
+        // local replica plus that one remote. See
+        // `quorum_scan_refuses_instead_of_serving_a_partial_fanout`.
+        //
+        // The error is the same shape as the total-failure case below so callers
+        // see one contract: `every replica fire failed` reports how many were
+        // tried when none worked, this reports the shortfall when some did.
         if fanout.streams.len() < replicas.needed {
             tracing::warn!(
                 failed = fanout.fire_failures,
                 succeeded = fanout.streams.len(),
                 needed = replicas.needed,
-                "paged streaming range read: partial fan-out — some replicas could not be reached"
+                "paged streaming range read: partial fan-out — refusing to serve below \
+                 the requested consistency level"
             );
+            return Err(ClusterError::Internal(format!(
+                "paged streaming range read: partial fan-out — reached {} of {} \
+                 required replicas ({:?} fired, {} live); refusing to serve a read \
+                 below the requested consistency level{}",
+                fanout.streams.len(),
+                replicas.needed,
+                fanout.fire_failures,
+                fanout.streams.len(),
+                fanout
+                    .last_error
+                    .as_deref()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            )));
         }
 
         let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
