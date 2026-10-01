@@ -1416,6 +1416,49 @@ impl TableState {
     }
 }
 
+/// What an evicted-SSTable restore has to do, counted from the eviction
+/// markers and the manifest before any download starts.
+#[derive(Debug, PartialEq, Eq)]
+struct RestoreWork {
+    /// Tables with at least one restorable generation.
+    tables: usize,
+    /// Marked generations the manifest lists (the ones that can be restored).
+    generations: usize,
+    /// Manifest-recorded bytes of those generations.
+    bytes: u64,
+}
+
+fn restore_work(
+    evicted: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    manifest: &crate::manifest::Manifest,
+) -> RestoreWork {
+    let mut work = RestoreWork {
+        tables: 0,
+        generations: 0,
+        bytes: 0,
+    };
+    for (dir_name, gens) in evicted {
+        let mut in_table = 0usize;
+        for entry in manifest.sstables.get(dir_name).into_iter().flatten() {
+            if gens.contains(&entry.id) {
+                in_table += 1;
+                work.bytes = work.bytes.saturating_add(entry.size);
+            }
+        }
+        work.generations += in_table;
+        work.tables += usize::from(in_table > 0);
+    }
+    work
+}
+
+/// Progress is logged every 25 generations or every 30 seconds, whichever
+/// comes first.
+fn restore_progress_due(since_last_log: std::time::Duration, gens_since_last_log: usize) -> bool {
+    const EVERY_GENERATIONS: usize = 25;
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+    gens_since_last_log >= EVERY_GENERATIONS || since_last_log >= EVERY
+}
+
 /// Transition of the "hot data blocks cache eviction" condition.
 #[derive(Debug, PartialEq, Eq)]
 enum HotBlockEdge {
@@ -12448,20 +12491,53 @@ impl StorageEngine {
             ))
         })?;
         let (manifest, _version) = crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+        let work = restore_work(&evicted, &manifest);
+        // A restore can run for minutes (R2 request throttling); say so up
+        // front and keep reporting, or startup looks hung.
+        tracing::info!(
+            tables = work.tables,
+            generations = work.generations,
+            bytes = work.bytes,
+            "storage-engine: restoring evicted SSTables from S3 before registering tables"
+        );
+        let started = Instant::now();
+        let mut last_log = started;
+        let mut gens_since_log = 0usize;
         let mut restored = 0usize;
+        let mut restored_bytes = 0u64;
         for (dir_name, gens) in evicted {
             let Some((keyspace, table)) = dir_name.split_once('.') else {
                 continue;
             };
             let table_id = TableId::new(keyspace, table);
-            let mut marked = crate::manifest::Manifest::new();
             for entry in manifest.sstables.get(&dir_name).into_iter().flatten() {
-                if gens.contains(&entry.id) {
-                    marked.add_sstable(&dir_name, entry.clone());
+                if !gens.contains(&entry.id) {
+                    continue;
+                }
+                let mut one = crate::manifest::Manifest::new();
+                one.add_sstable(&dir_name, entry.clone());
+                let downloaded =
+                    Self::download_sstables_into(data_dir, &store, &prefix, &table_id, &one)
+                        .await?;
+                restored += downloaded;
+                if downloaded > 0 {
+                    restored_bytes = restored_bytes.saturating_add(entry.size);
+                }
+                gens_since_log += 1;
+                if restore_progress_due(last_log.elapsed(), gens_since_log) {
+                    tracing::info!(
+                        restored,
+                        total = work.generations,
+                        restored_bytes,
+                        total_bytes = work.bytes,
+                        elapsed_secs = started.elapsed().as_secs(),
+                        table = %dir_name,
+                        "storage-engine: restoring evicted SSTables from S3"
+                    );
+                    last_log = Instant::now();
+                    gens_since_log = 0;
                 }
             }
-            restored +=
-                Self::download_sstables_into(data_dir, &store, &prefix, &table_id, &marked).await?;
 
             let table_dir = data_dir.join("sstables").join(&dir_name);
             for gen in &gens {
@@ -12482,6 +12558,9 @@ impl StorageEngine {
         if restored > 0 {
             tracing::warn!(
                 restored,
+                total = work.generations,
+                restored_bytes,
+                elapsed_secs = started.elapsed().as_secs(),
                 "storage-engine: restored evicted SSTables from S3 before registering tables"
             );
         }
@@ -28260,6 +28339,56 @@ mod tests {
         assert!(StorageEngine::list_generations_in_dir(&hot_dir).is_empty());
         assert!(StorageEngine::list_generations_in_dir(&cold_dir).is_empty());
         engine.shutdown().unwrap();
+    }
+
+    /// The restore's start line reports what it will do: only marked
+    /// generations the manifest lists count, grouped by table.
+    #[test]
+    fn restore_work_counts_marked_manifest_generations() {
+        let entry = |id: &str, size: u64| crate::manifest::ManifestEntry {
+            id: id.to_string(),
+            size,
+            min_token: i64::MIN,
+            max_token: i64::MAX,
+            min_timestamp: 0,
+            max_timestamp: 0,
+        };
+        let mut manifest = crate::manifest::Manifest::new();
+        manifest.add_sstable("ks.a", entry("1", 100));
+        manifest.add_sstable("ks.a", entry("2", 200));
+        manifest.add_sstable("ks.a", entry("3", 400)); // not marked evicted
+        manifest.add_sstable("ks.b", entry("7", 1000));
+        let mut evicted = std::collections::BTreeMap::new();
+        evicted.insert(
+            "ks.a".to_string(),
+            ["1", "2"].map(String::from).into_iter().collect(),
+        );
+        evicted.insert(
+            "ks.b".to_string(),
+            ["7", "8"].map(String::from).into_iter().collect(), // 8 not in manifest
+        );
+        evicted.insert(
+            "ks.gone".to_string(),
+            ["9"].map(String::from).into_iter().collect(), // table not in manifest
+        );
+
+        assert_eq!(
+            restore_work(&evicted, &manifest),
+            RestoreWork {
+                tables: 2,
+                generations: 3,
+                bytes: 1300
+            }
+        );
+    }
+
+    #[test]
+    fn restore_progress_is_due_by_count_or_by_time() {
+        use std::time::Duration;
+        assert!(!restore_progress_due(Duration::from_secs(5), 3));
+        assert!(restore_progress_due(Duration::from_secs(5), 25));
+        assert!(restore_progress_due(Duration::from_secs(30), 1));
+        assert!(!restore_progress_due(Duration::from_secs(29), 24));
     }
 
     /// The "hot data keeps the cache over its limit" warning reports edges,
