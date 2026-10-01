@@ -345,7 +345,11 @@ impl RpcClient {
             // notifying the lane watcher so a dead connection cannot retain
             // a phantom in-flight request or keep dispatching new work.
             self.pending.remove(&stream_id);
-            let _ = self.alive_tx.send(false);
+            // `send_replace`, not `send`, for the reason given at the read
+            // loop above: `send` discards the value when no receiver exists
+            // yet, so a lane subscribing later would read this dead client as
+            // alive and never reconnect.
+            self.alive_tx.send_replace(false);
             return Err(NetError::Protocol("connection closed".into()));
         }
 
@@ -392,7 +396,9 @@ impl RpcClient {
             body: body.freeze(),
         };
         if self.tx.send(frame).await.is_err() {
-            let _ = self.alive_tx.send(false);
+            // `send_replace`, not `send`: see the read loop. A discarded value
+            // would leave a later subscriber believing this client is alive.
+            self.alive_tx.send_replace(false);
             return Err(NetError::Protocol("connection closed".into()));
         }
         Ok(())
