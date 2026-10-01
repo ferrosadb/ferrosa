@@ -367,6 +367,21 @@ early acknowledgement.
   never be pooled under another node's id. `PeerFireSink` (range-stream
   replies) also refuses to stream to the local host_id with a specific error
   instead of a bare "unknown peer" (t_b78e8e9a).
+- **Streaming range reads serve the local replica locally.** A ring entry that
+  carries this node's own host_id (under any node id) is the local replica, not
+  a remote: `range_read_remotes` (and the fulltext fan-out) drop it, so the
+  local-engine stream answers it and a node started alone or with peers down
+  still serves CL ONE/LOCAL_ONE. `spawn_replica_fragment_stream` errors rather
+  than firing to the local host_id.
+- **Auto-repair never claims convergence it did not observe.**
+  `classify_repair_outcome` maps a table's session tallies to a `RepairOutcome`:
+  `Converged` needs at least one successful session, no failures and no
+  divergence. All-failed logs ERROR (table + failure count), partial failure
+  WARNs, and zero sessions WARNs that agreement was not verified. Failed and
+  empty cycles increment `ferrosa_auto_repair_tables_failed_total` /
+  `ferrosa_auto_repair_tables_no_sessions_total`, are not counted as repaired,
+  and are readable via `AutoRepairScheduler::last_outcome`; the round-robin
+  cursor retries them.
 
 ## Dependencies
 

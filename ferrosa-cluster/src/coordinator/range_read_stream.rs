@@ -1424,6 +1424,15 @@ impl ClusterCoordinator {
         resume: Option<&ScanResume>,
         window_chunks: u32,
     ) -> crate::error::Result<ClusterPartitionStream> {
+        // Guard, not a fallback: the local replica is served by the local engine
+        // stream, never over the wire. Reaching here with the local host_id is a
+        // caller bug and must fail loudly rather than loop (t_b78e8e9a).
+        if host_id == self.peer_manager.local_host_id() {
+            return Err(ClusterError::Internal(format!(
+                "streaming range read: refusing to fire a stream request to the local host_id \
+                 {host_id}; the local replica must be served from the local engine"
+            )));
+        }
         let request_id = self.next_stream_request_id();
         let receiver = self
             .stream_router
@@ -1683,12 +1692,20 @@ impl ClusterCoordinator {
         let node_ids = ring.node_ids();
         let local_id = self.local_node_id;
         let node_count = node_ids.len();
+        // A ring entry under another node id that carries THIS node's host_id is
+        // the local replica (t_b78e8e9a). It is served by the local engine
+        // stream the merge always includes; firing to it would go through
+        // `PeerManager`, which has no entry for the local host ("unknown peer").
+        let local_host_id = self.peer_manager.local_host_id();
         let candidates: Vec<(uuid::Uuid, String)> = node_ids
             .iter()
             .filter(|&&id| id != local_id)
             .filter_map(|&id| ring.get_node(id).map(|n| (n.host_id, n.addr.clone())))
+            .filter(|(host_id, _)| *host_id != local_host_id)
             .collect();
         drop(ring);
+        // Aliases of the local node are not additional replicas.
+        let node_count = node_count.min(candidates.len() + 1);
 
         let needed = remote_count_for_cl(cl, replication_factor, node_count, candidates.len());
         debug_assert!(needed <= candidates.len());

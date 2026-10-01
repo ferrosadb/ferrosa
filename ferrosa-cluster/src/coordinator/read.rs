@@ -4940,6 +4940,66 @@ mod tests {
         assert_eq!(count, 1, "COUNT(*) must equal the one written partition");
     }
 
+    /// t_b78e8e9a: a ring entry under a different node id but carrying THIS
+    /// node's own host_id is the local replica, not a remote. The streaming
+    /// range read used to treat it as a remote candidate and fire a stream
+    /// request at its own host_id through `PeerManager`, which has no entry for
+    /// the local host ("unknown peer: <own host_id>"), so a node started alone
+    /// (or with peers down) failed reads it could answer from its own replica.
+    /// The coordinator must serve that replica from the local engine.
+    #[tokio::test]
+    async fn streaming_range_read_serves_self_replica_locally() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let local_host_id = Uuid::new_v4();
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            local_host_id,
+            Arc::new(NoopListener),
+        ));
+
+        let mut local_node = make_node("10.0.0.1:7000");
+        local_node.host_id = local_host_id;
+        // The same physical node registered again under another node id.
+        let mut self_alias = make_node("10.0.0.1:7000");
+        self_alias.host_id = local_host_id;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_node);
+        ring.add_node(2u64, self_alias);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[150]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm,
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage
+            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .unwrap();
+
+        let mut stream = coordinator
+            .coordinate_range_read_stream_all_with(&table_id, 0, ConsistencyLevel::One, 1)
+            .await
+            .expect("self-targeted replica must be served locally, not fired to via PeerManager");
+        let mut partitions = 0usize;
+        while let Some(item) = stream.next().await {
+            item.expect("local rows stream without error");
+            partitions += 1;
+        }
+        assert_eq!(partitions, 1, "the locally written partition is returned");
+    }
+
     struct GeneratorRangeStorage {
         generated_rows: usize,
     }
