@@ -117,6 +117,16 @@ pub enum Message {
         /// trailing extension: a pre-capability peer neither sends it (decoded
         /// as 0) nor reads it (it ignores trailing bytes).
         capabilities: u32,
+        /// This node's data center, advertised as Cassandra-style application
+        /// state so peers can classify it for NetworkTopologyStrategy and
+        /// LOCAL_* quorum accounting. `None` = not advertised (an older peer,
+        /// or no DC configured); peers must then treat us as a local-DC peer,
+        /// exactly as before this field existed. Written AFTER `capabilities`,
+        /// which keeps its trailer position for peers that predate this field.
+        data_center: Option<String>,
+        /// This node's rack within [`Self::data_center`]. `None` = not
+        /// advertised; see [`Self::data_center`].
+        rack: Option<String>,
     },
     HandshakeAck {
         host_id: Uuid,
@@ -131,6 +141,11 @@ pub enum Message {
         /// Capability bits the ACCEPTING node understands, so the initiator
         /// learns them too. Same trailing-extension rules as on `Handshake`.
         capabilities: u32,
+        /// This node's data center. `None` = not advertised; see
+        /// [`Self::Handshake`]'s twin field.
+        data_center: Option<String>,
+        /// This node's rack. `None` = not advertised.
+        rack: Option<String>,
     },
     Ping {
         nonce: u64,
@@ -477,6 +492,8 @@ impl Message {
                 cql_broadcast,
                 internode_broadcast,
                 capabilities,
+                data_center,
+                rack,
             } => {
                 put_string(buf, cluster_name)?;
                 put_uuid(buf, host_id);
@@ -493,6 +510,13 @@ impl Message {
                 put_optional_string(buf, internode_broadcast)?;
                 // Capability bits (trailing extension; absent on older peers).
                 buf.put_u32(*capabilities);
+                // Optional DC/rack application state, appended AFTER the
+                // capability u32 so a peer that predates these fields still
+                // reads capabilities at its own offset. Absent on a
+                // pre-extension peer, which then decodes `None` and keeps the
+                // pre-existing "treated as local-DC" classification.
+                put_optional_string(buf, data_center)?;
+                put_optional_string(buf, rack)?;
             }
             Self::HandshakeAck {
                 host_id,
@@ -503,6 +527,8 @@ impl Message {
                 cql_broadcast,
                 internode_broadcast,
                 capabilities,
+                data_center,
+                rack,
             } => {
                 put_uuid(buf, host_id);
                 buf.put_u8(*protocol_version);
@@ -515,6 +541,10 @@ impl Message {
                 put_optional_string(buf, internode_broadcast)?;
                 // Capability bits (trailing extension; absent on older peers).
                 buf.put_u32(*capabilities);
+                // Optional DC/rack application state, after the capability u32
+                // (same append-only rule as on `Handshake`).
+                put_optional_string(buf, data_center)?;
+                put_optional_string(buf, rack)?;
             }
             Self::Ping { nonce, sent_at } => {
                 buf.put_u64(*nonce);
@@ -665,6 +695,11 @@ impl Message {
                 // Optional internode broadcast hostname (v1 extension)
                 let internode_broadcast = get_optional_string(body)?;
                 let capabilities = get_trailing_capabilities(body);
+                // Optional DC/rack application state, read AFTER the
+                // capabilities u32 (append-only; a pre-extension peer leaves
+                // the buffer exhausted here and decodes `None`, never a guess).
+                let data_center = get_optional_string(body)?;
+                let rack = get_optional_string(body)?;
                 Self::Handshake {
                     cluster_name,
                     host_id,
@@ -674,6 +709,8 @@ impl Message {
                     cql_broadcast,
                     internode_broadcast,
                     capabilities,
+                    data_center,
+                    rack,
                 }
             }
             MsgType::HandshakeAck => {
@@ -690,6 +727,9 @@ impl Message {
                 // Optional internode broadcast hostname (v1 extension)
                 let internode_broadcast = get_optional_string(body)?;
                 let capabilities = get_trailing_capabilities(body);
+                // Optional DC/rack application state, after the capability u32.
+                let data_center = get_optional_string(body)?;
+                let rack = get_optional_string(body)?;
                 Self::HandshakeAck {
                     host_id,
                     protocol_version,
@@ -699,6 +739,8 @@ impl Message {
                     cql_broadcast,
                     internode_broadcast,
                     capabilities,
+                    data_center,
+                    rack,
                 }
             }
             MsgType::Ping => {
@@ -957,6 +999,8 @@ mod tests {
             cql_broadcast: Some("host:19042".into()),
             internode_broadcast: Some("host:17000".into()),
             capabilities: crate::handshake::LOCAL_CAPABILITIES,
+            data_center: Some("dc1".into()),
+            rack: Some("rack1".into()),
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
@@ -975,6 +1019,8 @@ mod tests {
             cql_broadcast: None,
             internode_broadcast: None,
             capabilities: 0,
+            data_center: None,
+            rack: None,
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
@@ -1044,7 +1090,13 @@ mod tests {
         put_string(&mut old_format, "h:17000").unwrap();
 
         assert_eq!(&new_format[..old_format.len()], &old_format[..]);
-        assert_eq!(&new_format[old_format.len()..], &0x1u32.to_be_bytes()[..]);
+        // The capability u32 keeps its ORIGINAL offset: the DC/rack extension
+        // is appended after it, so a peer that predates only the DC/rack fields
+        // still reads capabilities where it expects them.
+        assert_eq!(
+            &new_format[old_format.len()..old_format.len() + 4],
+            &0x1u32.to_be_bytes()[..]
+        );
     }
 
     #[test]
@@ -1058,6 +1110,8 @@ mod tests {
             cql_broadcast: Some("192.168.1.5:19042".into()),
             internode_broadcast: Some("192.168.1.5:17000".into()),
             capabilities: crate::handshake::LOCAL_CAPABILITIES,
+            data_center: Some("dc1".into()),
+            rack: Some("rack1".into()),
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
@@ -1065,11 +1119,11 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
-    /// Capabilities are a trailing extension in BOTH directions of a rolling
-    /// upgrade: a body from a node that predates them (nothing after the last
-    /// field) decodes as 0, and a new body is the old body plus four bytes, so
-    /// an old decoder — which stops after `internode_broadcast` and ignores the
-    /// rest — reads every field it knows unchanged.
+    /// Capabilities and the DC/rack announcement are BOTH trailing extensions
+    /// of the same body, in that order: a body from a node that predates
+    /// capabilities (nothing after the last field) decodes as 0/None/None, and
+    /// a v0.23 body (capability u32, no DC/rack) decodes as None/None — the
+    /// peer stays classified as local-DC rather than being refused.
     #[test]
     fn handshake_ack_capabilities_are_a_trailing_extension() {
         let new = Message::HandshakeAck {
@@ -1081,14 +1135,22 @@ mod tests {
             cql_broadcast: None,
             internode_broadcast: Some("n:17000".into()),
             capabilities: crate::handshake::CAP_RESULT_CURSOR_PAGE,
+            data_center: Some("dc1".into()),
+            rack: Some("rack1".into()),
         };
         let mut buf = BytesMut::new();
         new.encode(&mut buf).unwrap();
-        let (prefix, tail) = buf.split_at(buf.len() - 4);
-        assert_eq!(tail, crate::handshake::CAP_RESULT_CURSOR_PAGE.to_be_bytes());
+        // The capability u32 keeps the offset it had before DC/rack existed;
+        // the extension is appended after it, never before.
+        let extension_len = (1 + 2 + "dc1".len()) + (1 + 2 + "rack1".len());
+        let cap_offset = buf.len() - extension_len - 4;
+        assert_eq!(
+            &buf[cap_offset..cap_offset + 4],
+            crate::handshake::CAP_RESULT_CURSOR_PAGE.to_be_bytes()
+        );
         let old_body = Message::decode(
             MsgType::HandshakeAck,
-            &mut bytes::Bytes::copy_from_slice(prefix),
+            &mut bytes::Bytes::copy_from_slice(&buf[..cap_offset]),
         )
         .unwrap();
         let Message::HandshakeAck {
@@ -1101,6 +1163,27 @@ mod tests {
         };
         assert_eq!(capabilities, 0, "a pre-capability body advertises nothing");
         assert_eq!(internode_broadcast.as_deref(), Some("n:17000"));
+
+        // v0.23 format: capability u32 present, DC/rack absent.
+        let v023 = Message::HandshakeAck {
+            data_center: None,
+            rack: None,
+            ..new.clone()
+        };
+        let mut v023_buf = BytesMut::new();
+        v023.encode(&mut v023_buf).unwrap();
+        let Message::HandshakeAck {
+            capabilities,
+            data_center,
+            rack,
+            ..
+        } = Message::decode(MsgType::HandshakeAck, &mut v023_buf.freeze()).unwrap()
+        else {
+            panic!("expected HandshakeAck");
+        };
+        assert_eq!(capabilities, crate::handshake::CAP_RESULT_CURSOR_PAGE);
+        assert_eq!(data_center, None, "no announcement is None, never \"\"");
+        assert_eq!(rack, None);
     }
 
     #[test]
@@ -1161,6 +1244,74 @@ mod tests {
             } => {
                 assert_eq!(cql_broadcast.as_deref(), Some("10.0.0.1:19042"));
                 assert_eq!(internode_broadcast, None);
+            }
+            other => panic!("expected Handshake, got {other:?}"),
+        }
+    }
+
+    /// Rolling-upgrade guard: a pre-DC-advertisement peer sends cql_broadcast
+    /// and internode_broadcast but no DC/rack trailing fields. Its topology
+    /// must decode as `None` (treated as local) while the fields it DID send
+    /// are preserved — never silently dropped or misread as a DC.
+    #[test]
+    fn handshake_backward_compat_dc_absent_keeps_earlier_fields() {
+        let host_id = Uuid::new_v4();
+        let mut buf = BytesMut::new();
+        put_string(&mut buf, "ferrosa").unwrap();
+        put_uuid(&mut buf, &host_id);
+        buf.put_u8(1); // protocol_version
+        buf.put_u8(1); // one compression
+        buf.put_u8(0); // none
+        put_bytes(&mut buf, &[]).unwrap(); // auth_token
+        buf.put_u8(1); // cql_broadcast present
+        put_string(&mut buf, "10.0.0.1:19042").unwrap();
+        buf.put_u8(1); // internode_broadcast present
+        put_string(&mut buf, "10.0.0.1:17000").unwrap();
+        // No DC marker and no rack marker — the pre-extension frame ends here.
+
+        let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
+        match decoded {
+            Message::Handshake {
+                cql_broadcast,
+                internode_broadcast,
+                data_center,
+                rack,
+                ..
+            } => {
+                assert_eq!(cql_broadcast.as_deref(), Some("10.0.0.1:19042"));
+                assert_eq!(internode_broadcast.as_deref(), Some("10.0.0.1:17000"));
+                assert_eq!(data_center, None, "an absent DC must stay None, not \"\"");
+                assert_eq!(rack, None);
+            }
+            other => panic!("expected Handshake, got {other:?}"),
+        }
+    }
+
+    /// A peer that predates ONLY the rack field (DC present, rack absent) must
+    /// still yield its DC and a `None` rack.
+    #[test]
+    fn handshake_backward_compat_rack_absent_keeps_dc() {
+        let host_id = Uuid::new_v4();
+        let mut buf = BytesMut::new();
+        put_string(&mut buf, "ferrosa").unwrap();
+        put_uuid(&mut buf, &host_id);
+        buf.put_u8(1); // protocol_version
+        buf.put_u8(1); // one compression
+        buf.put_u8(0); // none
+        put_bytes(&mut buf, &[]).unwrap();
+        buf.put_u8(0); // no cql_broadcast
+        buf.put_u8(0); // no internode_broadcast
+        buf.put_u8(1); // data_center present
+        put_string(&mut buf, "dc7").unwrap();
+        // No rack marker.
+
+        let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
+        match decoded {
+            Message::Handshake {
+                data_center, rack, ..
+            } => {
+                assert_eq!(data_center.as_deref(), Some("dc7"));
+                assert_eq!(rack, None);
             }
             other => panic!("expected Handshake, got {other:?}"),
         }

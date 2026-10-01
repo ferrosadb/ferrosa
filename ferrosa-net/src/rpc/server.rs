@@ -31,12 +31,18 @@ pub trait InboundPeerCallback: Send + Sync {
     /// them. The callback records them so a peer that restarted with a newer
     /// build is visible to capability-gated features without the observer
     /// restarting (t_d853fa2a).
+    ///
+    /// `data_center`/`rack` are the inbound peer's advertised topology, if it
+    /// announced any (`None` = an older peer or none configured; the callee
+    /// must treat that as "same DC as local", exactly as before this carried
+    /// a payload).
     fn on_inbound_peer(
         &self,
         peer_id: PeerId,
         cql_broadcast: Option<String>,
         internode_broadcast: Option<String>,
         capabilities: u32,
+        data_center: Option<String>,
     );
 }
 
@@ -274,6 +280,7 @@ impl RpcServer {
                             cql_broadcast: None,
                             internode_broadcast: None,
                             capabilities: config.advertised_capabilities,
+                            data_center: None,
                         };
                         let mut body = bytes::BytesMut::new();
                         if let Err(e) = ack.encode(&mut body) {
@@ -356,6 +363,7 @@ impl RpcServer {
                 peer.cql_broadcast,
                 peer.internode_broadcast,
                 peer.capabilities,
+                peer.data_center,
             );
         }
 

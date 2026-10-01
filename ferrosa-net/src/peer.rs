@@ -78,6 +78,10 @@ pub struct PeerManager {
     /// Internode broadcast hostnames learned from peer handshakes. Used so the
     /// committed `NodeInfo.addr` is a re-resolvable hostname, not a frozen IP.
     peer_internode_broadcasts: RwLock<HashMap<uuid::Uuid, String>>,
+    /// Data centers advertised by peers in their handshake. Absent = the peer
+    /// did not announce one (older peer or none configured) and callers fall
+    /// back to "same DC as local"; see `ModeController::peer_dcs`.
+    peer_data_centers: RwLock<HashMap<uuid::Uuid, String>>,
     raft_runtime: OnceLock<Arc<tokio::runtime::Runtime>>,
     data_runtime: OnceLock<Arc<tokio::runtime::Runtime>>,
     started_at: tokio::time::Instant,
@@ -248,6 +252,7 @@ impl PeerManager {
             listener,
             peer_cql_broadcasts: RwLock::new(HashMap::new()),
             peer_internode_broadcasts: RwLock::new(HashMap::new()),
+            peer_data_centers: RwLock::new(HashMap::new()),
             raft_runtime: OnceLock::new(),
             data_runtime: OnceLock::new(),
             started_at: tokio::time::Instant::now(),
@@ -474,14 +479,16 @@ impl PeerManager {
             pool.shutdown().await;
             return false;
         }
-        // Extract the peer's broadcasts from the handshake before wrapping in Arc.
+        // Extract the peer's broadcasts + advertised topology from the handshake
+        // before wrapping in Arc.
         let cql_broadcast = pool.peer_cql_broadcast().map(str::to_owned);
         let internode_broadcast = pool.peer_internode_broadcast().map(str::to_owned);
+        let data_center = pool.peer_data_center().map(str::to_owned);
         // An unguarded install publishes the broadcasts before the peer is
         // visible. A guarded one must not touch them for a peer that may have
         // been removed, so it publishes after the guarded insert succeeds.
         if expect.is_none() {
-            self.store_broadcasts(host_id, &cql_broadcast, &internode_broadcast)
+            self.store_broadcasts(host_id, &cql_broadcast, &internode_broadcast, &data_center)
                 .await;
         }
         let state = Arc::new(PeerState::new(peer_id, Some(Arc::new(pool)), self.now_ms()));
@@ -510,7 +517,7 @@ impl PeerManager {
                 .and_then(|old| old.pool.clone())
         };
         if expect.is_some() {
-            self.store_broadcasts(host_id, &cql_broadcast, &internode_broadcast)
+            self.store_broadcasts(host_id, &cql_broadcast, &internode_broadcast, &data_center)
                 .await;
         }
         if let Some(l) = self.listener.get("connected") {
@@ -522,14 +529,17 @@ impl PeerManager {
         true
     }
 
-    /// Record the CQL broadcast address (for system.peers.native_address) and
-    /// the internode broadcast hostname (committed into NodeInfo.addr so the
-    /// address re-resolves across container IP churn) learned in a handshake.
+    /// Record the CQL broadcast address (for system.peers.native_address), the
+    /// internode broadcast hostname (committed into NodeInfo.addr so the
+    /// address re-resolves across container IP churn), and the advertised data
+    /// center (so LOCAL_* quorum accounting and DC-aware placement classify the
+    /// peer correctly) learned in a handshake.
     async fn store_broadcasts(
         &self,
         host_id: uuid::Uuid,
         cql_broadcast: &Option<String>,
         internode_broadcast: &Option<String>,
+        data_center: &Option<String>,
     ) {
         if let Some(broadcast) = cql_broadcast {
             self.peer_cql_broadcasts
@@ -542,6 +552,12 @@ impl PeerManager {
                 .write()
                 .await
                 .insert(host_id, broadcast.clone());
+        }
+        if let Some(dc) = data_center {
+            self.peer_data_centers
+                .write()
+                .await
+                .insert(host_id, dc.clone());
         }
     }
 
@@ -1030,6 +1046,7 @@ impl PeerManager {
             .write()
             .await
             .remove(&host_id);
+        self.peer_data_centers.write().await.remove(&host_id);
         if let Some(state) = removed {
             // Retire the pool's lane actors; dropping the map entry alone
             // leaves their tasks and reconnect watchers running forever
@@ -1083,6 +1100,27 @@ impl PeerManager {
     /// peer-connected planner). Returns None if the lock is contended.
     pub fn get_peer_internode_broadcast_sync(&self, host_id: uuid::Uuid) -> Option<String> {
         self.peer_internode_broadcasts
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.get(&host_id).cloned())
+    }
+
+    /// Store a peer's advertised data center learned during handshake.
+    pub async fn set_peer_data_center(&self, host_id: uuid::Uuid, dc: String) {
+        self.peer_data_centers.write().await.insert(host_id, dc);
+    }
+
+    /// Retrieve a peer's advertised data center (if known from handshake).
+    pub async fn get_peer_data_center(&self, host_id: uuid::Uuid) -> Option<String> {
+        self.peer_data_centers.read().await.get(&host_id).cloned()
+    }
+
+    /// Non-blocking version for synchronous contexts (e.g. the cluster-mode
+    /// peer-connected planner). Returns None if the lock is contended — the
+    /// caller then falls back to treating the peer as local, which is the
+    /// safe single-DC default rather than a wrong cross-DC classification.
+    pub fn get_peer_data_center_sync(&self, host_id: uuid::Uuid) -> Option<String> {
+        self.peer_data_centers
             .try_read()
             .ok()
             .and_then(|guard| guard.get(&host_id).cloned())

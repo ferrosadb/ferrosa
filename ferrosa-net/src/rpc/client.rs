@@ -136,6 +136,8 @@ pub struct RpcClient {
     peer_internode_broadcast: Option<String>,
     /// Capability bits the peer advertised in its HandshakeAck.
     peer_capabilities: u32,
+    /// Data center the peer advertised during handshake.
+    peer_data_center: Option<String>,
     pending: Arc<PendingReplies>,
     tx: mpsc::Sender<Frame>,
     next_stream_id: Arc<AtomicU32>,
@@ -171,6 +173,11 @@ impl RpcClient {
     /// that predates them.
     pub fn peer_capabilities(&self) -> u32 {
         self.peer_capabilities
+    }
+
+    /// The peer's data center, obtained during the handshake (if announced).
+    pub fn peer_data_center(&self) -> Option<&str> {
+        self.peer_data_center.as_deref()
     }
 
     /// Subscribe to the connection liveness channel.
@@ -288,6 +295,7 @@ impl RpcClient {
         let peer_cql_broadcast = peer.cql_broadcast;
         let peer_internode_broadcast = peer.internode_broadcast;
         let peer_capabilities = peer.capabilities;
+        let peer_data_center = peer.data_center;
 
         let pending: Arc<PendingReplies> = Arc::new(DashMap::new());
         let (tx, mut rx) = mpsc::channel::<Frame>(256);
@@ -361,6 +369,7 @@ impl RpcClient {
             peer_cql_broadcast,
             peer_internode_broadcast,
             peer_capabilities,
+            peer_data_center,
             pending,
             tx,
             next_stream_id: Arc::new(AtomicU32::new(1)),
