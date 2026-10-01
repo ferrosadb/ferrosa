@@ -32,8 +32,9 @@ use object_store::{
     PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, UploadPart,
 };
 
-/// Default for [`tracked_label_pairs`].
-const DEFAULT_TRACKED_LABEL_PAIRS: usize = 4096;
+/// Default for [`tracked_label_pairs`], used when `FERROSA_S3_STATS_MAX_KEYS` is
+/// unset, blank or unparseable.
+pub const DEFAULT_TRACKED_LABEL_PAIRS: usize = 4096;
 
 /// Distinct (table, component) label pairs tracked, from
 /// `FERROSA_S3_STATS_MAX_KEYS` (default [`DEFAULT_TRACKED_LABEL_PAIRS`]). Further

@@ -13450,7 +13450,22 @@ impl StorageEngine {
             "storage-engine: registering evicted SSTables as remote-backed (index components only, no Data.db download)"
         );
         let started = Instant::now();
-        let mut failures: Vec<String> = Vec::new();
+        // Only LISTED_FAILURES messages are ever shown, so retain exactly that
+        // many: a max-heap capped at LISTED_FAILURES yields the same lowest-N
+        // sorted sample the old `sort().take(N)` produced, in O(N) memory rather
+        // than one string per failed generation (352-373 per node on 2026-09-29).
+        // `failure_count` carries the true total into the error message.
+        let mut failures: std::collections::BinaryHeap<String> =
+            std::collections::BinaryHeap::new();
+        let mut failure_count = 0usize;
+        let note_failure =
+            |heap: &mut std::collections::BinaryHeap<String>, count: &mut usize, msg: String| {
+                *count += 1;
+                heap.push(msg);
+                if heap.len() > LISTED_FAILURES {
+                    heap.pop();
+                }
+            };
         let mut jobs = Vec::new();
         for (dir_name, gens) in &evicted {
             let table_dir = data_dir.join("sstables").join(dir_name);
@@ -13469,7 +13484,11 @@ impl StorageEngine {
                 } else if listed {
                     jobs.push((dir_name.clone(), gen.clone(), table_dir.clone()));
                 } else {
-                    failures.push(format!("{dir_name} generation {gen}: not in the manifest"));
+                    note_failure(
+                        &mut failures,
+                        &mut failure_count,
+                        format!("{dir_name} generation {gen}: not in the manifest"),
+                    );
                 }
             }
         }
@@ -13486,19 +13505,27 @@ impl StorageEngine {
         while let Some((dir_name, gen, outcome)) = results.next().await {
             match outcome {
                 Ok(crate::evicted_read::QueryFetch::Ready) => registered += 1,
-                Ok(other) => failures.push(format!(
-                    "{dir_name} generation {gen}: objects unavailable in the store ({other:?})"
-                )),
-                Err(e) => failures.push(format!("{dir_name} generation {gen}: {e}")),
+                Ok(other) => note_failure(
+                    &mut failures,
+                    &mut failure_count,
+                    format!(
+                        "{dir_name} generation {gen}: objects unavailable in the store ({other:?})"
+                    ),
+                ),
+                Err(e) => note_failure(
+                    &mut failures,
+                    &mut failure_count,
+                    format!("{dir_name} generation {gen}: {e}"),
+                ),
             }
         }
-        if !failures.is_empty() {
-            failures.sort();
-            let shown: Vec<_> = failures.iter().take(LISTED_FAILURES).cloned().collect();
+        if failure_count > 0 {
+            let mut shown = failures.into_sorted_vec();
+            shown.truncate(LISTED_FAILURES);
             return Err(ferrosa_common::Error::InvalidFormat(format!(
                 "{} evicted SSTable generation(s) are neither local nor resolvable from the \
                  object store; refusing to start and serve their tables without them: {}",
-                failures.len(),
+                failure_count,
                 shown.join("; ")
             )));
         }
@@ -13514,7 +13541,7 @@ impl StorageEngine {
     /// the background of a sync pass, so tables that are actually queried get
     /// local `Data.db` again without a startup bulk download (t_6a2847c8).
     ///
-    /// Bounded: at most [`HOT_RESTORE_MAX_GENERATIONS`] generations per call,
+    /// Bounded: at most 8 generations per call (`HOT_RESTORE_MAX_GENERATIONS`),
     /// and it stops, never re-triggering eviction, when restoring the next
     /// generation would leave free disk under the eviction free-space target
     /// or push the uploaded-SSTable cache past `local_cache_max_bytes`.
