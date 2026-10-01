@@ -53,7 +53,7 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   `accept_handshake` exchange `Handshake`/`HandshakeAck`, verifying cluster name,
   protocol version, and an `HMAC-SHA256(psk, cluster_name|host_id|nonce)` auth
   token via the `hmac` crate's constant-time `verify_slice`. The handshake also
-  exchanges CQL- and internode-broadcast addresses, and **capability bits**: a
+  exchanges CQL- and internode-broadcast addresses, **capability bits**: a
   trailing `u32` on BOTH `Handshake` and `HandshakeAck`
   (`NetConfig::advertised_capabilities`, default `LOCAL_CAPABILITIES`), so the
   initiator and the acceptor each learn the other's (`HandshakePeer::capabilities`,
@@ -86,6 +86,18 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   (1<<1) — the peer serves `ResultCursorPage` (`0x68`) /
   `ResultCursorPageReply` (`0x69`), opaque ferrosa-cql payloads forwarding a CQL
   result cursor's next page to the node that owns it.
+
+  The same handshake also carries the peer's own topology: two presence-marked
+  trailing optional strings with the sender's `data_center` and `rack`, written
+  AFTER the capability `u32` so a peer that predates them still reads
+  capabilities at its own offset (append-only in both directions). An empty
+  DC/rack is advertised as ABSENT (`None`), never as `""` — an empty DC name is
+  neither "known" nor "absent" and would record a peer in a data center that
+  cannot exist. A peer that announces nothing (an older build, or no
+  `FERROSA_DATA_CENTER` set) is treated as a local-DC peer, exactly as before, so
+  a rolling upgrade never reclassifies live peers. Advertising DC/rack here is
+  what lets a node learn its peers' real topology instead of assuming every peer
+  shares its own.
 - **Priority lanes + actor pool** (`pool`, `lane_actor`) — `PriorityPool` holds
   three TCP connections per peer, one per `Lane` (`Raft`, `Data`, `Bulk`). Each
   lane is owned by a dedicated actor task that processes `LaneCommand`s

@@ -658,6 +658,15 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   internode endpoint when creating reverse pools and tracking invite targets;
   the observed IP plus local port is only a compatibility fallback. This keeps
   same-host clusters with per-node ports from routing every host ID to the seed.
+- Internode DC/rack propagation — peers advertise their `data_center`/`rack` in
+  the handshake; the controller records them (`peer_dcs` / `peer_racks`) from
+  both the inbound handshake and outbound connects, and every site that commits
+  a peer (ring build, recovered-topology refresh, `handle_join_request`, the
+  seed-join loop) resolves that peer's topology through one rule
+  (`peer_topology`): the peer's announced value wins, and a peer that announced
+  none falls back to local. `NetworkTopologyStrategy` then places replicas
+  across real DCs and `LOCAL_*` quorums count only local-DC replicas. Resolution
+  happens once per connection establishment, not per message.
 - `ring/` — `TokenRing` (BTreeMap), SimpleStrategy + NetworkTopologyStrategy
   replica selection with rack diversity, learner `owns_tokens` handling.
 - `controller/membership.rs` — `MembershipChanger` mutates the four membership

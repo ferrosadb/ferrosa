@@ -78,6 +78,18 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
    storage-apply seam now resolves merged dependencies when an explicit no-write
    finalize reaches a replica that never registered that txn; retain the focused
    regression and fault-schedule coverage, then add cross-DC failure cases.
+5. **CL-16 (RPN 168)** — *fixed, retained as a regression note.* A peer's
+   committed `NodeInfo` was stamped with the LOCAL node's `data_center`/`rack`,
+   so `NetworkTopologyStrategy` believed every peer was local and `LOCAL_QUORUM`
+   counted remote-DC replicas — a real durability/consistency exposure in a
+   multi-DC cluster, and invisible in a single-DC test. Root cause: the
+   handshake never carried DC/rack and `record_peer_dc` had no callers. Fixed by
+   advertising DC/rack on the wire and resolving every commit site through one
+   rule (`peer_topology`: announced wins, absent falls back to local). Detection:
+   `local_quorum_excludes_remote_dc_replicas_for_{inbound,outbound}_peers` (the
+   non-vacuous multi-DC test — a single-DC test passes with the bug present),
+   `peer_topology_*`, `seed_join_node_info_*`.
+
 ## Detection assets
 - `ELECTION_STORM_TERM_JUMPS_TOTAL`, `INSTALLSNAPSHOT_PUSHES_TOTAL` (Raft health).
 - `LEADER_ELECTION_TIMEOUTS`, `FORMATION_REDUCED_DURABILITY_WRITES`,
