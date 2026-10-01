@@ -8,6 +8,7 @@ pub mod config;
 pub mod download;
 pub mod manager;
 pub mod pending_log;
+pub mod pool;
 pub mod replay;
 pub mod stats;
 pub mod throttle;

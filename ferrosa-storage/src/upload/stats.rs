@@ -726,9 +726,48 @@ pub fn record_retry(op: &str) {
     }
 }
 
+static MAX_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static POOL_MAX_IDLE: AtomicU64 = AtomicU64::new(0);
+
+/// Record the effective in-flight limit and pool size the store was built
+/// with, so "what is the pool size on this host" is answerable from metrics.
+pub fn record_pool_settings(max_in_flight: usize, pool_max_idle_per_host: usize) {
+    MAX_IN_FLIGHT.store(max_in_flight as u64, Ordering::Relaxed);
+    POOL_MAX_IDLE.store(pool_max_idle_per_host as u64, Ordering::Relaxed);
+}
+
+/// Prometheus gauges of the effective in-flight limit and pool size.
+fn render_pool_gauges() -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP ferrosa_s3_max_in_flight Effective cap on concurrent object-store requests.\n",
+    );
+    out.push_str("# TYPE ferrosa_s3_max_in_flight gauge\n");
+    let _ = writeln!(
+        out,
+        "ferrosa_s3_max_in_flight {}",
+        MAX_IN_FLIGHT.load(Ordering::Relaxed)
+    );
+    out.push_str(
+        "# HELP ferrosa_s3_pool_max_idle_per_host Effective idle connections kept per host.\n",
+    );
+    out.push_str("# TYPE ferrosa_s3_pool_max_idle_per_host gauge\n");
+    let _ = writeln!(
+        out,
+        "ferrosa_s3_pool_max_idle_per_host {}",
+        POOL_MAX_IDLE.load(Ordering::Relaxed)
+    );
+    out
+}
+
 /// Prometheus text for the global stats; empty when disabled.
 pub fn render_prometheus() -> String {
-    global().map(|s| s.render_prometheus()).unwrap_or_default()
+    let Some(stats) = global() else {
+        return String::new();
+    };
+    let mut out = stats.render_prometheus();
+    out.push_str(&render_pool_gauges());
+    out
 }
 
 /// An [`ObjectStore`] that records every request into [`ObjectStoreStats`].

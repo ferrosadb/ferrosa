@@ -263,3 +263,14 @@ fn global_rendering_is_empty_until_enabled() {
     assert!(global().is_none());
     assert_eq!(render_prometheus(), "");
 }
+
+#[test]
+fn pool_gauges_report_the_recorded_settings() {
+    record_pool_settings(64, 96);
+    let text = render_pool_gauges();
+    assert!(text.contains("ferrosa_s3_max_in_flight 64\n"), "{text}");
+    assert!(
+        text.contains("ferrosa_s3_pool_max_idle_per_host 96\n"),
+        "{text}"
+    );
+}

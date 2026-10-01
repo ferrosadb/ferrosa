@@ -104,6 +104,7 @@ impl ObjectStoreConfig {
         // typo fails startup instead of the first restore. Both are read once
         // per process; `build_object_store` and the download path use them.
         super::download::config()?;
+        super::pool::config()?;
         super::stats::enabled_from_env()?;
 
         // Local file:// backend takes precedence when its path is set.
@@ -181,36 +182,29 @@ impl ObjectStoreConfig {
     /// This is the one place connection-pool settings live, so every path
     /// that shares the client (uploads, deletes, restore, rehydrate, ranged
     /// reads) inherits them. See [`Self::pool_max_idle_per_host`].
-    pub fn client_options(&self) -> object_store::ClientOptions {
-        object_store::ClientOptions::new()
+    pub fn client_options(&self) -> ferrosa_common::Result<object_store::ClientOptions> {
+        let pool = super::pool::config()?;
+        Ok(object_store::ClientOptions::new()
             .with_allow_http(self.allow_http)
             .with_timeout(self.request_timeout)
-            .with_connect_timeout(std::time::Duration::from_secs(10))
-            .with_pool_max_idle_per_host(self.pool_max_idle_per_host())
-            .with_pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .with_connect_timeout(pool.connect_timeout)
+            .with_pool_max_idle_per_host(self.pool_max_idle_per_host()?)
+            .with_pool_idle_timeout(pool.idle_timeout))
     }
 
-    /// Idle connections kept per host: enough for every request the process
-    /// can have in flight at once (download parts x concurrent restores, plus
-    /// the upload, compaction-upload and delete workers), never fewer than
-    /// [`MIN_POOL_IDLE_PER_HOST`]. A pool smaller than the peak concurrency
-    /// closes and reopens TLS connections on every burst.
-    pub fn pool_max_idle_per_host(&self) -> usize {
-        let download = match super::download::config() {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                tracing::warn!(error = %e, "invalid download tunables; sizing the connection pool from defaults");
-                super::download::DownloadConfig::default()
-            }
-        };
-        let in_flight = download.part_concurrency * download.restore_concurrency
-            + self.upload_workers
-            + self.compaction_upload_workers
-            + self.delete_workers;
-        let capped = self
-            .max_concurrent_requests
-            .map_or(in_flight, |m| m.min(in_flight));
-        capped.max(MIN_POOL_IDLE_PER_HOST)
+    /// Cap on concurrent object-store requests: `FERROSA_S3_MAX_CONCURRENT_REQUESTS`
+    /// when set, else [`super::pool::DEFAULT_MAX_IN_FLIGHT`], which is sized for
+    /// a WAN link (bandwidth x round-trip time), not for this machine's cores.
+    pub fn effective_max_in_flight(&self) -> usize {
+        self.max_concurrent_requests
+            .unwrap_or(super::pool::DEFAULT_MAX_IN_FLIGHT)
+    }
+
+    /// Idle connections kept per host: `FERROSA_S3_POOL_MAX_IDLE_PER_HOST`
+    /// when set, else the in-flight limit. Never smaller than the in-flight
+    /// limit, because a pool below peak in-flight reconnects on every burst.
+    pub fn pool_max_idle_per_host(&self) -> ferrosa_common::Result<usize> {
+        super::pool::config()?.max_idle_per_host(self.effective_max_in_flight())
     }
 
     /// Whether this configuration targets the local `file://` backend.
@@ -261,7 +255,7 @@ impl ObjectStoreConfig {
             .with_region(&self.region)
             .with_allow_http(self.allow_http)
             .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .with_client_options(self.client_options());
+            .with_client_options(self.client_options()?);
 
         if let Some(ref key_id) = self.access_key_id {
             builder = builder.with_access_key_id(key_id);
@@ -287,17 +281,20 @@ impl ObjectStoreConfig {
         // Every path shares this one store, so the caps here bound uploads,
         // deletes, rehydration and restore together. 429 retry is always on:
         // object_store does not retry client errors.
-        let store: std::sync::Arc<dyn ObjectStore> = match self.max_concurrent_requests {
-            Some(max) => std::sync::Arc::new(object_store::limit::LimitStore::new(store, max)),
-            None => store,
-        };
-        if self.max_requests_per_second.is_some() || self.max_concurrent_requests.is_some() {
-            tracing::info!(
-                max_requests_per_second = ?self.max_requests_per_second,
-                max_concurrent_requests = ?self.max_concurrent_requests,
-                "object store requests are throttled"
-            );
-        }
+        let max_in_flight = self.effective_max_in_flight();
+        let store: std::sync::Arc<dyn ObjectStore> =
+            std::sync::Arc::new(object_store::limit::LimitStore::new(store, max_in_flight));
+        let pool_max_idle = self.pool_max_idle_per_host()?;
+        let pool = super::pool::config()?;
+        super::stats::record_pool_settings(max_in_flight, pool_max_idle);
+        tracing::info!(
+            max_in_flight,
+            pool_max_idle_per_host = pool_max_idle,
+            pool_idle_timeout_secs = pool.idle_timeout.as_secs(),
+            connect_timeout_secs = pool.connect_timeout.as_secs(),
+            max_requests_per_second = ?self.max_requests_per_second,
+            "object store client built"
+        );
         Ok(Box::new(super::throttle::ThrottledStore::new(
             store,
             self.max_requests_per_second,
@@ -461,11 +458,6 @@ where
 /// restore on 2026-09-30.
 pub const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 900;
 
-/// Floor for idle pooled connections per host.
-pub const MIN_POOL_IDLE_PER_HOST: usize = 32;
-/// How long an idle pooled connection is kept before it is closed.
-const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-
 /// Parse `FERROSA_S3_REQUEST_TIMEOUT_SECS`. Unset or empty means the default;
 /// anything else must be a positive whole number of seconds, and a bad value
 /// is rejected naming the variable rather than quietly using the default.
@@ -480,24 +472,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pool_holds_every_request_the_process_can_have_in_flight() {
+    fn the_pool_is_sized_from_in_flight_and_ignores_workers_and_cores() {
         let cfg = ObjectStoreConfig::test_config();
-        let download = crate::upload::download::config().unwrap();
-        let peak = download.part_concurrency * download.restore_concurrency
-            + cfg.upload_workers
-            + cfg.compaction_upload_workers
-            + cfg.delete_workers;
-        assert!(
-            cfg.pool_max_idle_per_host() >= peak,
-            "pool must not be smaller than peak concurrency"
+        assert_eq!(
+            cfg.effective_max_in_flight(),
+            super::super::pool::DEFAULT_MAX_IN_FLIGHT
         );
-        assert!(cfg.pool_max_idle_per_host() >= MIN_POOL_IDLE_PER_HOST);
+        assert_eq!(
+            cfg.pool_max_idle_per_host().unwrap(),
+            cfg.effective_max_in_flight()
+        );
 
-        let capped = ObjectStoreConfig {
-            max_concurrent_requests: Some(2),
+        let busy = ObjectStoreConfig {
+            upload_workers: 500,
+            delete_workers: 500,
             ..ObjectStoreConfig::test_config()
         };
-        assert_eq!(capped.pool_max_idle_per_host(), MIN_POOL_IDLE_PER_HOST);
+        assert_eq!(
+            busy.pool_max_idle_per_host().unwrap(),
+            cfg.pool_max_idle_per_host().unwrap(),
+            "worker counts must not move the pool"
+        );
+
+        let wide = ObjectStoreConfig {
+            max_concurrent_requests: Some(300),
+            ..ObjectStoreConfig::test_config()
+        };
+        assert_eq!(wide.effective_max_in_flight(), 300);
+        assert_eq!(wide.pool_max_idle_per_host().unwrap(), 300);
     }
 
     #[test]
@@ -689,7 +691,7 @@ mod tests {
             .with_access_key_id("k")
             .with_secret_access_key("s")
             // allow_http comes only from client_options(), as in production.
-            .with_client_options(cfg.client_options())
+            .with_client_options(cfg.client_options().unwrap())
             .with_retry(object_store::RetryConfig {
                 max_retries: 0,
                 retry_timeout: std::time::Duration::from_secs(1),

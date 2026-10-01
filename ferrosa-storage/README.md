@@ -274,7 +274,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   **Request throttling (`upload/throttle.rs`):** every path shares one object
   store, wrapped in `ThrottledStore`. `FERROSA_S3_MAX_REQUESTS_PER_SECOND` paces
   requests evenly (no burst) and `FERROSA_S3_MAX_CONCURRENT_REQUESTS` caps them
-  in flight (`object_store::limit::LimitStore`); unset means unlimited, and a
+  in flight (`object_store::limit::LimitStore`); unset means the WAN default of 64, and a
   non-positive or non-integer value stops startup naming the variable. A request
   answered `429 Too Many Requests` is retried with exponential backoff (10
   attempts, 250 ms doubling to 30 s) — `object_store` retries only 5xx — and the
@@ -289,8 +289,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   one GET through a 1 MiB buffered writer. Startup restore runs
   `FERROSA_RESTORE_CONCURRENCY` generations at a time, clearing each marker only
   once its generation is on disk. There is one client per process
-  (`ObjectStoreConfig::client_options` holds the pool: `pool_max_idle_per_host`
-  covers parts x restores + upload/delete workers, floor 32; 90 s idle timeout),
+  (`ObjectStoreConfig::client_options` holds the pool, sized from the in-flight target
+  `FERROSA_S3_MAX_CONCURRENT_REQUESTS`, default 64 for a WAN, never from cores;
+  `FERROSA_S3_POOL_MAX_IDLE_PER_HOST`, `FERROSA_S3_POOL_IDLE_TIMEOUT_SECS` and
+  `FERROSA_S3_CONNECT_TIMEOUT_SECS` tune it; effective values are logged at
+  construction),
   and `object_store_and_config` errors rather than building a second client.
   **Stats (`upload/stats.rs`, `FERROSA_S3_STATS=1`):** a `StatsStore` layer under
   the throttle records per-operation counts, bytes, latency histograms, errors,
