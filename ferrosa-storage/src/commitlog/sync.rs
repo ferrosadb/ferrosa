@@ -186,7 +186,14 @@ impl SyncStrategy for PeriodicSync {
         PENDING_WRITES.fetch_add(1, Ordering::Relaxed);
         PENDING_BYTES.fetch_add(bytes, Ordering::Relaxed);
         if previous == 0 || previous_bytes.saturating_add(bytes) >= self.batch.target_bytes {
-            let (_lock, cvar) = &*self.wake;
+            // Notify while holding `wake.lock`, for the same reason GroupSync
+            // does: the sync thread holds this lock when it checks `pending`
+            // and the batch's byte target before calling wait_for(). Without
+            // the lock a notification sent in that window is lost and the
+            // thread sleeps the whole sync interval, so a batch that reached
+            // target_bytes is not fsynced until the timer fires.
+            let (lock, cvar) = &*self.wake;
+            let _guard = lock.lock();
             cvar.notify_one();
         }
     }
@@ -694,9 +701,13 @@ mod tests {
         // timer behavior is correct. Wait for the flush callback itself so the
         // assertion is synchronized to the event being tested, not scheduler
         // timing.
+        // Wait on the predicate, not the notification: the flush can fire and
+        // notify before this thread reaches the wait, and an unconditional
+        // `wait_for` then sleeps the full timeout on a flag that is already set.
         let (lock, cvar) = &*flush_observed;
         let mut flushed = lock.lock();
-        let result = cvar.wait_for(&mut flushed, Duration::from_secs(5));
+        let result =
+            cvar.wait_while_for(&mut flushed, |observed| !*observed, Duration::from_secs(5));
         assert!(
             *flushed && !result.timed_out(),
             "periodic flush callback did not run within 5s"
