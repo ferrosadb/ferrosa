@@ -428,6 +428,20 @@ pub struct RebuildOutcome {
 }
 
 impl RebuildOutcome {
+    /// The outcome a backfill's [`Coverage`](crate::index::orphan::Coverage)
+    /// tally amounts to. One conversion for `rebuild_index` and
+    /// `add_partition_key_index`, so the two cannot report the same backfill
+    /// differently.
+    #[must_use]
+    pub fn from_coverage(coverage: &crate::index::orphan::Coverage) -> Self {
+        Self {
+            sstables_rebuilt: coverage.built,
+            sstables_total: coverage.expected,
+            sstables_vanished: coverage.vanished,
+            sstables_failed: coverage.failed,
+        }
+    }
+
     /// Whether every SSTable that HOLDS ROWS is now covered.
     ///
     /// Vanished SSTables (data file gone, TOC and sidecars still present) cannot
@@ -5252,7 +5266,20 @@ impl StorageEngine {
                     );
                     return Ok(false);
                 }
-                self.add_partition_key_index(table_id, index_name, component, index_type)?;
+                let outcome =
+                    self.add_partition_key_index(table_id, index_name, component, index_type)?;
+                if !outcome.is_complete() {
+                    // Registered, not usable: the index is stale and refuses
+                    // reads until `ferrosa-ctl index rebuild` completes it.
+                    tracing::error!(
+                        keyspace = table_id.keyspace(),
+                        table = table_id.table(),
+                        index_name,
+                        ?outcome,
+                        "partition-key-column index registered {site} but its backfill did NOT \
+                         complete; it stays stale and refuses reads until rebuilt"
+                    );
+                }
                 tracing::info!(
                     keyspace = table_id.keyspace(),
                     table = table_id.table(),
@@ -5777,13 +5804,23 @@ impl StorageEngine {
     /// the same reason [`add_clustering_index`](Self::add_clustering_index)
     /// exists for the other half of the primary key. Writes extract the value
     /// from the composite partition key at `partition_key_component`.
+    ///
+    /// Returns the backfill's [`RebuildOutcome`]. An incomplete backfill is NOT
+    /// an `Err`: the index is registered and correctly stale (reads through it
+    /// are refused), and `ferrosa-ctl index rebuild` can finish the job. But the
+    /// caller must look at [`RebuildOutcome::is_complete`] rather than assume
+    /// `Ok` means the index covers the table.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the table is not registered.
     pub fn add_partition_key_index(
         &self,
         table_id: &TableId,
         index_name: &str,
         partition_key_component: usize,
         index_type: ferrosa_index::IndexType,
-    ) -> ferrosa_common::Result<()> {
+    ) -> ferrosa_common::Result<RebuildOutcome> {
         self.index_tracker
             .register_index(table_id.keyspace(), table_id.table(), index_name);
 
@@ -5809,7 +5846,7 @@ impl StorageEngine {
         //
         // Mark each SSTable pending BEFORE submitting, so a consult that finds
         // the index empty can only trust it once the backfill has completed.
-        self.backfill_partition_key_index(
+        let coverage = self.backfill_partition_key_index(
             state,
             table_id,
             index_name,
@@ -5817,7 +5854,7 @@ impl StorageEngine {
             index_type,
         );
 
-        Ok(())
+        Ok(RebuildOutcome::from_coverage(&coverage))
     }
 
     /// Build (or rebuild) the partition-key index sidecars for every SSTable
@@ -6111,12 +6148,7 @@ impl StorageEngine {
             );
         }
 
-        Ok(RebuildOutcome {
-            sstables_rebuilt,
-            sstables_total,
-            sstables_vanished: coverage.vanished,
-            sstables_failed: coverage.failed,
-        })
+        Ok(RebuildOutcome::from_coverage(&coverage))
     }
 
     /// Register a full-text index on a table.
@@ -22844,6 +22876,7 @@ mod tests {
                     make_row(b"v", 1000),
                     1000,
                 )
+                .write(&tid, &make_key(&format!("k{i}")), make_row(b"v", 1000), 1000)
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
