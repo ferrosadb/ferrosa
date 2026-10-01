@@ -12224,13 +12224,16 @@ impl StorageEngine {
         table_dir.join(format!("{gen}.evicted"))
     }
 
-    /// Durably record that `gen` is about to be evicted. Written and fsynced,
-    /// with its directory entry, BEFORE any component is deleted, so a crash
-    /// between the two can never lose track of an evicted SSTable.
-    fn record_eviction(table_dir: &std::path::Path, gen: &str) -> std::io::Result<()> {
-        let marker = Self::evicted_marker_path(table_dir, gen);
-        std::fs::File::create(&marker)?.sync_all()?;
-        std::fs::File::open(table_dir)?.sync_all()
+    /// Durably record that `gen` is about to be evicted, and why. The record
+    /// ([`crate::eviction_marker`]) is written and fsynced, with its directory
+    /// entry, BEFORE any component is deleted, so a crash between the two can
+    /// never lose track of an evicted SSTable.
+    fn record_eviction(
+        table_dir: &std::path::Path,
+        gen: &str,
+        record: &crate::eviction_marker::EvictionRecord,
+    ) -> std::io::Result<()> {
+        crate::eviction_marker::write_marker(table_dir, gen, record)
     }
 
     /// Deletes all on-disk files for an SSTable generation that is leaving the
@@ -12724,10 +12727,12 @@ impl StorageEngine {
         {
             let over_cache_limit = total_bytes > max_bytes;
             let under_free_target = target_free > 0 && projected_available < target_free;
-            if !over_cache_limit && !under_free_target {
+            let Some(trigger) =
+                crate::eviction_marker::Trigger::from_limits(over_cache_limit, under_free_target)
+            else {
                 stopped_early = true;
                 break;
-            }
+            };
             if total_bytes <= min_bytes {
                 tracing::warn!(
                     total_uploaded_cache_bytes = total_bytes,
@@ -12743,7 +12748,20 @@ impl StorageEngine {
             // Record the eviction durably first; without the record a restart
             // cannot tell this SSTable from a compacted-away one and would
             // leave it out of its table. No record, no eviction.
-            if let Err(e) = Self::record_eviction(&table_dir, &sstable_id) {
+            let record = crate::eviction_marker::EvictionRecord {
+                trigger,
+                generation_bytes: Some(size),
+                total_bytes: Some(total_bytes),
+                max_bytes: Some(max_bytes),
+                min_bytes: Some(min_bytes),
+                projected_available: Some(projected_available),
+                target_free: Some(target_free),
+                ..crate::eviction_marker::EvictionRecord::bare(
+                    trigger,
+                    crate::eviction_marker::SOURCE_EVICTOR,
+                )
+            };
+            if let Err(e) = Self::record_eviction(&table_dir, &sstable_id, &record) {
                 tracing::error!(
                     table = table_id,
                     sstable = sstable_id,
@@ -13083,6 +13101,7 @@ impl StorageEngine {
         if evicted.is_empty() {
             return Ok(0);
         }
+        crate::eviction_marker::log_census(&data_dir.join("sstables"));
         let (store, prefix) = store.ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "{} evicted SSTable table(s) need restoring from S3, but S3 is not configured",
@@ -30198,7 +30217,8 @@ mod tests {
         let table_dir = dir.path().join("sstables").join(table_id().to_string());
         std::fs::create_dir_all(&table_dir).unwrap();
         std::fs::write(table_dir.join("42-Data.db"), b"x").unwrap();
-        StorageEngine::record_eviction(&table_dir, "42").unwrap();
+        StorageEngine::record_eviction(&table_dir, "42", &crate::eviction_marker::test_record())
+            .unwrap();
 
         StorageEngine::delete_sstable_files(&table_dir, "42");
 
@@ -30314,6 +30334,160 @@ mod tests {
             "a retired generation leaves nothing behind, found {leftovers:?}"
         );
         engine.shutdown().unwrap();
+    /// Build an engine over `dir` holding generations `1` and `2` (80 bytes
+    /// each) that the manifest lists as uploaded, with the given cache cap and
+    /// disk-free reserve. Returns the engine, its table dir and the manifest.
+    fn engine_with_two_uploaded_sstables(
+        dir: &std::path::Path,
+        cache_max_bytes: u64,
+        free_reserve_bytes: u64,
+    ) -> (StorageEngine, std::path::PathBuf, crate::manifest::Manifest) {
+        let mut config = StorageEngineConfig::test_config(dir);
+        config.local_cache_max_bytes = cache_max_bytes;
+        config.local_disk_free_reserve_bytes = free_reserve_bytes;
+        let engine = StorageEngine::new(config, None).unwrap();
+        let table_id = table_id().to_string();
+        let table_dir = dir.join("sstables").join(&table_id);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let mut manifest = crate::manifest::Manifest::new();
+        for id in ["1", "2"] {
+            std::fs::write(table_dir.join(format!("{id}-Data.db")), vec![1u8; 80]).unwrap();
+            manifest.add_sstable(
+                &table_id,
+                crate::manifest::ManifestEntry {
+                    id: id.to_string(),
+                    size: 80,
+                    min_token: i64::MIN,
+                    max_token: i64::MAX,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+        }
+        (engine, table_dir, manifest)
+    }
+
+    /// The record of the eviction that saw the whole cache: the one with the
+    /// largest `total_bytes` among the markers in `table_dir`.
+    fn first_eviction_record(
+        table_dir: &std::path::Path,
+    ) -> crate::eviction_marker::EvictionRecord {
+        use crate::eviction_marker::{read_marker, MarkerState};
+        let records: Vec<_> = ["1", "2"]
+            .iter()
+            .filter_map(|gen| {
+                let marker = StorageEngine::evicted_marker_path(table_dir, gen);
+                marker.exists().then(|| read_marker(&marker))
+            })
+            .map(|state| match state {
+                MarkerState::Recorded(r) => r,
+                other => panic!("a fresh eviction must write a readable record, got {other:?}"),
+            })
+            .collect();
+        assert!(!records.is_empty(), "an eviction wrote a marker");
+        records
+            .into_iter()
+            .max_by_key(|r| r.total_bytes)
+            .expect("non-empty")
+    }
+
+    /// 2026-09-29: ~1000 SSTables were evicted and nobody could say why,
+    /// because the marker was empty and the reason lived in a rotated log. A
+    /// cache-cap eviction must name that trigger and the byte figures.
+    #[test]
+    fn a_cache_cap_eviction_marker_names_its_trigger_and_figures() {
+        use crate::eviction_marker::Trigger;
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, manifest) = engine_with_two_uploaded_sstables(dir.path(), 100, 0);
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+        assert!(evicted >= 1, "160 cached bytes over a 100 byte cap evicts");
+
+        let record = first_eviction_record(&table_dir);
+        assert_eq!(record.trigger, Trigger::CacheCap);
+        assert_eq!(record.source, crate::eviction_marker::SOURCE_EVICTOR);
+        assert_eq!(record.generation_bytes, Some(80));
+        assert_eq!(record.total_bytes, Some(160));
+        assert_eq!(record.max_bytes, Some(100));
+        assert_eq!(record.min_bytes, Some(0));
+        assert_eq!(record.target_free, Some(0));
+        assert!(record.written_at_unix_ms > 0);
+    }
+
+    /// A free-space eviction (cache well under its cap, disk under its free
+    /// target) names that trigger and carries the free-space figures.
+    #[test]
+    fn a_free_space_eviction_marker_names_its_trigger_and_figures() {
+        use crate::eviction_marker::Trigger;
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, manifest) =
+            engine_with_two_uploaded_sstables(dir.path(), 1024 * 1024, u64::MAX / 4);
+
+        let evicted = engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+        assert!(evicted >= 1);
+
+        let record = first_eviction_record(&table_dir);
+        assert_eq!(record.trigger, Trigger::FreeSpace);
+        assert_eq!(record.max_bytes, Some(1024 * 1024));
+        assert_eq!(record.total_bytes, Some(160));
+        assert!(record.target_free.unwrap() > record.projected_available.unwrap());
+    }
+
+    /// Markers written before the record existed are empty. They must keep
+    /// restoring, and be reported as "evicted, reason unknown".
+    #[test]
+    fn an_empty_legacy_marker_is_still_honoured_and_reason_unknown() {
+        use crate::eviction_marker::{read_marker, MarkerState};
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::File::create(StorageEngine::evicted_marker_path(&table_dir, "7")).unwrap();
+
+        let found = StorageEngine::evicted_generations(&dir.path().join("sstables"));
+        assert!(found.values().next().unwrap().contains("7"));
+        assert_eq!(
+            read_marker(&StorageEngine::evicted_marker_path(&table_dir, "7")),
+            MarkerState::Legacy
+        );
+    }
+
+    /// A truncated or garbage marker is still an eviction marker: restore
+    /// honours it, startup does not fail, and it reads as reason-unknown with
+    /// the parse error preserved.
+    #[test]
+    fn a_corrupt_marker_is_honoured_as_reason_unknown_not_an_error() {
+        use crate::eviction_marker::{read_marker, MarkerState};
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let full = serde_json::to_vec(&crate::eviction_marker::test_record()).unwrap();
+        std::fs::write(
+            StorageEngine::evicted_marker_path(&table_dir, "8"),
+            &full[..full.len() / 2],
+        )
+        .unwrap();
+        std::fs::write(
+            StorageEngine::evicted_marker_path(&table_dir, "9"),
+            [0xff, 0xfe, 0x00, 0x41],
+        )
+        .unwrap();
+
+        let found = StorageEngine::evicted_generations(&dir.path().join("sstables"));
+        let gens = found.values().next().unwrap();
+        assert!(gens.contains("8") && gens.contains("9"));
+        for gen in ["8", "9"] {
+            assert!(
+                matches!(
+                    read_marker(&StorageEngine::evicted_marker_path(&table_dir, gen)),
+                    MarkerState::Unreadable(_)
+                ),
+                "generation {gen}"
+            );
+        }
     }
 
     /// The same loss through the crash-recovery constructor.

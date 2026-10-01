@@ -1736,6 +1736,26 @@ pub(crate) fn rehydrate_if_evicted(dir: &Path, gen: &str) -> Result<()> {
     if data.exists() || !marker.exists() {
         return Ok(());
     }
+    match crate::eviction_marker::read_marker(&marker) {
+        crate::eviction_marker::MarkerState::Recorded(record) => tracing::info!(
+            dir = %dir.display(),
+            gen,
+            trigger = ?record.trigger,
+            source = %record.source,
+            "rehydrating an evicted SSTable"
+        ),
+        crate::eviction_marker::MarkerState::Legacy => tracing::info!(
+            dir = %dir.display(),
+            gen,
+            "rehydrating an evicted SSTable (legacy marker: reason unknown)"
+        ),
+        crate::eviction_marker::MarkerState::Unreadable(why) => tracing::warn!(
+            dir = %dir.display(),
+            gen,
+            error = %why,
+            "rehydrating an evicted SSTable (marker unreadable: reason unknown)"
+        ),
+    }
     if !ferrosa_sstable::io::rehydrate_file(&data)? {
         tracing::error!(
             dir = %dir.display(),

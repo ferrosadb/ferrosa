@@ -311,6 +311,18 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `open_sstable_from_dir`) and then clears the marker; an unmarked missing
   generation still fails to open so the read path's view-retry fires. System
   keyspaces are never evicted. See FMEA ST-38.
+  **The marker records why** (`eviction_marker.rs`, FMEA ST-63): one JSON
+  object `{version, trigger, source, written_at_unix_ms, generation_bytes,
+  total_bytes, max_bytes, min_bytes, projected_available, target_free}`.
+  `trigger` is `cache_cap`, `free_space`, `cache_cap_and_free_space`, or
+  `recovered` (written by a tool, not an eviction decision); `source` names the
+  writer (`ferrosa-storage evictor`, or `ferrosa-ctl sstable mark-evicted`). It
+  is written to a temp file, fsynced, renamed and the directory fsynced before
+  any component is deleted. Restore keys on the file's presence, never its
+  content: an EMPTY file is a legacy marker (evicted, reason unknown), and a
+  truncated or garbage file is also honoured as reason-unknown and reported
+  (`MarkerState::{Recorded, Legacy, Unreadable}`; restore logs one census line
+  and a WARN when any marker is unreadable). Unknown fields are ignored.
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
