@@ -149,6 +149,65 @@ fn resolve_udf_sandbox_config(config: &toml::Value) -> Result<ferrosa_udf::Sandb
     Ok(sandbox)
 }
 
+/// Storage tunables that the `ferrosa-storage` crate reads from the
+/// environment, each settable from the TOML file: `(env var, [section], key)`.
+/// The TOML value is pinned into the env before `StorageEngineConfig::from_env`
+/// runs, the same way `[storage].data_dir` and `[s3].local_path` are bridged.
+const STORAGE_TUNABLE_BRIDGES: [(&str, &str, &str); 3] = [
+    ("FERROSA_CACHE_MAX_BYTES", "storage", "cache_max_bytes"),
+    (
+        "FERROSA_CACHE_HOT_WINDOW_SECS",
+        "storage",
+        "cache_hot_window_secs",
+    ),
+    (
+        "FERROSA_S3_REQUEST_TIMEOUT_SECS",
+        "s3",
+        "request_timeout_secs",
+    ),
+];
+
+/// The `(env var, value)` pairs the TOML file sets for
+/// [`STORAGE_TUNABLE_BRIDGES`]. Pure: reads no environment. A key that is
+/// present but is not a whole non-negative number is an error, so a typo cannot
+/// leave a tunable silently at its default.
+fn storage_tunables_from_toml(config: &toml::Value) -> Result<Vec<(&'static str, String)>, String> {
+    let mut out = Vec::new();
+    for (env_key, section, key) in STORAGE_TUNABLE_BRIDGES {
+        let Some(value) = config.get(section).and_then(|s| s.get(key)) else {
+            continue;
+        };
+        let raw = value
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| value.to_string());
+        let parsed: u64 = raw.parse().map_err(|e| {
+            format!("[{section}] {key} = {raw:?} is not a whole non-negative number: {e}")
+        })?;
+        out.push((env_key, parsed.to_string()));
+    }
+    Ok(out)
+}
+
+/// Pin the TOML-set storage tunables into the environment. TOML wins over a
+/// value already in the env (the precedence [`config_val`] documents), and an
+/// override of a differing env value is logged so it is never silent.
+fn apply_storage_tunables(config: &toml::Value) -> Result<(), String> {
+    for (env_key, value) in storage_tunables_from_toml(config)? {
+        match std::env::var(env_key) {
+            Ok(existing) if existing != value => tracing::warn!(
+                env_key,
+                env_value = existing,
+                toml_value = value,
+                "config file overrides the environment for this storage tunable"
+            ),
+            _ => {}
+        }
+        std::env::set_var(env_key, value);
+    }
+    Ok(())
+}
+
 /// Keys accepted under `[jsonb]`; anything else is refused so a typo cannot
 /// silently leave a limit at its default.
 const JSONB_KEYS: [&str; 8] = [
@@ -1554,6 +1613,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              disk is the durable store, SSTable eviction disabled)"
         );
         std::env::set_var("FERROSA_LOCAL_STORE_PATH", &local_store_path);
+    }
+
+    // Cache-size and object-store timeout tunables: TOML wins, env is the
+    // fallback (same bridge as `data_dir` / `local_path` above).
+    if let Err(e) = apply_storage_tunables(&file_config) {
+        eprintln!("FATAL: invalid storage configuration: {e}");
+        std::process::exit(1);
     }
 
     // 3. Create StorageEngine — use open() on restart to replay commit log
@@ -3537,6 +3603,66 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn tunables_toml() -> toml::Value {
+        toml::from_str(
+            "[storage]\ncache_max_bytes = 1073741824\ncache_hot_window_secs = 60\n\
+             [s3]\nrequest_timeout_secs = 120\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn storage_tunables_from_toml_reads_each_bridged_key() {
+        let pairs = storage_tunables_from_toml(&tunables_toml()).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ("FERROSA_CACHE_MAX_BYTES", "1073741824".to_string()),
+                ("FERROSA_CACHE_HOT_WINDOW_SECS", "60".to_string()),
+                ("FERROSA_S3_REQUEST_TIMEOUT_SECS", "120".to_string()),
+            ]
+        );
+        assert!(storage_tunables_from_toml(&empty_config())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn storage_tunables_from_toml_refuses_a_value_that_is_not_a_number() {
+        for bad in ["\"lots\"", "-1", "1.5", "true"] {
+            let cfg: toml::Value =
+                toml::from_str(&format!("[storage]\ncache_max_bytes = {bad}\n")).unwrap();
+            let err = storage_tunables_from_toml(&cfg).unwrap_err();
+            assert!(err.contains("cache_max_bytes"), "{bad}: {err}");
+        }
+    }
+
+    /// A TOML value reaches the engine config, and wins over an env value.
+    #[test]
+    fn toml_storage_tunables_reach_the_engine_config_and_win_over_env() {
+        let local_store = tempfile::tempdir().unwrap();
+        std::env::set_var("FERROSA_LOCAL_STORE_PATH", local_store.path());
+        std::env::set_var("FERROSA_CACHE_MAX_BYTES", "999");
+        std::env::remove_var("FERROSA_CACHE_HOT_WINDOW_SECS");
+        std::env::remove_var("FERROSA_S3_REQUEST_TIMEOUT_SECS");
+
+        apply_storage_tunables(&tunables_toml()).unwrap();
+        let config = ferrosa_storage::StorageEngineConfig::from_env().unwrap();
+
+        std::env::remove_var("FERROSA_LOCAL_STORE_PATH");
+        std::env::remove_var("FERROSA_CACHE_MAX_BYTES");
+        std::env::remove_var("FERROSA_CACHE_HOT_WINDOW_SECS");
+        std::env::remove_var("FERROSA_S3_REQUEST_TIMEOUT_SECS");
+
+        assert_eq!(config.local_cache_max_bytes, 1_073_741_824);
+        assert_eq!(config.cache_hot_window_secs, 60);
+        let object_store = config.object_store.expect("local store path was set");
+        assert_eq!(
+            object_store.request_timeout,
+            std::time::Duration::from_secs(120)
+        );
     }
 
     #[test]
