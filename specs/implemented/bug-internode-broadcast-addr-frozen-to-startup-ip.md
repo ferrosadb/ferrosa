@@ -1,6 +1,6 @@
 # BUG: Internode broadcast address frozen to startup IP — stale Raft membership after container IP churn
 
-**Status**: **Reopened / in progress (2026-08-07).** PR #86 fixed environment-variable hostname advertisement and PR #94 fixed lane reconnects, but a launchd-managed same-host cluster exposed two uncovered paths: `[internode].broadcast` updated only the resolved socket and was not advertised in the handshake, while inbound reverse dialing assumed every peer used the receiver's internode port. Focused RED/GREEN tests now cover both boundaries; live-cluster verification remains pending.
+**Status**: **Verified — automated regression coverage landed (2026-09-30).** PR #86 fixed environment-variable hostname advertisement, PR #94 fixed lane reconnects, and the `fix/internode-verify` work (stacked on PR #479) landed the remaining two paths: the re-resolvable `FERROSA_INTERNODE_BROADCAST` hostname is now advertised in the handshake and committed as the node's own `NodeInfo.addr` (not the startup-resolved IP), and inbound reverse dialing uses the peer's advertised endpoint. The regression test `ferrosa-cluster::controller::tests::internode_broadcast_hostname_is_advertised_and_committed_not_a_frozen_ip` pins both halves: it drives a real `ferrosa-net` handshake to assert the advertised address is the hostname, feeds that advertisement through `membership::node_info_addr` to assert the committed membership entry is the hostname, and asserts dial-time resolution reaches the peer's CURRENT address. It was observed **RED** against the old advertisement (`Some("10.89.1.176:17000")`) and **GREEN** against the current code (`localhost:17000`), at commit `8897f3f3`. **The originally-requested live podman/docker IP-churn run was NOT performed** — this is its automated substitute (see Verification below).
 **Component**: `ferrosa-net` (config), `ferrosa-cluster` (Raft membership / internode routing)
 **Severity**: High — silent read-path degradation in any environment where node IPs change across restarts (podman/docker default networking, k8s pods, DHCP).
 **Found**: 2026-06-05, debugging a live `ferrosa-memory` 3-node dev cluster.
@@ -130,6 +130,63 @@ a launchd configuration or startup-order error.
 Pin static container IPs so the once-resolved broadcast address stays valid across restarts. Applied in
 `ferrosa-memory/docker-compose.yml` (static `ipv4_address` per node on the `10.89.1.0/24` subnet). This is an
 infra-level mitigation; the bug itself must be fixed here in `ferrosa-net`.
+
+## Verification
+
+### Code half (confirmed present at `8897f3f3`)
+
+| Step | File:line | What it does |
+| --- | --- | --- |
+| Preserve the raw hostname at config load | `ferrosa-net/src/config.rs:56-61` (field), `:218-234` (set from `FERROSA_INTERNODE_BROADCAST`) | stores the unresolved `host:port` in `internode_broadcast` |
+| Advertise it in the handshake | `ferrosa-net/src/handshake.rs:26` (field), `:81` (initiator), `:109,243` (acceptor `HandshakeAck`) | peers decode the hostname, not a resolved IP |
+| Commit it as this node's own address | `ferrosa-cluster/src/controller/cluster.rs:1079,1101-1103,2241-2248` via `NetConfig::advertised_internode_addr` (`config.rs:130`) | seed/self `NodeInfo.addr` is the hostname |
+| Store a peer's hostname on connect | `ferrosa-cluster/src/controller/peer_events.rs:524-531` | the peer-manager keeps the advertised hostname |
+| Commit a peer's hostname, not the observed IP | `ferrosa-cluster/src/controller/membership.rs:29-37,65` (`node_info_addr`) | membership/token-ring entry re-resolves |
+| Reverse-dial at the peer's advertised port | `ferrosa-cluster/src/controller/peer_events.rs:44-52` | inbound dialing no longer assumes a uniform port |
+| Re-resolve on reconnect | `ferrosa-net/src/pool.rs:165,360-366` (`pick_reconnect_host`) | lane reconnect uses the hostname, not the connect-time IP |
+
+### Automated regression test
+
+`ferrosa-cluster::controller::tests::internode_broadcast_hostname_is_advertised_and_committed_not_a_frozen_ip`
+(`ferrosa-cluster/src/controller/tests.rs`).
+
+It drives a **real** `ferrosa-net` handshake over an in-memory duplex:
+
+1. **Advertised half** — the node under test is configured with
+   `internode_broadcast = Some("localhost:17000")` and a *different*
+   `broadcast_addr = 10.89.1.176:17000` (the frozen startup IP). The peer decodes
+   the `HandshakeAck` and asserts `internode_broadcast == Some("localhost:17000")`,
+   i.e. the hostname — and explicitly **not** the startup IP.
+2. **Committed half** — that advertisement is fed through
+   `membership::node_info_addr(observed_current_addr, advertised)`; the committed
+   `NodeInfo.addr` must equal the hostname, not the observed IP and not the
+   startup IP, and must not be a parseable `SocketAddr` literal.
+3. **Dial-time re-resolution** — `committed.to_socket_addrs()` must yield the
+   peer's CURRENT address (`127.0.0.1:17000`), a different generation from the
+   startup IP. The test ends with a non-vacuity guard proving the frozen
+   `10.89.1.176:17000` literal resolves only to itself and therefore could never
+   reach the current address.
+
+### RED / GREEN evidence
+
+- **RED** — with the advertisement temporarily reverted to the old behaviour
+  (`send_handshake_ack(..., &Some(config.broadcast_addr.to_string()))`):
+  `the handshake must carry the re-resolvable hostname, not a frozen IP;
+  left: Some("10.89.1.176:17000") right: Some("localhost:17000")` → `1 failed`.
+- **GREEN** — with the advertisement restored (`&config.internode_broadcast`):
+  `test result: ok. 1 passed; 0 failed`.
+
+### Scope of this verification
+
+This is an **automated substitute** for the live-cluster run the item originally
+requested. The repository's in-process Raft harness
+(`ferrosa-cluster/tests/common/raft_harness.rs`) routes Raft RPCs over
+`tokio::mpsc` channels and deliberately bypasses ferrosa-net/TCP, so it cannot
+restart a node under a changed address; there is no automated harness that churns
+container IPs. The test therefore pins the invariant the live run would exercise —
+that the advertised address and the committed membership address are the
+re-resolvable hostname, and that resolving it at dial time reaches the peer's
+current address — at the two boundaries that gate the failure mode.
 
 ## Related
 
