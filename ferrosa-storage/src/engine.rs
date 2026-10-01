@@ -12544,10 +12544,14 @@ impl StorageEngine {
             .object_store
             .as_ref()
             .ok_or_else(|| ferrosa_common::Error::InvalidFormat("S3 not configured".into()))?;
-        let store = match &self.object_store {
-            Some(store) => Arc::clone(store),
-            None => Arc::from(os_config.build_object_store()?),
-        };
+        // Every constructor builds the one shared client when an object store
+        // is configured. Building another here would open a second connection
+        // pool per call, so a missing client is an error, not a rebuild.
+        let store = self.object_store.as_ref().map(Arc::clone).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(
+                "object store is configured but the engine holds no shared client".into(),
+            )
+        })?;
         Ok((os_config, store))
     }
 
@@ -13118,52 +13122,78 @@ impl StorageEngine {
             bytes = work.bytes,
             "storage-engine: restoring evicted SSTables from S3 before registering tables"
         );
+        let cfg = crate::upload::download::config()?;
         let started = Instant::now();
         let mut last_log = started;
         let mut gens_since_log = 0usize;
         let mut restored = 0usize;
         let mut restored_bytes = 0u64;
-        for (dir_name, gens) in evicted {
+        // One job per evicted generation, run `restore_concurrency` at a time.
+        // Each job's marker is cleared as soon as that generation is on disk
+        // (never before), so a later failure does not redo finished work.
+        let mut jobs = Vec::new();
+        for (dir_name, gens) in &evicted {
             let Some((keyspace, table)) = dir_name.split_once('.') else {
                 continue;
             };
             let table_id = TableId::new(keyspace, table);
-            for entry in manifest.sstables.get(&dir_name).into_iter().flatten() {
+            for entry in manifest.sstables.get(dir_name).into_iter().flatten() {
                 if !gens.contains(&entry.id) {
                     continue;
                 }
                 let mut one = crate::manifest::Manifest::new();
-                one.add_sstable(&dir_name, entry.clone());
-                let downloaded =
-                    Self::download_sstables_into(data_dir, &store, &prefix, &table_id, &one)
-                        .await?;
-                restored += downloaded;
-                if downloaded > 0 {
-                    restored_bytes = restored_bytes.saturating_add(entry.size);
-                }
-                gens_since_log += 1;
-                if restore_progress_due(last_log.elapsed(), gens_since_log) {
-                    tracing::info!(
-                        restored,
-                        total = work.generations,
-                        restored_bytes,
-                        total_bytes = work.bytes,
-                        elapsed_secs = started.elapsed().as_secs(),
-                        table = %dir_name,
-                        "storage-engine: restoring evicted SSTables from S3"
-                    );
-                    last_log = Instant::now();
-                    gens_since_log = 0;
-                }
+                one.add_sstable(dir_name, entry.clone());
+                jobs.push((dir_name.clone(), table_id.clone(), entry.clone(), one));
             }
-
+        }
+        let (store_ref, prefix_ref) = (&store, &prefix);
+        let mut running = futures::StreamExt::buffer_unordered(
+            futures::stream::iter(jobs.into_iter().map(
+                |(dir_name, table_id, entry, one)| async move {
+                    let downloaded = Self::download_sstables_into(
+                        data_dir, store_ref, prefix_ref, &table_id, &one,
+                    )
+                    .await?;
+                    Ok::<_, ferrosa_common::Error>((dir_name, entry, downloaded))
+                },
+            )),
+            cfg.restore_concurrency,
+        );
+        while let Some(done) = futures::StreamExt::next(&mut running).await {
+            let (dir_name, entry, downloaded) = done?;
+            restored += downloaded;
+            if downloaded > 0 {
+                restored_bytes = restored_bytes.saturating_add(entry.size);
+            }
             let table_dir = data_dir.join("sstables").join(&dir_name);
-            for gen in &gens {
+            if Self::generation_component_path(&table_dir, &entry.id, "Data.db").is_some() {
+                Self::clear_evicted_marker(&table_dir, &dir_name, &entry.id);
+            }
+            gens_since_log += 1;
+            if restore_progress_due(last_log.elapsed(), gens_since_log) {
+                tracing::info!(
+                    restored,
+                    total = work.generations,
+                    restored_bytes,
+                    total_bytes = work.bytes,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    concurrency = cfg.restore_concurrency,
+                    table = %dir_name,
+                    "storage-engine: restoring evicted SSTables from S3"
+                );
+                last_log = Instant::now();
+                gens_since_log = 0;
+            }
+        }
+        drop(running);
+
+        // Generations the manifest does not list, or whose objects are gone,
+        // are still missing; keep their markers and say so.
+        for (dir_name, gens) in &evicted {
+            let table_dir = data_dir.join("sstables").join(dir_name);
+            for gen in gens {
                 if Self::generation_component_path(&table_dir, gen, "Data.db").is_some() {
-                    if let Err(e) = std::fs::remove_file(Self::evicted_marker_path(&table_dir, gen))
-                    {
-                        tracing::warn!(table = %dir_name, sstable = %gen, error = %e, "storage-engine: restored an evicted SSTable but could not clear its marker");
-                    }
+                    Self::clear_evicted_marker(&table_dir, dir_name, gen);
                 } else {
                     tracing::error!(
                         table = %dir_name,
@@ -13183,6 +13213,18 @@ impl StorageEngine {
             );
         }
         Ok(restored)
+    }
+
+    /// Remove an eviction marker once its generation is on disk. An absent
+    /// marker is fine (already cleared); any other failure is reported.
+    fn clear_evicted_marker(table_dir: &std::path::Path, dir_name: &str, gen: &str) {
+        match std::fs::remove_file(Self::evicted_marker_path(table_dir, gen)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(table = %dir_name, sstable = %gen, error = %e, "storage-engine: restored an evicted SSTable but could not clear its marker");
+            }
+        }
     }
 
     /// [`Self::restore_evicted_sstables`] called from the synchronous
@@ -13554,81 +13596,17 @@ impl StorageEngine {
         ))
     }
 
-    /// Download one component, retrying the whole object when a request or
-    /// its body fails partway. A 100 MB `Data.db` from R2 dropped mid-body
-    /// ("error decoding response body") and failed a node's entire restore
-    /// on 2026-09-29. Each retry starts a fresh request and truncates the
-    /// file, so a partial body is never kept. `NotFound` is not retried.
+    /// Download one component. Large objects are fetched as parallel ranged
+    /// parts and small ones with a single GET; a failed part is retried
+    /// alone, and `NotFound` is not retried. A half-written file never
+    /// outlives a failure. See [`crate::upload::download`].
     async fn download_sstable_component_to_path(
         store: &dyn object_store::ObjectStore,
         s3_path: &object_store::path::Path,
         local_path: &std::path::Path,
     ) -> ferrosa_common::Result<Option<u64>> {
-        const ATTEMPTS: u32 = 5;
-        let mut backoff = std::time::Duration::from_millis(500);
-        let mut attempt = 1;
-        loop {
-            match Self::download_sstable_component_once(store, s3_path, local_path).await {
-                Err(e) if attempt < ATTEMPTS => {
-                    tracing::warn!(
-                        path = %s3_path,
-                        attempt,
-                        error = %e,
-                        "SSTable component download failed; retrying the whole object"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
-                    attempt += 1;
-                }
-                result => return result,
-            }
-        }
-    }
-
-    async fn download_sstable_component_once(
-        store: &dyn object_store::ObjectStore,
-        s3_path: &object_store::path::Path,
-        local_path: &std::path::Path,
-    ) -> ferrosa_common::Result<Option<u64>> {
-        let result = match store.get(s3_path).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "S3 download failed for {s3_path}: {e}"
-                )));
-            }
-        };
-
-        let mut stream = result.into_stream();
-        let mut file = tokio::fs::File::create(local_path).await.map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to create SSTable download temp file {}: {e}",
-                local_path.display()
-            ))
-        })?;
-        use tokio::io::AsyncWriteExt;
-        let mut bytes = 0u64;
-        while let Some(chunk) = stream.try_next().await.map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to stream SSTable component {s3_path}: {e}"
-            ))
-        })? {
-            bytes = bytes.saturating_add(chunk.len() as u64);
-            file.write_all(&chunk).await.map_err(|e| {
-                ferrosa_common::Error::InvalidFormat(format!(
-                    "failed to write SSTable download temp file {}: {e}",
-                    local_path.display()
-                ))
-            })?;
-        }
-        file.sync_data().await.map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to sync SSTable download temp file {}: {e}",
-                local_path.display()
-            ))
-        })?;
-        Ok(Some(bytes))
+        let cfg = crate::upload::download::config()?;
+        crate::upload::download::download_component(store, s3_path, local_path, &cfg).await
     }
 
     fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {

@@ -56,7 +56,7 @@ without changing the process environment. Digest verification is unconditional.
 | `flush` | `FlushTarget` trait + `FileFlushTarget`/`InMemoryFlushTarget`; serialization-header construction |
 | `merge`, `range_merger` | Read-path cell-level LWW merge; streaming range/token-range merge |
 | `compaction/` | `CompactionExecutor`, STCS + UCS strategies, `CompactionGate`, validator (oracle + differential) |
-| `upload/` | `UploadManager` (tokio task), `ObjectStoreConfig`, pending-upload log + replay across flat and generation-dir SSTable layouts |
+| `upload/` | `UploadManager` (tokio task), `ObjectStoreConfig` (the one client + connection-pool settings), pending-upload log + replay across flat and generation-dir SSTable layouts; `download` (ranged-part component downloads, `FERROSA_S3_DOWNLOAD_PART_*`, `FERROSA_RESTORE_CONCURRENCY`); `stats` (optional `FERROSA_S3_STATS` layer, Prometheus + `system_observability.object_store_*` tables) |
 | `cache`, `pin_config` | `LocalCache` LRU + pinning; NVMe `PinMode` |
 | `index/` | Index state tracker (registered/pending/current completeness), build scheduler, local/remote/off backends, artifact manifest, virtual table; `LocalBackend` resolves flat and engine table-dir SSTable layouts and writes sidecars beside table SSTables |
 | `snapshot/`, `restore/` | S3 snapshot manager + restore manager + validation (PITR); `restore/intent.rs` carries the restore-on-boot intent (`FERROSA_RESTORE_*`) and the apply-once marker that keeps a reboot-surviving env var from re-restoring on every start |

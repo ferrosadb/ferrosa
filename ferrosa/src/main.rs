@@ -2508,6 +2508,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     schema.virtual_tables().register(Arc::new(
         ferrosa_storage::virtual_tables::SnapshotsTable::new(storage.clone()),
     ));
+    // Object-store tuning stats; empty unless FERROSA_S3_STATS=1.
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_storage::virtual_tables::ObjectStoreStatsTable::new(
+            ferrosa_storage::upload::stats::global().cloned(),
+        ),
+    ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_storage::virtual_tables::ObjectStoreOpsTable::new(
+            ferrosa_storage::upload::stats::global().cloned(),
+        ),
+    ));
     schema.virtual_tables().register(Arc::new(
         ferrosa_storage::index::virtual_table::SecondaryIndexesVirtualTable::new(
             storage.index_tracker().clone(),

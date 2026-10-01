@@ -186,6 +186,10 @@ worker is initialized. Byte values are bytes unless the name says otherwise.
 | `FERROSA_CACHE_MAX_BYTES` | Maximum local SSTable cache size | `10737418240` (10 GiB) |
 | `FERROSA_CACHE_HOT_WINDOW_SECS` | Seconds after a foreground read during which a table's uploaded SSTables are never evicted from the local cache. `0` disables hotness. | `900` |
 | `FERROSA_S3_REQUEST_TIMEOUT_SECS` | Per-request object-store timeout, covering the whole response body; must fit the largest SSTable component download | `900` |
+| `FERROSA_S3_DOWNLOAD_PART_BYTES` | Size of one ranged GET when downloading a component; objects at or below it use a single GET. Positive integer; invalid values stop startup | `16777216` (16 MiB) |
+| `FERROSA_S3_DOWNLOAD_PART_CONCURRENCY` | Ranged parts in flight per object. All parts share the one store, so `FERROSA_S3_MAX_*` caps still apply. A 429 shrinks that object's concurrency by one slot | `4` |
+| `FERROSA_RESTORE_CONCURRENCY` | SSTable generations restored at once at startup | `4` |
+| `FERROSA_S3_STATS` | `1`/`true` collects object-store stats (per-operation counts, bytes, latency, 429s; per-table/component bytes, object sizes, throughput, read amplification) and exposes them as `ferrosa_s3_*` Prometheus series and `system_observability.object_store_stats` / `object_store_ops`. Per-table labels exist only when on | off |
 | `FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES` | Free space reserved on the data filesystem; writes fail closed below it | `536870912` (512 MiB) |
 | `FERROSA_CACHE_MIN_BYTES` | Minimum local cache target | `0` |
 | `FERROSA_LOCAL_DISK_EVICTION_LOW_WATER_BYTES` | Free-space point that starts local SSTable eviction | `2 × FERROSA_LOCAL_DISK_FREE_RESERVE_BYTES` |

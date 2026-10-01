@@ -100,6 +100,11 @@ impl ObjectStoreConfig {
                 .ok()
                 .as_deref(),
         )?;
+        // Validate the download tunables and the stats switch up front so a
+        // typo fails startup instead of the first restore. Both are read once
+        // per process; `build_object_store` and the download path use them.
+        super::download::config()?;
+        super::stats::enabled_from_env()?;
 
         // Local file:// backend takes precedence when its path is set.
         if let Ok(local_path) = std::env::var("FERROSA_LOCAL_STORE_PATH") {
@@ -172,11 +177,40 @@ impl ObjectStoreConfig {
     ///
     /// `allow_http` lives here too: installing client options replaces the
     /// builder's own, so an `allow_http` set on the builder alone is lost.
+    ///
+    /// This is the one place connection-pool settings live, so every path
+    /// that shares the client (uploads, deletes, restore, rehydrate, ranged
+    /// reads) inherits them. See [`Self::pool_max_idle_per_host`].
     pub fn client_options(&self) -> object_store::ClientOptions {
         object_store::ClientOptions::new()
             .with_allow_http(self.allow_http)
             .with_timeout(self.request_timeout)
             .with_connect_timeout(std::time::Duration::from_secs(10))
+            .with_pool_max_idle_per_host(self.pool_max_idle_per_host())
+            .with_pool_idle_timeout(POOL_IDLE_TIMEOUT)
+    }
+
+    /// Idle connections kept per host: enough for every request the process
+    /// can have in flight at once (download parts x concurrent restores, plus
+    /// the upload, compaction-upload and delete workers), never fewer than
+    /// [`MIN_POOL_IDLE_PER_HOST`]. A pool smaller than the peak concurrency
+    /// closes and reopens TLS connections on every burst.
+    pub fn pool_max_idle_per_host(&self) -> usize {
+        let download = match super::download::config() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(error = %e, "invalid download tunables; sizing the connection pool from defaults");
+                super::download::DownloadConfig::default()
+            }
+        };
+        let in_flight = download.part_concurrency * download.restore_concurrency
+            + self.upload_workers
+            + self.compaction_upload_workers
+            + self.delete_workers;
+        let capped = self
+            .max_concurrent_requests
+            .map_or(in_flight, |m| m.min(in_flight));
+        capped.max(MIN_POOL_IDLE_PER_HOST)
     }
 
     /// Whether this configuration targets the local `file://` backend.
@@ -240,12 +274,22 @@ impl ObjectStoreConfig {
             ferrosa_common::Error::InvalidFormat(format!("failed to build S3 client: {e}"))
         })?;
 
+        // Stats sit innermost so they see every real request (each 429 retry
+        // as its own) and latency without client-side pacing. Off unless
+        // FERROSA_S3_STATS enabled the process-wide stats.
+        let store: std::sync::Arc<dyn ObjectStore> = match super::stats::global() {
+            Some(stats) => std::sync::Arc::new(super::stats::StatsStore::new(
+                std::sync::Arc::new(store),
+                std::sync::Arc::clone(stats),
+            )),
+            None => std::sync::Arc::new(store),
+        };
         // Every path shares this one store, so the caps here bound uploads,
         // deletes, rehydration and restore together. 429 retry is always on:
         // object_store does not retry client errors.
         let store: std::sync::Arc<dyn ObjectStore> = match self.max_concurrent_requests {
             Some(max) => std::sync::Arc::new(object_store::limit::LimitStore::new(store, max)),
-            None => std::sync::Arc::new(store),
+            None => store,
         };
         if self.max_requests_per_second.is_some() || self.max_concurrent_requests.is_some() {
             tracing::info!(
@@ -417,6 +461,11 @@ where
 /// restore on 2026-09-30.
 pub const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 900;
 
+/// Floor for idle pooled connections per host.
+pub const MIN_POOL_IDLE_PER_HOST: usize = 32;
+/// How long an idle pooled connection is kept before it is closed.
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Parse `FERROSA_S3_REQUEST_TIMEOUT_SECS`. Unset or empty means the default;
 /// anything else must be a positive whole number of seconds, and a bad value
 /// is rejected naming the variable rather than quietly using the default.
@@ -429,6 +478,27 @@ pub fn parse_request_timeout(value: Option<&str>) -> ferrosa_common::Result<std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pool_holds_every_request_the_process_can_have_in_flight() {
+        let cfg = ObjectStoreConfig::test_config();
+        let download = crate::upload::download::config().unwrap();
+        let peak = download.part_concurrency * download.restore_concurrency
+            + cfg.upload_workers
+            + cfg.compaction_upload_workers
+            + cfg.delete_workers;
+        assert!(
+            cfg.pool_max_idle_per_host() >= peak,
+            "pool must not be smaller than peak concurrency"
+        );
+        assert!(cfg.pool_max_idle_per_host() >= MIN_POOL_IDLE_PER_HOST);
+
+        let capped = ObjectStoreConfig {
+            max_concurrent_requests: Some(2),
+            ..ObjectStoreConfig::test_config()
+        };
+        assert_eq!(capped.pool_max_idle_per_host(), MIN_POOL_IDLE_PER_HOST);
+    }
 
     #[test]
     fn s3_required_parsing_is_strict() {

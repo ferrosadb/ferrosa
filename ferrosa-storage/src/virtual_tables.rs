@@ -410,9 +410,264 @@ impl VirtualTable for SnapshotsTable {
     }
 }
 
+// ===========================================================================
+// ObjectStoreStatsTable / ObjectStoreOpsTable — object-store tuning stats
+// ===========================================================================
+
+use crate::upload::stats::ObjectStoreStats;
+
+fn col(name: &str, data_type: DataType) -> VirtualColumnDef {
+    VirtualColumnDef {
+        name: name.into(),
+        data_type,
+    }
+}
+
+fn big(value: u64) -> CellValue {
+    CellValue::live(
+        i64::try_from(value)
+            .unwrap_or(i64::MAX)
+            .to_be_bytes()
+            .to_vec(),
+        0,
+    )
+}
+
+fn empty() -> CellValue {
+    CellValue::live(Vec::new(), 0)
+}
+
+fn dbl(value: f64) -> CellValue {
+    CellValue::live(value.to_be_bytes().to_vec(), 0)
+}
+
+fn text(value: &str) -> CellValue {
+    CellValue::live(value.as_bytes().to_vec(), 0)
+}
+
+/// Virtual table: `system_observability.object_store_stats`
+///
+/// One row per (table, component) with bytes, object sizes, ranged versus
+/// whole reads, download throughput and read amplification, so keys and table
+/// sizes can be tuned. Empty unless `FERROSA_S3_STATS=1` enabled collection.
+pub struct ObjectStoreStatsTable {
+    stats: Option<Arc<ObjectStoreStats>>,
+    columns: Vec<VirtualColumnDef>,
+}
+
+impl ObjectStoreStatsTable {
+    /// `stats` is [`crate::upload::stats::global`]; `None` means collection is off.
+    pub fn new(stats: Option<Arc<ObjectStoreStats>>) -> Self {
+        let columns = vec![
+            col("table_name", DataType::Text),
+            col("component", DataType::Text),
+            col("get_whole", DataType::BigInt),
+            col("get_ranged", DataType::BigInt),
+            col("put_requests", DataType::BigInt),
+            col("bytes_fetched", DataType::BigInt),
+            col("bytes_requested", DataType::BigInt),
+            col("bytes_put", DataType::BigInt),
+            col("objects_seen", DataType::BigInt),
+            col("object_size_max_bytes", DataType::BigInt),
+            col("object_size_sum_bytes", DataType::BigInt),
+            col("downloads", DataType::BigInt),
+            col("ranged_downloads", DataType::BigInt),
+            col("download_mb_per_sec", DataType::Double),
+            col("part_retries", DataType::BigInt),
+            col("read_amplification", DataType::Double),
+        ];
+        Self { stats, columns }
+    }
+}
+
+impl VirtualTable for ObjectStoreStatsTable {
+    fn name(&self) -> &str {
+        "object_store_stats"
+    }
+
+    fn keyspace(&self) -> &str {
+        "system_observability"
+    }
+
+    fn columns(&self) -> &[VirtualColumnDef] {
+        &self.columns
+    }
+
+    fn primary_key_columns(&self) -> &[usize] {
+        &[0, 1]
+    }
+
+    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+        let Some(stats) = &self.stats else {
+            return Vec::new();
+        };
+        stats
+            .object_snapshots()
+            .iter()
+            .map(|s| VirtualRow {
+                cells: vec![
+                    text(&s.key.table),
+                    text(&s.key.component),
+                    big(s.get_whole),
+                    big(s.get_ranged),
+                    big(s.put_requests),
+                    big(s.bytes_fetched),
+                    big(s.bytes_requested),
+                    big(s.bytes_put),
+                    big(s.objects_seen),
+                    big(s.size_max),
+                    big(s.size_sum),
+                    big(s.downloads),
+                    big(s.ranged_downloads),
+                    dbl(s.download_mb_per_sec()),
+                    big(s.part_retries),
+                    dbl(s.read_amplification()),
+                ],
+            })
+            .collect()
+    }
+
+    fn subscription_mode(&self) -> SubscriptionMode {
+        SubscriptionMode::Pollable
+    }
+}
+
+/// Virtual table: `system_observability.object_store_ops`
+///
+/// One row per operation kind (get, get_range, put, multipart, delete, list,
+/// head, other): request count, bytes, errors, 429s, retries and latency.
+/// Empty unless `FERROSA_S3_STATS=1` enabled collection.
+pub struct ObjectStoreOpsTable {
+    stats: Option<Arc<ObjectStoreStats>>,
+    columns: Vec<VirtualColumnDef>,
+}
+
+impl ObjectStoreOpsTable {
+    /// `stats` is [`crate::upload::stats::global`]; `None` means collection is off.
+    pub fn new(stats: Option<Arc<ObjectStoreStats>>) -> Self {
+        let columns = vec![
+            col("op", DataType::Text),
+            col("requests", DataType::BigInt),
+            col("bytes", DataType::BigInt),
+            col("errors", DataType::BigInt),
+            col("rate_limited", DataType::BigInt),
+            col("retries", DataType::BigInt),
+            col("p50_ms", DataType::BigInt),
+            col("p99_ms", DataType::BigInt),
+            col("total_ms", DataType::Double),
+        ];
+        Self { stats, columns }
+    }
+}
+
+impl VirtualTable for ObjectStoreOpsTable {
+    fn name(&self) -> &str {
+        "object_store_ops"
+    }
+
+    fn keyspace(&self) -> &str {
+        "system_observability"
+    }
+
+    fn columns(&self) -> &[VirtualColumnDef] {
+        &self.columns
+    }
+
+    fn primary_key_columns(&self) -> &[usize] {
+        &[0]
+    }
+
+    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+        let Some(stats) = &self.stats else {
+            return Vec::new();
+        };
+        stats
+            .op_snapshots()
+            .iter()
+            .map(|s| VirtualRow {
+                cells: vec![
+                    text(s.op),
+                    big(s.requests),
+                    big(s.bytes),
+                    big(s.errors),
+                    big(s.rate_limited),
+                    big(s.retries),
+                    // A histogram with no samples has no quantile: report an
+                    // empty value (as `snapshots.expires_at` does), not a
+                    // made-up zero.
+                    s.p50_ms.map_or_else(empty, big),
+                    s.p99_ms.map_or_else(empty, big),
+                    dbl(s.total_ms),
+                ],
+            })
+            .collect()
+    }
+
+    fn subscription_mode(&self) -> SubscriptionMode {
+        SubscriptionMode::Pollable
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod object_store_stats_tests {
+    use super::*;
+    use crate::upload::stats::DownloadRecord;
+    use object_store::path::Path;
+    use std::time::Duration;
+
+    fn cell_text(row: &VirtualRow, i: usize) -> String {
+        String::from_utf8(row.cells[i].value.clone().expect("live cell").to_vec()).unwrap()
+    }
+
+    fn cell_i64(row: &VirtualRow, i: usize) -> i64 {
+        i64::from_be_bytes(row.cells[i].value.as_deref().unwrap().try_into().unwrap())
+    }
+
+    #[test]
+    fn disabled_stats_give_empty_tables() {
+        assert!(ObjectStoreStatsTable::new(None).read(None).is_empty());
+        assert!(ObjectStoreOpsTable::new(None).read(None).is_empty());
+    }
+
+    #[test]
+    fn stats_table_has_one_row_per_table_and_component() {
+        let stats = Arc::new(ObjectStoreStats::new());
+        let path = Path::from("p/ab/ks.t/7/7-Data.db");
+        stats.record_download(&DownloadRecord {
+            path: &path,
+            object_bytes: 4096,
+            elapsed: Duration::from_secs(1),
+            parts: 1,
+            ranged: false,
+            part_retries: 0,
+        });
+        let table = ObjectStoreStatsTable::new(Some(stats));
+        let rows = table.read(None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cells.len(), table.columns().len());
+        assert_eq!(cell_text(&rows[0], 0), "ks.t");
+        assert_eq!(cell_text(&rows[0], 1), "Data.db");
+        assert_eq!(cell_i64(&rows[0], 11), 1, "downloads");
+    }
+
+    #[test]
+    fn ops_table_has_a_row_per_operation_and_null_quantiles_when_idle() {
+        let table = ObjectStoreOpsTable::new(Some(Arc::new(ObjectStoreStats::new())));
+        let rows = table.read(None);
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[0].cells.len(), table.columns().len());
+        assert_eq!(cell_text(&rows[0], 0), "get");
+        assert_eq!(
+            rows[0].cells[6].value.as_deref(),
+            Some([].as_slice()),
+            "idle op has no p50"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

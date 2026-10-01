@@ -280,6 +280,25 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   attempts, 250 ms doubling to 30 s) — `object_store` retries only 5xx — and the
   log reports the start and end of a throttling episode, not every 429. Set both
   when recovering from Cloudflare R2.
+  **Downloads and pooling (`upload/download.rs`):** a component above
+  `FERROSA_S3_DOWNLOAD_PART_BYTES` (16 MiB) is fetched as ranged GETs
+  (`FERROSA_S3_DOWNLOAD_PART_CONCURRENCY`, default 4, through the same shared
+  store) written with positional writes into a preallocated `.part` file, which is
+  length-checked, fsynced and renamed; a failed part is retried alone (5
+  attempts) and a 429 shrinks that object's concurrency. A smaller component is
+  one GET through a 1 MiB buffered writer. Startup restore runs
+  `FERROSA_RESTORE_CONCURRENCY` generations at a time, clearing each marker only
+  once its generation is on disk. There is one client per process
+  (`ObjectStoreConfig::client_options` holds the pool: `pool_max_idle_per_host`
+  covers parts x restores + upload/delete workers, floor 32; 90 s idle timeout),
+  and `object_store_and_config` errors rather than building a second client.
+  **Stats (`upload/stats.rs`, `FERROSA_S3_STATS=1`):** a `StatsStore` layer under
+  the throttle records per-operation counts, bytes, latency histograms, errors,
+  429s and retries, and per (table, component) bytes, object-size histogram,
+  ranged vs whole GETs, download throughput and read amplification. Exposed as
+  `ferrosa_s3_*` Prometheus series and the virtual tables
+  `system_observability.object_store_stats` and `object_store_ops`. Off by
+  default; the keyed table is capped at 4096 keys with an overflow bucket.
 - **Local cache** (`cache.rs`) — LRU eviction with manifest-pinned entries that
   are never evicted. With the local `file://` backend the cache is constructed
   durable (`new_with_durability`): the local disk *is* the store of record, so
