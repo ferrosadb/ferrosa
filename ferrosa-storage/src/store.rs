@@ -59,6 +59,21 @@ use crate::memtable::Memtable;
 use crate::merge;
 use crate::range_merger::ColumnOrdinalMapping;
 
+/// What a flush did to the table's SSTable set.
+///
+/// The flush path has two early exits that write nothing; they must stay
+/// distinguishable from a real publish because everything downstream of a
+/// flush (eager index builds, pin accounting) acts on "the SSTable this flush
+/// just wrote".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlushOutcome {
+    /// No SSTable was written: the memtable was empty, or every row was
+    /// quarantined.
+    NothingToFlush,
+    /// At least one new SSTable was installed in the live view.
+    Published,
+}
+
 /// Outcome of resolving an SSTable's column-ordinal mapping.
 ///
 /// `SstableGone` is benign — compaction replaced the generation and its rows
@@ -2859,17 +2874,24 @@ impl<F: FlushTarget> TableStore<F> {
     /// 5. Build the SSTable via [`SSTableWriter`] and [`FlushTarget::flush`].
     /// 6. Prepend the new reader to the SSTable list and clear `flushing`.
     pub fn flush(&self) -> Result<()> {
-        self.flush_with_swap_callback(|| {})
+        self.flush_with_swap_callback(|| {}).map(|_outcome| ())
     }
 
     /// Flushes while notifying the owner immediately after the active
     /// memtable has been swapped for a fresh one. The completion result still
     /// carries the durability outcome; this callback only releases
     /// backpressure waiters that depend on active-memtable capacity.
+    ///
+    /// Returns [`FlushOutcome::Published`] only when this call installed a new
+    /// SSTable. A flush with nothing to write (empty memtable, or every row
+    /// quarantined) returns [`FlushOutcome::NothingToFlush`]: no SSTable
+    /// exists for it, and [`Self::last_flush_generation`] still names an
+    /// EARLIER flush (or 0 if this process has never flushed the table), so a
+    /// caller must not treat that generation as freshly written.
     pub(crate) fn flush_with_swap_callback(
         &self,
         on_memtable_release: impl FnOnce(),
-    ) -> Result<()> {
+    ) -> Result<FlushOutcome> {
         let total_start = Instant::now();
         let phase_start = Instant::now();
         let _guard = self.flush_guard.lock();
@@ -2997,7 +3019,7 @@ impl<F: FlushTarget> TableStore<F> {
             };
             new_view.check_invariants("flush:clear_flushing");
             self.view.store(Arc::new(new_view));
-            return Ok(());
+            return Ok(FlushOutcome::NothingToFlush);
         }
 
         // Step 4: Sort partitions by key (required by SSTableWriter).
@@ -3087,7 +3109,7 @@ impl<F: FlushTarget> TableStore<F> {
             };
             new_view.check_invariants("flush:clear_all_quarantined");
             self.view.store(Arc::new(new_view));
-            return Ok(());
+            return Ok(FlushOutcome::NothingToFlush);
         }
 
         // Parallel sharded flush (slice #3): when the table has NO secondary
@@ -3108,13 +3130,9 @@ impl<F: FlushTarget> TableStore<F> {
             crate::flush_executor::width(),
         );
         if num_shards > 1 {
-            return self.flush_sharded(
-                partitions,
-                num_shards,
-                total_rows,
-                total_start,
-                &old_active,
-            );
+            return self
+                .flush_sharded(partitions, num_shards, total_rows, total_start, &old_active)
+                .map(|()| FlushOutcome::Published);
         }
 
         let header = flush::build_serialization_header(&schema, &partitions);
@@ -3514,7 +3532,7 @@ impl<F: FlushTarget> TableStore<F> {
         new_view.check_invariants("flush:install_new_sstable");
         self.view.store(Arc::new(new_view));
 
-        Ok(())
+        Ok(FlushOutcome::Published)
     }
 
     /// Parallel sharded flush (slice #3). Split the token-sorted `partitions`

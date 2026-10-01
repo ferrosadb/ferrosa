@@ -50,7 +50,7 @@ use crate::compaction::retry::CompactionRetryPolicy;
 use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
 use crate::flush::{FileFlushTarget, REQUIRED_SSTABLE_COMPONENTS};
-use crate::store::{TableStore, VectorIndexConfig, VectorIndexMethod};
+use crate::store::{FlushOutcome, TableStore, VectorIndexConfig, VectorIndexMethod};
 use crate::timeseries::aggregator::decode_typed_numeric;
 use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
 use crate::timeseries::consolidation::Accumulator;
@@ -9774,7 +9774,7 @@ impl StorageEngine {
         )
         .entered();
         // Flush + index submit under read lock, then release before write lock.
-        let (gen, is_pinned, cl_position) = {
+        let (gen, is_pinned, cl_position, flush_outcome) = {
             let tables = self.tables.read();
             let state = tables.get(table_id).ok_or_else(|| {
                 ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
@@ -9795,7 +9795,7 @@ impl StorageEngine {
             // moving discard_completed before this line, reintroduces the P0
             // "kill mid-flush loses both the torn SSTable and the WAL copy" bug.
             let pressure_notify = Arc::clone(&state.write_pressure_notify);
-            state
+            let flush_outcome = state
                 .store
                 .flush_with_swap_callback(|| pressure_notify.notify_waiters())?;
             let active_size = state.store.memtable_size() as u64;
@@ -9817,7 +9817,16 @@ impl StorageEngine {
             // Eager index build: submit high-priority index rebuild for the newly
             // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
             // 0-1 entries in steady state by ensuring sidecar indexes are current.
-            if let Some(ref scheduler) = self.index_scheduler {
+            //
+            // Only when this flush actually published an SSTable. A flush with
+            // nothing to write leaves `last_flush_generation()` naming an
+            // earlier SSTable (0 if this process never flushed the table, e.g.
+            // after its SSTables were evicted): building against that id
+            // queued a phantom pending SSTable per index and logged a false
+            // "cannot resolve ordinal layout" error for each (ST-43).
+            if let (Some(scheduler), FlushOutcome::Published) =
+                (self.index_scheduler.as_ref(), flush_outcome)
+            {
                 let gen = state.store.last_flush_generation();
                 let ck_total = state.store.clustering_column_count();
                 let pk_total = state.store.partition_key_column_count();
@@ -9922,7 +9931,7 @@ impl StorageEngine {
 
             let flushed_gen = state.store.last_flush_generation();
             let pinned = state.pin_config.is_some();
-            (flushed_gen, pinned, cl_position)
+            (flushed_gen, pinned, cl_position, flush_outcome)
         };
 
         // Advance commit log checkpoint: tell the commit log that this table's
@@ -9937,7 +9946,7 @@ impl StorageEngine {
 
         // For pinned tables: record the new SSTable and enforce max_bytes.
         // We do this outside the read lock so we can take a write lock.
-        if is_pinned {
+        if is_pinned && flush_outcome == FlushOutcome::Published {
             let table_dir = self
                 .config
                 .data_dir
@@ -22263,6 +22272,56 @@ mod tests {
         );
     }
 
+    /// ST-43 catch-up path: an index re-registered over SSTables it has not
+    /// covered (what a restart does for every table) backfills them, and a
+    /// later no-op flush must not knock it back to pending with a phantom
+    /// SSTable — which would withhold the index from the planner for good.
+    #[test]
+    fn restart_backfill_survives_a_following_empty_flush() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        (0..5).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !engine.index_is_current(&tid, "val_idx") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "the backfill must complete"
+        );
+
+        engine.flush(&tid).unwrap();
+
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "a flush with nothing to write must leave a current index current"
+        );
+        assert_eq!(
+            collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
     /// A planner-visible index with outstanding backfill work must never answer
     /// an empty or partial result as though it were complete. Callers can retry
     /// after the tracker becomes current, but they cannot recover rows hidden by
@@ -27660,6 +27719,118 @@ mod tests {
             btree_job.index_type,
             IndexType::BTree,
             "an unregistered index defaults to BTree, matching index_type_for"
+        );
+    }
+
+    /// A schema shaped like the live `agent_memory.mentioned_in` edge table:
+    /// three regular columns sorted by name, so the indexed `session_id` and
+    /// `tenant_id` sit at ordinals 1 and 2. Column types are text/int so
+    /// `make_key`/`make_row` rows validate; the ordinals are what matter here.
+    fn edge_table_schema() -> TableSchema {
+        let utf8 = "org.apache.cassandra.db.marshal.UTF8Type";
+        let col = |name: &str, type_name: &str| ColumnDefinition {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+        };
+        TableSchema {
+            keyspace: "agent_memory".to_string(),
+            table: "mentioned_in".to_string(),
+            key_type: utf8.to_string(),
+            clustering_columns: vec![col("fold_id", "org.apache.cassandra.db.marshal.Int32Type")],
+            static_columns: vec![],
+            regular_columns: vec![
+                col("created_at", utf8),
+                col("session_id", utf8),
+                col("tenant_id", utf8),
+            ],
+            extensions: Default::default(),
+        }
+    }
+
+    /// ST-43 (live: every `agent_memory` edge table, 2026-09-30): flushing a
+    /// table with NOTHING in its memtable published no SSTable, yet the eager
+    /// index build ran against `last_flush_generation()` — 0 for a table this
+    /// process has not flushed, e.g. after its SSTables were evicted. Each
+    /// index then marked a PHANTOM SSTable "0" pending and logged
+    /// "cannot resolve ordinal layout" because "0" is not in the live view.
+    #[test]
+    fn empty_flush_queues_no_eager_index_build_for_a_phantom_sstable() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let schema = edge_table_schema();
+        let table_id = TableId::new(&schema.keyspace, &schema.table);
+        engine.register_table(schema).unwrap();
+        engine
+            .add_index(
+                &table_id,
+                "idx_mentioned_in_by_session",
+                1,
+                IndexType::BTree,
+            )
+            .unwrap();
+        engine
+            .add_index(&table_id, "idx_mentioned_in_by_tenant", 2, IndexType::BTree)
+            .unwrap();
+
+        engine.flush(&table_id).unwrap();
+
+        for index_name in ["idx_mentioned_in_by_session", "idx_mentioned_in_by_tenant"] {
+            let (indexed, pending) =
+                engine
+                    .index_tracker()
+                    .get_coverage("agent_memory", "mentioned_in", index_name);
+            assert!(
+                pending.is_empty() && indexed.is_empty(),
+                "{index_name}: a flush that wrote no SSTable must not touch the index \
+                 tracker; indexed={indexed:?} pending={pending:?}"
+            );
+            assert!(
+                engine
+                    .index_tracker()
+                    .is_current("agent_memory", "mentioned_in", index_name),
+                "{index_name}: index must stay Current after a no-op flush"
+            );
+        }
+    }
+
+    /// Control for ST-43: a flush that DOES publish an SSTable still reaches
+    /// the eager index path, and records the real generation, not a stale one.
+    #[test]
+    fn publishing_flush_still_tracks_its_sstable_for_each_index() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let schema = edge_table_schema();
+        let table_id = TableId::new(&schema.keyspace, &schema.table);
+        engine.register_table(schema).unwrap();
+        engine
+            .add_index(&table_id, "idx_mentioned_in_by_tenant", 2, IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&table_id, &make_key("pk"), make_row(b"v", 1000), 1000)
+            .unwrap();
+
+        engine.flush(&table_id).unwrap();
+
+        let (indexed, pending) = engine.index_tracker().get_coverage(
+            "agent_memory",
+            "mentioned_in",
+            "idx_mentioned_in_by_tenant",
+        );
+        let tracked: HashSet<String> = indexed.union(&pending).cloned().collect();
+        assert_eq!(
+            tracked.len(),
+            1,
+            "exactly the one flushed SSTable must be tracked: {tracked:?}"
+        );
+        assert!(
+            !tracked.contains("0"),
+            "the tracked id must be the real flush generation: {tracked:?}"
         );
     }
 

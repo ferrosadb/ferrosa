@@ -318,7 +318,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   requests carry filtered predicates and clustering-column source metadata so
   remote sidecars match local builds. Existing SSTables and flush-time eager
   builds are marked pending in `IndexStateTracker` before async build
-  submission, giving read planners a real completeness signal.
+  submission, giving read planners a real completeness signal. Flush-time
+  builds run only when the flush published an SSTable
+  (`FlushOutcome::Published`); a flush with nothing to write touches neither
+  the tracker nor the pin accounting (ST-43).
   Registrations are dogfooded to `system_schema.indexes`; `unregister_table`
   (the DROP TABLE choke point for every DDL route) cascades tombstones over the
   dropped table's registrations via `write_index_tombstones_for_table` and
