@@ -1219,6 +1219,13 @@ struct TableState {
     write_pressure_percent: Arc<AtomicU64>,
     /// Tracks soft-zone edges so logs are emitted once per transition.
     in_write_soft_zone: AtomicBool,
+    /// Unix milliseconds of the last FOREGROUND read of this table; `0` means
+    /// never read since startup. The uploaded-SSTable cache evictor keys on it
+    /// so hot, rarely-written tables are not evicted. Anti-entropy repair
+    /// (`read_token_range*`, `walk_token_range*`), compaction and self-heal
+    /// deliberately never stamp it: they touch every table and would make
+    /// everything look hot. Lock-free so the read path pays one relaxed store.
+    last_foreground_read_unix_ms: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -1352,6 +1359,29 @@ impl IntoIterator for LocalTableSchemas {
 }
 
 impl TableState {
+    /// Records a foreground read of this table (see
+    /// `last_foreground_read_unix_ms`).
+    fn note_foreground_read(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            // A clock before 1970 is a host fault; stamp 1 ("read, at the
+            // epoch") rather than 0 ("never read") so the read is still seen.
+            .map_or(1, |d| (d.as_millis() as u64).max(1));
+        self.last_foreground_read_unix_ms
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Time of the last foreground read, `None` if never read since startup.
+    fn last_foreground_read(&self) -> Option<std::time::SystemTime> {
+        match self
+            .last_foreground_read_unix_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            ms => Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+        }
+    }
+
     fn time_series_timestamp_unit(&self) -> TimeSeriesTimestampUnit {
         self.schema
             .clustering_columns
@@ -4013,6 +4043,7 @@ impl StorageEngine {
             write_pressure_notify: Arc::new(tokio::sync::Notify::new()),
             write_pressure_percent: Arc::new(AtomicU64::new(0)),
             in_write_soft_zone: AtomicBool::new(false),
+            last_foreground_read_unix_ms: AtomicU64::new(0),
         })
     }
 
@@ -8145,9 +8176,31 @@ impl StorageEngine {
         .entered();
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.read_limited_rows(key, row_limit),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.read_limited_rows(key, row_limit)
+            }
             None => Ok(None),
         }
+    }
+
+    /// When `table_id` was last read by a foreground query, `None` if it has
+    /// not been since startup (or is unregistered). The cache evictor's heat
+    /// signal; repair, compaction and self-heal reads never set it.
+    pub fn table_last_foreground_read(&self, table_id: &TableId) -> Option<std::time::SystemTime> {
+        self.tables
+            .read()
+            .get(table_id)
+            .and_then(|state| state.last_foreground_read())
+    }
+
+    #[cfg(test)]
+    fn clear_last_foreground_read_for_test(&self, table_id: &TableId) {
+        let tables = self.tables.read();
+        let state = tables.get(table_id).expect("table registered");
+        state
+            .last_foreground_read_unix_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Read at most `row_limit` rows strictly after `start_clustering` from one
@@ -8166,9 +8219,12 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<Option<Partition>> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .read_limited_rows_from(key, start_clustering, row_limit),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .read_limited_rows_from(key, start_clustering, row_limit)
+            }
             None => Ok(None),
         }
     }
@@ -8201,7 +8257,10 @@ impl StorageEngine {
         .entered();
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.read_clustering_row(key, clustering),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.read_clustering_row(key, clustering)
+            }
             None => Ok(None),
         }
     }
@@ -8346,9 +8405,12 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<Vec<Partition>> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .read_range_limited_rows(start, end, limit, row_limit),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .read_range_limited_rows(start, end, limit, row_limit)
+            }
             None => Ok(vec![]),
         }
     }
@@ -8378,7 +8440,10 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<u64> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.count_range_matching(start, end, matches),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.count_range_matching(start, end, matches)
+            }
             None => Ok(0),
         }
     }
@@ -8400,9 +8465,12 @@ impl StorageEngine {
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .range_iter_projected(wanted, partition_limit, start, end),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .range_iter_projected(wanted, partition_limit, start, end)
+            }
             None => Box::pin(futures::stream::empty()),
         }
     }
@@ -8426,7 +8494,10 @@ impl StorageEngine {
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.range_iter(start, end),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.range_iter(start, end)
+            }
             None => Box::pin(futures::stream::empty()),
         }
     }
@@ -8446,7 +8517,10 @@ impl StorageEngine {
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.range_iter_fragmented(start, end),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.range_iter_fragmented(start, end)
+            }
             None => Box::pin(futures::stream::empty()),
         }
     }
@@ -8464,9 +8538,12 @@ impl StorageEngine {
     > {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .range_iter_projected_fragmented(wanted, start, end),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .range_iter_projected_fragmented(wanted, start, end)
+            }
             None => Box::pin(futures::stream::empty()),
         }
     }
@@ -8507,6 +8584,7 @@ impl StorageEngine {
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
+        state.note_foreground_read();
         state
             .store
             .read_by_index_each_after(index_name, key, after, visitor)
@@ -8601,9 +8679,12 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<Vec<Partition>> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state
-                .store
-                .read_by_index_in_partition(index_name, key, partition_key),
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .read_by_index_in_partition(index_name, key, partition_key)
+            }
             None => Err(ferrosa_common::Error::InvalidData(format!(
                 "read_by_index_in_partition: table {table_id:?} not registered"
             ))),
@@ -8625,7 +8706,10 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<Vec<Partition>> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.read_by_index_cell_ranges(index_name, ranges),
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.read_by_index_cell_ranges(index_name, ranges)
+            }
             None => Ok(vec![]),
         }
     }
@@ -8700,6 +8784,7 @@ impl StorageEngine {
             let Some(state) = tables.get(table_id) else {
                 return Ok(vec![]);
             };
+            state.note_foreground_read();
             merge_hits(
                 &mut score_map,
                 state
@@ -8931,8 +9016,9 @@ impl StorageEngine {
             None => return Ok(()),
         };
 
-        if !self.tables.read().contains_key(table_id) {
-            return Ok(());
+        match self.tables.read().get(table_id) {
+            Some(state) => state.note_foreground_read(),
+            None => return Ok(()),
         }
 
         /// The shapes this path can walk a sidecar at a time.
@@ -17536,6 +17622,70 @@ mod tests {
     /// repair needs to ask "give me everything in this Merkle leaf's
     /// token sub-range" — the existing key-bounded `read_range` cannot
     /// answer that question.
+    /// Cache eviction keys on read heat. A foreground read must stamp the
+    /// table; anti-entropy repair reads touch every table by design and must
+    /// not, or everything would look hot.
+    #[test]
+    fn foreground_reads_stamp_the_table_and_repair_reads_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        let dk = make_key("k1");
+        engine.write(&tid, &dk, make_row(b"v", 1000), 1000).unwrap();
+        assert_eq!(
+            engine.table_last_foreground_read(&tid),
+            None,
+            "a table never read starts cold"
+        );
+
+        // Repair primitives, compaction-free: no stamp.
+        engine.read_token_range(&tid, i64::MIN, i64::MAX, 10).unwrap();
+        engine
+            .read_token_range_bounded(&tid, i64::MIN, i64::MAX, 10, 1 << 20)
+            .unwrap();
+        engine
+            .walk_token_range(&tid, i64::MIN, i64::MAX, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            engine.table_last_foreground_read(&tid),
+            None,
+            "repair reads must not make a table hot"
+        );
+
+        // Each foreground entry point stamps.
+        let before = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        let reads: Vec<(&str, Box<dyn Fn()>)> = vec![
+            (
+                "read",
+                Box::new(|| {
+                    engine.read(&tid, &dk).unwrap();
+                }),
+            ),
+            (
+                "read_clustering_row",
+                Box::new(|| {
+                    engine.read_clustering_row(&tid, &dk, &[]).unwrap();
+                }),
+            ),
+            (
+                "read_range",
+                Box::new(|| {
+                    engine.read_range(&tid, None, None, 10).unwrap();
+                }),
+            ),
+        ];
+        for (name, read) in &reads {
+            engine.clear_last_foreground_read_for_test(&tid);
+            read();
+            let stamp = engine
+                .table_last_foreground_read(&tid)
+                .unwrap_or_else(|| panic!("{name} must stamp the table"));
+            assert!(stamp >= before, "{name} stamped a stale time");
+        }
+    }
+
     #[test]
     fn read_token_range_filters_by_token_bounds() {
         let dir = tempfile::tempdir().unwrap();
