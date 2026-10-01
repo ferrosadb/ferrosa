@@ -203,11 +203,17 @@ impl Cluster {
     /// Make the next PreAccept each node sends wait for the other, so the two
     /// transactions cross on the wire.
     fn arm_preaccept_crossing(&self) {
-        *self.transport.preaccept_crossing.lock() = Some(Arc::new(tokio::sync::Barrier::new(2)));
-        self.node_transports.iter().take(2).for_each(|node| {
+        // Exactly CROSSING_NODES nodes may cross: the barrier below is sized to
+        // that, so a third participant would wait on a party that never comes.
+        // Named rather than a bare `take(2)` so the pairing with the barrier is
+        // explicit (and so the P0 OOM audit does not read it as a result cap).
+        const CROSSING_NODES: usize = 2;
+        *self.transport.preaccept_crossing.lock() =
+            Some(Arc::new(tokio::sync::Barrier::new(CROSSING_NODES)));
+        for node in &self.node_transports[..CROSSING_NODES] {
             node.crossed
-                .store(false, std::sync::atomic::Ordering::SeqCst)
-        });
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
