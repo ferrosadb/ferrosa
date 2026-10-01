@@ -955,9 +955,29 @@ async fn i1_hot_table_bytes_are_the_only_excess_over_the_cap() {
     h.engine().shutdown().unwrap();
 }
 
-/// I3: read an evicted table back, evict it again, repeat. Every round
-/// rehydrates from the object store and returns the identical partitions,
-/// byte for byte and timestamp for timestamp.
+/// I3: read an evicted table back, evict it again, repeat. Every round serves
+/// the identical partitions from the object store, byte for byte and timestamp
+/// for timestamp.
+///
+/// This test used to assert the opposite of what it asserts now. Before ST-51 a
+/// query opened an evicted generation by rehydrating the WHOLE generation, so
+/// "reading it must have made it local" was the contract. ST-51 exists because
+/// that contract was the bug: a single point read waited on a 479 MB SSTable,
+/// re-filled the disk the evictor had just freed, and paid the egress. A query
+/// now fetches only the small index components and serves `Data.db` by ranged
+/// reads, so the generation STAYS remote. Asserting locality here would pin the
+/// defect, so the assertion is inverted rather than dropped — which is strictly
+/// stronger, because it fails if anything regresses to whole-generation
+/// download.
+///
+/// The routes that DO still restore in full are covered elsewhere, not here:
+/// compaction inputs by `i1_i2_compaction_over_evicted_inputs_*`, and the
+/// hot-table background pass by `engine_evicted_ranged_tests` (which drives
+/// `restore_hot_evicted_sstables` directly). `FERROSA_RESTORE_EVICTED_MODE=full`
+/// is NOT pinned by any test: it is read with `std::env::var` at startup, and
+/// setting a process-global in one test while the rest of the binary runs in
+/// parallel would be a race, not a test. Closing that needs the mode to come
+/// from injectable config (t_46397434).
 #[tokio::test(flavor = "multi_thread")]
 async fn i3_evict_rehydrate_evict_cycles_return_identical_rows() {
     let mut params = Params::default_with(0);
@@ -990,10 +1010,15 @@ async fn i3_evict_rehydrate_evict_cycles_return_identical_rows() {
             );
         }
         h.assert_readable(&format!("round {round}"), None);
+        // `local_generations` keys on a local `<gen>-Data.db`, so 0 is exactly
+        // "the rows were served from the object store without downloading the
+        // generation" — ST-51's promise, and the inverse of the pre-ST-51
+        // assertion this replaces.
         for model in &h.models {
-            assert!(
-                h.local_generations(model) > 0,
-                "round {round}: reading {} must have rehydrated it",
+            assert_eq!(
+                h.local_generations(model),
+                0,
+                "round {round}: reading {} must NOT have downloaded its Data.db (ST-51)",
                 model.name
             );
         }
