@@ -247,6 +247,12 @@ pub fn rebuild_url(host: &str, web_port: u16, keyspace: &str, table: &str, index
 pub struct RebuildReport {
     pub sstables_rebuilt: u64,
     pub sstables_total: u64,
+    /// SSTables compacted away with their metadata left behind: no rows, so
+    /// neither built nor missing.
+    pub sstables_vanished: u64,
+    /// SSTables that should have been indexed and were not. Non-zero means the
+    /// index stays stale and refuses reads.
+    pub sstables_failed: u64,
     pub complete: bool,
 }
 
@@ -270,6 +276,8 @@ pub fn parse_rebuild_report(body: &serde_json::Value) -> Result<RebuildReport, S
         .get("sstables_total")
         .and_then(serde_json::Value::as_u64)
         .ok_or("response has no `sstables_total`; this ferrosa-ctl and the node disagree about /api/index/rebuild")?;
+    let vanished = required_count(body, "sstables_vanished")?;
+    let failed = required_count(body, "sstables_failed")?;
     let complete = body
         .get("complete")
         .and_then(serde_json::Value::as_bool)
@@ -277,8 +285,70 @@ pub fn parse_rebuild_report(body: &serde_json::Value) -> Result<RebuildReport, S
     Ok(RebuildReport {
         sstables_rebuilt: rebuilt,
         sstables_total: total,
+        sstables_vanished: vanished,
+        sstables_failed: failed,
         complete,
     })
+}
+
+/// A count the node must report. Missing means this tool and the node disagree
+/// about the response: defaulting to zero would render "3 SSTables failed" as
+/// "none failed" against a node that predates the field.
+fn required_count(body: &serde_json::Value, field: &str) -> Result<u64, String> {
+    body.get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "response has no `{field}`; this ferrosa-ctl and the node disagree about \
+                 /api/index/rebuild"
+            )
+        })
+}
+
+/// Turn the node's report into what the operator reads and the process
+/// verdict: `Ok` is printed and exits 0, `Err` is printed and exits non-zero.
+///
+/// A rebuild that left any SSTable failed is an `Err` even when the node said
+/// `complete`: the two can only disagree through a bug, and the safe reading of
+/// a disagreement is "not repaired".
+///
+/// # Errors
+///
+/// Returns the message to print when the rebuild did not complete.
+pub fn render_rebuild(
+    report: &RebuildReport,
+    index: &str,
+    table: &str,
+    host: &str,
+) -> Result<String, String> {
+    let indexable = report
+        .sstables_total
+        .saturating_sub(report.sstables_vanished);
+    let vanished_note = if report.sstables_vanished > 0 {
+        format!(
+            " ({} more had no data file: compacted away, nothing to index there)",
+            report.sstables_vanished
+        )
+    } else {
+        String::new()
+    };
+    if report.complete && report.sstables_failed == 0 {
+        Ok(format!(
+            "Rebuilt '{index}' on {table}: {} of {indexable} SSTables, {} failed{vanished_note}. \
+             Reads through it are complete on {host}.",
+            report.sstables_rebuilt, report.sstables_failed,
+        ))
+    } else {
+        // A partial rebuild is NOT a success. Saying so in the exit code is
+        // what keeps a repair script from marching on.
+        Err(format!(
+            "Rebuilt '{index}' on {table}: only {} of {indexable} SSTables, {} FAILED\
+             {vanished_note}. Reads through this index are STILL incomplete on {host}; the \
+             index stays stale and refuses reads. Check the node log for `index backfill \
+             FAILED` and the reason.",
+            report.sstables_rebuilt, report.sstables_failed,
+        ))
+    }
 }
 
 /// `ferrosa-ctl index rebuild` — repair one index on one node.
@@ -322,24 +392,9 @@ pub async fn run_index_rebuild(
     }
 
     let report = parse_rebuild_report(&body)?;
-    if report.complete {
-        println!(
-            "Rebuilt '{index}' on {keyspace}.{table}: {} of {} SSTables. Reads through it are \
-             complete on {web_host}.",
-            report.sstables_rebuilt, report.sstables_total
-        );
-        Ok(())
-    } else {
-        // A partial rebuild is NOT a success. Saying so in the exit code is
-        // what keeps a repair script from marching on.
-        Err(format!(
-            "Rebuilt '{index}' on {keyspace}.{table}: only {} of {} SSTables. Reads through \
-             this index are STILL incomplete — check the node log for `index backfill FAILED` \
-             and the reason.",
-            report.sstables_rebuilt, report.sstables_total
-        )
-        .into())
-    }
+    let line = render_rebuild(&report, index, &format!("{keyspace}.{table}"), web_host)?;
+    println!("{line}");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -473,7 +528,8 @@ mod tests {
     #[test]
     fn a_complete_rebuild_reports_complete() {
         let body = serde_json::json!({
-            "sstables_rebuilt": 17, "sstables_total": 17, "complete": true
+            "sstables_rebuilt": 17, "sstables_total": 17, "sstables_vanished": 0,
+            "sstables_failed": 0, "complete": true
         });
         let r = parse_rebuild_report(&body).unwrap();
         assert!(r.complete);
@@ -485,7 +541,8 @@ mod tests {
         // 3 of 17 leaves reads incomplete. Rendering that as success is the
         // failure this whole command exists to avoid.
         let body = serde_json::json!({
-            "sstables_rebuilt": 3, "sstables_total": 17, "complete": false
+            "sstables_rebuilt": 3, "sstables_total": 17, "sstables_vanished": 0,
+            "sstables_failed": 14, "complete": false
         });
         let r = parse_rebuild_report(&body).unwrap();
         assert!(!r.complete);
@@ -502,8 +559,58 @@ mod tests {
 
     #[test]
     fn a_response_without_complete_is_refused_rather_than_guessed() {
-        let body = serde_json::json!({ "sstables_rebuilt": 5, "sstables_total": 5 });
+        let body = serde_json::json!({
+            "sstables_rebuilt": 5, "sstables_total": 5,
+            "sstables_vanished": 0, "sstables_failed": 0
+        });
         let err = parse_rebuild_report(&body).expect_err("must not infer completeness");
         assert!(err.contains("refusing to guess"), "{err}");
+    }
+
+    fn report(
+        rebuilt: u64,
+        total: u64,
+        vanished: u64,
+        failed: u64,
+        complete: bool,
+    ) -> RebuildReport {
+        RebuildReport {
+            sstables_rebuilt: rebuilt,
+            sstables_total: total,
+            sstables_vanished: vanished,
+            sstables_failed: failed,
+            complete,
+        }
+    }
+
+    #[test]
+    fn an_incomplete_rebuild_names_the_failed_sstables_and_is_an_error() {
+        let err = render_rebuild(&report(3, 17, 0, 14, false), "idx", "ks.t", "h")
+            .expect_err("a partial rebuild must exit non-zero");
+        assert!(err.contains("14 FAILED"), "{err}");
+        assert!(err.contains("only 3 of 17"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_sstable_is_an_error_even_if_the_node_said_complete() {
+        let err = render_rebuild(&report(16, 17, 0, 1, true), "idx", "ks.t", "h")
+            .expect_err("failed > 0 contradicts complete; not repaired");
+        assert!(err.contains("1 FAILED"), "{err}");
+    }
+
+    #[test]
+    fn a_complete_rebuild_prints_zero_failed_and_accounts_for_vanished() {
+        let line = render_rebuild(&report(2, 23, 21, 0, true), "idx", "ks.t", "h").unwrap();
+        assert!(line.contains("2 of 2 SSTables, 0 failed"), "{line}");
+        assert!(line.contains("21 more had no data file"), "{line}");
+    }
+
+    #[test]
+    fn a_response_missing_the_failed_count_is_refused_not_defaulted() {
+        let body = serde_json::json!({
+            "sstables_rebuilt": 5, "sstables_total": 5, "sstables_vanished": 0, "complete": true
+        });
+        let err = parse_rebuild_report(&body).expect_err("an older node must not read as 0 failed");
+        assert!(err.contains("sstables_failed"), "{err}");
     }
 }
