@@ -1,7 +1,7 @@
 use super::cluster::{
     build_recovered_topology_refresh_plan, build_recovered_topology_token_repair_plan,
-    drain_ddl_queue, keyspace_needs_cluster_replay, should_initialize_seed_membership,
-    should_run_bootstrap_streaming,
+    drain_ddl_queue, keyspace_needs_cluster_replay, peer_topology, seed_join_node_info,
+    should_initialize_seed_membership, should_run_bootstrap_streaming,
 };
 use super::*;
 use crate::raft::{NodeInfo, NodeState};
@@ -6091,4 +6091,96 @@ async fn local_quorum_excludes_remote_dc_replicas_for_inbound_peers() {
     assert_eq!(controller.mode(), DeploymentMode::Cluster);
 
     assert_local_quorum_excludes_remote_dc(&controller, dc2_peer_a, dc2_peer_b);
+}
+
+// ---------------------------------------------------------------------------
+// Internode DC/rack: the single resolution rule, and the seed-join rule.
+//
+// These exercise the production helpers directly rather than standing up a live
+// multi-node Raft cluster, following the existing
+// `recovered_topology_refresh_plan_*` tests: a peer that is committed into the
+// cluster or into the ring must carry THE PEER's announced dc/rack, never the
+// local node's. That stamping bug is what let LOCAL_* quorums count remote-DC
+// replicas.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn peer_topology_prefers_the_peers_announced_dc_and_rack() {
+    let peer = uuid::Uuid::new_v4();
+    let peer_dcs = std::collections::HashMap::from([(peer, "dc2".to_string())]);
+    let peer_racks = std::collections::HashMap::from([(peer, "rack2".to_string())]);
+    assert_eq!(
+        peer_topology(peer, &peer_dcs, &peer_racks, "dc1", "rack1"),
+        ("dc2".to_string(), "rack2".to_string()),
+        "an announced DC must win over the local node's"
+    );
+}
+
+#[test]
+fn peer_topology_falls_back_to_local_for_a_silent_peer() {
+    let peer = uuid::Uuid::new_v4();
+    assert_eq!(
+        peer_topology(
+            peer,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "dc1",
+            "rack1"
+        ),
+        ("dc1".to_string(), "rack1".to_string()),
+        "a peer that announced no DC is treated as local, preserving rolling upgrade"
+    );
+}
+
+#[test]
+fn peer_topology_treats_a_blank_announcement_as_absent() {
+    let peer = uuid::Uuid::new_v4();
+    let peer_dcs = std::collections::HashMap::from([(peer, "   ".to_string())]);
+    let peer_racks = std::collections::HashMap::from([(peer, String::new())]);
+    assert_eq!(
+        peer_topology(peer, &peer_dcs, &peer_racks, "dc1", "rack1"),
+        ("dc1".to_string(), "rack1".to_string()),
+    );
+}
+
+#[test]
+fn seed_join_node_info_commits_the_peers_own_topology() {
+    let peer = uuid::Uuid::new_v4();
+    let peer_dcs = std::collections::HashMap::from([(peer, "dc2".to_string())]);
+    let peer_racks = std::collections::HashMap::from([(peer, "rack2".to_string())]);
+    let info = seed_join_node_info(
+        peer,
+        "127.0.0.1:7000".parse().unwrap(),
+        Some("127.0.0.1:7000"),
+        Some("127.0.0.1:9042".to_string()),
+        &peer_dcs,
+        &peer_racks,
+        "dc1",
+        "rack1",
+    );
+    assert_eq!(info.host_id, peer);
+    assert_eq!(
+        info.data_center, "dc2",
+        "the seed must commit the PEER's DC, not its own"
+    );
+    assert_eq!(info.rack, "rack2");
+    assert_eq!(info.cql_broadcast.as_deref(), Some("127.0.0.1:9042"));
+    assert_eq!(info.state, crate::raft::NodeState::Normal);
+}
+
+#[test]
+fn seed_join_node_info_falls_back_to_local_for_a_silent_peer() {
+    let peer = uuid::Uuid::new_v4();
+    let info = seed_join_node_info(
+        peer,
+        "127.0.0.1:7000".parse().unwrap(),
+        None,
+        None,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        "dc1",
+        "rack1",
+    );
+    assert_eq!(info.data_center, "dc1");
+    assert_eq!(info.rack, "rack1");
 }

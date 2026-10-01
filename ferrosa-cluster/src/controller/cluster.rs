@@ -740,6 +740,39 @@ pub fn peer_topology(
     (dc, rack)
 }
 
+/// The `NodeInfo` the seed commits for one peer it is admitting
+/// (`transition_to_cluster`'s seed-join loop, after leader election).
+///
+/// Split out of that loop for the same reason
+/// [`build_recovered_topology_refresh_plan`] is a free function: the loop only
+/// runs after a real `raft.initialize()` + leader election across a live
+/// multi-node cluster, so the rule it applies — a peer is committed under THE
+/// PEER's announced dc/rack — is not otherwise reachable from a test.
+///
+/// It resolves both halves through [`peer_topology`], the single rule the ring
+/// build and the recovered-topology refresh also use, so a peer's committed
+/// membership and its ring entry cannot disagree.
+pub(super) fn seed_join_node_info(
+    peer_uuid: uuid::Uuid,
+    addr: SocketAddr,
+    peer_internode_broadcast: Option<&str>,
+    peer_cql_broadcast: Option<String>,
+    peer_dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    peer_racks: &std::collections::HashMap<uuid::Uuid, String>,
+    local_dc: &str,
+    local_rack: &str,
+) -> crate::raft::NodeInfo {
+    let (data_center, rack) = peer_topology(peer_uuid, peer_dcs, peer_racks, local_dc, local_rack);
+    crate::raft::NodeInfo {
+        host_id: peer_uuid,
+        addr: super::membership::node_info_addr(addr, peer_internode_broadcast),
+        data_center,
+        rack,
+        state: crate::raft::NodeState::Normal,
+        cql_broadcast: peer_cql_broadcast,
+    }
+}
+
 /// W6.3: partition a `(host_id, addr)` peer list by DC, given a lookup
 /// table from `host_id` to DC name. Peers not present in `dcs` default
 /// to `local_dc` — this preserves single-DC behavior when no per-peer
@@ -2748,34 +2781,16 @@ impl ModeController {
                             let peer_node_id = uuid_to_node_id(*peer_uuid);
                             let peer_internode_broadcast =
                                 peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
-                            // The seed authors each peer's identity here, so the
-                            // committed `NodeInfo` must carry THE PEER's
-                            // announced dc/rack — ours would file a remote-DC
-                            // node as a local-DC replica on every follower and
-                            // re-enable the LOCAL_QUORUM bug. Same single rule
-                            // (`peer_topology`) the ring build uses, so the ring
-                            // entry and the committed member cannot disagree.
-                            let (peer_dc, peer_rack) = super::cluster::peer_topology(
+                            let node_info = seed_join_node_info(
                                 *peer_uuid,
+                                *addr,
+                                peer_internode_broadcast.as_deref(),
+                                peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
                                 &peer_dc_map,
                                 &peer_racks,
                                 &config_for_promotion.data_center,
                                 &config_for_promotion.rack,
                             );
-                            let node_info = crate::raft::NodeInfo {
-                                host_id: *peer_uuid,
-                                addr: super::membership::node_info_addr(
-                                    *addr,
-                                    peer_internode_broadcast.as_deref(),
-                                ),
-                                data_center: peer_dc,
-                                rack: peer_rack,
-                                state: crate::raft::NodeState::Normal,
-                                cql_broadcast: peer_cql_broadcasts
-                                    .get(peer_uuid)
-                                    .cloned()
-                                    .flatten(),
-                            };
                             let join_cmd = crate::raft::RaftCommand {
                                 op: crate::raft::RaftOp::JoinNode(node_info),
                                 schema_version: Uuid::new_v4(),
