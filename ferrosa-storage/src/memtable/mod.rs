@@ -257,15 +257,22 @@ pub(crate) fn expand_legacy_collection_blobs(row: &mut Row, schema: &TableSchema
     {
         return Ok(());
     }
-    let mut cells = Vec::with_capacity(row.cells.len() + 1);
-    for (idx, cell) in &row.cells {
-        match collection_kind_at(schema, *idx).filter(|_| is_blob(cell)) {
+    // Move the cells rather than cloning them: this runs per row on a replay
+    // path and `cell.clone()` copies row data (P0 OOM audit, rule
+    // `clone-on-row-data`). Taking the vec is safe because every caller hands
+    // this function a row it already owns — `expand_legacy_collection_blobs`'s
+    // caller normalizes a `row.clone()` and discards it wholesale on `Err`,
+    // quarantining the original — so a part-consumed row never reaches storage.
+    let original = std::mem::take(&mut row.cells);
+    let mut cells = Vec::with_capacity(original.len() + 1);
+    for (idx, cell) in original {
+        match collection_kind_at(schema, idx).filter(|_| is_blob(&cell)) {
             Some(kind) => cells.extend(
-                expand_legacy_collection_cell(kind, cell)?
+                expand_legacy_collection_cell(kind, &cell)?
                     .into_iter()
-                    .map(|element| (*idx, element)),
+                    .map(|element| (idx, element)),
             ),
-            None => cells.push((*idx, cell.clone())),
+            None => cells.push((idx, cell)),
         }
     }
     cells.sort_by(|(a_idx, a), (b_idx, b)| (a_idx, &a.path).cmp(&(b_idx, &b.path)));
