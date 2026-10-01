@@ -57,6 +57,13 @@ recovery against a stopped node's files):
 | `cluster demote-to-learner <host_id>` | `POST /api/cluster/demote-to-learner` |
 | `snapshot create\|list\|delete` | `…/api/snapshots[…]` |
 | `restore <name> [--point-in-time --force]` | `POST /api/restore` |
+| `index rebuild --keyspace --table --index` | `POST /api/index/rebuild?…` |
+
+`index rebuild` prints `N of M SSTables, F failed` (plus the count compacted
+away with metadata left behind) and **exits non-zero when the rebuild did not
+complete**, naming the failed SSTables; the index then stays stale and refuses
+reads. The node must report `sstables_vanished` and `sstables_failed`; a
+response without them is refused rather than read as zero failures.
 
 Several of these (`raft transfer-leader`, the three `cluster` learner-lifecycle
 commands, and `snapshot`/`restore`) call endpoints that are **not yet served by

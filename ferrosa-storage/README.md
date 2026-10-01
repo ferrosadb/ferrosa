@@ -429,7 +429,23 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   needs zero failures AND every enumerated SSTable accounted for, a sidecar that
   cannot be written, reopened or installed is a failure, and any failure leaves
   the tracker stale so index reads are refused. `RebuildOutcome` reports
-  `sstables_failed`.
+  `sstables_failed`, and `add_partition_key_index` returns the same
+  `RebuildOutcome` (an incomplete backfill is a stale index, not an `Err`; the
+  CQL router and the startup reload log it at ERROR). A metadata-only
+  generation (TOC, no `Data.db`) is still discounted on the inference that
+  compaction removed it, but each one logs a WARN naming the generation and
+  calling the claim unverified; nothing records a retirement yet.
+  **Row-count reconciliation** (`index::orphan::ScanTally`, run inside
+  `LocalBackend::build`): the build compares the partitions it read with the
+  partition count the writer recorded in the SSTable footer, and, for a
+  partition-key index, the entries it produced with the partitions it owed one
+  to. Tolerance is zero and the cost is nil (counters on the pass the build
+  already makes). A mismatch fails the build, so the index stays stale. Cell and
+  clustering indexes get only the partition-walk check, because a null cell
+  legitimately yields no entry; the remote backend is not reconciled. An
+  entry-level check for those kinds would need a full table scan and is not done.
+  `ferrosa-ctl index rebuild` prints the failed count and exits non-zero when a
+  rebuild did not complete.
 - **Full-text search** (`fulltext_search(table, index, query, limit)`) —
   searches the memtable FTI + the `-FTI-{index}.db` sidecar of each **live**
   SSTable, found from the store view (`TableStore::fulltext_live_sidecars`),

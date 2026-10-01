@@ -40,6 +40,78 @@
 //! coverage, while an SSTable that could not be READ is a real failure and must
 //! still be loud.
 
+/// What one SSTable build enumerated versus what it indexed: the row-count
+/// reconciliation backstop.
+///
+/// Classification (`GenerationState`) answers "was this generation read at all".
+/// This answers "of what was read, did the index get all of it", independently
+/// of how anything was classified. A live index reported `current` while
+/// covering 32,632 of 102,840 rows; either check alone would have caught it.
+///
+/// # Cost and tolerance
+///
+/// Free: the counters are incremented by the single pass the build already
+/// makes, and `partitions_declared` is a footer field. No second scan.
+///
+/// Tolerance is ZERO, by design:
+/// - `partitions_declared` is the partition count the writer recorded in the
+///   partition-index footer, so every healthy SSTable scans exactly that many.
+///   Fewer means the walk ended early (truncation, a skipped region).
+/// - For a partition-key index the indexed value is read from the key, never
+///   from a nullable cell, so every partition with a row yields exactly one
+///   entry. A shortfall means the value could not be decoded (wrong component,
+///   changed key layout) and the index would be silently empty.
+///
+/// Cell-valued and clustering indexes are deliberately not checked at the
+/// entry level: a null cell legitimately produces no entry, so a shortfall
+/// there is not evidence. A weaker check presented as strong would be worse
+/// than none; for those only the partition walk is reconciled. A full
+/// row-by-row comparison against a table scan is the only sound entry-level
+/// check for them and is not done on the rebuild path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanTally {
+    /// Partition count recorded by the writer in the partition-index footer.
+    pub partitions_declared: u64,
+    /// Partitions the build actually read.
+    pub partitions_scanned: u64,
+    /// Partitions the index should hold an entry for, when that is exact
+    /// (partition-key index). `None` for index kinds where nulls make it inexact.
+    pub entries_expected: Option<u64>,
+    /// Entries the build produced.
+    pub entries_indexed: u64,
+}
+
+impl ScanTally {
+    /// Check the tally against zero tolerance.
+    ///
+    /// # Errors
+    ///
+    /// Names both numbers so the operator can see how short the index is.
+    pub fn verify(&self) -> Result<(), String> {
+        if self.partitions_scanned != self.partitions_declared {
+            return Err(format!(
+                "reconciliation failed: the SSTable declares {} partitions but the build read \
+                 {}; the index would not cover {} of them",
+                self.partitions_declared,
+                self.partitions_scanned,
+                self.partitions_declared
+                    .saturating_sub(self.partitions_scanned),
+            ));
+        }
+        if let Some(expected) = self.entries_expected {
+            if self.entries_indexed != expected {
+                return Err(format!(
+                    "reconciliation failed: the build enumerated {expected} partitions to index \
+                     but produced {} entries; the index would be short by {}",
+                    self.entries_indexed,
+                    expected.saturating_sub(self.entries_indexed),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What one SSTable's backfill attempt means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackfillOutcome {
@@ -222,6 +294,45 @@ mod tests {
             coverage.record(BackfillOutcome::Failed);
         }
         coverage
+    }
+
+    fn scan(declared: u64, scanned: u64, expected: Option<u64>, indexed: u64) -> ScanTally {
+        ScanTally {
+            partitions_declared: declared,
+            partitions_scanned: scanned,
+            entries_expected: expected,
+            entries_indexed: indexed,
+        }
+    }
+
+    #[test]
+    fn a_scan_that_matches_its_declaration_and_expectation_verifies() {
+        scan(10, 10, Some(10), 10).verify().unwrap();
+        scan(0, 0, Some(0), 0).verify().unwrap();
+        scan(10, 10, None, 3).verify().unwrap();
+    }
+
+    #[test]
+    fn a_scan_that_read_fewer_partitions_than_declared_fails_naming_both() {
+        let err = scan(100, 32, None, 32).verify().unwrap_err();
+        assert!(
+            err.contains("declares 100") && err.contains("read 32"),
+            "{err}"
+        );
+        assert!(err.contains("68"), "the shortfall must be stated: {err}");
+    }
+
+    #[test]
+    fn fewer_entries_than_enumerated_partitions_fails() {
+        let err = scan(10, 10, Some(10), 0).verify().unwrap_err();
+        assert!(err.contains("10") && err.contains("0 entries"), "{err}");
+    }
+
+    #[test]
+    fn a_single_missing_entry_fails_because_tolerance_is_zero() {
+        scan(10, 10, Some(10), 9)
+            .verify()
+            .expect_err("one missing entry is one missing partition");
     }
 
     /// The legitimate #406 case: the TOC survives, the data file is gone.

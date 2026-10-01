@@ -5879,12 +5879,18 @@ impl StorageEngine {
             match settled {
                 Ok(outcome) => {
                     if outcome == BackfillOutcome::Vanished {
-                        tracing::info!(
+                        // WARN, not info: "its TOC survives, so compaction took
+                        // it" is an inference, not a recorded fact. If it is
+                        // wrong, live rows are missing from the index and this
+                        // line is the only trace of which generation to look at.
+                        tracing::warn!(
                             index_name,
                             table = %table_id,
                             sstable = %sst_id,
-                            "engine: SSTable has no data file but its metadata survives — \
-                             compacted away. Nothing to index; not counted against this index."
+                            "engine: SSTable {sst_id} is in the live set with a TOC but no data \
+                             file. Discounted as compacted away (unverified: nothing records a \
+                             retirement), so it is not counted against this index. If its rows \
+                             were not compacted into another SSTable they are missing from it."
                         );
                     }
                     // Built and vanished both clear the pending mark: a vanished
@@ -22819,6 +22825,69 @@ mod tests {
         drop(dir);
     }
 
+    /// `CREATE INDEX` backfills through `add_partition_key_index`. A failed
+    /// backfill used to be visible only through the stale tracker and an ERROR
+    /// log; the caller got `Ok(())`. It must see the outcome.
+    #[test]
+    fn add_partition_key_index_returns_the_outcome_of_a_failed_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for i in 0..3 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+        let gens = engine
+            .tables
+            .read()
+            .get(&tid)
+            .unwrap()
+            .store
+            .sstable_generation_ids();
+        let table_dir = engine.table_sstable_dir(&tid);
+        assert!(remove_generation_files(&table_dir, &gens[0], false) > 0);
+
+        let outcome = engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        assert_eq!(outcome.sstables_failed, 1, "{outcome:?}");
+        assert!(!outcome.is_complete(), "{outcome:?}");
+        assert!(!engine.index_is_current(&tid, "idx_pk"));
+    }
+
+    /// A clean backfill is reported complete to the caller.
+    #[test]
+    fn add_partition_key_index_reports_a_complete_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("k0"), make_row(b"v", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let outcome = engine
+            .add_partition_key_index(&tid, "idx_pk", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        assert_eq!(outcome.sstables_rebuilt, 1, "{outcome:?}");
+        assert!(outcome.is_complete(), "{outcome:?}");
+    }
+
     /// The legitimate #406 case must keep working: TOC and sidecars still
     /// there, Data.db gone. Nothing to index; the rebuild completes.
     #[test]
@@ -22834,6 +22903,79 @@ mod tests {
         assert_eq!(outcome.sstables_failed, 0, "{outcome:?}");
         assert!(outcome.is_complete(), "{outcome:?}");
         assert!(engine.index_is_current(&tid, "idx_pk"));
+        drop(dir);
+    }
+
+    /// Reconciliation backstop. An index whose component does not exist in the
+    /// partition key decodes to nothing for every partition: the build "succeeds"
+    /// with an empty sidecar. Without reconciling indexed entries against the
+    /// partitions the build enumerated, that reads as a complete, current,
+    /// EMPTY index, which is the shape of the live 68% shortfall regardless of
+    /// how any generation was classified.
+    #[test]
+    fn a_build_that_indexes_fewer_partitions_than_it_enumerated_does_not_mark_the_index_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for i in 0..2 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        // Component 5 of a one-component key: every partition decodes to None.
+        let outcome = engine
+            .add_partition_key_index(&tid, "idx_bad", 5, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        assert_eq!(outcome.sstables_failed, 2, "{outcome:?}");
+        assert!(!outcome.is_complete(), "{outcome:?}");
+        assert!(
+            !engine.index_is_current(&tid, "idx_bad"),
+            "an index that covers 0 of the rows its build enumerated must not be current"
+        );
+    }
+
+    /// A live generation with a TOC and no `Data.db` is discounted on the
+    /// ASSUMPTION that compaction removed it. Nothing positively proves that,
+    /// so each such discount must be visible: a WARN naming the generation, not
+    /// an info line that scrolls past.
+    #[test]
+    fn a_metadata_only_generation_is_discounted_with_a_warn_naming_it() {
+        let (dir, engine, tid, gens) = engine_with_indexed_generations(3);
+        let table_dir = engine.table_sstable_dir(&tid);
+        assert_eq!(remove_generation_files(&table_dir, &gens[0], true), 1);
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            engine.rebuild_index(&tid, "idx_pk").unwrap()
+        });
+
+        assert_eq!(outcome.sstables_vanished, 1, "{outcome:?}");
+        let text = logs.text();
+        assert!(
+            text.contains("WARN") && text.contains(gens[0].as_str()),
+            "the discounted generation {} must be named in a WARN; got: {text}",
+            gens[0]
+        );
+        assert!(
+            text.contains("unverified"),
+            "the WARN must say the compaction claim is unverified: {text}"
+        );
         drop(dir);
     }
 
