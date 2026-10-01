@@ -395,6 +395,25 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   timeout, and removes the local copy only after the put succeeds. A failed
   upload leaves the segment; the disk bound still wins, so the ring drops the
   oldest un-uploaded segment by age if uploads keep failing.
+  The marker lives in the TABLE directory; a compaction output sits in
+  `<table>/<gen>/` and is reopened with that directory, so
+  `rehydrate_if_evicted` looks one level up for it (without that, an evicted
+  compaction output failed to reopen and was quarantined as corrupt).
+- **Cache invariants** (`engine/cache_invariants.rs`) — an engine over an
+  in-memory object store, cache far smaller than its data, several tables (plain,
+  secondary-indexed, full-text), checked after every flush+sync cycle against a
+  model of what was written: I1 cache bound (cap + hot-table bytes), I2 every
+  row readable through every read path, I3 evict/rehydrate/evict round trips,
+  I4 restart, I5 lost objects fail loud (FMEA ST-40, ST-41). Seeded, so a
+  failure replays. Runs in PR CI; the longer sweep is `mod slow`
+  (`--features slow-tests`, nightly).
+- **Cache tunables** — `FERROSA_CACHE_MAX_BYTES`, `FERROSA_CACHE_HOT_WINDOW_SECS`
+  and `FERROSA_S3_REQUEST_TIMEOUT_SECS`, also settable from the `ferrosa` TOML as
+  `[storage] cache_max_bytes`, `[storage] cache_hot_window_secs` and
+  `[s3] request_timeout_secs`. TOML wins over the env var, which wins over the
+  default (the precedence every bridged key follows); a TOML value that is not a
+  whole number aborts startup. Size the cache well below the data so eviction
+  stays exercised: dev and test clusters use 1 GiB.
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —

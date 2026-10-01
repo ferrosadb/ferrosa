@@ -113,6 +113,14 @@ volume or changing query results.
    store) and a bounded background pass restores hot tables' generations while
    free disk allows. Compaction inputs and `FERROSA_RESTORE_EVICTED_MODE=full`
    still rehydrate in full.
+   Local disk is always smaller than the database, so eviction and read-back
+   run continuously, not only under pressure: `engine/cache_invariants.rs`
+   drives an engine over an in-memory object store with a cache far smaller
+   than its data and checks, after every flush+sync cycle, the cache bound (I1),
+   every row through every read path (I2), identical rows across repeated
+   evict/rehydrate cycles (I3), the same across restart (I4) and a loud error
+   when the store has lost the objects (I5; FMEA ST-40, ST-41). It runs in
+   PR CI; a larger randomized sweep is in `mod slow`.
    Periodic S3 sync skips incomplete generations before upload or manifest
    publication: all four required components (`Data.db`, `Partitions.db`,
    `Rows.db`, and `Filter.db`) must be present. This is a presence check;
