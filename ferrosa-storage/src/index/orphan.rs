@@ -328,6 +328,46 @@ mod tests {
         assert!(err.contains("10") && err.contains("0 entries"), "{err}");
     }
 
+    /// The live failure: an index reported complete while covering 32,632 of
+    /// 102,840 rows (31.7%). Any tolerance wide enough to admit that is not a
+    /// guard, so the check is pinned at exactly the live numbers, and at one
+    /// short of full on either side of the line.
+    #[test]
+    fn the_live_shortfall_of_32632_of_102840_is_rejected() {
+        let err = scan(102_840, 32_632, None, 32_632).verify().unwrap_err();
+        assert!(err.contains("102840") && err.contains("32632"), "{err}");
+        let err = scan(102_840, 102_840, Some(102_840), 32_632)
+            .verify()
+            .unwrap_err();
+        assert!(
+            err.contains("102840") && err.contains("32632 entries"),
+            "{err}"
+        );
+    }
+
+    /// Where the line is drawn, and why: tolerance is zero. The footer count is
+    /// the writer's own, so every healthy SSTable matches it exactly. Exact
+    /// equality is accepted; one short is rejected.
+    #[test]
+    fn the_line_sits_exactly_at_equality() {
+        scan(102_840, 102_840, Some(102_840), 102_840)
+            .verify()
+            .expect("equality is the only accepted partition count");
+        scan(102_840, 102_839, None, 102_839)
+            .verify()
+            .expect_err("one partition short must be rejected");
+        scan(102_840, 102_840, Some(102_840), 102_839)
+            .verify()
+            .expect_err("one entry short must be rejected");
+    }
+
+    /// Not a tolerance: for a cell-valued index a null cell yields no entry, so
+    /// fewer entries than partitions is legitimate and is NOT checked.
+    #[test]
+    fn a_cell_index_with_fewer_entries_than_partitions_is_accepted() {
+        scan(100, 100, None, 40).verify().unwrap();
+    }
+
     #[test]
     fn a_single_missing_entry_fails_because_tolerance_is_zero() {
         scan(10, 10, Some(10), 9)
