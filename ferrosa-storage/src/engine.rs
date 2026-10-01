@@ -737,10 +737,19 @@ impl StorageEngineConfig {
             ObjectStoreConfig::from_env(),
         )?;
 
-        let local_cache_max_bytes = std::env::var("FERROSA_CACHE_MAX_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10 * 1024 * 1024 * 1024); // 10 GB default
+        const DEFAULT_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+        let local_cache_max_bytes = match std::env::var("FERROSA_CACHE_MAX_BYTES") {
+            Err(_) => DEFAULT_CACHE_MAX_BYTES,
+            Ok(raw) => raw.parse().unwrap_or_else(|e| {
+                tracing::warn!(
+                    value = raw,
+                    error = %e,
+                    default = DEFAULT_CACHE_MAX_BYTES,
+                    "FERROSA_CACHE_MAX_BYTES is not a whole number of bytes; using the default"
+                );
+                DEFAULT_CACHE_MAX_BYTES
+            }),
+        };
 
         let cache_hot_window_secs = match std::env::var("FERROSA_CACHE_HOT_WINDOW_SECS") {
             Err(_) => DEFAULT_CACHE_HOT_WINDOW_SECS,
@@ -2403,6 +2412,24 @@ impl StorageEngine {
                             )));
                         }
                     }
+                }
+
+                // The fixed list above is the SSTable proper. The evictor also
+                // deletes the generation's index artifacts (`.sidecar`, FTI,
+                // VEC, QVEC), so a rehydrate that skipped them left a
+                // generation whose rows read back but whose index postings were
+                // gone: the marker is cleared, a restart finds the generation
+                // complete, and every index read silently misses its rows.
+                if async_requested_path.exists() || restored > 0 {
+                    restored += Self::pull_index_artifacts(
+                        store.as_ref(),
+                        &async_prefix,
+                        &hex,
+                        &async_table_id,
+                        &async_sstable_id,
+                        &parent,
+                    )
+                    .await?;
                 }
 
                 Ok((
@@ -14964,6 +14991,9 @@ impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod cache_invariants;
 
 #[cfg(test)]
 mod tests {

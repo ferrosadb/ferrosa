@@ -1732,7 +1732,16 @@ struct FileComponentPaths {
 /// checks then observe.
 pub(crate) fn rehydrate_if_evicted(dir: &Path, gen: &str) -> Result<()> {
     let data = dir.join(format!("{gen}-Data.db"));
-    let marker = crate::engine::StorageEngine::evicted_marker_path(dir, gen);
+    // The evictor writes the marker in the TABLE directory. A compaction output
+    // lives in its own `<table>/<gen>/` directory and readers reopen it with
+    // that directory, so look one level up. Without this the marker is never
+    // found, the open fails as "missing Data.db", and the read path quarantines
+    // a healthy, uploaded generation as corrupt.
+    let marker_dir = match dir.file_name() {
+        Some(name) if name == gen => dir.parent().unwrap_or(dir),
+        _ => dir,
+    };
+    let marker = crate::engine::StorageEngine::evicted_marker_path(marker_dir, gen);
     if data.exists() || !marker.exists() {
         return Ok(());
     }
