@@ -11600,11 +11600,46 @@ impl StorageEngine {
         self.compaction_executor.await_result_available(timeout)
     }
 
+    /// Drives maintenance polls until `table_id` has no compaction task left
+    /// (every submitted task finished, was cancelled, or was finalized).
+    ///
+    /// The completion signal is the executor's own state transition: a task
+    /// stays registered until its claim is released, and every release or
+    /// result delivery wakes `changed()`. Nothing here depends on wall-clock
+    /// speed, so it is the load-independent replacement for "poll N times with
+    /// a short sleep". `hang_guard` only turns a stuck worker into a loud
+    /// failure; it is not a convergence budget.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn drive_compactions_until_idle(
+        &self,
+        table_id: &TableId,
+        hang_guard: std::time::Duration,
+    ) {
+        let settle = async {
+            loop {
+                // Enable before polling so a completion landing between the
+                // poll and the await is not missed.
+                let changed = self.compaction_executor.changed().notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                self.poll_compactions().await;
+                if !self.compaction_executor.table_has_tasks(table_id) {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        if tokio::time::timeout(hang_guard, settle).await.is_err() {
+            panic!("compaction for {table_id} did not settle within the {hang_guard:?} hang guard");
+        }
+    }
+
     /// bucketing or min_threshold.
     pub fn force_compact_all(&self) {
         let tables = self.tables.read();
         for (table_id, state) in tables.iter() {
             let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
+                tracing::warn!(%table_id, "force-compact: table not admitting compactions (paused or shut down); skipped");
                 continue;
             };
             let metadata = self.collect_sstable_metadata(table_id, state);
@@ -11618,11 +11653,19 @@ impl StorageEngine {
                     table_id: table_id.clone(),
                     purge,
                 };
-                if let Err(e) = self
+                match self
                     .compaction_executor
                     .try_submit_with_ticket(task, &ticket)
                 {
-                    tracing::error!(%e, %table_id, "force-compact: submit failed");
+                    Ok(true) => {}
+                    // Overlap with an in-flight claim, or a full worker queue:
+                    // nothing was submitted and force-compact never retries, so
+                    // say so rather than look like it worked.
+                    Ok(false) => tracing::warn!(
+                        %table_id,
+                        "force-compact: task not accepted (inputs already claimed or worker queue full)"
+                    ),
+                    Err(e) => tracing::error!(%e, %table_id, "force-compact: submit failed"),
                 }
             }
         }

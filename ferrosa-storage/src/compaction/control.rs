@@ -195,6 +195,18 @@ impl TaskTracker {
         Some(task.input_bytes)
     }
 
+    /// Whether any queued, running or awaiting-finalization task is registered
+    /// for `table_id`. A task stays registered until its claim is released, so
+    /// `false` means the table's compaction work has fully settled.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn table_has_tasks(&self, table_id: &TableId) -> bool {
+        self.state
+            .lock()
+            .tasks
+            .values()
+            .any(|task| &task.table_id == table_id)
+    }
+
     #[cfg(test)]
     fn table_gate_count(&self) -> usize {
         self.state.lock().tables.len()

@@ -867,6 +867,13 @@ impl CompactionExecutor {
         &self.tracker.changed
     }
 
+    /// Whether `table` still has a compaction task registered (queued, running,
+    /// or finished but not yet finalized).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn table_has_tasks(&self, table: &crate::TableId) -> bool {
+        self.tracker.table_has_tasks(table)
+    }
+
     pub(crate) fn try_submit_with_ticket(
         &self,
         task: CompactionTask,
