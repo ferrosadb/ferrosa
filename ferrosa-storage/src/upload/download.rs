@@ -253,14 +253,8 @@ async fn download_once(
     tmp: &Path,
     cfg: &DownloadConfig,
 ) -> Result<Option<Downloaded>, Fail> {
-    let result = match store.get(s3_path).await {
-        Ok(result) => result,
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(e) => {
-            return Err(Fail::Retry(format!(
-                "S3 download failed for {s3_path}: {e}"
-            )))
-        }
+    let Some(result) = first_response(store, s3_path, cfg).await? else {
+        return Ok(None);
     };
     let size = result.meta.size as u64;
     let etag = result.meta.e_tag.clone();
@@ -276,6 +270,39 @@ async fn download_once(
         }));
     }
     download_ranged(store, s3_path, tmp, cfg, size, etag, stream).await
+}
+
+/// The request that reveals the object's size. It asks for the first part
+/// only (`0..part_bytes`, which a store clamps to the object's length), so its
+/// body is read to the end and the connection goes back to the pool. An
+/// unbounded GET here would have its body abandoned after part 0 on a large
+/// object, which closes the connection: one new TLS connection per download.
+///
+/// A store that rejects the range (an empty object has no byte 0) is asked
+/// again with a plain GET, which is always a whole-object read.
+async fn first_response(
+    store: &dyn ObjectStore,
+    s3_path: &ObjectPath,
+    cfg: &DownloadConfig,
+) -> Result<Option<object_store::GetResult>, Fail> {
+    let options = GetOptions {
+        range: Some(GetRange::Bounded(0..cfg.part_bytes as usize)),
+        ..GetOptions::default()
+    };
+    match store.get_opts(s3_path, options).await {
+        Ok(result) => Ok(Some(result)),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(first) => {
+            tracing::debug!(path = %s3_path, error = %first, "ranged first request refused; using a plain GET");
+            match store.get(s3_path).await {
+                Ok(result) => Ok(Some(result)),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(Fail::Retry(format!(
+                    "S3 download failed for {s3_path}: {e} (ranged attempt: {first})"
+                ))),
+            }
+        }
+    }
 }
 
 fn verify_len(written: u64, expected: u64, s3_path: &ObjectPath) -> Result<(), Fail> {
@@ -503,6 +530,13 @@ async fn part_from_stream(
                     .map_err(|f| f.into_error().to_string())?;
                 offset += len;
             }
+        }
+        // Read the body to its end so the connection is returned to the pool.
+        if let Some(extra) = stream.try_next().await.map_err(|e| e.to_string())? {
+            return Err(format!(
+                "response is longer than its part: {} more bytes",
+                extra.len()
+            ));
         }
         Ok(())
     }

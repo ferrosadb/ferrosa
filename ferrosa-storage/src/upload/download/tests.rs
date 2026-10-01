@@ -163,7 +163,7 @@ impl ObjectStore for ScriptedStore {
             }
         }
         let mut result = self.inner.get_opts(location, options).await?;
-        if start.is_none() {
+        if start.unwrap_or(0) == 0 {
             let replacement = self.swap_after_first.lock().unwrap().take();
             if let Some(replacement) = replacement {
                 self.inner
@@ -305,12 +305,12 @@ async fn a_large_object_downloads_as_ranged_parts_byte_identical() {
     assert_eq!(written, Some(body.len() as u64));
     assert_eq!(std::fs::read(&local).unwrap(), body);
     assert_eq!(leftovers(dir.path()), vec!["7-Data.db".to_string()]);
-    // One whole GET reveals the size and serves part 0; parts 1..=5 are ranged.
-    assert_eq!(store.requests_for(None), 1);
+    // A ranged GET of part 0 reveals the size and serves part 0; parts 1..=5 follow.
+    assert_eq!(store.requests_for(None), 0, "no unbounded GET");
+    assert_eq!(store.requests_for(Some(0)), 1, "part 0 is fetched once");
     for start in [1024, 2048, 3072, 4096, 5120] {
         assert_eq!(store.requests_for(Some(start)), 1, "part at {start}");
     }
-    assert_eq!(store.requests_for(Some(0)), 0, "part 0 rides the first GET");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -329,11 +329,7 @@ async fn parts_download_concurrently_up_to_the_configured_limit() {
     // Six ranged parts at concurrency 3: a sequential fallback peaks at 1, an
     // unbounded fan-out peaks at 6.
     assert_eq!(store.max_inflight.load(Ordering::SeqCst), 3);
-    assert_eq!(
-        store.total_requests(),
-        7,
-        "one whole GET + six ranged parts"
-    );
+    assert_eq!(store.total_requests(), 7, "part 0 + six ranged parts");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -350,6 +346,23 @@ async fn a_small_object_is_one_get() {
     assert_eq!(written, Some(700));
     assert_eq!(std::fs::read(&local).unwrap(), body);
     assert_eq!(store.total_requests(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_object_downloads_to_an_empty_file() {
+    // A ranged request for byte 0 of an empty object is refused by stores, so
+    // the first request falls back to a plain GET.
+    let store = ScriptedStore::with_object(&[]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("7-Data.db");
+
+    let written = download_component(&store, &key(), &local, &cfg(1024, 3))
+        .await
+        .unwrap();
+
+    assert_eq!(written, Some(0));
+    assert_eq!(std::fs::metadata(&local).unwrap().len(), 0);
+    assert_eq!(store.requests_for(None), 1, "the plain-GET fallback");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -406,7 +419,11 @@ async fn a_failed_part_is_retried_alone() {
             "part at {start} must not be refetched"
         );
     }
-    assert_eq!(store.requests_for(None), 1, "the object is not restarted");
+    assert_eq!(
+        store.requests_for(Some(0)),
+        1,
+        "the object is not restarted"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -430,7 +447,7 @@ async fn a_part_that_never_succeeds_fails_loud_and_leaves_nothing() {
     );
     assert_eq!(store.requests_for(Some(2048)) as u32, MAX_ATTEMPTS);
     assert_eq!(
-        store.requests_for(None),
+        store.requests_for(Some(0)),
         1,
         "exhausted parts are not retried as a whole object"
     );
@@ -591,10 +608,13 @@ async fn spawn_counting_server(body: Bytes) -> (std::net::SocketAddr, Arc<Atomic
                         slice.len()
                     );
                     use tokio::io::AsyncWriteExt;
-                    sock.write_all(response.as_bytes())
-                        .await
-                        .expect("write head");
-                    sock.write_all(&slice).await.expect("write body");
+                    // A client that abandons a response mid-body resets the
+                    // connection; that ends this connection, as on a real server.
+                    if sock.write_all(response.as_bytes()).await.is_err()
+                        || sock.write_all(&slice).await.is_err()
+                    {
+                        return;
+                    }
                 }
             });
         }
@@ -605,7 +625,9 @@ async fn spawn_counting_server(body: Bytes) -> (std::net::SocketAddr, Arc<Atomic
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sequential_downloads_reuse_pooled_connections() {
     const DOWNLOADS: usize = 20;
-    let body = Bytes::from(pattern(1024 * 1024));
+    // The object is far larger than a socket buffer, so a download that
+    // abandons part of a response body cannot hide behind buffering.
+    let body = Bytes::from(pattern(8 * 1024 * 1024));
     let (addr, accepted) = spawn_counting_server(body.clone()).await;
     let config = crate::upload::config::ObjectStoreConfig {
         endpoint: format!("http://{addr}"),
@@ -614,7 +636,7 @@ async fn sequential_downloads_reuse_pooled_connections() {
     // One client for every download: the pool only helps if it is shared.
     let store = config.build_object_store().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let cfg = cfg(256 * 1024, 4);
+    let cfg = cfg(1024 * 1024, 4);
 
     for i in 0..DOWNLOADS {
         let out = dir.path().join(format!("o{i}"));
@@ -629,7 +651,7 @@ async fn sequential_downloads_reuse_pooled_connections() {
     }
 
     let conns = accepted.load(Ordering::SeqCst);
-    // Each download issues 4 requests, 80 in all; a pool that works needs
+    // Each download issues 8 requests, 160 in all; a pool that works needs
     // roughly the per-object concurrency, not one connection per request.
     assert!(
         conns <= cfg.part_concurrency + 4,
