@@ -10204,6 +10204,31 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Offline re-ingest for `ferrosa-ctl commitlog set-aside --apply`. The
+    /// node must be stopped.
+    ///
+    /// Opens a local-only engine over `data_dir` (its local schema registers
+    /// the tables, which re-ingests their set-aside frames and flushes them to
+    /// SSTables there) and returns what is still set aside. The engine runs
+    /// over `scratch_commit_log_dir`, never the node's own commit log, so the
+    /// node's un-flushed segments stay exactly as they were for its next
+    /// start. There is no object store: the flushed SSTables reach S3 through
+    /// the node's own sync after it restarts.
+    pub fn reingest_set_aside_offline(
+        data_dir: &Path,
+        scratch_commit_log_dir: &Path,
+    ) -> ferrosa_common::Result<crate::replay_set_aside::SetAsideStatus> {
+        let mut config = StorageEngineConfig::test_config(data_dir);
+        config.commit_log = CommitLogConfig::test_config(scratch_commit_log_dir);
+        config.local_cache_max_bytes = u64::MAX;
+        config.flush_threshold_bytes = 64 * 1024 * 1024;
+        config.flush_max_age_secs = 30;
+        let engine = Self::new(config, None)?;
+        let status = engine.replay_set_aside_status();
+        engine.shutdown()?;
+        Ok(status)
+    }
+
     /// Re-ingests every set-aside mutation whose table is registered. Returns
     /// the first failure after trying every file; the remainder stays set aside
     /// and is reported by [`replay_set_aside_status`](Self::replay_set_aside_status).

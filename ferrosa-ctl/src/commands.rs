@@ -22,6 +22,11 @@ pub mod compaction;
 /// and takes a scan instead.
 pub mod index;
 
+/// Inspect and replay set-aside commit-log mutations
+/// (`ferrosa-ctl commitlog set-aside ...`). Operates on a data directory with
+/// no network connection.
+pub mod set_aside;
+
 /// Offline SSTable analysis & recovery (`ferrosa-ctl sstable ...`). Operates on
 /// an on-disk table directory with no network connection.
 pub mod sstable;

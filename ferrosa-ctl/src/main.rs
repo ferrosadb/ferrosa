@@ -191,6 +191,38 @@ enum Commands {
         #[command(subcommand)]
         action: SstableAction,
     },
+
+    /// Commit-log recovery (operates on a data directory; no live node
+    /// connection required).
+    Commitlog {
+        #[command(subcommand)]
+        action: CommitlogAction,
+    },
+}
+
+/// Commit-log recovery sub-actions (offline, filesystem-only).
+#[derive(Debug, Subcommand)]
+enum CommitlogAction {
+    /// Inspect the commit-log mutations startup replay set aside because no
+    /// table schema was available (`<data dir>/commitlog-unreplayed/`), and
+    /// replay them. Those rows are durable but invisible to reads, and `/readyz`
+    /// reports the node as not ready until they are applied. A node re-ingests
+    /// them itself once the table's schema registers. Dry-run by default — pass
+    /// `--apply`, with the node STOPPED, to replay the frames whose table schema
+    /// is known locally and drop them from the file.
+    SetAside {
+        /// The node's data directory (the one that holds `commitlog-unreplayed/`).
+        dir: std::path::PathBuf,
+
+        /// Actually replay. Without this flag the command only reports counts.
+        /// The node MUST be stopped before applying.
+        #[arg(long)]
+        apply: bool,
+
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Index sub-actions. These ask ONE node: an index can be built on this
@@ -704,6 +736,11 @@ async fn main() {
             } => {
                 commands::index::run_index_rebuild(&web_host, web_port, &keyspace, &table, &index)
                     .await
+            }
+        },
+        Commands::Commitlog { action } => match action {
+            CommitlogAction::SetAside { dir, apply, json } => {
+                commands::set_aside::run_set_aside(&dir, apply, json)
             }
         },
         Commands::Sstable { action } => match action {

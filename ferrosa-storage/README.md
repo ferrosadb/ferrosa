@@ -501,9 +501,25 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   and appends the overflow to `<data_dir>/commitlog-unreplayed/*.unreplayed`
   (CRC-framed, fsynced before the commit-log segment is deleted). The engine
   opens, logs table ids/count/path at ERROR, bumps
-  `ferrosa_commitlog_replay_set_aside_mutations_total` and reports it through
-  `StorageEngine::replay_set_aside_report()`. Set-aside mutations are durable but
-  NOT visible to reads, and are not re-ingested automatically. Replay also
+  `ferrosa_commitlog_replay_set_aside_mutations_total` and reports the unapplied
+  remainder through `StorageEngine::replay_set_aside_status()`, the
+  `ferrosa_commitlog_replay_set_aside_pending_mutations` gauge, and `/readyz`
+  (503, `waiting_for: "set_aside_mutations"`). Set-aside mutations are durable
+  but NOT visible to reads until re-ingested.
+- **Set-aside re-ingest** (`replay_set_aside.rs`, `StorageEngine::adopt_set_aside_files`)
+  — every constructor (`new`, `new_with_archive_store`, `open`) finds
+  `*.unreplayed` files, and each table registration (startup local schema, the
+  `open` schema, or DDL) re-ingests that table's frames. Frames stream one at a
+  time; each is applied through a strict path (a failed row aborts the file and
+  keeps it whole), the touched tables are flushed to SSTables, and only then
+  does the file shrink: frames for tables still unknown are copied to
+  `<file>.partial`, which atomically replaces the file, and a fully applied file
+  is removed. A crash at any point leaves the original, and re-applying a frame
+  rewrites identical cells, so a repeat adds no rows. A torn or corrupt file is
+  never skipped or partly applied: it is reported (ERROR, `/readyz`
+  `unreadable_files`) and kept for the operator. Offline route:
+  `ferrosa-ctl commitlog set-aside <data-dir> [--apply]`
+  (`StorageEngine::reingest_set_aside_offline`). Replay also
   expands legacy whole-value collection cells into element cells so the SSTable
   writer's mixed-cell assertion cannot fire at the next flush.
 - **Range reads fail loud on an unreadable SSTable** (`store.rs`,

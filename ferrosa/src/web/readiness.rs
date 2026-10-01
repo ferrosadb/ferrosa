@@ -25,6 +25,11 @@
 //! | Cluster    | Ready only once a Raft leader is elected    |
 //! | Degraded*  | Mode rules apply unless consensus failed    |
 //!
+//! Independent of mode, a node that holds set-aside commit-log mutations (rows
+//! startup replay could not bind to a schema, durable but invisible to reads)
+//! answers `503 {"waiting_for":"set_aside_mutations"}` with the counts, until
+//! they are re-ingested.
+//!
 //! It lives outside the `/api/*` auth middleware so external
 //! orchestrators (docker-compose, k8s, smoke scripts) can probe it without
 //! credentials.

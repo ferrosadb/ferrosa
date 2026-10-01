@@ -87,6 +87,21 @@ so ctl can never disagree with what the node decides at boot.
 - `sstable reingest <dir> [--user --password-env --apply --include-quarantine --limit]` — salvage CORRUPT gens and re-insert through the **live** write path (`--host`), preserving original timestamps; dry-run default.
 - `sstable s3-clean <dir> [--apply]` — delete CORRUPT generations' objects from the object store so a cold restart can't re-download them; dry-run default.
 
+### Commit-log set-aside recovery (filesystem only)
+
+- `commitlog set-aside <data-dir> [--apply --json]` — startup replay with no table
+  schema writes overflow mutations to `<data-dir>/commitlog-unreplayed/*.unreplayed`;
+  those rows are durable but invisible to reads and `/readyz` reports the node as
+  not ready (`waiting_for: "set_aside_mutations"`). Without `--apply` it reports
+  file, mutation and per-table counts (pure read; an unreadable file is named
+  with its byte offset). With `--apply`, **node stopped**, it applies every frame
+  whose table schema is in the data dir's local schema, flushes those tables to
+  SSTables, and rewrites each file without the applied frames (removing it when
+  empty). It exits non-zero while anything stays set aside. The node's own commit
+  log is never touched (the engine runs over a scratch commit log). A node
+  normally does this itself at startup once the schema is known; the flushed
+  SSTables reach S3 through the node's sync after it restarts.
+
 ## Dependencies
 
 **Calls** (ferrosa crates this depends on): ferrosa-cluster, ferrosa-common,
