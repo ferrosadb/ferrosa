@@ -101,6 +101,23 @@ Known gap: allow entries that omit `symbol` suppress a whole (file, rule) pair,
 so a *new* violation inside an already-allowlisted file is not caught. Tracked
 as forge t_e1d5f83c; baseline triage is forge t_a49d88c3.
 
+**Rule calibration (2026-10).** Three false-positive shapes were removed from
+the rules after per-site triage, each with a unit test:
+- `unbounded-range-read` now requires the *absence* of a finite bound: a
+  `read_range(.., None, None, <limit>)` whose 4th argument is present and not the
+  `usize::MAX` sentinel materializes at most `limit` partitions — the caller's
+  own bound, the same class as a query LIMIT — so it is a bounded read, not a
+  full-table scan (this is exactly what `read_persisted_indexes` and the startup
+  system-table loaders rely on). Absent-limit and `usize::MAX` still fire.
+- `with-capacity-limit` no longer treats a bare `count` as a paging cap: a
+  `count` argument is an untrusted-frame/structural length followed by a read of
+  exactly that many elements (a pre-allocation hint, often `.min(..)`-guarded),
+  not a result bound.
+- The scan skips test-only in-`src` modules whose gating `cfg` sits on the `mod`
+  declaration in a parent file (`test_support.rs`, compiled only under the
+  `test-generators` feature, and `compaction/validator/`, compiled only under
+  `cfg(test)` / `compaction-validator`); neither enters the serving library.
+
 **Move-based-streaming Clone/Copy rules (2026-07 extension).** The original
 `clone-on-row-data` matched only literal `partition/rows/cells` receivers; six
 confirmed blind spots (`.cloned()` adapters, closure-param clones, renamed

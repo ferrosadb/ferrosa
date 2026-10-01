@@ -371,7 +371,14 @@ fn return_type(sig: &syn::Signature) -> Option<&syn::Type> {
 }
 
 /// Bare-identifier names that signal a paging / user-derived capacity argument.
-const CAP_IDENTS: &[&str] = &["limit", "cap", "n", "count"];
+///
+/// `count` is deliberately absent: a `count` argument is the length declared in
+/// an inbound frame (or a fixed structural count), and the code that follows it
+/// either reads exactly `count` elements (so the capacity is a pre-allocation
+/// hint, not a result bound) or guards against an oversized count with a
+/// `.min(..)` before allocating. Naming it a "paging cap" is exactly the
+/// false positive this rule must not raise.
+const CAP_IDENTS: &[&str] = &["limit", "cap", "n"];
 
 /// True if a `with_capacity` argument expression is a capacity heuristic hit:
 /// a bare ident in `CAP_IDENTS`, or any ident path containing `limit`.
@@ -673,6 +680,30 @@ fn is_none_literal(expr: &syn::Expr) -> bool {
         if p.path.segments.last().map(|s| s.ident == "None") == Some(true))
 }
 
+/// True if `expr` is an explicit unbounded sentinel (`usize::MAX` / `MAX`).
+fn is_unbounded_sentinel(expr: &syn::Expr) -> bool {
+    matches!(expr, syn::Expr::Path(p)
+        if p.path.segments.last().map(|s| s.ident == "MAX") == Some(true))
+}
+
+/// True if a `read_range(.., None, None, <limit>)` call has NO finite bound —
+/// the trailing limit argument is absent or the explicit `usize::MAX` sentinel.
+///
+/// A finite limit is a real result bound: the call materializes at most `limit`
+/// partitions, which is exactly the caller's own bound (the same class as a
+/// query LIMIT). Only an absent bound or an explicit `usize::MAX` is an
+/// unbounded full-table read. The audited shape is 4-arg
+/// `read_range(&table, start, end, limit)`; the limit is the 4th argument.
+fn range_read_limit_is_unbounded<'a, I>(args: I) -> bool
+where
+    I: IntoIterator<Item = &'a syn::Expr>,
+{
+    match args.into_iter().nth(3) {
+        None => true,
+        Some(e) => is_unbounded_sentinel(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Visitor
 // ---------------------------------------------------------------------------
@@ -815,12 +846,17 @@ impl<'a> Auditor<'a> {
             }
         }
 
-        // Rule 2: free-fn `read_range(None, None, ..)`.
-        if last == Some("read_range") && has_consecutive_none_pair(node.args.iter()) {
+        // Rule 2: free-fn `read_range(None, None, ..)` with no finite bound.
+        if last == Some("read_range")
+            && has_consecutive_none_pair(node.args.iter())
+            && range_read_limit_is_unbounded(node.args.iter())
+        {
             self.push(
                 node.span().start().line,
                 rule::UNBOUNDED_RANGE_READ,
-                "read_range(None, None, ..) is an unbounded full-table range read".to_string(),
+                "read_range(None, None, ..) with no finite limit is an unbounded full-table \
+                 range read"
+                    .to_string(),
             );
         }
 
@@ -977,12 +1013,21 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
             }
         }
 
-        // Rule 2: `read_range` whose first two args are both `None` (unbounded).
-        if method == "read_range" && has_consecutive_none_pair(node.args.iter()) {
+        // Rule 2: `read_range` whose first two args are both `None` (unbounded)
+        // AND whose trailing limit is absent or the explicit `usize::MAX`
+        // sentinel. A finite limit is a real result bound (the caller's own),
+        // so `read_range(.., None, None, N)` is a bounded read, not a full-table
+        // materialization.
+        if method == "read_range"
+            && has_consecutive_none_pair(node.args.iter())
+            && range_read_limit_is_unbounded(node.args.iter())
+        {
             self.push(
                 line,
                 rule::UNBOUNDED_RANGE_READ,
-                "read_range(None, None, ..) is an unbounded full-table range read".to_string(),
+                "read_range(None, None, ..) with no finite limit is an unbounded full-table \
+                 range read"
+                    .to_string(),
             );
         }
 
@@ -1492,8 +1537,27 @@ pub fn audit_source(path: &str, src: &str, allow: &Allowlist) -> Vec<Finding> {
         .collect()
 }
 
+/// Path fragments identifying code that is never compiled into the serving
+/// library: test-harness and validation-oracle modules. The audit already skips
+/// `#[cfg(test)]` items and `tests/`/`benches/` dirs; these are the in-`src/`
+/// equivalents whose gating `cfg` sits on the `mod` declaration in a parent
+/// file, so a whole-file scan cannot see it.
+///
+/// - `/test_support.rs` — declared `#[cfg(feature = "test-generators")]` in
+///   `lib.rs`; proptest generators/fixtures for the repair-fuzz harness, off in
+///   the serving build.
+/// - `/compaction/validator/` — declared
+///   `#[cfg(any(test, feature = "compaction-validator"))]` in
+///   `compaction/mod.rs`; its module docs state it never enters the production
+///   library (the feature exists so `ferrosa-loadgen`, itself non-serving, can
+///   reuse the oracle for soak runs).
+///
+/// These are not serving read paths, so a materialization finding in them is a
+/// false positive for the OOM guard.
+const NON_SERVING_PATH_FRAGMENTS: &[&str] = &["/test_support.rs", "/compaction/validator/"];
+
 /// True if a path should be scanned: a `.rs` file under a `src/` dir, not in
-/// `tests/` or `benches/`.
+/// `tests/` or `benches/`, and not in a test-only support/validator module.
 fn is_scannable(path: &Path) -> bool {
     if path.extension().and_then(|e| e.to_str()) != Some("rs") {
         return false;
@@ -1504,7 +1568,13 @@ fn is_scannable(path: &Path) -> bool {
         .collect();
     let in_src = comps.iter().any(|c| c == "src");
     let in_excluded = comps.iter().any(|c| c == "tests" || c == "benches");
-    in_src && !in_excluded
+    if !in_src || in_excluded {
+        return false;
+    }
+    let joined = path.to_string_lossy();
+    !NON_SERVING_PATH_FRAGMENTS
+        .iter()
+        .any(|frag| joined.contains(frag))
 }
 
 /// Audit every scannable file under `roots`. IO happens here; detection is
@@ -1731,6 +1801,28 @@ mod tests {
         );
     }
 
+    /// `count` is an untrusted-wire / structural length, not a paging cap: the
+    /// decoder reads exactly `count` elements, so the capacity is a
+    /// pre-allocation hint (and `count.min(4096)` guards the allocation). The
+    /// sibling accord decoders (`count.min(4096)`) are already exempt by name;
+    /// a bare `count` must be too, or the same shape is flagged when spelled
+    /// without the `.min()`.
+    #[test]
+    fn rule_c_does_not_fire_on_wire_count_capacity() {
+        let src = r#"
+            fn f(body: &[u8]) {
+                let count = read_len(body);
+                let mut entries = Vec::with_capacity(count);
+                let mut capped = Vec::with_capacity(count.min(4096));
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::WITH_CAPACITY_LIMIT),
+            "a wire-declared `count` is a pre-allocation hint, not a result cap: {f:?}"
+        );
+    }
+
     // -- Rule (d): while-let push accumulation -----------------------------
     #[test]
     fn rule_d_fires_on_stream_push_loop() {
@@ -1801,6 +1893,31 @@ mod tests {
         "#;
         let f = audit_source("x.rs", src, &no_allow());
         assert!(f.is_empty(), "test code must be skipped entirely: {f:?}");
+    }
+
+    // -- Test-only in-src modules are not scanned --------------------------
+    /// The crate-internal test fixtures (`test_support.rs`) and the differential
+    /// compaction validator (`compaction/validator/`) are `#[cfg(test)]` /
+    /// feature-gated harnesses that never enter the serving library. Scanning
+    /// them is a false positive — the whole-file scan cannot see the gating
+    /// `cfg` on the `mod` declaration in the parent file.
+    #[test]
+    fn is_scannable_excludes_test_only_support_and_validator_modules() {
+        let scan = PathBuf::from("/repo/ferrosa-storage/src/test_support.rs");
+        let validator = PathBuf::from("/repo/ferrosa-storage/src/compaction/validator/oracle.rs");
+        assert!(
+            !is_scannable(&scan),
+            "test_support.rs is a test fixture module, not a serving path"
+        );
+        assert!(
+            !is_scannable(&validator),
+            "compaction validator is cfg(test)/feature-gated, not a serving path"
+        );
+        // A normal production module is still scanned.
+        assert!(
+            is_scannable(&PathBuf::from("/repo/ferrosa-storage/src/engine.rs")),
+            "production modules must still be scanned"
+        );
     }
 
     // -- Whitelist suppression --------------------------------------------
@@ -1953,12 +2070,15 @@ mod tests {
     // -- Rule 2: unbounded-range-read --------------------------------------
     #[test]
     fn rule_unbounded_range_read_fires_on_none_none() {
-        // Real shape: `read_range(&table_id, None, None, limit)` — the two
-        // consecutive `None` range bounds make it a full-table scan.
+        // Real shape: `read_range(&table_id, None, None, usize::MAX)` — the two
+        // consecutive `None` range bounds make it a full-table scan, and the
+        // `usize::MAX` limit is the explicit "no bound" sentinel. A finite limit
+        // in this position bounds the result (see the finite-limit test), so it
+        // is the sentinel/absent arg that makes the read unbounded.
         let src = r#"
             fn a(storage: S, table_id: T) {
-                let _x = storage.read_range(&table_id, None, None, 100);
-                let _y = read_range(&table_id, None, None, 10_000);
+                let _x = storage.read_range(&table_id, None, None, usize::MAX);
+                let _y = read_range(&table_id, None, None, usize::MAX);
             }
         "#;
         let f = audit_source("x.rs", src, &no_allow());
@@ -1968,7 +2088,7 @@ mod tests {
             .count();
         assert_eq!(
             count, 2,
-            "method + free-fn read_range(.,None,None,.) fire: {f:?}"
+            "method + free-fn read_range(.,None,None,usize::MAX) fire: {f:?}"
         );
     }
 
@@ -1984,6 +2104,48 @@ mod tests {
         assert!(
             !f.iter().any(|x| x.rule == rule::UNBOUNDED_RANGE_READ),
             "bounded reads must not fire: {f:?}"
+        );
+    }
+
+    /// A `None, None` RANGE with a finite trailing limit is still bounded: the
+    /// scan materializes at most `limit` partitions, which is the caller's own
+    /// bound (same class as a query LIMIT) — NOT an unbounded full-table read.
+    /// The finite limit is precisely what keeps `read_persisted_indexes` and the
+    /// startup system-table loaders from being full-table materializations.
+    #[test]
+    fn rule_unbounded_range_read_does_not_fire_with_finite_limit() {
+        let src = r#"
+            fn a(storage: S, table_id: T) {
+                let _x = storage.read_range(&table_id, None, None, 10_000);
+                let _y = read_range(&table_id, None, None, limit);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::UNBOUNDED_RANGE_READ),
+            "a finite limit bounds the result; None,None + finite limit must not \
+             fire: {f:?}"
+        );
+    }
+
+    /// The genuinely unbounded shapes still fire: an absent limit arg, and the
+    /// explicit `usize::MAX` sentinel (what a caller uses when it means "all").
+    #[test]
+    fn rule_unbounded_range_read_fires_without_limit_or_with_max_sentinel() {
+        let src = r#"
+            fn a(storage: S, table_id: T) {
+                let _x = storage.read_range(&table_id, None, None);
+                let _y = read_range(&table_id, None, None, usize::MAX);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::UNBOUNDED_RANGE_READ)
+            .count();
+        assert_eq!(
+            count, 2,
+            "no-limit and usize::MAX are the genuinely unbounded shapes: {f:?}"
         );
     }
 
