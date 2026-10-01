@@ -6155,8 +6155,7 @@ fn seed_join_node_info_commits_the_peers_own_topology() {
         Some("127.0.0.1:9042".to_string()),
         &peer_dcs,
         &peer_racks,
-        "dc1",
-        "rack1",
+        ("dc1", "rack1"),
     );
     assert_eq!(info.host_id, peer);
     assert_eq!(
@@ -6178,8 +6177,7 @@ fn seed_join_node_info_falls_back_to_local_for_a_silent_peer() {
         None,
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
-        "dc1",
-        "rack1",
+        ("dc1", "rack1"),
     );
     assert_eq!(info.data_center, "dc1");
     assert_eq!(info.rack, "rack1");

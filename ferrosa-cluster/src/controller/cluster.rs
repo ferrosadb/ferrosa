@@ -759,9 +759,11 @@ pub(super) fn seed_join_node_info(
     peer_cql_broadcast: Option<String>,
     peer_dcs: &std::collections::HashMap<uuid::Uuid, String>,
     peer_racks: &std::collections::HashMap<uuid::Uuid, String>,
-    local_dc: &str,
-    local_rack: &str,
+    // The local node's own (data_center, rack) - the fallback for a peer that
+    // announced neither. Grouped as a tuple so the parameter list stays cohesive.
+    local_topology: (&str, &str),
 ) -> crate::raft::NodeInfo {
+    let (local_dc, local_rack) = local_topology;
     let (data_center, rack) = peer_topology(peer_uuid, peer_dcs, peer_racks, local_dc, local_rack);
     crate::raft::NodeInfo {
         host_id: peer_uuid,
@@ -2788,8 +2790,10 @@ impl ModeController {
                                 peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
                                 &peer_dc_map,
                                 &peer_racks,
-                                &config_for_promotion.data_center,
-                                &config_for_promotion.rack,
+                                (
+                                    &config_for_promotion.data_center,
+                                    &config_for_promotion.rack,
+                                ),
                             );
                             let join_cmd = crate::raft::RaftCommand {
                                 op: crate::raft::RaftOp::JoinNode(node_info),
