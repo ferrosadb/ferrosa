@@ -128,6 +128,12 @@ T-025 operator requests preserve existing cancellation reasons, count each task
 once under the registry lock, and keep future admission open. Scoped tests cover
 unselected tasks, repeated requests and empty registries.
 
+## ST-54 collection-cell ordinal in the memtable merge normalizer
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| ST-54 | `normalize_collection_rows_for_merge` looked a cell ordinal up in `regular_columns` alone, without the static offset the schema defines (statics `0..S`, regulars `S..`) | On a table with static columns, a legacy whole-collection write followed by an element write is rejected, or the blob is expanded under another column's type | 7 | 3 | 3 | 63 | Single mapping `TableSchema::column_at_ordinal` (inverse of `column_index`), used by the normalizer and `validate_row_against_schema`. Tests: `merge_expands_a_legacy_*`, `merge_normalization_leaves_other_columns_on_their_own_ordinals`, `tests/static_column_collections.rs`. Open: flushing any table with statics panics in the SSTable writer (board t_2aaed446). |
+
 ## T-150 jsonb type threading
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation |

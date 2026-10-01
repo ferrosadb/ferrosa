@@ -315,6 +315,21 @@ impl TableSchema {
         None
     }
 
+    /// The inverse of [`Self::column_index`]: the column a cell ordinal refers
+    /// to. Statics occupy `0..static_columns.len()`, regulars follow. Returns
+    /// `None` for an ordinal past the last regular column.
+    ///
+    /// Every consumer that maps a row-cell ordinal back to a column must use
+    /// this, so no two paths can disagree about the static offset.
+    pub fn column_at_ordinal(&self, ordinal: u16) -> Option<&ColumnDefinition> {
+        let idx = usize::from(ordinal);
+        let static_count = self.static_columns.len();
+        match idx.checked_sub(static_count) {
+            None => self.static_columns.get(idx),
+            Some(regular_idx) => self.regular_columns.get(regular_idx),
+        }
+    }
+
     /// Returns a startup warning for schemas whose stored static/regular
     /// column order does not match Cassandra's column-name comparator.
     ///
@@ -701,6 +716,13 @@ mod tests {
         assert_eq!(schema.column_index("name"), Some(1));
         assert_eq!(schema.column_index("age"), Some(2));
         assert_eq!(schema.column_index("nonexistent"), None);
+
+        // column_at_ordinal is the exact inverse, and nothing exists past the end.
+        for name in ["s1", "name", "age"] {
+            let ordinal = schema.column_index(name).unwrap();
+            assert_eq!(schema.column_at_ordinal(ordinal).unwrap().name, name);
+        }
+        assert!(schema.column_at_ordinal(3).is_none());
     }
 
     #[test]

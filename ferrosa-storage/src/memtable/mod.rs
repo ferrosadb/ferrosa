@@ -183,9 +183,9 @@ pub(crate) fn normalize_collection_rows_for_merge(
         let mut replacements = std::collections::HashMap::new();
         for (idx, cell) in &row.cells {
             if complex_columns.contains(idx) && cell.path.is_none() && !cell.is_tombstone() {
-                let column = schema.regular_columns.get(*idx as usize).ok_or_else(|| {
+                let column = schema.column_at_ordinal(*idx).ok_or_else(|| {
                     Error::InvalidData(format!(
-                        "collection cell column index {idx} is outside the regular schema"
+                        "collection cell column index {idx} is outside the table schema"
                     ))
                 })?;
                 let kind = raw_collection_kind(&column.type_name).ok_or_else(|| {
@@ -296,18 +296,12 @@ pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Re
         }
     }
 
-    let static_count = schema.static_columns.len();
     for (col_idx, cell) in &row.cells {
         let bytes = match &cell.value {
             Some(v) => v,
             None => continue,
         };
-        let idx = *col_idx as usize;
-        let column = if idx < static_count {
-            &schema.static_columns[idx]
-        } else if idx - static_count < schema.regular_columns.len() {
-            &schema.regular_columns[idx - static_count]
-        } else {
+        let Some(column) = schema.column_at_ordinal(*col_idx) else {
             continue;
         };
         if let Err(reason) = validate_cell_bytes(&column.type_name, bytes) {
