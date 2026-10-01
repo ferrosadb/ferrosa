@@ -308,3 +308,116 @@ fn a_generation_missing_a_required_component_cannot_be_opened() {
 
     assert_eq!(outcome, QueryFetch::Missing);
 }
+
+/// A compaction output lives in `<table>/<gen>/` while the evictor writes its
+/// marker in the TABLE directory. The ranged-read open must look one level up,
+/// as `rehydrate_if_evicted` does; otherwise the marker is never found, the
+/// open fails as "missing Data.db", and the read path quarantines a healthy,
+/// uploaded generation (cache invariant I2 after compaction).
+#[test]
+fn a_compaction_output_generation_is_opened_for_ranged_reads() {
+    let f = fixture(10, 100);
+    put_component(&f, "Partitions.db", b"partitions");
+    put_component(&f, "Rows.db", b"rows");
+    put_component(&f, "Filter.db", b"filter");
+    let table_dir = f.path.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&table_dir).unwrap();
+    std::fs::File::create(crate::engine::StorageEngine::evicted_marker_path(
+        &table_dir, "7",
+    ))
+    .unwrap();
+    let output_dir = table_dir.join("7");
+
+    let remote_data = crate::flush::prepare_evicted_for_query(&output_dir, "7").unwrap();
+
+    assert!(
+        remote_data,
+        "an evicted compaction output must open for ranged reads"
+    );
+    assert_eq!(
+        std::fs::read(output_dir.join("7-Filter.db")).unwrap(),
+        b"filter",
+        "its index components land in its own generation directory"
+    );
+    assert!(
+        !output_dir.join("7-Data.db").exists(),
+        "Data.db stays remote"
+    );
+}
+
+/// The flush-shaped twin of the compaction-output test: a flushed generation is
+/// opened from the TABLE directory itself, where its marker also lives. Looking
+/// one level up for it (the compaction-output rule applied unconditionally)
+/// would never find the marker, and every evicted flush generation would fail
+/// to open and be quarantined. Together the two tests pin `eviction_marker_dir`
+/// for both call shapes.
+#[test]
+fn a_flushed_generation_is_opened_for_ranged_reads() {
+    let f = fixture(10, 100);
+    put_component(&f, "Partitions.db", b"partitions");
+    put_component(&f, "Rows.db", b"rows");
+    put_component(&f, "Filter.db", b"filter");
+    let table_dir = f.path.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&table_dir).unwrap();
+    std::fs::File::create(crate::engine::StorageEngine::evicted_marker_path(
+        &table_dir, "7",
+    ))
+    .unwrap();
+
+    let remote_data = crate::flush::prepare_evicted_for_query(&table_dir, "7").unwrap();
+
+    assert!(
+        remote_data,
+        "an evicted flush generation must open for ranged reads"
+    );
+    assert_eq!(
+        std::fs::read(table_dir.join("7-Filter.db")).unwrap(),
+        b"filter",
+        "its index components land beside the marker, in the table directory"
+    );
+    assert!(
+        !table_dir.join("7-Data.db").exists(),
+        "Data.db stays remote"
+    );
+}
+
+/// The negative case of the compaction-output test. A compaction output with NO eviction
+/// marker was retired by compaction (the evictor writes the marker before it
+/// deletes anything, and retirement clears it). Its objects may still sit in
+/// the store, but restoring or ranged-reading it would resurrect purged rows.
+/// The open must fail loud (a typed error, so the read path's view-retry
+/// fires), fetch nothing, and leave no local file behind.
+#[test]
+fn a_markerless_compaction_output_fails_loud_and_fetches_nothing() {
+    let f = fixture(10, 100);
+    put_component(&f, "Partitions.db", b"partitions");
+    put_component(&f, "Rows.db", b"rows");
+    put_component(&f, "Filter.db", b"filter");
+    let table_dir = f.path.parent().unwrap().to_path_buf();
+    let output_dir = table_dir.join("7");
+
+    let remote_data = crate::flush::prepare_evicted_for_query(&output_dir, "7").unwrap();
+    let err = match crate::flush::open_file_sstable(&output_dir, "7") {
+        Ok(_) => panic!("a marker-less missing generation must not open"),
+        Err(e) => e,
+    };
+
+    assert!(
+        !remote_data,
+        "no marker: the generation must not be served from the object store"
+    );
+    assert!(
+        err.to_string().contains("missing required Data.db"),
+        "the open must fail with the typed missing-component error, got: {err}"
+    );
+    assert_eq!(f.reads.gets(), 0, "no object was read for the generation");
+    assert_eq!(
+        f.reads.index_bytes_fetched(),
+        0,
+        "no component was downloaded for the generation"
+    );
+    assert!(
+        !output_dir.exists(),
+        "no local file or directory may appear for the generation"
+    );
+}
