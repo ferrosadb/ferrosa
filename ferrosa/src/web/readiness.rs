@@ -88,6 +88,7 @@ fn mode_label(mode: DeploymentMode) -> &'static str {
 pub async fn readyz_handler(
     State(mc): State<Arc<ModeController>>,
     State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
+    State(storage): State<Arc<ferrosa_storage::StorageEngine>>,
 ) -> (StatusCode, Json<Value>) {
     if !mc.consensus_is_healthy() {
         return (
@@ -116,6 +117,31 @@ pub async fn readyz_handler(
                 "failed": failed,
                 "detail": "a client listener failed to start; see the reasons and the \
                     ferrosa_listener_up metric"
+            })),
+        );
+    }
+    // Commit-log mutations startup replay could not bind to a table schema are
+    // durable on disk but in no memtable, so reads cannot see them. Answering 200
+    // would make a node holding invisible rows indistinguishable from a healthy
+    // one. They are re-ingested automatically once the table's schema registers.
+    let set_aside = storage.replay_set_aside_status();
+    if !set_aside.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ready": false,
+                "waiting_for": "set_aside_mutations",
+                "mutations": set_aside.mutations(),
+                "tables": set_aside.tables(),
+                "unreadable_files": set_aside
+                    .unreadable()
+                    .into_iter()
+                    .map(|f| json!({"path": f.path.display().to_string(), "error": f.error}))
+                    .collect::<Vec<Value>>(),
+                "detail": "committed mutations are set aside on disk and invisible to reads \
+                    until their table schema is registered; inspect with \
+                    `ferrosa-ctl commitlog set-aside` and see the ferrosa_commitlog_replay_\
+                    set_aside_pending_mutations metric"
             })),
         );
     }
@@ -240,21 +266,31 @@ mod tests {
         cluster_config: ferrosa_cluster::ClusterConfig,
     ) -> WebAppState {
         let dir = tempfile::tempdir().expect("tempdir");
+        make_state_in(dir.path(), cluster_config)
+    }
+
+    /// State over the storage data dir `data_dir`, which may already hold files
+    /// (the engine looks for set-aside files while it is constructed).
+    fn make_state_in(
+        data_dir: &std::path::Path,
+        cluster_config: ferrosa_cluster::ClusterConfig,
+    ) -> WebAppState {
+        let dir = data_dir;
         let storage_config = StorageEngineConfig {
             commit_log: CommitLogConfig {
-                log_dir: dir.path().join("commitlog"),
-                checkpoint_dir: dir.path().join("commitlog"),
+                log_dir: dir.join("commitlog"),
+                checkpoint_dir: dir.join("commitlog"),
                 archive: None,
                 ..CommitLogConfig::default()
             },
-            compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+            compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
             local_disk_free_reserve_bytes: 0,
             flush_threshold_bytes: 4096,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
-            data_dir: dir.path().to_path_buf(),
+            data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
             write_verify: true,
             auth_enabled: false,
@@ -661,6 +697,78 @@ what made this failure invisible"
         state.listeners.mark_failed("bolt", "denied");
         state.listeners.mark_up("bolt");
         assert_eq!(probe(state).await.0, StatusCode::OK);
+    }
+
+    fn set_aside_table_schema() -> ferrosa_common::schema::TableSchema {
+        ferrosa_common::schema::TableSchema {
+            keyspace: "aside_ks".to_string(),
+            table: "aside_t".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::schema::ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// Writes `n` mutations for `aside_ks.aside_t` into a set-aside file, as a
+    /// startup replay with no schema would.
+    fn set_aside_mutations(data_dir: &std::path::Path, n: usize) {
+        let mut aside = ferrosa_storage::replay_set_aside::ReplaySetAside::new(data_dir);
+        for i in 0..n {
+            let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+                format!("k{i}").into_bytes(),
+            ));
+            let row = ferrosa_sstable::types::Row {
+                clustering: vec![],
+                cells: vec![(0, ferrosa_common::CellValue::live(b"v".to_vec(), 5))],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(5),
+            };
+            aside
+                .append(&ferrosa_storage::Mutation::new(
+                    "aside_ks".into(),
+                    "aside_t".into(),
+                    key,
+                    vec![row],
+                    5,
+                ))
+                .expect("append set-aside mutation");
+        }
+        aside.sync().expect("sync set-aside file");
+    }
+
+    /// A node holding committed rows it cannot read back must say so: the rows
+    /// are durable but invisible, and answering 200 is the silent missing-data
+    /// state this probe exists to rule out. It clears once they are applied.
+    #[tokio::test]
+    async fn readyz_is_not_ready_while_set_aside_mutations_are_unapplied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_aside_mutations(dir.path(), 2);
+        let state = make_state_in(dir.path(), ferrosa_cluster::ClusterConfig::default());
+        let storage = Arc::clone(&state.storage);
+
+        let (status, body) = probe(state.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["waiting_for"], "set_aside_mutations");
+        assert_eq!(body["mutations"], 2);
+        assert_eq!(body["tables"]["aside_ks.aside_t"], 2);
+
+        storage
+            .register_table(set_aside_table_schema())
+            .expect("register table");
+
+        let (status, body) = probe(state).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "applied rows clear the state: {body}"
+        );
+        assert_eq!(body["ready"], true);
     }
 
     /// The Cluster mode (no Raft instance installed yet) must return 503.

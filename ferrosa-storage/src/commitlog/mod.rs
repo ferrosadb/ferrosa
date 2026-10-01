@@ -134,6 +134,12 @@ pub fn render_prometheus() -> String {
         "ferrosa_commitlog_replay_set_aside_mutations_total {}\n",
         crate::replay_set_aside::replay_set_aside_mutations_total()
     ));
+    out.push_str("# HELP ferrosa_commitlog_replay_set_aside_pending_mutations Set-aside mutations not yet re-ingested; non-zero means rows are on disk but invisible to reads.\n");
+    out.push_str("# TYPE ferrosa_commitlog_replay_set_aside_pending_mutations gauge\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_replay_set_aside_pending_mutations {}\n",
+        crate::replay_set_aside::replay_set_aside_pending_mutations()
+    ));
     out.push_str("# HELP ferrosa_commitlog_append_bytes_total Total bytes reserved for commit-log entries.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_bytes_total counter\n");
     out.push_str(&format!(

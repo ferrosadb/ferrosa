@@ -574,6 +574,56 @@ pub enum IncrementalCompactionSchedule {
     },
 }
 
+/// Failure injection for set-aside re-ingest crash tests.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SetAsideFaults {
+    /// Fail before applying the frame with this index.
+    pub(crate) fail_before_frame: Option<usize>,
+    /// Fail after the tables are flushed, before the file is rewritten.
+    pub(crate) fail_after_flush: bool,
+}
+
+/// Feeds set-aside frames into the engine's tables and makes them durable by
+/// flushing the tables they touched.
+struct EngineSetAsideSink<'a> {
+    engine: &'a StorageEngine,
+    /// When set, only this table's frames are applied; the rest are kept.
+    only: Option<&'a TableId>,
+    touched: std::collections::HashSet<TableId>,
+    faults: SetAsideFaults,
+}
+
+impl crate::replay_set_aside::SetAsideSink for EngineSetAsideSink<'_> {
+    fn apply(&mut self, index: usize, mutation: &Mutation) -> ferrosa_common::Result<bool> {
+        if self.faults.fail_before_frame == Some(index) {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "injected set-aside re-ingest fault before frame {index}"
+            )));
+        }
+        let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        if self.only.is_some_and(|only| *only != table_id) {
+            return Ok(false);
+        }
+        if !StorageEngine::apply_replay_mutation_strict(&self.engine.tables, mutation)? {
+            return Ok(false);
+        }
+        self.touched.insert(table_id);
+        Ok(true)
+    }
+
+    fn make_durable(&mut self) -> ferrosa_common::Result<()> {
+        for table_id in self.touched.drain() {
+            self.engine.flush(&table_id)?;
+        }
+        if self.faults.fail_after_flush {
+            return Err(ferrosa_common::Error::InvalidData(
+                "injected set-aside re-ingest fault after the flush".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl StorageEngineConfig {
     /// Reads configuration from `FERROSA_*` environment variables.
     pub fn from_env() -> ferrosa_common::Result<Self> {
@@ -1137,9 +1187,13 @@ pub struct StorageEngine {
     /// These are applied lazily when the table is later registered.
     deferred_replay_mutations: parking_lot::Mutex<Vec<Mutation>>,
     /// Mutations startup replay wrote to disk instead of a memtable because no
-    /// schema was available and the in-memory buffer was full. `None` when
-    /// nothing was set aside. See [`crate::replay_set_aside`].
-    replay_set_aside: Option<crate::replay_set_aside::ReplaySetAsideReport>,
+    /// schema was available and the in-memory buffer was full, and that have
+    /// not been re-ingested yet. Empty when nothing is set aside. These rows
+    /// are invisible to reads, so `/readyz` reports them. See
+    /// [`crate::replay_set_aside`].
+    set_aside_status: parking_lot::Mutex<crate::replay_set_aside::SetAsideStatus>,
+    /// Serializes set-aside re-ingest runs (startup and table registration).
+    set_aside_reingest: parking_lot::Mutex<()>,
     /// Index registrations that arrived before their table was registered,
     /// applied when it is — the same lazy shape as
     /// `deferred_replay_mutations` directly above, for the same reason.
@@ -2771,7 +2825,8 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
-            replay_set_aside: None,
+            set_aside_status: parking_lot::Mutex::new(Default::default()),
+            set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -2828,6 +2883,12 @@ impl StorageEngine {
         // disk pressure plus a restart emptied system_schema.indexes and most
         // agent_memory tables on all three memory-cluster nodes.
         engine.restore_evicted_sstables_blocking()?;
+        // Before the local schema registers its tables: each registration then
+        // re-ingests that table's set-aside mutations (see
+        // `replay_deferred_mutations_for_table`). This constructor is the one a
+        // restart goes through once the commit-log segments that fed a
+        // set-aside file are gone, so it must find the file itself.
+        engine.adopt_set_aside_files()?;
         engine.load_local_schema_if_present()?;
         Ok(engine)
     }
@@ -2983,7 +3044,7 @@ impl StorageEngine {
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
 
-        Ok(Self {
+        let engine = Self {
             config,
             runtime_tuning: *crate::runtime_tuning::storage_runtime_tuning(),
             write_admission: WriteAdmissionSettings::from_env(),
@@ -2998,7 +3059,8 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
-            replay_set_aside: None,
+            set_aside_status: parking_lot::Mutex::new(Default::default()),
+            set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -3035,7 +3097,11 @@ impl StorageEngine {
             reader_pool,
             #[cfg(test)]
             upload_store_override: None,
-        })
+        };
+        // Same as `new`: a set-aside file from an earlier boot is found here
+        // even though this constructor replays nothing.
+        engine.adopt_set_aside_files()?;
+        Ok(engine)
     }
 
     /// Opens an existing storage engine directory and replays uncommitted
@@ -3160,8 +3226,7 @@ impl StorageEngine {
             },
             || set_aside.lock().sync(),
         )?;
-        let replay_set_aside = set_aside.into_inner().into_report();
-        if let Some(report) = &replay_set_aside {
+        if let Some(report) = &set_aside.into_inner().into_report() {
             tracing::error!(
                 mutations = report.mutations,
                 tables = ?report.tables,
@@ -3169,8 +3234,8 @@ impl StorageEngine {
                 limit = max_pending_without_schema,
                 "commit-log replay had no table schema and its in-memory buffer was full \
                  (FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA); the overflow was set aside on \
-                 disk, NOT replayed. Those mutations are invisible to reads until the schema \
-                 is restored and the file is re-ingested"
+                 disk, NOT replayed. Those mutations are invisible to reads until their \
+                 table schema is registered, when they are re-ingested automatically"
             );
         }
 
@@ -3189,7 +3254,8 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations,
-            replay_set_aside,
+            set_aside_status: parking_lot::Mutex::new(Default::default()),
+            set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -3228,6 +3294,7 @@ impl StorageEngine {
             upload_store_override: None,
         };
 
+        engine.adopt_set_aside_files()?;
         Ok((engine, pending_mutations))
     }
 
@@ -3803,15 +3870,44 @@ impl StorageEngine {
         Self::apply_replay_mutation_to_tables(&self.tables, mutation)
     }
 
+    /// Commit-log replay: applies `mutation` if its table is registered.
+    ///
+    /// A row that fails to apply is logged per row at ERROR by the strict
+    /// path, and the commit-log segment still carries the mutation, so replay
+    /// does not abort. Returns whether the table was registered.
     fn apply_replay_mutation_to_tables(
         tables: &RwLock<HashMap<TableId, TableState>>,
         mutation: &Mutation,
     ) -> bool {
+        match Self::apply_replay_mutation_strict(tables, mutation) {
+            Ok(registered) => registered,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    keyspace = %mutation.keyspace,
+                    table = %mutation.table,
+                    "replay: a row of this mutation failed to apply (see the preceding errors)"
+                );
+                true
+            }
+        }
+    }
+
+    /// Applies `mutation` to its table's memtable. `Ok(false)` when the table
+    /// is not registered. A malformed row goes to the quarantine file and
+    /// counts as handled; any other row failure is returned (after every row
+    /// has been attempted), so a caller that is about to discard its only copy
+    /// of the mutation can refuse to.
+    fn apply_replay_mutation_strict(
+        tables: &RwLock<HashMap<TableId, TableState>>,
+        mutation: &Mutation,
+    ) -> ferrosa_common::Result<bool> {
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
         let tables = tables.read();
         let Some(state) = tables.get(&table_id) else {
-            return false;
+            return Ok(false);
         };
+        let mut first_error: Option<ferrosa_common::Error> = None;
         // Layer 3 of the timeuuid-flush-wedge fix: when the per-cell
         // length validator (run inside `Memtable::put`) rejects a row at
         // replay time, salvage the row to a quarantine JSONL file rather
@@ -3845,6 +3941,11 @@ impl StorageEngine {
                             Ok(qw) => quarantine_writer = Some(qw),
                             Err(e) => {
                                 tracing::error!(%e, %table_id, "replay: failed to open quarantine writer; row dropped");
+                                first_error.get_or_insert_with(|| {
+                                    ferrosa_common::Error::InvalidFormat(format!(
+                                        "{table_id}: quarantine writer unavailable, row dropped: {e}"
+                                    ))
+                                });
                                 continue;
                             }
                         }
@@ -3855,12 +3956,18 @@ impl StorageEngine {
                         qw.write_row(mutation.key.key.as_bytes(), row, &schema, &reason)
                     {
                         tracing::error!(%qe, %table_id, "replay: failed to write quarantine row");
+                        first_error.get_or_insert_with(|| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "{table_id}: could not quarantine a malformed row: {qe}"
+                            ))
+                        });
                     } else {
                         quarantined_in_partition += 1;
                     }
                 }
                 Err(e) => {
                     tracing::error!(%e, %table_id, "replay: failed to replay row");
+                    first_error.get_or_insert(e);
                 }
             }
         }
@@ -3875,10 +3982,14 @@ impl StorageEngine {
                 "replay: quarantined malformed rows — see quarantine file for forensic record"
             );
         }
-        true
+        match first_error {
+            None => Ok(true),
+            Some(e) => Err(e),
+        }
     }
 
     fn replay_deferred_mutations_for_table(&self, table_id: &TableId) {
+        self.reingest_set_aside_for_table(table_id);
         let pending = {
             let mut deferred = self.deferred_replay_mutations.lock();
             if deferred.is_empty() {
@@ -10052,17 +10163,160 @@ impl StorageEngine {
         &self.compaction_executor
     }
 
-    /// What startup replay set aside on disk because no table schema was
-    /// available to bind it to, or `None` if nothing was set aside.
+    /// Everything startup replay set aside on disk because no table schema was
+    /// available to bind it to, and that has not been re-ingested yet.
     ///
-    /// A `Some` means mutations are durable under `<data_dir>/commitlog-unreplayed/`
-    /// but are NOT in any memtable: they are invisible to reads until an
-    /// operator restores the schema and re-ingests them. Surface it in status
-    /// output; it is the engine's explicit degraded state.
-    pub fn replay_set_aside_report(
+    /// Non-empty means mutations are durable under
+    /// `<data_dir>/commitlog-unreplayed/` but are NOT in any memtable: they are
+    /// invisible to reads until their table's schema is registered (automatic)
+    /// or an operator runs `ferrosa-ctl commitlog set-aside --apply`. `/readyz`
+    /// reports it; it is the engine's explicit degraded state.
+    pub fn replay_set_aside_status(&self) -> crate::replay_set_aside::SetAsideStatus {
+        self.set_aside_status.lock().clone()
+    }
+
+    /// Finds the set-aside files on disk, records them as the engine's
+    /// degraded state, and re-ingests whatever the registered tables can take.
+    fn adopt_set_aside_files(&self) -> ferrosa_common::Result<()> {
+        let status = crate::replay_set_aside::scan_set_aside_dir(&self.config.data_dir)?;
+        for file in status.unreadable() {
+            tracing::error!(
+                path = %file.path.display(),
+                error = file.error.as_deref().unwrap_or_default(),
+                "set-aside file cannot be read to its end; it is kept untouched and its \
+                 mutations are NOT re-ingested. Inspect it with \
+                 `ferrosa-ctl commitlog set-aside`"
+            );
+        }
+        if !status.is_empty() {
+            tracing::error!(
+                files = status.files.len(),
+                mutations = status.mutations(),
+                tables = ?status.tables(),
+                "mutations are set aside on disk and invisible to reads until their table \
+                 schema is registered; /readyz reports this node as not ready"
+            );
+        }
+        self.publish_set_aside_status(status);
+        if let Err(e) = self.reingest_set_aside_with_faults(None, SetAsideFaults::default()) {
+            tracing::error!(%e, "startup re-ingest of set-aside mutations is incomplete");
+        }
+        Ok(())
+    }
+
+    /// Re-ingests every set-aside mutation whose table is registered. Returns
+    /// the first failure after trying every file; the remainder stays set aside
+    /// and is reported by [`replay_set_aside_status`](Self::replay_set_aside_status).
+    pub fn reingest_set_aside(&self) -> ferrosa_common::Result<()> {
+        self.reingest_set_aside_with_faults(None, SetAsideFaults::default())
+    }
+
+    fn publish_set_aside_status(&self, status: crate::replay_set_aside::SetAsideStatus) {
+        crate::replay_set_aside::set_replay_set_aside_pending_mutations(status.mutations());
+        *self.set_aside_status.lock() = status;
+    }
+
+    /// Called whenever a table becomes known: replays that table's set-aside
+    /// mutations. A failure is logged and leaves them set aside; it never fails
+    /// the registration, because `/readyz` already reports the remainder.
+    fn reingest_set_aside_for_table(&self, table_id: &TableId) {
+        let key = format!("{}.{}", table_id.keyspace(), table_id.table());
+        let pending = self
+            .set_aside_status
+            .lock()
+            .files
+            .iter()
+            .any(|f| f.error.is_none() && f.tables.contains_key(&key));
+        if !pending {
+            return;
+        }
+        if let Err(e) =
+            self.reingest_set_aside_with_faults(Some(table_id), SetAsideFaults::default())
+        {
+            tracing::error!(%e, table = %table_id, "set-aside mutations for this table stay set aside");
+        }
+    }
+
+    pub(crate) fn reingest_set_aside_with_faults(
         &self,
-    ) -> Option<&crate::replay_set_aside::ReplaySetAsideReport> {
-        self.replay_set_aside.as_ref()
+        only: Option<&TableId>,
+        faults: SetAsideFaults,
+    ) -> ferrosa_common::Result<()> {
+        let _serial = self.set_aside_reingest.lock();
+        let mut first_error = None;
+        for path in crate::replay_set_aside::list_set_aside_files(&self.config.data_dir)? {
+            if !self.set_aside_file_is_ready(&path, only) {
+                continue;
+            }
+            let mut sink = EngineSetAsideSink {
+                engine: self,
+                only,
+                touched: std::collections::HashSet::new(),
+                faults,
+            };
+            match crate::replay_set_aside::reingest_file(&path, &mut sink) {
+                Ok(outcome) => self.record_set_aside_outcome(&path, &outcome),
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        path = %path.display(),
+                        "set-aside re-ingest failed; the file is kept whole and nothing in it \
+                         is lost"
+                    );
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Whether a re-ingest run should open `path`: a file known to be
+    /// unreadable is left to the operator, and a file none of whose tables is
+    /// registered (or targeted) has nothing to apply.
+    fn set_aside_file_is_ready(&self, path: &Path, only: Option<&TableId>) -> bool {
+        let status = self.set_aside_status.lock();
+        let Some(file) = status.files.iter().find(|f| f.path == path) else {
+            return true;
+        };
+        if file.error.is_some() {
+            return false;
+        }
+        let tables = self.tables.read();
+        file.tables.keys().any(|key| {
+            tables
+                .keys()
+                .any(|id| format!("{}.{}", id.keyspace(), id.table()) == *key)
+                && only.is_none_or(|o| format!("{}.{}", o.keyspace(), o.table()) == *key)
+        })
+    }
+
+    fn record_set_aside_outcome(
+        &self,
+        path: &Path,
+        outcome: &crate::replay_set_aside::FileOutcome,
+    ) {
+        if outcome.applied == 0 {
+            return;
+        }
+        let mut status = self.set_aside_status.lock().clone();
+        status.files.retain(|f| f.path != path);
+        if !outcome.removed {
+            status
+                .files
+                .push(crate::replay_set_aside::SetAsideFileStatus {
+                    path: path.to_path_buf(),
+                    mutations: outcome.kept,
+                    tables: outcome.kept_tables.clone(),
+                    error: None,
+                });
+        }
+        tracing::info!(
+            path = %path.display(),
+            applied = outcome.applied,
+            still_set_aside = outcome.kept,
+            "re-ingested set-aside mutations; the rows are visible to reads again"
+        );
+        self.publish_set_aside_status(status);
     }
 
     #[cfg(test)]
@@ -13751,7 +14005,8 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
-            replay_set_aside: None,
+            set_aside_status: parking_lot::Mutex::new(Default::default()),
+            set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             compaction_retry: parking_lot::Mutex::new(CompactionRetryPolicy::default()),
@@ -28561,12 +28816,15 @@ mod tests {
             .expect("a full no-schema replay buffer must degrade, not refuse to open");
         assert_eq!(pending.len(), 1, "the buffered mutation is still returned");
 
-        let report = engine
-            .replay_set_aside_report()
-            .expect("the overflowing mutation must be reported as set aside");
-        assert_eq!(report.mutations, 1);
-        assert_eq!(report.tables.get("test_ks.test_table"), Some(&1));
-        let set_aside = crate::replay_set_aside::read_set_aside_file(&report.path).unwrap();
+        let status = engine.replay_set_aside_status();
+        assert_eq!(
+            status.mutations(),
+            1,
+            "the overflowing mutation must be reported as set aside"
+        );
+        assert_eq!(status.tables().get("test_ks.test_table"), Some(&1));
+        let set_aside =
+            crate::replay_set_aside::read_set_aside_file(&status.files[0].path).unwrap();
         assert_eq!(set_aside.len(), 1, "the set-aside file holds the mutation");
         assert_eq!(set_aside[0].table, "test_table");
         assert!(
@@ -28603,7 +28861,7 @@ mod tests {
         };
         let (engine, pending) = StorageEngine::open(config, None).unwrap();
         assert!(pending.is_empty(), "durable schema binds replay directly");
-        assert!(engine.replay_set_aside_report().is_none());
+        assert!(engine.replay_set_aside_status().is_empty());
         for i in 0..3 {
             assert!(
                 engine
@@ -28613,6 +28871,193 @@ mod tests {
                 "mutation k{i} must be replayed from the durable schema"
             );
         }
+    }
+
+    /// Writes `keys` for `test_ks.test_table` into a fresh set-aside file under
+    /// `dir`, exactly as a startup replay with no schema would have.
+    fn set_aside_test_keys(dir: &std::path::Path, keys: &[&str]) -> std::path::PathBuf {
+        let mut aside = crate::replay_set_aside::ReplaySetAside::new(dir);
+        for (i, key) in keys.iter().enumerate() {
+            let ts = 100 + i as i64;
+            aside
+                .append(&Mutation::new(
+                    "test_ks".into(),
+                    "test_table".into(),
+                    make_key(key),
+                    vec![make_row(b"aside", ts)],
+                    ts,
+                ))
+                .unwrap();
+        }
+        aside.sync().unwrap();
+        aside.into_report().unwrap().path
+    }
+
+    fn assert_each_key_has_one_row(engine: &StorageEngine, keys: &[&str]) {
+        for key in keys {
+            let partition = engine
+                .read(&table_id(), &make_key(key))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{key} must be visible after re-ingest"));
+            assert_eq!(partition.rows.len(), 1, "{key} must have exactly one row");
+        }
+    }
+
+    #[test]
+    fn set_aside_mutations_reingest_when_their_table_is_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["a0", "a1", "a2"];
+        let path = set_aside_test_keys(dir.path(), &keys);
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let before = engine.replay_set_aside_status();
+        assert_eq!(before.mutations(), 3, "invisible rows must be counted");
+        assert_eq!(before.tables().get("test_ks.test_table"), Some(&3));
+        assert!(engine.read(&table_id(), &make_key("a0")).unwrap().is_none());
+
+        engine.register_table(test_schema()).unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists(), "the set-aside file is gone once applied");
+        assert!(engine.replay_set_aside_status().is_empty());
+    }
+
+    #[test]
+    fn open_reingests_set_aside_mutations_once_the_schema_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            // A flush persists storage-schema.json, the schema `open` binds to.
+            engine
+                .write(&table_id(), &make_key("anchor"), make_row(b"v", 9), 9)
+                .unwrap();
+            engine.flush(&table_id()).unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+        let keys = ["b0", "b1"];
+        let path = set_aside_test_keys(dir.path(), &keys);
+
+        let (engine, _pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists(), "the next boot with a schema self-heals");
+        assert!(engine.replay_set_aside_status().is_empty());
+    }
+
+    #[test]
+    fn set_aside_mutations_for_an_unknown_table_stay_and_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = set_aside_test_keys(dir.path(), &["c0", "c1"]);
+        let before = std::fs::read(&path).unwrap();
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(schema_with_a_static_column())
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), before, "file left intact");
+        let status = engine.replay_set_aside_status();
+        assert_eq!(status.mutations(), 2);
+        assert_eq!(status.tables().get("test_ks.test_table"), Some(&2));
+        assert!(
+            engine.read(&table_id(), &make_key("c0")).is_err()
+                || engine.read(&table_id(), &make_key("c0")).unwrap().is_none()
+        );
+    }
+
+    #[test]
+    fn a_crash_mid_reingest_before_the_flush_loses_and_duplicates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["d0", "d1", "d2", "d3", "d4"];
+        let path;
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            path = set_aside_test_keys(dir.path(), &keys);
+            let faults = SetAsideFaults {
+                fail_before_frame: Some(3),
+                ..SetAsideFaults::default()
+            };
+            engine
+                .reingest_set_aside_with_faults(None, faults)
+                .expect_err("the injected fault must surface, not be swallowed");
+            assert_eq!(
+                crate::replay_set_aside::read_set_aside_file(&path)
+                    .unwrap()
+                    .len(),
+                5,
+                "no frame is dropped before its mutation is durable"
+            );
+            // Dropping here is the crash: three rows were only in the memtable.
+        }
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_crash_after_the_flush_but_before_the_file_is_removed_duplicates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["e0", "e1", "e2"];
+        let path;
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            path = set_aside_test_keys(dir.path(), &keys);
+            let faults = SetAsideFaults {
+                fail_after_flush: true,
+                ..SetAsideFaults::default()
+            };
+            engine
+                .reingest_set_aside_with_faults(None, faults)
+                .expect_err("the injected fault must surface");
+            assert!(path.exists(), "the file outlives the crash");
+        }
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        assert_each_key_has_one_row(&engine, &keys);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_torn_set_aside_file_is_reported_and_kept_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = set_aside_test_keys(dir.path(), &["f0", "f1"]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "file kept for the operator"
+        );
+        let status = engine.replay_set_aside_status();
+        let unreadable = status.unreadable();
+        assert_eq!(unreadable.len(), 1, "the torn file is named");
+        assert!(unreadable[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("torn frame"));
     }
 
     #[test]

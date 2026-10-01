@@ -95,6 +95,12 @@ impl FromRef<WebAppState> for Arc<crate::listener_status::ListenerStatus> {
     }
 }
 
+impl FromRef<WebAppState> for Arc<StorageEngine> {
+    fn from_ref(state: &WebAppState) -> Self {
+        Arc::clone(&state.storage)
+    }
+}
+
 impl FromRef<WebAppState> for Arc<VirtualTableRegistry> {
     fn from_ref(state: &WebAppState) -> Self {
         state.registry.clone()
