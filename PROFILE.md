@@ -162,6 +162,7 @@ worker is initialized. Byte values are bytes unless the name says otherwise.
 | `FERROSA_MEMTABLE_BACKPRESSURE_BYTES` | Active memtable limit before writes are backpressured/rejected; defaults to `max(4 × flush threshold, 64 MiB)` | `268435456` (256 MiB with the default flush threshold) |
 | `FERROSA_MEMTABLE_NUM_SHARDS` | Number of memtable shards | `64` |
 | `FERROSA_FLUSH_MAX_AGE_SECS` | Maximum age before a memtable is flushed | `30` |
+| `FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS` | Startup commit-log replay: most mutations held in memory for tables that are absent while a schema exists. Overflow is written to `<data_dir>/commitlog-unreplayed/` and logged at ERROR with table ids and counts. Must be a positive integer; an invalid value fails startup. | `10000` |
 | `FERROSA_FLUSH_PARALLELISM` | Shared flush worker count | Host available parallelism, clamped to `1..64` |
 | `FERROSA_CACHE_MAX_BYTES` | Maximum local SSTable cache size | `10737418240` (10 GiB) |
 | `FERROSA_CACHE_HOT_WINDOW_SECS` | Seconds after a foreground read during which a table's uploaded SSTables are never evicted from the local cache. `0` disables hotness. | `900` |

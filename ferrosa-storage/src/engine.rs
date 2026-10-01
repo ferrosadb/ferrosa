@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use ferrosa_common::task_pool::TaskPool;
 use futures::TryStreamExt;
 use parking_lot::RwLock;
@@ -1520,6 +1519,63 @@ fn restore_work(
     work
 }
 
+/// Test seam between a rehydrated component's temp file being complete and its
+/// promotion by rename: the window in which a concurrent retirement used to
+/// sweep the temp file away (ST-61). Keyed by table directory so tests running
+/// in parallel only see their own.
+#[cfg(test)]
+mod rehydrate_promote_seam {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    type PromoteHook = Arc<dyn Fn(&Path) + Send + Sync>;
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, PromoteHook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn install(table_dir: &Path, hook: PromoteHook) {
+        HOOKS
+            .lock()
+            .expect("promote seam lock")
+            .insert(table_dir.to_path_buf(), hook);
+    }
+
+    pub(super) fn fire(tmp_path: &Path) {
+        let hook = tmp_path.parent().and_then(|dir| {
+            HOOKS
+                .lock()
+                .expect("promote seam lock")
+                .get(dir)
+                .map(Arc::clone)
+        });
+        if let Some(hook) = hook {
+            hook(tmp_path);
+        }
+    }
+}
+
+/// Environment variable bounding the commit-log replay's in-memory buffer of
+/// mutations whose table is absent from a schema that otherwise exists.
+const MAX_DEFERRED_REPLAY_ENV: &str = "FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS";
+
+/// Default for [`MAX_DEFERRED_REPLAY_ENV`].
+const DEFAULT_MAX_DEFERRED_REPLAY_MUTATIONS: usize = 10_000;
+
+/// Parses [`MAX_DEFERRED_REPLAY_ENV`]: unset or blank is the default, anything
+/// else must be a positive integer. An invalid value is an error naming the
+/// variable, never a silent fall back to the default.
+fn parse_max_deferred_replay_mutations(raw: Option<&str>) -> ferrosa_common::Result<usize> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_MAX_DEFERRED_REPLAY_MUTATIONS);
+    };
+    match raw.parse::<usize>() {
+        Ok(limit) if limit > 0 => Ok(limit),
+        _ => Err(ferrosa_common::Error::InvalidFormat(format!(
+            "{MAX_DEFERRED_REPLAY_ENV} must be a positive integer, got {raw:?}"
+        ))),
+    }
+}
+
 /// Progress is logged every 25 generations or every 30 seconds, whichever
 /// comes first.
 fn restore_progress_due(since_last_log: std::time::Duration, gens_since_last_log: usize) -> bool {
@@ -2077,8 +2133,6 @@ impl StorageEngine {
             "CRC.db",
         ];
 
-        let rehydration_locks: Arc<DashMap<String, Arc<std::sync::Mutex<()>>>> =
-            Arc::new(DashMap::new());
         {
             let data_dir = data_dir.clone();
             let prefix = prefix.clone();
@@ -2187,16 +2241,24 @@ impl StorageEngine {
 
             crate::metrics::inc_sstable_rehydration_request();
             let started = Instant::now();
-            let lock_key = format!("{table_id}/{sstable_id}");
-            let rehydration_lock = Arc::clone(
-                rehydration_locks
-                    .entry(lock_key.clone())
-                    .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
-                    .value(),
+            // Shared with compaction's input retirement (ST-61): a retire of
+            // this generation cannot sweep our temp files mid-download, and a
+            // generation retired while we waited is not downloaded again.
+            let generation_slot = crate::generation_guard::slot(
+                &data_dir.join("sstables").join(&table_id),
+                &sstable_id,
             );
-            let _guard = rehydration_lock
-                .lock()
-                .expect("SSTable rehydration lock poisoned");
+            let generation = generation_slot.lock();
+            if generation.is_retired() {
+                tracing::warn!(
+                    local_path = %path.display(),
+                    table = table_id,
+                    sstable = sstable_id,
+                    "refusing to rehydrate an SSTable generation compaction has retired; \
+                     the caller's view of the table is stale"
+                );
+                return Ok(false);
+            }
             let Some(parent) = path.parent() else {
                 return Ok(false);
             };
@@ -2273,6 +2335,8 @@ impl StorageEngine {
                                 ))
                             })?;
                             drop(file);
+                            #[cfg(test)]
+                            rehydrate_promote_seam::fire(&tmp_path);
                             tokio::fs::rename(&tmp_path, &local_path)
                                 .await
                                 .map_err(|e| {
@@ -3114,6 +3178,19 @@ impl StorageEngine {
         config: StorageEngineConfig,
         runtime: Option<&tokio::runtime::Handle>,
     ) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
+        let max_deferred_absent_table = parse_max_deferred_replay_mutations(
+            std::env::var(MAX_DEFERRED_REPLAY_ENV).ok().as_deref(),
+        )?;
+        Self::open_with_deferred_limit(config, runtime, max_deferred_absent_table)
+    }
+
+    /// [`Self::open`] with the absent-table deferral bound passed in, so a
+    /// test can pick it without touching the process environment.
+    fn open_with_deferred_limit(
+        config: StorageEngineConfig,
+        runtime: Option<&tokio::runtime::Handle>,
+        max_deferred_absent_table: usize,
+    ) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
         })?;
@@ -3207,6 +3284,9 @@ impl StorageEngine {
         let set_aside = parking_lot::Mutex::new(crate::replay_set_aside::ReplaySetAside::new(
             &config.data_dir,
         ));
+        // Absent-table overflow, per table id, for the ERROR below.
+        let mut absent_table_spilled: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
         let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming_with_barrier(
             config.commit_log.clone(),
             |mutation| {
@@ -3220,23 +3300,47 @@ impl StorageEngine {
                     }
                     pending_mutations.push(mutation);
                 } else if !Self::apply_replay_mutation_to_tables(&tables, &mutation) {
-                    deferred_replay_mutations.lock().push(mutation);
+                    Self::defer_or_set_aside_absent_table_mutation(
+                        &deferred_replay_mutations,
+                        &set_aside,
+                        &mut absent_table_spilled,
+                        max_deferred_absent_table,
+                        mutation,
+                    )?;
                 }
                 Ok(())
             },
             || set_aside.lock().sync(),
         )?;
-        if let Some(report) = &set_aside.into_inner().into_report() {
-            tracing::error!(
-                mutations = report.mutations,
-                tables = ?report.tables,
-                path = %report.path.display(),
-                limit = max_pending_without_schema,
-                "commit-log replay had no table schema and its in-memory buffer was full \
-                 (FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA); the overflow was set aside on \
-                 disk, NOT replayed. Those mutations are invisible to reads until their \
-                 table schema is registered, when they are re-ingested automatically"
-            );
+        let set_aside = set_aside.into_inner();
+        let absent_spilled_total: u64 = absent_table_spilled.values().sum();
+        let no_schema_spilled = set_aside.count().saturating_sub(absent_spilled_total);
+        let replay_set_aside = set_aside.into_report();
+        if let Some(report) = &replay_set_aside {
+            if no_schema_spilled > 0 {
+                tracing::error!(
+                    mutations = no_schema_spilled,
+                    tables = ?report.tables,
+                    path = %report.path.display(),
+                    limit = max_pending_without_schema,
+                    "commit-log replay had no table schema and its in-memory buffer was full \
+                     (FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA); the overflow was set aside on \
+                     disk, NOT replayed. Those mutations are invisible to reads until their \
+                     table schema is registered, when they are re-ingested automatically"
+                );
+            }
+            if absent_spilled_total > 0 {
+                tracing::error!(
+                    mutations = absent_spilled_total,
+                    tables = ?absent_table_spilled,
+                    path = %report.path.display(),
+                    limit = max_deferred_absent_table,
+                    "commit-log replay found mutations for tables absent from the schema and its \
+                     in-memory deferral buffer was full ({MAX_DEFERRED_REPLAY_ENV}); the overflow \
+                     was set aside on disk, NOT replayed. Those mutations are invisible to reads \
+                     unless the table is registered and the file is re-ingested"
+                );
+            }
         }
 
         let engine = Self {
@@ -3863,6 +3967,30 @@ impl StorageEngine {
                 self.deferred_replay_mutations.lock().push(mutation);
             }
         }
+        Ok(())
+    }
+
+    /// Holds a mutation whose table is absent for a later `register_table`,
+    /// up to `max_deferred`; past that it is appended to the durable set-aside
+    /// store (fsynced by the replay barrier before its segment is deleted) and
+    /// counted per table in `spilled`, so startup memory stays bounded.
+    fn defer_or_set_aside_absent_table_mutation(
+        deferred: &parking_lot::Mutex<Vec<Mutation>>,
+        set_aside: &parking_lot::Mutex<crate::replay_set_aside::ReplaySetAside>,
+        spilled: &mut std::collections::BTreeMap<String, u64>,
+        max_deferred: usize,
+        mutation: Mutation,
+    ) -> ferrosa_common::Result<()> {
+        let mut deferred = deferred.lock();
+        if deferred.len() < max_deferred {
+            deferred.push(mutation);
+            return Ok(());
+        }
+        drop(deferred);
+        set_aside.lock().append(&mutation)?;
+        *spilled
+            .entry(format!("{}.{}", mutation.keyspace, mutation.table))
+            .or_insert(0) += 1;
         Ok(())
     }
 
@@ -29128,6 +29256,114 @@ mod tests {
             .contains("torn frame"));
     }
 
+    /// Writes `n` unflushed rows to a table that is then dropped, leaving its
+    /// mutations in the commit log while the persisted schema holds only the
+    /// surviving table. Returns the data dir holder.
+    fn data_dir_with_commit_log_for_a_dropped_table(n: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        let dropped = TableSchema {
+            table: "dropped_table".to_string(),
+            ..test_schema()
+        };
+        let dropped_id = TableId::new(&dropped.keyspace, &dropped.table);
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(dropped).unwrap();
+        for i in 0..n {
+            engine
+                .write(
+                    &dropped_id,
+                    &make_key(&format!("d{i}")),
+                    make_row(b"v", i as i64),
+                    i as i64,
+                )
+                .unwrap();
+        }
+        engine.unregister_table(&dropped_id).unwrap();
+        // A flush persists storage-schema.json, now without the dropped table.
+        engine
+            .write(&tid, &make_key("anchor"), make_row(b"v", 9), 9)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine.commit_log.shutdown().unwrap();
+        dir
+    }
+
+    /// t_f5a69b0b: mutations for a table absent from an existing schema were
+    /// held in an unbounded `Vec`, so a large commit log for a dropped table
+    /// could exhaust memory at startup. Past the bound they spill to the
+    /// durable set-aside store, counted per table.
+    #[test]
+    fn replay_spills_absent_table_mutations_past_the_deferral_bound() {
+        let dir = data_dir_with_commit_log_for_a_dropped_table(5);
+
+        let (engine, _pending) = StorageEngine::open_with_deferred_limit(
+            StorageEngineConfig::test_config(dir.path()),
+            None,
+            2,
+        )
+        .expect("an overfull deferral buffer must spill, not refuse to open");
+
+        assert_eq!(
+            engine.deferred_replay_mutation_count_for_test(),
+            2,
+            "memory stays bounded at the limit"
+        );
+        // `replay_set_aside_report()` became `replay_set_aside_status()`, which
+        // reports every set-aside file rather than one aggregate; this spill
+        // writes a single file, so that file IS the report.
+        let status = engine.replay_set_aside_status();
+        assert_eq!(status.files.len(), 1, "the overflow went to one file");
+        let report = &status.files[0];
+        assert_eq!(report.mutations, 3);
+        assert_eq!(report.tables.get("test_ks.dropped_table"), Some(&3));
+        let on_disk = crate::replay_set_aside::read_set_aside_file(&report.path).unwrap();
+        assert_eq!(on_disk.len(), 3, "the set-aside file holds the overflow");
+        assert!(on_disk.iter().all(|m| m.table == "dropped_table"));
+    }
+
+    #[test]
+    fn replay_defers_absent_table_mutations_under_the_bound_as_before() {
+        let dir = data_dir_with_commit_log_for_a_dropped_table(5);
+
+        let (engine, _pending) = StorageEngine::open_with_deferred_limit(
+            StorageEngineConfig::test_config(dir.path()),
+            None,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(engine.deferred_replay_mutation_count_for_test(), 5);
+        assert!(
+            engine.replay_set_aside_status().is_empty(),
+            "nothing is set aside while the buffer has room"
+        );
+    }
+
+    #[test]
+    fn deferred_replay_bound_tunable_rejects_invalid_values_naming_the_variable() {
+        assert_eq!(
+            parse_max_deferred_replay_mutations(None).unwrap(),
+            DEFAULT_MAX_DEFERRED_REPLAY_MUTATIONS
+        );
+        assert_eq!(
+            parse_max_deferred_replay_mutations(Some("  ")).unwrap(),
+            DEFAULT_MAX_DEFERRED_REPLAY_MUTATIONS
+        );
+        assert_eq!(parse_max_deferred_replay_mutations(Some("64")).unwrap(), 64);
+        for bad in ["0", "-1", "lots", "1.5"] {
+            let err = parse_max_deferred_replay_mutations(Some(bad))
+                .expect_err("an invalid bound must be rejected")
+                .to_string();
+            assert!(
+                err.contains("FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS") && err.contains(bad),
+                "error must name the variable and the value, got: {err}"
+            );
+        }
+    }
+
     #[test]
     fn replayed_legacy_collection_blob_does_not_panic_flush_beside_element_cells() {
         let dir = tempfile::tempdir().unwrap();
@@ -29795,6 +30031,114 @@ mod tests {
             StorageEngine::evicted_generations(&dir.path().join("sstables")).is_empty(),
             "a retired generation must not keep an eviction marker"
         );
+    }
+
+    /// ST-61: compaction retired an evicted input without clearing its marker,
+    /// so every later start logged an ERROR per marker for rows that are
+    /// deliberately not served, training operators to ignore the message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_retiring_an_evicted_input_leaves_no_marker_for_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable(dir.path(), "test-retire-evicted-marker").await;
+        assert!(StorageEngine::evicted_marker_path(&table_dir, &gen).exists());
+
+        assert!(crate::compaction::retire::retire(&table_dir, &gen));
+
+        assert!(
+            StorageEngine::evicted_generations(&dir.path().join("sstables")).is_empty(),
+            "a start after the retirement has no marker to complain about"
+        );
+        assert_eq!(
+            StorageEngine::restore_evicted_sstables_blocking_in(dir.path(), None).unwrap(),
+            0
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// A generation compaction retired must not be pulled back from S3 by a
+    /// reader that still holds a stale view of the table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_generation_is_not_rehydrated_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable(dir.path(), "test-retired-not-rehydrated").await;
+        assert!(crate::compaction::retire::retire(&table_dir, &gen));
+
+        let rehydrated =
+            ferrosa_sstable::io::rehydrate_file(table_dir.join(format!("{gen}-Data.db"))).unwrap();
+
+        assert!(!rehydrated, "a retired generation is refused, not restored");
+        assert!(StorageEngine::generation_component_path(&table_dir, &gen, "Data.db").is_none());
+        engine.shutdown().unwrap();
+    }
+
+    /// ST-61 (t_dfd7d1bd): one run logged `failed to promote SSTable
+    /// rehydration temp file ...rehydrate.tmp` beside `compaction: task failed
+    /// ... Data.db is missing`. Retirement sweeps every `<gen>-*` entry, temp
+    /// files included, so retiring a generation while a rehydrate of it was
+    /// between "temp file complete" and "rename" moved the temp file away.
+    ///
+    /// The seam fires in exactly that window and starts the retirement there.
+    /// The retirement must wait for the rehydrate, which then completes, and
+    /// only afterwards remove the generation: never a half-present generation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retiring_a_generation_while_it_is_promoting_waits_for_the_rehydrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, table_dir, gen, _keys) =
+            engine_with_evicted_sstable(dir.path(), "test-promote-vs-retire").await;
+
+        let retirement: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<bool>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let finished_inside_window = Arc::new(AtomicBool::new(false));
+        {
+            let retirement = Arc::clone(&retirement);
+            let finished_inside_window = Arc::clone(&finished_inside_window);
+            let (dir_for_retire, gen_for_retire) = (table_dir.clone(), gen.clone());
+            rehydrate_promote_seam::install(
+                &table_dir,
+                Arc::new(move |_tmp| {
+                    let mut slot = retirement.lock();
+                    if slot.is_some() {
+                        return;
+                    }
+                    let (dir, gen) = (dir_for_retire.clone(), gen_for_retire.clone());
+                    let handle =
+                        std::thread::spawn(move || crate::compaction::retire::retire(&dir, &gen));
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    finished_inside_window.store(handle.is_finished(), Ordering::SeqCst);
+                    *slot = Some(handle);
+                }),
+            );
+        }
+
+        let rehydrated =
+            ferrosa_sstable::io::rehydrate_file(table_dir.join(format!("{gen}-Data.db")))
+                .expect("the rehydrate must complete, not fail on a vanished temp file");
+
+        assert!(rehydrated);
+        assert!(
+            !finished_inside_window.load(Ordering::SeqCst),
+            "the retirement ran while the rehydrate was promoting"
+        );
+        let handle = retirement
+            .lock()
+            .take()
+            .expect("the seam started the retirement");
+        assert!(
+            handle.join().unwrap(),
+            "the retirement completes afterwards"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(gen.as_str()))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a retired generation leaves nothing behind, found {leftovers:?}"
+        );
+        engine.shutdown().unwrap();
     }
 
     /// The same loss through the crash-recovery constructor.

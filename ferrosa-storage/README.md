@@ -300,8 +300,12 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   from S3 before any table registers (`restore_evicted_sstables`), because
   generation discovery reads local files only. Only marked generations are
   restored: a manifest entry without a marker may be a compacted-away input, and
-  restoring it would resurrect purged rows. Retiring a generation
-  (`delete_sstable_files`) removes its marker. A live reader that reopens a
+  restoring it would resurrect purged rows. Retiring a generation removes its
+  marker: `delete_sstable_files` (truncate/eviction) and compaction's input
+  retirement (`compaction::retire::retire`, which clears it last and fails the
+  retirement if it cannot, FMEA ST-61). Retirement and S3 rehydration of one
+  generation exclude each other (`generation_guard`), and a retired generation
+  is not rehydrated again. A live reader that reopens a
   marked generation between eviction and restart rehydrates it from S3 first
   (`flush::rehydrate_if_evicted`, called by `open_file_sstable` and
   `open_sstable_from_dir`) and then clears the marker; an unmarked missing
@@ -522,6 +526,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   (`StorageEngine::reingest_set_aside_offline`). Replay also
   expands legacy whole-value collection cells into element cells so the SSTable
   writer's mixed-cell assertion cannot fire at the next flush.
+  Mutations for tables absent while a schema exists are held in memory up to
+  `FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS` (default 10000; invalid values fail
+  `open` naming the variable) and the overflow goes to the same set-aside file,
+  counted per table and logged at ERROR (FMEA ST-62).
 - **Range reads fail loud on an unreadable SSTable** (`store.rs`,
   `with_retried_scan`, FMEA ST-41) — `read_range*`, `read_token_range[_bounded]`,
   `walk_token_range[_for_digest]`, the time-series cursor and the full-text
