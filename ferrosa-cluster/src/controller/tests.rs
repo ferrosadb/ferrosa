@@ -3965,8 +3965,10 @@ async fn advertised_peer_from_handshake(
     use tokio_util::codec::Framed;
 
     let (client_io, server_io) = tokio::io::duplex(8192);
-    let mut client_config = ferrosa_net::config::NetConfig::default();
-    client_config.cluster_name = server_config.cluster_name.clone();
+    let client_config = ferrosa_net::config::NetConfig {
+        cluster_name: server_config.cluster_name.clone(),
+        ..Default::default()
+    };
 
     let mut client_framed = Framed::new(
         client_io,
@@ -4000,11 +4002,13 @@ async fn internode_broadcast_hostname_is_advertised_and_committed_not_a_frozen_i
     // after the next restart.
     let advertised = "localhost:17000";
 
-    let mut server_config = ferrosa_net::config::NetConfig::default();
-    server_config.cluster_name = "ferrosa".to_string();
-    server_config.broadcast_addr = startup_ip;
-    server_config.bind_addr = "0.0.0.0:17000".parse().unwrap();
-    server_config.internode_broadcast = Some(advertised.to_string());
+    let server_config = ferrosa_net::config::NetConfig {
+        cluster_name: "ferrosa".to_string(),
+        broadcast_addr: startup_ip,
+        bind_addr: "0.0.0.0:17000".parse().unwrap(),
+        internode_broadcast: Some(advertised.to_string()),
+        ..Default::default()
+    };
 
     // (1) What the node advertises in the handshake — the peer-facing half.
     let peer = advertised_peer_from_handshake(&server_config).await;
