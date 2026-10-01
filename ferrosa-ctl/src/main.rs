@@ -362,6 +362,36 @@ enum SstableAction {
         #[arg(long)]
         apply: bool,
     },
+
+    /// Mark generations an older ferrosa evicted without recording it, so the
+    /// next start restores them from S3. Evidence is the node's log: each
+    /// `evicted uploaded local SSTable from cache` line names one. Replaces the
+    /// unsupported `scripts/recover-evicted-sstables.py`. Dry-run by default;
+    /// refuses a data dir whose node is running (it probes the sled lock under
+    /// `<data-dir>/raft`). Never overwrites an existing marker.
+    MarkEvicted {
+        /// The node's data directory (holds `sstables/` and `raft/`).
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+
+        /// The node's stdout/stderr log recording the evictions.
+        #[arg(long)]
+        log: std::path::PathBuf,
+
+        /// Scan only the last N MiB of the log (0 = all).
+        #[arg(long, default_value_t = 0)]
+        tail_mb: u64,
+
+        /// Write the markers. Without this, only the plan is printed. The node
+        /// MUST be stopped.
+        #[arg(long)]
+        apply: bool,
+
+        /// With --apply, proceed although no lock file exists to prove the
+        /// node is stopped (single-node dirs without a raft directory).
+        #[arg(long)]
+        assume_stopped: bool,
+    },
 }
 
 /// Raft administration sub-actions.
@@ -785,6 +815,19 @@ async fn main() {
             SstableAction::S3Clean { dir, apply } => {
                 commands::sstable::sstable_s3_clean(&dir, apply).await
             }
+            SstableAction::MarkEvicted {
+                data_dir,
+                log,
+                tail_mb,
+                apply,
+                assume_stopped,
+            } => commands::evicted::sstable_mark_evicted(
+                &data_dir,
+                &log,
+                tail_mb,
+                apply,
+                assume_stopped,
+            ),
         },
     };
 
@@ -1481,6 +1524,36 @@ mod tests {
                 assert_eq!(dir, std::path::PathBuf::from("/data/ks.t"));
                 assert!(!apply, "quarantine must default to dry-run (apply=false)");
                 assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sstable_mark_evicted_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "sstable",
+            "mark-evicted",
+            "--data-dir",
+            "/data/node1",
+            "--log",
+            "/logs/node1.log",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Sstable {
+                action:
+                    SstableAction::MarkEvicted {
+                        apply,
+                        assume_stopped,
+                        tail_mb,
+                        ..
+                    },
+            } => {
+                assert!(!apply, "mark-evicted must default to dry-run");
+                assert!(!assume_stopped);
+                assert_eq!(tail_mb, 0);
             }
             other => panic!("unexpected command: {other:?}"),
         }

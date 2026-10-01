@@ -47,6 +47,7 @@ flowchart TD
 | `main` (`src/main.rs`) | ~1411 | clap `Cli` + `Commands`/sub-action enums, `#[tokio::main]` dispatch, exit codes |
 | `commands` (`src/commands.rs`) | ~2182 | CQL observability `run_*`, web-API cluster commands, offline raft reset/inspect/truncate, `cluster bootstrap-dc`, table/empty printers |
 | `commands::sstable` (`src/commands/sstable.rs`) | ~1717 | offline SSTable scan / inspect / quarantine / salvage / reingest / s3-clean |
+| `commands::evicted` (`src/commands/evicted.rs`) | ~330 | `sstable mark-evicted`: log-evidence eviction markers, sled-lock liveness probe |
 | `tui` (`src/tui.rs`) | ~517 | ratatui dashboard: `Panel`, `AppState`, `render*`, `event_loop` |
 | `auth` (`src/auth.rs`) | ~440 | `set-password` flow: validation, `ALTER ROLE` builder w/ escaping, admin-pw resolution, `CqlExecutor` trait |
 | `lib` (`src/lib.rs`) | 8 | re-exports `commands`/`auth`/`tui` for the integration tests |

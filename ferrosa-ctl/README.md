@@ -93,6 +93,7 @@ so ctl can never disagree with what the node decides at boot.
 - `sstable salvage <dir> [--include-quarantine --json]` — measure recoverable-row yield (pure read).
 - `sstable reingest <dir> [--user --password-env --apply --include-quarantine --limit]` — salvage CORRUPT gens and re-insert through the **live** write path (`--host`), preserving original timestamps; dry-run default.
 - `sstable s3-clean <dir> [--apply]` — delete CORRUPT generations' objects from the object store so a cold restart can't re-download them; dry-run default.
+- `sstable mark-evicted --data-dir <dir> --log <node.log> [--tail-mb N --apply --assume-stopped]` — write eviction markers for generations an older ferrosa evicted without recording it (evidence: the node log's `evicted uploaded local SSTable from cache` lines), so the next start restores them from S3. Replaces the unsupported `scripts/recover-evicted-sstables.py`. Dry-run default, reports per table; refuses a data dir whose node holds the sled lock under `<dir>/raft` (even for a dry run); `--apply` also refuses a dir with no lock to probe unless `--assume-stopped`; skips generations that are local, already marked or whose table is gone, and never overwrites a marker. Markers carry `source = ferrosa-ctl sstable mark-evicted`, `trigger = recovered`.
 
 ### Commit-log set-aside recovery (filesystem only)
 

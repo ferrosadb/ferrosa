@@ -37,6 +37,8 @@ sled = "0.34"
 # Scratch commit-log dir for `commitlog set-aside --apply`, so the node's own
 # segments are never touched.
 tempfile = "3"
+# Offline liveness probe for `sstable mark-evicted`: try the node's sled flock.
+fs2 = "0.4"
 
 [dev-dependencies]
 arc-swap = "1.7"
