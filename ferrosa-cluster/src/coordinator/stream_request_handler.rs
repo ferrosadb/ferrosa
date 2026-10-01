@@ -51,16 +51,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 /// cap so a single full fragment flushes as one chunk. Env-tunable through
 /// the same `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` knob that bounds the
 /// producer, keeping the wire frame and the producer fragment aligned.
-const DEFAULT_STREAM_CHUNK_ROW_CAP: usize = 4_096;
-
 pub(crate) fn stream_chunk_row_cap() -> usize {
-    match std::env::var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT") {
-        Ok(v) => match v.trim().parse::<usize>() {
-            Ok(n) if n >= 1 => n,
-            _ => DEFAULT_STREAM_CHUNK_ROW_CAP,
-        },
-        Err(_) => DEFAULT_STREAM_CHUNK_ROW_CAP,
-    }
+    // Delegates to `ferrosa_storage`'s resolver so the wire frame cap and the
+    // producer fragment cap cannot drift: they are the SAME knob
+    // (`FERROSA_RANGE_READ_ROWS_PER_FRAGMENT`) and a frame must be able to
+    // carry one full fragment. Two independent `env::var` reads could disagree
+    // the moment only one of them was overridden.
+    ferrosa_storage::range_merger::rows_per_fragment()
 }
 
 /// Type alias for the per-partition async stream returned by
