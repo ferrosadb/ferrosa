@@ -65,7 +65,11 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   so container IP churn is handled automatically. `NetError::LaneShutdown`
   means a pool's actors have exited (peer connection replaced); it is not
   reconnect exhaustion. `PeerManager` re-issues a request once on the current
-  pool when the one it resolved was replaced mid-request. `remove_peer` shuts
+  pool when the one it resolved was replaced mid-request. If the registered
+  pool itself is dead, `PeerManager` deregisters it, re-dials once via
+  `ensure_peer` (identity-checked), logs the failure and the recovery once
+  each, and re-issues the request; if the dial fails the request errors and a
+  pool-less placeholder keeps the peer's address for the next `ensure_peer`. `remove_peer` shuts
   the peer's pool down so its lane-actor tasks exit.
 - **RPC server + handler registry** (`rpc`) — `RpcServer` accepts inbound
   connections, runs the acceptor handshake, and dispatches frames through a

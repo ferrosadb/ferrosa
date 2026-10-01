@@ -47,6 +47,8 @@ pub struct PeerManager {
     raft_runtime: OnceLock<Arc<tokio::runtime::Runtime>>,
     data_runtime: OnceLock<Arc<tokio::runtime::Runtime>>,
     started_at: tokio::time::Instant,
+    /// Serialises dead-pool replacement so concurrent requests share one dial.
+    replace_lock: tokio::sync::Mutex<()>,
 }
 
 struct PeerState {
@@ -92,6 +94,7 @@ impl PeerManager {
             raft_runtime: OnceLock::new(),
             data_runtime: OnceLock::new(),
             started_at: tokio::time::Instant::now(),
+            replace_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -144,8 +147,9 @@ impl PeerManager {
     /// then fails with [`NetError::LaneShutdown`] on a pool that is no longer
     /// registered. That says nothing about the peer, so the request is
     /// re-issued ONCE on the current pool. If the map still holds the same
-    /// (dead) pool there is nothing newer to try and the error is returned
-    /// after logging it, rather than looping.
+    /// (dead) pool, [`Self::replace_dead_pool`] deregisters it and dials one
+    /// replacement (bounded: a single attempt per request, no loop); if that
+    /// fails the error is returned.
     async fn on_current_pool<T, F, Fut>(
         &self,
         host_id: uuid::Uuid,
@@ -158,26 +162,69 @@ impl PeerManager {
         let (state, pool) = self.pool_for_peer(host_id).await?;
         let out = match op(Arc::clone(&pool)).await {
             Err(NetError::LaneShutdown) => {
-                let (state, current) = self.pool_for_peer(host_id).await?;
-                if Arc::ptr_eq(&pool, &current) {
-                    tracing::error!(
+                let (_, current) = self.pool_for_peer(host_id).await?;
+                let current = if Arc::ptr_eq(&pool, &current) {
+                    self.replace_dead_pool(host_id, &pool).await?
+                } else {
+                    tracing::debug!(
                         peer = %host_id,
-                        "peer's registered pool has dead lane actors and nothing replaced it"
+                        "pool was replaced mid-request; re-issuing on the current pool"
                     );
-                    return Err(NetError::LaneShutdown);
-                }
-                tracing::debug!(
-                    peer = %host_id,
-                    "pool was replaced mid-request; re-issuing on the current pool"
-                );
+                    current
+                };
                 let out = op(current).await?;
-                state.record_activity(self.now_ms());
+                // `state` may be the replaced entry; credit the live one.
+                self.record_activity(host_id).await;
                 return Ok(out);
             }
             other => other?,
         };
         state.record_activity(self.now_ms());
         Ok(out)
+    }
+
+    /// Deregister `dead` (a pool whose lane actors have exited) and dial a
+    /// replacement through [`Self::ensure_peer`], which also verifies peer
+    /// identity (t_a3df19a5).
+    ///
+    /// Serialised by `replace_lock` so concurrent requests that hit the same
+    /// dead pool produce ONE dial: later arrivals find the pool already
+    /// replaced and reuse it. Exactly one dial is attempted per call (no retry
+    /// loop). The failure and the recovery are each logged once, by the
+    /// request that performed the replacement. On failure the dead pool stays
+    /// deregistered (a pool-less placeholder keeps the peer's address so a
+    /// later `ensure_peer` can redial) and the error is returned.
+    async fn replace_dead_pool(
+        &self,
+        host_id: uuid::Uuid,
+        dead: &Arc<PriorityPool>,
+    ) -> crate::error::Result<Arc<PriorityPool>> {
+        let _guard = self.replace_lock.lock().await;
+        // Errors here mean the peer was removed or deregistered meanwhile.
+        let (state, current) = self.pool_for_peer(host_id).await?;
+        if !Arc::ptr_eq(dead, &current) {
+            return Ok(current); // another request already replaced it
+        }
+        let addr = state.peer_id.1;
+        tracing::warn!(
+            peer = %host_id, %addr,
+            "peer's registered pool has dead lane actors; deregistering and re-dialing"
+        );
+        let placeholder = Arc::new(PeerState::new(state.peer_id, None, self.now_ms()));
+        self.peers.write().await.insert(host_id, placeholder);
+        dead.shutdown().await;
+        if let Err(e) = self.ensure_peer(host_id, &addr.to_string()).await {
+            tracing::error!(
+                peer = %host_id, %addr, error = %e,
+                "replacing the dead pool failed; peer has no pool until the next ensure_peer"
+            );
+            return Err(NetError::Protocol(format!(
+                "replacing dead pool for peer {host_id} at {addr} failed: {e}"
+            )));
+        }
+        tracing::info!(peer = %host_id, %addr, "replaced dead pool with a fresh connection");
+        let (_, fresh) = self.pool_for_peer(host_id).await?;
+        Ok(fresh)
     }
 
     /// Add a connected peer with a real connection pool.
@@ -1235,10 +1282,11 @@ mod tests {
         }
     }
 
-    /// If the pool in the map is itself dead there is nothing newer to retry
-    /// on: the error must surface (once), not loop.
+    /// t_a3df19a5: a registered pool whose lane actors died must be
+    /// deregistered and replaced by a fresh dial, so the request succeeds
+    /// instead of every later request failing until restart.
     #[tokio::test]
-    async fn dead_current_pool_surfaces_lane_shutdown_without_retry_loop() {
+    async fn dead_registered_pool_is_replaced_and_request_succeeds() {
         let config = NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             ..NetConfig::default()
@@ -1254,8 +1302,65 @@ mod tests {
             Arc::new(TestListener::new()),
         );
         pm.ensure_peer(server_id, &addr).await.unwrap();
+        let (_, dead) = pm.pool_for_peer(server_id).await.unwrap();
+        dead.shutdown().await; // stands in for a lane actor that died
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let resp = pm
+            .on_current_pool(server_id, |pool| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    pool.send(
+                        Message::Ping {
+                            nonce: 1,
+                            sent_at: 0,
+                        },
+                        Lane::Data,
+                    )
+                    .await
+                }
+            })
+            .await
+            .expect("a dead pool must be replaced and the request re-issued");
+        assert!(matches!(resp, Message::Pong { nonce: 1, .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one retry");
+
         let (_, current) = pm.pool_for_peer(server_id).await.unwrap();
-        current.shutdown().await;
+        assert!(
+            !Arc::ptr_eq(&dead, &current),
+            "the dead pool must have been deregistered and replaced"
+        );
+        assert_eq!(
+            current.all_lanes_resolved().await,
+            LaneOutcome::AllConnected
+        );
+
+        pm.remove_peer(server_id).await;
+        server.shutdown(Duration::from_millis(50)).await;
+    }
+
+    /// If the replacement dial fails the request errors loudly (once, no
+    /// retry loop) and the dead pool is NOT left registered.
+    #[tokio::test]
+    async fn failed_replacement_errors_and_deregisters_the_dead_pool() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap().to_string();
+        let pm = PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            Arc::new(TestListener::new()),
+        );
+        pm.ensure_peer(server_id, &addr).await.unwrap();
+        let (_, dead) = pm.pool_for_peer(server_id).await.unwrap();
+        dead.shutdown().await;
+        server.shutdown(Duration::from_millis(50)).await; // redial must fail
 
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let err = pm
@@ -1273,15 +1378,26 @@ mod tests {
                 }
             })
             .await
-            .expect_err("dead pool must error");
+            .expect_err("failed replacement must surface an error");
         assert!(
-            matches!(err, crate::error::NetError::LaneShutdown),
-            "got {err:?}"
+            err.to_string().contains("replac"),
+            "error must say the replacement failed, got: {err}"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry on the same pool");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no retry without a new pool"
+        );
+        assert!(
+            !pm.has_live_peer(server_id),
+            "the dead pool must not stay registered"
+        );
+        assert!(
+            pm.has_peer(server_id),
+            "the peer entry (and its address) is kept so a later ensure_peer can redial"
+        );
 
         pm.remove_peer(server_id).await;
-        server.shutdown(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
