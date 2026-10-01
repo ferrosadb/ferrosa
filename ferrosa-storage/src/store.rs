@@ -987,6 +987,21 @@ fn next_remapped_clustered_row<R: ReadAt + Send + Sync + 'static>(
     Ok(row)
 }
 
+/// [`ferrosa_sstable::reader::PartitionIter::stream_clustered_rows`] where a
+/// failure of the SSTable's own decode is attributed through `attribute`, but
+/// a failure raised by `on_row` (the caller's sink, not the SSTable) passes
+/// through unchanged: a full hash sink must not quarantine a healthy file.
+fn stream_rows_attributed<R: ReadAt + Send + Sync + 'static>(
+    iter: &mut ferrosa_sstable::reader::PartitionIter<'_, R>,
+    mut on_row: impl FnMut(&Row) -> Result<()>,
+    attribute: impl FnOnce(ferrosa_common::Error) -> ferrosa_common::Error,
+) -> Result<()> {
+    let mut sink_failed = false;
+    let streamed =
+        iter.stream_clustered_rows(|row| on_row(row).inspect_err(|_| sink_failed = true));
+    streamed.map_err(|e| if sink_failed { e } else { attribute(e) })
+}
+
 /// One SSTable reader participating in a bounded token-range merge.
 ///
 /// Either a **pooled** reader (opened through the shared
@@ -1045,26 +1060,32 @@ impl<F: FlushTarget> Drop for MergeReader<F> {
 /// emitted partition is identical no matter how inputs are batched across
 /// passes — the property the multi-pass cascade relies on for digest
 /// equivalence.
-fn merge_sstable_iters<R, Emit>(
+///
+/// `fail(i, cause)` attributes a read error from `iters[i]` to the SSTable it
+/// serves (typed `CorruptSstable` for a table SSTable). Errors from `emit` are
+/// the caller's own and pass through untouched.
+fn merge_sstable_iters<R, Emit, Fail>(
     iters: &mut [ferrosa_sstable::reader::PartitionIter<'_, R>],
     mappings: &[ColumnOrdinalMapping],
     end_token: i64,
+    fail: Fail,
     mut emit: Emit,
 ) -> Result<()>
 where
     R: ReadAt + Send + Sync + 'static,
     Emit: FnMut(Partition) -> Result<()>,
+    Fail: Fn(usize, ferrosa_common::Error) -> ferrosa_common::Error,
 {
     loop {
         let pick = |cur: &Option<DecoratedKey>, candidate: &DecoratedKey| -> bool {
             cur.as_ref().map(|k| candidate < k).unwrap_or(true)
         };
         let mut smallest_key: Option<DecoratedKey> = None;
-        for iter in iters.iter_mut() {
+        for (idx, iter) in iters.iter_mut().enumerate() {
             // A peek error is an unreadable SSTable: propagate it. Treating it
             // as "exhausted" would silently drop every later partition of
             // that source from the merge.
-            if let Some(k) = iter.peek_partition_key()? {
+            if let Some(k) = iter.peek_partition_key().map_err(|e| fail(idx, e))? {
                 if k.token.0 >= end_token {
                     continue;
                 }
@@ -1079,8 +1100,9 @@ where
 
         let mut group: Vec<Partition> = Vec::new();
         for (idx, iter) in iters.iter_mut().enumerate() {
-            if matches!(iter.peek_partition_key()?, Some(k) if k == key) {
-                if let Some(mut p) = iter.next_partition()? {
+            let peeked = iter.peek_partition_key().map_err(|e| fail(idx, e))?;
+            if matches!(peeked, Some(k) if k == key) {
+                if let Some(mut p) = iter.next_partition().map_err(|e| fail(idx, e))? {
                     mappings[idx].remap_partition(&mut p);
                     group.push(p);
                 }
@@ -1288,6 +1310,11 @@ pub(crate) mod read_race_test_hook {
         /// When set on a thread, that thread's next `read_limited_rows` pauses
         /// once at the barrier right after snapshotting the view.
         pub static ARMED: std::cell::RefCell<Option<Arc<ReadViewBarrier>>> =
+            const { std::cell::RefCell::new(None) };
+
+        /// When set on a thread, runs between a failed range-scan attempt and
+        /// its fresh-view retry — where a compaction swap would land.
+        pub static ON_SCAN_RETRY: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
             const { std::cell::RefCell::new(None) };
     }
 }
@@ -2246,6 +2273,12 @@ impl<F: FlushTarget> TableStore<F> {
             };
             if retries < MAX_VIEW_RETRIES && !delivered.get() {
                 retries += 1;
+                #[cfg(test)]
+                read_race_test_hook::ON_SCAN_RETRY.with(|c| {
+                    if let Some(hook) = c.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
                 continue;
             }
             self.view_retry_exhausted
@@ -4844,11 +4877,19 @@ impl<F: FlushTarget> TableStore<F> {
         let header = flush::build_serialization_header(schema, &[]);
         let mut writer = SSTableWriter::new(WriteOptions::default(), header);
         let mut wrote = 0u64;
-        merge_sstable_iters(&mut iters, &mappings, end_token, |partition| {
-            writer.add_partition(&partition)?;
-            wrote += 1;
-            Ok(())
-        })?;
+        merge_sstable_iters(
+            &mut iters,
+            &mappings,
+            end_token,
+            |idx, cause| {
+                self.merge_reader_failure("bounded_merge", "merge", &batch_readers[idx], cause)
+            },
+            |partition| {
+                writer.add_partition(&partition)?;
+                wrote += 1;
+                Ok(())
+            },
+        )?;
         // Iterators borrow `batch_readers`; drop them so the readers (and their
         // pool slots) are released before we open the spill run.
         drop(iters);
@@ -5003,6 +5044,16 @@ impl<F: FlushTarget> TableStore<F> {
         // iterators below, so the pool cannot evict mid-scan and spill files are
         // cleaned up on drop.
         let merge_readers = self.bounded_overlap_readers(start_token, end_token)?;
+        // Attribute a mid-stream read error to the SSTable that raised it, so
+        // it is the same typed, retried, quarantined error as an open failure.
+        let fail = |idx: usize, stage: &'static str, cause: ferrosa_common::Error| {
+            self.merge_reader_failure(
+                "walk_token_range_for_digest",
+                stage,
+                &merge_readers[idx],
+                cause,
+            )
+        };
 
         let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
             Vec::with_capacity(merge_readers.len());
@@ -5034,8 +5085,11 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                 }
             }
-            for iter in sst_iters.iter_mut() {
-                if let Some(k) = iter.peek_partition_key()? {
+            for (idx, iter) in sst_iters.iter_mut().enumerate() {
+                if let Some(k) = iter
+                    .peek_partition_key()
+                    .map_err(|e| fail(idx, "peek", e))?
+                {
                     if k.token.0 >= end_token {
                         continue;
                     }
@@ -5059,7 +5113,8 @@ impl<F: FlushTarget> TableStore<F> {
                 .collect();
             let mut sst_match_indices: Vec<usize> = Vec::new();
             for (i, iter) in sst_iters.iter_mut().enumerate() {
-                if matches!(iter.peek_partition_key()?, Some(k) if k == key) {
+                let peeked = iter.peek_partition_key().map_err(|e| fail(i, "peek", e))?;
+                if matches!(peeked, Some(k) if k == key) {
                     sst_match_indices.push(i);
                 }
             }
@@ -5070,7 +5125,8 @@ impl<F: FlushTarget> TableStore<F> {
                 // SSTable API so no `Partition` ever materialises.
                 let sst_idx = sst_match_indices[0];
                 let header = sst_iters[sst_idx]
-                    .next_partition_header_only()?
+                    .next_partition_header_only()
+                    .map_err(|e| fail(sst_idx, "header", e))?
                     .expect("source had key; header must yield");
                 let mapping = &sst_mappings[sst_idx];
                 let (decoded_key, deletion, mut static_row) = header;
@@ -5083,14 +5139,19 @@ impl<F: FlushTarget> TableStore<F> {
                     &ferrosa_sstable::types::Row,
                 ) -> Result<()>|
                  -> Result<()> {
+                    let attribute = |e| fail(sst_idx, "rows", e);
                     if mapping.is_identity() {
-                        iter_ref.stream_clustered_rows(|row| on_row(row))
+                        stream_rows_attributed(iter_ref, |row| on_row(row), attribute)
                     } else {
-                        iter_ref.stream_clustered_rows(|row| {
-                            let mut row = row.clone();
-                            mapping.remap_regular_row(&mut row);
-                            on_row(&row)
-                        })
+                        stream_rows_attributed(
+                            iter_ref,
+                            |row| {
+                                let mut row = row.clone();
+                                mapping.remap_regular_row(&mut row);
+                                on_row(&row)
+                            },
+                            attribute,
+                        )
                     }
                 };
                 delivered.set(true);
@@ -5131,7 +5192,10 @@ impl<F: FlushTarget> TableStore<F> {
                     mem_row_iters.push(rows.into_iter());
                 }
                 for i in &sst_match_indices {
-                    if let Some((k, d, mut sr)) = sst_iters[*i].next_partition_header_only()? {
+                    let header = sst_iters[*i]
+                        .next_partition_header_only()
+                        .map_err(|e| fail(*i, "header", e))?;
+                    if let Some((k, d, mut sr)) = header {
                         if let Some(static_row) = sr.as_mut() {
                             sst_mappings[*i].remap_static_row(static_row);
                         }
@@ -5172,11 +5236,7 @@ impl<F: FlushTarget> TableStore<F> {
                     for &si in &sst_local_indices {
                         sst_heads.push(
                             next_remapped_clustered_row(&mut sst_iters[si], &sst_mappings[si])
-                                .map_err(|e| {
-                                    ferrosa_common::Error::InvalidData(format!(
-                                        "sst.next_clustered_row: {e}"
-                                    ))
-                                })?,
+                                .map_err(|e| fail(si, "row", e))?,
                         );
                     }
                     loop {
@@ -5228,11 +5288,7 @@ impl<F: FlushTarget> TableStore<F> {
                                     &mut sst_iters[si],
                                     &sst_mappings[si],
                                 )
-                                .map_err(|e| {
-                                    ferrosa_common::Error::InvalidData(format!(
-                                        "sst.next_clustered_row: {e}"
-                                    ))
-                                })?;
+                                .map_err(|e| fail(si, "row", e))?;
                             }
                         }
                         let row = merged_row.expect("at least one source matched");
@@ -5327,6 +5383,11 @@ impl<F: FlushTarget> TableStore<F> {
         // covers this. The `MergeReader`s own their readers and any spill temp
         // dirs for the iterators' lifetime (cleaned up on drop).
         let merge_readers = self.bounded_overlap_readers(start_token, end_token)?;
+        // Attribute a mid-stream read error to the SSTable that raised it, so
+        // it is the same typed, retried, quarantined error as an open failure.
+        let fail = |idx: usize, stage: &'static str, cause: ferrosa_common::Error| {
+            self.merge_reader_failure("walk_token_range", stage, &merge_readers[idx], cause)
+        };
 
         // For each input reader: an iter parked at the first in-range partition.
         // We do NOT decode the body — we keep only the peeked DecoratedKey.
@@ -5364,8 +5425,11 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                 }
             }
-            for iter in sst_iters.iter_mut() {
-                if let Some(k) = iter.peek_partition_key()? {
+            for (idx, iter) in sst_iters.iter_mut().enumerate() {
+                if let Some(k) = iter
+                    .peek_partition_key()
+                    .map_err(|e| fail(idx, "peek", e))?
+                {
                     if k.token.0 >= end_token {
                         // sstable is past the range; treat as exhausted
                         continue;
@@ -5390,14 +5454,17 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
             for (idx, iter) in sst_iters.iter_mut().enumerate() {
-                let matches = matches!(iter.peek_partition_key()?, Some(k) if k == key);
+                let peeked = iter
+                    .peek_partition_key()
+                    .map_err(|e| fail(idx, "peek", e))?;
+                let matches = matches!(peeked, Some(k) if k == key);
                 if !matches {
                     continue;
                 }
                 // A decode error here is an unreadable SSTable: propagate it.
                 // Dropping this source's copy of the key would hand the
                 // callback a stale or empty merge as if it were complete.
-                if let Some(mut p) = iter.next_partition()? {
+                if let Some(mut p) = iter.next_partition().map_err(|e| fail(idx, "decode", e))? {
                     sst_mappings[idx].remap_partition(&mut p);
                     group.push(p);
                 }
@@ -9573,6 +9640,164 @@ mod tests {
         assert_names_sstable(&err, "missing-gen");
     }
 
+    // ST-41 residual: a decode error AFTER the SSTable opened (mid-stream) in a
+    // streaming merge must be the same typed, retried, quarantined error as an
+    // open failure — not the raw SSTable error.
+
+    #[test]
+    fn walk_token_range_mid_stream_decode_error_is_typed_and_quarantines() {
+        let store = store_with_truncated_sstable();
+        let err = store
+            .walk_token_range(i64::MIN, i64::MAX, |_| Ok(()))
+            .expect_err("a decode error mid-walk must surface, not be skipped");
+        assert_names_sstable(&err, "truncated-gen");
+        assert!(
+            store.is_sstable_quarantined("truncated-gen"),
+            "a generation that fails to decode after the retry bound must be quarantined"
+        );
+        assert_eq!(
+            store
+                .view_retry_exhausted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the bounded view retries must have been exhausted exactly once"
+        );
+    }
+
+    #[test]
+    fn walk_token_range_for_digest_mid_stream_decode_error_is_typed_and_quarantines() {
+        let store = store_with_truncated_sstable();
+        let err = store
+            .walk_token_range_for_digest(i64::MIN, i64::MAX, |_, _, _, emit| {
+                emit(&mut |_row| Ok(()))
+            })
+            .expect_err("a decode error mid-digest-walk must surface, not be skipped");
+        assert_names_sstable(&err, "truncated-gen");
+        assert!(store.is_sstable_quarantined("truncated-gen"));
+    }
+
+    /// A store whose view holds one SSTable that opens but fails to decode
+    /// (`truncated-gen`), and which a first scan retry replaces with its
+    /// healthy compaction output (`merged-gen`) — what a compaction landing
+    /// between two attempts does to a retired input.
+    ///
+    /// `truncate_data_to` picks WHERE the damaged input fails: 8 bytes decodes the
+    /// header and fails in the rows (after a digest walk has delivered the key,
+    /// so it is final), 3 bytes fails before anything is delivered (retriable).
+    fn store_with_input_retired_on_first_retry(
+        truncate_data_to: usize,
+    ) -> Arc<TableStore<InMemoryFlushTarget>> {
+        let store = Arc::new(test_store());
+        let schema = test_schema();
+        let truncated = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("c", b"old", 1000)],
+            Some(truncate_data_to),
+        ));
+        let truncated_desc = SstableDescriptor::from_reader(
+            "truncated-gen".to_string(),
+            std::path::PathBuf::new(),
+            &truncated,
+        );
+        store.seed_reader(&truncated_desc, truncated);
+        install_descriptors(&store, vec![truncated_desc]);
+
+        let merged = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("c", b"merged", 1000)],
+            None,
+        ));
+        let merged_desc = SstableDescriptor::from_reader(
+            "merged-gen".to_string(),
+            std::path::PathBuf::new(),
+            &merged,
+        );
+        store.seed_reader(&merged_desc, merged);
+
+        let hook_store = Arc::clone(&store);
+        let mut fired = false;
+        read_race_test_hook::ON_SCAN_RETRY.with(|c| {
+            *c.borrow_mut() = Some(Box::new(move || {
+                assert!(!fired, "the retry hook must fire exactly once");
+                fired = true;
+                install_descriptors(&hook_store, vec![merged_desc.clone()]);
+            }));
+        });
+        store
+    }
+
+    #[test]
+    fn walk_token_range_mid_stream_error_from_retired_input_retries_and_succeeds() {
+        let store = store_with_input_retired_on_first_retry(8);
+        let mut keys = Vec::new();
+        store
+            .walk_token_range(i64::MIN, i64::MAX, |p| {
+                keys.push(p.key.clone());
+                Ok(())
+            })
+            .expect("a failure that clears on a fresh view must not surface");
+        assert_eq!(
+            keys,
+            vec![make_key("c")],
+            "the merged partition is served once"
+        );
+        assert!(
+            !store.is_sstable_quarantined("truncated-gen"),
+            "a transient retired-input window must not quarantine anything"
+        );
+        assert_eq!(
+            store
+                .view_retry_exhausted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn walk_token_range_for_digest_mid_stream_error_from_retired_input_retries_and_succeeds() {
+        let store = store_with_input_retired_on_first_retry(3);
+        let mut keys = Vec::new();
+        store
+            .walk_token_range_for_digest(i64::MIN, i64::MAX, |k, _, _, emit| {
+                keys.push(k.clone());
+                emit(&mut |_row| Ok(()))
+            })
+            .expect("a failure that clears on a fresh view must not surface");
+        assert_eq!(
+            keys,
+            vec![make_key("c")],
+            "the merged partition is hashed once"
+        );
+        assert!(!store.is_sstable_quarantined("truncated-gen"));
+    }
+
+    #[test]
+    fn walk_callback_error_is_not_mistaken_for_an_sstable_failure() {
+        let store = test_store();
+        let healthy = Arc::new(sstable_reader_from_partitions(
+            &test_schema(),
+            &[make_partition("a", b"healthy", 1000)],
+            None,
+        ));
+        let desc = SstableDescriptor::from_reader(
+            "healthy-gen".to_string(),
+            std::path::PathBuf::new(),
+            &healthy,
+        );
+        store.seed_reader(&desc, healthy);
+        install_descriptors(&store, vec![desc]);
+        let err = store
+            .walk_token_range_for_digest(i64::MIN, i64::MAX, |_, _, _, emit| {
+                emit(&mut |_row| Err(ferrosa_common::Error::InvalidData("hash sink full".into())))
+            })
+            .expect_err("a callback failure must fail the walk");
+        assert!(
+            err.corrupt_sstable_range().is_none() && err.to_string().contains("hash sink full"),
+            "a row-callback error must pass through untyped, got: {err}"
+        );
+        assert!(store.quarantined_sstable_gens().is_empty());
+    }
+
     #[test]
     fn time_series_cursor_fails_loud_on_unopenable_sstable() {
         let store = store_with_unopenable_sstable(&["a"], &["ts-key"]);
@@ -13042,6 +13267,53 @@ mod tests {
             store.flush().unwrap();
         }
         store
+    }
+
+    /// ST-41 residual: with more overlapping SSTables than the reader budget the
+    /// scan cascades through `merge_sstable_iters`; a source that fails to decode
+    /// mid-merge must surface as the typed error naming that generation and be
+    /// quarantined, not leak the raw SSTable error from the spill pass.
+    #[test]
+    fn bounded_merge_mid_stream_decode_error_is_typed_and_quarantines() {
+        let cap = 2usize;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = file_store_full_overlap(dir.path(), cap, 5, 6);
+        reset_pool(&mut store, cap);
+
+        let victim = store.view.load().sstables[0].clone();
+        let base = if victim.dir.as_os_str().is_empty() {
+            dir.path().to_path_buf()
+        } else {
+            victim.dir.clone()
+        };
+        let data_path = base.join(format!("{}-Data.db", victim.gen));
+        // Drop the checksum components (a pre-T-011 generation has none, so
+        // the reader treats them as "not checked") and cut Data.db short: the
+        // reader then opens and positions cleanly on the first partition and
+        // only fails when the merge decodes a later one.
+        for suffix in ["CRC.db", "Digest.crc32"] {
+            let p = base.join(format!("{}-{suffix}", victim.gen));
+            if p.exists() {
+                std::fs::remove_file(&p).unwrap();
+            }
+        }
+        let data = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", data_path.display()));
+        // Cut mid-partition (not on a partition boundary, which would read as a
+        // clean end of data).
+        data.set_len(data.metadata().unwrap().len() / 2 + 5)
+            .unwrap();
+
+        let err = store
+            .walk_token_range(i64::MIN, i64::MAX, |_| Ok(()))
+            .expect_err("a source that fails mid-merge must fail the cascade");
+        assert_names_sstable(&err, &victim.gen);
+        assert!(
+            store.is_sstable_quarantined(&victim.gen),
+            "the generation that failed mid-merge must be quarantined"
+        );
     }
 
     /// LARGE-RANGE DATA-BOUND GATE (the gap that let the OOM regression through).
