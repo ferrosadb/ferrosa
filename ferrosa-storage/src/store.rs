@@ -658,6 +658,9 @@ pub struct TableStore<F: FlushTarget> {
     /// replica. Keyed by `gen`; the covered range is recovered from the live
     /// descriptor (still in the view until repair swaps it out).
     quarantined_sstables: parking_lot::RwLock<std::collections::HashSet<String>>,
+    /// Generations whose object recently failed to open: they fail fast for a
+    /// short TTL instead of costing a reopen per retry per read.
+    missing_sstables: MissingSstableCache,
     /// Serializes FTI sidecar builds for this table, so a burst of concurrent
     /// queries that all find the same SSTable uncovered builds its sidecar
     /// once instead of tokenizing it once per query at the same time.
@@ -944,6 +947,29 @@ fn open_pooled_readers<T: FlushTarget>(
     start: Option<&DecoratedKey>,
     end: Option<&DecoratedKey>,
 ) -> Result<Vec<Arc<SSTableReader<T::Reader>>>> {
+    open_pooled_readers_with(
+        reader_pool,
+        pool_table_key,
+        flush_target,
+        descriptors,
+        start,
+        end,
+        None,
+    )
+}
+
+/// [`open_pooled_readers`] with an optional negative cache. Callers that sit
+/// under the fresh-view retry loop pass the store's, so a known-missing
+/// generation fails fast instead of being reopened on every retry.
+fn open_pooled_readers_with<T: FlushTarget>(
+    reader_pool: &SharedReaderPool<T::Reader>,
+    pool_table_key: &str,
+    flush_target: &T,
+    descriptors: &[SstableDescriptor],
+    start: Option<&DecoratedKey>,
+    end: Option<&DecoratedKey>,
+    missing: Option<&MissingSstableCache>,
+) -> Result<Vec<Arc<SSTableReader<T::Reader>>>> {
     let start_bytes = start.map(ferrosa_sstable::byte_comparable::encode);
     let end_bytes = end.map(ferrosa_sstable::byte_comparable::encode);
     let mut readers = Vec::new();
@@ -961,7 +987,11 @@ fn open_pooled_readers<T: FlushTarget>(
         let dir = desc.dir.clone();
         let gen = desc.gen_num();
         let key = (pool_table_key.to_string(), gen);
-        readers.push(reader_pool.get_or_open(key, || flush_target.open_reader(&dir, gen))?);
+        let open = || reader_pool.get_or_open(key, || flush_target.open_reader(&dir, gen));
+        readers.push(match missing {
+            Some(cache) => cache.open_through(&desc.gen, open)?,
+            None => open()?,
+        });
     }
     Ok(readers)
 }
@@ -1000,6 +1030,157 @@ fn stream_rows_attributed<R: ReadAt + Send + Sync + 'static>(
     let streamed =
         iter.stream_clustered_rows(|row| on_row(row).inspect_err(|_| sink_failed = true));
     streamed.map_err(|e| if sink_failed { e } else { attribute(e) })
+}
+
+/// How long a generation whose object could not be opened keeps failing fast.
+const MISSING_SSTABLE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Most generations the negative cache remembers at once.
+const MISSING_SSTABLE_CAP: usize = 256;
+
+/// Short-lived negative cache of SSTable generations whose object could not be
+/// opened (missing from local disk and from the object store, typically an
+/// evicted SSTable whose rehydrate failed).
+///
+/// Without it every range read re-opens the same missing object on each of the
+/// eight fresh-view retries and again on the next read, until repair
+/// intervenes. With it the FIRST failed open is real; for the next `ttl` the
+/// same generation fails immediately with an error that still reaches the
+/// caller as the typed `CorruptSstable` — it is a fast failure, never a short
+/// `Ok`. Entries are dropped when the generation is seeded (restored or
+/// freshly written), when quarantine is resolved, when an open of it succeeds,
+/// when they expire, and — to bound memory — oldest first once `cap` is hit.
+///
+/// Observable through [`TableStore::missing_sstable_open_failures`] /
+/// [`TableStore::missing_sstable_fast_fails`] and a WARN when a generation
+/// first enters the cache.
+pub(crate) struct MissingSstableCache {
+    ttl: std::time::Duration,
+    cap: usize,
+    /// `gen -> when its open last failed`.
+    entries: parking_lot::Mutex<HashMap<String, Instant>>,
+    /// Mirror of `entries.len()` so the all-healthy hot path skips the lock.
+    count: std::sync::atomic::AtomicUsize,
+    open_failures: std::sync::atomic::AtomicU64,
+    fast_fails: std::sync::atomic::AtomicU64,
+}
+
+impl Default for MissingSstableCache {
+    fn default() -> Self {
+        Self::new(MISSING_SSTABLE_TTL, MISSING_SSTABLE_CAP)
+    }
+}
+
+impl MissingSstableCache {
+    pub(crate) fn new(ttl: std::time::Duration, cap: usize) -> Self {
+        assert!(
+            cap > 0,
+            "a zero-capacity negative cache cannot record anything"
+        );
+        Self {
+            ttl,
+            cap,
+            entries: parking_lot::Mutex::new(HashMap::new()),
+            count: std::sync::atomic::AtomicUsize::new(0),
+            open_failures: std::sync::atomic::AtomicU64::new(0),
+            fast_fails: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn sync_len(&self, entries: &HashMap<String, Instant>) {
+        self.count
+            .store(entries.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether `gen` failed to open within the last `ttl`. An expired entry is
+    /// dropped on the way past.
+    pub(crate) fn is_known_missing_at(&self, gen: &str, now: Instant) -> bool {
+        if self.len() == 0 {
+            return false;
+        }
+        let mut entries = self.entries.lock();
+        match entries.get(gen).copied() {
+            Some(at) if now.saturating_duration_since(at) < self.ttl => true,
+            Some(_) => {
+                entries.remove(gen);
+                self.sync_len(&entries);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Remember that `gen` failed to open at `now`. Returns whether it is a
+    /// new entry. At capacity, expired entries go first, then the oldest.
+    pub(crate) fn record_at(&self, gen: &str, now: Instant) -> bool {
+        let mut entries = self.entries.lock();
+        if !entries.contains_key(gen) && entries.len() >= self.cap {
+            let ttl = self.ttl;
+            entries.retain(|_, at| now.saturating_duration_since(*at) < ttl);
+            if entries.len() >= self.cap {
+                let oldest = entries
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(g, _)| g.clone());
+                if let Some(oldest) = oldest {
+                    entries.remove(&oldest);
+                }
+            }
+        }
+        let inserted = entries.insert(gen.to_string(), now).is_none();
+        self.sync_len(&entries);
+        inserted
+    }
+
+    /// Drop `gen`'s entry (restored, rewritten, or quarantine resolved).
+    pub(crate) fn forget(&self, gen: &str) {
+        if self.len() == 0 {
+            return;
+        }
+        let mut entries = self.entries.lock();
+        entries.remove(gen);
+        self.sync_len(&entries);
+    }
+
+    /// Run `open` for `gen` unless it recently failed to open, in which case
+    /// fail at once without touching storage.
+    pub(crate) fn open_through<T>(&self, gen: &str, open: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.is_known_missing_at(gen, Instant::now()) {
+            self.fast_fails
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(ferrosa_common::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "SSTable generation {gen} recently failed to open; failing fast for up to \
+                     {:?} (restore or repair clears this)",
+                    self.ttl
+                ),
+            )));
+        }
+        match open() {
+            Ok(v) => {
+                self.forget(gen);
+                Ok(v)
+            }
+            Err(e) => {
+                self.open_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.record_at(gen, Instant::now()) {
+                    tracing::warn!(
+                        gen,
+                        ttl = ?self.ttl,
+                        cause = %e,
+                        "SSTable open failed; further reads fail fast until the TTL lapses or \
+                         the generation is restored"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 /// One SSTable reader participating in a bounded token-range merge.
@@ -1518,6 +1699,7 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            missing_sstables: MissingSstableCache::default(),
             fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
@@ -1564,8 +1746,10 @@ impl<F: FlushTarget> TableStore<F> {
         let gen = desc.gen_num();
         let key = self.pool_key(desc);
         let flush_target = &self.flush_target;
-        self.reader_pool
-            .get_or_open(key, || flush_target.open_reader(&dir, gen))
+        self.missing_sstables.open_through(&desc.gen, || {
+            self.reader_pool
+                .get_or_open(key, || flush_target.open_reader(&dir, gen))
+        })
     }
 
     /// Open (pooled) the readers for every descriptor whose key range overlaps
@@ -1582,13 +1766,14 @@ impl<F: FlushTarget> TableStore<F> {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> Result<Vec<Arc<SSTableReader<F::Reader>>>> {
-        open_pooled_readers(
+        open_pooled_readers_with(
             &self.reader_pool,
             &self.pool_table_key,
             &*self.flush_target,
             descriptors,
             start,
             end,
+            Some(&self.missing_sstables),
         )
     }
 
@@ -1597,6 +1782,8 @@ impl<F: FlushTarget> TableStore<F> {
     /// does not reopen freshly-written component files.
     fn seed_reader(&self, desc: &SstableDescriptor, reader: Arc<SSTableReader<F::Reader>>) {
         self.reader_pool.insert_arc(self.pool_key(desc), reader);
+        // The generation's object exists now: stop failing it fast.
+        self.missing_sstables.forget(&desc.gen);
     }
 
     /// Create a `TableStore` with an initial set of SSTable readers already loaded.
@@ -1716,6 +1903,7 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            missing_sstables: MissingSstableCache::default(),
             fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
@@ -1798,6 +1986,7 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            missing_sstables: MissingSstableCache::default(),
             fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
@@ -2356,6 +2545,29 @@ impl<F: FlushTarget> TableStore<F> {
                  repair will refill its token range from a healthy replica"
             );
         }
+    }
+
+    /// Mark `gen`'s quarantine resolved (repair refilled or restored it): it
+    /// leaves the quarantine set and the negative open cache, so the next read
+    /// probes it for real. Returns whether it was quarantined.
+    pub fn resolve_sstable_quarantine(&self, gen: &str) -> bool {
+        self.missing_sstables.forget(gen);
+        self.quarantined_sstables.write().remove(gen)
+    }
+
+    /// Open attempts that failed for real (reached storage), not fast-failed.
+    pub fn missing_sstable_open_failures(&self) -> u64 {
+        self.missing_sstables
+            .open_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Opens refused immediately because the generation recently failed to
+    /// open. Each still surfaced to its caller as an error.
+    pub fn missing_sstable_fast_fails(&self) -> u64 {
+        self.missing_sstables
+            .fast_fails
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether `gen` is currently quarantined (and therefore skipped by reads).
@@ -9796,6 +10008,165 @@ mod tests {
             "a row-callback error must pass through untyped, got: {err}"
         );
         assert!(store.quarantined_sstable_gens().is_empty());
+    }
+
+    // ST-41 residual: a generation whose object is known missing fails FAST
+    // (still loud) instead of costing 8 reopen attempts on every range read.
+
+    fn missing_cache_counters(store: &TableStore<InMemoryFlushTarget>) -> (u64, u64) {
+        (
+            store.missing_sstable_open_failures(),
+            store.missing_sstable_fast_fails(),
+        )
+    }
+
+    #[test]
+    fn known_missing_generation_fails_fast_on_the_second_read() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let err = store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect_err("first read fails loud");
+        assert_names_sstable(&err, "missing-gen");
+        assert_eq!(
+            missing_cache_counters(&store),
+            (1, 8),
+            "one real open failure, then the 8 fresh-view retries fail fast without reopening"
+        );
+
+        let err = store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect_err("a known-missing generation must still fail loud, never a short Ok");
+        assert_names_sstable(&err, "missing-gen");
+        assert_eq!(
+            missing_cache_counters(&store),
+            (1, 17),
+            "the second read must not re-attempt the open"
+        );
+    }
+
+    #[test]
+    fn known_missing_generation_fails_fast_in_the_bounded_merge_walk() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        store
+            .walk_token_range(i64::MIN, i64::MAX, |_| Ok(()))
+            .expect_err("first walk fails loud");
+        let (failures, _) = missing_cache_counters(&store);
+        assert_eq!(failures, 1);
+        let err = store
+            .walk_token_range(i64::MIN, i64::MAX, |_| Ok(()))
+            .expect_err("a known-missing generation must still fail the walk");
+        assert_names_sstable(&err, "missing-gen");
+        assert_eq!(
+            missing_cache_counters(&store).0,
+            1,
+            "no reopen on the second walk"
+        );
+    }
+
+    #[test]
+    fn restored_generation_is_dropped_from_the_negative_cache() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect_err("first read fails loud");
+        let missing = store
+            .view
+            .load()
+            .sstables
+            .iter()
+            .find(|d| d.gen == "missing-gen")
+            .cloned()
+            .expect("missing-gen is in the view");
+
+        // Repair restores the object: the reader is seeded for the generation.
+        let restored = Arc::new(sstable_reader_from_partitions(
+            &test_schema(),
+            &[make_partition("c", b"missing", 1000)],
+            None,
+        ));
+        store.seed_reader(&missing, restored);
+
+        let before = missing_cache_counters(&store);
+        let rows = store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect("a restored generation must be readable again at once");
+        assert_eq!(rows.len(), 3, "all three partitions are served");
+        assert_eq!(
+            missing_cache_counters(&store),
+            before,
+            "the restored generation must not hit the negative cache"
+        );
+    }
+
+    #[test]
+    fn resolving_quarantine_clears_the_negative_cache_entry() {
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect_err("first read fails loud and quarantines");
+        assert!(store.is_sstable_quarantined("missing-gen"));
+
+        assert!(store.resolve_sstable_quarantine("missing-gen"));
+        assert!(!store.is_sstable_quarantined("missing-gen"));
+        assert!(
+            !store.resolve_sstable_quarantine("missing-gen"),
+            "resolving an unknown generation reports that nothing was cleared"
+        );
+
+        store
+            .read_range_limited_rows(None, None, 100, 0)
+            .expect_err("still missing, so still loud");
+        assert_eq!(
+            store.missing_sstable_open_failures(),
+            2,
+            "a resolved entry is re-probed with a real open"
+        );
+    }
+
+    #[test]
+    fn negative_cache_entry_expires_after_its_ttl() {
+        let ttl = std::time::Duration::from_secs(5);
+        let cache = MissingSstableCache::new(ttl, 8);
+        let t0 = Instant::now();
+        cache.record_at("g1", t0);
+        assert!(cache.is_known_missing_at("g1", t0 + std::time::Duration::from_secs(4)));
+        assert!(
+            !cache.is_known_missing_at("g1", t0 + ttl),
+            "an entry at its TTL is expired and must be re-probed"
+        );
+        assert_eq!(cache.len(), 0, "an expired entry is dropped when observed");
+    }
+
+    #[test]
+    fn negative_cache_is_bounded_and_prefers_dropping_expired_entries() {
+        let ttl = std::time::Duration::from_secs(10);
+        let cache = MissingSstableCache::new(ttl, 3);
+        let t0 = Instant::now();
+        cache.record_at("old", t0);
+        cache.record_at("g2", t0 + std::time::Duration::from_secs(8));
+        cache.record_at("g3", t0 + std::time::Duration::from_secs(9));
+        // Full; "old" has expired by now, so it is the one to go.
+        let now = t0 + std::time::Duration::from_secs(11);
+        cache.record_at("g4", now);
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.is_known_missing_at("old", now));
+        assert!(cache.is_known_missing_at("g2", now));
+        assert!(cache.is_known_missing_at("g4", now));
+
+        // Nothing expired: the entry closest to expiry is evicted, size holds.
+        cache.record_at("g5", now);
+        assert_eq!(cache.len(), 3, "the cache never grows past its bound");
+        assert!(cache.is_known_missing_at("g5", now));
+    }
+
+    #[test]
+    fn negative_cache_forget_drops_the_entry() {
+        let cache = MissingSstableCache::new(std::time::Duration::from_secs(5), 8);
+        let t0 = Instant::now();
+        cache.record_at("g1", t0);
+        cache.forget("g1");
+        assert!(!cache.is_known_missing_at("g1", t0));
+        cache.forget("never-recorded");
     }
 
     #[test]

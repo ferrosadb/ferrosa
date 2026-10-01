@@ -566,6 +566,17 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   They retry against a fresh view (compaction retired the input), then
   quarantine the SSTable and return a typed `Error::CorruptSstable`. Quarantined
   SSTables are not skipped by range reads: their rows are still missing.
+  A decode error AFTER the SSTable opened (mid-stream, in `walk_token_range[_for_digest]`
+  or the bounded-merge cascade) is attributed to the `MergeReader` that raised
+  it and takes the same path; a failure after the first row was delivered is
+  final (a retry would deliver twice), and an error from the caller's own row
+  callback is never mistaken for an SSTable failure. A generation whose open
+  failed is remembered for a short TTL (5 s, at most 256 entries — the
+  `MissingSstableCache` negative cache), so later reads and the eight retries
+  fail fast without reopening; it still returns the typed error, never a short
+  `Ok`. The entry is dropped when the generation is seeded (restored or
+  rewritten), when `resolve_sstable_quarantine` is called, or when it expires.
+  Counters: `missing_sstable_open_failures`, `missing_sstable_fast_fails`.
 - **Startup SSTable health** (`sstable_health.rs`) — decides whether a
   generation on disk can serve reads before it is loaded. A critical component
   (`Data.db`, `Partitions.db`) that is **missing**, **zero-byte**, or
