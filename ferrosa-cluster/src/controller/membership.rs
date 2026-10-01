@@ -11,6 +11,7 @@ use crate::error::{ClusterError, Result};
 use crate::raft::{uuid_to_node_id, NodeInfo, NodeState, RaftCommand, RaftOp};
 use crate::ring::TokenRing;
 
+use super::cluster::peer_topology;
 use super::token::generate_deterministic_token;
 use super::ModeController;
 
@@ -136,11 +137,26 @@ impl ModeController {
             .collect();
 
         // 5. Propose JoinNode via Raft.
+        //
+        // The committed entry must carry THE PEER's announced dc/rack, never
+        // ours: this node authors the joiner's identity, so stamping it with
+        // the local topology would record a remote-DC node as a local-DC
+        // replica in every follower's `state.members` / ring, and LOCAL_*
+        // quorums would then count it as local. A peer that announced nothing
+        // (an older peer mid-rolling-upgrade) still falls back to the local
+        // topology, which is the behaviour before DC advertisement existed.
+        let (peer_dc, peer_rack) = peer_topology(
+            peer_host_id,
+            &self.peer_dcs_snapshot(),
+            &self.peer_racks_snapshot(),
+            &self.config.data_center,
+            &self.config.rack,
+        );
         let node_info = NodeInfo {
             host_id: peer_host_id,
             addr: String::new(), // will be filled by the connecting peer
-            data_center: self.config.data_center.clone(),
-            rack: self.config.rack.clone(),
+            data_center: peer_dc,
+            rack: peer_rack,
             state: NodeState::Normal,
             cql_broadcast: None,
         };

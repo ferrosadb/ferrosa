@@ -486,6 +486,18 @@ impl PeerEventListener for ModeController {
                 self.record_peer_dc(host_id, dc);
             }
         }
+        // The rack half of the same bridge, off the same already-stored
+        // handshake value: recording only the DC would let `peer_topology`
+        // pair this peer's remote DC with OUR rack.
+        let announced_rack = match &**self.peer_manager.load() {
+            Some(pm) => pm.get_peer_rack_sync(host_id),
+            None => None,
+        };
+        if let Some(rack) = announced_rack {
+            if !rack.trim().is_empty() {
+                self.record_peer_rack(host_id, rack);
+            }
+        }
 
         // Track this peer
         {
@@ -677,6 +689,15 @@ impl InboundPeerCallback for ModeController {
                 if let Some(pm) = &**self.peer_manager.load() {
                     pm.set_peer_data_center_sync(host_id, dc.clone());
                 }
+            }
+        }
+        // Same recording for the rack half of the announced topology, in the
+        // same place and under the same non-empty guard: every producer authors
+        // a peer's `NodeInfo` from `peer_topology(.., peer_dcs, peer_racks, ..)`,
+        // so recording only the DC would pair a remote DC with OUR rack.
+        if let Some(ref rack_name) = rack {
+            if !rack_name.trim().is_empty() {
+                self.record_peer_rack(host_id, rack_name.clone());
             }
         }
 

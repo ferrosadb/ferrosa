@@ -248,6 +248,22 @@ pub struct ModeController {
     /// Peers absent from this map default to the local DC — this
     /// preserves single-DC behavior unchanged.
     pub(super) peer_dcs: Mutex<HashMap<Uuid, String>>,
+    /// Known rack for each connected peer. Exact mirror of [`Self::peer_dcs`]:
+    /// populated by [`Self::record_peer_rack`] from the same handshake that
+    /// announces the peer's DC, and read by every producer that authors a
+    /// peer's `NodeInfo` (`transition_to_cluster`'s ring build + seed join,
+    /// `handle_join_request`).
+    ///
+    /// It exists on the controller (not only in `PeerManager`) for the same
+    /// reason `peer_dcs` does: the producers run synchronously / inside an
+    /// owned `async move` block and must not reach through the
+    /// `ArcSwap<Option<PeerManager>>` guard, and a single in-scope map is what
+    /// keeps the ring entry and the voter classification from disagreeing.
+    ///
+    /// Peers absent from this map default to the local rack — this preserves
+    /// single-DC, single-rack behavior unchanged, including for a peer still on
+    /// a version that announces no topology.
+    pub(super) peer_racks: Mutex<HashMap<Uuid, String>>,
     /// Persistent hint store — holds mutations destined for temporarily
     /// unreachable replicas.  Shared with `ClusterCoordinator`.
     pub(super) hint_store: Arc<HintStore>,
@@ -512,6 +528,7 @@ impl ModeController {
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_dcs: Mutex::new(HashMap::new()),
+            peer_racks: Mutex::new(HashMap::new()),
             hint_store,
             hint_config,
             hint_deliveries_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -678,6 +695,7 @@ impl ModeController {
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_dcs: Mutex::new(HashMap::new()),
+            peer_racks: Mutex::new(HashMap::new()),
             hint_store,
             hint_config,
             hint_deliveries_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -753,6 +771,7 @@ impl ModeController {
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_dcs: Mutex::new(HashMap::new()),
+            peer_racks: Mutex::new(HashMap::new()),
             hint_store,
             hint_config,
             hint_deliveries_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1095,6 +1114,37 @@ impl ModeController {
     /// by tests.
     pub(crate) fn peer_dcs_snapshot(&self) -> HashMap<Uuid, String> {
         self.peer_dcs.lock().clone()
+    }
+
+    /// Record a connected peer's rack. Mirror of [`Self::record_peer_dc`] for
+    /// the other half of the announced topology, called from the same two
+    /// handshake paths (`on_inbound_peer`, `on_peer_connected`) that record the
+    /// DC.
+    ///
+    /// A rack is only useful paired with a DC: [`peer_topology`] takes both
+    /// from these maps, so recording one without the other would let a peer's
+    /// ring entry mix a remote DC with our rack.
+    ///
+    /// Idempotent: re-recording overwrites the prior entry. Pass the peer's
+    /// `rack` as configured at the peer (matches `FERROSA_RACK` on that node).
+    ///
+    /// [`peer_topology`]: super::cluster::peer_topology
+    pub fn record_peer_rack(&self, host_id: Uuid, rack_name: impl Into<String>) {
+        self.peer_racks.lock().insert(host_id, rack_name.into());
+    }
+
+    /// Look up a peer's rack, if known. Returns `None` for peers that have not
+    /// announced one; callers should treat that as "same rack as local".
+    pub fn peer_rack(&self, host_id: Uuid) -> Option<String> {
+        self.peer_racks.lock().get(&host_id).cloned()
+    }
+
+    /// Snapshot of the peer-rack map — the counterpart of
+    /// [`Self::peer_dcs_snapshot`], so every producer that authors a peer's
+    /// `NodeInfo` can resolve both halves of its topology from one place with
+    /// no `PeerManager`/`ArcSwap` access.
+    pub(crate) fn peer_racks_snapshot(&self) -> HashMap<Uuid, String> {
+        self.peer_racks.lock().clone()
     }
 
     /// Return a snapshot of the current token ring.

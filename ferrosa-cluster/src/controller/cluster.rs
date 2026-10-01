@@ -1167,14 +1167,7 @@ impl ModeController {
                 )
             })
             .collect();
-        let peer_racks: std::collections::HashMap<Uuid, String> = peers
-            .iter()
-            .filter_map(|(peer_uuid, _)| {
-                peer_manager
-                    .get_peer_rack_sync(*peer_uuid)
-                    .map(|rack| (*peer_uuid, rack))
-            })
-            .collect();
+        let peer_racks = self.peer_racks_snapshot();
 
         // Determine whether this node is the seed (responsible for calling
         // raft.initialize()). The seed is the node with the highest UUID among
@@ -1517,14 +1510,22 @@ impl ModeController {
             // local. Peers that announced nothing fall back to the local DC
             // via `dc_for_peer`, preserving single-DC behaviour for a peer
             // that is still on the old version.
+            //
+            // Both halves come from the controller's own maps through the one
+            // shared rule, so this entry cannot mix our DC with the peer's rack
+            // (or vice versa) and cannot disagree with the recovered-topology
+            // refresh or the seed-authored `JoinNode` for the same peer.
             for (peer_uuid, addr) in &peers {
                 let peer_node_id = uuid_to_node_id(*peer_uuid);
                 let peer_internode_broadcast =
                     peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
-                let peer_dc = super::cluster::dc_for_peer(*peer_uuid, &peer_dc_map, &local_dc);
-                let peer_rack = peer_manager
-                    .get_peer_rack_sync(*peer_uuid)
-                    .unwrap_or_else(|| self.config.rack.clone());
+                let (peer_dc, peer_rack) = super::cluster::peer_topology(
+                    *peer_uuid,
+                    &peer_dc_map,
+                    &peer_racks,
+                    &local_dc,
+                    &self.config.rack,
+                );
                 ring.add_node(
                     peer_node_id,
                     NodeInfo {
@@ -2747,14 +2748,28 @@ impl ModeController {
                             let peer_node_id = uuid_to_node_id(*peer_uuid);
                             let peer_internode_broadcast =
                                 peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
+                            // The seed authors each peer's identity here, so the
+                            // committed `NodeInfo` must carry THE PEER's
+                            // announced dc/rack — ours would file a remote-DC
+                            // node as a local-DC replica on every follower and
+                            // re-enable the LOCAL_QUORUM bug. Same single rule
+                            // (`peer_topology`) the ring build uses, so the ring
+                            // entry and the committed member cannot disagree.
+                            let (peer_dc, peer_rack) = super::cluster::peer_topology(
+                                *peer_uuid,
+                                &peer_dc_map,
+                                &peer_racks,
+                                &config_for_promotion.data_center,
+                                &config_for_promotion.rack,
+                            );
                             let node_info = crate::raft::NodeInfo {
                                 host_id: *peer_uuid,
                                 addr: super::membership::node_info_addr(
                                     *addr,
                                     peer_internode_broadcast.as_deref(),
                                 ),
-                                data_center: config_for_promotion.data_center.clone(),
-                                rack: config_for_promotion.rack.clone(),
+                                data_center: peer_dc,
+                                rack: peer_rack,
                                 state: crate::raft::NodeState::Normal,
                                 cql_broadcast: peer_cql_broadcasts
                                     .get(peer_uuid)
