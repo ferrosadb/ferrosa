@@ -774,6 +774,17 @@ impl ModeController {
         self.local_host_id
     }
 
+    /// The schema this node currently holds.
+    ///
+    /// Reported, not reconciled: a caller comparing this across nodes is the only
+    /// way to observe schema divergence, because every node's peer rows carry its
+    /// own version (`ferrosa-schema/src/system/peers.rs` writes `peer.schema_version
+    /// = snap.version`), so any check built on replicated peer metadata agrees
+    /// with itself. See `controller::bootstrap::replay_schema::postcondition`.
+    pub fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
     /// Graceful shutdown: cancel all background tasks and wait for them to finish.
     ///
     /// Call before dropping the node to ensure in-flight Raft proposals,

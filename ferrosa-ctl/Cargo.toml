@@ -40,6 +40,9 @@ tempfile = "3"
 # Offline liveness probe for `sstable mark-evicted`: try the node's sled flock.
 fs2 = "0.4"
 
+# `schema check` parses the schema/version UUIDs the admin API reports.
+uuid = { version = "1", features = ["v4"] }
+
 [dev-dependencies]
 arc-swap = "1.7"
 ferrosa-schema = { path = "../ferrosa-schema" }
@@ -50,4 +53,3 @@ ferrosa-storage = { path = "../ferrosa-storage", features = ["test-support"] }
 ferrosa-udf = { path = "../ferrosa-udf" }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
-uuid = { version = "1", features = ["v4"] }
