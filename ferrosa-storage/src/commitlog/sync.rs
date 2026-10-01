@@ -768,7 +768,11 @@ mod tests {
 
         let (lock, cvar) = &*flush_observed;
         let mut flushed = lock.lock();
-        let result = cvar.wait_for(&mut flushed, Duration::from_secs(5));
+        // Wait on the predicate, not the notification: the flush can fire and
+        // notify before this thread reaches the wait, and an unconditional
+        // `wait_for` then sleeps the full timeout on a flag that is already set.
+        let result =
+            cvar.wait_while_for(&mut flushed, |observed| !*observed, Duration::from_secs(5));
         assert!(
             *flushed && !result.timed_out(),
             "periodic sync did not flush after reaching target bytes"
