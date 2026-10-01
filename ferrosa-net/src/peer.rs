@@ -1684,7 +1684,7 @@ mod tests {
     // paused clock with real loopback sockets; `run_hops` yields real time
     // between virtual hops so kernel readiness is observed.
 
-    use crate::reconnect::total_reconnect_attempts;
+    use crate::slow_retry_tests::spawn_fake_peer;
     use crate::slow_retry_tests::{advance_hops, free_addr};
     use serial_test::serial;
 
@@ -1815,24 +1815,21 @@ mod tests {
         advance_hops(Duration::from_secs(60), Duration::from_secs(5)).await;
 
         fx.pm.remove_peer(fx.peer_id).await;
-        let attempts = total_reconnect_attempts();
         let connected = fx.listener.connected_count.load(Ordering::Relaxed);
 
-        let server = start_server_at(&fx, fx.peer_id).await;
+        // The node is back and would accept (and handshake) any dial. Counting
+        // its accepts is peer-scoped, so unlike the process-wide attempt
+        // counter it cannot be moved by other tests running in parallel.
+        let node = spawn_fake_peer(fx.addr, fx.peer_id, Duration::ZERO, None);
         advance_hops(Duration::from_secs(10 * 60), Duration::from_secs(5)).await;
 
         assert!(!fx.pm.has_peer(fx.peer_id), "removed peer came back");
-        assert_eq!(
-            total_reconnect_attempts(),
-            attempts,
-            "a removed peer kept being dialed"
-        );
+        assert_eq!(node.accepted(), 0, "a removed peer was dialed");
         assert_eq!(
             fx.listener.connected_count.load(Ordering::Relaxed),
             connected,
             "a removed peer was announced as connected again"
         );
-        server.shutdown(Duration::from_millis(50)).await;
     }
 
     /// The address now answers as a different node: it is dialed, refused, and
@@ -1841,13 +1838,14 @@ mod tests {
     #[serial(net_reconnect_counters)]
     async fn redial_refuses_an_address_owned_by_another_node() {
         let fx = peer_left_pool_less_by_outage().await;
-        let attempts = total_reconnect_attempts();
 
-        let impostor = start_server_at(&fx, uuid::Uuid::new_v4()).await;
+        let impostor = spawn_fake_peer(fx.addr, uuid::Uuid::new_v4(), Duration::ZERO, None);
         advance_hops(Duration::from_secs(5 * 60), Duration::from_secs(5)).await;
 
+        // Peer-scoped: the impostor completed handshakes, so the manager did
+        // dial the address and then refused what answered.
         assert!(
-            total_reconnect_attempts() > attempts,
+            impostor.accepted() >= 1,
             "the manager never dialed the address, so nothing was refused"
         );
         assert!(
@@ -1855,7 +1853,6 @@ mod tests {
             "a different node was pooled under the expected peer id"
         );
         assert!(fx.pm.has_peer(fx.peer_id), "the peer entry must be kept");
-        impostor.shutdown(Duration::from_millis(50)).await;
         fx.pm.remove_peer(fx.peer_id).await;
     }
 

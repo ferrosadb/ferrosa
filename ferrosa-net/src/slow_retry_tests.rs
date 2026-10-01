@@ -34,12 +34,12 @@ const MINUTE: Duration = Duration::from_secs(60);
 // go away again after a fixed time.
 // ---------------------------------------------------------------------------
 
-struct FakePeer {
+pub(crate) struct FakePeer {
     accepted: Arc<AtomicUsize>,
 }
 
 impl FakePeer {
-    fn accepted(&self) -> usize {
+    pub(crate) fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
     }
 }
@@ -54,7 +54,7 @@ pub(crate) fn free_addr() -> SocketAddr {
 
 /// Bind `addr` after `start_after` and answer handshakes as `id`; stop
 /// listening and drop every connection after `up_for` (never if `None`).
-fn spawn_fake_peer(
+pub(crate) fn spawn_fake_peer(
     addr: SocketAddr,
     id: Uuid,
     start_after: Duration,
@@ -406,7 +406,9 @@ async fn slow_retry_logs_the_drop_and_the_recovery_once_each() {
 async fn shutdown_during_slow_retry_stops_attempts_and_leaks_no_task() {
     let addr = free_addr();
     let peer_id = Uuid::new_v4();
-    let returned = spawn_fake_peer(addr, peer_id, 40 * MINUTE, None);
+    // Binds five seconds after the shutdown below, so any dial the lane made
+    // after being shut down would reach it and show in `accepted()`.
+    let returned = spawn_fake_peer(addr, peer_id, 25 * MINUTE + Duration::from_secs(5), None);
     let tasks_before_lane = tokio::runtime::Handle::current()
         .metrics()
         .num_alive_tasks();
@@ -432,21 +434,17 @@ async fn shutdown_during_slow_retry_stops_attempts_and_leaks_no_task() {
     handle.shutdown().await;
     // One slow-retry interval (plus jitter) for in-flight sleeps to notice.
     run_for(2 * MINUTE).await;
-    let attempts_settled = total_reconnect_attempts();
     let tasks_settled = tokio::runtime::Handle::current()
         .metrics()
         .num_alive_tasks();
 
     run_for(30 * MINUTE).await;
-    assert_eq!(
-        total_reconnect_attempts(),
-        attempts_settled,
-        "a shut-down lane kept dialing"
-    );
+    // Peer-scoped and exact: the process-wide attempt counter is also bumped by
+    // unrelated tests running in parallel threads, so it cannot prove "no dial".
     assert_eq!(
         returned.accepted(),
         0,
-        "a shut-down lane reconnected to the returning peer"
+        "a shut-down lane dialed the returning peer"
     );
     let tasks_after = tokio::runtime::Handle::current()
         .metrics()
