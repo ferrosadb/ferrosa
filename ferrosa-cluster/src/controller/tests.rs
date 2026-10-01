@@ -3935,3 +3935,139 @@ async fn an_inbound_peer_is_registered_in_the_raft_node_map() {
          is 'registration pending' forever: {map:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// bug-internode-broadcast-addr-frozen-to-startup-ip
+//
+// Regression test for the whole wire: a node told to advertise a HOSTNAME:port
+// must (1) put that hostname — not the IP it resolved at startup — into the
+// handshake every peer decodes, and (2) commit that same hostname as its
+// NodeInfo.addr, so dial-time resolution reaches the peer's CURRENT address
+// rather than a frozen, dead IP. The live container-IP churn end-to-end run
+// remains the item's own gate; this test asserts the invariant at the two
+// boundaries that gate it, without needing podman.
+//
+// RED against the old behaviour: when the advertisement is the resolved
+// SocketAddr (`NetConfig::broadcast_addr` with `internode_broadcast` absent —
+// the pre-fix shape) the handshake advertises no hostname and the committed
+// `NodeInfo.addr` becomes the startup/observed IP literal. Both the handshake
+// assertion and the dial-time re-resolution assertion below then fail.
+// ---------------------------------------------------------------------------
+
+/// Drive a real ferrosa-net handshake over an in-memory duplex and return the
+/// `HandshakePeer` the initiator decoded — i.e. what the server node advertised
+/// about itself on the wire.
+async fn advertised_peer_from_handshake(
+    server_config: &ferrosa_net::config::NetConfig,
+) -> ferrosa_net::handshake::HandshakePeer {
+    use ferrosa_net::codec::InternodeCodec;
+    use ferrosa_net::handshake::{accept_handshake, initiate_handshake};
+    use tokio_util::codec::Framed;
+
+    let (client_io, server_io) = tokio::io::duplex(8192);
+    let mut client_config = ferrosa_net::config::NetConfig::default();
+    client_config.cluster_name = server_config.cluster_name.clone();
+
+    let mut client_framed = Framed::new(
+        client_io,
+        InternodeCodec::new(client_config.max_frame_body_size),
+    );
+    let mut server_framed = Framed::new(
+        server_io,
+        InternodeCodec::new(server_config.max_frame_body_size),
+    );
+
+    let client_fut =
+        initiate_handshake(&mut client_framed, &client_config, Uuid::from_u128(0xdead));
+    let server_fut = accept_handshake(&mut server_framed, server_config, Uuid::from_u128(1));
+    let (client_res, server_res) = tokio::join!(client_fut, server_fut);
+    server_res.expect("the node accepts the handshake");
+    client_res.expect("the peer decodes the HandshakeAck")
+}
+
+#[tokio::test]
+async fn internode_broadcast_hostname_is_advertised_and_committed_not_a_frozen_ip() {
+    use std::net::ToSocketAddrs;
+
+    // A generation-1 address the node resolved ONCE, at startup. It is dead now
+    // — no listener, and (crucially) it is NOT where the node actually is.
+    let startup_ip: std::net::SocketAddr = "10.89.1.176:17000".parse().unwrap();
+    // The generation-2 address the node is reachable at RIGHT NOW. Deliberately a
+    // different address family/value, mirroring container IP churn.
+    let current_addr: std::net::SocketAddr = "127.0.0.1:17000".parse().unwrap();
+    // The re-resolvable target the node is configured to advertise; it resolves
+    // to `current_addr` today and would resolve to whatever address the node gets
+    // after the next restart.
+    let advertised = "localhost:17000";
+
+    let mut server_config = ferrosa_net::config::NetConfig::default();
+    server_config.cluster_name = "ferrosa".to_string();
+    server_config.broadcast_addr = startup_ip;
+    server_config.bind_addr = "0.0.0.0:17000".parse().unwrap();
+    server_config.internode_broadcast = Some(advertised.to_string());
+
+    // (1) What the node advertises in the handshake — the peer-facing half.
+    let peer = advertised_peer_from_handshake(&server_config).await;
+    assert_eq!(
+        peer.internode_broadcast.as_deref(),
+        Some(advertised),
+        "the handshake must carry the re-resolvable hostname, not a frozen IP"
+    );
+    assert_ne!(
+        peer.internode_broadcast.as_deref(),
+        Some(startup_ip.to_string().as_str()),
+        "the handshake must NOT advertise the startup-frozen IP"
+    );
+
+    // (2) What a peer commits as this node's NodeInfo.addr — the committed half.
+    // The observed connection address is the node's CURRENT address, not the
+    // startup IP.
+    let committed =
+        super::membership::node_info_addr(current_addr, peer.internode_broadcast.as_deref());
+    assert_eq!(
+        committed, advertised,
+        "the committed membership entry must be the re-resolvable hostname, not \
+         the address the node happened to connect from"
+    );
+    assert_ne!(
+        committed,
+        current_addr.to_string(),
+        "committing the observed IP is the frozen-address bug"
+    );
+    assert_ne!(
+        committed,
+        startup_ip.to_string(),
+        "committing the startup IP is the frozen-address bug"
+    );
+    assert!(
+        committed.parse::<std::net::SocketAddr>().is_err(),
+        "a re-resolvable committed entry must be host:port, never a SocketAddr \
+         literal — an IP literal is exactly what freezes to one generation"
+    );
+
+    // (3) Dial-time resolution reaches the node's CURRENT address.
+    let dialed: Vec<std::net::SocketAddr> = committed
+        .to_socket_addrs()
+        .expect("the committed hostname must resolve at dial time")
+        .collect();
+    assert!(
+        dialed.contains(&current_addr),
+        "resolving the committed entry at dial time must reach the node's CURRENT \
+         address {current_addr}; got {dialed:?}"
+    );
+
+    // Non-vacuity guard: the frozen startup IP could NOT reach the current
+    // address, because re-resolving an IP literal is a no-op. This is the
+    // concrete difference between the committed hostname and the old behavior.
+    let frozen: Vec<std::net::SocketAddr> = startup_ip
+        .to_string()
+        .to_socket_addrs()
+        .expect("an IP literal always resolves to itself")
+        .collect();
+    assert_eq!(frozen, vec![startup_ip]);
+    assert!(
+        !frozen.contains(&current_addr),
+        "the startup-frozen IP must not reach the current address — otherwise this \
+         test would be vacuous"
+    );
+}
