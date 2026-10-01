@@ -1616,6 +1616,117 @@ mod tests {
 
     // ---- Switchover endpoint tests ------------------------------------
 
+    /// Build a state whose node is a committed cluster member with one connected
+    /// peer, i.e. a node an operator would legitimately downgrade.
+    ///
+    /// `make_state()` gives a standalone node, and `WebAppState` exposes the
+    /// controller, so the test sets the real preconditions the way production
+    /// reaches them: a PeerManager is installed (the pair transition requires
+    /// one) and the peer is in `connected_peers` (a pair replicates to exactly
+    /// one peer). Without both, a 200 would be meaningless.
+    fn make_state_in_cluster_with_peer() -> WebAppState {
+        use ferrosa_net::peer::PeerManager;
+        use std::sync::Arc;
+
+        let state = make_state();
+        let mc = state.mode_controller.clone();
+        let net_config = Arc::new(ferrosa_net::config::NetConfig::default());
+        let pm = Arc::new(PeerManager::new(net_config, mc.host_id(), mc.clone()));
+        mc.set_peer_manager(pm);
+        mc.set_mode_for_test(ferrosa_common::deployment_mode::DeploymentMode::Cluster);
+        // Drive the REAL production path rather than reaching into controller
+        // state: an operator's node has its peer in `connected_peers` because
+        // `on_peer_connected` put it there. `PeerEventListener` is the public
+        // trait ferrosa-net uses for exactly this, so the test can register a
+        // peer the same way the network layer does.
+        use ferrosa_net::peer::PeerEventListener;
+        // A peer whose Uuid sorts ABOVE the local host, so `choose_pair_role`
+        // elects this node Secondary deterministically (`was_promoted` is false
+        // here). That gives the test an observable that only exists if the pair
+        // machinery actually ran -- a "declare pair, install nothing" shortcut
+        // leaves `role` None, and `role` is part of the public cluster status.
+        // `choose_pair_role` returns Primary when `local <= peer`, so to get a
+        // Secondary we need a peer that sorts BELOW the local host.
+        let local = mc.host_id();
+        assert!(local.as_u128() > 0, "a zero host id has no peer below it");
+        let peer = uuid::Uuid::from_u128(local.as_u128() - 1);
+        assert!(peer < local, "the peer must sort below the local host");
+        mc.on_peer_connected((peer, "127.0.0.1:7000".parse().unwrap()));
+        state
+    }
+
+    /// A committed cluster member WITH a connected peer is downgraded by the
+    /// endpoint, and the node really moves -- not just the response string.
+    ///
+    /// The refusal case is the easy half. This is the one that catches a
+    /// "declare pair, install nothing" implementation: it asserts the status,
+    /// the mode the node reports, and that the pair machinery is actually in
+    /// place, which is what the automatic state machine refuses to do without
+    /// an operator.
+    #[tokio::test]
+    async fn api_downgrade_to_pair_succeeds_for_a_cluster_member_with_a_peer() {
+        let state = make_state_in_cluster_with_peer();
+        let mc = state.mode_controller.clone();
+        assert_eq!(
+            mc.mode(),
+            ferrosa_common::deployment_mode::DeploymentMode::Cluster,
+            "precondition: the node starts as a committed cluster member"
+        );
+
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/downgrade-to-pair")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "an operator downgrade with a peer connected must succeed"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "downgraded to pair mode");
+        assert_eq!(parsed["mode"], "pair");
+        assert!(
+            parsed["peer"].as_str().is_some_and(|p| !p.is_empty()),
+            "the response must name the replication target"
+        );
+        assert!(
+            parsed["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("no longer commits through Raft")),
+            "the response must state the guarantee that changed, got: {}",
+            parsed["warning"]
+        );
+
+        // The MODE moved, and the pair machinery came with it.
+        assert_eq!(
+            mc.mode(),
+            ferrosa_common::deployment_mode::DeploymentMode::Pair,
+            "the endpoint must actually move the node's mode"
+        );
+        // `role` comes from `pair_context`, which ONLY the machinery installs.
+        // This is the assertion that fails for a shortcut that sets the mode and
+        // returns early -- verified by red probe.
+        assert_eq!(
+            mc.role().map(|r| r.to_string()).as_deref(),
+            Some("secondary"),
+            "the pair machinery (pair_context) must be installed, not just the mode; \
+             a node reporting pair with no role is the 'declare pair, install \
+             nothing' bug"
+        );
+        assert_eq!(
+            mc.ddl_path_kind(),
+            "pair",
+            "the DDL path must be the pair path, not left on the cluster/direct path"
+        );
+    }
+
     /// The operator downgrade endpoint reports a refusal as 409, not 500.
     ///
     /// A node with no connected peer cannot become a pair -- there would be
