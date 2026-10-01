@@ -1,3 +1,36 @@
+# Scripts
+
+## Policy: scripts never touch production data
+
+Scripts here are **reference and test material**. They are never the supported
+way to recover, repair or otherwise mutate a node's data directory. That path
+belongs in the product (`ferrosa-ctl`), where it is tested, dry-run by default
+and refuses a live node.
+
+Why: on 2026-09-29 `recover-evicted-sstables.py` wrote eviction markers
+straight into live node data directories. It and the evictor both wrote an
+empty `<gen>.evicted` file, so afterwards nobody could tell a real eviction
+from the script's own marking.
+
+* `scripts/guard-no-python-data-writes.py` runs in CI (job
+  `no-python-data-writes`). It fails when a tracked `scripts/**/*.py` declares a
+  data-directory argument (`--data-dir`, `--data-root`, ...) and contains a
+  mutating filesystem call. A deliberate exception carries
+  `# data-dir-write-ok: <reason>` on the mutating line (or on the argument line
+  to waive the file). It is a heuristic: it does not follow paths through
+  variables, so review any new script that takes a data directory.
+* The two current exceptions: `rf_evidence.py` (a test harness that owns the
+  scratch `--data-root` it creates for throwaway nodes) and
+  `recover-evicted-sstables.py` (unsupported, refuses to run without
+  `--i-understand-this-is-unsupported`).
+
+| Python script | Kind |
+|---------------|------|
+| `check-unbounded-reads.py` | Read-only CI lint over source files. |
+| `inject-nightly-image.py` | Rewrites the Compose files named on its command line; takes no data dir. |
+| `rf_evidence.py` | Test harness; starts throwaway nodes in a scratch `--data-root` it owns. |
+| `recover-evicted-sstables.py` | UNSUPPORTED reference. Use `ferrosa-ctl sstable mark-evicted`. |
+
 # Test Cluster Scripts
 
 Scripts for bringing up a 3-node Ferrosa test cluster and running cluster-dependent tests.

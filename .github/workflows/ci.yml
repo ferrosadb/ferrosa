@@ -58,6 +58,19 @@ jobs:
       - name: Guard tests
         run: bash tests/test_guard_no_memory_public.sh
 
+  # Python must not recover or mutate production data (2026-09-29: a recovery
+  # script's markers were indistinguishable from the evictor's). See
+  # scripts/README.md.
+  no-python-data-writes:
+    name: scripts must not write into a data dir
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: No script writes into a data directory
+        run: python3 scripts/guard-no-python-data-writes.py
+      - name: Guard tests
+        run: python3 -m unittest -q tests/ci/test_guard_no_python_data_writes.py
+
   # jsonb guards (T-025): serde_json features are unified workspace-wide, so one
   # dependent enabling arbitrary_precision / preserve_order / unbounded_depth
   # changes number and object semantics everywhere (hazards M8, M12). The value

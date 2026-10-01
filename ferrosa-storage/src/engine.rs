@@ -22895,7 +22895,6 @@ mod tests {
                     make_row(b"v", 1000),
                     1000,
                 )
-                .write(&tid, &make_key(&format!("k{i}")), make_row(b"v", 1000), 1000)
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
@@ -30334,6 +30333,8 @@ mod tests {
             "a retired generation leaves nothing behind, found {leftovers:?}"
         );
         engine.shutdown().unwrap();
+    }
+
     /// Build an engine over `dir` holding generations `1` and `2` (80 bytes
     /// each) that the manifest lists as uploaded, with the given cache cap and
     /// disk-free reserve. Returns the engine, its table dir and the manifest.

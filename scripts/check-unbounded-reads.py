@@ -5,6 +5,8 @@ Ferrosa has historically hit OOMs when code accidentally materializes whole
 ranges/tables into RAM instead of using streaming/paged paths. This guard catches
 the highest-risk call shape: `read_range(None, None, ...)` in production Rust.
 
+Read-only: scans source files and writes nothing. CI lint, not a data tool.
+
 Tests may exercise the fail-closed cap and intentional exceptions may be marked
 with `allowlist unbounded-read` on the same or immediately preceding line.
 """
