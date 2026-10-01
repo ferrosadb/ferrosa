@@ -102,6 +102,13 @@ pub struct EvictionRecord {
     /// Free disk bytes the evictor was trying to reach (0 = disabled).
     #[serde(default)]
     pub target_free: Option<u64>,
+    /// Index artifacts (`.sidecar`, full-text, vector files; component names
+    /// after `{gen}-`) the generation held locally when it was evicted. A
+    /// restore must obtain every one of them: an index without its postings
+    /// answers `Ok` with no rows. `None` means unknown (a legacy or recovered
+    /// marker), so only what the object store lists can be pulled.
+    #[serde(default)]
+    pub index_artifacts: Option<Vec<String>>,
 }
 
 impl EvictionRecord {
@@ -118,6 +125,7 @@ impl EvictionRecord {
             min_bytes: None,
             projected_available: None,
             target_free: None,
+            index_artifacts: None,
         }
     }
 }
@@ -179,6 +187,16 @@ pub fn read_marker(path: &Path) -> MarkerState {
             Err(e) => MarkerState::Unreadable(format!("not a valid eviction record: {e}")),
         },
         Err(e) => MarkerState::Unreadable(format!("could not read the marker: {e}")),
+    }
+}
+
+/// The index artifacts the marker at `path` says the generation held when it
+/// was evicted. `None` when the marker is legacy, unreadable or written by a
+/// recovery tool: the expected set is then unknown.
+pub fn expected_index_artifacts(path: &Path) -> Option<Vec<String>> {
+    match read_marker(path) {
+        MarkerState::Recorded(record) => record.index_artifacts,
+        MarkerState::Legacy | MarkerState::Unreadable(_) => None,
     }
 }
 
@@ -282,6 +300,7 @@ pub(crate) fn test_record() -> EvictionRecord {
         min_bytes: Some(0),
         projected_available: Some(5),
         target_free: Some(10),
+        index_artifacts: Some(vec!["idx_a.sidecar".to_string()]),
     }
 }
 

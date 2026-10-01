@@ -12347,6 +12347,35 @@ impl StorageEngine {
         reclaimed
     }
 
+    /// Index artifacts (component names after `{gen}-`) generation `gen` holds
+    /// locally, sorted. Recorded in its eviction marker so a restore can tell
+    /// a lost artifact from one that never existed.
+    fn local_index_artifacts(table_dir: &std::path::Path, gen: &str) -> Vec<String> {
+        let dir = if table_dir.join(gen).is_dir() {
+            table_dir.join(gen)
+        } else {
+            table_dir.to_path_buf()
+        };
+        let prefix = format!("{gen}-");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!(dir = %dir.display(), gen, error = %e, "evictor: cannot list the generation's index artifacts; its marker will not record them");
+                return Vec::new();
+            }
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let component = name.strip_prefix(&prefix)?;
+                Self::is_index_artifact(component).then(|| component.to_string())
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Deletes all on-disk component files for an SSTable generation, leaving
     /// any eviction marker in place.
     fn delete_sstable_components(table_dir: &std::path::Path, gen: &str) -> u64 {
@@ -12913,6 +12942,7 @@ impl StorageEngine {
                 min_bytes: Some(min_bytes),
                 projected_available: Some(projected_available),
                 target_free: Some(target_free),
+                index_artifacts: Some(Self::local_index_artifacts(&table_dir, &sstable_id)),
                 ..crate::eviction_marker::EvictionRecord::bare(
                     trigger,
                     crate::eviction_marker::SOURCE_EVICTOR,
@@ -13970,7 +14000,7 @@ impl StorageEngine {
     /// Whether `component` (a file name after `{gen}-`) is an index artifact
     /// rather than an SSTable component: a scalar `.sidecar`, or a full-text,
     /// vector or quantized-vector index file.
-    fn is_index_artifact(component: &str) -> bool {
+    pub(crate) fn is_index_artifact(component: &str) -> bool {
         component.ends_with(".sidecar")
             || component.starts_with("FTI-")
             || component.starts_with("VEC-")

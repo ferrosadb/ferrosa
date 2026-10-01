@@ -342,7 +342,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   each sync, `restore_hot_evicted_sstables` fully restores hot tables'
   generations (8 per pass, only while free disk stays above the eviction target
   and the uploaded cache under its limit; `FERROSA_RESTORE_HOT_TABLES_ON_START=0`
-  disables). A live QUERY that reopens a
+  disables).
+  A remote-backed generation's index artifacts (`.sidecar`, full-text, vector
+  files) are fetched whole with its index components (ST-59), and its eviction
+  marker lists the artifacts it held, so a lost one fails the open instead of
+  leaving an index with missing postings. A live QUERY that reopens a
   marked generation between eviction and restart does not download it
   (ST-51, `evicted_read.rs`): `open_file_sstable` fetches only the small index
   components (`Partitions.db`, `Rows.db`, `Filter.db`, `Statistics.db`,

@@ -516,6 +516,17 @@ impl Harness {
         params: &Params,
         models: &[Model],
     ) -> StorageEngine {
+        Self::try_open_engine(dir, store, prefix, params, models).unwrap()
+    }
+
+    /// [`Self::open_engine`] that returns a failed startup instead of panicking.
+    fn try_open_engine(
+        dir: &std::path::Path,
+        store: &Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+        params: &Params,
+        models: &[Model],
+    ) -> ferrosa_common::Result<StorageEngine> {
         let mut config = StorageEngineConfig::test_config(dir);
         config.local_cache_max_bytes = params.cache_cap;
         config.cache_hot_window_secs = params.hot_window_secs;
@@ -533,8 +544,7 @@ impl Harness {
             Arc::clone(store),
             prefix.to_string(),
             &tokio::runtime::Handle::current(),
-        )
-        .unwrap();
+        )?;
         // The test constructor does not install the read-through hook the
         // production constructors do.
         StorageEngine::install_s3_file_read_rehydration_hook(
@@ -545,7 +555,7 @@ impl Harness {
         for model in models {
             Self::register(&engine, model);
         }
-        engine
+        Ok(engine)
     }
 
     fn register(engine: &StorageEngine, model: &Model) {
@@ -1179,4 +1189,116 @@ mod slow {
             h.engine().shutdown().unwrap();
         }
     }
+}
+
+// ---- Index artifacts of evicted generations (t_f217fd9d, FMEA ST-59) ----
+
+/// Delete the stored objects of one kind of index artifact, as if the bucket
+/// had lost them, leaving every SSTable component in place.
+async fn delete_index_objects(
+    store: &Arc<dyn object_store::ObjectStore>,
+    is_artifact: fn(&str) -> bool,
+) -> usize {
+    use futures::StreamExt;
+    let mut doomed = Vec::new();
+    let mut listing = store.list(None);
+    while let Some(object) = listing.next().await {
+        let location = object.expect("listing the in-memory store").location;
+        if location.filename().is_some_and(is_artifact) {
+            doomed.push(location);
+        }
+    }
+    drop(listing);
+    for location in &doomed {
+        store.delete(location).await.expect("deleting an object");
+    }
+    doomed.len()
+}
+
+/// 2026-10-01: a restart registered every evicted generation remote-backed
+/// and fetched only its SSTable index components. The `.sidecar` and
+/// full-text artifacts stayed in the object store, so every index consult
+/// found no postings and answered `Ok` with no rows (expected 112).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_over_evicted_generations_serves_every_index_consult() {
+    let mut params = Params::default_with(0);
+    params.cache_cap = 1;
+    let mut h = Harness::new("inv-restart-index", params);
+    for _ in 0..2 {
+        h.write_cycle();
+        h.flush_and_sync().await;
+    }
+    for model in &h.models {
+        assert_eq!(
+            h.local_generations(model),
+            0,
+            "precondition: {}",
+            model.name
+        );
+    }
+
+    h.restart();
+
+    h.assert_index_paths_readable_first("after a restart over evicted generations");
+    for model in &h.models {
+        assert_eq!(
+            h.local_generations(model),
+            0,
+            "{}: the consult must be served remote-backed, not by a full rehydrate",
+            model.name
+        );
+    }
+    h.engine().shutdown().unwrap();
+}
+
+/// The marker records which index artifacts the generation held when it was
+/// evicted. If the store no longer has one of them, the restart must refuse
+/// to serve the table: an index without its postings answers `Ok` with no rows.
+async fn lost_index_artifact_fails_startup_loud(
+    prefix: &str,
+    is_artifact: fn(&str) -> bool,
+    what: &str,
+) {
+    let mut params = Params::default_with(0);
+    params.cache_cap = 1;
+    let mut h = Harness::new(prefix, params);
+    h.write_cycle();
+    h.flush_and_sync().await;
+    let engine = h.engine.take().expect("the engine is running");
+    engine.shutdown().unwrap();
+    drop(engine);
+    let lost = delete_index_objects(&h.store, is_artifact).await;
+    assert!(lost >= 1, "precondition: the store held {what} objects");
+
+    let outcome = Harness::try_open_engine(h.dir.path(), &h.store, &h.prefix, &h.params, &h.models);
+
+    let err = match outcome {
+        Ok(_) => panic!("startup served tables whose {what} objects are gone"),
+        Err(e) => e,
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("index artifact") && text.contains("evicted"),
+        "the error must name the lost index artifact of an evicted generation: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_sidecar_object_fails_startup_loud() {
+    lost_index_artifact_fails_startup_loud(
+        "inv-lost-sidecar",
+        |name| name.ends_with(".sidecar"),
+        "sidecar",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_fulltext_object_fails_startup_loud() {
+    lost_index_artifact_fails_startup_loud(
+        "inv-lost-fti",
+        |name| name.contains("-FTI-"),
+        "full-text",
+    )
+    .await;
 }
