@@ -663,7 +663,10 @@ impl Harness {
         let (manifest, _) = crate::manifest::Manifest::load(self.store.as_ref(), &self.prefix)
             .await
             .unwrap();
-        let candidates = self.engine().collect_uploaded_local_sstables(&manifest);
+        let candidates = self
+            .engine()
+            .collect_uploaded_local_sstables(&manifest)
+            .candidates;
         let local = candidates.iter().map(|c| c.size).sum();
         let mut per_table = BTreeMap::new();
         for c in &candidates {
