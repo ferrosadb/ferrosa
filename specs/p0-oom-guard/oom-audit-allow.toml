@@ -24,61 +24,6 @@
 # ---------------------------------------------------------------------------
 
 [[allow]]
-path = "ferrosa-cluster/src/write_path.rs"
-rule = "returns-vec-partition-or-row"
-symbol = "range_read_limited_rows"
-reason = "t_15417b35: SELECT-arm streaming fix removes this materializing range_read_limited_rows."
-owner = "storage"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/write_path.rs"
-rule = "limited-rows-call-site"
-symbol = "range_read_limited_rows"
-reason = "t_15417b35: write_path dispatch into the materializing range read; removed by SELECT-arm fix."
-owner = "storage"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/write_path.rs"
-rule = "limited-rows-call-site"
-symbol = "coordinate_range_read_limited_rows"
-reason = "t_15417b35: write_path -> coordinator materializing range read; removed by SELECT-arm fix."
-owner = "storage"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cql/src/router.rs"
-rule = "limited-rows-call-site"
-symbol = "range_read_limited_rows"
-reason = "t_15417b35: degraded IndexScanWithFilter/SingleIndex arm call sites; removed by SELECT-arm streaming fix."
-owner = "storage"
-expires = "2026-10-02"
-
-# NOTE (t_ee98faa0 / t_3fc6be3c, consume-path bounded-streaming refactor):
-# `read_local_range_stream_limited_rows` and `dedup_by_token` were DELETED — the
-# limited-rows coordinator now drinks the bounded token-deduped N-way merge
-# stream instead of reading a local Vec + accumulating remote partitions. Their
-# former allow entries (with-capacity-limit / stream-returns-vec /
-# returns-vec-partition-or-row) are removed with the symbols.
-
-# ---------------------------------------------------------------------------
-# Group 2 — pre-existing materialization predating the guard (epic t_110dd8a5)
-# Warn-mode first (FMEA: existing unfixed code must not block). Each path is
-# migrated to streaming under the epic; expiry 2026-12-31 forces re-review.
-# ---------------------------------------------------------------------------
-
-# -- ferrosa-cluster coordinator: range read / index read materialization ----
-# `coordinate_range_read_stream_limited_rows` returns a `Vec<Partition>` bounded
-# by the CALLER's own `limit` (a user `LIMIT N` / page probe) — NOT the whole
-# table. Post the consume-path bounded-streaming refactor (t_ee98faa0/t_3fc6be3c)
-# it drinks the bounded token-deduped N-way merge stream and folds `<= limit`
-# whole partitions; the accumulation is O(limit result), never O(table). These
-# three entries cover the `Vec`-returning signature (stream-returns-vec /
-# returns-vec-partition-or-row) and the bounded stream-drain fold
-# (stream-push-accumulation) inherent to that signature. Retire when the callers
-# (t_480c91fe) are migrated to page-by-page streaming and the fn is deleted.
-[[allow]]
 path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
 rule = "stream-returns-vec"
 symbol = "coordinate_range_read_stream_limited_rows"
@@ -275,15 +220,6 @@ expires = "2026-12-31"
 # ===========================================================================
 
 # -- Group 1b: SELECT-arm site removed by t_15417b35 (expiry 2026-09-30) ------
-[[allow]]
-path = "ferrosa-cql/src/router.rs"
-rule = "materializing-range-read-call-site"
-symbol = "range_read_projected"
-reason = "t_15417b35: degraded SELECT scan arm range_read_projected call (router.rs:4670), adjacent to the range_read_limited_rows sites; removed by the SELECT-arm streaming fix."
-owner = "storage"
-expires = "2026-10-02"
-
-# -- Group 2b: rule `collect-vec-partition-or-row` (epic t_110dd8a5) ----------
 [[allow]]
 path = "ferrosa-cluster/src/accord/apply.rs"
 rule = "collect-vec-partition-or-row"
@@ -736,38 +672,6 @@ expires = "2027-07-01"
 
 # The P0 DEFAULT_RANGE_READ_LIMIT family — removed by the streaming epic.
 [[allow]]
-path = "ferrosa-cluster/src/write_path.rs"
-rule = "server-side-result-cap"
-reason = "t_15417b35/t_480c91fe: DEFAULT_RANGE_READ_LIMIT const + clamps, removed as the SELECT-arm/callers stream."
-owner = "bkearns"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/read.rs"
-rule = "server-side-result-cap"
-symbol = "DEFAULT_RANGE_READ_LIMIT"
-reason = "t_15417b35/t_480c91fe: legacy coordinated read clamp, removed as callers stream."
-owner = "bkearns"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
-rule = "server-side-result-cap"
-symbol = "DEFAULT_RANGE_READ_LIMIT"
-reason = "t_15417b35/t_480c91fe: legacy limited-rows clamp, removed as callers stream."
-owner = "bkearns"
-expires = "2026-10-02"
-
-[[allow]]
-path = "ferrosa-cluster/src/raft/handlers.rs"
-rule = "server-side-result-cap"
-symbol = "DEFAULT_RANGE_READ_LIMIT"
-reason = "documented intentional per-replica cap on the legacy non-streaming RPC (FERROSA_BULK_STREAMING_RANGE_READ=0 opt-out); retire with the legacy path (t_15417b35)."
-owner = "bkearns"
-expires = "2026-10-02"
-
-# Genuine caps with tracked removal tasks.
-[[allow]]
 path = "ferrosa-storage/src/store.rs"
 rule = "server-side-result-cap"
 reason = "t_1f2485ef: INDEX_RESULT_CAP + RANGE_READ_MATERIALIZATION_CAP fail-loud refusal caps; stream instead."
@@ -1214,4 +1118,3 @@ symbol = "execute_query_streaming"
 reason = "Rows stream to the ReplySink as the executor yields them (t_f348ba0b); the returned Vec holds only the bounded tail (CommandComplete or the terminating ErrorResponse)."
 owner = "bkearns"
 expires = "2027-07-01"
-

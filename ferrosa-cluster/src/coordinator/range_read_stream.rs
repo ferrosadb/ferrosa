@@ -1628,7 +1628,7 @@ impl ClusterCoordinator {
     /// This is used by full-table CQL scans whose result must be complete
     /// (`ALLOW FILTERING`, `SELECT DISTINCT`, and uncapped `SELECT *`). The
     /// legacy materializing range RPC is intentionally not used here because it
-    /// applies `DEFAULT_RANGE_READ_LIMIT` and would silently return partial
+    /// applies a per-replica message window and would silently return partial
     /// query results.
     pub async fn coordinate_range_read_stream_all(
         &self,
@@ -2113,12 +2113,11 @@ impl ClusterCoordinator {
         limit: usize,
         row_limit: usize,
     ) -> crate::error::Result<Vec<Partition>> {
-        // `limit` is the caller's own bound (a user `LIMIT N`, or the
-        // `DEFAULT_RANGE_READ_LIMIT + 1` probe of the truncation-detecting
-        // checked reader) — NOT a server-side result cap. Do not re-clamp it to
-        // 10_000: a user `LIMIT 20000` must return up to 20000 rows. Memory is
-        // bounded by the caller's chosen `limit`. Floor at 1 (a 0-limit bounded
-        // read is meaningless).
+        // `limit` is the caller's own bound (a user `LIMIT N`) — NOT a
+        // server-side result cap. Do not re-clamp it to 10_000: a user
+        // `LIMIT 20000` must return up to 20000 rows. Memory is bounded by the
+        // caller's chosen `limit`. Floor at 1 (a 0-limit bounded read is
+        // meaningless).
         let limit = limit.max(1);
 
         // BOUNDED-STREAMING CONSUME PATH (`t_ee98faa0` / `t_3fc6be3c`).

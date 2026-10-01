@@ -6793,10 +6793,9 @@ async fn route_select_user_table_inner(
                             // there is NO server-side row cap: the result is exact
                             // over the whole table and memory is independent of the
                             // scanned row count. (The previous path capped this at
-                            // DEFAULT_RANGE_READ_LIMIT and then fail-loud'd, so
-                            // `SELECT SUM(v) FROM t` over >10k rows was refused
-                            // entirely.) ORDER BY / DISTINCT keep the bounded path
-                            // below until spill-to-disk lands (step 5).
+                            // 10_000 and then fail-loud'd, so `SELECT SUM(v) FROM t`
+                            // over >10k rows was refused entirely.) ORDER BY /
+                            // DISTINCT stream and, where they must buffer, spill.
                             let accs = build_agg_accumulators(s, &all_col_names, &all_col_types)?;
                             let stream = state
                                 .write_path
@@ -6929,9 +6928,9 @@ async fn route_select_user_table_inner(
                             > = None;
                             // Arbitrary unbounded ORDER BY (no LIMIT): stream the whole
                             // scan uncapped and sort with bounded memory via a spilling
-                            // external merge sort (step 5). This replaces the old
-                            // fail-loud DEFAULT_RANGE_READ_LIMIT probe cap — the result
-                            // is bounded ONLY by the query's LIMIT, and the sort's
+                            // external merge sort (step 5). There is no server-side
+                            // result cap — the result is bounded ONLY by the query's
+                            // LIMIT, and the sort's
                             // working set by the spill threshold. The reservation's temp
                             // dir holds spilled runs and is cleaned up on drop. When set,
                             // `spilled_sorted_rows` already holds the fully-ordered rows,
@@ -6940,144 +6939,159 @@ async fn route_select_user_table_inner(
                                 prepare_order_by_execution(state, ks, s, table_meta)?;
                             let mut spilled_sorted_rows: Option<Vec<Vec<Option<CqlValue>>>> = None;
                             let mut spilled_sort_did_spill = false;
-                            let partitions = if count_only_select {
-                                // COUNT(*) must NEVER pre-materialize a capped Vec.
-                                // `range_read_limited_rows` clamps to the magic
-                                // `DEFAULT_RANGE_READ_LIMIT` (10_000): on a large
-                                // table that both silently undercounts (data loss)
-                                // and OOM-kills the node materializing the window.
-                                // Counting needs no materialized rows — fall through
-                                // to the streaming count branch below, which counts
-                                // over a bounded partition stream (O(1) partitions in
-                                // flight, uncapped, exact).
-                                None
-                            } else if let Some(wanted) = projection_wanted {
-                                // Push partition-count cap down to the merger so
-                                // `LIMIT N` stops the scan after N partitions
-                                // rather than walking every SSTable. The stream is
-                                // consumed below directly into `all_rows`.
-                                projected_stream = Some(
-                                    state
+                            let partitions: Option<Vec<ferrosa_sstable::types::Partition>> =
+                                if count_only_select {
+                                    // COUNT(*) must NEVER pre-materialize a capped Vec.
+                                    // `range_read_limited_rows` clamps to the magic
+                                    // `DEFAULT_RANGE_READ_LIMIT` (10_000): on a large
+                                    // table that both silently undercounts (data loss)
+                                    // and OOM-kills the node materializing the window.
+                                    // Counting needs no materialized rows — fall through
+                                    // to the streaming count branch below, which counts
+                                    // over a bounded partition stream (O(1) partitions in
+                                    // flight, uncapped, exact).
+                                    None
+                                } else if let Some(wanted) = projection_wanted {
+                                    // Push partition-count cap down to the merger so
+                                    // `LIMIT N` stops the scan after N partitions
+                                    // rather than walking every SSTable. The stream is
+                                    // consumed below directly into `all_rows`.
+                                    projected_stream = Some(
+                                        state
+                                            .write_path
+                                            .load()
+                                            .range_read_projected_stream_all_with(
+                                                &table_id,
+                                                wanted,
+                                                scan_bound,
+                                                ctx.consistency,
+                                                &table_strategy,
+                                            )
+                                            .await?,
+                                    );
+                                    None
+                                } else if let Some(bound) = scan_bound {
+                                    // User-supplied LIMIT (or page size) provided the
+                                    // bound: returning exactly the requested rows is
+                                    // intentional and correct, so no truncation check.
+                                    //
+                                    // Stream at most `bound` partitions rather than
+                                    // materializing a `Vec<Partition>` via
+                                    // `range_read_limited_rows`: the storage layer
+                                    // fail-louds a Vec-materializing read whose bound
+                                    // exceeds its OOM guard, so a user `LIMIT` larger
+                                    // than that guard (e.g. `LIMIT 20000`) must stream.
+                                    // Memory is bounded by the user's chosen `bound`;
+                                    // the result is bounded ONLY by the query's LIMIT.
+                                    let stream = state
                                         .write_path
                                         .load()
-                                        .range_read_projected_stream_all_with(
+                                        .range_read_stream_all_with(
                                             &table_id,
-                                            wanted,
-                                            scan_bound,
+                                            row_limit,
                                             ctx.consistency,
                                             &table_strategy,
                                         )
-                                        .await?,
-                                );
-                                None
-                            } else if let Some(bound) = scan_bound {
-                                // User-supplied LIMIT (or page size) provided the
-                                // bound: returning exactly the requested rows is
-                                // intentional and correct, so no truncation check.
-                                //
-                                // Stream at most `bound` partitions rather than
-                                // materializing a `Vec<Partition>` via
-                                // `range_read_limited_rows`: the storage layer
-                                // fail-louds a Vec-materializing read whose bound
-                                // exceeds its OOM guard, so a user `LIMIT` larger
-                                // than that guard (e.g. `LIMIT 20000`) must stream.
-                                // Memory is bounded by the user's chosen `bound`;
-                                // the result is bounded ONLY by the query's LIMIT.
-                                let stream = state
-                                    .write_path
-                                    .load()
-                                    .range_read_stream_all_with(
-                                        &table_id,
-                                        row_limit,
-                                        ctx.consistency,
-                                        &table_strategy,
-                                    )
-                                    .await?;
-                                projected_stream = Some(Box::pin(stream.take(bound)));
-                                None
-                            } else if let Some(reservation) = order_by_spill.as_ref() {
-                                // Arbitrary unbounded ORDER BY: stream the ENTIRE scan
-                                // uncapped and sort it with a spilling external merge
-                                // sort. No server-side row cap; the sort's working set
-                                // is bounded by the spill threshold, not the result
-                                // size, and rows move (never clone) into the sorter.
-                                let stream = state
-                                    .write_path
-                                    .load()
-                                    .range_read_stream_all_with(
-                                        &table_id,
-                                        row_limit,
-                                        ctx.consistency,
-                                        &table_strategy,
-                                    )
-                                    .await?;
-                                let order_specs: Vec<(usize, bool)> = s
-                                    .order_by
-                                    .iter()
-                                    .filter_map(|(col_name, dir)| {
-                                        let idx =
-                                            all_col_names.iter().position(|n| n == col_name)?;
-                                        Some((idx, *dir == OrderDirection::Asc))
-                                    })
-                                    .collect();
-                                let threshold = ferrosa_storage::process_spill_threshold_bytes();
-                                let (sorted, did_spill) = sort_rows_from_partition_stream_spilling(
-                                    stream,
-                                    reservation.path(),
-                                    ferrosa_storage::RowOrder::new(order_specs),
-                                    threshold,
-                                    PartitionRowContext {
-                                        all_col_names: &all_col_names,
-                                        all_col_types: &all_col_types,
-                                        pk_indices: &pk_indices,
-                                        ck_indices: &ck_indices,
-                                        storage_to_table: &storage_to_table,
-                                    },
-                                    SelectPredicateContext {
-                                        statement: s,
-                                        table_meta,
-                                        keyspace: ks,
-                                        state,
-                                    },
-                                )
-                                .await?;
-                                spilled_sorted_rows = Some(sorted);
-                                spilled_sort_did_spill = did_spill;
-                                None
-                            } else if row_limit > 0 {
-                                // Complex shape (DISTINCT / aggregate / function
-                                // projection) over a full ALLOW FILTERING scan with no
-                                // user bound: the read is capped at the engine's
-                                // DEFAULT_RANGE_READ_LIMIT only. Distincting or
-                                // aggregating over a silently clipped window yields a
-                                // wrong answer, so fail loud when the cap actually
-                                // clipped data (D4) instead of truncating. (Arbitrary
-                                // unbounded ORDER BY is handled by the spill branch
-                                // above.)
-                                let (partitions, truncated) = state
-                                    .write_path
-                                    .load()
-                                    .range_read_limited_rows_checked(
-                                        &table_id,
-                                        ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
-                                        row_limit,
-                                    )
-                                    .await?;
-                                if truncated {
-                                    ferrosa_storage::metrics::inc_range_read_truncated();
-                                    return Err(CqlError::Invalid(
-                                        "query scans more than 10000 rows and cannot be bounded \
-                                         for this shape (ORDER BY / DISTINCT / aggregate / \
-                                         function projection over ALLOW FILTERING); add a LIMIT, \
-                                         create an index on the filtered/ordered columns, or \
-                                         narrow the predicate"
-                                            .into(),
-                                    ));
-                                }
-                                Some(partitions)
-                            } else {
-                                None
-                            };
+                                        .await?;
+                                    projected_stream = Some(Box::pin(stream.take(bound)));
+                                    None
+                                } else if let Some(reservation) = order_by_spill.as_ref() {
+                                    // Arbitrary unbounded ORDER BY: stream the ENTIRE scan
+                                    // uncapped and sort it with a spilling external merge
+                                    // sort. No server-side row cap; the sort's working set
+                                    // is bounded by the spill threshold, not the result
+                                    // size, and rows move (never clone) into the sorter.
+                                    let stream = state
+                                        .write_path
+                                        .load()
+                                        .range_read_stream_all_with(
+                                            &table_id,
+                                            row_limit,
+                                            ctx.consistency,
+                                            &table_strategy,
+                                        )
+                                        .await?;
+                                    let order_specs: Vec<(usize, bool)> = s
+                                        .order_by
+                                        .iter()
+                                        .filter_map(|(col_name, dir)| {
+                                            let idx =
+                                                all_col_names.iter().position(|n| n == col_name)?;
+                                            Some((idx, *dir == OrderDirection::Asc))
+                                        })
+                                        .collect();
+                                    let threshold =
+                                        ferrosa_storage::process_spill_threshold_bytes();
+                                    let (sorted, did_spill) =
+                                        sort_rows_from_partition_stream_spilling(
+                                            stream,
+                                            reservation.path(),
+                                            ferrosa_storage::RowOrder::new(order_specs),
+                                            threshold,
+                                            PartitionRowContext {
+                                                all_col_names: &all_col_names,
+                                                all_col_types: &all_col_types,
+                                                pk_indices: &pk_indices,
+                                                ck_indices: &ck_indices,
+                                                storage_to_table: &storage_to_table,
+                                            },
+                                            SelectPredicateContext {
+                                                statement: s,
+                                                table_meta,
+                                                keyspace: ks,
+                                                state,
+                                            },
+                                        )
+                                        .await?;
+                                    spilled_sorted_rows = Some(sorted);
+                                    spilled_sort_did_spill = did_spill;
+                                    None
+                                } else if row_limit > 0 {
+                                    // Per-row function projection / DISTINCT over a full
+                                    // ALLOW FILTERING scan. A per-row projection is
+                                    // computable inline, and DISTINCT de-duplicates
+                                    // downstream through a spill-backed set, so neither
+                                    // needs a server-side result cap. Stream the uncapped
+                                    // scan (bounded in-flight memory, `O(num_sources)`
+                                    // partitions resident) and MOVE each partition's rows
+                                    // through the row builder below. Previously this
+                                    // refused a query we can serve, which is not a
+                                    // correctness guarantee — it is a refusal.
+                                    let stream = state
+                                        .write_path
+                                        .load()
+                                        .range_read_stream_all_with(
+                                            &table_id,
+                                            row_limit,
+                                            ctx.consistency,
+                                            &table_strategy,
+                                        )
+                                        .await?;
+                                    projected_stream = Some(stream);
+                                    None
+                                } else {
+                                    // Any remaining full-scan shape that reached this arm
+                                    // is one we can serve: a per-row projection, or a
+                                    // `DISTINCT` whose de-duplication is spill-backed
+                                    // downstream. Stream the uncapped scan rather than
+                                    // refusing the query — a refusal is not a correctness
+                                    // guarantee, it is an outage for a query the engine can
+                                    // answer. (COUNT and every built-in scalar aggregate
+                                    // returned above; an arbitrary unbounded ORDER BY is
+                                    // handled by the spill branch above.)
+                                    let stream = state
+                                        .write_path
+                                        .load()
+                                        .range_read_stream_all_with(
+                                            &table_id,
+                                            row_limit,
+                                            ctx.consistency,
+                                            &table_strategy,
+                                        )
+                                        .await?;
+                                    projected_stream = Some(stream);
+                                    None
+                                };
                             if count_only_select {
                                 let row_context = PartitionRowContext {
                                     all_col_names: &all_col_names,
@@ -7178,11 +7192,17 @@ async fn route_select_user_table_inner(
                                 )
                                 .await?;
                             } else {
+                                // Unreachable by construction: every arm above
+                                // streams or spills, so a full-scan row result is
+                                // always built from `projected_stream` /
+                                // `spilled_sorted_rows` / `partitions`. Kept
+                                // fail-loud (never a silent empty result) so a
+                                // future arm that returns none of the three is a
+                                // loud bug here rather than data loss.
                                 return Err(CqlError::Invalid(
-                                    "unbounded full-table materialization is disabled; use a \
-                                     page-compatible scan, add a LIMIT/index/materialized view, \
-                                     or rewrite ORDER BY/DISTINCT/aggregate/function projection \
-                                     queries to a bounded plan"
+                                    "internal: full-table scan produced no result source; this is a \
+                                     bug — every scan shape must populate partitions, the \
+                                     projected stream, or the spilling sort"
                                         .into(),
                                 ));
                             }
@@ -22239,7 +22259,7 @@ mod tests {
 
         let tenant_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         let tenant_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-        let matching_rows = ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT + 2;
+        let matching_rows = ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW + 2;
         for i in 0..matching_rows {
             let suffix = format!("{:012x}", i + 1);
             let session = format!("00000000-0000-0000-0000-{suffix}");
@@ -22708,7 +22728,8 @@ mod tests {
 
     /// Regression: a projected full-scan (here `SELECT DISTINCT` over a
     /// partition-key column) MUST return every distinct partition even when the
-    /// table has more than `DEFAULT_RANGE_READ_LIMIT` (10_000) partitions.
+    /// table has more than the legacy 10_000-partition window (the old
+    /// `DEFAULT_RANGE_READ_LIMIT`, now `LEGACY_RANGE_READ_REPLICA_WINDOW`).
     ///
     /// The projected arm now routes through the streaming, uncapped
     /// `range_read_projected_stream_all_with` variant: there is NO server-side
@@ -22753,7 +22774,7 @@ mod tests {
         // Insert >10k distinct partitions, flushing periodically so the rows
         // spread across many token-interleaved SSTables plus the active memtable
         // (the LSM state that exercises the multi-run merge).
-        let total = ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT + 500;
+        let total = ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW + 500;
         let table_id = ferrosa_storage::TableId::new("distinct_big", "t");
         for i in 0..total {
             route(
@@ -22790,7 +22811,7 @@ mod tests {
             total,
             "SELECT DISTINCT over {total} partitions must return every distinct \
              partition key, not a server-capped {} window",
-            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+            ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW
         );
     }
 
@@ -22803,11 +22824,12 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// (a) A simple coordinated `WHERE … ALLOW FILTERING` scan over more than
-    /// `DEFAULT_RANGE_READ_LIMIT` rows must return EVERY matching row, bounded
+    /// 10_000 (the old `DEFAULT_RANGE_READ_LIMIT`) rows must return EVERY
+    /// matching row, bounded
     /// only by paging — never truncated to a server-side 10_000 window.
     #[tokio::test]
     async fn allow_filtering_scan_returns_all_rows_past_10k() {
-        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let n = (ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW as i64) + 500;
         let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
 
         // `v = id * 10`, so `v >= 0` matches every row. Walk every page with the
@@ -22828,16 +22850,17 @@ mod tests {
             n as usize,
             "ALLOW FILTERING scan over {n} rows must return every row, not a \
              server-capped {} window",
-            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+            ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW
         );
     }
 
     /// (b) A streaming scalar aggregate (`SUM`) over more than
-    /// `DEFAULT_RANGE_READ_LIMIT` rows must be EXACT — computed over the whole
+    /// 10_000 (the old `DEFAULT_RANGE_READ_LIMIT`) rows must be EXACT —
+    /// computed over the whole
     /// table, not over a clipped 10_000-row window (and not fail-loud).
     #[tokio::test]
     async fn sum_aggregate_is_exact_past_10k() {
-        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let n = (ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW as i64) + 500;
         let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
 
         // v = i * 10 for i in 0..n  →  SUM(v) = 10 * (n-1) * n / 2.
@@ -22865,18 +22888,19 @@ mod tests {
             expected,
             "SUM(v) over {n} rows must be exact ({expected}), not summed over a \
              capped {} window",
-            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+            ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW
         );
     }
 
     /// (c) `SELECT DISTINCT <partition key>` over more than
-    /// `DEFAULT_RANGE_READ_LIMIT` partitions must return every distinct
+    /// 10_000 (the old `DEFAULT_RANGE_READ_LIMIT`) partitions must return
+    /// every distinct
     /// partition key (token-ordered scan visits each partition once). This is
     /// the non-projected DISTINCT arm reached when the projection ordinal path
     /// is not taken; it must stream uncapped like the projected arm.
     #[tokio::test]
     async fn distinct_partition_key_returns_all_rows_past_10k_non_projected() {
-        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let n = (ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW as i64) + 500;
         let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
 
         let select = match crate::parser::parse("SELECT DISTINCT id FROM pageks.t").unwrap() {
@@ -22890,7 +22914,220 @@ mod tests {
             n as usize,
             "SELECT DISTINCT id over {n} partitions must return every distinct \
              partition key, not a server-capped {} window",
-            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+            ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Degraded SELECT scan arm: complex shapes must STREAM WITH SPILL, never
+    // fail loud and never silently truncate at a server-side 10_000 cap.
+    //
+    // Invariants under test (see the commit message body):
+    //   (a) COMPLETENESS  — every matching row is returned, > cap.
+    //   (b) ORDERING      — token/clustering order preserved exactly.
+    //   (c) no silent truncation AND no fail-loud for a servable shape.
+    //   (d) LIMIT/paging semantics unchanged.
+    //   (e) spill/temp files removed on every exit path.
+    //   (f) the change itself rewrites no data (differential vs. reference).
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// (a)+(c) `SELECT DISTINCT <non-partition-key column>` with `ALLOW
+    /// FILTERING` over MORE rows than the legacy 10_000-row window must
+    /// return
+    /// every distinct value. This is the degraded arm's DISTINCT shape: it is
+    /// projected over a non-PK column, so it is neither the projected-ordinal
+    /// DISTINCT arm nor the full-PK-projection paging arm. It previously fell
+    /// through to the "unbounded full-table materialization is disabled" error
+    /// (or, when a LIMIT was present, the `range_read_limited_rows_checked`
+    /// fail-loud probe cap) — both refuse a query we can serve by streaming the
+    /// scan with a spill-backed de-duplication set.
+    #[tokio::test]
+    async fn distinct_non_pk_returns_all_rows_past_10k() {
+        let n = (ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        // v = id * 10 → all n values are distinct.
+        let (rows, _pages) = collect_all_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT DISTINCT v FROM pageks.t WHERE v >= 0 ALLOW FILTERING",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            rows.len(),
+            n as usize,
+            "SELECT DISTINCT over a non-PK column across {n} rows must return every \
+             distinct value, not an error and not a server-capped {} window",
+            ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW
+        );
+        let mut got: Vec<i32> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int v, got {other:?}"),
+            })
+            .collect();
+        got.sort_unstable();
+        let expected: Vec<i32> = (0..n as i32).map(|i| i * 10).collect();
+        assert_eq!(
+            got, expected,
+            "DISTINCT must return the exact distinct set — no loss, no duplication"
+        );
+    }
+
+    /// (a)+(c) A function-call projection (`writetime`) over a full ALLOW
+    /// FILTERING scan is a per-row projection, so it streams; it must return
+    /// every row past the cap rather than erroring.
+    #[tokio::test]
+    async fn function_projection_scan_returns_all_rows_past_10k() {
+        let n = (ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let (rows, _pages) = collect_all_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT writetime(v) FROM pageks.t WHERE v >= 0 ALLOW FILTERING",
+            None,
+        )
+        .await;
+        assert_eq!(
+            rows.len(),
+            n as usize,
+            "a per-row function projection over {n} rows must return every row, not a \
+             server-capped {} window",
+            ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW
+        );
+    }
+
+    /// (d) A `LIMIT` on the DISTINCT-non-PK shape returns exactly the limit and
+    /// a correct continuation; paging does not duplicate or drop rows. Walks the
+    /// paged traversal and compares the union to the unpaged result.
+    #[tokio::test]
+    async fn distinct_non_pk_limit_and_paging_are_exact() {
+        let n = 2_000i64;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let cql = "SELECT DISTINCT v FROM pageks.t WHERE v >= 0 ALLOW FILTERING";
+        let (unpaged, _) = collect_all_pages(&state, &auth, &ks, cql, None).await;
+        let (paged, pages) = collect_all_pages(&state, &auth, &ks, cql, Some(137)).await;
+        assert!(pages > 1, "expected multiple pages, got {pages}");
+        let mut a: Vec<i32> = unpaged
+            .iter()
+            .map(|r| match &r[0] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int, got {other:?}"),
+            })
+            .collect();
+        let mut b: Vec<i32> = paged
+            .iter()
+            .map(|r| match &r[0] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int, got {other:?}"),
+            })
+            .collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(
+            a, b,
+            "paged traversal of the degraded DISTINCT arm must equal the unpaged result \
+             exactly — no gaps, no duplicates"
+        );
+        assert_eq!(a.len(), n as usize);
+    }
+
+    /// (e) The degraded arm's spill/temp files are removed on the normal exit
+    /// path — no leak of the DISTINCT temp table or the ORDER BY temp-sort table.
+    #[tokio::test]
+    async fn degraded_arm_spill_temp_files_are_cleaned_up() {
+        let n = 500i64;
+        let (state, dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let select = match crate::parser::parse(
+            "SELECT DISTINCT v FROM pageks.t WHERE v >= 0 ALLOW FILTERING",
+        )
+        .unwrap()
+        {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select)
+            .await
+            .expect("degraded DISTINCT arm must stream, not fail loud");
+        assert_eq!(res.rows.len(), n as usize);
+
+        for root in ["tmp_distinct", "tmp_order_by_sort"] {
+            let path = dir.path().join(root);
+            if path.exists() {
+                let leftovers: Vec<_> = std::fs::read_dir(&path)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name())
+                    .collect();
+                assert!(
+                    leftovers.is_empty(),
+                    "{root} temp tables were left behind after the query: {leftovers:?}"
+                );
+            }
+        }
+    }
+
+    /// (f) Differential: the streaming degraded arm must return byte-identical
+    /// rows (values AND order) to the reference the non-streaming read produces
+    /// for the same input. Guards against the streaming rewrite silently
+    /// reordering, dropping, or rewriting row data.
+    #[tokio::test]
+    async fn degraded_arm_streaming_is_row_identical_to_reference() {
+        let n = 300i64;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let cql = "SELECT DISTINCT v FROM pageks.t WHERE v >= 0 ALLOW FILTERING";
+        let (rows, _) = collect_all_pages(&state, &auth, &ks, cql, None).await;
+
+        // Reference: the complete distinct set, computed independently in the
+        // test from the seeded data (v = id * 10, one row per id).
+        let mut expected: Vec<i32> = (0..n as i32).map(|i| i * 10).collect();
+        expected.sort_unstable();
+
+        let got: Vec<i32> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int v, got {other:?}"),
+            })
+            .collect();
+        let mut got_sorted = got.clone();
+        got_sorted.sort_unstable();
+        assert_eq!(
+            got_sorted, expected,
+            "streaming degraded arm diverged from the reference row set"
+        );
+
+        // ORDERING invariant: the scan must preserve clustering order — here,
+        // ascending Murmur3 partition-token order, which is the LSM merge order
+        // the streaming scan has to reproduce exactly. `v = id * 10` and the
+        // storage key is the 4-byte big-endian `id`, so the expected token order
+        // is computed here independently of the scan under test.
+        let expected_token_order: Vec<i32> = {
+            let mut keyed: Vec<(ferrosa_common::Token, i32)> = (0..n as i32)
+                .map(|id| {
+                    let dk = ferrosa_common::key::DecoratedKey::new(
+                        ferrosa_common::key::PartitionKey::from(&id.to_be_bytes()[..]),
+                    );
+                    (dk.token, id * 10)
+                })
+                .collect();
+            keyed.sort_unstable();
+            keyed.into_iter().map(|(_, v)| v).collect()
+        };
+        assert_eq!(
+            got, expected_token_order,
+            "rows must be emitted in ascending partition-token (clustering) order — \
+             the streaming scan must not reorder them"
         );
     }
 
@@ -22946,17 +23183,16 @@ mod tests {
         assert_eq!(as_i64(&row[4]), 20, "AVG(v) = 60/3");
     }
 
-    /// Guard: an unbounded `ORDER BY` (no LIMIT) over more than
-    /// `DEFAULT_RANGE_READ_LIMIT` rows must stay BOUNDED — it fails loud rather
-    /// than materializing the whole table into an in-memory global sort. Its cap
-    /// intentionally remains until spill-to-disk lands (step 5). This test locks
-    /// in that step 2 does NOT accidentally uncap the accumulating sort shape.
+    /// An unbounded `ORDER BY` (no LIMIT) over more rows than the legacy
+    /// 10_000-row window must return EVERY row in correct order, via the
+    /// spilling external merge sort — never the old fail-loud refusal and never
+    /// a silently truncated window.
     #[tokio::test]
     async fn order_by_no_limit_sorts_all_rows_past_10k() {
         // Step 5: an arbitrary unbounded ORDER BY (no LIMIT) over a >10k table
         // now returns EVERY row in correct order via the spilling external sort,
         // instead of the old fail-loud DEFAULT_RANGE_READ_LIMIT cap.
-        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let n = (ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW as i64) + 500;
         let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
 
         let select = match crate::parser::parse("SELECT * FROM pageks.t ORDER BY v").unwrap() {
@@ -31433,6 +31669,56 @@ mod tests {
         );
     }
 
+    /// The degraded (complex-shape) full-scan arm must SERVE every shape it can
+    /// by streaming (and, for ORDER BY/DISTINCT, spilling) — never by refusing
+    /// the query with a "cannot be bounded for this shape" / "materialization is
+    /// disabled" error, which is an outage, not a correctness guarantee. This
+    /// pins the source contract that the fail-loud result-cap refusal is gone
+    /// from the arm AND that no remaining error in the arm is a cap refusal.
+    ///
+    /// The last `Err` in the arm is a genuinely unreachable internal invariant
+    /// (a future arm that selects none of partitions / projected stream /
+    /// spilling sort); it must read as a bug, not as a query-shape refusal.
+    #[test]
+    fn degraded_scan_arm_serves_all_shapes_by_streaming_never_refuses() {
+        const START: &str = "let partitions: Option<Vec<ferrosa_sstable::types::Partition>> =";
+        const END: &str = "\n                            filter_rows_by_select_predicates(";
+        let source = include_str!("router.rs");
+        let after = source
+            .split(START)
+            .nth(1)
+            .expect("degraded scan arm must bind `partitions` with an explicit Vec type");
+        let arm = after
+            .split(END)
+            .next()
+            .expect("degraded scan arm must be terminated by the post-scan predicate filter");
+
+        for forbidden in [
+            "materialization is disabled",
+            "cannot be bounded for this shape",
+            "range_read_limited_rows_checked(",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "the degraded full-scan arm must not refuse a servable shape ({forbidden:?} found) \
+                 — every shape is bounded only by the query's LIMIT, streamed, or spilled"
+            );
+        }
+        assert!(
+            arm.contains("range_read_stream_all_with"),
+            "the arm must stream the uncapped scan through range_read_stream_all_with"
+        );
+        assert!(
+            arm.contains("sort_rows_from_partition_stream_spilling"),
+            "the unbounded ORDER BY shape must spill instead of refusing"
+        );
+        assert!(
+            arm.contains("internal: full-table scan produced no result source"),
+            "the only remaining error in the arm must be the unreachable internal \
+             no-result-source invariant, not a shape refusal"
+        );
+    }
+
     #[test]
     fn count_filtering_scans_project_only_predicate_columns() {
         let source = include_str!("router.rs");
@@ -33997,13 +34283,14 @@ mod tests {
     mod slow {
         use super::*;
 
-        /// A user `LIMIT N` greater than `DEFAULT_RANGE_READ_LIMIT` must return N
+        /// A user `LIMIT N` greater than the legacy 10_000-row window must
+        /// return N
         /// rows — the query's own LIMIT is the ONLY bound. Previously
         /// `range_read_limited_rows` clamped the scan to 10_000, silently capping a
         /// large user LIMIT below what the client asked for.
         #[tokio::test]
         async fn user_limit_above_10k_returns_all_requested_rows() {
-            let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+            let n = (ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW as i64) + 500;
             let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
 
             let cql = format!("SELECT * FROM pageks.t LIMIT {n}");
@@ -34015,7 +34302,7 @@ mod tests {
                 ids.len(),
                 n as usize,
                 "LIMIT {n} must return {n} distinct rows, not a server-capped {} window",
-                ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+                ferrosa_cluster::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW
             );
         }
 

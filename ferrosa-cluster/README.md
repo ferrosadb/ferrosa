@@ -173,12 +173,15 @@ early acknowledgement.
   `WritePath::range_read_projected` wrapper has been removed, so projected
   scans use `range_read_projected_stream_all_*` directly (default; legacy capped
   path behind `FERROSA_BULK_STREAMING_RANGE_READ=0`).
-  `DEFAULT_RANGE_READ_LIMIT` (10_000) is **not** a result cap on streamable
-  shapes: `range_read_limited_rows` and `coordinate_range_read_stream_limited_rows`
-  honor the caller's own bound (a user `LIMIT N`) uncapped; the const now only
-  bounds the truncation-detecting `range_read_limited_rows_checked` probe (for the
-  still-accumulating `ORDER BY` shape, until spill-to-disk lands) and the legacy
-  degraded RPC (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
+  `DEFAULT_RANGE_READ_LIMIT` — the old 10_000-row *result* cap — is gone; the
+  value survives as `LEGACY_RANGE_READ_REPLICA_WINDOW`, a **resource** bound on
+  one legacy single-shot range RPC message, never a result bound.
+  `range_read_limited_rows` and `coordinate_range_read_stream_limited_rows`
+  honor the caller's own bound (a user `LIMIT N`) uncapped, and
+  `range_read_limited_rows_checked` now probes exactly one partition past the
+  caller's own bound instead of a hard cap; no query path selects it. The window
+  is never applied as a result cap on a streaming `*_stream_all_*` scan
+  (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
   The same bounded Bulk frames now carry global secondary-index walks, in row
   order — `(partition key, clustering)` — from an optional cursor carried in
   the request's `start_key` + `start_clustering` (resume strictly after that

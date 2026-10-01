@@ -75,8 +75,13 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   through `sort_rows_from_partition_stream_spilling` → `ferrosa_storage::ExternalSorter`
   (bounded-memory external merge sort, cascade k-way merge), returning the fully,
   correctly ordered result with no cap and memory bounded by the spill threshold
-  (`FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`). `DISTINCT`/aggregate/function-projection
-  keep their `range_read_limited_rows_checked` fail-loud cap
+  (`FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`). The remaining complex shapes —
+  a `DISTINCT` over a non-partition-key column, a per-row function projection,
+  or any other full `ALLOW FILTERING` scan with no user bound — **stream** the
+  uncapped scan too, so no shape fail-louds on a query the engine can answer:
+  a per-row projection is computed inline and `DISTINCT` de-duplicates through
+  the spill-backed `SpillingDedup` set (`reserve_distinct_temp_table`). Results
+  are bounded only by the query's own `LIMIT`, never a server-side row cap
   (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
   Global secondary-index reads (`SingleIndex`, `IndexScanWithFilter`,
   `IndexIntersection`) stream in row order — `(partition key, clustering)` —

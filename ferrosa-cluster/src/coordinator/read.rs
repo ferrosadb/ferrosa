@@ -1508,7 +1508,10 @@ impl ClusterCoordinator {
         &self,
         table_id: &TableId,
     ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
-        self.coordinate_range_read_limited(table_id, crate::write_path::DEFAULT_RANGE_READ_LIMIT)
+        // Uncapped: a range read's result is bounded by the query's own LIMIT,
+        // never by a server-side cap. Route through the streaming path so this
+        // does not materialize a capped window.
+        self.coordinate_range_read_limited_rows(table_id, usize::MAX, 0)
             .await
     }
 
@@ -1539,7 +1542,11 @@ impl ClusterCoordinator {
                 .await;
         }
 
-        let limit = limit.clamp(1, crate::write_path::DEFAULT_RANGE_READ_LIMIT);
+        // LEGACY path (`FERROSA_BULK_STREAMING_RANGE_READ=0`, a documented
+        // degraded mixed-version opt-out). A per-replica window is a RESOURCE
+        // bound on one RPC message, not a query result cap — the query path
+        // never selects this branch.
+        let limit = limit.clamp(1, crate::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW);
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
 

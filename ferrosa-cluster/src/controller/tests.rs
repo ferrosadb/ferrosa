@@ -2929,7 +2929,7 @@ fn bootstrap_streaming_produces_mutations_for_remote_nodes() {
                 &table_id,
                 None,
                 None,
-                crate::write_path::DEFAULT_RANGE_READ_LIMIT,
+                crate::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW,
             )
             .unwrap();
 

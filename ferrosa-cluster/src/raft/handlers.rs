@@ -1204,7 +1204,7 @@ pub struct RangeReadRequestPayload {
 }
 
 fn default_range_read_limit() -> usize {
-    crate::write_path::DEFAULT_RANGE_READ_LIMIT
+    crate::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW
 }
 
 /// Payload for a remote range-read response.
@@ -1252,7 +1252,7 @@ impl RpcHandler for RangeReadHandler {
 
         let range_read_limit = req
             .limit
-            .clamp(1, crate::write_path::DEFAULT_RANGE_READ_LIMIT);
+            .clamp(1, crate::write_path::LEGACY_RANGE_READ_REPLICA_WINDOW);
         let row_limit = req.row_limit;
         let partitions = match self.storage.read_range_limited_rows(
             &table_id,
