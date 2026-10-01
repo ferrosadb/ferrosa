@@ -6007,6 +6007,45 @@ fn assert_local_quorum_excludes_remote_dc(
     );
 }
 
+/// Leader dials its peers OUTBOUND: the DC arrives in the handshake, is stored
+/// in `PeerManager`, and must be bridged into the controller's `peer_dcs` by
+/// `on_peer_connected` — otherwise the peers the leader itself dialled stay
+/// unclassified and LOCAL_QUORUM counts their remote replicas as local.
+#[tokio::test]
+async fn local_quorum_excludes_remote_dc_replicas_for_outbound_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::from_u128(1);
+    let (dc2_peer_a, dc2_peer_b, _) = multidc_peers();
+
+    let (controller, _handles) = ModeController::new(
+        multidc_config(dir.path()),
+        net_config.clone(),
+        local_id,
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm.clone());
+
+    // What `PeerManager::install_pool` does before it fires the callback: it
+    // stores the advertised topology from the handshake, then calls
+    // `on_peer_connected`.
+    for (peer, port) in [(dc2_peer_a, 7001u16), (dc2_peer_b, 7002)] {
+        pm.set_peer_data_center(peer, "dc2".to_string()).await;
+        pm.set_peer_rack(peer, "rack2".to_string()).await;
+        controller.on_peer_connected((peer, format!("127.0.0.1:{port}").parse().unwrap()));
+    }
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    assert_local_quorum_excludes_remote_dc(&controller, dc2_peer_a, dc2_peer_b);
+}
+
 /// Peers dial the leader INBOUND (a seed is dialled BY its peers): the DC
 /// arrives on the handshake callback and must be recorded before
 /// `transition_to_cluster` snapshots `peer_dcs`.

@@ -452,6 +452,41 @@ impl PeerEventListener for ModeController {
         }
         tracing::info!(peer = %host_id, %addr, "peer connected");
 
+        // Bridge the peer's announced data center into the controller's own
+        // map. For an OUTBOUND connection `PeerManager::install_pool` has
+        // already stored the handshake's advertised topology (its
+        // `store_broadcasts` runs before this callback), so this is a
+        // non-blocking read of a value that is already there — but nothing
+        // copied it into `peer_dcs`, and the leader dials its peers outbound
+        // after ClusterInvite. Without this bridge the peers the leader itself
+        // dialled stayed unclassified and `partition_peers_by_dc` treated them
+        // as local (the bug): LOCAL_* quorum counting counted remote-DC
+        // replicas, and ring build re-authored them under OUR dc.
+        //
+        // Deliberate choice: a SYNC peer-manager read. This callback cannot
+        // await, and `peer_dcs` is a `std::sync::Mutex` map, so the pair
+        // `get_peer_data_center_sync` (try_read) → `record_peer_dc` is the
+        // only option that neither blocks nor spawns. It allocates one String
+        // per connection establishment — the same discipline `on_inbound_peer`
+        // already uses — not per message, so the handshake hot path is
+        // untouched. `get_peer_data_center_sync` returns None on lock
+        // contention; that only leaves the peer classified as local, the same
+        // safe single-DC fallback the rolling-upgrade path takes, and the
+        // inbound callback remains the authority for a peer learned that way.
+        //
+        // Recorded BEFORE the transition guard below, so an outbound
+        // connection that triggers `transition_to_cluster` cannot race a
+        // snapshot of an empty map.
+        let announced_dc = match &**self.peer_manager.load() {
+            Some(pm) => pm.get_peer_data_center_sync(host_id),
+            None => None,
+        };
+        if let Some(dc) = announced_dc {
+            if !dc.trim().is_empty() {
+                self.record_peer_dc(host_id, dc);
+            }
+        }
+
         // Track this peer
         {
             let mut peers = self.connected_peers.lock();
