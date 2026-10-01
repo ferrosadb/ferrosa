@@ -76,19 +76,7 @@ owner = "storage"
 expires = "2026-12-31"
 
 # -- ferrosa-cluster pair / repair --------------------------------------------
-[[allow]]
-path = "ferrosa-cluster/src/pair/catchup.rs"
-rule = "with-capacity-limit"
-reason = "t_110dd8a5: pair catchup pre-allocation over a bounded catchup batch."
-owner = "storage"
-expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-cluster/src/pair/coordinator.rs"
-rule = "with-capacity-limit"
-reason = "t_110dd8a5: pair coordinator pre-allocation over a bounded batch."
-owner = "storage"
-expires = "2026-12-31"
 
 [[allow]]
 path = "ferrosa-cluster/src/repair/executor.rs"
@@ -134,34 +122,10 @@ reason = "t_110dd8a5: router accumulation loops over bounded result windows."
 owner = "storage"
 expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-cql/src/router.rs"
-rule = "returns-vec-partition-or-row"
-reason = "t_110dd8a5: router index-intersection helpers materialize bounded partition sets."
-owner = "storage"
-expires = "2026-12-31"
 
 # -- ferrosa-storage engine / store / memtable -------------------------------
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/driver.rs"
-rule = "stream-returns-vec"
-reason = "t_110dd8a5: compaction validator (test/validation oracle path), not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/driver.rs"
-rule = "returns-vec-partition-or-row"
-reason = "t_110dd8a5: compaction validator oracle, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/oracle.rs"
-rule = "returns-vec-partition-or-row"
-reason = "t_110dd8a5: compaction validation oracle, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
 
 [[allow]]
 path = "ferrosa-storage/src/data_store.rs"
@@ -177,12 +141,6 @@ reason = "t_110dd8a5: storage engine range/index/ann read materialization; migra
 owner = "storage"
 expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/index/sidecar.rs"
-rule = "with-capacity-limit"
-reason = "t_110dd8a5: index sidecar pre-allocation over a bounded result set."
-owner = "storage"
-expires = "2026-12-31"
 
 [[allow]]
 path = "ferrosa-storage/src/memtable/sharded.rs"
@@ -205,12 +163,6 @@ reason = "t_110dd8a5: storage store range/index/ann read materialization; migrat
 owner = "storage"
 expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/test_support.rs"
-rule = "returns-vec-partition-or-row"
-reason = "t_110dd8a5: test_support merge helper used only by tests/harness, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
 
 # ===========================================================================
 # Extended rules (collect / unbounded-range-read / materializing-call-site /
@@ -255,19 +207,7 @@ reason = "t_110dd8a5 (collect-vec-partition-or-row): repair RPC collects a bound
 owner = "storage"
 expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/corpus.rs"
-rule = "collect-vec-partition-or-row"
-reason = "t_110dd8a5 (collect-vec-partition-or-row): compaction validator corpus builder, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/soak.rs"
-rule = "collect-vec-partition-or-row"
-reason = "t_110dd8a5 (collect-vec-partition-or-row): compaction validator soak harness, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
 
 [[allow]]
 path = "ferrosa-storage/src/store.rs"
@@ -276,41 +216,11 @@ reason = "t_110dd8a5 (collect-vec-partition-or-row): storage store collects boun
 owner = "storage"
 expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/test_support.rs"
-rule = "collect-vec-partition-or-row"
-reason = "t_110dd8a5 (collect-vec-partition-or-row): test_support helpers used only by tests/harness."
-owner = "storage"
-expires = "2026-12-31"
 
 # -- Group 2b: rule `unbounded-range-read` (epic t_110dd8a5) ------------------
-[[allow]]
-path = "ferrosa-cluster/src/controller/cluster.rs"
-rule = "unbounded-range-read"
-reason = "t_110dd8a5 (unbounded-range-read): bootstrap reads a system/control table over a bounded keyspace at startup."
-owner = "storage"
-expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/read.rs"
-rule = "unbounded-range-read"
-reason = "t_110dd8a5 (unbounded-range-read): coordinator local read_range(None,None) under an explicit partition limit; migrate with streaming rework."
-owner = "storage"
-expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-cluster/src/system_table_loader.rs"
-rule = "unbounded-range-read"
-reason = "t_110dd8a5 (unbounded-range-read): system-table loader scans small bounded system tables at startup."
-owner = "storage"
-expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/engine.rs"
-rule = "unbounded-range-read"
-reason = "t_110dd8a5 (unbounded-range-read): engine-internal read_range(None,None) under an explicit limit; migrate with the streaming engine API."
-owner = "storage"
-expires = "2026-12-31"
 
 # -- Group 2b: rule `cqlvalue-row-accumulation` (epic t_110dd8a5) -------------
 [[allow]]
@@ -320,12 +230,6 @@ reason = "t_110dd8a5 (cqlvalue-row-accumulation): CQL result-row encoding materi
 owner = "storage"
 expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-row-bridge/src/row.rs"
-rule = "cqlvalue-row-accumulation"
-reason = "t_110dd8a5 (cqlvalue-row-accumulation): row-bridge value conversion materializes a bounded row matrix."
-owner = "storage"
-expires = "2026-12-31"
 
 # -- Group 2b: rule `clone-on-row-data` (epic t_110dd8a5) ---------------------
 # Acknowledged false-positive-prone (per-partition-boundary key/partition clones
@@ -423,19 +327,7 @@ reason = "t_110dd8a5 (clone-on-row-data): commitlog row clone on the write/repla
 owner = "storage"
 expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/driver.rs"
-rule = "clone-on-row-data"
-reason = "t_110dd8a5 (clone-on-row-data): compaction validator clone, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
 
-[[allow]]
-path = "ferrosa-storage/src/compaction/validator/oracle.rs"
-rule = "clone-on-row-data"
-reason = "t_110dd8a5 (clone-on-row-data): compaction validation oracle clones, not a serving read path."
-owner = "storage"
-expires = "2026-12-31"
 
 [[allow]]
 path = "ferrosa-storage/src/engine.rs"
