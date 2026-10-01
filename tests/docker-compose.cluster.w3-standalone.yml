@@ -88,6 +88,7 @@ services:
       FERROSA_DATA_DIR: "/var/lib/ferrosa"
       FERROSA_AUTH_DISABLED: "true"
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: "ferrosa-test"
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
@@ -125,6 +126,7 @@ services:
       FERROSA_DATA_DIR: "/var/lib/ferrosa"
       FERROSA_AUTH_DISABLED: "true"
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: "ferrosa-test"
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
@@ -162,6 +164,7 @@ services:
       FERROSA_DATA_DIR: "/var/lib/ferrosa"
       FERROSA_AUTH_DISABLED: "true"
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: "ferrosa-test"
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"

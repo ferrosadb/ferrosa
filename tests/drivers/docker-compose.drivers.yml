@@ -120,6 +120,7 @@ services:
       FERROSA_GRAPH_ENABLED: "true"
       RUST_LOG: "ferrosa_cql=debug,info"
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: "ferrosa-drivers"
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
@@ -157,6 +158,7 @@ services:
       FERROSA_CLUSTER_NAME: "ferrosa-driver-test-auth"
       FERROSA_GRAPH_ENABLED: "true"
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: "ferrosa-drivers-auth"
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"

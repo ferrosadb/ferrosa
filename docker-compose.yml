@@ -103,6 +103,7 @@ services:
       FERROSA_SEED: "node2:7000,node3:7000"
       FERROSA_CLUSTER_NAME: ferrosa-dev
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: ferrosa-data
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
@@ -144,6 +145,7 @@ services:
       FERROSA_SEED: "node1:7000,node3:7000"
       FERROSA_CLUSTER_NAME: ferrosa-dev
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: ferrosa-data
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
@@ -179,6 +181,7 @@ services:
       FERROSA_SEED: "node1:7000,node2:7000"
       FERROSA_CLUSTER_NAME: ferrosa-dev
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_CACHE_MAX_BYTES: "1073741824"  # 1 GiB: local disk is a cache, keep eviction exercised
       FERROSA_S3_BUCKET: ferrosa-data
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
