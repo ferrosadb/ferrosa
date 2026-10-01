@@ -318,7 +318,16 @@ early acknowledgement.
   its dependencies have applied locally (otherwise it parks and the cascade
   applies it in order). An explicit no-write Apply also resolves an absent local
   dependency and cascades parked dependents; this handles merged dependencies
-  learned from another replica without falsely acknowledging real writes.
+  learned from another replica without falsely acknowledging real writes. A
+  transaction waits only for dependencies that execute **before** it: its
+  dependency set is computed from `t0`, so a dependency committed with a later
+  `t` is waived (at apply time, or when that dependency's commit lands). Without
+  this, two transactions whose PreAccepts crossed each waited on the other until
+  the 5 s dependency wait failed both, with every replica live (FMEA CL-28). A
+  dependency cycle among parked transactions is refused loudly, never dropped.
+  `accord/quorum_availability.rs` drives real replicas through the real committer
+  to pin the criterion: a live quorum commits while one replica is paused, and a
+  lost quorum fails promptly naming the quorum.
 - `recovery.rs` — Paxos-style recovery selecting by highest `accepted_ballot`.
 - `transaction_commit.rs` — `AccordTransactionCommitter`: the cluster-side
   implementation of `ferrosa_storage`'s `TransactionCommitter` seam (ADR-021). CQL/
