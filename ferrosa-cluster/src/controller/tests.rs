@@ -3216,8 +3216,16 @@ fn concurrent_mode_transitions_serialize() {
 /// cannot reach (the harness has no real network), so the Raft
 /// election poll runs out the budget and the timeout branch fires.
 /// `formation_timeout_secs = 1` keeps the test fast.
+///
+/// This node has NO data dir history and the harness never recorded cluster
+/// membership, so it is a genuine first-time former -- the case where falling
+/// back is still allowed. It settles in `degraded-pair`, NOT `pair`: a node
+/// that cannot reach its seeds has not established a pair either, and
+/// `degraded-pair` keeps the peer context for recovery without claiming a
+/// two-node shape it never had. The old assertion demanded `Pair`, i.e. it
+/// pinned the automatic downgrade this change removes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn forming_falls_back_to_pair_on_timeout() {
+async fn forming_falls_back_to_degraded_pair_on_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
     let schema = test_schema();
@@ -3275,16 +3283,30 @@ async fn forming_falls_back_to_pair_on_timeout() {
     let mut observed_mode = controller.mode();
     while tokio::time::Instant::now() < deadline {
         observed_mode = controller.mode();
-        if observed_mode == DeploymentMode::Pair {
+        if observed_mode.is_degraded() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    assert_eq!(
+    // The contract is "a formation timeout degrades; it never declares a pair".
+    // WHICH degraded shape is deliberately not pinned: it depends on how far
+    // formation got before the deadline (a node already in degraded-cluster
+    // cannot legally become degraded-pair), so asserting one exactly would be
+    // pinning a race rather than the rule.
+    assert!(
+        observed_mode.is_degraded(),
+        "a formation timeout must leave the node degraded, got {observed_mode}",
+    );
+    assert_ne!(
         observed_mode,
         DeploymentMode::Pair,
-        "after formation_timeout_secs elapses without a leader, mode must revert to Pair",
+        "the formation timeout must not downgrade to pair mode",
+    );
+    assert_ne!(
+        observed_mode,
+        DeploymentMode::Standalone,
+        "the formation timeout must not drop the node to standalone",
     );
 
     controller.shutdown().await;
@@ -3646,6 +3668,10 @@ fn no_controller_code_sets_the_mode_outside_the_state_machine() {
         "set_mode_for_test",
         "force_mode_override",
         "try_transition_mode",
+        // The free guard fn: the single place an automatic transition is
+        // allowed to reach the store. Named here so a fourth exemption has to
+        // be added deliberately, which is the whole point of the list.
+        "try_transition_mode_swap",
     ];
     let mut offenders = Vec::new();
 
@@ -3669,7 +3695,7 @@ fn no_controller_code_sets_the_mode_outside_the_state_machine() {
         let is_mod = file_name == "mod.rs";
         for (n, line) in source.lines().enumerate() {
             let trimmed = line.trim();
-            if !trimmed.contains("mode.store(") || trimmed.starts_with("//") {
+            if !trimmed.contains(".store(Arc::new(DeploymentMode::") || trimmed.starts_with("//") {
                 continue;
             }
             if is_mod {
@@ -3691,6 +3717,107 @@ fn no_controller_code_sets_the_mode_outside_the_state_machine() {
 force_mode_override if an operator is deliberately overriding it:\n  {}",
         offenders.join("\n  ")
     );
+}
+
+/// A node that has ever been a committed cluster member must never be demoted
+/// to a pair by a formation timeout.
+///
+/// This is the case that actually bit: node2 recovered from the durable
+/// `cluster-member` marker correctly as `degraded-cluster`, then its formation
+/// timeout stored `DeploymentMode::Pair` unconditionally. Moving a node out of
+/// a Raft cluster is a change of the system's guarantees -- a pair replicates
+/// point-to-point and accepts writes a quorum would have refused, while the
+/// rest of the cluster keeps committing through Raft -- so it must be an
+/// operator action, like promoting a secondary to primary.
+///
+/// The marker is what makes the rule survive the fact that deployment mode
+/// lives only in memory, so the test writes a real marker and asserts the
+/// timeout path settles on `degraded-cluster`, and that `pair` is unreachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_former_cluster_member_never_falls_back_to_pair_on_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        formation_timeout_secs: Some(1),
+        raft_heartbeat_ms: 50,
+        raft_election_timeout_min_ms: 100,
+        raft_election_timeout_max_ms: 200,
+        ..ClusterConfig::default()
+    });
+    // Write the marker where the node actually READS it. `initial_for_restart`
+    // consults `configured_raft_dir`, which nests per data center
+    // (<raft_data_dir>/<dc>), so a marker at <raft_data_dir> is invisible to it
+    // and the node silently starts fresh. Deriving the path from the same
+    // function the code uses is what keeps this test honest.
+    let raft_dir =
+        crate::controller::cluster::configured_raft_dir(&config).expect("a configured raft dir");
+    std::fs::create_dir_all(&raft_dir).unwrap();
+    DeploymentMode::record_cluster_membership(&raft_dir).unwrap();
+    assert!(
+        DeploymentMode::was_cluster_member(&raft_dir),
+        "the marker must be where initial_for_restart looks"
+    );
+    let net_config = Arc::new(NetConfig::default());
+    let registry = Arc::new(HandlerRegistry::new());
+    let host_id = Uuid::from_u128(u128::MAX);
+    let peer_id = Uuid::from_u128(1);
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        host_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        host_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    // A returning member starts as a degraded cluster, not a pair.
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::DegradedCluster,
+        "the marker must decide the starting mode"
+    );
+
+    let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    controller.transition_to_forming(vec![(peer_id, unreachable)]);
+
+    // Wait for the timeout to actually FIRE (its counter is monotonic and
+    // process-wide), then assert the mode it settled on. Without waiting on the
+    // counter this would pass vacuously by observing the starting mode.
+    let timeouts_before = crate::controller::cluster::bootstrap_silent_failure_counts().2;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+    let timed_out =
+        || crate::controller::cluster::bootstrap_silent_failure_counts().2 > timeouts_before;
+    while !timed_out() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        timed_out(),
+        "the formation timeout must have fired for this assertion to mean anything"
+    );
+    let observed = controller.mode();
+
+    assert_eq!(
+        observed,
+        DeploymentMode::DegradedCluster,
+        "a former cluster member must degrade within the cluster shape, \
+         never become a pair",
+    );
+    for forbidden in [DeploymentMode::Pair, DeploymentMode::Standalone] {
+        assert_ne!(
+            observed, forbidden,
+            "a formation timeout must never demote a former cluster member to {forbidden}",
+        );
+    }
+
+    controller.shutdown().await;
 }
 
 /// A cluster node must never end up holding a *pair* write path.

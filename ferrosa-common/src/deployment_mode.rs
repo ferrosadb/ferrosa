@@ -166,6 +166,17 @@ impl DeploymentMode {
         }
     }
 
+    /// Is this a degraded shape -- a node that has lost peers or quorum?
+    ///
+    /// Used by the formation-timeout path and its tests: a timeout must leave
+    /// the node in a degraded shape of whatever it already was, never in a
+    /// smaller shape. Note that `Forming` is NOT degraded -- it is the
+    /// pre-cluster state, which is the one place falling back is legitimate.
+    #[must_use]
+    pub fn is_degraded(self) -> bool {
+        matches!(self, Self::DegradedPair | Self::DegradedCluster)
+    }
+
     /// Check if transitioning from `self` to `target` is allowed.
     ///
     /// Valid transitions:
