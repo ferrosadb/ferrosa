@@ -44,6 +44,9 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
         delete_workers: 2,
         max_requests_per_second: None,
         max_concurrent_requests: None,
+        request_timeout: std::time::Duration::from_secs(
+            ferrosa_storage::upload::config::DEFAULT_S3_REQUEST_TIMEOUT_SECS,
+        ),
     };
 
     StorageEngineConfig {

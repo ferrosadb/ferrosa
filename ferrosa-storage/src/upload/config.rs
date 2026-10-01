@@ -55,6 +55,10 @@ pub struct ObjectStoreConfig {
     /// Client-side cap on object-store requests in flight
     /// (`FERROSA_S3_MAX_CONCURRENT_REQUESTS`); `None` is uncapped.
     pub max_concurrent_requests: Option<usize>,
+    /// Per-request timeout, covering the whole response body
+    /// (`FERROSA_S3_REQUEST_TIMEOUT_SECS`, default
+    /// [`DEFAULT_S3_REQUEST_TIMEOUT_SECS`]).
+    pub request_timeout: std::time::Duration,
 }
 
 impl ObjectStoreConfig {
@@ -91,6 +95,11 @@ impl ObjectStoreConfig {
                 .ok()
                 .as_deref(),
         )?;
+        let request_timeout = parse_request_timeout(
+            std::env::var("FERROSA_S3_REQUEST_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        )?;
 
         // Local file:// backend takes precedence when its path is set.
         if let Ok(local_path) = std::env::var("FERROSA_LOCAL_STORE_PATH") {
@@ -111,6 +120,7 @@ impl ObjectStoreConfig {
                     delete_workers,
                     max_requests_per_second,
                     max_concurrent_requests,
+                    request_timeout,
                 });
             }
         }
@@ -153,7 +163,20 @@ impl ObjectStoreConfig {
             delete_workers,
             max_requests_per_second,
             max_concurrent_requests,
+            request_timeout,
         })
+    }
+
+    /// HTTP client options for the S3 client. The timeout spans the whole
+    /// response, body included, so it is what bounds a large download.
+    ///
+    /// `allow_http` lives here too: installing client options replaces the
+    /// builder's own, so an `allow_http` set on the builder alone is lost.
+    pub fn client_options(&self) -> object_store::ClientOptions {
+        object_store::ClientOptions::new()
+            .with_allow_http(self.allow_http)
+            .with_timeout(self.request_timeout)
+            .with_connect_timeout(std::time::Duration::from_secs(10))
     }
 
     /// Whether this configuration targets the local `file://` backend.
@@ -203,7 +226,8 @@ impl ObjectStoreConfig {
             .with_bucket_name(&self.bucket)
             .with_region(&self.region)
             .with_allow_http(self.allow_http)
-            .with_conditional_put(S3ConditionalPut::ETagMatch);
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .with_client_options(self.client_options());
 
         if let Some(ref key_id) = self.access_key_id {
             builder = builder.with_access_key_id(key_id);
@@ -256,6 +280,7 @@ impl ObjectStoreConfig {
             delete_workers: 2,
             max_requests_per_second: None,
             max_concurrent_requests: None,
+            request_timeout: std::time::Duration::from_secs(DEFAULT_S3_REQUEST_TIMEOUT_SECS),
         }
     }
 }
@@ -382,6 +407,23 @@ where
             "{name} must be a positive integer, got {raw:?}"
         ))),
     }
+}
+
+/// Default per-request timeout for object-store calls, in seconds.
+///
+/// It covers the whole response body, so it must fit the largest SSTable
+/// component at the slowest link we expect: a 525 MB `Data.db` at under
+/// 1 MB/s. object_store's own default is 30 s, which cut off every large
+/// restore on 2026-09-30.
+pub const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 900;
+
+/// Parse `FERROSA_S3_REQUEST_TIMEOUT_SECS`. Unset or empty means the default;
+/// anything else must be a positive whole number of seconds, and a bad value
+/// is rejected naming the variable rather than quietly using the default.
+pub fn parse_request_timeout(value: Option<&str>) -> ferrosa_common::Result<std::time::Duration> {
+    let secs = parse_request_limit::<u64>("FERROSA_S3_REQUEST_TIMEOUT_SECS", value)?
+        .unwrap_or(DEFAULT_S3_REQUEST_TIMEOUT_SECS);
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 #[cfg(test)]
@@ -535,6 +577,114 @@ mod tests {
         let store = cfg.build_object_store().unwrap().to_string();
         assert!(store.starts_with("ThrottledStore("), "{store}");
         assert!(store.contains("LimitStore(4"), "{store}");
+    }
+
+    /// An HTTP server that answers every request with a 10-byte body sent one
+    /// byte every `gap`, so the whole response takes about `10 * gap`.
+    async fn slow_body_server(gap: std::time::Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if sock.read(&mut buf).await.is_err() {
+                        return;
+                    }
+                    let head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"e\"\r\n\
+                                Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n";
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for b in b"0123456789" {
+                        tokio::time::sleep(gap).await;
+                        if sock.write_all(&[*b]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn s3_against(endpoint: &str, timeout_secs: u64) -> object_store::aws::AmazonS3 {
+        let mut cfg = ObjectStoreConfig::test_config();
+        cfg.request_timeout = std::time::Duration::from_secs(timeout_secs);
+        object_store::aws::AmazonS3Builder::new()
+            .with_endpoint(endpoint)
+            .with_bucket_name("b")
+            .with_region("us-east-1")
+            .with_access_key_id("k")
+            .with_secret_access_key("s")
+            // allow_http comes only from client_options(), as in production.
+            .with_client_options(cfg.client_options())
+            .with_retry(object_store::RetryConfig {
+                max_retries: 0,
+                retry_timeout: std::time::Duration::from_secs(1),
+                ..Default::default()
+            })
+            .build()
+            .unwrap()
+    }
+
+    /// 2026-09-30: restoring a 479 MB evicted Data.db from R2 failed four
+    /// times with "error decoding response body" and the node exited. The
+    /// client had no options, so object_store's 30 s default request timeout
+    /// — which covers the body — cut off every download that took longer.
+    /// The timeout must be the configured one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_download_slower_than_the_request_timeout_fails_and_a_longer_timeout_completes_it() {
+        use object_store::ObjectStore;
+        let endpoint = slow_body_server(std::time::Duration::from_millis(200)).await;
+        let path = object_store::path::Path::from("big-Data.db");
+
+        let short = s3_against(&endpoint, 1);
+        let cut_off = match short.get(&path).await {
+            Ok(r) => r.bytes().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        // It must fail on the body timeout, not on anything earlier (a bad
+        // scheme or refused connection would pass a bare is_err()).
+        let err = format!(
+            "{:?}",
+            cut_off.expect_err("a 2 s body must not fit a 1 s timeout")
+        );
+        // reqwest Decode -> Body -> TimedOut: the "error decoding response
+        // body" that ended the live restore.
+        assert!(
+            err.contains("Decode") && err.contains("TimedOut"),
+            "expected a body timeout, got {err}"
+        );
+
+        let long = s3_against(&endpoint, 10);
+        let body = long.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(&body[..], b"0123456789");
+    }
+
+    #[test]
+    fn the_request_timeout_defaults_long_enough_for_large_sstables() {
+        assert_eq!(
+            parse_request_timeout(None).unwrap(),
+            std::time::Duration::from_secs(DEFAULT_S3_REQUEST_TIMEOUT_SECS)
+        );
+        const { assert!(DEFAULT_S3_REQUEST_TIMEOUT_SECS >= 600) };
+        assert_eq!(
+            parse_request_timeout(Some("120")).unwrap(),
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn an_invalid_request_timeout_is_rejected_naming_the_variable() {
+        for bad in ["0", "-5", "soon", "1.5"] {
+            let err = parse_request_timeout(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains("FERROSA_S3_REQUEST_TIMEOUT_SECS"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]
