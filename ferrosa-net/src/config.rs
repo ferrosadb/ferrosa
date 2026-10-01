@@ -25,6 +25,11 @@ pub struct NetConfig {
     pub max_connections: usize,
     /// Max time to complete handshake before closing connection (T5).
     pub handshake_timeout: Duration,
+    /// Bound on DNS resolution and on the TCP connect, each, for every outbound
+    /// dial (fast reconnect, slow-retry probe, peer re-dial). Without it a peer
+    /// that blackholes SYN stretches probe cadence to the OS connect timeout.
+    /// Together with `handshake_timeout` a dial is bounded by the sum of the three.
+    pub connect_timeout: Duration,
     /// Max frame body size in bytes (T3 mitigation).
     pub max_frame_body_size: u32,
     /// Max concurrent streams per connection lane (T15).
@@ -71,6 +76,7 @@ impl Default for NetConfig {
             heartbeat_timeout: Duration::from_millis(1500),
             max_connections: 512,
             handshake_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(5),
             max_frame_body_size: 256 * 1024 * 1024, // 256 MiB
             max_streams_per_lane: 128,
             raft_lane_timeout: Lane::Raft.timeout(),
@@ -257,6 +263,9 @@ impl NetConfig {
         if let Some(s) = r.parsed::<u64>("FERROSA_HANDSHAKE_TIMEOUT_SECS") {
             cfg.handshake_timeout = Duration::from_secs(s);
         }
+        if let Some(timeout) = r.positive_ms("FERROSA_CONNECT_TIMEOUT_MS") {
+            cfg.connect_timeout = timeout;
+        }
         if let Some(n) = r.parsed("FERROSA_MAX_FRAME_BODY_SIZE") {
             cfg.max_frame_body_size = n;
         }
@@ -390,6 +399,7 @@ mod tests {
         assert_eq!(cfg.heartbeat_interval, Duration::from_millis(500));
         assert_eq!(cfg.heartbeat_timeout, Duration::from_millis(1500));
         assert_eq!(cfg.handshake_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
     }
 
     fn env(pairs: &[(&'static str, &str)]) -> impl Fn(&str) -> Option<String> {

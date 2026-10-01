@@ -111,11 +111,15 @@ impl PriorityPool {
         raft_runtime: Option<Arc<tokio::runtime::Runtime>>,
         data_runtime: Option<Arc<tokio::runtime::Runtime>>,
     ) -> Result<Self> {
-        let peer_addr: SocketAddr = tokio::net::lookup_host(peer_host)
-            .await
-            .map_err(NetError::Io)?
-            .next()
-            .ok_or_else(|| NetError::Protocol(format!("no address resolved for {peer_host}")))?;
+        let peer_addr: SocketAddr =
+            tokio::time::timeout(config.connect_timeout, tokio::net::lookup_host(peer_host))
+                .await
+                .map_err(|_| NetError::Timeout(format!("DNS resolution of '{peer_host}'")))?
+                .map_err(NetError::Io)?
+                .next()
+                .ok_or_else(|| {
+                    NetError::Protocol(format!("no address resolved for {peer_host}"))
+                })?;
 
         let tls_connector = crate::tls::build_tls_connector(&config)?.map(Arc::new);
         let raft_task_pool = TaskPool::from_optional_runtime("raft-lane", raft_runtime.clone());

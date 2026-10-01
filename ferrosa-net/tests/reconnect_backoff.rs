@@ -117,6 +117,17 @@ async fn dormant_lane_rate_limits_probes() {
     let status = handle.query_status().await.unwrap();
     assert_eq!(status, LaneStatusReport::Dormant, "must be Dormant first");
 
+    // The loop above sent MarkFailed back to back, so it left two fast-phase
+    // reconnect tasks running (each up to ~4 min of backoff). A real lane has
+    // one cycle at a time. Let them finish before measuring, or their attempts
+    // are counted as probes.
+    for _ in 0..120 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     // Advance ten probe intervals, a second at a time so each probe task runs.
     let attempts_before = total_reconnect_attempts();
     const INTERVALS: u64 = 10;
@@ -128,10 +139,20 @@ async fn dormant_lane_rate_limits_probes() {
     }
     let delta = total_reconnect_attempts().saturating_sub(attempts_before);
 
+    // The lower bound is what actually guards the fix: `1..=INTERVALS` would
+    // pass for a lane that probed ONCE and then gave up forever, which is the
+    // bug this slow-retry phase exists to remove. Probe waits carry up to 25%
+    // jitter and the next wait starts only after the previous dial fails, which
+    // for an unroutable peer takes up to `connect_timeout` (5 s). Worst case a
+    // cycle is 30 * 1.25 + 5 = 42.5 s, so 300 s holds floor(300 / 42.5) = 7
+    // attempts. That is the floor; the ceiling is 10 (no jitter, instant fail).
+    // Without a bounded TCP connect a blackholed address hangs the first probe
+    // and this saw exactly 1.
+    const MIN_ATTEMPTS: u64 = INTERVALS * 4 / 5 - 1;
     assert!(
-        (1..=INTERVALS).contains(&delta),
-        "dormant lane must probe once per interval: expected 1..={INTERVALS} attempts over \
-         {INTERVALS} intervals, saw {delta}"
+        (MIN_ATTEMPTS..=INTERVALS).contains(&delta),
+        "dormant lane must keep probing about once per interval: expected \
+         {MIN_ATTEMPTS}..={INTERVALS} attempts over {INTERVALS} intervals, saw {delta}"
     );
 
     // Lane must still be Dormant (probes failed, peer still down).

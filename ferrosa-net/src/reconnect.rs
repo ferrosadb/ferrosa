@@ -304,11 +304,20 @@ async fn dial_once(
     task_pool: TaskPool,
 ) -> Result<RpcClient, String> {
     inc_total_reconnect_attempts();
-    let peer_addr = match tokio::net::lookup_host(peer_host).await {
-        Ok(mut addrs) => addrs
+    // DNS is bounded here and the TCP connect and handshake inside
+    // `RpcClient::connect_with_tls_on_pool`, each by its own config timeout, so
+    // one dial takes at most connect_timeout*2 + handshake_timeout.
+    let peer_addr = match tokio::time::timeout(
+        config.connect_timeout,
+        tokio::net::lookup_host(peer_host),
+    )
+    .await
+    {
+        Ok(Ok(mut addrs)) => addrs
             .next()
             .ok_or_else(|| "DNS resolved no addresses".to_owned())?,
-        Err(e) => return Err(format!("DNS resolution failed: {e}")),
+        Ok(Err(e)) => return Err(format!("DNS resolution failed: {e}")),
+        Err(_) => return Err("DNS resolution timed out".to_owned()),
     };
     RpcClient::connect_with_tls_on_pool(
         config,

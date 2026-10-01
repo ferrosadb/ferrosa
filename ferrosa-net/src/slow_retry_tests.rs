@@ -260,6 +260,34 @@ async fn lane_whose_peer_just_died(addr: SocketAddr, id: Uuid) -> LaneHandle {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// A dial to an address that never answers (TEST-NET-1, 192.0.2.0/24, is
+/// reserved and unroutable; depending on the host the SYN is dropped or the
+/// route is refused) must return within `connect_timeout`, not the OS connect
+/// timeout. Every retry loop serialises behind a dial, so an unbounded one
+/// stretches "a probe every 30 s" into "a probe per OS timeout, or never".
+#[tokio::test]
+async fn dial_to_an_unroutable_address_is_bounded_by_connect_timeout() {
+    let config = Arc::new(NetConfig {
+        connect_timeout: Duration::from_millis(300),
+        ..NetConfig::default()
+    });
+    let started = std::time::Instant::now();
+    let result = RpcClient::connect_with_tls_on_pool(
+        config,
+        Uuid::new_v4(),
+        "192.0.2.1:9".parse().expect("socket address"),
+        None,
+        TaskPool::current("slow-retry-test"),
+    )
+    .await;
+    assert!(result.is_err(), "nothing listens at TEST-NET-1");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "dial took {:?}; the TCP connect is not bounded by connect_timeout",
+        started.elapsed()
+    );
+}
+
 /// A connection that dies while nothing is subscribed to its liveness channel
 /// (the lane actor subscribes a moment after the client is built, and a
 /// reconnected client sits in the actor's mailbox first) must still read as
@@ -327,7 +355,20 @@ async fn slow_retry_logs_the_drop_and_the_recovery_once_each() {
     let handle = lane_whose_peer_just_died(addr, peer_id).await;
     let _returned = spawn_fake_peer(addr, peer_id, 60 * MINUTE, None);
 
-    run_for(62 * MINUTE).await;
+    // The fast phase (three cycles) ends by minute 12 at the latest. Count the
+    // attempts made between minute 13 and minute 58: with a probe every 30 s
+    // plus up to 25% jitter that is at least 2700 / 37.5 = 72. The log
+    // assertions below only mean something if many probes happened silently, so
+    // require most of them (60) rather than any.
+    run_for(13 * MINUTE).await;
+    let attempts_at_13m = total_reconnect_attempts();
+    run_for(45 * MINUTE).await;
+    let slow_attempts = total_reconnect_attempts() - attempts_at_13m;
+    assert!(
+        slow_attempts >= 60,
+        "expected a probe about every 30 s over 45 minutes, saw {slow_attempts}"
+    );
+    run_for(4 * MINUTE).await;
     assert_eq!(status(&handle).await, LaneStatusReport::Connected);
 
     let lines = logs.lines();
@@ -375,7 +416,16 @@ async fn shutdown_during_slow_retry_stops_attempts_and_leaks_no_task() {
     let first = spawn_bound_fake_peer(first, peer_id, Duration::from_secs(1));
     let handle = connected_lane(addr).await;
     tokio::time::pause(); // after the connect; see `lane_whose_peer_just_died`
-    run_for(25 * MINUTE).await;
+    run_for(13 * MINUTE).await;
+    let attempts_at_13m = total_reconnect_attempts();
+    run_for(12 * MINUTE).await;
+    // Without live probing the "no further attempts after shutdown" check below
+    // would hold trivially: 12 minutes at one probe per <= 37.5 s is >= 19.
+    let slow_attempts = total_reconnect_attempts() - attempts_at_13m;
+    assert!(
+        slow_attempts >= 15,
+        "the lane was not probing before shutdown: {slow_attempts} attempts in 12 minutes"
+    );
     assert_ne!(status(&handle).await, LaneStatusReport::Connected);
     assert_eq!(first.accepted(), 1);
 

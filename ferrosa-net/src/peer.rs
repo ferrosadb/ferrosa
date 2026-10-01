@@ -761,8 +761,17 @@ impl PeerManager {
             None => placeholder.peer_id.1.to_string(),
         };
         inc_total_reconnect_attempts();
-        let resolved = match tokio::net::lookup_host(&target).await {
-            Ok(mut addrs) => match addrs.next() {
+        let lookup = tokio::time::timeout(
+            self.config.connect_timeout,
+            tokio::net::lookup_host(&target),
+        );
+        let resolved = match lookup.await {
+            Err(_) => {
+                return RedialOutcome::Failed(DialFailure::Other(NetError::Timeout(format!(
+                    "DNS resolution of '{target}'"
+                ))))
+            }
+            Ok(Ok(mut addrs)) => match addrs.next() {
                 Some(addr) => addr,
                 None => {
                     return RedialOutcome::Failed(DialFailure::Other(NetError::Protocol(format!(
@@ -770,7 +779,7 @@ impl PeerManager {
                     ))))
                 }
             },
-            Err(e) => return RedialOutcome::Failed(DialFailure::Other(NetError::Io(e))),
+            Ok(Err(e)) => return RedialOutcome::Failed(DialFailure::Other(NetError::Io(e))),
         };
         let pool = match self.dial_verified(host_id, &target, resolved).await {
             Ok(pool) => pool,

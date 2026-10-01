@@ -87,6 +87,7 @@ one warning per setting and the default is used.
 | Environment variable | What it changes | Default |
 |---|---|---:|
 | `FERROSA_NET_RECONNECT_FAST_ATTEMPTS` | Connect attempts per fast-phase cycle (exponential backoff 1 s doubling to 30 s). After three exhausted cycles the lane enters slow-retry | `10` |
+| `FERROSA_CONNECT_TIMEOUT_MS` | Bound on DNS resolution and on the TCP connect, each, for every outbound dial (fast reconnect, slow-retry probe, peer re-dial). The handshake keeps its own `FERROSA_HANDSHAKE_TIMEOUT_SECS`. One lane dial is therefore bounded by 2 x this + the handshake timeout (15 s at defaults), below the 30 s slow interval; the next probe is scheduled only after the previous dial ends, so cadence is interval + dial time, never stuck behind a hung connect | `5000` ms |
 | `FERROSA_NET_RECONNECT_SLOW_INTERVAL_MS` | Interval between single-attempt probes in slow-retry, and the cap on a pool-less peer's re-dial backoff. Up to 25% random jitter is added so nodes do not dial in lockstep | `30000` ms |
 
 Logging is edge-only: one line when a lane drops into slow-retry and one when

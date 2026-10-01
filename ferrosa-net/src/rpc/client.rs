@@ -139,7 +139,12 @@ impl RpcClient {
         tls_connector: Option<&tokio_rustls::TlsConnector>,
         task_pool: TaskPool,
     ) -> Result<Self> {
-        let tcp_stream = TcpStream::connect(peer_addr).await?;
+        // Bounded: an unroutable or SYN-dropping peer would otherwise hang here
+        // for the OS connect timeout (minutes), stalling every retry loop.
+        let tcp_stream =
+            tokio::time::timeout(config.connect_timeout, TcpStream::connect(peer_addr))
+                .await
+                .map_err(|_| NetError::Timeout(format!("tcp connect to {peer_addr}")))??;
 
         // Perform the protocol handshake (and TLS if configured) using a helper
         // that handles the stream type generically.
