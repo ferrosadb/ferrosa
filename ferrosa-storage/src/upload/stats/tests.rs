@@ -202,15 +202,12 @@ fn read_amplification_is_one_when_nothing_was_requested() {
 #[test]
 fn label_cardinality_is_bounded() {
     let stats = ObjectStoreStats::new();
-    for i in 0..(MAX_OBJECT_KEYS + 50) {
+    let limit = tracked_label_pairs();
+    for i in 0..(limit + 50) {
         stats.record_requested(&sstable_key(&format!("ks.t{i}"), "1", "Data.db"), 1);
     }
     let objects = stats.object_snapshots();
-    assert_eq!(
-        objects.len(),
-        MAX_OBJECT_KEYS + 1,
-        "the cap plus one overflow bucket"
-    );
+    assert_eq!(objects.len(), limit + 1, "the cap plus one overflow bucket");
     let overflow = object(&objects, "-", "overflow");
     assert_eq!(overflow.bytes_requested, 50);
 }

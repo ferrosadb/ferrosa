@@ -10,7 +10,7 @@
 //! the 429 retry layer), so it sees every real request, each retry as its own
 //! request, and latency that excludes client-side pacing. Per table and
 //! component the key layout `prefix/<hex>/<table>/<gen>/<gen>-<component>`
-//! is parsed; label cardinality is bounded by [`MAX_OBJECT_KEYS`].
+//! is parsed; label cardinality is bounded by [`tracked_label_pairs`].
 //!
 //! Exposed through Prometheus ([`render_prometheus`]) and the virtual tables
 //! `system_observability.object_store_ops` and `object_store_objects`.
@@ -32,9 +32,39 @@ use object_store::{
     PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, UploadPart,
 };
 
-/// Distinct (table, component) label pairs tracked. Further keys fold into
-/// `("-", "overflow")` and the first overflow is logged.
-pub const MAX_OBJECT_KEYS: usize = 4096;
+/// Default for [`tracked_label_pairs`].
+const DEFAULT_TRACKED_LABEL_PAIRS: usize = 4096;
+
+/// Distinct (table, component) label pairs tracked, from
+/// `FERROSA_S3_STATS_MAX_KEYS` (default [`DEFAULT_TRACKED_LABEL_PAIRS`]). Further
+/// keys fold into `("-", "overflow")` and the first overflow is logged, so no
+/// observation is dropped silently.
+///
+/// This bounds METRIC LABEL CARDINALITY, not query results: a read of
+/// `system_observability.object_store_stats` returns every tracked row and
+/// truncates nothing. Unbounded label cardinality is the failure it prevents.
+/// Read once and cached, so a mid-run change does not resize the map.
+pub fn tracked_label_pairs() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("FERROSA_S3_STATS_MAX_KEYS") {
+            Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                // Fail loud-ish: stats are optional, so a bad value must not
+                // stop the node, but it must not be silently ignored either.
+                _ => {
+                    tracing::warn!(
+                        value = %raw,
+                        default = DEFAULT_TRACKED_LABEL_PAIRS,
+                        "FERROSA_S3_STATS_MAX_KEYS must be a positive integer; using the default"
+                    );
+                    DEFAULT_TRACKED_LABEL_PAIRS
+                }
+            },
+            _ => DEFAULT_TRACKED_LABEL_PAIRS,
+        }
+    })
+}
 
 /// Request latency bucket upper bounds, milliseconds.
 pub const LATENCY_BUCKETS_MS: [u64; 12] = [
@@ -353,14 +383,15 @@ impl ObjectStoreStats {
         if let Some(found) = map.get(&key) {
             return Arc::clone(found);
         }
-        let key = if map.len() >= MAX_OBJECT_KEYS {
+        let limit = tracked_label_pairs();
+        let key = if map.len() >= limit {
             let overflow = ObjectKey {
                 table: "-".into(),
                 component: "overflow".into(),
             };
             if !map.contains_key(&overflow) {
                 tracing::warn!(
-                    limit = MAX_OBJECT_KEYS,
+                    limit,
                     "object-store stats: too many distinct (table, component) keys; \
                      further keys are folded into component=overflow"
                 );

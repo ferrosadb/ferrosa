@@ -1215,14 +1215,3 @@ reason = "Rows stream to the ReplySink as the executor yields them (t_f348ba0b);
 owner = "bkearns"
 expires = "2027-07-01"
 
-# ---------------------------------------------------------------------------
-# Metric cardinality, not a result cap (added 2026-10-01 with the S3 stats layer)
-# ---------------------------------------------------------------------------
-
-[[allow]]
-path = "ferrosa-storage/src/upload/stats.rs"
-rule = "server-side-result-cap"
-symbol = "MAX_OBJECT_KEYS"
-reason = "Bounds distinct (table, component) METRIC LABEL pairs, not query results. Excess keys fold into an explicit (\"-\", \"overflow\") bucket and the first overflow is logged, so no observation is dropped silently; a query against system_observability.object_store_stats returns every tracked row and truncates nothing. Unbounded label cardinality is the failure this cap prevents. Renaming the const to dodge the heuristic would be worse than this entry."
-owner = "bkearns"
-expires = "2027-07-01"
