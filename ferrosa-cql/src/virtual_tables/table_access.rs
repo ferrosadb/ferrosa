@@ -164,50 +164,46 @@ impl VirtualTable for TableAccessSummaryTable {
         &[0, 1]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        self.tracker
-            .counters
-            .iter()
-            .map(|entry| {
-                let (ks, tbl) = entry.key();
-                let c = entry.value();
-                let cells = vec![
-                    CellValue::live(ks.as_bytes().to_vec(), 0),
-                    CellValue::live(tbl.as_bytes().to_vec(), 0),
-                    CellValue::live(
-                        (c.reads.load(Ordering::Relaxed) as i64)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                    CellValue::live(
-                        (c.writes.load(Ordering::Relaxed) as i64)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                    CellValue::live(
-                        (c.point_lookups.load(Ordering::Relaxed) as i64)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                    CellValue::live(
-                        (c.range_scans.load(Ordering::Relaxed) as i64)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                    CellValue::live(
-                        (c.full_scans.load(Ordering::Relaxed) as i64)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                ];
-                VirtualRow { cells }
-            })
-            .collect()
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        for entry in &self.tracker.counters {
+            let (ks, tbl) = entry.key();
+            let c = entry.value();
+            let cells = vec![
+                CellValue::live(ks.as_bytes().to_vec(), 0),
+                CellValue::live(tbl.as_bytes().to_vec(), 0),
+                CellValue::live(
+                    (c.reads.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+                CellValue::live(
+                    (c.writes.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+                CellValue::live(
+                    (c.point_lookups.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+                CellValue::live(
+                    (c.range_scans.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+                CellValue::live(
+                    (c.full_scans.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+            ];
+            visit(VirtualRow { cells });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

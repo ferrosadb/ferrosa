@@ -145,12 +145,6 @@ impl VirtualTable for PeersV2Table {
         (col_idx == TOKENS_COL).then_some(WireType::SetText)
     }
 
-    fn read(&self, predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        let mut rows = Vec::new();
-        self.visit_rows(predicate, &mut |row| rows.push(row));
-        rows
-    }
-
     fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         tracing::debug!(
             "PeersV2Table::visit_rows start client={}",

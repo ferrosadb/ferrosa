@@ -170,40 +170,36 @@ impl VirtualTable for QueryFingerprintsTable {
         &[0]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        self.tracker
-            .entries
-            .iter()
-            .map(|entry| {
-                let hash = *entry.key();
-                let fp = entry.value();
-                let cells = vec![
-                    CellValue::live((hash as i64).to_be_bytes().to_vec(), 0),
-                    CellValue::live(fp.query_text.as_bytes().to_vec(), 0),
-                    CellValue::live(
-                        (fp.count.load(Ordering::Relaxed) as i64)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                    CellValue::live(
-                        fp.total_duration_us
-                            .load(Ordering::Relaxed)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                    CellValue::live(
-                        fp.last_seen_ms
-                            .load(Ordering::Relaxed)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                ];
-                VirtualRow { cells }
-            })
-            .collect()
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        for entry in self.tracker.entries.iter() {
+            let hash = *entry.key();
+            let fp = entry.value();
+            let cells = vec![
+                CellValue::live((hash as i64).to_be_bytes().to_vec(), 0),
+                CellValue::live(fp.query_text.as_bytes().to_vec(), 0),
+                CellValue::live(
+                    (fp.count.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+                CellValue::live(
+                    fp.total_duration_us
+                        .load(Ordering::Relaxed)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+                CellValue::live(
+                    fp.last_seen_ms
+                        .load(Ordering::Relaxed)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+            ];
+            visit(VirtualRow { cells });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

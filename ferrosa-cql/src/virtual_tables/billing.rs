@@ -166,39 +166,35 @@ impl VirtualTable for BillingMetersTable {
         &[0, 1, 2]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        self.meter
-            .buckets
-            .iter()
-            .map(|entry| {
-                let (client, ks, minute) = entry.key();
-                let b = entry.value();
-                let cells = vec![
-                    CellValue::live(client.as_bytes().to_vec(), 0),
-                    CellValue::live(ks.as_bytes().to_vec(), 0),
-                    CellValue::live((*minute as i64).to_be_bytes().to_vec(), 0),
-                    CellValue::live(
-                        (b.bytes_in.load(Ordering::Relaxed) as i64)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                    CellValue::live(
-                        (b.bytes_out.load(Ordering::Relaxed) as i64)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                    CellValue::live(
-                        (b.request_count.load(Ordering::Relaxed) as i64)
-                            .to_be_bytes()
-                            .to_vec(),
-                        0,
-                    ),
-                ];
-                VirtualRow { cells }
-            })
-            .collect()
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        for entry in &self.meter.buckets {
+            let (client, ks, minute) = entry.key();
+            let b = entry.value();
+            let cells = vec![
+                CellValue::live(client.as_bytes().to_vec(), 0),
+                CellValue::live(ks.as_bytes().to_vec(), 0),
+                CellValue::live((*minute as i64).to_be_bytes().to_vec(), 0),
+                CellValue::live(
+                    (b.bytes_in.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+                CellValue::live(
+                    (b.bytes_out.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+                CellValue::live(
+                    (b.request_count.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                ),
+            ];
+            visit(VirtualRow { cells });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

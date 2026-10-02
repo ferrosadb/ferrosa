@@ -250,24 +250,20 @@ impl VirtualTable for ActiveQueriesTable {
         &[0]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        self.tracker
-            .snapshot()
-            .into_iter()
-            .map(|s| {
-                let cells = vec![
-                    CellValue::live((s.query_id as i64).to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.client_address.into_bytes(), 0),
-                    CellValue::live(s.username.into_bytes(), 0),
-                    CellValue::live(s.query_text.into_bytes(), 0),
-                    CellValue::live(s.keyspace.into_bytes(), 0),
-                    CellValue::live(s.start_epoch_ms.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.elapsed_ms.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.state.into_bytes(), 0),
-                ];
-                VirtualRow { cells }
-            })
-            .collect()
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        for s in self.tracker.snapshot() {
+            let cells = vec![
+                CellValue::live((s.query_id as i64).to_be_bytes().to_vec(), 0),
+                CellValue::live(s.client_address.into_bytes(), 0),
+                CellValue::live(s.username.into_bytes(), 0),
+                CellValue::live(s.query_text.into_bytes(), 0),
+                CellValue::live(s.keyspace.into_bytes(), 0),
+                CellValue::live(s.start_epoch_ms.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.elapsed_ms.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.state.into_bytes(), 0),
+            ];
+            visit(VirtualRow { cells });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

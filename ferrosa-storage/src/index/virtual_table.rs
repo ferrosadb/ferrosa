@@ -116,9 +116,8 @@ impl VirtualTable for SecondaryIndexesVirtualTable {
         &[0, 1, 2]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         let states = self.tracker.all_states();
-        let mut rows = Vec::with_capacity(states.len());
 
         for state in &states {
             let (keyspace, table) = &state.table;
@@ -129,7 +128,7 @@ impl VirtualTable for SecondaryIndexesVirtualTable {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
 
-            rows.push(VirtualRow {
+            visit(VirtualRow {
                 cells: vec![
                     // keyspace_name (Text)
                     CellValue::live(keyspace.as_bytes().to_vec(), 0),
@@ -165,8 +164,6 @@ impl VirtualTable for SecondaryIndexesVirtualTable {
                 ],
             });
         }
-
-        rows
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

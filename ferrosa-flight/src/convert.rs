@@ -187,15 +187,36 @@ pub fn record_batch_to_rows(batch: &RecordBatch) -> Result<DecodedRows, ConvertE
     let schema = batch.schema();
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
 
-    let mut cols: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(batch.num_columns());
+    // Decode each column exactly once into a per-column `Vec`, then transpose
+    // column-major -> row-major by MOVING every cell out of its column.
+    //
+    // The previous shape cloned each cell (`col[i].clone()`) into a freshly
+    // allocated row vector while the whole column matrix was still alive, so a
+    // broad batch paid one `CqlValue` deep clone per cell (a `String`/`Vec<u8>`
+    // allocation for text/blob/jsonb cells) AND held both matrices at once.
+    // Consuming each column through `into_iter()` makes the transpose a pure
+    // move: no `CqlValue` is cloned and the column buffers are drained as the
+    // row vectors are filled.
+    //
+    // Bound: this is one inbound Arrow `RecordBatch` (the `DoPut` client's
+    // batch), so peak is O(batch), independent of the total stream — the batch,
+    // not the table, sizes it. Each `CqlValue` in the result is a MOVE out of a
+    // column buffer; the only remaining per-cell allocation is inside
+    // `decode_column` itself (unavoidable: decoding an Arrow value into an owned
+    // `CqlValue` allocates for variable-width types).
+    let num_rows = batch.num_rows();
+    let mut cols: Vec<std::vec::IntoIter<Option<CqlValue>>> =
+        Vec::with_capacity(batch.num_columns());
     for c in 0..batch.num_columns() {
-        cols.push(decode_column(batch.column(c), schema.field(c).data_type())?);
+        cols.push(decode_column(batch.column(c), schema.field(c).data_type())?.into_iter());
     }
 
-    // Transpose column-major -> row-major.
-    let mut rows = Vec::with_capacity(batch.num_rows());
-    for i in 0..batch.num_rows() {
-        rows.push(cols.iter().map(|col| col[i].clone()).collect());
+    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        // Every column has exactly `num_rows` cells; `flatten` maps a missing
+        // trailing cell to `None` (the same "absent cell" convention the rest of
+        // the module uses).
+        rows.push(cols.iter_mut().filter_map(Iterator::next).collect());
     }
     Ok((names, rows))
 }
