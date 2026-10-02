@@ -15,6 +15,7 @@ use tabled::settings::Style;
 
 use ferrosa_cql::client::{CqlClient, QueryResult};
 use ferrosa_cql::error::CqlError;
+use std::io::{BufRead, Read};
 
 pub mod compaction;
 pub mod evicted;
@@ -1050,6 +1051,197 @@ pub fn cluster_bootstrap_dc(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+// ── Schema agreement ─────────────────────────────────────────────────────────
+
+/// Read one node's independently-reported schema version and host id.
+async fn fetch_reported_schema_version(
+    endpoint: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<(uuid::Uuid, uuid::Uuid), WebError> {
+    let url = format!("http://{endpoint}/admin/membership-snapshot");
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Some(u) = username {
+        req = req.basic_auth(u, password);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "{endpoint} returned HTTP {status}. `/admin/*` is auth-protected: pass \
+             --username (and --password-stdin) for a node with auth enabled. Body: {text}"
+        )
+        .into());
+    }
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("{endpoint} returned a non-JSON body: {e}: {text}"))?;
+    // A node running an older binary omits this field entirely; say so instead of
+    // reporting a parse error, because that is a real and likely operator case.
+    let ver = body
+        .get("schema_version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "{endpoint} did not report schema_version; its binary predates this field, \
+                 so it cannot take part in the check"
+            )
+        })?;
+    let schema_version = uuid::Uuid::parse_str(ver)
+        .map_err(|e| format!("{endpoint} reported an unparsable schema_version '{ver}': {e}"))?;
+    let host_id = body
+        .get("reporter_host_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or(uuid::Uuid::nil());
+    Ok((schema_version, host_id))
+}
+
+/// Compare the schema version every node holds, and fail if they disagree.
+///
+/// This is the only observable that can detect a stale-schema node. Membership,
+/// voter counts and learner counts all look healthy while it is in that state,
+/// and `system.peers` cannot help either: every node writes the *local* snapshot
+/// version into every peer row (`ferrosa-schema/src/system/peers.rs`), so a node
+/// reading its peers back always reads its own value and agrees with itself.
+///
+/// The comparison is delegated to
+/// [`ferrosa_cluster::controller::bootstrap::replay_schema::postcondition`], the
+/// bootstrap phase's own rule, so the gate and the phase cannot drift apart.
+pub async fn schema_check(
+    nodes: &[String],
+    username: Option<&str>,
+    password_stdin: bool,
+) -> Result<(), WebError> {
+    use ferrosa_cluster::controller::bootstrap::replay_schema::{postcondition, ReplaySchemaState};
+
+    if nodes.is_empty() {
+        return Err("pass at least one node with --nodes <host:port,...>".into());
+    }
+
+    // Same password resolution as `compaction stop`: stdin when asked (for
+    // scripting), otherwise an interactive no-echo prompt. `/admin/*` sits behind
+    // the auth middleware, so a check that cannot authenticate is not a check.
+    let password = if username.is_some() {
+        if password_stdin {
+            let mut line = String::new();
+            // Passwords are one line; bound accidental file/pipe input as well.
+            let mut input = std::io::stdin().lock().take(4097);
+            input.read_line(&mut line)?;
+            if line.len() > 4096 {
+                return Err("password input exceeds 4096 bytes".into());
+            }
+            Some(line.trim_end_matches(['\r', '\n']).to_owned())
+        } else {
+            Some(crate::auth::prompt_password("Admin password: ")?)
+        }
+    } else {
+        None
+    };
+    let password = password.as_deref();
+
+    let mut versions: std::collections::BTreeMap<u64, uuid::Uuid> = Default::default();
+    let mut labels: std::collections::BTreeMap<u64, (String, Option<uuid::Uuid>)> =
+        Default::default();
+    let mut leader_node_id: Option<u64> = None;
+
+    for (i, endpoint) in nodes.iter().enumerate() {
+        let endpoint = endpoint.trim();
+        if endpoint.is_empty() {
+            continue;
+        }
+        let node_id = (i + 1) as u64;
+        let (schema_version, host_id) =
+            fetch_reported_schema_version(endpoint, username, password).await?;
+
+        // Who leads. Best-effort: only used to label the report, never to decide
+        // the outcome, so a missing voter list cannot become a false verdict.
+        if leader_node_id.is_none() {
+            if let Ok(voters) = fetch_openraft_voters(endpoint, username, password).await {
+                if !voters.is_empty() {
+                    leader_node_id = Some(node_id);
+                }
+            }
+        }
+
+        versions.insert(node_id, schema_version);
+        labels.insert(node_id, (endpoint.to_string(), Some(host_id)));
+    }
+
+    if versions.is_empty() {
+        return Err("no usable node endpoints were given".into());
+    }
+
+    let state = ReplaySchemaState {
+        leader_node_id: leader_node_id.unwrap_or(1),
+        node_schema_versions: versions.clone(),
+    };
+
+    // Name the divergent nodes by endpoint, not by a synthetic ordinal: an
+    // operator needs the host to act on.
+    let report = |sink: &mut dyn std::io::Write| {
+        for (id, (ep, host)) in &labels {
+            let _ = writeln!(
+                sink,
+                "  node {id}  {ep}  schema_version={}  host_id={}",
+                versions[id],
+                host.map(|h| h.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            );
+        }
+    };
+
+    match postcondition(&state) {
+        Ok(()) => {
+            let v = versions.values().next().copied().unwrap_or_default();
+            println!("schema agrees across {} node(s): {v}", versions.len());
+            report(&mut std::io::stdout());
+            Ok(())
+        }
+        Err(e) => {
+            let leader_version = state.node_schema_versions[&state.leader_node_id];
+            let differing = versions.values().filter(|v| **v != leader_version).count();
+            eprintln!("schema DIVERGED across {} node(s): {e}", versions.len());
+            report(&mut std::io::stderr());
+            eprintln!(
+                "{differing} of {} node(s) differ from the leader. A node holding a stale \
+                 schema makes every fresh session's schema-agreement wait time out, even for \
+                 a satisfied IF NOT EXISTS -- while the cluster still reports a healthy \
+                 voter count. Restore the lagging node and re-check.",
+                versions.len()
+            );
+            Err(format!("schema disagreement: {differing} node(s) differ from the leader").into())
+        }
+    }
+}
+
+/// Best-effort read of a node's openraft voter list, used only to label which
+/// endpoint is the leader in the report.
+async fn fetch_openraft_voters(
+    endpoint: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<Vec<String>, WebError> {
+    let url = format!("http://{endpoint}/admin/membership-snapshot");
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Some(u) = username {
+        req = req.basic_auth(u, password);
+    }
+    let text = req.send().await?.text().await.unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    Ok(body
+        .get("openraft_voters")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
 
 #[cfg(test)]
 mod tests {

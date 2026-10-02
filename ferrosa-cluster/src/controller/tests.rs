@@ -1529,6 +1529,100 @@ async fn raft_init_registers_handlers() {
     );
 }
 
+/// A node that missed DDL while it was down comes back with a stale schema and
+/// has to be able to install the cluster's schema.
+///
+/// Cluster mode registers the Raft, read and repair handlers but NOT the schema
+/// sync handler, so a rejoining node can be told about a schema snapshot and
+/// have nowhere to receive it. The divergence never repairs: the node re-offers
+/// the tables it already has, learns nothing about the ones it lacks, and every
+/// session that needs cluster-wide schema agreement keeps failing.
+///
+/// Modelled on the path a returning member actually takes -- a `cluster-member`
+/// marker, so it comes up inside the cluster shape and never forms a pair. The
+/// pair-mode registration is deliberately not exercised here: a former member
+/// never reaches it, which is precisely why the gap is real.
+///
+/// Invariant: a node in the cluster shape must be able to RECEIVE a schema
+/// snapshot, whether or not its formation succeeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn former_cluster_member_registers_schema_sync_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        formation_timeout_secs: Some(1),
+        raft_heartbeat_ms: 50,
+        raft_election_timeout_min_ms: 100,
+        raft_election_timeout_max_ms: 200,
+        ..ClusterConfig::default()
+    });
+
+    // The marker must live where the node actually reads it, or the node
+    // silently starts fresh and this test would assert nothing.
+    let raft_dir =
+        crate::controller::cluster::configured_raft_dir(&config).expect("a configured raft dir");
+    std::fs::create_dir_all(&raft_dir).unwrap();
+    DeploymentMode::record_cluster_membership(&raft_dir).unwrap();
+    assert!(
+        DeploymentMode::was_cluster_member(&raft_dir),
+        "the marker must be where initial_for_restart looks"
+    );
+
+    let net_config = Arc::new(NetConfig::default());
+    let registry = Arc::new(HandlerRegistry::new());
+    let host_id = Uuid::from_u128(u128::MAX);
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        host_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        host_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::DegradedCluster,
+        "a returning member starts inside the cluster shape, never as a pair"
+    );
+
+    // Its formation times out against an unreachable peer, as a real rejoining
+    // node's does, and the registration happens on that path.
+    //
+    // Wait on THIS controller's own registry, not on the process-wide
+    // formation-timeout counter: that counter is shared with every other test
+    // in the binary, so under a parallel run another test's timeout satisfies
+    // the wait before this controller has done anything, and the assertion
+    // below then fails for a reason that has nothing to do with the behaviour
+    // under test. Polling the observable we actually care about keeps the test
+    // isolated.
+    let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    controller.transition_to_forming(vec![(Uuid::from_u128(1), unreachable)]);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !controller.registry.has_handler(MsgType::PairSchemaSync)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        controller.registry.has_handler(MsgType::PairSchemaSync),
+        "a node in the cluster shape must be able to receive a schema snapshot, \
+         otherwise a rejoining node's divergence is permanent: it can only ever \
+         push the schema it already has and never learns the tables it lacks"
+    );
+
+    controller.shutdown().await;
+}
+
 #[test]
 fn deterministic_token_generation_is_stable() {
     let node_id = 42u64;
@@ -4313,5 +4407,42 @@ fn the_automatic_pair_transition_is_still_refused_for_a_cluster() {
         DeploymentMode::Cluster,
         "transition_to_pair must still refuse Cluster -> Pair; only the operator \
          entry point may cross that line"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Schema-snapshot push authority
+// ---------------------------------------------------------------------------
+
+/// Only the Raft leader may send a peer its schema snapshot.
+///
+/// The receiving handler treats tables its own schema holds that the incoming
+/// snapshot lacks as dropped, and unregisters them -- deleting their local
+/// SSTable directories. So a NON-leader sending its schema would tell a healthy
+/// peer to delete the newer tables the sender never learned about: a silent
+/// divergence becomes silent data loss.
+///
+/// Invariant: the send is permitted if and only if this node is known to be the
+/// Raft leader.
+#[test]
+fn only_the_raft_leader_may_send_a_schema_snapshot() {
+    let me = Uuid::from_u128(0xaaaa);
+    let someone_else = Uuid::from_u128(0xbbbb);
+
+    assert!(
+        super::cluster::should_send_schema_snapshot(me, Some(me)),
+        "the leader must be allowed to send the cluster schema to a joining peer"
+    );
+
+    assert!(
+        !super::cluster::should_send_schema_snapshot(me, Some(someone_else)),
+        "a follower sending its schema would have the leader delete tables the \
+         follower never learned about; it must NOT be allowed"
+    );
+
+    assert!(
+        !super::cluster::should_send_schema_snapshot(me, None),
+        "with no known leader this node cannot speak for the cluster schema, so \
+         it must not send"
     );
 }

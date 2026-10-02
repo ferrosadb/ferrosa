@@ -165,6 +165,17 @@ enum Commands {
         action: ClusterAction,
     },
 
+    /// Schema agreement across the cluster's nodes.
+    ///
+    /// A node whose schema is stale cannot take part in schema agreement, so
+    /// every fresh CQL session that issues a statement needing agreement -- even
+    /// a satisfied `IF NOT EXISTS` -- waits and then times out. Membership and
+    /// voter counts cannot see this condition; only the schema versions can.
+    Schema {
+        #[command(subcommand)]
+        action: SchemaAction,
+    },
+
     /// Restore from a snapshot, optionally to a point in time.
     Restore {
         /// Name of the snapshot to restore from.
@@ -601,6 +612,31 @@ enum ClusterAction {
     },
 }
 
+/// Schema sub-actions.
+#[derive(Debug, Subcommand)]
+enum SchemaAction {
+    /// Compare the schema version every node holds and report any divergence.
+    ///
+    /// Exits non-zero when the nodes disagree, so it can gate a rollout: a node
+    /// left stale by a restart makes every fresh session's schema-agreement wait
+    /// time out, and the cluster still reports a healthy voter count while it is
+    /// in that state -- so voter counts cannot gate it.
+    Check {
+        /// Comma-separated admin endpoints to compare, e.g.
+        /// `10.0.0.1:9090,10.0.0.2:9090,10.0.0.3:9090`. Each must be reachable.
+        #[arg(long = "nodes", value_delimiter = ',')]
+        nodes: Vec<String>,
+
+        /// Admin/operator username. Prompts for its password unless --password-stdin is set.
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Read the password from one line of standard input.
+        #[arg(long, requires = "username")]
+        password_stdin: bool,
+    },
+}
+
 /// Snapshot sub-actions.
 #[derive(Debug, Subcommand)]
 enum SnapshotAction {
@@ -843,6 +879,13 @@ async fn main() {
                 assume_stopped,
             ),
         },
+        Commands::Schema { action } => match action {
+            SchemaAction::Check {
+                nodes,
+                username,
+                password_stdin,
+            } => commands::schema_check(&nodes, username.as_deref(), password_stdin).await,
+        },
     };
 
     if let Err(e) = result {
@@ -863,6 +906,59 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `schema check` must be reachable and take its node list.
+    ///
+    /// This is the command an operator runs to answer "did a restart leave a node
+    /// behind?". If it were unreachable or misparsed, the detection would exist in
+    /// the library and be unusable in practice.
+    #[test]
+    fn parse_schema_check_takes_nodes_and_credentials() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "schema",
+            "check",
+            "--nodes",
+            "10.0.0.1:9090,10.0.0.2:9090",
+            "--username",
+            "ferrosa_admin",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Schema {
+                action:
+                    SchemaAction::Check {
+                        nodes,
+                        username,
+                        password_stdin,
+                    },
+            } => {
+                assert_eq!(nodes, vec!["10.0.0.1:9090", "10.0.0.2:9090"]);
+                assert_eq!(username.as_deref(), Some("ferrosa_admin"));
+                assert!(!password_stdin);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// `--password-stdin` without a username is rejected: there would be nobody to
+    /// authenticate as, and silently ignoring it would produce a confusing 401.
+    #[test]
+    fn schema_check_password_stdin_requires_username() {
+        let err = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "schema",
+            "check",
+            "--nodes",
+            "10.0.0.1:9090",
+            "--password-stdin",
+        ])
+        .expect_err("password-stdin without username must be rejected");
+        assert!(
+            err.to_string().contains("username"),
+            "error should point at the missing username, got: {err}"
+        );
     }
 
     /// `cluster downgrade-to-pair` must be reachable from the CLI.

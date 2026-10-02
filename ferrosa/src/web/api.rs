@@ -727,6 +727,17 @@ async fn membership_snapshot_handler(State(mc): State<Arc<ModeController>>) -> J
         peer_manager_peers = live_ids.into_iter().map(|u| u.to_string()).collect();
     }
 
+    // The schema version this node independently holds.
+    //
+    // Exposed raw and unreconciled on purpose. `system.peers` is written with
+    // every peer's `schema_version` set to this node's own snapshot version, so a
+    // node reading its peers back always sees its own value -- an agreement check
+    // built on that data agrees with itself and can never detect divergence. The
+    // only honest signal is each node publishing what IT holds, which is what
+    // makes `bootstrap::replay_schema::postcondition` (a comparison across nodes)
+    // possible at all.
+    let schema_version = mc.schema().snapshot().version.to_string();
+
     Json(json!({
         "reporter_host_id": mc.host_id().to_string(),
         "state_members": Value::Object(state_members),
@@ -736,6 +747,7 @@ async fn membership_snapshot_handler(State(mc): State<Arc<ModeController>>) -> J
         "peer_manager_peers": peer_manager_peers,
         "committed_cluster_size": committed_cluster_size,
         "live_peer_count": live_peer_count,
+        "schema_version": schema_version,
     }))
 }
 
@@ -922,6 +934,47 @@ mod tests {
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
         }
+    }
+
+    /// The membership snapshot must expose this node's schema version.
+    ///
+    /// Schema agreement is what a CQL client waits on after DDL, and it is the
+    /// condition a rollout must check: a single node whose schema is stale makes
+    /// every fresh session's schema-agreement wait time out, even for a statement
+    /// that is a satisfied `IF NOT EXISTS`. Until this field existed there was no
+    /// way to observe that from outside a node.
+    ///
+    /// It is reported as the RAW value this node holds, deliberately not
+    /// reconciled against anything. `system.peers` is written with every peer's
+    /// `schema_version` set to the local snapshot's version, so a node always
+    /// reads back its own value from every peer row -- an agreement check built
+    /// on that data would agree with itself unconditionally and detect nothing.
+    /// The only honest signal is each node reporting what it independently holds.
+    #[tokio::test]
+    async fn membership_snapshot_reports_the_local_schema_version() {
+        let app = crate::web::build_router(make_state());
+
+        let response = app
+            .oneshot(
+                Request::get("/admin/membership-snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert!(
+            json.get("schema_version").is_some(),
+            "a node must report its own schema version so a rollout can tell \
+             whether the cluster agrees; got keys: {:?}",
+            json.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
     }
 
     #[tokio::test]
