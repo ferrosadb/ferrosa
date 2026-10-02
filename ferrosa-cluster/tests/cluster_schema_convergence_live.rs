@@ -40,9 +40,11 @@
 //!   --test cluster_schema_convergence_live -- --nocapture
 //! ```
 //!
-//! `cqlsh` and `podman` must be on PATH. The node containers are managed through
-//! the project name from `FERROSA_TEST_CLUSTER_PROJECT` (default
-//! `ferrosa-test-w1`), which the up-script prints.
+//! `cqlsh` and `podman` must be on PATH. The node container to restart is
+//! DISCOVERED from running podman containers by node-name suffix, because the
+//! compose project name is a convention that differs between the local up-script
+//! and CI and is not exported to the test. `FERROSA_TEST_CLUSTER_PROJECT`
+//! overrides the discovery when set.
 
 #![cfg(feature = "live-infra-tests")]
 
@@ -75,31 +77,75 @@ fn nodes() -> Vec<(String, String)> {
     nodes
 }
 
-fn project() -> String {
-    std::env::var("FERROSA_TEST_CLUSTER_PROJECT").unwrap_or_else(|_| "ferrosa-test-w1".to_string())
+/// The index of the node container to restart (node 3, 1-based).
+const NODE_INDEX: usize = 3;
+
+/// Find the container backing node `NODE_INDEX`, without being told the project.
+///
+/// The project name is a local convention -- the local up-script uses one, CI
+/// another (`ferrosa-test-ci`) -- and neither exports it to the test. Only
+/// `FERROSA_TEST_CLUSTER_NODES` is exported. So the container is discovered by
+/// asking podman for running containers whose name ends in the node suffix,
+/// accepting either separator, rather than guessing the project.
+fn node_container() -> String {
+    // An explicit override still wins, for a deliberately unusual setup.
+    if let Ok(project) = std::env::var("FERROSA_TEST_CLUSTER_PROJECT") {
+        for candidate in [
+            format!("{project}_node{NODE_INDEX}_1"),
+            format!("{project}-node{NODE_INDEX}-1"),
+        ] {
+            if container_exists(&candidate) {
+                return candidate;
+            }
+        }
+        panic!(
+            "FERROSA_TEST_CLUSTER_PROJECT={project} was given but neither \
+             {project}_node{NODE_INDEX}_1 nor {project}-node{NODE_INDEX}-1 exists"
+        );
+    }
+
+    let out = Command::new("podman")
+        .args(["ps", "--format", "{{.Names}}"])
+        .output()
+        .unwrap_or_else(|e| panic!("could not run podman ps: {e}"));
+    assert!(
+        out.status.success(),
+        "podman ps failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let names = String::from_utf8_lossy(&out.stdout);
+
+    // `ferrosa-test-w1_node3_1` (compose underscore) or `ferrosa-test-ci-node3-1`.
+    let suffixes = [
+        format!("_node{NODE_INDEX}_1"),
+        format!("-node{NODE_INDEX}-1"),
+    ];
+    let matches: Vec<&str> = names
+        .lines()
+        .map(str::trim)
+        .filter(|n| suffixes.iter().any(|s| n.ends_with(s.as_str())))
+        .collect();
+
+    match matches.as_slice() {
+        [] => panic!(
+            "no running container for node {NODE_INDEX}. Expected one whose name \
+             ends in _node{NODE_INDEX}_1 or -node{NODE_INDEX}-1. Running: {:?}",
+            names.lines().map(str::trim).collect::<Vec<_>>()
+        ),
+        [only] => (*only).to_string(),
+        many => panic!(
+            "node {NODE_INDEX} is ambiguous, {} containers match: {many:?}",
+            many.len()
+        ),
+    }
 }
 
-/// The container backing node `index` (1-based). The up-script resolves this the
-/// same way; both spellings are tried because the separator depends on how
-/// podman was driven.
-fn container_for(project: &str, index: usize) -> String {
-    for candidate in [
-        format!("{project}_node{index}_1"),
-        format!("{project}-node{index}-1"),
-    ] {
-        let ok = Command::new("podman")
-            .args(["container", "exists", &candidate])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            return candidate;
-        }
-    }
-    panic!(
-        "no container for node {index} in project {project}; \
-         set FERROSA_TEST_CLUSTER_PROJECT to the project the up-script printed"
-    );
+fn container_exists(name: &str) -> bool {
+    Command::new("podman")
+        .args(["container", "exists", name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn podman(args: &[&str]) -> String {
@@ -240,7 +286,6 @@ fn rejoining_node_learns_a_table_created_while_it_was_down() {
     // test stops. Confirming "the cluster applied the DDL" has to read from a
     // node that is still up.
     let (first, other) = (&nodes[0], &nodes[1]);
-    let project = project();
 
     // The keyspace name MUST be unique per run.
     //
@@ -259,7 +304,7 @@ fn rejoining_node_learns_a_table_created_while_it_was_down() {
 
     // Stop the node BEFORE any of the DDL, so the keyspace AND the table are both
     // genuinely new to it. The guard puts it back on any exit, including a panic.
-    let stopped = container_for(&project, 3);
+    let stopped = node_container();
     eprintln!("stopping {stopped} (node 3) to make it miss the DDL");
     podman(&["stop", &stopped]);
     let mut guard = RestartOnDrop::new(stopped.clone());
