@@ -2768,6 +2768,50 @@ impl ModeController {
                         tracing::info!(
                             "raft recovered committed topology; skipping bootstrap streaming and promotion"
                         );
+                        // Recovery pass. The promote phase above runs only on a
+                        // FRESH join. On restart it was skipped entirely, so a
+                        // node that was mid-join when this leader last stopped
+                        // stayed `Joining` FOREVER: `TokenRing::replicas()`
+                        // skips non-Normal members, so that node's tokens were
+                        // silently served by other nodes (repair run from it
+                        // saw zero owned ranges, and its own full scans missed
+                        // a partition). The recovered topology is COMMITTED, so
+                        // a `Joining` member in it is a join whose promotion the
+                        // restart lost — not a node still streaming data.
+                        // Finish that promotion instead of leaving it stuck.
+                        let member_states: std::collections::BTreeMap<u64, NodeState> =
+                            match ring_for_bootstrap.load().as_ref().as_ref() {
+                                Some(ring) => ring
+                                    .node_ids()
+                                    .into_iter()
+                                    .filter_map(|id| ring.get_node(id).map(|info| (id, info.state)))
+                                    .collect(),
+                                None => std::collections::BTreeMap::new(),
+                            };
+                        let promote_plan = crate::repair::coordinator::promote_joining_members(
+                            &member_states,
+                        );
+                        if !promote_plan.is_empty() {
+                            let stuck: Vec<(u64, NodeState)> = member_states
+                                .iter()
+                                .filter(|(_, st)| !matches!(st, NodeState::Normal))
+                                .map(|(id, st)| (*id, *st))
+                                .collect();
+                            tracing::warn!(
+                                ?stuck,
+                                "recovered topology still has non-Normal members — resuming \
+                                 the Promote phase so their tokens stop being misrouted"
+                            );
+                            for op in promote_plan {
+                                let cmd = crate::raft::RaftCommand {
+                                    op,
+                                    schema_version: Uuid::new_v4(),
+                                };
+                                if let Err(e) = raft_arc.client_write(cmd).await {
+                                    tracing::warn!(%e, "recovery promote failed");
+                                }
+                            }
+                        }
                     }
                 }
                 None => {

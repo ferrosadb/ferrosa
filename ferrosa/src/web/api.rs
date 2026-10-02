@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrosa_cluster::raft::NodeState;
+use ferrosa_cluster::repair::coordinator::{ring_data_scatter_risk, ring_health};
 use ferrosa_cluster::ModeController;
 use ferrosa_common::DataType;
 use ferrosa_schema::VirtualTableRegistry;
@@ -30,6 +31,24 @@ struct DecommissionRequest {
 #[derive(serde::Serialize)]
 struct RingInfo {
     nodes: Vec<RingNodeInfo>,
+    /// False when any member is not `Normal`. A degraded ring silently
+    /// misroutes replicas (a `Joining` token owner is excluded from
+    /// `replicas()`), so the cluster must say so out loud.
+    ring_healthy: bool,
+    /// Members that are not `Normal`, with their state — the reason the ring
+    /// is unhealthy.
+    non_normal_members: Vec<NonNormalMember>,
+    /// Node ids that own tokens yet are excluded from `replicas()` because of
+    /// their state. Non-empty means writes/reads for those ranges are being
+    /// served by a node that does not own them.
+    data_scatter_risk: Vec<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct NonNormalMember {
+    node_id: u64,
+    address: String,
+    state: String,
 }
 
 #[derive(serde::Serialize)]
@@ -564,6 +583,8 @@ async fn ring_handler(State(mc): State<Arc<ModeController>>) -> (StatusCode, Jso
         }
     };
 
+    let health = ring_health(&ring);
+
     let nodes: Vec<RingNodeInfo> = ring
         .node_ids()
         .into_iter()
@@ -579,7 +600,23 @@ async fn ring_handler(State(mc): State<Arc<ModeController>>) -> (StatusCode, Jso
         })
         .collect();
 
-    let ring_info = RingInfo { nodes };
+    let ring_info = RingInfo {
+        nodes,
+        ring_healthy: health.is_healthy(),
+        non_normal_members: health
+            .non_normal_members
+            .iter()
+            .map(|(node_id, state)| NonNormalMember {
+                node_id: *node_id,
+                address: ring
+                    .get_node(*node_id)
+                    .map(|info| info.addr.clone())
+                    .unwrap_or_default(),
+                state: node_state_to_str(*state),
+            })
+            .collect(),
+        data_scatter_risk: ring_data_scatter_risk(&ring),
+    };
     match serde_json::to_value(&ring_info) {
         Ok(v) => (StatusCode::OK, Json(v)),
         Err(e) => (
@@ -1411,6 +1448,98 @@ mod tests {
             assert_eq!(node["state"], "Normal", "state should be Normal");
             assert_eq!(node["token_count"], 16, "each node has 16 tokens");
         }
+
+        // A fully-Normal ring is healthy and has nothing to repair. This is the
+        // non-vacuity half of the contract: the degradation signal must not
+        // fire on a healthy cluster.
+        assert_eq!(
+            parsed["ring_healthy"], true,
+            "an all-Normal ring must report ring_healthy=true"
+        );
+        assert_eq!(
+            parsed["non_normal_members"].as_array().map(|a| a.len()),
+            Some(0),
+            "no non-Normal members expected"
+        );
+        assert_eq!(
+            parsed["data_scatter_risk"].as_array().map(|a| a.len()),
+            Some(0),
+            "no token-owning excluded members expected"
+        );
+    }
+
+    /// A ring with a member stuck in `Joining` must say so out loud.
+    ///
+    /// `TokenRing::replicas()` silently skips a `Joining` token owner, so that
+    /// member's ranges are served by other nodes. The endpoint must surface
+    /// this as `ring_healthy=false` plus the offending member, or the cluster
+    /// looks healthy while misrouting — which is exactly how a stuck joiner
+    /// went unnoticed in production and quietly dropped a partition from that
+    /// node's scans.
+    #[tokio::test]
+    async fn api_ring_reports_a_stuck_joining_member_as_unhealthy() {
+        use ferrosa_cluster::raft::{NodeInfo, NodeState};
+
+        let state = make_state();
+
+        let mut ring = TokenRing::new();
+        for i in 1u64..=3 {
+            let host_id = uuid::Uuid::new_v4();
+            let node_state = if i == 2 {
+                NodeState::Joining
+            } else {
+                NodeState::Normal
+            };
+            ring.add_node(
+                i,
+                NodeInfo {
+                    host_id,
+                    addr: format!("10.0.0.{}:7000", i),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: node_state,
+                    cql_broadcast: None,
+                },
+            );
+            let tokens: Vec<i64> = (0..16).map(|j| (i as i64) * 1_000_000 + j).collect();
+            ring.assign_tokens(i, &tokens);
+        }
+        state.mode_controller.set_token_ring(Arc::new(ring));
+
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/cluster/ring")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            parsed["ring_healthy"], false,
+            "a ring with a Joining member must report ring_healthy=false"
+        );
+        let non_normal = parsed["non_normal_members"]
+            .as_array()
+            .expect("non_normal_members array");
+        assert_eq!(non_normal.len(), 1, "exactly the Joining member");
+        assert_eq!(non_normal[0]["node_id"], 2, "node2 is the stuck joiner");
+        assert_eq!(non_normal[0]["state"], "Joining", "and its state is named");
+
+        let risk = parsed["data_scatter_risk"]
+            .as_array()
+            .expect("data_scatter_risk array");
+        assert_eq!(
+            risk.len(),
+            1,
+            "node2 owns tokens yet is excluded from replicas() — the misroute \
+             must be named, got {risk:?}"
+        );
+        assert_eq!(risk[0], 2, "node2 is the member at scatter risk");
     }
 
     /// Sprint 2 W2.3: GET /admin/membership-snapshot returns the four maps
