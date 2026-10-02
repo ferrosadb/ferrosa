@@ -2807,7 +2807,47 @@ impl ModeController {
                                     op,
                                     schema_version: Uuid::new_v4(),
                                 };
-                                if let Err(e) = raft_arc.client_write(cmd).await {
+                                // A recovery pass can run on ANY node, and
+                                // `client_write` on a non-leader returns a
+                                // ForwardToLeader hint rather than applying.
+                                // Logging that as a failure left the node stuck
+                                // (observed live: "has to forward request to:
+                                // Some(...)"). Route it through the canonical
+                                // classify-then-forward chain, the same one the
+                                // membership refresh uses.
+                                let outcome = match raft_arc.client_write(cmd.clone()).await {
+                                    Ok(_) => Ok(()),
+                                    Err(raft_err) => Err(
+                                        crate::raft_forward::classify_client_write_error(
+                                            &raft_err,
+                                        ),
+                                    ),
+                                };
+                                let dispatch_pm = peer_manager_for_bootstrap.clone();
+                                let dispatch_ring = ring_for_bootstrap.clone();
+                                let dispatch_result =
+                                    crate::raft_forward::dispatch_propose_outcome(
+                                        outcome,
+                                        cmd,
+                                        move |leader_node_id| {
+                                            (**dispatch_ring.load()).as_ref().and_then(|ring| {
+                                                ring.get_node(leader_node_id).map(|n| n.host_id)
+                                            })
+                                        },
+                                        move |leader_uuid, cmd| {
+                                            let pm = dispatch_pm.clone();
+                                            async move {
+                                                crate::raft_forward::forward_raft_command_to_leader(
+                                                    pm.as_ref(),
+                                                    leader_uuid,
+                                                    cmd,
+                                                )
+                                                .await
+                                            }
+                                        },
+                                    )
+                                    .await;
+                                if let Err(e) = dispatch_result {
                                     tracing::warn!(%e, "recovery promote failed");
                                 }
                             }

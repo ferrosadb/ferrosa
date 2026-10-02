@@ -283,7 +283,7 @@ pub(crate) fn owned_token_ranges(
 
 /// Ring membership health, derived from node states alone.
 ///
-/// A member that is not [`NodeState::Normal`] is either on its way in
+/// A member that is not [`crate::raft::NodeState::Normal`] is either on its way in
 /// (`Joining`), on its way out (`Leaving` / `Decommissioned`), or a
 /// token-owning learner. `TokenRing::replicas()` excludes such members, so
 /// their tokens silently land on other nodes. That is a *degraded* ring, but
