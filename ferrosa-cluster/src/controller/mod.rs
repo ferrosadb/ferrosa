@@ -38,6 +38,7 @@ pub use cluster_rejoin::{
     CLUSTER_REJOIN_FAILURES_TOTAL,
 };
 
+pub use peer_events::{schema_snapshot_pushes_total, SCHEMA_SNAPSHOT_PUSHES_TOTAL};
 pub use token::deterministic_tokens_for_node;
 #[cfg(test)]
 pub(crate) use token::generate_deterministic_token;

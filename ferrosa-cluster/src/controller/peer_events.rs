@@ -10,6 +10,21 @@
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
+/// Count of schema snapshots pushed to a (re)joining peer.
+///
+/// The observable signal that the schema catch-up path actually ran. A rejoining
+/// node can converge without it only if its missed DDL is still in the retained
+/// Raft log, so a test that needs to prove the push happened cannot infer it from
+/// convergence alone -- it must read this. Same shape as
+/// `raft::snapshot_pusher::INSTALLSNAPSHOT_PUSHES_TOTAL`.
+pub static SCHEMA_SNAPSHOT_PUSHES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Total schema snapshots pushed to (re)joining peers.
+pub fn schema_snapshot_pushes_total() -> u64 {
+    SCHEMA_SNAPSHOT_PUSHES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 use ferrosa_net::peer::PeerEventListener;
 use ferrosa_net::rpc::handler::PeerId;
 use ferrosa_net::rpc::InboundPeerCallback;
@@ -299,6 +314,11 @@ impl ModeController {
                 "pushing the cluster schema to a (re)joining peer"
             );
             super::token::send_schema_sync_to_peer(&peer_manager, peer_id, &schema).await;
+            // Operator visibility, and the signal an integration test asserts on:
+            // this counter is the only way to distinguish "the push ran" from
+            // "the peer happened to converge some other way". Mirrors
+            // `INSTALLSNAPSHOT_PUSHES_TOTAL` in raft/snapshot_pusher.rs.
+            SCHEMA_SNAPSHOT_PUSHES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
 
