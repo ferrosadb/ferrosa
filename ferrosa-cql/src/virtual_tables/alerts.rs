@@ -163,21 +163,17 @@ impl VirtualTable for AlertsTable {
         &[0]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        self.registry
-            .snapshot()
-            .into_iter()
-            .map(|a| {
-                let cells = vec![
-                    CellValue::live(a.name.into_bytes(), 0),
-                    CellValue::live(a.severity.as_str().as_bytes().to_vec(), 0),
-                    CellValue::live(a.message.into_bytes(), 0),
-                    CellValue::live(a.triggered_at_ms.to_be_bytes().to_vec(), 0),
-                    CellValue::live(a.last_evaluated_ms.to_be_bytes().to_vec(), 0),
-                ];
-                VirtualRow { cells }
-            })
-            .collect()
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        for a in self.registry.snapshot() {
+            let cells = vec![
+                CellValue::live(a.name.into_bytes(), 0),
+                CellValue::live(a.severity.as_str().as_bytes().to_vec(), 0),
+                CellValue::live(a.message.into_bytes(), 0),
+                CellValue::live(a.triggered_at_ms.to_be_bytes().to_vec(), 0),
+                CellValue::live(a.last_evaluated_ms.to_be_bytes().to_vec(), 0),
+            ];
+            visit(VirtualRow { cells });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

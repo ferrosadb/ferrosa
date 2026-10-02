@@ -145,9 +145,8 @@ impl VirtualTable for SystemSchemaAggregatesTable {
         &[0, 1]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         let snap = self.snapshot.load_full();
-        let mut rows = Vec::new();
 
         for ((_ks, _name, _atypes), agg) in &snap.aggregates {
             let arg_types: Vec<String> = agg.arg_types.iter().map(cql_type_to_string).collect();
@@ -161,7 +160,7 @@ impl VirtualTable for SystemSchemaAggregatesTable {
                 .unwrap_or_default();
             let return_type_str = cql_type_to_string(&agg.return_type);
 
-            rows.push(VirtualRow {
+            visit(VirtualRow {
                 cells: vec![
                     CellValue::live(agg.keyspace.as_bytes().to_vec(), 0),
                     CellValue::live(agg.name.as_bytes().to_vec(), 0),
@@ -174,8 +173,6 @@ impl VirtualTable for SystemSchemaAggregatesTable {
                 ],
             });
         }
-
-        rows
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

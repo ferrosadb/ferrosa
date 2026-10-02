@@ -179,26 +179,23 @@ impl VirtualTable for FullScanReasonsTable {
         &[0, 1, 2]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         let reasons = self
             .tracker
             .reasons
             .read()
             .expect("FullScanTracker lock poisoned");
-        reasons
-            .iter()
-            .map(|e| {
-                let cells = vec![
-                    CellValue::live(e.keyspace.as_bytes().to_vec(), 0),
-                    CellValue::live(e.table_name.as_bytes().to_vec(), 0),
-                    CellValue::live(e.predicate_column.as_bytes().to_vec(), 0),
-                    CellValue::live(e.operator.as_bytes().to_vec(), 0),
-                    CellValue::live((e.count as i64).to_be_bytes().to_vec(), 0),
-                    CellValue::live(e.last_seen_ms.to_be_bytes().to_vec(), 0),
-                ];
-                VirtualRow { cells }
-            })
-            .collect()
+        for e in reasons.iter() {
+            let cells = vec![
+                CellValue::live(e.keyspace.as_bytes().to_vec(), 0),
+                CellValue::live(e.table_name.as_bytes().to_vec(), 0),
+                CellValue::live(e.predicate_column.as_bytes().to_vec(), 0),
+                CellValue::live(e.operator.as_bytes().to_vec(), 0),
+                CellValue::live((e.count as i64).to_be_bytes().to_vec(), 0),
+                CellValue::live(e.last_seen_ms.to_be_bytes().to_vec(), 0),
+            ];
+            visit(VirtualRow { cells });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

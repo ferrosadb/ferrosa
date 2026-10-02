@@ -69,19 +69,17 @@ impl VirtualTable for RrdRuntimeSettingsTable {
         &[0]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        vec![
-            row(
-                "ring_memory_budget_bytes",
-                self.settings.ring_memory_budget_bytes().unwrap_or(0) as i64,
-                "runtime",
-            ),
-            row(
-                "ring_thrash_warn_evictions",
-                self.settings.ring_thrash_warn_evictions() as i64,
-                "runtime",
-            ),
-        ]
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        visit(row(
+            "ring_memory_budget_bytes",
+            self.settings.ring_memory_budget_bytes().unwrap_or(0) as i64,
+            "runtime",
+        ));
+        visit(row(
+            "ring_thrash_warn_evictions",
+            self.settings.ring_thrash_warn_evictions() as i64,
+            "runtime",
+        ));
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

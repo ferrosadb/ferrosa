@@ -289,11 +289,11 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
     for table in &tables {
         let table_name = table.name();
         let columns = table.columns();
-        let rows = table.read(None);
 
-        // For each row, extract numeric columns as metrics
-        // Use text columns as labels
-        for row in &rows {
+        // Stream rows one at a time: a live observability table's result set can
+        // scale with connections/tables/queries, and a scrape must not
+        // materialize each table's whole result set before emitting its gauges.
+        table.visit_rows(None, &mut |row| {
             let mut labels = Vec::new();
 
             // Collect text columns as labels
@@ -351,7 +351,7 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
                     }
                 }
             }
-        }
+        });
     }
 
     output
@@ -762,8 +762,10 @@ mod tests {
         fn primary_key_columns(&self) -> &[usize] {
             &[0]
         }
-        fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
-            self.rows.clone()
+        fn visit_rows(&self, _: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+            for row in &self.rows {
+                visit(row.clone());
+            }
         }
         fn subscription_mode(&self) -> SubscriptionMode {
             SubscriptionMode::Pollable
@@ -1085,9 +1087,7 @@ mod tests {
             fn primary_key_columns(&self) -> &[usize] {
                 &[]
             }
-            fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
-                vec![]
-            }
+            fn visit_rows(&self, _: Option<&RowPredicate>, _visit: &mut dyn FnMut(VirtualRow)) {}
             fn subscription_mode(&self) -> SubscriptionMode {
                 SubscriptionMode::Pollable
             }
