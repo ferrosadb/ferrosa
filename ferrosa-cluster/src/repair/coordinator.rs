@@ -281,6 +281,114 @@ pub(crate) fn owned_token_ranges(
     ranges
 }
 
+/// Ring membership health, derived from node states alone.
+///
+/// A member that is not [`crate::raft::NodeState::Normal`] is either on its way in
+/// (`Joining`), on its way out (`Leaving` / `Decommissioned`), or a
+/// token-owning learner. `TokenRing::replicas()` excludes such members, so
+/// their tokens silently land on other nodes. That is a *degraded* ring, but
+/// nothing in the system said so — the failure was found by hand.
+///
+/// This type makes it sayable. See `joining_node_health.rs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RingHealth {
+    /// `(node_id, state)` for every member that is not `Normal`, ordered by
+    /// node_id. A non-empty list means the cluster is NOT healthy.
+    pub non_normal_members: Vec<(u64, crate::raft::NodeState)>,
+    /// Total members known to the ring (Normal and non-Normal alike).
+    pub total_members: usize,
+}
+
+impl RingHealth {
+    /// True when any member is not `Normal` — i.e. the ring is degraded and
+    /// some tokens may be served by a node that does not own them.
+    pub fn has_non_normal_members(&self) -> bool {
+        !self.non_normal_members.is_empty()
+    }
+
+    /// True only for a fully-`Normal` ring. This is the signal that MUST NOT
+    /// be silent: a cluster reporting unhealthy here is misrouting replicas.
+    pub fn is_healthy(&self) -> bool {
+        self.non_normal_members.is_empty()
+    }
+}
+
+/// Snapshot ring health from the token ring's node states.
+///
+/// INVARIANT: `health.has_non_normal_members()` is true **iff** some member
+/// is not `Normal`. A silent degraded ring is the defect this exists to
+/// surface (`ring_health(all_normal).is_healthy() == true` is equally
+/// required — a signal that always fires is noise).
+pub fn ring_health(ring: &TokenRing) -> RingHealth {
+    let mut non_normal_members: Vec<(u64, crate::raft::NodeState)> = ring
+        .node_ids()
+        .into_iter()
+        .filter_map(|id| {
+            ring.get_node(id)
+                .map(|info| (id, info.state))
+                .filter(|(_, st)| !matches!(st, crate::raft::NodeState::Normal))
+        })
+        .collect();
+    non_normal_members.sort_unstable_by_key(|(id, _)| *id);
+    RingHealth {
+        non_normal_members,
+        total_members: ring.node_ids().len(),
+    }
+}
+
+/// Node ids that own ring tokens but are excluded from `replicas()` purely
+/// because of their state.
+///
+/// These nodes are the concrete misroute: their token ranges are handed to
+/// other nodes, so a coordinator writing "for" them actually writes
+/// elsewhere, and repair from their perspective sees no ranges at all.
+///
+/// INVARIANT: for every id in the result, `ring.tokens_for_node(id)` is
+/// non-empty AND `replicas()` skips it for at least one of its own tokens.
+pub fn ring_data_scatter_risk(ring: &TokenRing) -> Vec<u64> {
+    let mut at_risk: Vec<u64> = ring_health(ring)
+        .non_normal_members
+        .into_iter()
+        .filter_map(|(id, _)| {
+            let mut owned = ring.tokens_for_node(id);
+            if owned.is_empty() {
+                return None;
+            }
+            owned.sort_unstable();
+            // The node is at risk when a token it owns resolves to a replica
+            // set that does not include it.
+            let misrouted = owned
+                .iter()
+                .any(|&token| !ring.replicas(token, 1).contains(&id));
+            misrouted.then_some(id)
+        })
+        .collect();
+    at_risk.sort_unstable();
+    at_risk
+}
+
+/// Plan the Promote phase: one `SetNodeState { Normal }` per member still in
+/// `Joining`, in node_id order.
+///
+/// `Joining` is the only state the Promote phase moves forward. `Leaving` and
+/// `Decommissioned` are deliberate operator intent and MUST NOT be promoted
+/// back, and learners are a distinct state machine (ADR-014), not joiners.
+///
+/// INVARIANT: `plan` contains exactly one op per `Joining` member, and is
+/// empty when no member is `Joining` (no needless Raft churn).
+pub fn promote_joining_members(
+    members: &std::collections::BTreeMap<u64, crate::raft::NodeState>,
+) -> Vec<crate::raft::RaftOp> {
+    members
+        .iter()
+        .filter(|(_, st)| matches!(st, crate::raft::NodeState::Joining))
+        .map(|(&node_id, _)| crate::raft::RaftOp::SetNodeState {
+            node_id,
+            state: crate::raft::NodeState::Normal,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
