@@ -1175,8 +1175,10 @@ mod tests {
         fn primary_key_columns(&self) -> &[usize] {
             &[0]
         }
-        fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
-            self.rows.clone()
+        fn visit_rows(&self, _: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+            for row in &self.rows {
+                visit(row.clone());
+            }
         }
         fn subscription_mode(&self) -> SubscriptionMode {
             SubscriptionMode::Pollable
@@ -1341,9 +1343,7 @@ mod tests {
         fn primary_key_columns(&self) -> &[usize] {
             &[]
         }
-        fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
-            vec![]
-        }
+        fn visit_rows(&self, _: Option<&RowPredicate>, _visit: &mut dyn FnMut(VirtualRow)) {}
         fn subscription_mode(&self) -> SubscriptionMode {
             SubscriptionMode::Pollable
         }

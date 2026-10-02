@@ -112,11 +112,19 @@ pub async fn execute(
         .min(binding_sets.len());
 
     let mut results = SparqlJsonResults::new(plan.projection.clone());
-    for row in &binding_sets[start..end] {
+    // Drain the LIMIT window and MOVE each selected binding out of its solution
+    // row into the projection, instead of cloning every binding (`b.clone()`).
+    // The drained window is the result set we are about to return, so this
+    // produces byte-identical `SparqlJsonResults` while removing one `Binding`
+    // (and its boxed term string) allocation per projected column per row. The
+    // solutions outside `[start, end)` are dropped here exactly as the borrow
+    // form left them to be dropped by the caller.
+    for row in binding_sets.drain(start..end) {
+        let mut row = row;
         let projected: HashMap<String, Binding> = plan
             .projection
             .iter()
-            .filter_map(|var| row.get(var).map(|b| (var.clone(), b.clone())))
+            .filter_map(|var| row.remove(var).map(|b| (var.clone(), b)))
             .collect();
         results.add_row(projected);
     }

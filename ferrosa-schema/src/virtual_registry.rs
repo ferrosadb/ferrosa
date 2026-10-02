@@ -92,9 +92,7 @@ mod tests {
             &[]
         }
 
-        fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
-            vec![]
-        }
+        fn visit_rows(&self, _: Option<&RowPredicate>, _visit: &mut dyn FnMut(VirtualRow)) {}
 
         fn subscription_mode(&self) -> SubscriptionMode {
             SubscriptionMode::Pollable

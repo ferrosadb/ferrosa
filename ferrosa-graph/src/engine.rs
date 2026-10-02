@@ -1067,7 +1067,7 @@ impl GraphEngine {
                 // outer row. A returning inner yields one combined binding per inner
                 // row. Projection is deferred to the finalizer.
                 let inner_rows = if inner_returns {
-                    rows_as_bindings(&inner_result)
+                    rows_as_bindings(inner_result)
                 } else {
                     vec![HashMap::new()]
                 };
@@ -1893,18 +1893,15 @@ fn eval_trailing_aggregate(
 
 /// Turn a `GraphResult`'s rows into per-row binding maps keyed by column name, so
 /// trailing-RETURN expressions can read inner-subquery outputs by name.
-fn rows_as_bindings(result: &GraphResult) -> Vec<HashMap<String, Value>> {
-    result
-        .rows
-        .iter()
-        .map(|row| {
-            result
-                .columns
-                .iter()
-                .cloned()
-                .zip(row.iter().cloned())
-                .collect()
-        })
+///
+/// Consumes the result: each inner row is MOVED into its binding map rather than
+/// `row.iter().cloned()` cloning every cell value (the old form copied each cell
+/// of every inner row). Column names are still cloned (a handful of `String`s,
+/// schema arity — not result-sized). The produced maps are identical.
+fn rows_as_bindings(result: GraphResult) -> Vec<HashMap<String, Value>> {
+    let GraphResult { columns, rows, .. } = result;
+    rows.into_iter()
+        .map(|row| columns.iter().cloned().zip(row).collect())
         .collect()
 }
 

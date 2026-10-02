@@ -74,9 +74,8 @@ impl VirtualTable for ConsolidationStatusTable {
         SubscriptionMode::Pollable
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         let snap = self.schema.snapshot();
-        let mut rows = Vec::new();
 
         for ((ks, tbl), meta) in &snap.tables {
             // Check if table has consolidation extensions.
@@ -104,7 +103,7 @@ impl VirtualTable for ConsolidationStatusTable {
                 .cloned()
                 .unwrap_or_default();
 
-            rows.push(VirtualRow {
+            visit(VirtualRow {
                 cells: vec![
                     CellValue::live(ks.as_bytes().to_vec(), 0),
                     CellValue::live(tbl.as_bytes().to_vec(), 0),
@@ -115,7 +114,5 @@ impl VirtualTable for ConsolidationStatusTable {
                 ],
             });
         }
-
-        rows
     }
 }

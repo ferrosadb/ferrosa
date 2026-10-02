@@ -372,28 +372,22 @@ impl FullTextIndexReader {
         }
     }
 
-    /// Maximum number of terms a prefix wildcard can expand to.
-    const MAX_WILDCARD_EXPANSION: usize = 10_000;
-
-    /// Evaluate a prefix wildcard query, expanding to matching terms with a cap.
+    /// Evaluate a prefix wildcard query, expanding to every matching term.
+    ///
+    /// The expansion STREAMS: each matching term is scored directly into
+    /// `scores` as it is found, so the full matching-term list is never
+    /// materialized and no term is silently dropped (t_83f5226d). The old shape
+    /// collected every matching term and, past a fixed 10_000 cap, kept only
+    /// the highest-doc-frequency terms — a silent, wrong partial result. Result
+    /// volume is bounded upstream by the caller's own LIMIT/top-k; this function
+    /// adds no result bound of its own.
     fn eval_prefix<'a>(&'a self, prefix: &str, scores: &mut HashMap<&'a [u8], f64>) {
-        // Collect matching terms and their doc frequencies.
-        let mut matching: Vec<(&str, u32)> = self
+        for (term, _) in self
             .index
             .terms
             .iter()
             .filter(|(term, _)| term.starts_with(prefix))
-            .map(|(term, entry)| (term.as_str(), entry.doc_freq))
-            .collect();
-
-        // If exceeds cap, keep terms with highest doc frequency.
-        if matching.len() > Self::MAX_WILDCARD_EXPANSION {
-            matching.sort_by_key(|item| std::cmp::Reverse(item.1));
-            matching.truncate(Self::MAX_WILDCARD_EXPANSION);
-        }
-
-        // Score all postings from matching terms.
-        for (term, _) in matching {
+        {
             self.score_term(term, scores);
         }
     }

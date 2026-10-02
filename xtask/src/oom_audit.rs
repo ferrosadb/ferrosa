@@ -4147,10 +4147,17 @@ mod tests {
     #[test]
     fn invariant_every_shipped_allow_expiry_is_a_real_iso_date() {
         let allow = shipped_allow();
+        // Deliberately NOT an absolute entry count. The allowlist is meant to
+        // SHRINK as the underlying findings get fixed, so asserting a floor
+        // (this test previously required > 100) would make legitimate cleanup
+        // fail the build — punishing the exact work the file asks for. The
+        // property that actually matters is that the file parsed into entries
+        // at all, so a typo cannot make this loop vacuously pass.
         assert!(
-            allow.entries.len() > 100,
-            "sanity: the shipped allowlist should not have shrunk to {} entries",
-            allow.entries.len()
+            !allow.entries.is_empty(),
+            "sanity: the shipped allowlist parsed to 0 entries — either the file \
+             is missing or its format changed, and the expiry checks below would \
+             pass vacuously"
         );
         for e in &allow.entries {
             assert!(
@@ -4229,9 +4236,21 @@ mod tests {
                 checked += 1;
             }
         }
+        // The invariant is FULL cross-product coverage, not an absolute count:
+        // every shipped entry compared against every probe. A magic floor (this
+        // test previously required > 1000) silently encodes the allowlist's size
+        // and breaks whenever entries are legitimately removed.
         assert!(
-            checked > 1000,
-            "sanity: expected a real cross-product of entries x probes, got {checked}"
+            !allow.entries.is_empty() && probes.len() > 1,
+            "sanity: need both entries and probes to exercise a cross-product              (entries={}, probes={})",
+            allow.entries.len(),
+            probes.len()
+        );
+        assert_eq!(
+            checked,
+            probes.len() * allow.entries.len(),
+            "sanity: expected a full entries x probes cross-product; the loop did \
+             not compare every pair"
         );
     }
 

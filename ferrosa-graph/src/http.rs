@@ -695,7 +695,11 @@ fn make_subscribe_stream(
         }
 
         let mut previous_rows = if delta {
-            Some(initial_result.rows.clone())
+            // MOVED, not cloned: `initial_result` is not used again after this
+            // point (the snapshot already serialized above), so the baseline
+            // row set transfers ownership into `previous_rows` for free instead
+            // of deep-copying every row on every SUBSCRIBE { delta: true }.
+            Some(initial_result.rows)
         } else {
             None
         };

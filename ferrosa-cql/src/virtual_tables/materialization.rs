@@ -178,12 +178,6 @@ impl VirtualTable for MaterializationQueuesTable {
         &[0, 1, 2, 3, 5]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        let mut rows = Vec::new();
-        self.visit_rows(None, &mut |row| rows.push(row));
-        rows
-    }
-
     fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         self.provider.visit_queue_snapshots(&mut |snapshot| {
             visit(queue_virtual_row(snapshot));
@@ -224,12 +218,6 @@ impl VirtualTable for MaterializationStatusTable {
 
     fn primary_key_columns(&self) -> &[usize] {
         &[0, 1, 2]
-    }
-
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        let mut rows = Vec::new();
-        self.visit_rows(None, &mut |row| rows.push(row));
-        rows
     }
 
     fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {

@@ -214,61 +214,58 @@ impl VirtualTable for ConnectionsTable {
         SubscriptionMode::Pollable
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         let now = Instant::now();
         let snapshot = self.tracker.connections.load();
 
-        snapshot
-            .values()
-            .map(|info| {
-                let idle_secs = now
-                    .duration_since(info.connected_at)
-                    .as_secs()
-                    .min(i32::MAX as u64) as i32;
+        for info in snapshot.values() {
+            let idle_secs = now
+                .duration_since(info.connected_at)
+                .as_secs()
+                .min(i32::MAX as u64) as i32;
 
-                // Column 0: peer_address (Text)
-                let peer_address = CellValue::live(info.peer_address.as_bytes().to_vec(), 0);
+            // Column 0: peer_address (Text)
+            let peer_address = CellValue::live(info.peer_address.as_bytes().to_vec(), 0);
 
-                // Column 1: peer_port (Int — 4 bytes big-endian)
-                let peer_port = CellValue::live((info.peer_port as i32).to_be_bytes().to_vec(), 0);
+            // Column 1: peer_port (Int — 4 bytes big-endian)
+            let peer_port = CellValue::live((info.peer_port as i32).to_be_bytes().to_vec(), 0);
 
-                // Column 2: state (Text)
-                let state = CellValue::live(info.state.as_bytes().to_vec(), 0);
+            // Column 2: state (Text)
+            let state = CellValue::live(info.state.as_bytes().to_vec(), 0);
 
-                // Column 3: username (Text, NULL tombstone when absent)
-                let username = match &info.username {
-                    Some(u) => CellValue::live(u.as_bytes().to_vec(), 0),
-                    None => CellValue::tombstone(0, 0),
-                };
+            // Column 3: username (Text, NULL tombstone when absent)
+            let username = match &info.username {
+                Some(u) => CellValue::live(u.as_bytes().to_vec(), 0),
+                None => CellValue::tombstone(0, 0),
+            };
 
-                // Column 4: idle_seconds (Int)
-                let idle_seconds = CellValue::live(idle_secs.to_be_bytes().to_vec(), 0);
+            // Column 4: idle_seconds (Int)
+            let idle_seconds = CellValue::live(idle_secs.to_be_bytes().to_vec(), 0);
 
-                // Column 5: requests_served (BigInt — 8 bytes big-endian)
-                let requests_served = CellValue::live(
-                    (info.requests_served.load(Ordering::Relaxed) as i64)
-                        .to_be_bytes()
-                        .to_vec(),
-                    0,
-                );
+            // Column 5: requests_served (BigInt — 8 bytes big-endian)
+            let requests_served = CellValue::live(
+                (info.requests_served.load(Ordering::Relaxed) as i64)
+                    .to_be_bytes()
+                    .to_vec(),
+                0,
+            );
 
-                // Column 6: protocol_version (Int)
-                let protocol_version =
-                    CellValue::live((info.protocol_version as i32).to_be_bytes().to_vec(), 0);
+            // Column 6: protocol_version (Int)
+            let protocol_version =
+                CellValue::live((info.protocol_version as i32).to_be_bytes().to_vec(), 0);
 
-                VirtualRow {
-                    cells: vec![
-                        peer_address,
-                        peer_port,
-                        state,
-                        username,
-                        idle_seconds,
-                        requests_served,
-                        protocol_version,
-                    ],
-                }
-            })
-            .collect()
+            visit(VirtualRow {
+                cells: vec![
+                    peer_address,
+                    peer_port,
+                    state,
+                    username,
+                    idle_seconds,
+                    requests_served,
+                    protocol_version,
+                ],
+            });
+        }
     }
 }
 

@@ -97,16 +97,14 @@ pub fn pg_namespace(schema: &Schema) -> InMemoryTable {
         Column::new("nspname", ColumnType::Text),
     ]);
 
-    let mut rows: Vec<Row> = RESERVED_NAMESPACES
-        .iter()
-        .map(|ns| {
-            Row::new(vec![
-                oid_val(namespace_oid(ns)),
-                Value::Text((*ns).to_string()),
-            ])
-        })
-        .collect();
-
+    let mut rows: Vec<Row> =
+        Vec::with_capacity(RESERVED_NAMESPACES.len() + snapshot.keyspaces.len());
+    for ns in RESERVED_NAMESPACES {
+        rows.push(Row::new(vec![
+            oid_val(namespace_oid(ns)),
+            Value::Text(ns.to_string()),
+        ]));
+    }
     for ks in sorted_keyspaces(&snapshot) {
         rows.push(Row::new(vec![oid_val(namespace_oid(&ks)), Value::Text(ks)]));
     }
@@ -127,17 +125,16 @@ pub fn pg_class(schema: &Schema) -> InMemoryTable {
         Column::new("relkind", ColumnType::Text),
     ]);
 
-    let rows: Vec<Row> = sorted_tables(&snapshot)
-        .into_iter()
-        .map(|(ks, table)| {
-            Row::new(vec![
-                oid_val(relation_oid(&ks, &table)),
-                Value::Text(table),
-                oid_val(namespace_oid(&ks)),
-                Value::Text("r".to_string()),
-            ])
-        })
-        .collect();
+    let tables = sorted_tables(&snapshot);
+    let mut rows: Vec<Row> = Vec::with_capacity(tables.len());
+    for (ks, table) in tables {
+        rows.push(Row::new(vec![
+            oid_val(relation_oid(&ks, &table)),
+            Value::Text(table),
+            oid_val(namespace_oid(&ks)),
+            Value::Text("r".to_string()),
+        ]));
+    }
 
     InMemoryTable::new(rel_schema, rows)
 }
@@ -215,10 +212,16 @@ pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
     used.sort_unstable_by_key(|p| p.oid);
     used.dedup_by_key(|p| p.oid);
 
-    let rows: Vec<Row> = used
-        .into_iter()
-        .map(|p| Row::new(vec![oid_val(p.oid), Value::Text(p.typname.to_string())]))
-        .collect();
+    // Build the rows directly into the reused `used` buffer's capacity — no
+    // second `Vec` from a `map(..).collect()`, and only one row's worth of
+    // temporary at a time.
+    let mut rows: Vec<Row> = Vec::with_capacity(used.len());
+    for p in used {
+        rows.push(Row::new(vec![
+            oid_val(p.oid),
+            Value::Text(p.typname.to_string()),
+        ]));
+    }
 
     Ok(InMemoryTable::new(rel_schema, rows))
 }

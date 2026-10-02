@@ -168,6 +168,14 @@ early acknowledgement.
   than the legacy degrading path). `WritePath::fulltext_search_stream` is the
   mode-dispatching entry; `FERROSA_BULK_STREAMING_FULLTEXT=0` falls back to
   the legacy single-message union for mixed-version upgrades.
+- `coordinator/range_read_stream.rs` — every merge source pull goes through
+  `next_fragment_bounded` (CL-19), so a silent source — including the LOCAL
+  engine stream, which has no `clean_end_guarded_stream` watchdog of its own —
+  surfaces as a loud, retryable error naming the merge and its budget instead of
+  parking the scan until the caller's own timeout fires. Both merge paths are
+  covered: the fragment merge (`FragmentCursor::ensure_peeked`) and the
+  whole-partition merge used by `LIMIT N` + partition-key reads, which bypasses
+  the cursor entirely.
 - `coordinator/{range_read_stream,stream_*}.rs` — ADR-020 streaming range reads
   and projected streaming scans; the old Vec-returning
   `WritePath::range_read_projected` wrapper has been removed, so projected

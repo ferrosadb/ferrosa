@@ -109,6 +109,40 @@ pub(crate) fn set_merge_source_fragment_timeout_for_test(timeout: Duration) {
     );
 }
 
+/// Pull one fragment from a merge source, bounded by
+/// [`merge_source_fragment_timeout`].
+///
+/// THE reason this exists: every merge in this file awaits sources in order, so
+/// a source that never yields wedges every source behind it, and the merge can
+/// only surface the problem by waiting. Remote sources are independently guarded
+/// (`clean_end_guarded_stream`'s `IdleTimeoutWatchdog`), but a LOCAL engine
+/// stream is handed to the merge unwrapped, so nothing else bounds it. Bounding
+/// the pull here is what turns "wedged forever, observed as the caller's own
+/// timeout" into a loud, retryable error that names the condition.
+///
+/// `context` identifies the merge in the error so a live failure is legible.
+pub(crate) async fn next_fragment_bounded<S>(
+    stream: &mut S,
+    context: &str,
+) -> Option<Result<Partition, ClusterError>>
+where
+    S: futures::Stream<Item = Result<Partition, ClusterError>> + Unpin,
+{
+    let budget = merge_source_fragment_timeout();
+    match tokio::time::timeout(budget, stream.next()).await {
+        // A timeout becomes an ERROR ITEM, the same shape as an upstream error,
+        // so every caller's existing error arm reports it -- no caller can
+        // accidentally treat the wedge as a clean end-of-stream.
+        Err(_elapsed) => Some(Err(ClusterError::Internal(format!(
+            "streaming range read: a {context} source produced no fragment within {}ms; \
+             failing loudly rather than waiting forever (one silent source must not stall \
+             the scan)",
+            budget.as_millis()
+        )))),
+        Ok(item) => item,
+    }
+}
+
 /// Per-request buffer for the StreamRouter receiver. Bounded so a
 /// slow consumer back-pressures the inbound dispatch (chunks queue
 /// up at the lane until the consumer drains).
@@ -638,11 +672,10 @@ async fn merge_local_and_single_remote_whole(
     table_id: TableId,
     row_limit: usize,
     projected_regular_ordinals: Option<Vec<u16>>,
-    mut remote_stream: ClusterPartitionStream,
+    remote_stream: ClusterPartitionStream,
     out_tx: mpsc::Sender<crate::error::Result<Partition>>,
 ) {
-    let mut local_stream: ClusterPartitionStream = if let Some(wanted) = projected_regular_ordinals
-    {
+    let local_stream: ClusterPartitionStream = if let Some(wanted) = projected_regular_ordinals {
         Box::pin(
             storage
                 .range_iter_projected(&table_id, wanted, None, None, None)
@@ -655,8 +688,20 @@ async fn merge_local_and_single_remote_whole(
                 .map(|item| item.map_err(ClusterError::Storage)),
         )
     };
-    let mut local_next = local_stream.next().await;
-    let mut remote_next = remote_stream.next().await;
+    merge_local_and_single_remote_whole_streams(local_stream, remote_stream, row_limit, out_tx)
+        .await;
+}
+
+/// Streams-in core of [`merge_local_and_single_remote_whole`], split out so the
+/// merge is unit-testable without a `StorageEngine`.
+async fn merge_local_and_single_remote_whole_streams(
+    mut local_stream: ClusterPartitionStream,
+    mut remote_stream: ClusterPartitionStream,
+    row_limit: usize,
+    out_tx: mpsc::Sender<crate::error::Result<Partition>>,
+) {
+    let mut local_next = next_fragment_bounded(&mut local_stream, "whole-merge").await;
+    let mut remote_next = next_fragment_bounded(&mut remote_stream, "whole-merge").await;
 
     loop {
         match (local_next.take(), remote_next.take()) {
@@ -677,7 +722,7 @@ async fn merge_local_and_single_remote_whole(
                 {
                     return;
                 }
-                local_next = local_stream.next().await;
+                local_next = next_fragment_bounded(&mut local_stream, "whole-merge").await;
             }
             (None, Some(Ok(remote))) => {
                 if out_tx
@@ -687,7 +732,7 @@ async fn merge_local_and_single_remote_whole(
                 {
                     return;
                 }
-                remote_next = remote_stream.next().await;
+                remote_next = next_fragment_bounded(&mut remote_stream, "whole-merge").await;
             }
             (Some(Ok(local)), Some(Ok(remote))) => {
                 let local_token = local.key.token.0;
@@ -700,7 +745,7 @@ async fn merge_local_and_single_remote_whole(
                     {
                         return;
                     }
-                    local_next = local_stream.next().await;
+                    local_next = next_fragment_bounded(&mut local_stream, "whole-merge").await;
                     remote_next = Some(Ok(remote));
                 } else if remote_token < local_token {
                     if out_tx
@@ -711,7 +756,7 @@ async fn merge_local_and_single_remote_whole(
                         return;
                     }
                     local_next = Some(Ok(local));
-                    remote_next = remote_stream.next().await;
+                    remote_next = next_fragment_bounded(&mut remote_stream, "whole-merge").await;
                 } else {
                     let merged = ferrosa_storage::merge::merge_partitions(vec![local, remote]);
                     if out_tx
@@ -721,8 +766,8 @@ async fn merge_local_and_single_remote_whole(
                     {
                         return;
                     }
-                    local_next = local_stream.next().await;
-                    remote_next = remote_stream.next().await;
+                    local_next = next_fragment_bounded(&mut local_stream, "whole-merge").await;
+                    remote_next = next_fragment_bounded(&mut remote_stream, "whole-merge").await;
                 }
             }
         }
@@ -780,19 +825,10 @@ where
         if self.primed || self.done {
             return Ok(());
         }
-        let budget = merge_source_fragment_timeout();
-        match tokio::time::timeout(budget, self.stream.next()).await {
-            Err(_elapsed) => {
-                return Err(ClusterError::Internal(format!(
-                    "streaming range read: a merge source produced no fragment within {}ms; \
-                     failing loudly rather than waiting forever (one silent source must not \
-                     stall the scan)",
-                    budget.as_millis()
-                )));
-            }
-            Ok(None) => self.done = true,
-            Ok(Some(Err(e))) => return Err(e),
-            Ok(Some(Ok(p))) => self.peeked = Some(p),
+        match next_fragment_bounded(&mut self.stream, "fragment-merge").await {
+            None => self.done = true,
+            Some(Err(e)) => return Err(e),
+            Some(Ok(p)) => self.peeked = Some(p),
         }
         self.primed = true;
         Ok(())
@@ -2533,6 +2569,103 @@ mod tests {
         assert!(
             err.to_string().contains("produced no fragment"),
             "expected the loud silence error, got: {err}"
+        );
+    }
+
+    /// THE SAME STALL ON THE OTHER MERGE PATH.
+    ///
+    /// `merge_local_and_single_remote_whole_streams` is the whole-partition
+    /// merge used by `LIMIT N` + partition-key-equality reads. It does NOT go
+    /// through `FragmentCursor`, so the per-fragment bound added to
+    /// `ensure_peeked` does not cover it -- it awaits `local_stream.next()`
+    /// directly, and its local stream is built straight from
+    /// `storage.range_iter(...)` with no idle watchdog.
+    ///
+    /// So the same wedge is reachable here: a silent local read parks the merge
+    /// before the remote source is ever polled, and nothing can interrupt it.
+    /// Fixed by the same bounded-pull helper the fragment path uses.
+    #[tokio::test]
+    async fn a_silent_local_source_must_not_wedge_the_whole_merge() {
+        set_merge_source_fragment_timeout_for_test(Duration::from_millis(200));
+        let local: ClusterPartitionStream = Box::pin(futures::stream::pending());
+        let remote: ClusterPartitionStream =
+            Box::pin(futures::stream::iter(vec![Ok(partition(b"r"))]));
+
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let merge = tokio::spawn(async move {
+            merge_local_and_single_remote_whole_streams(local, remote, 0, out_tx).await;
+        });
+
+        let mut delivered = Vec::new();
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(item) = out_rx.recv().await {
+                delivered.push(item);
+            }
+        })
+        .await;
+
+        merge.abort();
+
+        assert!(
+            drained.is_ok(),
+            "the whole merge wedged on a silent LOCAL source: it delivered {} item(s) and never \
+             terminated within 5s. This path bypasses `FragmentCursor`, so it needs the same \
+             bounded pull the fragment merge uses.",
+            delivered.len()
+        );
+        let err = delivered
+            .iter()
+            .find_map(|i| i.as_ref().err())
+            .expect("the silent local source must be reported as a loud error");
+        assert!(
+            err.to_string().contains("produced no fragment"),
+            "the error must name the condition, got: {err}"
+        );
+    }
+
+    /// INVARIANT: the whole merge still streams a normal, live pair correctly.
+    ///
+    /// The bound must not disturb ordinary merging: one local + one remote, both
+    /// live, must both come through (including a same-token merge).
+    #[tokio::test]
+    async fn the_whole_merge_still_merges_a_live_pair() {
+        set_merge_source_fragment_timeout_for_test(Duration::from_secs(2));
+        let local: ClusterPartitionStream = Box::pin(futures::stream::iter(vec![
+            Ok(partition(b"a")),
+            Ok(partition(b"c")),
+        ]));
+        let remote: ClusterPartitionStream =
+            Box::pin(futures::stream::iter(vec![Ok(partition(b"b"))]));
+
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let merge = tokio::spawn(async move {
+            merge_local_and_single_remote_whole_streams(local, remote, 0, out_tx).await;
+        });
+
+        let mut keys = Vec::new();
+        let mut tokens = Vec::new();
+        while let Some(item) = out_rx.recv().await {
+            let p = item.expect("a live pair must not error");
+            tokens.push(p.key.token.0);
+            keys.push(p.key.key.as_bytes().to_vec());
+        }
+        merge.await.unwrap();
+
+        // The merged order is by TOKEN, not by key bytes: a decorated key's
+        // position on the ring is its token. So the assertion is that the
+        // output is token-sorted and complete -- not some assumed byte order.
+        let mut sorted = tokens.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            tokens, sorted,
+            "a live local+remote pair must merge in ascending token order"
+        );
+        let mut got = keys.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "every key from both sources must be delivered exactly once"
         );
     }
 
