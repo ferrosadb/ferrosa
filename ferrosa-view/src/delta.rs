@@ -81,7 +81,7 @@ pub fn compute_view_delta(
         (None, Some(n)) => vec![upsert(view, n, timestamp)],
         (Some(p), None) => vec![delete(view, p, timestamp)],
         (Some(p), Some(n)) => {
-            if view_pk_values(view, p) == view_pk_values(view, n) {
+            if view_pk_eq(view, p, n) {
                 // Same view row, column update.
                 vec![upsert(view, n, timestamp)]
             } else {
@@ -97,41 +97,74 @@ fn projects(view: &ViewMetadata, row: &RowSnapshot) -> bool {
     view.primary_key().all(|c| row.get(c).is_some())
 }
 
-/// View primary-key column values, in view-PK order. Callers must ensure the row
-/// is projected (every PK column present).
-fn view_pk_values(view: &ViewMetadata, row: &RowSnapshot) -> Vec<(String, Vec<u8>)> {
-    view.primary_key()
-        .map(|c| (c.to_string(), row.get(c).cloned().unwrap_or_default()))
-        .collect()
+/// True iff `p` and `n` project to the SAME view primary key, in view-PK order.
+///
+/// This is the "same view row?" test in [`compute_view_delta`]. It compares the
+/// borrowed value slices directly instead of materializing two
+/// `Vec<(String, Vec<u8>)>` just to compare them (which allocated two vectors
+/// plus a clone per PK column per transition). Absent columns compare as an
+/// empty slice, matching the old `cloned().unwrap_or_default()` semantics.
+fn view_pk_eq(view: &ViewMetadata, p: &RowSnapshot, n: &RowSnapshot) -> bool {
+    view.primary_key().all(|c| {
+        p.get(c).map(Vec::as_slice).unwrap_or(&[]) == n.get(c).map(Vec::as_slice).unwrap_or(&[])
+    })
 }
 
-/// Projected non-key columns. UDF/aggregate projection is handled by the
-/// udf-eval cycle; base-column projection is handled here.
-fn projected_columns(view: &ViewMetadata, row: &RowSnapshot) -> Vec<(String, Vec<u8>)> {
-    view.selected
-        .iter()
-        .filter_map(|vc| match &vc.source {
+/// Extend `out` with the view primary-key column values, in view-PK order.
+/// Callers must ensure the row is projected (every PK column present).
+///
+/// The value bytes are copied out of the borrowed row exactly once, into the
+/// owned `ViewDelta` (whose `Vec<u8>` payload is the protocol shape). The
+/// previous form additionally CLONED each value inside a `map(..).collect()`
+/// closure (`row.get(c).cloned()`); extending borrows the value and clones it
+/// once, so no per-column intermediate clone is allocated.
+fn extend_view_pk_values(view: &ViewMetadata, row: &RowSnapshot, out: &mut Vec<(String, Vec<u8>)>) {
+    out.reserve(view.primary_key().count());
+    for c in view.primary_key() {
+        let value = row.get(c).cloned().unwrap_or_default();
+        out.push((c.to_string(), value));
+    }
+}
+
+/// Extend `out` with the projected non-key columns. UDF/aggregate projection is
+/// handled by the udf-eval cycle; base-column projection is handled here.
+///
+/// The `(name, bytes)` pair is built by MOVING `view column name` and cloning
+/// the borrowed value exactly once, instead of cloning the name and the value
+/// inside a `filter_map` closure.
+fn extend_projected_columns(
+    view: &ViewMetadata,
+    row: &RowSnapshot,
+    out: &mut Vec<(String, Vec<u8>)>,
+) {
+    for vc in &view.selected {
+        match &vc.source {
             ColumnSource::Base(base_col) => {
-                row.get(base_col).map(|val| (vc.name.clone(), val.clone()))
+                if let Some(val) = row.get(base_col) {
+                    out.push((vc.name.clone(), val.clone()));
+                }
             }
-            ColumnSource::Udf { .. } | ColumnSource::Aggregate { .. } => None,
-        })
-        .collect()
+            ColumnSource::Udf { .. } | ColumnSource::Aggregate { .. } => {}
+        }
+    }
 }
 
 fn upsert(view: &ViewMetadata, row: &RowSnapshot, timestamp: i64) -> ViewDelta {
+    let mut view_pk = Vec::new();
+    extend_view_pk_values(view, row, &mut view_pk);
+    let mut columns = Vec::new();
+    extend_projected_columns(view, row, &mut columns);
     ViewDelta::Upsert {
-        view_pk: view_pk_values(view, row),
-        columns: projected_columns(view, row),
+        view_pk,
+        columns,
         timestamp,
     }
 }
 
 fn delete(view: &ViewMetadata, row: &RowSnapshot, timestamp: i64) -> ViewDelta {
-    ViewDelta::Delete {
-        view_pk: view_pk_values(view, row),
-        timestamp,
-    }
+    let mut view_pk = Vec::new();
+    extend_view_pk_values(view, row, &mut view_pk);
+    ViewDelta::Delete { view_pk, timestamp }
 }
 
 #[cfg(test)]

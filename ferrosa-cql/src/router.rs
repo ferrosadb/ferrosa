@@ -3129,7 +3129,7 @@ async fn route_lwt_via_accord(
         let gate = Box::new(move |row: Option<&[u8]>| -> bool {
             match decode_agreed_row_to_map(&schema, &gate_ks, &gate_table, row) {
                 Ok(agreed) => {
-                    crate::accord_router::eval_lwt_for_statement(&gate_stmt, agreed.as_ref())
+                    crate::accord_router::eval_lwt_for_statement(&gate_stmt, agreed)
                         .map(|r| r.applied)
                         // Not an LWT reaching the gate (defensive): never silently apply
                         // — treat as condition-not-met so the write does not persist.
@@ -8809,7 +8809,7 @@ async fn eval_local_condition(
             .zip(row.iter().cloned())
             .collect()
     });
-    let verdict = crate::accord_router::eval_if_conditions(conditions, if_exists, as_map.as_ref());
+    let verdict = crate::accord_router::eval_if_conditions(conditions, if_exists, as_map);
     if verdict.applied {
         return Ok(None);
     }
@@ -19279,13 +19279,13 @@ mod tests {
                 &[0]
             }
 
-            fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
-                vec![VirtualRow {
+            fn visit_rows(&self, _: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+                visit(VirtualRow {
                     cells: vec![
                         CellValue::live(b"hello".to_vec(), 0),
                         CellValue::live(42i32.to_be_bytes().to_vec(), 0),
                     ],
-                }]
+                });
             }
 
             fn subscription_mode(&self) -> SubscriptionMode {
@@ -19353,10 +19353,6 @@ mod tests {
 
             fn primary_key_columns(&self) -> &[usize] {
                 &[0]
-            }
-
-            fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
-                panic!("virtual table route must not require Vec materialization")
             }
 
             fn visit_rows(&self, _: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {

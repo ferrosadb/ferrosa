@@ -147,30 +147,26 @@ impl VirtualTable for StorageStatsTable {
         &[0, 1]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        self.provider
-            .collect_stats()
-            .into_iter()
-            .map(|s| {
-                let cells = vec![
-                    CellValue::live(s.keyspace.into_bytes(), 0),
-                    CellValue::live(s.table_name.into_bytes(), 0),
-                    CellValue::live(s.memtable_size_bytes.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.memtable_count.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.sstable_count.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.sstable_size_bytes.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.s3_object_count.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.s3_bytes.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.local_sstable_component_count.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.compressed_sstable_count.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.uncompressed_sstable_count.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.local_cache_max_bytes.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.local_sstable_cache_bytes.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.pending_compactions.to_be_bytes().to_vec(), 0),
-                ];
-                VirtualRow { cells }
-            })
-            .collect()
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        for s in self.provider.collect_stats() {
+            let cells = vec![
+                CellValue::live(s.keyspace.into_bytes(), 0),
+                CellValue::live(s.table_name.into_bytes(), 0),
+                CellValue::live(s.memtable_size_bytes.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.memtable_count.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.sstable_count.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.sstable_size_bytes.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.s3_object_count.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.s3_bytes.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.local_sstable_component_count.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.compressed_sstable_count.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.uncompressed_sstable_count.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.local_cache_max_bytes.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.local_sstable_cache_bytes.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.pending_compactions.to_be_bytes().to_vec(), 0),
+            ];
+            visit(VirtualRow { cells });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {
@@ -267,7 +263,7 @@ impl VirtualTable for ArchiveStatusTable {
         &[0]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         let s = self.provider.archive_status();
         let cells = vec![
             CellValue::live(s.unarchived_segments.to_be_bytes().to_vec(), 0),
@@ -275,7 +271,7 @@ impl VirtualTable for ArchiveStatusTable {
             CellValue::live(s.last_archive_success.into_bytes(), 0),
             CellValue::live(s.archive_errors_total.to_be_bytes().to_vec(), 0),
         ];
-        vec![VirtualRow { cells }]
+        visit(VirtualRow { cells });
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {
@@ -383,26 +379,22 @@ impl VirtualTable for SnapshotsTable {
         &[0]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        self.provider
-            .snapshot_info()
-            .into_iter()
-            .map(|s| {
-                let expires_at_bytes = match s.expires_at {
-                    Some(ts) => ts.into_bytes(),
-                    None => Vec::new(),
-                };
-                let cells = vec![
-                    CellValue::live(s.name.into_bytes(), 0),
-                    CellValue::live(s.created_at.into_bytes(), 0),
-                    CellValue::live(expires_at_bytes, 0),
-                    CellValue::live(s.commit_log_segment.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.commit_log_offset.to_be_bytes().to_vec(), 0),
-                    CellValue::live(s.node_id.into_bytes(), 0),
-                ];
-                VirtualRow { cells }
-            })
-            .collect()
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        for s in self.provider.snapshot_info() {
+            let expires_at_bytes = match s.expires_at {
+                Some(ts) => ts.into_bytes(),
+                None => Vec::new(),
+            };
+            let cells = vec![
+                CellValue::live(s.name.into_bytes(), 0),
+                CellValue::live(s.created_at.into_bytes(), 0),
+                CellValue::live(expires_at_bytes, 0),
+                CellValue::live(s.commit_log_segment.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.commit_log_offset.to_be_bytes().to_vec(), 0),
+                CellValue::live(s.node_id.into_bytes(), 0),
+            ];
+            visit(VirtualRow { cells });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {
@@ -497,14 +489,12 @@ impl VirtualTable for ObjectStoreStatsTable {
         &[0, 1]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         let Some(stats) = &self.stats else {
-            return Vec::new();
+            return;
         };
-        stats
-            .object_snapshots()
-            .iter()
-            .map(|s| VirtualRow {
+        for s in stats.object_snapshots() {
+            visit(VirtualRow {
                 cells: vec![
                     text(&s.key.table),
                     text(&s.key.component),
@@ -523,8 +513,8 @@ impl VirtualTable for ObjectStoreStatsTable {
                     big(s.part_retries),
                     dbl(s.read_amplification()),
                 ],
-            })
-            .collect()
+            });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {
@@ -577,14 +567,12 @@ impl VirtualTable for ObjectStoreOpsTable {
         &[0]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         let Some(stats) = &self.stats else {
-            return Vec::new();
+            return;
         };
-        stats
-            .op_snapshots()
-            .iter()
-            .map(|s| VirtualRow {
+        for s in stats.op_snapshots() {
+            visit(VirtualRow {
                 cells: vec![
                     text(s.op),
                     big(s.requests),
@@ -599,8 +587,8 @@ impl VirtualTable for ObjectStoreOpsTable {
                     s.p99_ms.map_or_else(empty, big),
                     dbl(s.total_ms),
                 ],
-            })
-            .collect()
+            });
+        }
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

@@ -701,7 +701,13 @@ async fn read_message<S: AsyncRead + Unpin>(
             .await
             .map_err(|e| GraphError::Internal(format!("read chunk body: {e}")))?;
 
-        message.extend_from_slice(&chunk);
+        // Move the chunk body straight into the message buffer. `read_exact`
+        // fills `chunk` then `extend_from_slice(&chunk)` copied every byte a
+        // second time; `message.append(&mut chunk)` MOVES the bytes out of
+        // `chunk` (a memcpy into `message` that reuses `message`'s own spare
+        // capacity — no per-chunk deep copy of a Vec element). `message` is the
+        // per-connection frame buffer; each chunk's contents are unchanged.
+        message.append(&mut chunk);
     }
 }
 

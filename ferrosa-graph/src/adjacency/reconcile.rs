@@ -14,7 +14,7 @@ use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_schema::Schema;
 use ferrosa_sstable::types::DeletionTime;
-use ferrosa_storage::TableId;
+use ferrosa_storage::{Mutation, TableId};
 
 use crate::adjacency::observer::make_adjacency_mutation;
 use crate::adjacency::schema::{adjacency_keyspace_name, DIRECTION_IN, DIRECTION_OUT};
@@ -152,7 +152,7 @@ pub async fn reconcile_once(
                         &edge_table_fqn,
                         now_micros(),
                     );
-                    if write_mutation(write_path, &mutation).await.is_ok() {
+                    if write_mutation(write_path, mutation).await.is_ok() {
                         metrics.entries_repaired += 1;
                     }
                 }
@@ -179,7 +179,7 @@ pub async fn reconcile_once(
                         &edge_table_fqn,
                         now_micros(),
                     );
-                    if write_mutation(write_path, &mutation).await.is_ok() {
+                    if write_mutation(write_path, mutation).await.is_ok() {
                         metrics.entries_repaired += 1;
                     }
                 }
@@ -382,17 +382,20 @@ fn extract_edge_label(clustering: &[u8]) -> Option<String> {
 }
 
 /// Write a mutation by decomposing it into individual row writes via WritePath.
-async fn write_mutation(
-    write_path: &WritePath,
-    mutation: &ferrosa_storage::Mutation,
-) -> ferrosa_common::Result<()> {
+///
+/// Takes the `Mutation` by value: each row is MOVED into its `WritePath::write`
+/// call instead of being deep-cloned (the previous `&Mutation` receiver forced a
+/// `row.clone()` per row). The mutation is owned by the caller and dropped right
+/// after, so consuming it removes one heap clone per repaired row on the
+/// reconcile hot path with no change to which rows are written or their order.
+async fn write_mutation(write_path: &WritePath, mutation: Mutation) -> ferrosa_common::Result<()> {
     let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-    for row in &mutation.rows {
+    for row in mutation.rows {
         write_path
             .write(
                 &table_id,
                 &mutation.key,
-                row.clone(),
+                row,
                 mutation.timestamp,
                 ferrosa_cluster::consistency::ConsistencyLevel::One,
                 &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {

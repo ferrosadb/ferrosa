@@ -52,9 +52,8 @@ impl VirtualTable for StubVirtualTable {
         &self.pk_columns
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, _visit: &mut dyn FnMut(VirtualRow)) {
         // TODO: Full implementation pending for this virtual table.
-        vec![]
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {

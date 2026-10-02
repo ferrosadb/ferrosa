@@ -14,9 +14,12 @@ use std::time::Duration;
 /// A virtual table backed by live code instead of SSTables.
 ///
 /// Implementers supply schema metadata (`name`, `keyspace`, `columns`,
-/// `primary_key_columns`) and a `read` method for compatibility. Tables with
-/// large or live result sets should override [`VirtualTable::visit_rows`] so
-/// callers can consume rows without first building a `Vec<VirtualRow>`.
+/// `primary_key_columns`) and [`VirtualTable::visit_rows`]. That visitor is the
+/// read path: the query/serving layer consumes rows through it so a table's
+/// peak heap does not scale with its result-set size. [`VirtualTable::read`] is
+/// a provided convenience for the bounded callers that genuinely need an owned
+/// `Vec`; it collects via `visit_rows` and must never be the only implementation
+/// of a large or live table.
 ///
 /// # Object Safety
 ///
@@ -36,20 +39,30 @@ pub trait VirtualTable: Send + Sync {
     /// clustering, in order).
     fn primary_key_columns(&self) -> &[usize];
 
-    /// Materialise rows, optionally filtered by `predicate`.
+    /// Visit rows, optionally filtered by `predicate`.
+    ///
+    /// REQUIRED — this is the virtual-table read path. Implementations must emit
+    /// one row at a time through `visit` and must not build an intermediate
+    /// collection of rows: a table's peak heap has to stay independent of its
+    /// result-set size. A table whose result set is genuinely bounded (by the
+    /// caller's own row cap, or by a fixed set of system rows) may still satisfy
+    /// this by emitting its rows directly.
     ///
     /// Implementations may apply as much or as little of the predicate as
     /// convenient; the query layer will re-apply it for correctness.
-    fn read(&self, predicate: Option<&RowPredicate>) -> Vec<VirtualRow>;
+    fn visit_rows(&self, predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow));
 
-    /// Visit rows without requiring the implementation to return a vector.
+    /// Materialise rows, optionally filtered by `predicate`.
     ///
-    /// The default adapter preserves all existing virtual tables. Streaming or
-    /// live tables should override this method and emit one row at a time.
-    fn visit_rows(&self, predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
-        for row in self.read(predicate) {
-            visit(row);
-        }
+    /// PROVIDED. Collects [`VirtualTable::visit_rows`] into an owned `Vec`, in
+    /// visit order, so it returns exactly the rows the visitor emits — same
+    /// order, same count, no duplicates. Prefer `visit_rows` on any read path
+    /// whose result set is not already bounded by the caller; the `Vec` this
+    /// returns is O(rows) in heap.
+    fn read(&self, predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+        let mut rows = Vec::new();
+        self.visit_rows(predicate, &mut |row| rows.push(row));
+        rows
     }
 
     /// How the table should be kept fresh when watched by a subscriber.
@@ -196,8 +209,8 @@ mod tests {
             &[0]
         }
 
-        fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-            vec![VirtualRow { cells: vec![] }]
+        fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+            visit(VirtualRow { cells: vec![] })
         }
 
         fn subscription_mode(&self) -> SubscriptionMode {
@@ -211,6 +224,53 @@ mod tests {
         assert_eq!(table.name(), "test_table");
         assert_eq!(table.keyspace(), "system_observability");
         assert_eq!(table.read(None).len(), 1);
+    }
+
+    /// Invariant: the provided `read` returns exactly the rows `visit_rows`
+    /// emits, in visit order — no drop, no duplicate, no reordering. This is
+    /// what lets every existing `read` caller keep its result while the read
+    /// path itself streams.
+    #[test]
+    fn provided_read_collects_visit_rows_in_order() {
+        struct Ordered(u32);
+        impl VirtualTable for Ordered {
+            fn name(&self) -> &str {
+                "ordered"
+            }
+            fn keyspace(&self) -> &str {
+                "system_observability"
+            }
+            fn columns(&self) -> &[VirtualColumnDef] {
+                &[]
+            }
+            fn primary_key_columns(&self) -> &[usize] {
+                &[0]
+            }
+            fn visit_rows(
+                &self,
+                _predicate: Option<&RowPredicate>,
+                visit: &mut dyn FnMut(VirtualRow),
+            ) {
+                for i in 0..self.0 {
+                    visit(VirtualRow {
+                        cells: vec![CellValue::live(i.to_be_bytes().to_vec(), 0)],
+                    });
+                }
+            }
+            fn subscription_mode(&self) -> SubscriptionMode {
+                SubscriptionMode::Pollable
+            }
+        }
+
+        let table = Ordered(5);
+        let rows = table.read(None);
+        assert_eq!(rows.len(), 5, "read must surface every visited row");
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.cells[0],
+                CellValue::live((i as u32).to_be_bytes().to_vec(), 0)
+            );
+        }
     }
 
     #[test]
