@@ -155,6 +155,14 @@ dependency/apply check, without remote read-vote fanout. See
    registered a txn that appears in a committed dependency set, its explicit
    empty Apply resolves that dependency and cascades parked writes. Non-empty
    Apply to an absent txn remains a failure and is never acknowledged.
+10. **A degraded ring is loud, and a stuck joiner is repairable.** `replicas()`
+    excludes any member that is not `Normal`, so a `Joining` token owner's
+    ranges are served by other nodes. `ring_health` / `ring_data_scatter_risk`
+    make that state reportable (`GET /api/cluster/ring` exposes `ring_healthy`,
+    `non_normal_members`, `data_scatter_risk`), and the recovered-topology path
+    resumes the Promote phase via `promote_joining_members` rather than
+    skipping it on every restart. Promote touches `Joining` only: `Leaving`,
+    `Decommissioned` and `Learner` are never promoted (CL-29).
 
 ## Correctness evidence (be honest)
 
