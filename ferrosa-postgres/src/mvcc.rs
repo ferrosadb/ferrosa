@@ -369,30 +369,47 @@ impl MvccManager {
         table: &str,
     ) -> HashMap<Vec<Value>, Option<Row>> {
         let state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
+        // Pre-size the returned overlay to the exact number of changed keys for
+        // this table, so its backing table is allocated ONCE instead of growing
+        // (and reallocating/rehashing) as keys are inserted. The overlay stays
+        // sparse — bounded by MVCC-changed keys, never by table size. The
+        // per-key `row.clone()` transfers a versioned row out of the shared
+        // state under the lock; a sparse overlay of that many owned Rows is the
+        // contract and is not a table-scale copy.
         if let Some(cluster_ts) = snapshot.cluster_ts {
-            return state
-                .distributed_versions
-                .iter()
-                .filter(|(key, _)| key.table == table)
-                .filter_map(|(key, versions)| {
-                    versions
-                        .range(..=cluster_ts)
-                        .next_back()
-                        .map(|(_, row)| (key.key.clone(), row.clone()))
-                })
-                .collect();
+            let mut overlay = HashMap::with_capacity(
+                state
+                    .distributed_versions
+                    .keys()
+                    .filter(|key| key.table == table)
+                    .count(),
+            );
+            for (key, versions) in &state.distributed_versions {
+                if key.table != table {
+                    continue;
+                }
+                if let Some((_, row)) = versions.range(..=cluster_ts).next_back() {
+                    overlay.insert(key.key.clone(), row.clone());
+                }
+            }
+            return overlay;
         }
-        state
-            .versions
-            .iter()
-            .filter(|(key, _)| key.table == table)
-            .filter_map(|(key, versions)| {
-                versions
-                    .range(..=snapshot.read_ts)
-                    .next_back()
-                    .map(|(_, row)| (key.key.clone(), row.clone()))
-            })
-            .collect()
+        let mut overlay = HashMap::with_capacity(
+            state
+                .versions
+                .keys()
+                .filter(|key| key.table == table)
+                .count(),
+        );
+        for (key, versions) in &state.versions {
+            if key.table != table {
+                continue;
+            }
+            if let Some((_, row)) = versions.range(..=snapshot.read_ts).next_back() {
+                overlay.insert(key.key.clone(), row.clone());
+            }
+        }
+        overlay
     }
 
     /// Applies a PostgreSQL commit while holding the PG commit-order lock.

@@ -378,6 +378,16 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
                 .chain(ctx.ck_idx.iter())
                 .map(|index| values[*index].clone())
                 .collect();
+            // `row.clone()` here is REQUIRED, not wasteful. `ctx.overlay` is an
+            // `Arc` shared by every scan in one query (a self-join opens two
+            // independent scans over the same overlay), so the substituted row
+            // must be CLONED out — mutating the overlay (`remove`) to move the
+            // row would make the second scan miss a restored historical row and
+            // silently return a wrong result. The key clone is likewise needed
+            // because `values` is MOVED into `Row::new` on the no-overlay path.
+            // Both copies are sparse (one per MVCC-changed key, not per table
+            // row) and are the documented, correctness-required exceptions
+            // (t_110dd8a5).
             let row = match ctx.overlay.get(&key) {
                 Some(Some(row)) => {
                     overlay_seen.insert(key);

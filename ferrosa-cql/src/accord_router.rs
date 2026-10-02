@@ -179,16 +179,18 @@ pub struct LwtResult {
 /// Returns `applied=true` if the row does not exist (None), `applied=false`
 /// with the existing row values if it does.
 pub fn eval_insert_if_not_exists(
-    existing_row: Option<&HashMap<String, Option<CqlValue>>>,
+    existing_row: Option<HashMap<String, Option<CqlValue>>>,
 ) -> LwtResult {
     match existing_row {
         None => LwtResult {
             applied: true,
             current_values: HashMap::new(),
         },
+        // Move the row into the result — the caller no longer needs it, so this
+        // is a pointer move, not a clone of every cell.
         Some(row) => LwtResult {
             applied: false,
-            current_values: row.clone(),
+            current_values: row,
         },
     }
 }
@@ -200,12 +202,16 @@ pub fn eval_insert_if_not_exists(
 ///
 /// If `if_exists` is true and the row is `None`, returns `applied=false`.
 ///
+/// `existing_row` is consumed: on a non-match the row is MOVED into
+/// `current_values` (no per-cell clone), which is the whole point of the owned
+/// signature.
+///
 /// Returns `applied=true` if all conditions match, `applied=false` with
 /// current values otherwise.
 pub fn eval_if_conditions(
     conditions: &[IfCondition],
     if_exists: bool,
-    existing_row: Option<&HashMap<String, Option<CqlValue>>>,
+    existing_row: Option<HashMap<String, Option<CqlValue>>>,
 ) -> LwtResult {
     // IF EXISTS check: row must exist.
     let row = match existing_row {
@@ -255,9 +261,10 @@ pub fn eval_if_conditions(
         };
 
         if !matches {
+            // Move the row into the result rather than cloning every cell.
             return LwtResult {
                 applied: false,
-                current_values: row.clone(),
+                current_values: row,
             };
         }
     }
@@ -312,7 +319,7 @@ pub fn classify_lwt(stmt: &Statement) -> Option<LwtPredicateKind> {
 /// no divergent logic. Returns `None` if the statement is not an LWT.
 pub fn eval_lwt_for_statement(
     stmt: &Statement,
-    existing_row: Option<&HashMap<String, Option<CqlValue>>>,
+    existing_row: Option<HashMap<String, Option<CqlValue>>>,
 ) -> Option<LwtResult> {
     match stmt {
         Statement::Insert(s) if s.if_not_exists => Some(eval_insert_if_not_exists(existing_row)),
@@ -401,13 +408,13 @@ pub fn eval_batch_cas(
     for (stmt, existing_row) in statements.iter().zip(row_states.iter()) {
         let lwt = match stmt {
             Statement::Insert(s) if s.if_not_exists => {
-                eval_insert_if_not_exists(existing_row.as_ref())
+                eval_insert_if_not_exists(existing_row.clone())
             }
             Statement::Update(s) if !s.if_conditions.is_empty() || s.if_exists => {
-                eval_if_conditions(&s.if_conditions, s.if_exists, existing_row.as_ref())
+                eval_if_conditions(&s.if_conditions, s.if_exists, existing_row.clone())
             }
             Statement::Delete(s) if !s.if_conditions.is_empty() || s.if_exists => {
-                eval_if_conditions(&s.if_conditions, s.if_exists, existing_row.as_ref())
+                eval_if_conditions(&s.if_conditions, s.if_exists, existing_row.clone())
             }
             // Statements without conditions are always "applied" individually.
             _ => LwtResult {
@@ -1025,7 +1032,7 @@ mod tests {
         existing.insert("id".to_string(), Some(CqlValue::Int(1)));
         existing.insert("name".to_string(), Some(CqlValue::Text("Alice".into())));
 
-        let result = eval_insert_if_not_exists(Some(&existing));
+        let result = eval_insert_if_not_exists(Some(existing.clone()));
         assert!(
             !result.applied,
             "INSERT IF NOT EXISTS on existing row must not apply"
@@ -1094,7 +1101,7 @@ mod tests {
             value: Term::IntegerLiteral(10),
         }];
 
-        let result = eval_if_conditions(&conditions, false, Some(&row));
+        let result = eval_if_conditions(&conditions, false, Some(row.clone()));
         assert!(
             result.applied,
             "UPDATE IF v=10 on row where v=10 must apply"
@@ -1107,7 +1114,7 @@ mod tests {
             value: Term::IntegerLiteral(99),
         }];
 
-        let result = eval_if_conditions(&conditions_mismatch, false, Some(&row));
+        let result = eval_if_conditions(&conditions_mismatch, false, Some(row.clone()));
         assert!(
             !result.applied,
             "UPDATE IF v=99 on row where v=10 must not apply"
@@ -1138,7 +1145,7 @@ mod tests {
             value: Term::StringLiteral("active".into()),
         }];
 
-        let result = eval_if_conditions(&conditions, false, Some(&row));
+        let result = eval_if_conditions(&conditions, false, Some(row.clone()));
         assert!(
             result.applied,
             "DELETE IF status='active' on matching row must apply"
@@ -1150,7 +1157,7 @@ mod tests {
             value: Term::StringLiteral("inactive".into()),
         }];
 
-        let result = eval_if_conditions(&conditions_mismatch, false, Some(&row));
+        let result = eval_if_conditions(&conditions_mismatch, false, Some(row.clone()));
         assert!(
             !result.applied,
             "DELETE IF status='inactive' on row where status='active' must not apply"
@@ -1169,7 +1176,7 @@ mod tests {
         );
 
         // IF EXISTS on existing row (no other conditions).
-        let result = eval_if_conditions(&[], true, Some(&row));
+        let result = eval_if_conditions(&[], true, Some(row.clone()));
         assert!(
             result.applied,
             "DELETE IF EXISTS on existing row must apply"
@@ -1324,7 +1331,7 @@ mod tests {
             value: Term::IntegerLiteral(10),
         }];
 
-        let result = eval_if_conditions(&conditions, false, Some(&row));
+        let result = eval_if_conditions(&conditions, false, Some(row.clone()));
         assert!(!result.applied, "IF v != 10 should fail when v=10");
 
         let conditions2 = vec![IfCondition {
@@ -1333,7 +1340,7 @@ mod tests {
             value: Term::IntegerLiteral(99),
         }];
 
-        let result = eval_if_conditions(&conditions2, false, Some(&row));
+        let result = eval_if_conditions(&conditions2, false, Some(row.clone()));
         assert!(result.applied, "IF v != 99 should pass when v=10");
     }
 
@@ -1357,7 +1364,7 @@ mod tests {
             },
         ];
 
-        let result = eval_if_conditions(&conditions, false, Some(&row));
+        let result = eval_if_conditions(&conditions, false, Some(row.clone()));
         assert!(result.applied, "both conditions match, should apply");
 
         // First condition matches, second does not.
@@ -1374,7 +1381,7 @@ mod tests {
             },
         ];
 
-        let result = eval_if_conditions(&conditions_partial, false, Some(&row));
+        let result = eval_if_conditions(&conditions_partial, false, Some(row.clone()));
         assert!(!result.applied, "second condition fails, should not apply");
     }
 
@@ -1390,7 +1397,7 @@ mod tests {
             value: Term::Null,
         }];
 
-        let result = eval_if_conditions(&conditions, false, Some(&row));
+        let result = eval_if_conditions(&conditions, false, Some(row.clone()));
         assert!(result.applied, "IF v=NULL should match when v is NULL");
 
         let conditions_non_null = vec![IfCondition {
@@ -1399,7 +1406,7 @@ mod tests {
             value: Term::IntegerLiteral(10),
         }];
 
-        let result = eval_if_conditions(&conditions_non_null, false, Some(&row));
+        let result = eval_if_conditions(&conditions_non_null, false, Some(row.clone()));
         assert!(!result.applied, "IF v=10 should fail when v is NULL");
     }
 
@@ -1414,7 +1421,7 @@ mod tests {
             operator: IfOperator::Gt,
             value: Term::IntegerLiteral(40),
         }];
-        assert!(eval_if_conditions(&cond_gt, false, Some(&row)).applied);
+        assert!(eval_if_conditions(&cond_gt, false, Some(row.clone())).applied);
 
         // v < 60: should pass
         let cond_lt = vec![IfCondition {
@@ -1422,7 +1429,7 @@ mod tests {
             operator: IfOperator::Lt,
             value: Term::IntegerLiteral(60),
         }];
-        assert!(eval_if_conditions(&cond_lt, false, Some(&row)).applied);
+        assert!(eval_if_conditions(&cond_lt, false, Some(row.clone())).applied);
 
         // v >= 50: should pass
         let cond_ge = vec![IfCondition {
@@ -1430,7 +1437,7 @@ mod tests {
             operator: IfOperator::GtEq,
             value: Term::IntegerLiteral(50),
         }];
-        assert!(eval_if_conditions(&cond_ge, false, Some(&row)).applied);
+        assert!(eval_if_conditions(&cond_ge, false, Some(row.clone())).applied);
 
         // v <= 50: should pass
         let cond_le = vec![IfCondition {
@@ -1438,7 +1445,7 @@ mod tests {
             operator: IfOperator::LtEq,
             value: Term::IntegerLiteral(50),
         }];
-        assert!(eval_if_conditions(&cond_le, false, Some(&row)).applied);
+        assert!(eval_if_conditions(&cond_le, false, Some(row.clone())).applied);
 
         // v > 50: should fail
         let cond_gt_fail = vec![IfCondition {
@@ -1446,7 +1453,7 @@ mod tests {
             operator: IfOperator::Gt,
             value: Term::IntegerLiteral(50),
         }];
-        assert!(!eval_if_conditions(&cond_gt_fail, false, Some(&row)).applied);
+        assert!(!eval_if_conditions(&cond_gt_fail, false, Some(row.clone())).applied);
     }
 
     #[test]
@@ -1464,7 +1471,7 @@ mod tests {
             ]),
         }];
 
-        assert!(eval_if_conditions(&cond_in, false, Some(&row)).applied);
+        assert!(eval_if_conditions(&cond_in, false, Some(row.clone())).applied);
 
         let cond_in_miss = vec![IfCondition {
             column: "v".into(),
@@ -1472,7 +1479,7 @@ mod tests {
             value: Term::InList(vec![Term::IntegerLiteral(1), Term::IntegerLiteral(2)]),
         }];
 
-        assert!(!eval_if_conditions(&cond_in_miss, false, Some(&row)).applied);
+        assert!(!eval_if_conditions(&cond_in_miss, false, Some(row.clone())).applied);
     }
 
     // -----------------------------------------------------------------------
@@ -1546,8 +1553,8 @@ mod tests {
         row.insert("id".to_string(), Some(CqlValue::Int(1)));
         row.insert("v".to_string(), Some(CqlValue::Int(50)));
 
-        let res =
-            eval_lwt_for_statement(&update_if_v_eq(50), Some(&row)).expect("UPDATE IF is an LWT");
+        let res = eval_lwt_for_statement(&update_if_v_eq(50), Some(row.clone()))
+            .expect("UPDATE IF is an LWT");
         assert!(res.applied, "matching IF v=50 must apply");
     }
 
@@ -1559,8 +1566,8 @@ mod tests {
         row.insert("id".to_string(), Some(CqlValue::Int(1)));
         row.insert("v".to_string(), Some(CqlValue::Int(999)));
 
-        let res =
-            eval_lwt_for_statement(&update_if_v_eq(50), Some(&row)).expect("UPDATE IF is an LWT");
+        let res = eval_lwt_for_statement(&update_if_v_eq(50), Some(row.clone()))
+            .expect("UPDATE IF is an LWT");
         assert!(!res.applied, "non-matching IF v=50 must NOT apply");
         assert_eq!(
             res.current_values.get("v"),
@@ -1582,7 +1589,7 @@ mod tests {
 
         let mut row = HashMap::new();
         row.insert("id".to_string(), Some(CqlValue::Int(1)));
-        let not_applied = eval_lwt_for_statement(&insert_if_not_exists(), Some(&row))
+        let not_applied = eval_lwt_for_statement(&insert_if_not_exists(), Some(row.clone()))
             .expect("INSERT IF NOT EXISTS is an LWT");
         assert!(
             !not_applied.applied,
@@ -1631,7 +1638,7 @@ mod tests {
                 value: Term::IntegerLiteral(literal),
             }];
 
-            let result = eval_if_conditions(&conditions, false, Some(&row));
+            let result = eval_if_conditions(&conditions, false, Some(row.clone()));
             assert!(
                 result.applied,
                 "IF v = {literal} must apply when the {label} column holds \
@@ -1656,7 +1663,7 @@ mod tests {
             value: Term::IntegerLiteral(321),
         }];
 
-        let result = eval_if_conditions(&conditions, false, Some(&row));
+        let result = eval_if_conditions(&conditions, false, Some(row.clone()));
         assert!(
             !result.applied,
             "IF v != 321 must NOT apply when the bigint column holds 321"
@@ -1677,7 +1684,7 @@ mod tests {
                 operator,
                 value: Term::IntegerLiteral(literal),
             }];
-            let result = eval_if_conditions(&conditions, false, Some(&row));
+            let result = eval_if_conditions(&conditions, false, Some(row.clone()));
             assert_eq!(result.applied, want, "{why}");
         };
 
@@ -1715,7 +1722,7 @@ mod tests {
             value: Term::IntegerLiteral(observed),
         }];
 
-        let result = eval_if_conditions(&conditions, false, Some(&row));
+        let result = eval_if_conditions(&conditions, false, Some(row.clone()));
         assert!(
             result.applied,
             "a CAS using the value just read must apply on the first attempt; \
@@ -1736,7 +1743,7 @@ mod tests {
             value: Term::InList(vec![Term::IntegerLiteral(7), Term::IntegerLiteral(321)]),
         }];
         assert!(
-            eval_if_conditions(&present, false, Some(&row)).applied,
+            eval_if_conditions(&present, false, Some(row.clone())).applied,
             "IF v IN (7, 321) must apply when the bigint column holds 321"
         );
 
@@ -1746,7 +1753,7 @@ mod tests {
             value: Term::InList(vec![Term::IntegerLiteral(7), Term::IntegerLiteral(8)]),
         }];
         assert!(
-            !eval_if_conditions(&absent, false, Some(&row)).applied,
+            !eval_if_conditions(&absent, false, Some(row.clone())).applied,
             "IF v IN (7, 8) must NOT apply when the bigint column holds 321"
         );
     }

@@ -254,17 +254,24 @@ fn build_centroids(
     dimensions: usize,
 ) -> Vec<Vec<f32>> {
     let centroid_count = list_count.min(rows.len());
-    let mut sorted_vectors: Vec<_> = rows.iter().map(|(_, vector)| vector.clone()).collect();
-    sorted_vectors.sort_by(|left, right| lexicographic_f32_cmp(left, right));
+
+    // Rank the corpus by vector value and keep only the INDICES (one `usize`
+    // per row), not a cloned copy of every vector (t_27cf714a). The seeding
+    // below then clones exactly `centroid_count` winning vectors into the
+    // centroid set. This is a pure refactor of the sort: the comparator and
+    // `sort_by`'s stability reproduce the pre-fix `sorted_vectors` order
+    // exactly, so every emitted centroid is bit-for-bit identical.
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&left, &right| lexicographic_f32_cmp(&rows[left].1, &rows[right].1));
 
     let mut centroids = (0..centroid_count)
         .map(|idx| {
             let source_idx = if centroid_count == 1 {
                 0
             } else {
-                idx * (sorted_vectors.len() - 1) / (centroid_count - 1)
+                idx * (order.len() - 1) / (centroid_count - 1)
             };
-            sorted_vectors[source_idx].clone()
+            rows[order[source_idx]].1.clone()
         })
         .collect::<Vec<_>>();
 

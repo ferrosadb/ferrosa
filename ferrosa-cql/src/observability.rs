@@ -136,28 +136,23 @@ impl VirtualTable for CqlStatsTable {
         &[0]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        let mut rows: Vec<VirtualRow> = self
-            .metrics
-            .snapshot()
-            .into_iter()
-            .map(|(label, count)| VirtualRow {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        for (label, count) in self.metrics.snapshot() {
+            visit(VirtualRow {
                 cells: vec![
                     CellValue::live(label.as_bytes().to_vec(), 0),
                     CellValue::live(count.to_be_bytes().to_vec(), 0),
                 ],
-            })
-            .collect();
+            });
+        }
 
         // Append the global error row.
-        rows.push(VirtualRow {
+        visit(VirtualRow {
             cells: vec![
                 CellValue::live(b"ERRORS".to_vec(), 0),
                 CellValue::live(self.metrics.error_count().to_be_bytes().to_vec(), 0),
             ],
         });
-
-        rows
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {
