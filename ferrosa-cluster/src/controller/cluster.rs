@@ -130,7 +130,7 @@ use crate::coordinator::{
 };
 use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
 use crate::mode::DeploymentMode;
-use crate::pair::ddl::DdlOperation;
+use crate::pair::ddl::{DdlOperation, PairSchemaSyncHandler};
 use crate::raft::handlers::{
     FulltextSearchHandler, IndexReadInPartitionHandler, RaftAppendHandler, RaftPreVoteHandler,
     RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
@@ -245,6 +245,43 @@ pub(super) fn should_initialize_seed_membership(
 
 pub(super) fn should_run_bootstrap_streaming(has_recovered_topology_state: bool) -> bool {
     !has_recovered_topology_state
+}
+
+/// Whether THIS node may send a peer its schema snapshot on join.
+///
+/// **Only the Raft leader may send.** The receiving handler
+/// (`PairSchemaSyncHandler`) does not merely add tables: it treats every table
+/// its own schema holds that the incoming snapshot lacks as a table that was
+/// dropped, and unregisters it -- releasing the table and deleting its local
+/// SSTable directory, exactly as `DropTable` would.
+///
+/// That is correct when the snapshot comes from the authoritative side and the
+/// receiver is behind. It is **destructive in the other direction**: a node
+/// holding a stale schema would tell a healthy peer that the newer tables it
+/// never learned about had been dropped, and the healthy peer would delete them.
+/// A naive "send my schema when a peer joins" therefore turns a benign
+/// divergence into data loss.
+///
+/// The leader is the authority for schema: DDL is committed through Raft, so the
+/// leader's applied schema is the cluster's. Leadership can move between the
+/// decision and the send, and this deliberately treats that as a reason NOT to
+/// send -- a peer that is genuinely behind will be sent a snapshot by whichever
+/// node is leader once they reconnect.
+///
+/// Kept as a pure function so the rule is testable without a cluster: the bug it
+/// guards against is silent and destroys data, which is the worst combination to
+/// leave covered only by an integration test.
+pub(super) fn should_send_schema_snapshot(
+    local_host_id: uuid::Uuid,
+    leader_host_id: Option<uuid::Uuid>,
+) -> bool {
+    match leader_host_id {
+        // Only when this node IS the leader, and only when both identities are
+        // known. `None` (no leader, or an unresolved node id) means no authority
+        // to speak for the cluster's schema.
+        Some(leader) => leader == local_host_id,
+        None => false,
+    }
 }
 
 /// Keyspaces that should be re-proposed through Raft during the
@@ -1796,6 +1833,28 @@ impl ModeController {
                 None => openraft::Config::default().max_payload_entries,
             };
 
+            // The snapshot policy decides how many committed entries are retained
+            // before a snapshot is taken and the log below it purged.
+            //
+            // A node that is away longer than this window cannot recover the
+            // schema it missed by log replay -- the entries are gone -- so this
+            // number is what makes schema catch-up necessary rather than optional.
+            // Overridable so a test can force the purged-window condition without
+            // writing a thousand entries; the production default is unchanged.
+            let raft_snapshot_logs_since_last = match std::env::var("FERROSA_RAFT_SNAPSHOT_LOGS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+            {
+                Some(n) if n > 0 => n,
+                Some(_) => {
+                    tracing::warn!(
+                        "FERROSA_RAFT_SNAPSHOT_LOGS must be greater than zero, using default 1000"
+                    );
+                    1000
+                }
+                None => 1000,
+            };
+
             let raft_config = match (openraft::Config {
                 cluster_name,
                 heartbeat_interval: raft_heartbeat_ms,
@@ -1805,7 +1864,9 @@ impl ModeController {
                 election_timeout_min: raft_election_min_ms,
                 election_timeout_max: raft_election_max_ms,
                 max_payload_entries: raft_max_payload_entries,
-                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+                    raft_snapshot_logs_since_last,
+                ),
                 enable_pre_vote: raft_enable_pre_vote,
                 check_quorum_ratio: raft_check_quorum_ratio,
                 ..Default::default()
@@ -2768,6 +2829,90 @@ impl ModeController {
                         tracing::info!(
                             "raft recovered committed topology; skipping bootstrap streaming and promotion"
                         );
+                        // Recovery pass. The promote phase above runs only on a
+                        // FRESH join. On restart it was skipped entirely, so a
+                        // node that was mid-join when this leader last stopped
+                        // stayed `Joining` FOREVER: `TokenRing::replicas()`
+                        // skips non-Normal members, so that node's tokens were
+                        // silently served by other nodes (repair run from it
+                        // saw zero owned ranges, and its own full scans missed
+                        // a partition). The recovered topology is COMMITTED, so
+                        // a `Joining` member in it is a join whose promotion the
+                        // restart lost — not a node still streaming data.
+                        // Finish that promotion instead of leaving it stuck.
+                        let member_states: std::collections::BTreeMap<u64, NodeState> =
+                            match ring_for_bootstrap.load().as_ref().as_ref() {
+                                Some(ring) => ring
+                                    .node_ids()
+                                    .into_iter()
+                                    .filter_map(|id| ring.get_node(id).map(|info| (id, info.state)))
+                                    .collect(),
+                                None => std::collections::BTreeMap::new(),
+                            };
+                        let promote_plan = crate::repair::coordinator::promote_joining_members(
+                            &member_states,
+                        );
+                        if !promote_plan.is_empty() {
+                            let stuck: Vec<(u64, NodeState)> = member_states
+                                .iter()
+                                .filter(|(_, st)| !matches!(st, NodeState::Normal))
+                                .map(|(id, st)| (*id, *st))
+                                .collect();
+                            tracing::warn!(
+                                ?stuck,
+                                "recovered topology still has non-Normal members — resuming \
+                                 the Promote phase so their tokens stop being misrouted"
+                            );
+                            for op in promote_plan {
+                                let cmd = crate::raft::RaftCommand {
+                                    op,
+                                    schema_version: Uuid::new_v4(),
+                                };
+                                // A recovery pass can run on ANY node, and
+                                // `client_write` on a non-leader returns a
+                                // ForwardToLeader hint rather than applying.
+                                // Logging that as a failure left the node stuck
+                                // (observed live: "has to forward request to:
+                                // Some(...)"). Route it through the canonical
+                                // classify-then-forward chain, the same one the
+                                // membership refresh uses.
+                                let outcome = match raft_arc.client_write(cmd.clone()).await {
+                                    Ok(_) => Ok(()),
+                                    Err(raft_err) => Err(
+                                        crate::raft_forward::classify_client_write_error(
+                                            &raft_err,
+                                        ),
+                                    ),
+                                };
+                                let dispatch_pm = peer_manager_for_bootstrap.clone();
+                                let dispatch_ring = ring_for_bootstrap.clone();
+                                let dispatch_result =
+                                    crate::raft_forward::dispatch_propose_outcome(
+                                        outcome,
+                                        cmd,
+                                        move |leader_node_id| {
+                                            (**dispatch_ring.load()).as_ref().and_then(|ring| {
+                                                ring.get_node(leader_node_id).map(|n| n.host_id)
+                                            })
+                                        },
+                                        move |leader_uuid, cmd| {
+                                            let pm = dispatch_pm.clone();
+                                            async move {
+                                                crate::raft_forward::forward_raft_command_to_leader(
+                                                    pm.as_ref(),
+                                                    leader_uuid,
+                                                    cmd,
+                                                )
+                                                .await
+                                            }
+                                        },
+                                    )
+                                    .await;
+                                if let Err(e) = dispatch_result {
+                                    tracing::warn!(%e, "recovery promote failed");
+                                }
+                            }
+                        }
                     }
                 }
                 None => {
@@ -2850,6 +2995,25 @@ impl ModeController {
                         engine: storage_for_bootstrap.clone(),
                     }));
                     tracing::info!("DDL path restored to Direct after formation timeout");
+
+                    // A node coming back inside the cluster shape must be able to
+                    // RECEIVE the cluster's schema, not only offer its own. The
+                    // ReplaySchema phase pushes this node's schema outward, so a
+                    // node that missed DDL while it was down re-offers the tables
+                    // it already has (each a no-op) and never learns the ones it
+                    // lacks -- the divergence never repairs.
+                    //
+                    // Pair mode registers this handler on its way through pair;
+                    // a returning member never forms a pair, so it would
+                    // otherwise have nowhere to receive a schema snapshot.
+                    registry.register(
+                        MsgType::PairSchemaSync,
+                        Arc::new(PairSchemaSyncHandler::new(
+                            schema_for_replay.clone(),
+                            storage_for_bootstrap.clone(),
+                        )),
+                    );
+
 
                     // P0-21 FIX: Spawn a background rejoin task that contacts
                     // the existing cluster's leader and asks it to add this node

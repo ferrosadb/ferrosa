@@ -308,6 +308,18 @@ early acknowledgement.
 - `hints/` — per-peer on-disk hint segments (CRC32, crash-recoverable),
   byte-budget backpressure (no silent loss → `needs_repair` + ERROR), FIFO
   at-least-once delivery as `MutationForward`. **No time-based TTL** (budget cap).
+- `repair/coordinator.rs::ring_health` / `RingHealth` / `ring_data_scatter_risk`
+  — pure ring-membership health derived from node states. A member that is not
+  `Normal` (`Joining` / `Leaving` / `Decommissioned` / `Learner`) is excluded
+  from `TokenRing::replicas()`, so its tokens are served by other nodes. These
+  make that degraded state reportable; `GET /api/cluster/ring` returns
+  `ring_healthy`, `non_normal_members` and `data_scatter_risk` (CL-29).
+- `repair/coordinator.rs::promote_joining_members` — pure Promote-phase planner:
+  one `SetNodeState{Normal}` per `Joining` member, and nothing for
+  `Leaving` / `Decommissioned` / `Learner` (operator intent and the ADR-014
+  learner state are never reversed). The controller runs it on the
+  recovered-topology path, which previously skipped promotion outright and so
+  left a mid-join node stuck `Joining` across every restart (CL-29).
 
 ### Accord transactions (`accord/`)
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
@@ -421,7 +433,10 @@ External: `openraft` (pinned fork), `sled`, `tokio`, `arc-swap`, `dashmap`,
 ~1050 test functions across the crate (in-module `#[cfg(test)]` + `tests/`).
 Notable integration suites: `failure_mode_matrix` (44), `raft_election_storm`
 (36), `leader_snapshot_push` (31), `accord_lwt_concurrent` (21),
-`accord_nemesis` (15), `correctness` (11), `cluster_formation` (10). All run on
+`accord_nemesis` (15), `correctness` (11), `cluster_formation` (10),
+`joining_node_health` (9 — ring membership health + Promote-phase planning;
+pins that a stuck `Joining` member is reported unhealthy and repaired, while
+`Leaving` / `Decommissioned` / `Learner` are never promoted, CL-29). All run on
 deterministic in-process harnesses unless gated behind `live-infra-tests`.
 
 Range-scan memory boundedness is guarded by two allocator-tracking suites:

@@ -38,6 +38,7 @@ pub use cluster_rejoin::{
     CLUSTER_REJOIN_FAILURES_TOTAL,
 };
 
+pub use peer_events::{schema_snapshot_pushes_total, SCHEMA_SNAPSHOT_PUSHES_TOTAL};
 pub use token::deterministic_tokens_for_node;
 #[cfg(test)]
 pub(crate) use token::generate_deterministic_token;
@@ -772,6 +773,17 @@ impl ModeController {
     /// Get local host_id.
     pub fn host_id(&self) -> Uuid {
         self.local_host_id
+    }
+
+    /// The schema this node currently holds.
+    ///
+    /// Reported, not reconciled: a caller comparing this across nodes is the only
+    /// way to observe schema divergence, because every node's peer rows carry its
+    /// own version (`ferrosa-schema/src/system/peers.rs` writes `peer.schema_version
+    /// = snap.version`), so any check built on replicated peer metadata agrees
+    /// with itself. See `controller::bootstrap::replay_schema::postcondition`.
+    pub fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
     }
 
     /// Graceful shutdown: cancel all background tasks and wait for them to finish.

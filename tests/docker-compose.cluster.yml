@@ -109,6 +109,11 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "ferrosa_ci_access_key"
       FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa_ci_secret_key"  # pragma: allowlist secret
+      # Test-only: shrink the Raft snapshot window so a reproduction can force
+      # the log entries below it to be snapshotted and PURGED. That is the
+      # condition under which a returning node cannot recover a missed schema by
+      # log replay, and needs a schema push instead. Prod default is 1000.
+      FERROSA_RAFT_SNAPSHOT_LOGS: "8"
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
       interval: 5s
@@ -149,6 +154,11 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "ferrosa_ci_access_key"
       FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa_ci_secret_key"  # pragma: allowlist secret
+      # Test-only: shrink the Raft snapshot window so a reproduction can force
+      # the log entries below it to be snapshotted and PURGED. That is the
+      # condition under which a returning node cannot recover a missed schema by
+      # log replay, and needs a schema push instead. Prod default is 1000.
+      FERROSA_RAFT_SNAPSHOT_LOGS: "8"
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
       interval: 5s
@@ -189,6 +199,11 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "ferrosa_ci_access_key"
       FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa_ci_secret_key"  # pragma: allowlist secret
+      # Test-only: shrink the Raft snapshot window so a reproduction can force
+      # the log entries below it to be snapshotted and PURGED. That is the
+      # condition under which a returning node cannot recover a missed schema by
+      # log replay, and needs a schema push instead. Prod default is 1000.
+      FERROSA_RAFT_SNAPSHOT_LOGS: "8"
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
       interval: 5s
@@ -229,6 +244,11 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "ferrosa_ci_access_key"
       FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa_ci_secret_key"  # pragma: allowlist secret
+      # Test-only: shrink the Raft snapshot window so a reproduction can force
+      # the log entries below it to be snapshotted and PURGED. That is the
+      # condition under which a returning node cannot recover a missed schema by
+      # log replay, and needs a schema push instead. Prod default is 1000.
+      FERROSA_RAFT_SNAPSHOT_LOGS: "8"
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
       interval: 5s
@@ -269,6 +289,11 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "ferrosa_ci_access_key"
       FERROSA_S3_SECRET_ACCESS_KEY: "ferrosa_ci_secret_key"  # pragma: allowlist secret
+      # Test-only: shrink the Raft snapshot window so a reproduction can force
+      # the log entries below it to be snapshotted and PURGED. That is the
+      # condition under which a returning node cannot recover a missed schema by
+      # log replay, and needs a schema push instead. Prod default is 1000.
+      FERROSA_RAFT_SNAPSHOT_LOGS: "8"
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
       interval: 5s

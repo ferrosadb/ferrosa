@@ -219,3 +219,22 @@ return 413. HTTP 202 returns `status: cancellation_requested`, `node_id`, echoed
 `keyspace`/`table`, `matched_tasks` and `already_cancelled_tasks`. This is a request
 acknowledgement: committed replacements continue, and future scheduling remains
 active. `ferrosa-ctl compaction stop` calls this endpoint.
+
+### Ring health (`GET /api/cluster/ring`)
+
+Alongside `nodes`, the ring endpoint reports membership health so a degraded
+ring is never silent:
+
+- `ring_healthy: bool` — false when any member is not `NodeState::Normal`.
+- `non_normal_members: [{node_id, address, state}]` — the reason it is false.
+- `data_scatter_risk: [node_id]` — members that own tokens yet are excluded
+  from `TokenRing::replicas()` because of their state, so their token ranges
+  are being served by other nodes.
+
+This exists because a node stuck in `Joining` looked healthy: it served CQL and
+reported peers, while `replicas()` skipped it. On a 3-node cluster that produced
+a reproducibly short paged scan on the stuck node and `ferrosa-ctl repair` with
+zero owned ranges. The controller now also resumes the Promote phase on the
+recovered-topology path (it previously skipped promotion on every restart, so a
+mid-join node stayed `Joining` forever). Invariants and boundaries are pinned in
+`ferrosa-cluster/tests/joining_node_health.rs`.
