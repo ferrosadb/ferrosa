@@ -456,9 +456,44 @@ jobs:
         run: |
           set -euo pipefail
           unwind_prefix="$RUNNER_TEMP/musl-libunwind"
+
+          # TWO libunwinds are genuinely needed, and neither may go on the
+          # LIBRARY SEARCH PATH, because `-lunwind` binds to the first match and
+          # one would displace the other:
+          #
+          #   * the sysroot archive supplies the C++ ABI symbols the Rust link
+          #     needs -- _Unwind_Resume, __register_frame, __deregister_frame.
+          #     Nothing else defines them: this link runs with -nodefaultlibs,
+          #     so libgcc is never pulled in.
+          #   * the hand-built archive supplies the libunwind C API jemalloc's
+          #     heap profiler calls -- unw_backtrace, unw_flush_cache,
+          #     unw_set_caching_policy. The sysroot archive does NOT have those.
+          #
+          # This is why `-L $unwind_prefix/lib` must not be used. With it, the
+          # hand-built archive shadowed the sysroot one and the link died with
+          # ~47 `undefined reference to _Unwind_Resume`. Measured both ways on a
+          # crate using tikv-jemallocator/profiling_libunwind:
+          #
+          #   -L <custom>/lib                        -> exit 101, 47 undefined
+          #   -C link-arg=<custom>/lib/libunwind.a   -> exit 0, static-pie, no INTERP
+          #
+          # So both are linked by explicit path. See
+          # tests/ci/test_profiling_libunwind_link.py.
+          sysroot_libunwind=""
+          for candidate in "$(rustc --print target-libdir --target "${{ matrix.target }}")/self-contained/libunwind.a" \
+                           "$(rustc --print sysroot)/lib/rustlib/${{ matrix.target }}/lib/self-contained/libunwind.a"; do
+            if [ -f "$candidate" ]; then sysroot_libunwind="$candidate"; break; fi
+          done
+          if [ -z "$sysroot_libunwind" ]; then
+            echo "::error::no sysroot libunwind for ${{ matrix.target }}; it is what defines _Unwind_Resume under -nodefaultlibs" >&2
+            exit 1
+          fi
+          echo "custom  libunwind: $unwind_prefix/lib/libunwind.a"
+          echo "sysroot libunwind: $sysroot_libunwind"
+
           export CPPFLAGS="-I$unwind_prefix/include"
-          export LDFLAGS="-L$unwind_prefix/lib"
-          export RUSTFLAGS="${RUSTFLAGS:-} -Lnative=$unwind_prefix/lib"
+          # Deliberately NO -L and NO -Lnative for unwind_prefix.
+          export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=$unwind_prefix/lib/libunwind.a -C link-arg=$sysroot_libunwind"
           cargo build --locked --profile profiling \
             --target "${{ matrix.target }}" \
             -p ferrosa --bin ferrosa --features ferrosa/full,ferrosa/profiling

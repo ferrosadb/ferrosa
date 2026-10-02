@@ -178,8 +178,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('bash .github/scripts/build-musl-libunwind.sh "${{ matrix.target }}" "$unwind_prefix"', workflow)
         self.assertIn('CPPFLAGS="-I$unwind_prefix/include"', workflow)
-        self.assertIn('LDFLAGS="-L$unwind_prefix/lib"', workflow)
-        self.assertIn('RUSTFLAGS="${RUSTFLAGS:-} -Lnative=$unwind_prefix/lib"', workflow)
+        # Both libunwinds are passed as explicit link args, never as search
+        # directories. `-L`/`-Lnative` for the hand-built archive shadowed
+        # Rust's sysroot libunwind, so `-lunwind` stopped resolving
+        # _Unwind_Resume and the musl link died with ~47 undefined references.
+        self.assertNotIn('LDFLAGS="-L$unwind_prefix/lib"', workflow)
+        self.assertNotIn("Lnative=$unwind_prefix/lib", workflow)
+        self.assertIn('link-arg=$unwind_prefix/lib/libunwind.a', workflow)
+        self.assertIn('link-arg=$sysroot_libunwind', workflow)
+        self.assertIn("self-contained/libunwind.a", workflow)
         self.assertIn("if readelf --program-headers \"$profiling_binary\" | grep 'INTERP'; then", workflow)
 
         build_script = ROOT / ".github" / "scripts" / "build-musl-libunwind.sh"

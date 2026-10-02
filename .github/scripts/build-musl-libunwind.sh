@@ -1,4 +1,25 @@
 #!/usr/bin/env bash
+# Build a musl-targeted libunwind for ferrosa's profiling image.
+#
+# WHY THIS EXISTS. ferrosa's `profiling` feature enables jemalloc's heap
+# profiler with libunwind (`profiling = ["tikv-jemallocator/profiling_libunwind"]`).
+# For that feature jemalloc-sys runs configure with `--enable-prof-libunwind` and
+# emits `cargo:rustc-link-lib=unwind`, and jemalloc then calls the libunwind C
+# API: `unw_backtrace`, `unw_flush_cache`, `unw_set_caching_policy`.
+#
+# Rust's musl sysroot ships its own self-contained/libunwind.a, but that archive
+# does NOT define those three. It defines the C++ ABI symbols instead
+# (_Unwind_Resume, __register_frame, __deregister_frame), which the Rust link
+# needs because it runs with `-nodefaultlibs` and so never pulls in libgcc.
+#
+# So BOTH archives are required, and neither may go on the library search path:
+# `-lunwind` binds to the first match, so a `-L` for this one shadows the
+# sysroot's, and the link then fails with ~47 `undefined reference to
+# _Unwind_Resume`. The release workflow links both by explicit path for this
+# reason -- see tests/ci/test_profiling_libunwind_link.py.
+#
+# Do not delete this script as redundant: the sysroot archive looks sufficient
+# (it defines the unwind symbols) but is missing unw_backtrace.
 set -euo pipefail
 
 target=${1:?usage: build-musl-libunwind.sh TARGET PREFIX}

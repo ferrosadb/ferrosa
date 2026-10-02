@@ -45,6 +45,12 @@ jobs:
         run: python3 -m unittest tests.ci.test_resolve_release_bin_dir
       - name: Check release workflow contract
         run: python3 -m unittest -q tests/ci/test_release_workflow.py
+      # Pins the musl profiling link: both libunwinds (the hand-built one for
+      # jemalloc's unw_backtrace, Rust's sysroot one for _Unwind_Resume) must be
+      # passed as link args, because `-L` makes one shadow the other and the
+      # profiling image silently stops shipping.
+      - name: Check musl profiling libunwind link contract
+        run: python3 -m unittest -q tests/ci/test_profiling_libunwind_link.py
       - name: Check CI cache workflow contract
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
       # Pins the daily OOM-audit workflow: that it still runs on a schedule,
