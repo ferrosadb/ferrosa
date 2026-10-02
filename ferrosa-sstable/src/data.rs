@@ -73,6 +73,48 @@ const CELL_IS_DELETED: u8 = 0x01;
 const CELL_IS_EXPIRING: u8 = 0x02;
 /// Cell has an empty value (tombstones, counters).
 const CELL_HAS_EMPTY_VALUE: u8 = 0x04;
+/// The set of columns present in a row, resolved WITHOUT allocating on the
+/// common path.
+///
+/// Every row body opens with a bitmap that names its present columns. In the
+/// overwhelmingly common `HAS_ALL_COLUMNS` case the set is simply the identity
+/// range `0..num_columns`, so the previous `(0..num_columns).collect()` built a
+/// throwaway `Vec<usize>` per row purely to iterate indices — one allocation per
+/// row on the hot scan path, discarded immediately after the loop.
+///
+/// Holding the range directly removes that allocation while keeping one uniform
+/// iteration shape for both cases. The subset case still needs the decoded
+/// `Vec<usize>` (its width is data-dependent), so it is the only arm that
+/// allocates.
+enum PresentColumns {
+    /// `HAS_ALL_COLUMNS`: every column index, in order.
+    All,
+    /// An explicit subset decoded from the row's present-columns bitmap.
+    Subset(Vec<usize>),
+}
+
+impl PresentColumns {
+    #[inline]
+    fn iter(&self, num_columns: usize) -> impl Iterator<Item = usize> + '_ {
+        // `0..n` is an empty-but-typed range when n == 0, matching the old
+        // `(0..0).collect()` behaviour for a column-less row.
+        let all = 0..num_columns;
+        let selected = match self {
+            PresentColumns::All => None,
+            PresentColumns::Subset(v) => Some(v.as_slice()),
+        };
+        all.filter(move |i| selected.is_none_or(|s| s.contains(i)))
+    }
+
+    #[inline]
+    fn len(&self, num_columns: usize) -> usize {
+        match self {
+            PresentColumns::All => num_columns,
+            PresentColumns::Subset(v) => v.len(),
+        }
+    }
+}
+
 /// Cell inherits the row-level timestamp (no per-cell timestamp encoded).
 const CELL_USE_ROW_TIMESTAMP: u8 = 0x08;
 /// Cell inherits the row-level TTL.
@@ -1277,10 +1319,10 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         };
         let num_columns = columns.len();
 
-        let present_columns: Vec<usize> = if flags & HAS_ALL_COLUMNS != 0 {
-            (0..num_columns).collect()
+        let present_columns = if flags & HAS_ALL_COLUMNS != 0 {
+            PresentColumns::All
         } else {
-            self.read_columns_subset(num_columns)?
+            PresentColumns::Subset(self.read_columns_subset(num_columns)?)
         };
 
         let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
@@ -1295,8 +1337,8 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // even needed — `marshal::collection_value_type` returns a `&str` derived
         // from the column type, and `columns` borrows through `Self::header`
         // (an `&'a` field), so nothing forces the metadata to be owned.
-        let mut cells = Vec::with_capacity(present_columns.len());
-        for &col_idx in &present_columns {
+        let mut cells = Vec::with_capacity(present_columns.len(num_columns));
+        for col_idx in present_columns.iter(num_columns) {
             let (is_complex, value_type) =
                 complex_col_meta(&columns[col_idx].1, self.header.complex_collections);
             if is_complex {
@@ -1516,13 +1558,13 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
         if wanted.is_empty() {
             let skipped_cells = (|| -> Result<()> {
-                let present_columns: Vec<usize> = if flags & HAS_ALL_COLUMNS != 0 {
-                    (0..num_columns).collect()
+                let present_columns = if flags & HAS_ALL_COLUMNS != 0 {
+                    PresentColumns::All
                 } else {
-                    self.read_columns_subset(num_columns)?
+                    PresentColumns::Subset(self.read_columns_subset(num_columns)?)
                 };
                 let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
-                for &col_idx in &present_columns {
+                for col_idx in present_columns.iter(num_columns) {
                     let (is_complex, value_type) =
                         complex_col_meta(&columns[col_idx].1, self.header.complex_collections);
                     if is_complex {
@@ -1552,10 +1594,10 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             });
         }
 
-        let present_columns: Vec<usize> = if flags & HAS_ALL_COLUMNS != 0 {
-            (0..num_columns).collect()
+        let present_columns = if flags & HAS_ALL_COLUMNS != 0 {
+            PresentColumns::All
         } else {
-            self.read_columns_subset(num_columns)?
+            PresentColumns::Subset(self.read_columns_subset(num_columns)?)
         };
 
         // Per-column (is_complex, value_type) is derived INLINE in the loop below
@@ -1570,8 +1612,8 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // many element cells — read or skip all of them as a unit.
         // `wanted` is small (typical SELECT projects a few cols), so linear
         // contains() is faster than a HashSet for the common case.
-        let mut cells = Vec::with_capacity(wanted.len().min(present_columns.len()));
-        for &col_idx in &present_columns {
+        let mut cells = Vec::with_capacity(wanted.len().min(present_columns.len(num_columns)));
+        for col_idx in present_columns.iter(num_columns) {
             let (is_complex, value_type) =
                 complex_col_meta(&columns[col_idx].1, self.header.complex_collections);
             let col_u16 = col_idx as u16;

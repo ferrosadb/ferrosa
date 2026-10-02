@@ -158,18 +158,21 @@ fn sstable_scan_steady_state_allocation_count() {
     );
 
     // Measured (this fixture: 2 simple columns, Int32 clustering):
-    //   BEFORE the `col_meta` fix: 3552 allocs / 384 rows = 9.25 per row
-    //   AFTER  the `col_meta` fix: 2400 allocs / 384 rows = 6.25 per row
-    // — an exact 3-alloc/row drop: the per-row `Vec` + one `String` per column.
+    //   3552 allocs / 384 rows = 9.250 per row   (original)
+    //   2400 allocs / 384 rows = 6.250 per row   (per-row `col_meta` table removed)
+    //   2016 allocs / 384 rows = 5.250 per row   (per-row `present_columns` Vec removed)
+    // — an exact 4-alloc/row drop across the two fixes.
     //
-    // The remainder is close to the honest return payload: each decoded row owns
-    // a clustering `Vec<u8>`, a `Vec<(u16, CellValue)>` of 2 cells, two cell
-    // value `Vec<u8>`s, and the small `present_columns` index Vec (the next
-    // candidate, still a per-row intermediate).
+    // The remainder is the honest return payload: each decoded row owns a
+    // clustering `Vec<u8>`, a `Vec<(u16, CellValue)>` of 2 cells, and two cell
+    // value `Vec<u8>`s. Those are *constructed* by the decoder, so moving does
+    // not remove them; only a caller-owned/pooled decode could, which is a
+    // separate API change.
     //
-    // Guard budget: 7/row. The pre-fix 9.25/row (the `col_meta` table) trips it;
-    // the post-fix 6.25/row clears it with margin.
-    const BUDGET_PER_ROW: usize = 7;
+    // Guard budget: 6/row, tightened so it catches EITHER regression — the
+    // `col_meta` table (+3/row -> 8.25) and the `present_columns` Vec (+1/row ->
+    // 6.25) each trip it, while the current 5.25 clears it.
+    const BUDGET_PER_ROW: usize = 6;
     let budget = rows_scanned * BUDGET_PER_ROW;
     assert!(
         steady <= budget,
