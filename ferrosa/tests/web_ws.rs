@@ -46,8 +46,8 @@ impl VirtualTable for StubConnectionsTable {
         &[]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
-        vec![VirtualRow { cells: vec![] }]
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
+        visit(VirtualRow { cells: vec![] });
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {
@@ -76,9 +76,9 @@ impl VirtualTable for CountingDemandTable {
         &[]
     }
 
-    fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
+    fn visit_rows(&self, _predicate: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        vec![VirtualRow { cells: vec![] }]
+        visit(VirtualRow { cells: vec![] });
     }
 
     fn subscription_mode(&self) -> SubscriptionMode {
