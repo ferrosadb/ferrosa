@@ -82,17 +82,20 @@ const CELL_USE_ROW_TTL: u8 = 0x10;
 /// collection is *complex* (multi-cell): its element cells carry a cell-path and
 /// their value is serialized with the collection's element/value type. Anything
 /// else is *simple*: one cell, value serialized with the column type itself.
-fn complex_col_meta(column_type: &str, complex_collections: bool) -> (bool, String) {
+///
+/// Both results BORROW from `column_type` (the collection's element/value type
+/// is a sub-slice of its type name), so deriving this per column costs no
+/// allocation. This is on the per-row hot path: an earlier version returned an
+/// owned `String` and was called once per column per row.
+fn complex_col_meta(column_type: &str, complex_collections: bool) -> (bool, &str) {
     if complex_collections && marshal::is_multicell(column_type) {
         // value_type is used only for simple columns; complex columns always
         // length-prefix their value. For a collection it's the element/value
         // type; for a UDT (per-field types) it is unused, so pass the column type.
-        let value_type = marshal::collection_value_type(column_type)
-            .unwrap_or(column_type)
-            .to_string();
+        let value_type = marshal::collection_value_type(column_type).unwrap_or(column_type);
         (true, value_type)
     } else {
-        (false, column_type.to_string())
+        (false, column_type)
     }
 }
 
@@ -1280,37 +1283,36 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             self.read_columns_subset(num_columns)?
         };
 
-        // Precompute per-column (is_complex, value_type) so the read loop below
-        // does not borrow `self.header` across the `&mut self` cell reads.
-        let col_meta: Vec<(usize, bool, String)> = present_columns
-            .iter()
-            .map(|&ci| {
-                let (is_complex, value_type) =
-                    complex_col_meta(&columns[ci].1, self.header.complex_collections);
-                (ci, is_complex, value_type)
-            })
-            .collect();
         let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
 
         // Read cells. A simple column is one cell; a complex (collection) column
         // is `[complex deletion?] uvint(cell-count)` then that many element cells,
         // each carrying a cell-path.
+        //
+        // The per-column `(is_complex, value_type)` is derived INLINE rather than
+        // precomputed into a `Vec<(usize, bool, String)>`: that table allocated
+        // one `String` per column PER ROW on the hot scan path, and it was not
+        // even needed — `marshal::collection_value_type` returns a `&str` derived
+        // from the column type, and `columns` borrows through `Self::header`
+        // (an `&'a` field), so nothing forces the metadata to be owned.
         let mut cells = Vec::with_capacity(present_columns.len());
-        for (col_idx, is_complex, value_type) in &col_meta {
-            if *is_complex {
+        for &col_idx in &present_columns {
+            let (is_complex, value_type) =
+                complex_col_meta(&columns[col_idx].1, self.header.complex_collections);
+            if is_complex {
                 let dt = self.read_complex_deletion(has_complex_deletion)?;
                 if let Some(sentinel) = complex_deletion_sentinel(dt) {
-                    cells.push((*col_idx as u16, sentinel));
+                    cells.push((col_idx as u16, sentinel));
                 }
                 let (count, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
                 for _ in 0..count {
                     let cell = self.read_cell(&liveness, value_type, true)?;
-                    cells.push((*col_idx as u16, cell));
+                    cells.push((col_idx as u16, cell));
                 }
             } else {
                 let cell = self.read_cell(&liveness, value_type, false)?;
-                cells.push((*col_idx as u16, cell));
+                cells.push((col_idx as u16, cell));
             }
         }
 
@@ -1519,13 +1521,11 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 } else {
                     self.read_columns_subset(num_columns)?
                 };
-                let col_meta: Vec<(bool, String)> = present_columns
-                    .iter()
-                    .map(|&ci| complex_col_meta(&columns[ci].1, self.header.complex_collections))
-                    .collect();
                 let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
-                for (is_complex, value_type) in &col_meta {
-                    if *is_complex {
+                for &col_idx in &present_columns {
+                    let (is_complex, value_type) =
+                        complex_col_meta(&columns[col_idx].1, self.header.complex_collections);
+                    if is_complex {
                         // Skip-all path: consume the complex deletion, emit nothing.
                         self.read_complex_deletion(has_complex_deletion)?;
                         let (count, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -1558,16 +1558,11 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             self.read_columns_subset(num_columns)?
         };
 
-        // Per-column (is_complex, value_type), precomputed so the read loop does
-        // not borrow `self.header` across the `&mut self` cell reads.
-        let col_meta: Vec<(usize, bool, String)> = present_columns
-            .iter()
-            .map(|&ci| {
-                let (is_complex, value_type) =
-                    complex_col_meta(&columns[ci].1, self.header.complex_collections);
-                (ci, is_complex, value_type)
-            })
-            .collect();
+        // Per-column (is_complex, value_type) is derived INLINE in the loop below
+        // rather than precomputed into a `Vec<(usize, bool, String)>`: the table
+        // allocated one `String` per column per row, and `columns` borrows
+        // through `Self::header` (`&'a`) while `collection_value_type` returns a
+        // `&str`, so no owned metadata is required.
         let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
 
         // For each present column: decode if wanted, skip otherwise. A complex
@@ -1576,10 +1571,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // `wanted` is small (typical SELECT projects a few cols), so linear
         // contains() is faster than a HashSet for the common case.
         let mut cells = Vec::with_capacity(wanted.len().min(present_columns.len()));
-        for (col_idx, is_complex, value_type) in &col_meta {
-            let col_u16 = *col_idx as u16;
+        for &col_idx in &present_columns {
+            let (is_complex, value_type) =
+                complex_col_meta(&columns[col_idx].1, self.header.complex_collections);
+            let col_u16 = col_idx as u16;
             let want = wanted.contains(&col_u16);
-            if *is_complex {
+            if is_complex {
                 let dt = self.read_complex_deletion(has_complex_deletion)?;
                 if want {
                     if let Some(sentinel) = complex_deletion_sentinel(dt) {

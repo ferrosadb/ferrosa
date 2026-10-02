@@ -1729,10 +1729,17 @@ impl SSTableWriter {
     ) -> Result<()> {
         use crate::reader::{SSTableComponents, SSTableReader};
 
+        // Borrow the already-materialized component bytes by reference instead
+        // of deep-cloning them: `ReadAt` is implemented for `&[u8]`, and the
+        // reader holds only views over the caller's `SSTableOutput` for the
+        // duration of this verification walk. The output is never mutated
+        // afterwards, so the borrow is sound and the clone (a second full
+        // copy of Data.db, which for a flush-sized SSTable is the dominant
+        // allocation here) is elided.
         let components = SSTableComponents {
-            data: output.data.clone(),
-            partitions: output.partitions.clone(),
-            rows: output.rows.clone(),
+            data: &output.data[..],
+            partitions: &output.partitions[..],
+            rows: &output.rows[..],
             filter: output.filter.clone(),
             compression_info: output.compression_info.clone(),
             statistics: output.statistics.clone(),
