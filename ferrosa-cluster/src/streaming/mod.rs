@@ -33,6 +33,34 @@ pub struct StreamedMutation {
     pub timestamp: i64,
 }
 
+impl StreamedMutation {
+    /// Encode one whole partition for row streaming (bootstrap, decommission,
+    /// rebalance). The single encoder every sender uses, so what crosses the
+    /// wire is decided here and nowhere else.
+    pub fn from_partition(
+        keyspace: &str,
+        table: &str,
+        partition: &ferrosa_sstable::types::Partition,
+    ) -> Result<Self, bincode::Error> {
+        use crate::raft::handlers::RowWire;
+        let wire_rows: Vec<RowWire> = partition.rows.iter().cloned().map(RowWire::from).collect();
+        let row = bincode::serialize(&wire_rows)?;
+        let timestamp = partition
+            .rows
+            .first()
+            .and_then(|r| r.cells.first())
+            .map(|(_, cv)| cv.timestamp)
+            .unwrap_or(0);
+        Ok(Self {
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            key: partition.key.key.as_bytes().to_vec(),
+            row,
+            timestamp,
+        })
+    }
+}
+
 /// Payload carried in a `StreamStart` message.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct StreamStartPayload {

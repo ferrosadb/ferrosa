@@ -2680,35 +2680,18 @@ impl ModeController {
                                     let owner = ring.primary_owner(token).unwrap_or(local_node_id);
 
                                     if owner != local_node_id {
-                                        use crate::raft::handlers::RowWire;
-                                        let wire_rows: Vec<RowWire> = partition.rows
-                                            .iter()
-                                            .cloned()
-                                            .map(RowWire::from)
-                                            .collect();
-                                        let row_bytes = match bincode::serialize(&wire_rows) {
-                                            Ok(bytes) => bytes,
+                                        let mutation = match StreamedMutation::from_partition(ks, tbl, partition) {
+                                            Ok(mutation) => mutation,
                                             Err(e) => {
                                                 tracing::error!(
                                                     %e,
                                                     partition_key = ?partition.key,
-                                                    "bootstrap: failed to serialize rows, skipping partition (data loss avoided)"
+                                                    "bootstrap: failed to serialize partition, skipping partition (data loss avoided)"
                                                 );
                                                 continue;
                                             }
                                         };
-                                        let ts = partition.rows.first()
-                                            .and_then(|r| r.cells.first())
-                                            .map(|(_, cv)| cv.timestamp)
-                                            .unwrap_or(0);
-
-                                        by_node.entry(owner).or_default().push(StreamedMutation {
-                                            keyspace: ks.clone(),
-                                            table: tbl.clone(),
-                                            key: partition.key.key.as_bytes().to_vec(),
-                                            row: row_bytes,
-                                            timestamp: ts,
-                                        });
+                                        by_node.entry(owner).or_default().push(mutation);
                                     }
                                 }
 

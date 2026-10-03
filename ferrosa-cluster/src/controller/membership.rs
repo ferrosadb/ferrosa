@@ -252,41 +252,26 @@ impl ModeController {
                                 .get_node(target_nid)
                                 .map(|n| n.host_id)
                                 .unwrap_or_default();
-                            // Serialize all rows via RowWire for full fidelity
-                            // (clustering keys, all cells, deletion, liveness).
-                            use crate::raft::handlers::RowWire;
-                            let wire_rows: Vec<RowWire> =
-                                partition.rows.iter().cloned().map(RowWire::from).collect();
                             // An empty payload used to stand in for a failed
                             // encode, and the receiver stored it as a live cell.
-                            let row_bytes = match bincode::serialize(&wire_rows) {
-                                Ok(bytes) => bytes,
+                            let mutation = match crate::streaming::StreamedMutation::from_partition(
+                                ks, tbl, &partition,
+                            ) {
+                                Ok(mutation) => mutation,
                                 Err(e) => {
                                     tracing::error!(
                                         %e,
                                         ks,
                                         tbl,
                                         partition_key = ?partition.key,
-                                        "decommission: failed to serialize rows, partition NOT streamed"
+                                        "decommission: failed to serialize partition, partition NOT streamed"
                                     );
                                     continue;
                                 }
                             };
-                            let ts = partition
-                                .rows
-                                .first()
-                                .and_then(|r| r.cells.first())
-                                .map(|(_, cv)| cv.timestamp)
-                                .unwrap_or(0);
 
                             session_counter += 1;
-                            let mutations = vec![crate::streaming::StreamedMutation {
-                                keyspace: ks.clone(),
-                                table: tbl.clone(),
-                                key: partition.key.key.as_bytes().to_vec(),
-                                row: row_bytes,
-                                timestamp: ts,
-                            }];
+                            let mutations = vec![mutation];
                             if let Err(e) = crate::streaming::sender::StreamSender::send_stream(
                                 mutations,
                                 &peer_manager,
