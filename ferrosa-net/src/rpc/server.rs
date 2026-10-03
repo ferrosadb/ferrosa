@@ -1500,14 +1500,10 @@ mod tests {
             );
         }
 
-        /// Mixed versions: a peer whose Handshake carries no capability bits
-        /// predates error replies and must never be sent one.
-        #[tokio::test(start_paused = true)]
-        async fn peer_without_error_reply_capability_gets_no_error_frame() {
-            let io = serve(registry_with(MsgType::Ping, Arc::new(PanicOnZero)));
-            let config = NetConfig::default();
-            let mut framed = Framed::new(io, InternodeCodec::new(config.max_frame_body_size));
-            let old_handshake = Message::Handshake {
+        /// A Handshake body exactly as a build before the capability field
+        /// wrote it: the current encoding minus its 4 trailing bytes.
+        fn pre_capability_handshake(config: &NetConfig) -> bytes::Bytes {
+            let handshake = Message::Handshake {
                 cluster_name: config.cluster_name.clone(),
                 host_id: uuid::Uuid::new_v4(),
                 protocol_version: crate::handshake::PROTOCOL_VERSION,
@@ -1518,26 +1514,227 @@ mod tests {
                 capabilities: 0,
             };
             let mut body = BytesMut::new();
-            old_handshake.encode(&mut body).unwrap();
+            handshake.encode(&mut body).unwrap();
+            let old_len = body.len() - 4;
+            assert_eq!(&body[old_len..], &[0, 0, 0, 0], "capabilities must trail");
+            body.truncate(old_len);
+            body.freeze()
+        }
+
+        fn encoded(msg: &Message) -> bytes::Bytes {
+            let mut body = BytesMut::new();
+            msg.encode(&mut body).unwrap();
+            body.freeze()
+        }
+
+        /// Rolling restart, old client → new server: a peer on the previous
+        /// build (its Handshake has no capability field at all) is accepted,
+        /// is served normally, and is never sent an error reply it could not
+        /// parse — it keeps the old behaviour of failing at its lane timeout.
+        #[tokio::test(start_paused = true)]
+        async fn peer_without_error_reply_capability_gets_no_error_frame() {
+            let io = serve(registry_with(MsgType::Ping, Arc::new(PanicOnZero)));
+            let config = NetConfig::default();
+            let mut framed = Framed::new(io, InternodeCodec::new(config.max_frame_body_size));
             framed
-                .send(raw_frame(MsgType::Handshake, 0, 0, body.freeze()))
+                .send(raw_frame(
+                    MsgType::Handshake,
+                    0,
+                    0,
+                    pre_capability_handshake(&config),
+                ))
                 .await
                 .unwrap();
             let ack = framed.next().await.unwrap().unwrap();
-            assert_eq!(ack.header.msg_type, MsgType::HandshakeAck);
+            let ack = Message::decode(ack.header.msg_type, &mut ack.body.clone()).unwrap();
+            assert!(
+                matches!(ack, Message::HandshakeAck { accepted: true, .. }),
+                "old peer rejected: {ack:?}"
+            );
 
-            let mut body = BytesMut::new();
-            ping(0).encode(&mut body).unwrap();
             framed
-                .send(raw_frame(MsgType::Ping, 3, 0, body.freeze()))
+                .send(raw_frame(MsgType::Ping, 3, 0, encoded(&ping(0))))
                 .await
                 .unwrap();
-
             let next = tokio::time::timeout(SILENCE, framed.next()).await;
             assert!(
                 next.is_err(),
                 "pre-capability peer was sent a frame: {next:?}"
             );
+
+            framed
+                .send(raw_frame(MsgType::Ping, 4, 0, encoded(&ping(1))))
+                .await
+                .unwrap();
+            let reply = framed.next().await.unwrap().unwrap();
+            assert_eq!(reply.header.flags & FLAG_RPC_ERROR, 0);
+            assert_eq!(reply.header.stream_id, 4);
+            let reply = Message::decode(reply.header.msg_type, &mut reply.body.clone()).unwrap();
+            assert!(
+                matches!(reply, Message::Pong { nonce: 1, .. }),
+                "got {reply:?}"
+            );
+        }
+
+        /// Rolling restart, new client → old server. The old server's decoder
+        /// stops after `internode_broadcast` and never checks for leftover
+        /// bytes (origin/main `Message::decode` and `accept_handshake`), so it
+        /// reads exactly the fields of the pre-capability prefix and ignores
+        /// the trailing u32. It answers with the unchanged HandshakeAck, serves
+        /// requests normally, and sends nothing for a failed one: the new
+        /// client then falls back to its lane deadline, the pre-fix behaviour.
+        #[tokio::test(start_paused = true)]
+        async fn new_client_against_pre_capability_server() {
+            let (client_io, server_io) = tokio::io::duplex(1 << 20);
+            tokio::spawn(async move {
+                let config = NetConfig::default();
+                let mut framed =
+                    Framed::new(server_io, InternodeCodec::new(config.max_frame_body_size));
+                let hs = framed.next().await.unwrap().unwrap();
+                // What an old decoder sees: the same fields as the prefix.
+                let full = Message::decode(MsgType::Handshake, &mut hs.body.clone()).unwrap();
+                let prefix = hs.body.slice(..hs.body.len() - 4);
+                let old_view = Message::decode(MsgType::Handshake, &mut prefix.clone()).unwrap();
+                let (
+                    Message::Handshake {
+                        host_id: a,
+                        cluster_name: ca,
+                        capabilities,
+                        ..
+                    },
+                    Message::Handshake {
+                        host_id: b,
+                        cluster_name: cb,
+                        ..
+                    },
+                ) = (&full, &old_view)
+                else {
+                    panic!("not a handshake: {full:?}");
+                };
+                assert_eq!((a, ca), (b, cb));
+                assert_eq!(*capabilities, crate::handshake::LOCAL_CAPABILITIES);
+                let ack = Message::HandshakeAck {
+                    host_id: uuid::Uuid::new_v4(),
+                    protocol_version: crate::handshake::PROTOCOL_VERSION,
+                    chosen_compression: 0,
+                    accepted: true,
+                    reason: String::new(),
+                    cql_broadcast: None,
+                    internode_broadcast: None,
+                };
+                framed
+                    .send(raw_frame(MsgType::HandshakeAck, 0, 0, encoded(&ack)))
+                    .await
+                    .unwrap();
+                // Old server: answer nonce != 0, send nothing when the
+                // handler "fails" on nonce 0.
+                while let Some(Ok(frame)) = framed.next().await {
+                    let msg =
+                        Message::decode(frame.header.msg_type, &mut frame.body.clone()).unwrap();
+                    if let Message::Ping { nonce, .. } = msg {
+                        if nonce != 0 {
+                            let pong = Message::Pong {
+                                nonce,
+                                ping_recv_at: 0,
+                                sent_at: 0,
+                            };
+                            let mut reply =
+                                raw_frame(MsgType::Pong, frame.header.stream_id, 0, encoded(&pong));
+                            reply.header.lane = frame.header.lane;
+                            framed.send(reply).await.unwrap();
+                        }
+                    }
+                }
+            });
+            let client = RpcClient::connect_over_stream(
+                Arc::new(NetConfig::default()),
+                uuid::Uuid::new_v4(),
+                peer_addr(),
+                client_io,
+            )
+            .await
+            .unwrap();
+
+            let pong = client
+                .send_with_timeout(ping(7), Lane::Data, Lane::Data.timeout())
+                .await
+                .unwrap();
+            assert!(
+                matches!(pong, Message::Pong { nonce: 7, .. }),
+                "got {pong:?}"
+            );
+
+            let started = tokio::time::Instant::now();
+            let failed = client
+                .send_with_timeout(ping(0), Lane::Data, Lane::Data.timeout())
+                .await;
+            assert!(
+                matches!(failed, Err(NetError::Timeout(_))),
+                "got {failed:?}"
+            );
+            assert_eq!(started.elapsed(), Lane::Data.timeout());
+            assert_eq!(client.pending_len(), 0, "stream slot leaked");
+        }
+
+        /// The connection closes at the very instant the requests' deadline
+        /// fires. Each request still resolves exactly once (timeout or
+        /// connection-closed), the slot map empties, and the in-flight gauge
+        /// returns to zero rather than going negative: the timeout path, the
+        /// close drain and a reply race only for the one oneshot sender
+        /// (`DashMap::remove` hands it to exactly one of them).
+        #[tokio::test(start_paused = true)]
+        async fn close_racing_the_deadline_releases_each_request_once() {
+            let (client_io, server_io) = tokio::io::duplex(1 << 20);
+            tokio::spawn(async move {
+                let config = NetConfig::default();
+                let mut framed =
+                    Framed::new(server_io, InternodeCodec::new(config.max_frame_body_size));
+                accept_handshake(&mut framed, &config, uuid::Uuid::new_v4())
+                    .await
+                    .unwrap();
+                for _ in 0..3 {
+                    let request = framed.next().await;
+                    assert!(
+                        matches!(request, Some(Ok(_))),
+                        "missing request: {request:?}"
+                    );
+                }
+                tokio::time::sleep(Lane::Data.timeout()).await;
+                // Drop exactly as the client deadlines fire.
+            });
+            let client = RpcClient::connect_over_stream(
+                Arc::new(NetConfig::default()),
+                uuid::Uuid::new_v4(),
+                peer_addr(),
+                client_io,
+            )
+            .await
+            .unwrap();
+
+            let send =
+                |nonce| client.send_with_timeout(ping(nonce), Lane::Data, Lane::Data.timeout());
+            let results = tokio::join!(send(1), send(2), send(3));
+
+            for result in [results.0, results.1, results.2] {
+                assert!(
+                    matches!(&result, Err(NetError::Timeout(_)))
+                        || matches!(&result, Err(NetError::Protocol(m)) if m.contains("connection closed")),
+                    "got {result:?}"
+                );
+            }
+            assert_eq!(client.pending_len(), 0, "stream slot leaked");
+            assert_eq!(client.in_flight.load(Ordering::Relaxed), 0);
+
+            // The dead connection refuses new work at once instead of
+            // stranding it until a deadline.
+            let after = client
+                .send_with_timeout(ping(4), Lane::Data, Lane::Data.timeout())
+                .await;
+            assert!(
+                matches!(&after, Err(NetError::Protocol(m)) if m.contains("connection closed")),
+                "got {after:?}"
+            );
+            assert_eq!(client.pending_len(), 0);
         }
 
         /// A connection that closes fails every request still waiting on it
