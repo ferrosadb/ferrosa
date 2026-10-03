@@ -100,7 +100,7 @@ impl StreamSender {
     ///
     /// Returns the number of mutations the receiver applied, once its
     /// `StreamEnd` reply says the count and checksum matched and the session
-    /// was applied ([`verify_stream_end_reply`]). Any network or serialisation
+    /// was applied (see `verify_stream_end_reply`). Any network or serialisation
     /// failure, a receiver rejection, or a reply that carries no verdict is a
     /// `ClusterError`: callers that change membership must not treat an
     /// unverified stream as moved data (P0-2).

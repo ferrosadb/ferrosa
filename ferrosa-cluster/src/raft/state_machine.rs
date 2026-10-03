@@ -216,7 +216,7 @@ pub struct RaftState {
     /// `serde(skip)`: adding a field to this struct would change the bincode
     /// layout of every persisted snapshot, and an upgraded node could no longer
     /// load the snapshot its previous build wrote. The map travels instead in a
-    /// trailing [`SnapshotExtension`] after the unchanged `SnapshotData`.
+    /// trailing `SnapshotExtension` after the unchanged `SnapshotData`.
     #[serde(skip)]
     pub bootstrap_complete: BTreeMap<u64, super::DataMovementEvidence>,
 }
