@@ -287,10 +287,15 @@ fn seed(engine: &StorageEngine) {
 /// Fold one scanned row into an O(1) accumulator: the count, and a sum over the
 /// `score` column (which holds the row's index). Together these prove every row
 /// arrived exactly once without the consumer ever holding more than one row.
+/// The sum of squares makes a dropped row and a duplicated one cancel only if
+/// they also cancel in the plain sum, which two distinct indexes cannot do.
+/// Each row's `id` must name its own `score`, so rows stitched together from
+/// two partitions fail too.
 #[derive(Default, PartialEq, Eq, Debug)]
 struct Digest {
     count: usize,
     score_sum: i64,
+    score_square_sum: i64,
     payload_bytes: usize,
 }
 
@@ -298,9 +303,19 @@ fn digest_of(rows: impl Iterator<Item = ferrosa_sql::Row>) -> Digest {
     let mut d = Digest::default();
     for row in rows {
         d.count += 1;
-        match row.get(3) {
-            Value::Int(score) => d.score_sum += score,
+        let score = match row.get(3) {
+            Value::Int(score) => *score,
             other => panic!("score must be an int, got {other:?}"),
+        };
+        d.score_sum += score;
+        d.score_square_sum += score * score;
+        match row.get(0) {
+            Value::Text(id) => assert_eq!(
+                id.strip_prefix("row").and_then(|n| n.parse::<i64>().ok()),
+                Some(score),
+                "row id {id} carries another row's score {score}"
+            ),
+            other => panic!("id must be text, got {other:?}"),
         }
         match row.get(2) {
             Value::Text(name) => d.payload_bytes += name.len(),
@@ -315,6 +330,7 @@ fn expected_digest() -> Digest {
     Digest {
         count: ROWS,
         score_sum: (0..ROWS as i64).sum(),
+        score_square_sum: (0..ROWS as i64).map(|i| i * i).sum(),
         payload_bytes: ROWS * VALUE_BYTES,
     }
 }
