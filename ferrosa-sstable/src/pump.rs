@@ -1426,7 +1426,7 @@ fn record_blocked_free(elapsed: Duration) {
 
 /// Segments the producer has handed to a flusher that the flusher has not yet
 /// written and returned to `free` — the live value of
-/// `write_pump_inflight_segments`, one per live [`InflightSegment`]. Bounded
+/// `write_pump_inflight_segments`, one per live `InflightSegment`. Bounded
 /// per pump by `depth + 1` (architecture.md § Backpressure chain,
 /// `write_pump_inflight_segments`); summed across every open pump.
 pub fn write_pump_inflight_segments() -> u64 {
