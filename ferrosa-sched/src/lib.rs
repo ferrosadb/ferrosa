@@ -258,6 +258,14 @@ pub fn render_prometheus() -> String {
         "ferrosa_sched_scan_parks_total {}\n",
         scan_parks_total()
     ));
+    out.push_str(
+        "# HELP ferrosa_sched_scan_releases_total Times a scan producer paused, giving back its pool slot and its thread, because its consumer stopped reading.\n\
+         # TYPE ferrosa_sched_scan_releases_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_scan_releases_total {}\n",
+        scan_releases_total()
+    ));
     // Runtime-stall detector (Phase 3): async-runtime freeze visibility. Kept as
     // its own module (process-global counters, no dependence on the pool) so it
     // reports even before any scan runs.
