@@ -13,7 +13,12 @@
 //!
 //! 1. peak additional heap during push+drain is bounded (does not scale with the
 //!    total row count), and
-//! 2. the output is complete and correctly ordered (no loss/dup/misorder).
+//! 2. the output is exactly the pushed rows, each intact, in sorted order (no
+//!    loss/dup/misorder/row mixing), checked against a reference built outside
+//!    the measurement window.
+//!
+//! Scope: this bounds the SORTER. It says nothing about callers that collect
+//! the sorted output (the CQL router does, into one `Vec`).
 //!
 //! Modeled on `ferrosa-cluster/tests/range_scan_streaming_memory_bound.rs`.
 
@@ -70,11 +75,12 @@ fn measure_peak<R>(f: impl FnOnce() -> R) -> (R, i64) {
 /// meaningful byte footprint (magnifies the gap between bounded and unbounded).
 const PAYLOAD_BYTES: usize = 512;
 
+/// The payload carries the row's own key, so a merge that pairs one row's key
+/// with another row's payload is caught, not only a misordered key.
 fn make_row(key: i64) -> Vec<Option<CqlValue>> {
-    vec![
-        Some(CqlValue::Bigint(key)),
-        Some(CqlValue::Blob(vec![0u8; PAYLOAD_BYTES])),
-    ]
+    let mut payload = vec![0u8; PAYLOAD_BYTES];
+    payload[..8].copy_from_slice(&key.to_le_bytes());
+    vec![Some(CqlValue::Bigint(key)), Some(CqlValue::Blob(payload))]
 }
 
 /// Deterministic LCG (no `rand` dependency) producing pseudo-random keys.
@@ -95,15 +101,26 @@ fn sort_peak(n: usize, threshold_bytes: u64) -> (i64, bool, bool) {
     let dir = tempfile::tempdir().unwrap();
     let order = RowOrder::new(vec![(0, true)]);
 
+    let seed = 0x1234_5678 ^ n as u64;
+    // The exact expected output, built BEFORE the measurement window so the
+    // reference never counts against the sorter: every pushed key, sorted.
+    // Checking against it (not just "non-decreasing, right count") catches a
+    // merge that drops one row and repeats another.
+    let mut expected: Vec<i64> = {
+        let mut rng = Lcg(seed);
+        (0..n).map(|_| rng.next_key()).collect()
+    };
+    expected.sort_unstable();
+
     let ((spilled, in_order), peak) = measure_peak(|| {
         let mut sorter = ExternalSorter::new(dir.path(), order, threshold_bytes);
-        let mut rng = Lcg(0x1234_5678 ^ n as u64);
+        let mut rng = Lcg(seed);
         for _ in 0..n {
             sorter.push(make_row(rng.next_key())).unwrap();
         }
         let spilled = sorter.spilled();
-        // Drain in sorted order, holding at most one row + the previous key.
-        let mut prev: Option<i64> = None;
+        // Drain in sorted order, comparing each row with the reference in
+        // place, so the result never accumulates.
         let mut in_order = true;
         let mut count = 0usize;
         for row in sorter.finish().unwrap() {
@@ -112,12 +129,17 @@ fn sort_peak(n: usize, threshold_bytes: u64) -> (i64, bool, bool) {
                 Some(CqlValue::Bigint(k)) => k,
                 _ => panic!("expected bigint key"),
             };
-            if let Some(p) = prev {
-                if key < p {
-                    in_order = false;
-                }
+            match &row[1] {
+                Some(CqlValue::Blob(payload)) => assert_eq!(
+                    payload[..8],
+                    key.to_le_bytes(),
+                    "row {count}: payload belongs to another row (n={n})"
+                ),
+                other => panic!("row {count}: expected blob payload, got {other:?}"),
             }
-            prev = Some(key);
+            if expected.get(count) != Some(&key) {
+                in_order = false;
+            }
             count += 1;
             // `row` drops here — the result never accumulates.
         }
@@ -150,7 +172,7 @@ fn order_by_spill_peak_is_independent_of_row_count() {
     );
     assert!(
         small_ok && large_ok,
-        "both runs must emit fully sorted output"
+        "both runs must emit exactly the pushed rows in sorted order"
     );
 
     // Bounded working set: 16x the rows must NOT cost ~16x the peak heap. Slack
