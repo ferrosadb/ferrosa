@@ -9581,9 +9581,10 @@ impl StorageEngine {
     ///
     /// First builds a sidecar for any live SSTable that has none, so a query
     /// tokenizes such an SSTable at most once instead of on every call. The
-    /// build runs with the table lock released and is single-flight per table;
-    /// a failure is logged by the build and leaves that SSTable to the
-    /// full-scan fallback, which still returns its rows.
+    /// build holds nothing engine-wide and is single-flight per sidecar; a
+    /// sidecar another query is building, or whose build failed (logged by
+    /// the build), is left to the full-scan fallback, which still returns its
+    /// rows.
     fn fulltext_sidecars_for_query(
         &self,
         table_id: &TableId,
@@ -33620,6 +33621,74 @@ mod tests {
             1,
             "the sidecar built for the uncovered SSTable must be persisted"
         );
+    }
+
+    /// A burst of queries that all find the same SSTables without a sidecar
+    /// builds each sidecar ONCE. This was a per-table `Mutex` that made every
+    /// query wait for every build; it is now a per-sidecar claim, and a query
+    /// that finds a build in flight scans instead of waiting (t_d938e6ae).
+    #[test]
+    fn concurrent_fts_sidecar_builds_build_each_sidecar_once() {
+        const SSTABLES: usize = 4;
+        const ROWS: usize = 400;
+        const QUERIES: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+        (0..SSTABLES).for_each(|s| {
+            (0..ROWS).for_each(|r| {
+                let body = format!("alpha beta gamma delta row{s}x{r} epsilon zeta eta theta");
+                engine
+                    .write(
+                        &tid,
+                        &make_key(&format!("doc{s}-{r:04}")),
+                        make_row(body.as_bytes(), 1),
+                        1,
+                    )
+                    .unwrap();
+            });
+            engine.flush(&tid).unwrap();
+        });
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let sidecars = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.to_string_lossy().ends_with("-FTI-idx_body.db"))
+                .collect()
+        };
+        sidecars(&table_dir)
+            .into_iter()
+            .for_each(|path| std::fs::remove_file(path).unwrap());
+
+        let state = engine.require_table(&tid).unwrap();
+        let start = std::sync::Barrier::new(QUERIES);
+        let outcomes: Vec<crate::store::FulltextSidecarOutcome> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..QUERIES)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let build = state.store.plan_missing_fulltext_sidecars("idx_body");
+                        start.wait();
+                        build.run()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let built: usize = outcomes.iter().map(|o| o.built).sum();
+        let failed: usize = outcomes.iter().map(|o| o.failed).sum();
+        assert_eq!(failed, 0, "{outcomes:?}");
+        assert_eq!(
+            built, SSTABLES,
+            "each uncovered SSTable's sidecar must be built exactly once: {outcomes:?}"
+        );
+        assert_eq!(sidecars(&table_dir).len(), SSTABLES);
+        engine.shutdown().unwrap();
     }
 
     /// Concurrent writes + flushes + compaction — reproduces the loadgen data loss.

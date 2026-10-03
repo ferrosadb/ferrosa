@@ -633,10 +633,11 @@ pub struct TableStore<F: FlushTarget> {
     /// Generations whose object recently failed to open: they fail fast for a
     /// short TTL instead of costing a reopen per retry per read.
     missing_sstables: MissingSstableCache,
-    /// Serializes FTI sidecar builds for this table, so a burst of concurrent
-    /// queries that all find the same SSTable uncovered builds its sidecar
-    /// once instead of tokenizing it once per query at the same time.
-    fulltext_sidecar_build_lock: Arc<Mutex<()>>,
+    /// `gen/index` keys of the FTI sidecars being built for this table, so a
+    /// burst of concurrent queries that all find the same SSTable uncovered
+    /// builds its sidecar once instead of tokenizing it once per query at the
+    /// same time. A query that finds a build in flight does not wait for it.
+    fulltext_sidecars_in_flight: Arc<crate::lockfree::SharedSet>,
 }
 
 /// The index declarations of one table, as one immutable value.
@@ -960,22 +961,72 @@ pub struct FulltextSidecarOutcome {
     /// Sidecars a concurrent build had already written by the time this one
     /// reached them.
     pub already_present: usize,
+    /// Sidecars another build was writing when this one reached them. This
+    /// build did not wait for it: the query that ran it scans those SSTables
+    /// in full this once instead.
+    pub in_flight_elsewhere: usize,
     /// Sidecars that could not be built or written. Each is logged at ERROR;
     /// queries keep scanning that SSTable in full until one is built.
     pub failed: usize,
 }
 
-/// FTI sidecars planned under the engine's table lock and built without it.
+/// FTI sidecars planned from one view of a table and built outside it.
 ///
 /// Holds only shared handles (flush target, schema snapshot, readers, the
-/// table's single-flight lock), so tokenizing a large SSTable never holds the lock
-/// every read, write and DDL statement on the node goes through.
+/// table's set of sidecars being built), so tokenizing a large SSTable holds
+/// nothing any read, write or DDL statement waits on.
 #[must_use = "a planned sidecar build does nothing until it is run"]
 pub struct FulltextSidecarBuild<F: FlushTarget> {
     flush_target: Arc<F>,
     schema: Arc<TableSchema>,
-    single_flight: Arc<Mutex<()>>,
+    /// `gen/index` keys of the sidecars being built right now, by any build
+    /// of this table: single-flight per sidecar, with no lock to wait on.
+    in_flight: Arc<crate::lockfree::SharedSet>,
     jobs: Vec<FulltextSidecarJob<F::Reader>>,
+}
+
+/// One sidecar build's claim on its `gen/index` key in the table's in-flight
+/// set; dropping it releases the claim, whether the build succeeded, failed
+/// or panicked.
+struct SidecarClaim<'a> {
+    in_flight: &'a crate::lockfree::SharedSet,
+    key: String,
+}
+
+impl<'a> SidecarClaim<'a> {
+    /// Claim `key`, or `None` if another build holds it. A claim that cannot
+    /// be recorded is refused too, loudly: building without it could
+    /// tokenize the same SSTable twice at once.
+    fn take(in_flight: &'a crate::lockfree::SharedSet, key: String) -> Option<Self> {
+        match in_flight.insert(&key) {
+            Ok(true) => Some(Self { in_flight, key }),
+            Ok(false) => None,
+            Err(e) => {
+                tracing::error!(%e, sidecar = %key, "fts: could not claim a sidecar build; skipped");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for SidecarClaim<'_> {
+    fn drop(&mut self) {
+        match self.in_flight.remove(&self.key) {
+            Ok(true) => {}
+            Ok(false) => tracing::error!(
+                sidecar = %self.key,
+                "fts: a sidecar build claim was already released; the in-flight set is inconsistent"
+            ),
+            // Left claimed, this sidecar is never built again by this
+            // process; every query keeps scanning its SSTable in full.
+            Err(e) => tracing::error!(
+                %e,
+                sidecar = %self.key,
+                "fts: a sidecar build claim could not be released; this sidecar will not be built \
+                 again until restart"
+            ),
+        }
+    }
 }
 
 impl<F: FlushTarget> FulltextSidecarBuild<F> {
@@ -990,8 +1041,15 @@ impl<F: FlushTarget> FulltextSidecarBuild<F> {
         if self.jobs.is_empty() {
             return outcome;
         }
-        let _single_flight = self.single_flight.lock();
         for job in &self.jobs {
+            let Some(_claim) =
+                SidecarClaim::take(&self.in_flight, format!("{}/{}", job.gen, job.index_name))
+            else {
+                outcome.in_flight_elsewhere += 1;
+                continue;
+            };
+            // Checked under the claim: a build that finished between this
+            // plan and the claim has left its file.
             if job
                 .dir
                 .join(fti_sidecar_file_name(&job.gen, &job.index_name))
@@ -2055,7 +2113,9 @@ impl<F: FlushTarget> TableStore<F> {
                 "index-unavailable SSTables",
             ),
             missing_sstables: MissingSstableCache::default(),
-            fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
+            fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
+                "FTI sidecar builds in flight",
+            )),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -2257,7 +2317,9 @@ impl<F: FlushTarget> TableStore<F> {
                 "index-unavailable SSTables",
             ),
             missing_sstables: MissingSstableCache::default(),
-            fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
+            fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
+                "FTI sidecar builds in flight",
+            )),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -2338,7 +2400,9 @@ impl<F: FlushTarget> TableStore<F> {
                 "index-unavailable SSTables",
             ),
             missing_sstables: MissingSstableCache::default(),
-            fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
+            fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
+                "FTI sidecar builds in flight",
+            )),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -7487,7 +7551,7 @@ impl<F: FlushTarget> TableStore<F> {
         FulltextSidecarBuild {
             flush_target: Arc::clone(&self.flush_target),
             schema: self.schema.load_full(),
-            single_flight: Arc::clone(&self.fulltext_sidecar_build_lock),
+            in_flight: Arc::clone(&self.fulltext_sidecars_in_flight),
             jobs: Vec::new(),
         }
     }
@@ -8819,9 +8883,10 @@ mod tests {
                 );
             }
         }
+        // The view lists the newest SSTable first.
         let last = view
             .sidecar_indexes
-            .last()
+            .first()
             .expect("the final flush published");
         let mut last_names: Vec<&str> = last.keys().map(String::as_str).collect();
         last_names.sort_unstable();
