@@ -120,7 +120,8 @@ ferrosa-common ferrosa-jsonb` enforces it). Runtime dependencies are `bytes`,
 - `JsonbValue`: an owned cell whose only constructors (`from_bytes`, `from_encoded`)
   validate. `view()` gives the `JsonbRef`.
 - One total order (D18, D18a): kind rank Object > Array > Boolean > Number > String >
-  Null; objects by pair count, then (key, value) pairs in PostgreSQL key order
+  Null, with PostgreSQL's one exception: a top-level empty array sorts below every
+  top-level scalar (`[] < null`; nested, `[[]] > [null]`); objects by pair count, then (key, value) pairs in PostgreSQL key order
   (shortest key first, then bytewise); arrays by length then element-wise; numbers by
   exact value; strings bytewise. `Ord`, `PartialOrd`, `try_cmp` and `order::compare`.
 - `Eq` is value equality (`cmp == Equal`, byte fast path); `Hash` walks the

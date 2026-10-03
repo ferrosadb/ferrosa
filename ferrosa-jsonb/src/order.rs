@@ -1,6 +1,7 @@
 //! Module: the one total order over jsonb values (T-106, D18, D18a, D2a).
 //! Correctness: correct when the order is PostgreSQL's (kind rank Object >
-//! Array > Boolean > Number > String > Null; objects by pair count, then by
+//! Array > Boolean > Number > String > Null, except that a top-level empty
+//! array sorts below every top-level scalar; objects by pair count, then by
 //! (key, value) pairs in PG key order, shortest key first then bytewise; arrays
 //! by length then element-wise; numbers by exact value; strings bytewise), no
 //! pair is incomparable, and nothing is mapped to `Equal` by fallback. The walk
@@ -8,8 +9,9 @@
 //! A reader fault cannot happen on a validated `JsonbValue`; if memory were
 //! corrupted, `Ord` falls back to comparing the cells' bytes (still total,
 //! never `Equal` for different bytes) and bumps [`comparison_faults`].
-//! Last revised: 2026-09-28
-//! Last changed: T-106 initial comparator.
+//! Last revised: 2026-10-03
+//! Last changed: PostgreSQL's top-level empty-array exception (checked
+//!   against postgres:16; the old table had `true < []`, PG has `[] < true`).
 
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -130,8 +132,34 @@ fn step<'a>(
     }
 }
 
-/// Compare two values in D18 order, reporting a reader fault as an error.
+/// PostgreSQL's one exception to the kind rank, at the top level only: an
+/// empty array sorts below every scalar. PG stores a top-level scalar as a
+/// one-element "raw scalar" array and compares element counts first, so `[]`
+/// (0 elements) < `null` (1). A non-empty array still outranks a scalar there,
+/// and nested values follow the rank (`[[]] > [null]`). Checked against
+/// postgres:16 (`tests/order.rs`, `PG_TABLE`).
+fn top_level_exception(a: ValueRef<'_>, b: ValueRef<'_>) -> Result<Option<Ordering>, JsonbError> {
+    let empty_array = |v: ValueRef<'_>| -> Result<bool, JsonbError> {
+        Ok(v.kind()? == ValueKind::Array && v.as_array()?.len() == 0)
+    };
+    let scalar = |v: ValueRef<'_>| -> Result<bool, JsonbError> {
+        Ok(!matches!(v.kind()?, ValueKind::Array | ValueKind::Object))
+    };
+    if empty_array(a)? && scalar(b)? {
+        return Ok(Some(Ordering::Less));
+    }
+    if scalar(a)? && empty_array(b)? {
+        return Ok(Some(Ordering::Greater));
+    }
+    Ok(None)
+}
+
+/// Compare two documents (top-level values) in D18 order, reporting a reader
+/// fault as an error.
 pub fn compare(a: ValueRef<'_>, b: ValueRef<'_>) -> Result<Ordering, JsonbError> {
+    if let Some(order) = top_level_exception(a, b)? {
+        return Ok(order);
+    }
     let mut stack = vec![Work::Vals(a, b)];
     while let Some(work) = stack.pop() {
         let order = match work {
