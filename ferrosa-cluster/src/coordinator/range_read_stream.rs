@@ -2564,6 +2564,139 @@ mod tests {
         assert!(matches!(forwarder.await.unwrap(), ForwardOutcome::Failed));
     }
 
+    /// Regression for the node2 wedge (2026-10-03), end to end on one node:
+    /// the REAL engine index walker as the local source, the REAL forwarder as
+    /// a remote that sends only heartbeats (a replica whose walk is stuck,
+    /// built before heartbeats were progress-gated). The merge waits on that
+    /// remote while the local walker sits parked in `blocking_send` inside
+    /// `tables.read()`; DDL (`tables.write()`) then blocks, and every later
+    /// reader behind it. The stream must fail within the no-data deadline so
+    /// the merge drops and the walker's guard is released.
+    ///
+    /// Paused time, driven with `advance`: the walker runs on a real blocking
+    /// thread, which inhibits the paused clock's auto-advance.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_only_remote_releases_the_local_index_walker() {
+        use ferrosa_common::cell::CellValue;
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        use ferrosa_storage::{StorageEngine, StorageEngineConfig};
+
+        const INDEX: &str = "hb_val_idx";
+        fn schema(table: &str) -> TableSchema {
+            TableSchema {
+                keyspace: "hb_ks".to_string(),
+                table: table.to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![ColumnDefinition {
+                    name: "ck".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                }],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "val".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                }],
+                extensions: Default::default(),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap(),
+        );
+        engine
+            .register_table_with_indexes(schema("hits"), vec![(INDEX.to_string(), 0_usize)])
+            .unwrap();
+        let tid = TableId::new("hb_ks", "hits");
+        for n in 0..32_i32 {
+            let key = DecoratedKey::new(PartitionKey::new(format!("pk{n}").into_bytes()));
+            let row = Row {
+                clustering: n.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(b"hot".to_vec(), 1))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1),
+            };
+            engine.write(&tid, &key, row, 1).unwrap();
+        }
+
+        let local: ClusterPartitionStream = Box::pin(
+            engine
+                .read_by_index_stream(&tid, INDEX, &ferrosa_index::IndexKey(b"hot".to_vec()))
+                .map(|item| item.map_err(ClusterError::Storage)),
+        );
+        const REQ: u32 = 7;
+        let (frame_tx, frame_rx) = mpsc::channel::<Message>(STREAM_RECEIVER_BUFFER);
+        let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        tokio::spawn(forward_remote_range_stream(frame_rx, REQ, 1, remote_tx));
+        let remote: ClusterPartitionStream = Box::pin(clean_end_guarded_stream(
+            remote_rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            uuid::Uuid::from_u128(2),
+        ));
+        let heartbeats = tokio::spawn(async move {
+            let mut seq = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if frame_tx.send(heartbeat_frame(REQ, seq)).await.is_err() {
+                    return;
+                }
+                seq += 1;
+            }
+        });
+
+        let mut merged = merge_index_streams_in_row_order(vec![local, remote]);
+        let consumer = tokio::spawn(async move {
+            // As the CQL page collector does: an error ends the read and
+            // drops the merge, and with it the local walker.
+            let first = merged.next().await;
+            drop(merged);
+            first.map(|r| r.is_err())
+        });
+
+        // Let the walker fill its channel and park, then run the clock past
+        // the no-data deadline one heartbeat at a time.
+        std::thread::sleep(Duration::from_millis(100));
+        let horizon = stream_no_data_deadline() + Duration::from_secs(30);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < horizon && !consumer.is_finished() {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            elapsed += Duration::from_secs(1);
+        }
+        heartbeats.abort();
+        let finished = consumer.is_finished();
+        if !finished {
+            // Drop the merge so the parked walker unparks and the runtime can
+            // shut down after the assertion fails, instead of hanging on it.
+            consumer.abort();
+        }
+        assert!(
+            finished,
+            "the merge was still waiting on a heartbeat-only remote after {}s",
+            horizon.as_secs()
+        );
+        assert_eq!(
+            consumer.await.unwrap(),
+            Some(true),
+            "the heartbeat-only remote must surface as an error"
+        );
+
+        let ddl_engine = Arc::clone(&engine);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            ddl_engine
+                .register_table(schema("created_during_read"))
+                .unwrap();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "DDL still blocked: the local index walker kept tables.read() after the merge failed"
+        );
+    }
+
     /// Control: a stream that delivers data keeps going past the no-data
     /// deadline. The deadline measures time since the last DATA frame, not
     /// since the stream began.
