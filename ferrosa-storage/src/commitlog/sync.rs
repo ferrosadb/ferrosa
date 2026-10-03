@@ -1,28 +1,58 @@
-//! Sync strategies for the commit log.
+//! Module: when commit-log segment buffers are fsynced, and when a write may
+//!   be acknowledged.
+//! Correctness: a write is acknowledged only while the sync machinery keeps up.
+//!   A dead sync thread, a failing fsync, or an fsync that has fallen behind
+//!   `sync_stall_deadline` makes the write path return
+//!   [`Error::CommitLogNotDurable`](ferrosa_common::Error::CommitLogNotDurable)
+//!   instead of an acknowledgement. No locks were added: durability state is
+//!   atomics ([`SyncHealth`]); the condvar mutexes predate this change.
+//! Last revised: 2026-10-03
+//! Last changed: P0-6 (t_88479cda). If the periodic sync thread died, writes
+//!   were still acknowledged and never fsynced; a Batch fsync error and a
+//!   Group flush error were logged and the write acknowledged anyway; a Group
+//!   stall panicked the writer. All three now refuse the write, and a dead
+//!   thread can be restarted by the node supervisor.
 //!
 //! Three strategies control when segment buffers are fsynced to disk:
 //!
-//! | Strategy | How it works | Trade-off |
-//! |----------|-------------|-----------|
-//! | [`BatchSync`] | Fsync after every write | Zero data loss, highest latency |
-//! | [`PeriodicSync`] | Background thread fsyncs on a timer | Best throughput, up to `sync_interval` data loss |
-//! | [`GroupSync`] | Background thread fsyncs batches of writes | Bounded latency, good throughput |
+//! | Strategy | How it works | Acknowledged-but-unsynced window |
+//! |----------|-------------|-----------------------------------|
+//! | [`BatchSync`] | Fsync after every write | None: an fsync error fails the write |
+//! | [`PeriodicSync`] | Background thread fsyncs on a timer | `max_delay` healthy; at most `sync_stall_deadline` otherwise |
+//! | [`GroupSync`] | Writers wait for a background batch fsync | None: the writer fails after `sync_stall_deadline` |
 //!
-//! The [`SyncStrategy`] trait defines the interface. Each strategy receives
-//! `on_write` calls after mutations are written to the segment buffer.
-//! [`BatchSync`] calls `flush_to_disk` inline; [`PeriodicSync`] and
-//! [`GroupSync`] delegate to a stored flush callback so they remain decoupled
-//! from segment rotation.
+//! ## The periodic bound, stated
+//!
+//! Periodic acknowledges before the fsync (that is its throughput). The window
+//! is bounded by refusing writes, not by trusting the thread:
+//!
+//! - the sync thread died (a panic): every write is refused at once;
+//! - the last fsync attempt failed: every write is refused until one succeeds;
+//! - the oldest write not yet covered by a successful fsync is older than
+//!   `sync_stall_deadline`: every write is refused until a sync catches up.
+//!
+//! So an acknowledged write that never reaches disk was acknowledged within
+//! `sync_stall_deadline` of the oldest unsynced write, and the node stops
+//! acknowledging after that: a crash loses at most `sync_stall_deadline`
+//! (default 2 s) of acknowledged writes, and `max_delay` (10 ms) while sync is
+//! healthy. A refused write's entry may still be in the segment buffer and
+//! reach disk later; like a write timeout, its outcome is unknown, never "acked".
+//!
+//! A supervisor reads [`SyncHealthSnapshot`]s and calls
+//! [`SyncStrategy::restart`] to replace a dead thread; the new thread first
+//! fsyncs everything the dead one left behind.
 
 // Items are used by later tasks (CommitLog, integration tests); suppress
 // dead-code warnings until those modules exist.
 #![allow(dead_code)]
 
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use parking_lot::{Condvar, Mutex};
 
 use super::config::CommitLogBatchConfig;
@@ -30,28 +60,412 @@ use super::segment::Segment;
 
 /// A flush callback that the sync strategy invokes to fsync the current segment.
 ///
-/// The `CommitLog` (Task 9) will provide a closure that loads the active segment
-/// and calls `flush_to_disk()`. This keeps sync strategies decoupled from
-/// segment rotation.
+/// The `CommitLog` provides a closure that loads the active segment and calls
+/// `flush_to_disk()`. This keeps sync strategies decoupled from segment
+/// rotation.
 pub type FlushCallback = Arc<dyn Fn() -> ferrosa_common::Result<()> + Send + Sync>;
+
+/// What an acknowledgement of this write means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckPolicy {
+    /// The write is acknowledged on return: refuse it unless the strategy
+    /// can stand behind it (see the module docs).
+    Durable,
+    /// The caller fsyncs explicitly (`CommitLog::force_sync`) before it
+    /// acknowledges anything, so sync health must not fail this append. Used
+    /// by atomic batches, where a refusal partway through would leave a torn
+    /// prefix in the log.
+    CallerSyncs,
+}
 
 /// Controls when commit log segment buffers are fsynced to disk.
 ///
-/// The three methods form a lifecycle:
+/// The methods form a lifecycle:
 /// 1. [`start()`](SyncStrategy::start) — launch background work (if any).
 /// 2. [`on_write()`](SyncStrategy::on_write) — called after each mutation.
 /// 3. [`stop()`](SyncStrategy::stop) — clean shutdown, flush pending data.
+///
+/// [`health()`](SyncStrategy::health) and [`restart()`](SyncStrategy::restart)
+/// are for the supervisor.
 pub trait SyncStrategy: Send + Sync {
     /// Called after each mutation is written to the segment buffer.
     ///
-    /// May block (Batch/Group) or return immediately (Periodic).
-    fn on_write(&self, segment: &Segment, position: u64, bytes: u64);
+    /// `Err` means the write must not be acknowledged; see [`AckPolicy`].
+    fn on_write(
+        &self,
+        segment: &Segment,
+        position: u64,
+        bytes: u64,
+        ack: AckPolicy,
+    ) -> ferrosa_common::Result<()>;
 
     /// Start background sync work (if any).
-    fn start(&self);
+    fn start(&self) -> ferrosa_common::Result<()>;
 
     /// Shut down cleanly. Fsync any pending data.
     fn stop(&self);
+
+    /// The current health of the sync machinery.
+    fn health(&self) -> SyncHealthSnapshot;
+
+    /// Replace a dead sync thread. `Ok(false)` when there was nothing to
+    /// restart (healthy, stopped, or no thread at all).
+    fn restart(&self) -> ferrosa_common::Result<bool>;
+
+    /// Make the sync thread panic at its next sync attempt.
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_panic(&self);
+}
+
+// ---------------------------------------------------------------------------
+// SyncHealth
+// ---------------------------------------------------------------------------
+
+/// Process-wide count of writes refused because the commit log could not make
+/// them durable.
+static REFUSED_WRITES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn refused_writes_total() -> u64 {
+    REFUSED_WRITES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Durability bookkeeping shared by the writers and the sync thread.
+///
+/// Every write takes a sequence number AFTER its entry is complete in the
+/// segment buffer; a sync reads the highest number before it flushes, so a
+/// successful flush covers every number up to that ticket. All atomics; the
+/// orderings that matter are `SeqCst` (see [`SyncHealth::sync_succeeded`]).
+pub struct SyncHealth {
+    base: Instant,
+    stall_deadline: Duration,
+    written_seq: AtomicU64,
+    durable_seq: AtomicU64,
+    /// Nanoseconds since `base`, plus one, of the oldest write not yet covered
+    /// by a successful sync; 0 when every write is durable.
+    unsynced_since: AtomicU64,
+    /// The sync thread died and has not been restarted.
+    dead: AtomicBool,
+    /// The last fsync attempt failed.
+    failing: AtomicBool,
+    panics: AtomicU64,
+    sync_failures: AtomicU64,
+    restarts: AtomicU64,
+    last_failure: ArcSwapOption<String>,
+    #[cfg(any(test, feature = "test-support"))]
+    inject_panic: AtomicBool,
+}
+
+/// A point-in-time copy of [`SyncHealth`] for supervisors and metrics.
+#[derive(Clone, Debug)]
+pub struct SyncHealthSnapshot {
+    /// Whether this strategy runs a background sync thread at all.
+    pub has_sync_thread: bool,
+    pub dead: bool,
+    pub failing: bool,
+    pub panics: u64,
+    pub sync_failures: u64,
+    pub restarts: u64,
+    /// How long the oldest unsynced write has waited, if any is waiting.
+    pub unsynced_for: Option<Duration>,
+    pub stall_deadline: Duration,
+    pub last_failure: Option<String>,
+}
+
+impl SyncHealthSnapshot {
+    /// The oldest unsynced write has waited past the stall deadline.
+    pub fn stalled(&self) -> bool {
+        self.unsynced_for
+            .is_some_and(|waited| waited >= self.stall_deadline)
+    }
+
+    /// Writes are being refused (or would be): dead, failing or stalled.
+    pub fn impaired(&self) -> bool {
+        self.dead || self.failing || self.stalled()
+    }
+}
+
+/// The highest write sequence a sync attempt will cover, and when it was read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SyncTicket {
+    target: u64,
+    at: Instant,
+}
+
+impl SyncHealth {
+    pub fn new(stall_deadline: Duration) -> Self {
+        assert!(
+            !stall_deadline.is_zero(),
+            "a zero stall deadline would refuse every write"
+        );
+        Self {
+            base: Instant::now(),
+            stall_deadline,
+            written_seq: AtomicU64::new(0),
+            durable_seq: AtomicU64::new(0),
+            unsynced_since: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            failing: AtomicBool::new(false),
+            panics: AtomicU64::new(0),
+            sync_failures: AtomicU64::new(0),
+            restarts: AtomicU64::new(0),
+            last_failure: ArcSwapOption::empty(),
+            #[cfg(any(test, feature = "test-support"))]
+            inject_panic: AtomicBool::new(false),
+        }
+    }
+
+    fn stamp(&self, now: Instant) -> u64 {
+        let nanos = now.saturating_duration_since(self.base).as_nanos();
+        nanos.min(u128::from(u64::MAX - 1)) as u64 + 1
+    }
+
+    /// Register a write whose entry is complete in the segment buffer.
+    pub(crate) fn note_write(&self, now: Instant) -> u64 {
+        let seq = self.written_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        // Already dirty: the older timestamp stands, which is the point.
+        let _ = self.unsynced_since.compare_exchange(
+            0,
+            self.stamp(now),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        seq
+    }
+
+    pub(crate) fn begin_sync(&self, now: Instant) -> SyncTicket {
+        SyncTicket {
+            target: self.written_seq.load(Ordering::SeqCst),
+            at: now,
+        }
+    }
+
+    /// A flush covering `ticket` succeeded. Returns `true` on the
+    /// failing -> healthy edge.
+    pub(crate) fn sync_succeeded(&self, ticket: SyncTicket) -> bool {
+        self.durable_seq.fetch_max(ticket.target, Ordering::SeqCst);
+        // Writes numbered past the ticket are still unsynced, and none of them
+        // started before the ticket was read, so the ticket's instant is a
+        // conservative age for them. The second check catches a write that
+        // lands between the first check and the store: its own CAS may have
+        // lost to the value being replaced.
+        let next = if self.written_seq.load(Ordering::SeqCst) == ticket.target {
+            0
+        } else {
+            self.stamp(ticket.at)
+        };
+        self.unsynced_since.store(next, Ordering::SeqCst);
+        if next == 0 && self.written_seq.load(Ordering::SeqCst) != ticket.target {
+            let _ = self.unsynced_since.compare_exchange(
+                0,
+                self.stamp(ticket.at),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+        self.failing.swap(false, Ordering::AcqRel)
+    }
+
+    /// An fsync attempt failed. Returns `true` on the healthy -> failing edge.
+    pub(crate) fn sync_failed(&self, error: &ferrosa_common::Error) -> bool {
+        self.sync_failures.fetch_add(1, Ordering::Relaxed);
+        self.last_failure
+            .store(Some(Arc::new(format!("fsync failed: {error}"))));
+        !self.failing.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn mark_dead(&self, detail: String) {
+        self.panics.fetch_add(1, Ordering::Relaxed);
+        self.last_failure.store(Some(Arc::new(detail)));
+        self.dead.store(true, Ordering::SeqCst);
+    }
+
+    /// Called by a freshly started sync thread before its first sync.
+    fn mark_alive(&self) {
+        self.dead.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn all_durable(&self) -> bool {
+        self.durable_seq.load(Ordering::SeqCst) >= self.written_seq.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn durable_through(&self, seq: u64) -> bool {
+        self.durable_seq.load(Ordering::SeqCst) >= seq
+    }
+
+    fn unsynced_for(&self, now: Instant) -> Option<Duration> {
+        let since = self.unsynced_since.load(Ordering::SeqCst);
+        (since != 0).then(|| {
+            let since = self.base + Duration::from_nanos(since - 1);
+            now.saturating_duration_since(since)
+        })
+    }
+
+    fn last_failure_text(&self) -> String {
+        self.last_failure
+            .load_full()
+            .map(|detail| detail.as_ref().clone())
+            .unwrap_or_else(|| "no failure recorded".to_string())
+    }
+
+    fn refuse(&self, reason: String) -> ferrosa_common::Error {
+        REFUSED_WRITES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        ferrosa_common::Error::CommitLogNotDurable { reason }
+    }
+
+    /// May a write that is acknowledged on return be acknowledged now?
+    pub(crate) fn admit(&self, now: Instant) -> ferrosa_common::Result<()> {
+        if self.is_dead() {
+            return Err(self.refuse(format!(
+                "the commit-log sync thread died ({}); writes are refused until it is restarted",
+                self.last_failure_text()
+            )));
+        }
+        if self.failing.load(Ordering::Acquire) {
+            return Err(self.refuse(format!(
+                "the last commit-log fsync failed ({}); writes are refused until one succeeds",
+                self.last_failure_text()
+            )));
+        }
+        if let Some(waited) = self.unsynced_for(now) {
+            if waited >= self.stall_deadline {
+                return Err(self.refuse(format!(
+                    "no commit-log fsync has completed for {}ms, past the {}ms stall deadline",
+                    waited.as_millis(),
+                    self.stall_deadline.as_millis()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn snapshot(&self, now: Instant, has_sync_thread: bool) -> SyncHealthSnapshot {
+        SyncHealthSnapshot {
+            has_sync_thread,
+            dead: self.is_dead(),
+            failing: self.failing.load(Ordering::Acquire),
+            panics: self.panics.load(Ordering::Relaxed),
+            sync_failures: self.sync_failures.load(Ordering::Relaxed),
+            restarts: self.restarts.load(Ordering::Relaxed),
+            unsynced_for: self.unsynced_for(now),
+            stall_deadline: self.stall_deadline,
+            last_failure: self
+                .last_failure
+                .load_full()
+                .map(|detail| detail.as_ref().clone()),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn arm_injected_panic(&self) {
+        self.inject_panic.store(true, Ordering::SeqCst);
+    }
+
+    /// Panic here if a test armed it. Compiled out of production builds.
+    fn maybe_injected_panic(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.inject_panic.swap(false, Ordering::SeqCst) {
+            panic!("injected commit-log sync panic");
+        }
+    }
+}
+
+/// The text of a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// Spawn a sync thread whose panic marks `health` dead (so writes are refused)
+/// and then runs `after_death` (to wake writers waiting on it).
+fn spawn_sync_thread<B, D>(
+    name: &'static str,
+    health: Arc<SyncHealth>,
+    body: B,
+    after_death: D,
+) -> ferrosa_common::Result<JoinHandle<()>>
+where
+    B: FnOnce() + Send + 'static,
+    D: FnOnce() + Send + 'static,
+{
+    // Returning only after the new thread has cleared `dead` means a write
+    // made right after a restart is not refused by the old thread's death.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let handle = thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            health.mark_alive();
+            // The receiver is gone only if the spawner gave up waiting, which
+            // it reports below.
+            let _ = started_tx.send(());
+            // The body's state is atomics and parking_lot locks, which do not
+            // poison; nothing is left half-updated that a restart would read.
+            if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(body)) {
+                let message = panic_message(payload.as_ref());
+                tracing::error!(
+                    thread = name,
+                    panic = %message,
+                    "commit-log sync thread panicked; writes are refused until the supervisor restarts it"
+                );
+                health.mark_dead(format!("{name} panicked: {message}"));
+                after_death();
+            }
+        })
+        .map_err(|e| {
+            ferrosa_common::Error::Io(std::io::Error::other(format!(
+                "could not spawn the {name} thread: {e}"
+            )))
+        })?;
+    match started_rx.recv_timeout(SYNC_THREAD_START_DEADLINE) {
+        Ok(()) => Ok(handle),
+        Err(e) => Err(ferrosa_common::Error::Io(std::io::Error::other(format!(
+            "the {name} thread did not start within {}s: {e}",
+            SYNC_THREAD_START_DEADLINE.as_secs()
+        )))),
+    }
+}
+
+/// How long a (re)start waits for the new sync thread to come alive.
+const SYNC_THREAD_START_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Join a sync thread that has exited or is about to.
+fn join_sync_thread(name: &'static str, handle: JoinHandle<()>) {
+    if handle.join().is_err() {
+        // `spawn_sync_thread` catches the body's panics, so this is a panic in
+        // the catch handler itself.
+        tracing::error!(
+            thread = name,
+            "commit-log sync thread died outside its panic handler"
+        );
+    }
+}
+
+/// Log the healthy -> failing edge at ERROR and every repeat at DEBUG.
+fn report_sync_failure(strategy: &'static str, health: &SyncHealth, e: &ferrosa_common::Error) {
+    if health.sync_failed(e) {
+        tracing::error!(
+            strategy,
+            %e,
+            "commit-log fsync failed; writes are refused until an fsync succeeds"
+        );
+    } else {
+        tracing::debug!(strategy, %e, "commit-log fsync still failing");
+    }
+}
+
+fn report_sync_success(strategy: &'static str, health: &SyncHealth, ticket: SyncTicket) {
+    if health.sync_succeeded(ticket) {
+        tracing::warn!(
+            strategy,
+            "commit-log fsync recovered; writes are acknowledged again"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -61,35 +475,76 @@ pub trait SyncStrategy: Send + Sync {
 /// Fsyncs after every single write. Zero data loss, highest latency.
 ///
 /// `on_write()` calls `segment.flush_to_disk()` synchronously, so every
-/// mutation is durable before the writer returns. No background thread.
-pub struct BatchSync;
+/// mutation is durable before the writer returns, and an fsync error fails
+/// the write. No background thread.
+pub struct BatchSync {
+    health: SyncHealth,
+}
 
 impl BatchSync {
     pub fn new() -> Self {
-        Self
+        Self {
+            health: SyncHealth::new(CommitLogBatchConfig::DEFAULT_SYNC_STALL_DEADLINE),
+        }
+    }
+}
+
+impl Default for BatchSync {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl SyncStrategy for BatchSync {
-    fn on_write(&self, segment: &Segment, _position: u64, bytes: u64) {
-        observe_sync_batch(1, bytes, Duration::ZERO);
-        // Intentionally ignoring the error here — the caller (CommitLog)
-        // will handle flush failures at a higher level. In a production
-        // system we'd propagate, but the trait signature returns `()`.
-        if let Err(e) = segment.flush_to_disk() {
-            tracing::error!(%e, "commitlog: flush_to_disk failed — data may not be durable");
+    fn on_write(
+        &self,
+        segment: &Segment,
+        _position: u64,
+        bytes: u64,
+        ack: AckPolicy,
+    ) -> ferrosa_common::Result<()> {
+        if ack == AckPolicy::CallerSyncs {
+            // The caller's force_sync is the fsync; an error here would tear
+            // its batch.
+            return Ok(());
         }
+        observe_sync_batch(1, bytes, Duration::ZERO);
+        let ticket = self.health.begin_sync(Instant::now());
         // No sync marker needed: BatchSync flushes every entry individually,
         // so every entry is already durable. Markers are only useful for
         // PeriodicSync/GroupSync where batches of entries are flushed together.
+        match segment.flush_to_disk() {
+            Ok(()) => {
+                report_sync_success("batch", &self.health, ticket);
+                Ok(())
+            }
+            Err(e) => {
+                report_sync_failure("batch", &self.health, &e);
+                Err(self.health.refuse(format!("fsync failed: {e}")))
+            }
+        }
     }
 
-    fn start(&self) {
-        // No-op: no background thread needed.
+    fn start(&self) -> ferrosa_common::Result<()> {
+        // No background thread needed.
+        Ok(())
     }
 
     fn stop(&self) {
         // No-op: every write is already fsynced.
+    }
+
+    fn health(&self) -> SyncHealthSnapshot {
+        self.health.snapshot(Instant::now(), false)
+    }
+
+    fn restart(&self) -> ferrosa_common::Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_panic(&self) {
+        panic!("BatchSync has no sync thread to inject a panic into");
     }
 }
 
@@ -97,11 +552,21 @@ impl SyncStrategy for BatchSync {
 // PeriodicSync
 // ---------------------------------------------------------------------------
 
-/// Fsyncs on a timer. Best throughput, up to `sync_interval` data loss on crash.
+/// Fsyncs on a timer. Best throughput; the ack-before-fsync window is bounded
+/// as the module docs state.
 ///
-/// `on_write()` returns immediately (no blocking). A background thread wakes
-/// every `sync_interval` and calls the flush callback.
+/// `on_write()` does not wait for the fsync. A background thread wakes every
+/// `sync_interval` (or when a batch fills) and calls the flush callback.
 pub struct PeriodicSync {
+    shared: Arc<PeriodicShared>,
+
+    /// Background thread handle, protected by a mutex so `stop()` and
+    /// `restart()` can take it.
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// State shared between `PeriodicSync` and its sync thread.
+struct PeriodicShared {
     /// Interval between fsyncs.
     sync_interval: Duration,
 
@@ -109,23 +574,24 @@ pub struct PeriodicSync {
     flush_callback: FlushCallback,
 
     /// Signals the background thread to stop.
-    stop_flag: Arc<AtomicBool>,
-
-    /// Background thread handle, protected by a mutex so `stop()` can take it.
-    handle: Mutex<Option<JoinHandle<()>>>,
+    stop_flag: AtomicBool,
 
     /// Condvar used to wake the background thread early on stop.
-    wake: Arc<(Mutex<bool>, Condvar)>,
+    wake: (Mutex<bool>, Condvar),
 
     /// Number of writes waiting for the next timed flush.
-    pending: Arc<AtomicU64>,
+    pending: AtomicU64,
 
     /// Bytes waiting for the next timed flush.
-    pending_bytes: Arc<AtomicU64>,
+    pending_bytes: AtomicU64,
 
     /// Adaptive batch controls.
     batch: CommitLogBatchConfig,
+
+    health: Arc<SyncHealth>,
 }
+
+const PERIODIC_THREAD: &str = "commitlog-periodic-sync";
 
 impl PeriodicSync {
     pub fn new(sync_interval: Duration, flush_callback: FlushCallback) -> Self {
@@ -141,138 +607,212 @@ impl PeriodicSync {
         batch: CommitLogBatchConfig,
         flush_callback: FlushCallback,
     ) -> Self {
+        let health = Arc::new(SyncHealth::new(batch.sync_stall_deadline));
         Self {
-            sync_interval,
-            flush_callback,
-            stop_flag: Arc::new(AtomicBool::new(false)),
+            shared: Arc::new(PeriodicShared {
+                sync_interval,
+                flush_callback,
+                stop_flag: AtomicBool::new(false),
+                wake: (Mutex::new(false), Condvar::new()),
+                pending: AtomicU64::new(0),
+                pending_bytes: AtomicU64::new(0),
+                batch,
+                health,
+            }),
             handle: Mutex::new(None),
-            wake: Arc::new((Mutex::new(false), Condvar::new())),
-            pending: Arc::new(AtomicU64::new(0)),
-            pending_bytes: Arc::new(AtomicU64::new(0)),
-            batch,
         }
     }
 
+    fn spawn(&self) -> ferrosa_common::Result<JoinHandle<()>> {
+        let shared = Arc::clone(&self.shared);
+        spawn_sync_thread(
+            PERIODIC_THREAD,
+            Arc::clone(&self.shared.health),
+            move || shared.run(),
+            || {},
+        )
+    }
+
     fn stop_inner(&self, flush_final: bool) {
-        self.stop_flag.store(true, Ordering::Release);
+        let shared = &self.shared;
+        shared.stop_flag.store(true, Ordering::Release);
 
         {
-            let (lock, cvar) = &*self.wake;
+            let (lock, cvar) = &shared.wake;
             let mut stopped = lock.lock();
             *stopped = true;
             cvar.notify_one();
         }
 
         if let Some(handle) = self.handle.lock().take() {
-            let _ = handle.join();
+            join_sync_thread(PERIODIC_THREAD, handle);
         }
 
         if flush_final {
-            if let Err(e) = (self.flush_callback)() {
-                tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
+            let ticket = shared.health.begin_sync(Instant::now());
+            match (shared.flush_callback)() {
+                Ok(()) => report_sync_success("periodic", &shared.health, ticket),
+                Err(e) => {
+                    report_sync_failure("periodic", &shared.health, &e);
+                    tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
+                }
+            }
+        }
+    }
+}
+
+impl PeriodicShared {
+    /// Nothing to sync: no pending writes and every write covered.
+    fn is_clean(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0 && self.health.all_durable()
+    }
+
+    fn run(&self) {
+        while !self.stop_flag.load(Ordering::Acquire) {
+            let (lock, cvar) = &self.wake;
+            let mut stopped = lock.lock();
+            if self.is_clean() {
+                let result = cvar.wait_for(&mut stopped, self.sync_interval);
+                if result.timed_out() && self.is_clean() {
+                    PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
+            if self.stop_flag.load(Ordering::Acquire) {
+                break;
+            }
+
+            let opened_at = Instant::now();
+            loop {
+                if self.pending_bytes.load(Ordering::Acquire) >= self.batch.target_bytes {
+                    break;
+                }
+                let elapsed = opened_at.elapsed();
+                if elapsed >= self.batch.max_delay {
+                    break;
+                }
+                let remaining = self.batch.max_delay.saturating_sub(elapsed);
+                // Timing out is the normal way out of the batch window.
+                let _ = cvar.wait_for(&mut stopped, remaining.min(self.sync_interval));
+                if self.stop_flag.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            drop(stopped);
+
+            if self.stop_flag.load(Ordering::Acquire) {
+                break;
+            }
+
+            let pending_writes = self.pending.swap(0, Ordering::AcqRel);
+            let batch_bytes = self.pending_bytes.swap(0, Ordering::AcqRel);
+            if pending_writes == 0 && self.health.all_durable() {
+                PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            PENDING_WRITES.fetch_sub(pending_writes, Ordering::Relaxed);
+            PENDING_BYTES.fetch_sub(batch_bytes, Ordering::Relaxed);
+            self.sync_once(pending_writes, batch_bytes, opened_at);
+        }
+    }
+
+    /// One fsync covering every write registered so far. A write left by a
+    /// dead predecessor thread has no pending count but is not durable, so it
+    /// is covered here too.
+    fn sync_once(&self, pending_writes: u64, batch_bytes: u64, opened_at: Instant) {
+        let ticket = self.health.begin_sync(Instant::now());
+        self.health.maybe_injected_panic();
+        match (self.flush_callback)() {
+            Ok(()) => {
+                report_sync_success("periodic", &self.health, ticket);
+                observe_sync_batch(pending_writes, batch_bytes, opened_at.elapsed());
+            }
+            Err(e) => {
+                self.pending.fetch_add(pending_writes, Ordering::AcqRel);
+                self.pending_bytes.fetch_add(batch_bytes, Ordering::AcqRel);
+                PENDING_WRITES.fetch_add(pending_writes, Ordering::Relaxed);
+                PENDING_BYTES.fetch_add(batch_bytes, Ordering::Relaxed);
+                report_sync_failure("periodic", &self.health, &e);
             }
         }
     }
 }
 
 impl SyncStrategy for PeriodicSync {
-    fn on_write(&self, _segment: &Segment, _position: u64, bytes: u64) {
+    fn on_write(
+        &self,
+        _segment: &Segment,
+        _position: u64,
+        bytes: u64,
+        ack: AckPolicy,
+    ) -> ferrosa_common::Result<()> {
+        let shared = &self.shared;
+        let now = Instant::now();
+        shared.health.note_write(now);
         // Edge-trigger the sync thread when the log transitions from clean to
         // dirty. This is not a per-write stream: writes already covered by the
         // open batch only bump the counter, so they cannot interrupt the timer
         // and collapse batching into tiny fsyncs.
-        let previous = self.pending.fetch_add(1, Ordering::AcqRel);
-        let previous_bytes = self.pending_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let previous = shared.pending.fetch_add(1, Ordering::AcqRel);
+        let previous_bytes = shared.pending_bytes.fetch_add(bytes, Ordering::AcqRel);
         PENDING_WRITES.fetch_add(1, Ordering::Relaxed);
         PENDING_BYTES.fetch_add(bytes, Ordering::Relaxed);
-        if previous == 0 || previous_bytes.saturating_add(bytes) >= self.batch.target_bytes {
+        if previous == 0 || previous_bytes.saturating_add(bytes) >= shared.batch.target_bytes {
             // Notify while holding `wake.lock`, for the same reason GroupSync
             // does: the sync thread holds this lock when it checks `pending`
             // and the batch's byte target before calling wait_for(). Without
             // the lock a notification sent in that window is lost and the
             // thread sleeps the whole sync interval, so a batch that reached
             // target_bytes is not fsynced until the timer fires.
-            let (lock, cvar) = &*self.wake;
+            let (lock, cvar) = &shared.wake;
             let _guard = lock.lock();
             cvar.notify_one();
         }
+        match ack {
+            AckPolicy::Durable => shared.health.admit(now),
+            AckPolicy::CallerSyncs => Ok(()),
+        }
     }
 
-    fn start(&self) {
-        let stop_flag = Arc::clone(&self.stop_flag);
-        let flush_callback = Arc::clone(&self.flush_callback);
-        let interval = self.sync_interval;
-        let wake = Arc::clone(&self.wake);
-        let pending = Arc::clone(&self.pending);
-        let pending_bytes = Arc::clone(&self.pending_bytes);
-        let batch = self.batch.clone();
-
-        let thread = thread::Builder::new()
-            .name("commitlog-periodic-sync".to_string())
-            .spawn(move || {
-                while !stop_flag.load(Ordering::Acquire) {
-                    let (lock, cvar) = &*wake;
-                    let mut stopped = lock.lock();
-                    if pending.load(Ordering::Acquire) == 0 {
-                        let result = cvar.wait_for(&mut stopped, interval);
-                        if result.timed_out() && pending.load(Ordering::Acquire) == 0 {
-                            PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-
-                    if stop_flag.load(Ordering::Acquire) {
-                        break;
-                    }
-
-                    let opened_at = Instant::now();
-                    loop {
-                        if pending_bytes.load(Ordering::Acquire) >= batch.target_bytes {
-                            break;
-                        }
-                        let elapsed = opened_at.elapsed();
-                        if elapsed >= batch.max_delay {
-                            break;
-                        }
-                        let remaining = batch.max_delay.saturating_sub(elapsed);
-                        let _ = cvar.wait_for(&mut stopped, remaining.min(interval));
-                        if stop_flag.load(Ordering::Acquire) {
-                            break;
-                        }
-                    }
-                    drop(stopped);
-
-                    if stop_flag.load(Ordering::Acquire) {
-                        break;
-                    }
-
-                    let pending_writes = pending.swap(0, Ordering::AcqRel);
-                    let batch_bytes = pending_bytes.swap(0, Ordering::AcqRel);
-                    if pending_writes == 0 {
-                        PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    PENDING_WRITES.fetch_sub(pending_writes, Ordering::Relaxed);
-                    PENDING_BYTES.fetch_sub(batch_bytes, Ordering::Relaxed);
-
-                    if let Err(e) = flush_callback() {
-                        pending.fetch_add(pending_writes, Ordering::AcqRel);
-                        pending_bytes.fetch_add(batch_bytes, Ordering::AcqRel);
-                        PENDING_WRITES.fetch_add(pending_writes, Ordering::Relaxed);
-                        PENDING_BYTES.fetch_add(batch_bytes, Ordering::Relaxed);
-                        tracing::error!(%e, "commitlog: periodic flush_callback failed — data may not be durable");
-                    } else {
-                        observe_sync_batch(pending_writes, batch_bytes, opened_at.elapsed());
-                    }
-                }
-            })
-            .expect("failed to spawn periodic sync thread");
-
-        *self.handle.lock() = Some(thread);
+    fn start(&self) -> ferrosa_common::Result<()> {
+        let handle = self.spawn()?;
+        *self.handle.lock() = Some(handle);
+        Ok(())
     }
 
     fn stop(&self) {
         self.stop_inner(true);
+    }
+
+    fn health(&self) -> SyncHealthSnapshot {
+        self.shared.health.snapshot(Instant::now(), true)
+    }
+
+    fn restart(&self) -> ferrosa_common::Result<bool> {
+        if self.shared.stop_flag.load(Ordering::Acquire) || !self.shared.health.is_dead() {
+            return Ok(false);
+        }
+        // Holding the handle slot serializes restarts: at most one sync
+        // thread runs. The dead thread has already left its body.
+        let mut slot = self.handle.lock();
+        if !self.shared.health.is_dead() {
+            return Ok(false);
+        }
+        if let Some(dead) = slot.take() {
+            join_sync_thread(PERIODIC_THREAD, dead);
+        }
+        // The new thread clears `dead` itself before its first sync, so a
+        // spawn failure leaves writes refused.
+        let handle = self.spawn()?;
+        *slot = Some(handle);
+        self.shared.health.restarts.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_panic(&self) {
+        self.shared.health.arm_injected_panic();
     }
 }
 
@@ -294,11 +834,20 @@ pub(crate) fn periodic_idle_flush_skipped_total() -> u64 {
 
 /// Fsyncs batches of writes. Bounded latency, good throughput.
 ///
-/// Writers call `on_write()` which increments a pending counter, signals the
-/// background thread, and blocks until the batch is flushed. The background
-/// thread wakes on condvar signal or `max_wait` timeout, calls the flush
-/// callback, then notifies all waiting writers.
+/// Writers call `on_write()`, which registers the write, signals the
+/// background thread, and blocks until a successful fsync covers the write.
+/// The writer fails instead when the thread died or `sync_stall_deadline`
+/// passes. The background thread wakes on a writer signal or `max_wait`,
+/// calls the flush callback, then notifies all waiting writers.
 pub struct GroupSync {
+    shared: Arc<GroupShared>,
+
+    /// Background thread handle.
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Shared coordination state between writers and the group sync thread.
+struct GroupShared {
     /// Maximum time to wait before fsyncing a batch.
     max_wait: Duration,
 
@@ -309,33 +858,26 @@ pub struct GroupSync {
     flush_callback: FlushCallback,
 
     /// Signals the background thread to stop.
-    stop_flag: Arc<AtomicBool>,
+    stop_flag: AtomicBool,
 
-    /// Background thread handle.
-    handle: Mutex<Option<JoinHandle<()>>>,
-
-    /// Shared state for coordinating writers and the flush thread.
-    state: Arc<GroupSyncState>,
-}
-
-/// Shared coordination state between writers and the group sync thread.
-struct GroupSyncState {
     /// Number of writes pending flush.
     pending: AtomicU64,
 
     /// Bytes pending flush.
     pending_bytes: AtomicU64,
 
-    /// Generation counter — incremented after each flush. Writers wait until
-    /// the generation advances past the value they observed on entry.
-    generation: AtomicU64,
-
     /// Condvar signaled by writers when new data is pending.
     writer_signal: (Mutex<()>, Condvar),
 
-    /// Condvar signaled by the flush thread when a batch is complete.
+    /// Condvar signaled by the flush thread when a batch is complete (or the
+    /// thread died). Always notified while holding its mutex: a waiter checks
+    /// `durable_seq` under it, so a notify without it can be lost.
     flush_complete: (Mutex<()>, Condvar),
+
+    health: Arc<SyncHealth>,
 }
+
+const GROUP_THREAD: &str = "commitlog-group-sync";
 
 impl GroupSync {
     pub fn new(max_wait: Duration, flush_callback: FlushCallback) -> Self {
@@ -351,52 +893,149 @@ impl GroupSync {
         batch: CommitLogBatchConfig,
         flush_callback: FlushCallback,
     ) -> Self {
+        let health = Arc::new(SyncHealth::new(batch.sync_stall_deadline));
         Self {
-            max_wait,
-            batch,
-            flush_callback,
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            handle: Mutex::new(None),
-            state: Arc::new(GroupSyncState {
+            shared: Arc::new(GroupShared {
+                max_wait,
+                batch,
+                flush_callback,
+                stop_flag: AtomicBool::new(false),
                 pending: AtomicU64::new(0),
                 pending_bytes: AtomicU64::new(0),
-                generation: AtomicU64::new(0),
                 writer_signal: (Mutex::new(()), Condvar::new()),
                 flush_complete: (Mutex::new(()), Condvar::new()),
+                health,
             }),
+            handle: Mutex::new(None),
         }
     }
 
+    fn spawn(&self) -> ferrosa_common::Result<JoinHandle<()>> {
+        let shared = Arc::clone(&self.shared);
+        let waker = Arc::clone(&self.shared);
+        spawn_sync_thread(
+            GROUP_THREAD,
+            Arc::clone(&self.shared.health),
+            move || shared.run(),
+            move || waker.wake_writers(),
+        )
+    }
+
     fn stop_inner(&self, flush_final: bool) {
+        let shared = &self.shared;
         {
-            let (lock, cvar) = &self.state.writer_signal;
+            let (lock, cvar) = &shared.writer_signal;
             let _guard = lock.lock();
-            self.stop_flag.store(true, Ordering::Release);
+            shared.stop_flag.store(true, Ordering::Release);
             cvar.notify_all();
         }
 
         if let Some(handle) = self.handle.lock().take() {
-            let _ = handle.join();
+            join_sync_thread(GROUP_THREAD, handle);
         }
 
         if flush_final {
-            if let Err(e) = (self.flush_callback)() {
-                tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
+            let ticket = shared.health.begin_sync(Instant::now());
+            match (shared.flush_callback)() {
+                Ok(()) => report_sync_success("group", &shared.health, ticket),
+                Err(e) => {
+                    report_sync_failure("group", &shared.health, &e);
+                    tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
+                }
             }
         }
+        shared.wake_writers();
+    }
+}
 
-        self.state.generation.fetch_add(1, Ordering::AcqRel);
-        {
-            let (_lock, cvar) = &self.state.flush_complete;
-            cvar.notify_all();
+impl GroupShared {
+    fn wake_writers(&self) {
+        let (lock, cvar) = &self.flush_complete;
+        let _guard = lock.lock();
+        cvar.notify_all();
+    }
+
+    fn run(&self) {
+        while !self.stop_flag.load(Ordering::Acquire) {
+            let opened_at;
+            // Wait for a writer signal or max_wait timeout.
+            {
+                let (lock, cvar) = &self.writer_signal;
+                let mut guard = lock.lock();
+
+                // Wait only if there is nothing to sync. A write left by a
+                // dead predecessor has no pending count but is not durable.
+                if self.pending.load(Ordering::Acquire) == 0 && self.health.all_durable() {
+                    // Timing out is how an idle thread re-checks the stop flag.
+                    let _timed_out = cvar.wait_for(&mut guard, self.max_wait);
+                    if self.stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if self.pending.load(Ordering::Acquire) == 0 && self.health.all_durable() {
+                        // Timed out, a spurious wake, or a stop notification
+                        // without writes.
+                        continue;
+                    }
+                }
+
+                opened_at = Instant::now();
+                while self.pending_bytes.load(Ordering::Acquire) < self.batch.target_bytes {
+                    if self.stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let elapsed = opened_at.elapsed();
+                    if elapsed >= self.batch.max_delay {
+                        break;
+                    }
+                    let result =
+                        cvar.wait_for(&mut guard, self.batch.max_delay.saturating_sub(elapsed));
+                    if result.timed_out() || self.stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+            }
+
+            if self.stop_flag.load(Ordering::Acquire) {
+                break;
+            }
+
+            let pending = self.pending.swap(0, Ordering::AcqRel);
+            let batch_bytes = self.pending_bytes.swap(0, Ordering::AcqRel);
+            PENDING_WRITES.fetch_sub(pending, Ordering::Relaxed);
+            PENDING_BYTES.fetch_sub(batch_bytes, Ordering::Relaxed);
+            let ticket = self.health.begin_sync(Instant::now());
+            self.health.maybe_injected_panic();
+            match (self.flush_callback)() {
+                Ok(()) => {
+                    report_sync_success("group", &self.health, ticket);
+                    observe_sync_batch(pending, batch_bytes, opened_at.elapsed());
+                }
+                Err(e) => {
+                    self.pending.fetch_add(pending, Ordering::AcqRel);
+                    self.pending_bytes.fetch_add(batch_bytes, Ordering::AcqRel);
+                    PENDING_WRITES.fetch_add(pending, Ordering::Relaxed);
+                    PENDING_BYTES.fetch_add(batch_bytes, Ordering::Relaxed);
+                    report_sync_failure("group", &self.health, &e);
+                }
+            }
+
+            // Wake every waiting writer to re-check its own write.
+            self.wake_writers();
         }
     }
 }
 
 impl SyncStrategy for GroupSync {
-    fn on_write(&self, _segment: &Segment, _position: u64, bytes: u64) {
-        // Record the generation before we add our pending write.
-        let my_gen = self.state.generation.load(Ordering::Acquire);
+    fn on_write(
+        &self,
+        _segment: &Segment,
+        _position: u64,
+        bytes: u64,
+        ack: AckPolicy,
+    ) -> ferrosa_common::Result<()> {
+        let shared = &self.shared;
+        let started = Instant::now();
+        let seq = shared.health.note_write(started);
 
         // Increment pending while holding writer_signal.lock.
         //
@@ -408,120 +1047,79 @@ impl SyncStrategy for GroupSync {
         // a notification sent between the check and the wait is lost, causing
         // the flush thread to sleep the full max_wait before flushing.
         {
-            let (lock, cvar) = &self.state.writer_signal;
+            let (lock, cvar) = &shared.writer_signal;
             let _guard = lock.lock();
-            self.state.pending.fetch_add(1, Ordering::AcqRel);
-            self.state.pending_bytes.fetch_add(bytes, Ordering::AcqRel);
+            shared.pending.fetch_add(1, Ordering::AcqRel);
+            shared.pending_bytes.fetch_add(bytes, Ordering::AcqRel);
             PENDING_WRITES.fetch_add(1, Ordering::Relaxed);
             PENDING_BYTES.fetch_add(bytes, Ordering::Relaxed);
             cvar.notify_one();
         }
 
-        // Wait until the flush thread completes our batch (generation advances).
-        let (lock, cvar) = &self.state.flush_complete;
+        if ack == AckPolicy::CallerSyncs {
+            return Ok(());
+        }
+
+        // Wait until a successful fsync covers this write. Every exit other
+        // than that one refuses the write; before, a failed flush still woke
+        // the writer as if it had succeeded, and a stall panicked it.
+        let deadline = shared.health.stall_deadline;
+        let (lock, cvar) = &shared.flush_complete;
         let mut guard = lock.lock();
-        while self.state.generation.load(Ordering::Acquire) <= my_gen {
-            let result = cvar.wait_for(&mut guard, Duration::from_secs(30));
-            if result.timed_out() {
-                // The flush thread has not advanced the generation in 30 seconds.
-                // This indicates the thread has died or the disk is unresponsive.
-                // Panic rather than silently returning — a caller that thinks the
-                // write is durable when it is not would cause data loss.
-                panic!(
-                    "GroupSync flush thread stalled for 30s (generation stuck at {}); \
-                     commit log is unresponsive",
-                    my_gen
-                );
+        loop {
+            if shared.health.durable_through(seq) {
+                return Ok(());
             }
+            if shared.health.is_dead() {
+                return shared.health.admit(Instant::now());
+            }
+            let waited = started.elapsed();
+            if waited >= deadline {
+                return Err(shared.health.refuse(format!(
+                    "no commit-log fsync covered this write within the {}ms stall deadline ({})",
+                    deadline.as_millis(),
+                    shared.health.last_failure_text()
+                )));
+            }
+            // A timeout re-checks the deadline above.
+            let _ = cvar.wait_for(&mut guard, deadline - waited);
         }
     }
 
-    fn start(&self) {
-        let stop_flag = Arc::clone(&self.stop_flag);
-        let flush_callback = Arc::clone(&self.flush_callback);
-        let state = Arc::clone(&self.state);
-        let max_wait = self.max_wait;
-        let batch = self.batch.clone();
-
-        let thread = thread::Builder::new()
-            .name("commitlog-group-sync".to_string())
-            .spawn(move || {
-                while !stop_flag.load(Ordering::Acquire) {
-                    let opened_at;
-                    // Wait for a writer signal or max_wait timeout.
-                    {
-                        let (lock, cvar) = &state.writer_signal;
-                        let mut guard = lock.lock();
-
-                        // Wait only if there are no pending writes.
-                        if state.pending.load(Ordering::Acquire) == 0 {
-                            let result = cvar.wait_for(&mut guard, max_wait);
-                            if stop_flag.load(Ordering::Acquire) {
-                                break;
-                            }
-                            if result.timed_out() && state.pending.load(Ordering::Acquire) == 0 {
-                                // Timed out with no pending writes; loop back.
-                                continue;
-                            }
-                            if state.pending.load(Ordering::Acquire) == 0 {
-                                // Spurious wake or stop notification without writes.
-                                continue;
-                            }
-                        }
-
-                        opened_at = Instant::now();
-                        while state.pending_bytes.load(Ordering::Acquire) < batch.target_bytes {
-                            if stop_flag.load(Ordering::Acquire) {
-                                break;
-                            }
-                            let elapsed = opened_at.elapsed();
-                            if elapsed >= batch.max_delay {
-                                break;
-                            }
-                            let result =
-                                cvar.wait_for(&mut guard, batch.max_delay.saturating_sub(elapsed));
-                            if result.timed_out() || stop_flag.load(Ordering::Acquire) {
-                                break;
-                            }
-                        }
-                    }
-
-                    if stop_flag.load(Ordering::Acquire) {
-                        break;
-                    }
-
-                    // Flush pending writes.
-                    let pending = state.pending.swap(0, Ordering::AcqRel);
-                    let batch_bytes = state.pending_bytes.swap(0, Ordering::AcqRel);
-                    if pending > 0 {
-                        PENDING_WRITES.fetch_sub(pending, Ordering::Relaxed);
-                        PENDING_BYTES.fetch_sub(batch_bytes, Ordering::Relaxed);
-                        if let Err(e) = flush_callback() {
-                            state.pending.fetch_add(pending, Ordering::AcqRel);
-                            state.pending_bytes.fetch_add(batch_bytes, Ordering::AcqRel);
-                            PENDING_WRITES.fetch_add(pending, Ordering::Relaxed);
-                            PENDING_BYTES.fetch_add(batch_bytes, Ordering::Relaxed);
-                            tracing::error!(%e, "commitlog: group flush_callback failed — data may not be durable");
-                        } else {
-                            observe_sync_batch(pending, batch_bytes, opened_at.elapsed());
-                        }
-                    }
-
-                    // Advance generation and wake all waiting writers.
-                    state.generation.fetch_add(1, Ordering::AcqRel);
-                    {
-                        let (_lock, cvar) = &state.flush_complete;
-                        cvar.notify_all();
-                    }
-                }
-            })
-            .expect("failed to spawn group sync thread");
-
-        *self.handle.lock() = Some(thread);
+    fn start(&self) -> ferrosa_common::Result<()> {
+        let handle = self.spawn()?;
+        *self.handle.lock() = Some(handle);
+        Ok(())
     }
 
     fn stop(&self) {
         self.stop_inner(true);
+    }
+
+    fn health(&self) -> SyncHealthSnapshot {
+        self.shared.health.snapshot(Instant::now(), true)
+    }
+
+    fn restart(&self) -> ferrosa_common::Result<bool> {
+        if self.shared.stop_flag.load(Ordering::Acquire) || !self.shared.health.is_dead() {
+            return Ok(false);
+        }
+        let mut slot = self.handle.lock();
+        if !self.shared.health.is_dead() {
+            return Ok(false);
+        }
+        if let Some(dead) = slot.take() {
+            join_sync_thread(GROUP_THREAD, dead);
+        }
+        let handle = self.spawn()?;
+        *slot = Some(handle);
+        self.shared.health.restarts.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn inject_panic(&self) {
+        self.shared.health.arm_injected_panic();
     }
 }
 
@@ -585,6 +1183,10 @@ fn update_max_u64(target: &AtomicU64, value: u64) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "sync_durability_tests.rs"]
+mod durability_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::segment::Segment;
     use super::*;
@@ -630,8 +1232,9 @@ mod tests {
         let (segment, offset) = write_mutation(dir.path());
 
         let sync = BatchSync::new();
-        sync.start();
-        sync.on_write(&segment, offset, 128);
+        sync.start().expect("start the sync thread");
+        sync.on_write(&segment, offset, 128, AckPolicy::Durable)
+            .expect("a healthy sync strategy acknowledges the write");
 
         // After on_write, the file should exist on disk with the written data.
         // Note: on_write flushes then writes a sync marker, so the file
@@ -658,10 +1261,11 @@ mod tests {
         // that on_write returns immediately).
         let flush_cb: FlushCallback = Arc::new(|| Ok(()));
         let sync = PeriodicSync::new(Duration::from_secs(60), flush_cb);
-        sync.start();
+        sync.start().expect("start the sync thread");
 
         let start = Instant::now();
-        sync.on_write(&segment, offset, 128);
+        sync.on_write(&segment, offset, 128, AckPolicy::Durable)
+            .expect("a healthy sync strategy acknowledges the write");
         let elapsed = start.elapsed();
 
         // on_write should return in under 1ms (it does nothing).
@@ -692,8 +1296,9 @@ mod tests {
             result
         });
         let sync = PeriodicSync::new(Duration::from_millis(50), flush_cb);
-        sync.start();
-        sync.on_write(&segment, offset, 128);
+        sync.start().expect("start the sync thread");
+        sync.on_write(&segment, offset, 128, AckPolicy::Durable)
+            .expect("a healthy sync strategy acknowledges the write");
 
         // The old test used a fixed 200ms sleep and then checked the file path.
         // Under full-package parallel test load, OS scheduling can delay the
@@ -736,10 +1341,11 @@ mod tests {
         });
 
         let sync = PeriodicSync::new(Duration::from_millis(50), flush_cb);
-        sync.start();
+        sync.start().expect("start the sync thread");
 
         for _ in 0..200 {
-            sync.on_write(&segment, offset, 128);
+            sync.on_write(&segment, offset, 128, AckPolicy::Durable)
+                .expect("a healthy sync strategy acknowledges the write");
         }
 
         thread::sleep(Duration::from_millis(140));
@@ -770,12 +1376,15 @@ mod tests {
             CommitLogBatchConfig {
                 target_bytes: 4096,
                 max_delay: Duration::from_secs(3600),
+                sync_stall_deadline: CommitLogBatchConfig::DEFAULT_SYNC_STALL_DEADLINE,
             },
             flush_cb,
         );
-        sync.start();
-        sync.on_write(&segment, offset, 2048);
-        sync.on_write(&segment, offset, 2048);
+        sync.start().expect("start the sync thread");
+        sync.on_write(&segment, offset, 2048, AckPolicy::Durable)
+            .expect("a healthy sync strategy acknowledges the write");
+        sync.on_write(&segment, offset, 2048, AckPolicy::Durable)
+            .expect("a healthy sync strategy acknowledges the write");
 
         let (lock, cvar) = &*flush_observed;
         let mut flushed = lock.lock();
@@ -807,19 +1416,23 @@ mod tests {
         });
 
         let sync = Arc::new(GroupSync::new(Duration::from_millis(100), flush_cb));
-        sync.start();
+        sync.start().expect("start the sync thread");
 
         // Spawn two writers that call on_write concurrently.
         let sync1 = Arc::clone(&sync);
         let seg1 = Arc::clone(&segment);
         let t1 = thread::spawn(move || {
-            sync1.on_write(&seg1, 0, 128);
+            sync1
+                .on_write(&seg1, 0, 128, AckPolicy::Durable)
+                .expect("a healthy sync strategy acknowledges the write");
         });
 
         let sync2 = Arc::clone(&sync);
         let seg2 = Arc::clone(&segment);
         let t2 = thread::spawn(move || {
-            sync2.on_write(&seg2, 0, 128);
+            sync2
+                .on_write(&seg2, 0, 128, AckPolicy::Durable)
+                .expect("a healthy sync strategy acknowledges the write");
         });
 
         t1.join().unwrap();
@@ -848,10 +1461,11 @@ mod tests {
 
         // Use a very long interval so the periodic timer never fires during the test.
         let sync = PeriodicSync::new(Duration::from_secs(3600), flush_cb);
-        sync.start();
+        sync.start().expect("start the sync thread");
 
         // on_write doesn't flush for PeriodicSync.
-        sync.on_write(&segment, offset, 128);
+        sync.on_write(&segment, offset, 128, AckPolicy::Durable)
+            .expect("a healthy sync strategy acknowledges the write");
 
         // File should not exist yet (timer hasn't fired).
         let path = segment.path();
@@ -884,7 +1498,7 @@ mod tests {
         // Use a very long max_wait so the group thread won't flush during the test
         // unless explicitly triggered by writes or stop.
         let sync = GroupSync::new(Duration::from_secs(3600), flush_cb);
-        sync.start();
+        sync.start().expect("start the sync thread");
 
         // stop() should flush any pending data.
         sync.stop();

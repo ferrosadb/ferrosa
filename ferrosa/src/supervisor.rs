@@ -19,6 +19,14 @@
 //! |--------------------|----------------------------------------|
 //! | `storage_flush`    | panic, stall (one per stall deadline)  |
 //! | `maintenance_loop` | panic, exit (the loop must never end)  |
+//! | `commitlog_sync`   | panic, stall (one per stall deadline)  |
+//!
+//! `commitlog_sync` is the commit log's background fsync thread (P0-6,
+//! t_88479cda). The write path does not depend on this supervisor for
+//! durability: the commit log itself refuses writes while its sync thread is
+//! dead, failing or stalled (see `ferrosa_storage::commitlog` `sync`). The
+//! [`CommitLogSyncSupervisor`] restarts a dead thread, reports the impaired
+//! state, and escalates past the intensity.
 //!
 //! A flush that RETURNS an error marks `storage_flush` impaired until a flush
 //! succeeds, but is not counted toward the intensity: the flusher is alive and
@@ -68,16 +76,23 @@ pub enum Child {
     /// The maintenance loop: flush ticks, compaction polling, commit-log GC,
     /// schema persistence and S3 sync.
     MaintenanceLoop,
+    /// The commit log's background fsync thread.
+    CommitLogSync,
 }
 
 impl Child {
-    const ALL: [Child; 2] = [Child::StorageFlush, Child::MaintenanceLoop];
+    const ALL: [Child; 3] = [
+        Child::StorageFlush,
+        Child::MaintenanceLoop,
+        Child::CommitLogSync,
+    ];
 
     /// Stable label for metrics, logs and the `/readyz` body.
     pub fn label(self) -> &'static str {
         match self {
             Child::StorageFlush => "storage_flush",
             Child::MaintenanceLoop => "maintenance_loop",
+            Child::CommitLogSync => "commitlog_sync",
         }
     }
 
@@ -85,6 +100,7 @@ impl Child {
         match self {
             Child::StorageFlush => 0,
             Child::MaintenanceLoop => 1,
+            Child::CommitLogSync => 2,
         }
     }
 }
@@ -222,7 +238,7 @@ struct ChildHealth {
 /// `/metrics`; written by the supervisors.
 #[derive(Default)]
 pub struct SupervisionStatus {
-    children: [ChildHealth; 2],
+    children: [ChildHealth; 3],
 }
 
 impl SupervisionStatus {
@@ -658,6 +674,230 @@ impl FlushSupervisor {
             "storage flush crashed; the next flush tick restarts it, and the node reports \
              not ready until a flush succeeds"
         );
+    }
+}
+
+/// How often the commit-log sync supervisor samples the sync thread's health.
+pub const COMMIT_LOG_SYNC_POLL: Duration = Duration::from_millis(100);
+
+/// What the commit-log sync supervisor watches and restarts. A trait so the
+/// tests can drive the supervisor without a disk.
+pub trait CommitLogSyncTarget: Send + Sync {
+    fn sync_health(&self) -> ferrosa_storage::commitlog::SyncHealthSnapshot;
+    fn restart_sync(&self) -> ferrosa_common::Result<bool>;
+}
+
+impl CommitLogSyncTarget for ferrosa_storage::StorageEngine {
+    fn sync_health(&self) -> ferrosa_storage::commitlog::SyncHealthSnapshot {
+        self.commit_log_sync_health()
+    }
+
+    fn restart_sync(&self) -> ferrosa_common::Result<bool> {
+        self.restart_commit_log_sync()
+    }
+}
+
+impl CommitLogSyncTarget for ferrosa_storage::commitlog::CommitLog {
+    fn sync_health(&self) -> ferrosa_storage::commitlog::SyncHealthSnapshot {
+        ferrosa_storage::commitlog::CommitLog::sync_health(self)
+    }
+
+    fn restart_sync(&self) -> ferrosa_common::Result<bool> {
+        ferrosa_storage::commitlog::CommitLog::restart_sync(self)
+    }
+}
+
+/// Supervises the commit log's fsync thread from health samples.
+///
+/// Each [`check`](Self::check) compares a fresh snapshot with the last one:
+/// a new panic is a crash (counted, then the thread is restarted), every
+/// elapsed stall deadline is a stall (counted), a failing fsync marks the
+/// child impaired without counting (the stall it causes is counted). Past the
+/// intensity it escalates instead of restarting. It is healthy again only
+/// when the snapshot is: alive, the last fsync succeeded, and no write has
+/// waited past the stall deadline.
+pub struct CommitLogSyncSupervisor<T: CommitLogSyncTarget + ?Sized> {
+    target: Arc<T>,
+    status: Arc<SupervisionStatus>,
+    window: IntensityWindow,
+    intensity: RestartIntensity,
+    escalation: Arc<EscalationPolicy>,
+    escalated: bool,
+    seen_panics: u64,
+    seen_sync_failures: u64,
+    /// Stall deadlines already recorded for the current stall episode.
+    stalls_recorded: u64,
+}
+
+impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
+    pub fn new(
+        target: Arc<T>,
+        status: Arc<SupervisionStatus>,
+        intensity: RestartIntensity,
+        escalation: Arc<EscalationPolicy>,
+    ) -> Self {
+        let baseline = target.sync_health();
+        Self {
+            target,
+            status,
+            window: IntensityWindow::new(intensity),
+            intensity,
+            escalation,
+            escalated: false,
+            seen_panics: baseline.panics,
+            seen_sync_failures: baseline.sync_failures,
+            stalls_recorded: 0,
+        }
+    }
+
+    /// Sample the sync thread's health once and act on it.
+    pub fn check(&mut self) {
+        let health = self.target.sync_health();
+        let detail = health
+            .last_failure
+            .clone()
+            .unwrap_or_else(|| "no failure recorded".to_string());
+
+        let new_panics = health.panics.saturating_sub(self.seen_panics);
+        self.seen_panics = health.panics;
+        // Restarted within one poll and died again: each death is counted.
+        for _ in 0..new_panics.min(u64::from(self.intensity.max_restarts) + 1) {
+            self.record_crash(FailureKind::Panic, detail.clone());
+        }
+        if health.dead && !self.escalated {
+            self.restart(&detail);
+        }
+
+        self.record_stalls(&health, &detail);
+
+        if health.sync_failures > self.seen_sync_failures {
+            self.seen_sync_failures = health.sync_failures;
+            if self
+                .status
+                .record_failure(Child::CommitLogSync, FailureKind::Error, &detail)
+            {
+                tracing::error!(
+                    task = Child::CommitLogSync.label(),
+                    %detail,
+                    "commit-log fsync failing; writes are refused and the node reports not ready \
+                     until an fsync succeeds"
+                );
+            }
+        }
+
+        // A thread restarted in this check has synced nothing yet; the next
+        // sample decides whether it recovered.
+        if !health.dead
+            && !health.impaired()
+            && !self.escalated
+            && self.status.record_recovery(Child::CommitLogSync)
+        {
+            tracing::warn!(
+                task = Child::CommitLogSync.label(),
+                "commit-log sync recovered; writes are acknowledged again"
+            );
+        }
+    }
+
+    fn restart(&mut self, detail: &str) {
+        match self.target.restart_sync() {
+            Ok(true) => {
+                self.status.record_restart(Child::CommitLogSync);
+                tracing::error!(
+                    task = Child::CommitLogSync.label(),
+                    %detail,
+                    "commit-log sync thread died and was restarted; it syncs what the dead \
+                     thread left before writes are acknowledged again"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // Writes stay refused (the thread is still dead); the next
+                // check retries the restart.
+                self.status.record_failure(
+                    Child::CommitLogSync,
+                    FailureKind::Error,
+                    &format!("restart failed: {e}"),
+                );
+                tracing::error!(
+                    task = Child::CommitLogSync.label(),
+                    %e,
+                    "could not restart the commit-log sync thread; writes stay refused and the \
+                     next check retries"
+                );
+            }
+        }
+    }
+
+    /// One stall per stall deadline the oldest unsynced write has outlived.
+    fn record_stalls(
+        &mut self,
+        health: &ferrosa_storage::commitlog::SyncHealthSnapshot,
+        detail: &str,
+    ) {
+        let Some(waited) = health.unsynced_for.filter(|_| health.stalled()) else {
+            self.stalls_recorded = 0;
+            return;
+        };
+        let due =
+            (waited.as_nanos() / health.stall_deadline.as_nanos()).min(u128::from(u64::MAX)) as u64;
+        let newly_due = due.saturating_sub(self.stalls_recorded);
+        self.stalls_recorded = due.max(self.stalls_recorded);
+        for _ in 0..newly_due.min(u64::from(self.intensity.max_restarts) + 1) {
+            self.record_crash(
+                FailureKind::Stall,
+                format!(
+                    "no commit-log fsync for {}ms, past the {}ms stall deadline ({detail})",
+                    waited.as_millis(),
+                    health.stall_deadline.as_millis()
+                ),
+            );
+        }
+    }
+
+    /// A panic or stall: counted toward the intensity, escalated past it.
+    fn record_crash(&mut self, kind: FailureKind, detail: String) {
+        self.status
+            .record_failure(Child::CommitLogSync, kind, &detail);
+        let in_period = self.window.record(Instant::now());
+        if self.escalated {
+            return;
+        }
+        if self.window.exceeded(in_period) {
+            self.escalated = true;
+            self.escalation.escalate(
+                &self.status,
+                &EscalationReport {
+                    child: Child::CommitLogSync,
+                    failures_in_period: in_period,
+                    intensity: self.intensity,
+                    last_failure: detail,
+                },
+            );
+            return;
+        }
+        tracing::error!(
+            task = Child::CommitLogSync.label(),
+            kind = kind.label(),
+            failures_in_period = in_period,
+            max_restarts = self.intensity.max_restarts,
+            %detail,
+            "commit-log sync failed; writes are refused and the node reports not ready until \
+             it recovers"
+        );
+    }
+}
+
+/// Run a [`CommitLogSyncSupervisor`] every `poll` until the process exits.
+pub async fn run_commit_log_sync_supervisor<T: CommitLogSyncTarget + ?Sized>(
+    mut supervisor: CommitLogSyncSupervisor<T>,
+    poll: Duration,
+) {
+    let mut tick = tokio::time::interval(poll);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        supervisor.check();
     }
 }
 

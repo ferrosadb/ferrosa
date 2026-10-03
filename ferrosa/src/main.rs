@@ -3202,6 +3202,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .background
         .spawn(maintenance::run_supervised(maintenance_context));
 
+    // P0-6 (t_88479cda): supervise the commit log's fsync thread. The commit
+    // log refuses writes on its own while the thread is dead or behind; this
+    // restarts it, reports it on /readyz and the metrics, and escalates past
+    // the intensity. The watcher runs under `supervise` so a panic in the
+    // watcher itself is a counted, restarted failure, not a silent end.
+    {
+        let storage = storage.clone();
+        let status = supervision_status.clone();
+        let intensity = supervisor::RestartIntensity::from_env();
+        let escalation = Arc::new(supervisor::EscalationPolicy::AbortProcess {
+            engine: storage.clone(),
+        });
+        runtimes.background.spawn(supervisor::supervise(
+            supervisor::Child::CommitLogSync,
+            status.clone(),
+            intensity,
+            escalation.clone(),
+            move || {
+                supervisor::run_commit_log_sync_supervisor(
+                    supervisor::CommitLogSyncSupervisor::new(
+                        storage.clone(),
+                        status.clone(),
+                        intensity,
+                        escalation.clone(),
+                    ),
+                    supervisor::COMMIT_LOG_SYNC_POLL,
+                )
+            },
+        ));
+    }
+
     // 13. Wait for shutdown signal (SIGINT or SIGTERM)
     //
     // Docker/Podman sends SIGTERM on `stop`. Without this, the process

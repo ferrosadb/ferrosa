@@ -38,7 +38,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   allocation, forward-linked sync markers, crash-recovery replay, CDC reader,
   S3 archiver for PITR, and per-table checkpoints. Three sync strategies
   (`Batch`, `Periodic`, `Group`); **default is `Periodic`** → a bounded
-  durability window (see FMEA).
+  durability window: writes are refused with `CommitLogNotDurable` while the
+  sync thread is dead, fsync is failing, or the oldest unsynced write is past
+  `FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS` (2000). The sync thread exposes
+  `sync_health()` / `restart_sync()` for the node supervisor (FMEA ST-71).
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
   memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`, and
   every view change is a compare-and-swap derived from the current view.

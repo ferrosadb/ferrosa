@@ -8787,9 +8787,11 @@ impl StorageEngine {
         }
 
         // Phase 1: Append all mutations to the commit log, tracking positions.
+        // Sync health must not refuse an append partway (that would leave a
+        // torn prefix); the force_sync below is this batch's durability.
         let mut positions: HashMap<TableId, CommitLogPosition> = HashMap::new();
         for m in &mutations {
-            let cl_pos = self.commit_log.append(m)?;
+            let cl_pos = self.commit_log.append_for_explicit_sync(m)?;
             let table_id = TableId::new(&m.keyspace, &m.table);
             positions.insert(table_id, cl_pos);
         }
@@ -10332,6 +10334,23 @@ impl StorageEngine {
     /// the commit log (e.g., for catch-up replay after failover).
     pub fn force_commit_log_sync(&self) -> ferrosa_common::Result<()> {
         self.commit_log.force_sync()
+    }
+
+    /// Health of the commit-log sync thread, for the node supervisor.
+    pub fn commit_log_sync_health(&self) -> crate::commitlog::SyncHealthSnapshot {
+        self.commit_log.sync_health()
+    }
+
+    /// Replace a dead commit-log sync thread. `Ok(false)` when there was
+    /// nothing to restart.
+    pub fn restart_commit_log_sync(&self) -> ferrosa_common::Result<bool> {
+        self.commit_log.restart_sync()
+    }
+
+    /// Make the commit-log sync thread panic at its next sync attempt.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_commit_log_sync_panic(&self) {
+        self.commit_log.inject_sync_panic();
     }
 
     /// Flushes the active memtable for a table to an SSTable on disk.
