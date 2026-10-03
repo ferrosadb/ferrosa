@@ -91,8 +91,8 @@ impl FullTextIndexReader {
 
     /// Execute a parsed [`FtsQuery`] and return scored hits.
     ///
-    /// Results are sorted by descending BM25 score. Deduplication by
-    /// partition key is applied: the maximum score for any key wins.
+    /// Results are sorted by descending BM25 score, one hit per key: a key's
+    /// per-term scores sum. The order of equal scores is unspecified.
     pub fn search(&self, query: &FtsQuery) -> Vec<FtsHit> {
         // Normalize query terms through the index's analyzer first, so a term
         // the index dropped/rewrote (e.g. a stop word) can't silently force a
