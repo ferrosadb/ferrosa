@@ -58,7 +58,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 /// reader on the node. Matches the coordinator's idle budget
 /// (`STREAMING_IDLE_TIMEOUT`, 30 s): by then the requester has given up on
 /// this stream anyway.
-const STREAM_SINK_SEND_DEADLINE: Duration = Duration::from_secs(30);
+pub(super) const STREAM_SINK_SEND_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Default ceiling on the number of clustered rows packed into one stream
 /// chunk frame. Matches `ferrosa_storage::range_merger`'s default fragment
@@ -362,7 +362,7 @@ pub async fn handle_stream_request_with_cancel<R, S>(
                 let bytes = bincode::serialize(&hb)
                     .expect("RangeReadStreamHeartbeatPayload serialization is infallible");
                 let heartbeat = Message::RangeReadStreamHeartbeat(Bytes::from(bytes));
-                if !send_bounded(sink, heartbeat, &req, &cancel).await {
+                if !send_bounded(sink, heartbeat, req.request_id, "range read", &cancel).await {
                     return;
                 }
             }
@@ -404,7 +404,8 @@ pub async fn handle_stream_request_with_cancel<R, S>(
     send_bounded(
         sink,
         Message::RangeReadStreamDone(Bytes::from(bytes)),
-        &req,
+        req.request_id,
+        "range read",
         &cancel,
     )
     .await;
@@ -428,41 +429,34 @@ fn resume_filter_rows(
     crate::write_path::filter_resumed_fragment(partition, start.key.as_bytes(), resume_ck)
 }
 
-/// Build a `RangeReadStreamChunk` from `batch`, send it via `sink`,
-/// and clear `batch` so its backing allocation is reused for the
-/// next chunk. The partitions are moved out of the batch — no
-/// clone — so memory peaks at `chunk_size` partitions held by the
-/// builder, not 2×.
-/// Hand one frame to `sink`, bounded by [`STREAM_SINK_SEND_DEADLINE`] and by
-/// `cancel`. Returns `false` when the frame was not accepted; the caller must
-/// then abandon the request so its local storage stream is dropped and the
-/// producer behind it unparks. Logged here, once per request (the caller
-/// returns on the first failure).
-async fn send_bounded<S: ChunkSink>(
+/// Hand one frame of a streamed response to `sink`, bounded by
+/// [`STREAM_SINK_SEND_DEADLINE`] and by `cancel`. Returns `false` when the
+/// frame was not accepted; the caller must then abandon the request so its
+/// local storage stream is dropped and the producer behind it unparks. Logged
+/// here, once per request (callers return on the first failure). Shared by
+/// every responder that feeds a sink from a local storage walk.
+pub(super) async fn send_bounded<S: ChunkSink + ?Sized>(
     sink: &S,
     msg: Message,
-    req: &RangeReadStreamRequestPayload,
+    request_id: u32,
+    what: &'static str,
     cancel: &CancellationToken,
 ) -> bool {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            tracing::debug!(
-                request_id = req.request_id,
-                "stream request: cancelled while a frame send was blocked"
-            );
+            tracing::debug!(request_id, what, "cancelled while a frame send was blocked");
             false
         }
         sent = tokio::time::timeout(STREAM_SINK_SEND_DEADLINE, sink.send(msg)) => match sent {
             Ok(()) => true,
             Err(_elapsed) => {
                 tracing::error!(
-                    request_id = req.request_id,
-                    keyspace = req.keyspace,
-                    table = req.table,
+                    request_id,
+                    what,
                     deadline_secs = STREAM_SINK_SEND_DEADLINE.as_secs(),
-                    "stream request: an outbound frame was not accepted within the deadline; \
-                     abandoning the request and releasing the local storage stream"
+                    "an outbound stream frame was not accepted within the deadline; abandoning \
+                     the request and releasing the local storage walk"
                 );
                 false
             }
@@ -470,6 +464,11 @@ async fn send_bounded<S: ChunkSink>(
     }
 }
 
+/// Build a `RangeReadStreamChunk` from `batch`, send it via `sink`,
+/// and clear `batch` so its backing allocation is reused for the
+/// next chunk. The partitions are moved out of the batch — no
+/// clone — so memory peaks at `chunk_size` partitions held by the
+/// builder, not 2×.
 async fn emit_chunk<S: ChunkSink>(
     req: &RangeReadStreamRequestPayload,
     batch: &mut Vec<Partition>,
@@ -492,7 +491,8 @@ async fn emit_chunk<S: ChunkSink>(
     send_bounded(
         sink,
         Message::RangeReadStreamChunk(Bytes::from(bytes)),
-        req,
+        req.request_id,
+        "range read",
         cancel,
     )
     .await
@@ -515,7 +515,8 @@ async fn send_truncated_done<S: ChunkSink>(
     send_bounded(
         sink,
         Message::RangeReadStreamDone(Bytes::from(bytes)),
-        req,
+        req.request_id,
+        "range read",
         cancel,
     )
     .await;
