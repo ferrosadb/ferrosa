@@ -53,7 +53,9 @@ Postgres drivers speak to ferrosa. Its boundary is deliberately narrow:
 | `query` (`src/query.rs`) | ~1927 | `execute_query`, DML (INSERT/UPDATE/DELETE), value codecs (text+binary), SQLSTATE mapping, `load_catalog` |
 | `storage_provider` (`src/storage_provider.rs`) | ~758 | `load_table`: bounded async-to-sync streaming provider; `cql_to_value`; R15 guard |
 | `catalog` (`src/catalog.rs`) | ~537 | `pg_catalog` projection (`pg_namespace`/`pg_class`/`pg_attribute`/`pg_type`) with deterministic OIDs |
-| `server` (`src/server.rs`) | ~540 | tokio TCP front-end: `serve`, `QueryContext`, `handle_connection`, the post-auth query loop |
+| `server` (`src/server.rs`) | ~540 | tokio TCP front-end: `serve`, `QueryContext`, `handle_connection`, the post-auth query loop (wakes to expire idle suspended portals) |
+| `result_stream` (`src/result_stream.rs`) | ~600 | Pull-driven result delivery: an owned `RowCursor` fetched 16 rows at a time on a blocking thread; a waiting query holds no thread |
+| `portal_limits` (`src/portal_limits.rs`) | ~380 | `PortalLimits`/`SuspendedPortals`: per-connection and per-node caps on suspended portals (`53000`), idle timeout (`57014`), metrics |
 | `lib` (`src/lib.rs`) | ~37 | Module wiring + public re-exports |
 
 ## Connection lifecycle
@@ -83,11 +85,16 @@ differential oracle exercise.
 `query::load_catalog` resolves every referenced table (FROM + optional JOIN) by
 opening each referenced table as a bounded-channel storage provider. The scan
 producer decodes storage partitions as the synchronous executor pulls rows;
-the scan channel capacity defaults to 64 and is configurable. The executor
-(`ferrosa_sql::execute_streaming`) runs on a blocking thread and hands rows to
-the async side in bounded batches (`result_stream`); each batch is encoded and
-written to the socket before the next is taken, so response memory is O(batch).
-Extended `Execute` honours `max_rows` with `PortalSuspended`. → `RowDescription`
+the scan channel capacity defaults to 64 and is configurable. The executor is
+an owned `ferrosa_sql::RowCursor`, pulled 16 rows at a time on a blocking
+thread (`result_stream`), with the next fetch started as each batch arrives;
+each batch is encoded and written to the socket, so response memory is
+O(batch). A fetch never waits on the client, so a query waiting for its client
+(suspended portal, undrained socket) holds no thread; its storage scan pauses
+after 10 ms and holds none either (ferrosa-storage ST-68). Extended `Execute`
+honours `max_rows` with `PortalSuspended`; suspended portals are capped per
+connection and per node (`53000` past either) and closed after an idle
+timeout (`portal_limits`, PG-14/PG-15). → `RowDescription`
 + streamed `DataRow`s + `CommandComplete "SELECT n"`. The caller appends one
 `ReadyForQuery`.
 

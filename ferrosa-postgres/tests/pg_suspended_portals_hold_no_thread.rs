@@ -1,29 +1,28 @@
-//! A suspended portal holds no thread while it waits.
+//! A query waiting for its client holds no thread.
 //!
 //! The PG listener runs on a runtime whose blocking pool is bounded
 //! (`background`: `max(cores * 2, 4)` threads). Every PG query's executor, and
 //! every storage range-scan producer, runs on a thread from that pool. If a
-//! portal suspended by `max_rows` kept its executor and its scan producer
-//! blocked on the client, about `cores` idle clients would use the pool up, and
-//! every later `spawn_blocking` on that runtime (every PG query, web, graph,
-//! SPARQL, maintenance) would queue forever (FMEA PG-Tf348ba0b, missing-guards
+//! portal suspended by `max_rows`, or a query whose client stopped reading its
+//! socket, kept its executor and its scan producer blocked on the client,
+//! about `cores` idle clients would use the pool up, and every later
+//! `spawn_blocking` on that runtime (every PG query, web, graph, SPARQL,
+//! maintenance) would queue forever (FMEA PG-Tf348ba0b, missing-guards
 //! entry 8).
 //!
-//! The invariant pinned here: however many portals are suspended, the number
-//! of blocking threads they hold is zero once they have settled, and another
-//! session's query completes.
+//! The invariant pinned here: however many queries wait on their clients, the
+//! number of blocking threads they hold is zero once they have settled, and
+//! another session's query completes.
 
+#[path = "common/blocking_pool.rs"]
+mod blocking_pool;
 #[path = "common/pg_server.rs"]
 mod pg_server;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use blocking_pool::{on_bounded_runtime, settle_blocking_pool, MAX_BLOCKING, SETTLE};
 use pg_server::{connect, start_server};
-
-/// The server runtime's blocking pool, as in production but small.
-const MAX_BLOCKING: usize = 4;
 
 /// Clients, each holding [`PORTALS_PER_CLIENT`] suspended portals: four times
 /// the blocking pool in all.
@@ -33,69 +32,6 @@ const PORTALS_PER_CLIENT: usize = 4;
 /// Far more partitions than every buffer between storage and socket, so each
 /// suspended portal's pipeline really is stopped mid-scan.
 const ROWS: usize = 4_000;
-
-/// How long a suspended portal may take to give its threads back. Covers the
-/// storage producer's short grace wait before it pauses.
-const SETTLE: Duration = Duration::from_secs(10);
-
-/// How many of the runtime's [`MAX_BLOCKING`] blocking threads are free.
-///
-/// Starts that many blocking tasks that each check in and then wait to be
-/// released, so they occupy every free thread at once; the count that checked
-/// in within `within` is the number of free threads. Tasks still queued when
-/// the probe gives up start later, find the release flag set, and return.
-async fn free_blocking_threads(within: Duration) -> usize {
-    let arrived = Arc::new(AtomicUsize::new(0));
-    let release = Arc::new(AtomicBool::new(false));
-    for _ in 0..MAX_BLOCKING {
-        let arrived = Arc::clone(&arrived);
-        let release = Arc::clone(&release);
-        tokio::task::spawn_blocking(move || {
-            arrived.fetch_add(1, Ordering::SeqCst);
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        });
-    }
-    let deadline = Instant::now() + within;
-    while arrived.load(Ordering::SeqCst) < MAX_BLOCKING && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let free = arrived.load(Ordering::SeqCst);
-    release.store(true, Ordering::SeqCst);
-    free
-}
-
-/// Wait until every blocking thread is free, or `SETTLE` passes. Returns the
-/// last count seen.
-async fn settle_blocking_pool() -> usize {
-    let deadline = Instant::now() + SETTLE;
-    loop {
-        let free = free_blocking_threads(Duration::from_millis(200)).await;
-        if free == MAX_BLOCKING || Instant::now() >= deadline {
-            return free;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Run `body` on a runtime shaped like the PG listener's, and shut it down
-/// with a timeout: a thread parked forever (the bug under test) must fail the
-/// test, not hang it in `Runtime::drop`.
-fn on_bounded_runtime(body: impl std::future::Future<Output = ()>) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .max_blocking_threads(MAX_BLOCKING)
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(body)));
-    rt.shutdown_timeout(Duration::from_secs(1));
-    if let Err(panic) = outcome {
-        std::panic::resume_unwind(panic);
-    }
-}
 
 #[test]
 fn suspended_portals_hold_no_blocking_thread() {
@@ -124,8 +60,8 @@ fn suspended_portals_hold_no_blocking_thread() {
                         .unwrap_or_else(|_| {
                             panic!(
                                 "portal {} of {} made no progress in 10 s: the {suspended} \
-                         portals already suspended hold the blocking pool \
-                         (max_blocking_threads = {MAX_BLOCKING})",
+                                 portals already suspended hold the blocking pool \
+                                 (max_blocking_threads = {MAX_BLOCKING})",
                                 suspended + 1,
                                 CLIENTS * PORTALS_PER_CLIENT
                             )
@@ -158,5 +94,40 @@ fn suspended_portals_hold_no_blocking_thread() {
         })
         .expect("the other session's SELECT succeeds");
         assert_eq!(rows.len(), ROWS, "every row is returned");
+    });
+}
+
+/// More concurrent queries than the blocking pool has threads all complete.
+/// Each query's executor waits on its storage scan; if the scan producers drew
+/// threads from the same bounded pool as the executors, enough concurrent
+/// queries would hold every thread waiting on producers that can never start.
+#[test]
+fn more_concurrent_queries_than_blocking_threads_all_complete() {
+    on_bounded_runtime(async {
+        ferrosa_sched::init_global_pool(ferrosa_sched::Reservation::new(17, 1));
+        let server = start_server(ROWS).await;
+        let mut queries = Vec::new();
+        for _ in 0..4 * MAX_BLOCKING {
+            let client = connect(server.port).await;
+            queries.push(tokio::spawn(async move {
+                client
+                    .query("SELECT id FROM t", &[])
+                    .await
+                    .map(|rows| rows.len())
+            }));
+        }
+        let all = futures::future::join_all(queries);
+        let done = tokio::time::timeout(Duration::from_secs(30), all)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{} concurrent queries beside a {MAX_BLOCKING}-thread blocking pool made \
+                     no progress in 30 s",
+                    4 * MAX_BLOCKING
+                )
+            });
+        for result in done {
+            assert_eq!(result.expect("joined").expect("query"), ROWS);
+        }
     });
 }
