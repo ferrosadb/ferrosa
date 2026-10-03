@@ -402,8 +402,11 @@ fn promote_to_voter_body(host_id: &str) -> serde_json::Value {
 }
 
 /// Build the `downgrade-to-pair` URL.
-fn downgrade_to_pair_url(host: &str, web_port: u16) -> String {
-    format!("http://{}:{}/api/cluster/downgrade-to-pair", host, web_port)
+fn downgrade_to_pair_url(host: &str, web_port: u16, peer: &str) -> String {
+    format!(
+        "http://{}:{}/api/cluster/downgrade-to-pair?peer={}",
+        host, web_port, peer
+    )
 }
 
 /// Build the `demote-to-learner` URL.
@@ -427,11 +430,15 @@ fn demote_to_learner_body(host_id: &str) -> serde_json::Value {
 /// timeout no longer downgrades. So this command is the whole of the "operator
 /// action" the node's warning log refers to.
 ///
-/// Issues `POST /api/cluster/downgrade-to-pair`. The node must have a connected
-/// peer, since pair mode replicates to one; the server refuses otherwise and
-/// says which peers it could see.
-pub async fn cluster_downgrade_to_pair(host: &str, web_port: u16) -> Result<(), WebError> {
-    let url = downgrade_to_pair_url(host, web_port);
+/// Issues `POST /api/cluster/downgrade-to-pair?peer=<host_id>`. The named peer
+/// must be connected, and the node refuses while Raft still runs on it or the
+/// ring holds any other member; the server says which condition failed.
+pub async fn cluster_downgrade_to_pair(
+    host: &str,
+    web_port: u16,
+    peer: &str,
+) -> Result<(), WebError> {
+    let url = downgrade_to_pair_url(host, web_port, peer);
     let client = reqwest::Client::new();
     let resp = client.post(&url).send().await?;
 
@@ -1520,8 +1527,11 @@ mod tests {
     /// like "endpoint not wired" when in fact the path was misspelled.
     #[test]
     fn ferrosa_ctl_cluster_downgrade_to_pair() {
-        let url = super::downgrade_to_pair_url("127.0.0.1", 9090);
-        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/downgrade-to-pair");
+        let url = super::downgrade_to_pair_url("127.0.0.1", 9090, "abc");
+        assert_eq!(
+            url,
+            "http://127.0.0.1:9090/api/cluster/downgrade-to-pair?peer=abc"
+        );
     }
 
     /// W8.5 RED. `ferrosa-ctl cluster demote-to-learner <host_id>` must

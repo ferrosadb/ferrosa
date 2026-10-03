@@ -4352,7 +4352,7 @@ fn downgrade_to_pair_is_refused_with_no_connected_peer() {
     assert!(controller.connected_peers.lock().is_empty());
 
     let err = controller
-        .downgrade_to_pair()
+        .downgrade_to_pair(Some(Uuid::new_v4()))
         .expect_err("no connected peer must be refused");
 
     let msg = err.to_string();
@@ -4386,7 +4386,7 @@ async fn downgrade_to_pair_moves_a_cluster_member_when_a_peer_is_connected() {
     controller.connected_peers.lock().push((peer, addr));
 
     let peer_host_id = controller
-        .downgrade_to_pair()
+        .downgrade_to_pair(Some(peer))
         .expect("a cluster with a connected peer must accept an operator downgrade");
 
     assert_eq!(
@@ -4398,6 +4398,102 @@ async fn downgrade_to_pair_moves_a_cluster_member_when_a_peer_is_connected() {
         DeploymentMode::Pair,
         "the operator override must actually move the mode"
     );
+}
+
+/// Refused without a NAMED peer (P0-5).
+///
+/// The old action paired with `connected_peers.first()`: whichever peer
+/// happened to connect first became the sole replication target. An operator
+/// must name the peer; "any connected peer" is not a decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_without_a_named_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    controller
+        .connected_peers
+        .lock()
+        .push((Uuid::new_v4(), addr));
+
+    let err = controller
+        .downgrade_to_pair(None)
+        .expect_err("a downgrade that names no peer must be refused");
+
+    assert!(
+        err.to_string().contains("named peer"),
+        "the refusal must say a named peer is required, got: {err}"
+    );
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+}
+
+/// Refused when the named peer is not the one connected (P0-5).
+///
+/// Before the fix the first connected peer was used regardless of what the
+/// operator meant, so naming B while only A was connected paired with A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_when_the_named_peer_is_not_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    controller
+        .connected_peers
+        .lock()
+        .push((Uuid::new_v4(), addr));
+
+    let named = Uuid::new_v4();
+    let err = controller
+        .downgrade_to_pair(Some(named))
+        .expect_err("a named peer that is not connected must be refused");
+
+    assert!(
+        err.to_string().contains(&named.to_string()),
+        "the refusal must name the requested peer, got: {err}"
+    );
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+}
+
+/// Refused while the token ring still holds members other than this node and
+/// the named peer (P0-5).
+///
+/// A pair replicates to exactly one peer. If a third node still owns tokens,
+/// it is still a replica serving ranges this node would now write without it:
+/// that is the split brain the review found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_while_the_ring_has_other_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let peer = Uuid::new_v4();
+    let third = Uuid::new_v4();
+    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    controller.connected_peers.lock().push((peer, addr));
+
+    let mut ring = crate::ring::TokenRing::new();
+    for (host_id, token) in [(controller.host_id(), 10), (peer, 20), (third, 30)] {
+        let node_id = crate::raft::uuid_to_node_id(host_id);
+        ring.add_node(
+            node_id,
+            crate::raft::NodeInfo {
+                host_id,
+                addr: "127.0.0.1:7000".into(),
+                data_center: "dc1".into(),
+                rack: "rack1".into(),
+                state: crate::raft::NodeState::Normal,
+                cql_broadcast: None,
+            },
+        );
+        ring.assign_tokens(node_id, &[token]);
+    }
+    controller.set_token_ring(Arc::new(ring));
+
+    let err = controller
+        .downgrade_to_pair(Some(peer))
+        .expect_err("a ring with a third member must be refused");
+
+    assert!(
+        err.to_string().contains(&third.to_string()),
+        "the refusal must name the member still in the ring, got: {err}"
+    );
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
 }
 
 /// The automatic path still cannot do this.
