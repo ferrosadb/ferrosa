@@ -464,6 +464,7 @@ mod tests {
         let result = QueryResult {
             column_names: vec![],
             rows: vec![wire_row("stale", 7)],
+            paging_state: None,
         };
         let rows = decode(&result).expect("a well-formed wire row decodes");
         assert_eq!(
@@ -483,6 +484,7 @@ mod tests {
         let result = QueryResult {
             column_names: vec![],
             rows: vec![row],
+            paging_state: None,
         };
         let err = decode(&result).expect_err("a 3-byte integer is a real disagreement");
         assert!(
@@ -500,6 +502,7 @@ mod tests {
             rows: vec![ResultRow {
                 columns: vec![Some(b"agent_memory".to_vec())],
             }],
+            paging_state: None,
         };
         let err = decode(&result).expect_err("a short row must not be silently dropped");
         assert!(

@@ -1328,6 +1328,7 @@ mod tests {
                         .collect(),
                 })
                 .collect(),
+            paging_state: None,
         }
     }
 

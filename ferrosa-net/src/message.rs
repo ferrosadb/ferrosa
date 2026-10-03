@@ -89,6 +89,16 @@ fn get_bytes(buf: &mut Bytes) -> Result<Vec<u8>> {
     Ok(buf.split_to(len).to_vec())
 }
 
+/// Read the trailing capability bits of a handshake, or 0 when the peer
+/// predates them (it sent nothing after its last field).
+fn get_trailing_capabilities(body: &mut Bytes) -> u32 {
+    if body.remaining() >= 4 {
+        body.get_u32()
+    } else {
+        0
+    }
+}
+
 /// Internode message. Each variant corresponds to a MsgType.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -103,10 +113,9 @@ pub enum Message {
         /// Raw internode broadcast hostname:port (re-resolvable). Peers store
         /// this in `NodeInfo.addr` so they can re-resolve it across IP churn.
         internode_broadcast: Option<String>,
-        /// Optional-feature bits the initiator understands (see
-        /// `handshake::CAP_*`). A trailing v1 extension: a peer that predates
-        /// it writes nothing here and decodes as `0`, and a peer that predates
-        /// it ignores the trailing bytes.
+        /// Capability bits (`handshake::CAP_*`) this node understands. A
+        /// trailing extension: a pre-capability peer neither sends it (decoded
+        /// as 0) nor reads it (it ignores trailing bytes).
         capabilities: u32,
     },
     HandshakeAck {
@@ -119,6 +128,9 @@ pub enum Message {
         /// Raw internode broadcast hostname:port (re-resolvable). Peers store
         /// this in `NodeInfo.addr` so they can re-resolve it across IP churn.
         internode_broadcast: Option<String>,
+        /// Capability bits the ACCEPTING node understands, so the initiator
+        /// learns them too. Same trailing-extension rules as on `Handshake`.
+        capabilities: u32,
     },
     Ping {
         nonce: u64,
@@ -285,6 +297,10 @@ pub enum Message {
     // Keyed secondary-index consult, routed to one partition's replicas
     IndexReadInPartitionRequest(Bytes),
     IndexReadInPartitionResponse(Bytes),
+    /// Opaque ferrosa-cql payload: fetch a result cursor's next page.
+    ResultCursorPage(Bytes),
+    /// Opaque ferrosa-cql payload: the page or a named refusal.
+    ResultCursorPageReply(Bytes),
 
     // Accord consensus — opaque payloads, ferrosa-cluster interprets
     AccordPreAccept(Bytes),
@@ -407,6 +423,8 @@ impl Message {
             Self::FulltextSearchResponse(_) => MsgType::FulltextSearchResponse,
             Self::IndexReadInPartitionRequest(_) => MsgType::IndexReadInPartitionRequest,
             Self::IndexReadInPartitionResponse(_) => MsgType::IndexReadInPartitionResponse,
+            Self::ResultCursorPage(_) => MsgType::ResultCursorPage,
+            Self::ResultCursorPageReply(_) => MsgType::ResultCursorPageReply,
             Self::AccordPreAccept(_) => MsgType::AccordPreAccept,
             Self::AccordPreAcceptOK(_) => MsgType::AccordPreAcceptOK,
             Self::AccordAccept(_) => MsgType::AccordAccept,
@@ -453,8 +471,7 @@ impl Message {
                 // Optional internode broadcast hostname (v1 extension — appended
                 // after cql_broadcast; absent on pre-extension peers)
                 put_optional_string(buf, internode_broadcast)?;
-                // Capability bits (v1 extension — appended after
-                // internode_broadcast; absent on pre-extension peers)
+                // Capability bits (trailing extension; absent on older peers).
                 buf.put_u32(*capabilities);
             }
             Self::HandshakeAck {
@@ -465,6 +482,7 @@ impl Message {
                 reason,
                 cql_broadcast,
                 internode_broadcast,
+                capabilities,
             } => {
                 put_uuid(buf, host_id);
                 buf.put_u8(*protocol_version);
@@ -475,6 +493,8 @@ impl Message {
                 put_optional_string(buf, cql_broadcast)?;
                 // Optional internode broadcast hostname (v1 extension)
                 put_optional_string(buf, internode_broadcast)?;
+                // Capability bits (trailing extension; absent on older peers).
+                buf.put_u32(*capabilities);
             }
             Self::Ping { nonce, sent_at } => {
                 buf.put_u64(*nonce);
@@ -574,6 +594,8 @@ impl Message {
             | Self::FulltextSearchResponse(b)
             | Self::IndexReadInPartitionRequest(b)
             | Self::IndexReadInPartitionResponse(b)
+            | Self::ResultCursorPage(b)
+            | Self::ResultCursorPageReply(b)
             | Self::AccordPreAccept(b)
             | Self::AccordPreAcceptOK(b)
             | Self::AccordAccept(b)
@@ -618,13 +640,7 @@ impl Message {
                 let cql_broadcast = get_optional_string(body)?;
                 // Optional internode broadcast hostname (v1 extension)
                 let internode_broadcast = get_optional_string(body)?;
-                // Capability bits (v1 extension). Absent on a pre-extension
-                // peer, which therefore understands no optional feature.
-                let capabilities = if body.remaining() >= 4 {
-                    body.get_u32()
-                } else {
-                    0
-                };
+                let capabilities = get_trailing_capabilities(body);
                 Self::Handshake {
                     cluster_name,
                     host_id,
@@ -649,6 +665,7 @@ impl Message {
                 let cql_broadcast = get_optional_string(body)?;
                 // Optional internode broadcast hostname (v1 extension)
                 let internode_broadcast = get_optional_string(body)?;
+                let capabilities = get_trailing_capabilities(body);
                 Self::HandshakeAck {
                     host_id,
                     protocol_version,
@@ -657,6 +674,7 @@ impl Message {
                     reason,
                     cql_broadcast,
                     internode_broadcast,
+                    capabilities,
                 }
             }
             MsgType::Ping => {
@@ -836,6 +854,10 @@ impl Message {
             MsgType::IndexReadInPartitionResponse => {
                 Self::IndexReadInPartitionResponse(body.split_to(body.remaining()))
             }
+            MsgType::ResultCursorPage => Self::ResultCursorPage(body.split_to(body.remaining())),
+            MsgType::ResultCursorPageReply => {
+                Self::ResultCursorPageReply(body.split_to(body.remaining()))
+            }
             MsgType::AccordPreAccept => Self::AccordPreAccept(body.split_to(body.remaining())),
             MsgType::AccordPreAcceptOK => Self::AccordPreAcceptOK(body.split_to(body.remaining())),
             MsgType::AccordAccept => Self::AccordAccept(body.split_to(body.remaining())),
@@ -902,7 +924,7 @@ mod tests {
             auth_token: vec![0xAB; 32],
             cql_broadcast: Some("host:19042".into()),
             internode_broadcast: Some("host:17000".into()),
-            capabilities: 0x5,
+            capabilities: crate::handshake::LOCAL_CAPABILITIES,
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
@@ -1003,11 +1025,50 @@ mod tests {
             reason: String::new(),
             cql_broadcast: Some("192.168.1.5:19042".into()),
             internode_broadcast: Some("192.168.1.5:17000".into()),
+            capabilities: crate::handshake::LOCAL_CAPABILITIES,
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::HandshakeAck, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    /// Capabilities are a trailing extension in BOTH directions of a rolling
+    /// upgrade: a body from a node that predates them (nothing after the last
+    /// field) decodes as 0, and a new body is the old body plus four bytes, so
+    /// an old decoder — which stops after `internode_broadcast` and ignores the
+    /// rest — reads every field it knows unchanged.
+    #[test]
+    fn handshake_ack_capabilities_are_a_trailing_extension() {
+        let new = Message::HandshakeAck {
+            host_id: Uuid::new_v4(),
+            protocol_version: 1,
+            chosen_compression: 0,
+            accepted: true,
+            reason: String::new(),
+            cql_broadcast: None,
+            internode_broadcast: Some("n:17000".into()),
+            capabilities: crate::handshake::CAP_RESULT_CURSOR_PAGE,
+        };
+        let mut buf = BytesMut::new();
+        new.encode(&mut buf).unwrap();
+        let (prefix, tail) = buf.split_at(buf.len() - 4);
+        assert_eq!(tail, crate::handshake::CAP_RESULT_CURSOR_PAGE.to_be_bytes());
+        let old_body = Message::decode(
+            MsgType::HandshakeAck,
+            &mut bytes::Bytes::copy_from_slice(prefix),
+        )
+        .unwrap();
+        let Message::HandshakeAck {
+            capabilities,
+            internode_broadcast,
+            ..
+        } = old_body
+        else {
+            panic!("expected HandshakeAck");
+        };
+        assert_eq!(capabilities, 0, "a pre-capability body advertises nothing");
+        assert_eq!(internode_broadcast.as_deref(), Some("n:17000"));
     }
 
     #[test]

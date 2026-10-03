@@ -304,6 +304,20 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Deletes the result cursors a connection parked when the connection ends.
+/// The owner key is the peer address, which `RequestContext::client_address`
+/// carries into the router.
+pub(crate) struct ResultCursorOwnerGuard {
+    registry: Arc<crate::result_cursor::ResultCursorRegistry>,
+    owner: String,
+}
+
+impl Drop for ResultCursorOwnerGuard {
+    fn drop(&mut self) {
+        self.registry.close_owner(&self.owner);
+    }
+}
+
 /// Handle a single CQL connection.
 ///
 /// This function owns the TCP connection and processes frames until the client
@@ -343,6 +357,12 @@ pub(crate) async fn handle_connection<S>(
     let _guard = ConnectionGuard {
         tracker: state.connection_tracker.clone(),
         peer,
+    };
+    // Result cursors this connection parks are deleted when it closes,
+    // however it closes: nothing will ask for their next pages.
+    let _cursor_guard = ResultCursorOwnerGuard {
+        registry: state.result_cursors.clone(),
+        owner: peer.to_string(),
     };
 
     let codec = CqlCodec::new(max_frame_size);
@@ -3661,6 +3681,7 @@ mod tests {
                 txn_registry: std::sync::Arc::new(parking_lot::Mutex::new(
                     crate::txn_registry::TransactionRegistry::default(),
                 )),
+                result_cursors: Default::default(),
             },
             dir,
         )

@@ -267,6 +267,7 @@ impl RpcServer {
                             reason: "overloaded".to_string(),
                             cql_broadcast: None,
                             internode_broadcast: None,
+                            capabilities: config.advertised_capabilities,
                         };
                         let mut body = bytes::BytesMut::new();
                         if let Err(e) = ack.encode(&mut body) {
@@ -1200,6 +1201,7 @@ mod tests {
                     reason: "x".repeat(70_000),
                     cql_broadcast: None,
                     internode_broadcast: None,
+                    capabilities: 0,
                 })
             }
         }
@@ -1621,6 +1623,8 @@ mod tests {
                     reason: String::new(),
                     cql_broadcast: None,
                     internode_broadcast: None,
+                    // An old server advertises no capabilities.
+                    capabilities: 0,
                 };
                 framed
                     .send(raw_frame(MsgType::HandshakeAck, 0, 0, encoded(&ack)))

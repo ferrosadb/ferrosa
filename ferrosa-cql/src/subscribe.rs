@@ -556,6 +556,7 @@ mod tests {
             txn_registry: std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::txn_registry::TransactionRegistry::default(),
             )),
+            result_cursors: Default::default(),
         };
 
         (Arc::new(state), dir)

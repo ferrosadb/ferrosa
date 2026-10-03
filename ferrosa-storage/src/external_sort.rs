@@ -412,6 +412,47 @@ pub enum SortedRows<T = Row, C = RowOrder> {
     Merged(KWayMerge<T, C>),
 }
 
+impl<T: SpillRow, C: SpillOrder<T>> SortedRows<T, C> {
+    /// Whether the remaining rows are read from run files (`true`) or held in
+    /// memory (`false`).
+    pub fn is_disk_backed(&self) -> bool {
+        matches!(self, SortedRows::Merged(_))
+    }
+
+    /// Move whatever an in-memory result still holds onto disk, so the value
+    /// can be kept between requests without pinning up to a spill threshold of
+    /// rows on the heap. A result already read from runs is returned as is.
+    ///
+    /// A server-side result cursor parks a [`SortedRows`] between pages for as
+    /// long as its client takes to ask for the next one. An un-spilled result
+    /// can hold up to the spill threshold (half the process budget by default),
+    /// so a handful of idle clients could pin the node's memory. On disk, a
+    /// parked result costs one buffered reader and one head row.
+    ///
+    /// `dir` must be the directory this result's runs live in (it is removed
+    /// with them); the run is created with `create_new`, so a second call into
+    /// the same directory fails loud rather than overwriting rows.
+    pub fn into_disk_backed(self, dir: &std::path::Path, order: C) -> Result<Self> {
+        let rows = match self {
+            SortedRows::Merged(merger) => return Ok(SortedRows::Merged(merger)),
+            SortedRows::InMemory(rows) => rows,
+        };
+        let path = dir.join("parked-run.bin");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| io_error(format!("external sort: create {}: {e}", path.display())))?;
+        let mut w = BufWriter::new(file);
+        for row in rows {
+            write_row(&mut w, &row)?;
+        }
+        w.flush()
+            .map_err(|e| io_error(format!("external sort: flush {}: {e}", path.display())))?;
+        Ok(SortedRows::Merged(KWayMerge::open(&[path], order)?))
+    }
+}
+
 impl<T: SpillRow, C: SpillOrder<T>> Iterator for SortedRows<T, C> {
     type Item = Result<T>;
 
@@ -620,6 +661,33 @@ mod tests {
         assert!(!s.spilled());
         let out: Vec<i64> = s.finish().unwrap().map(|r| ival(&r.unwrap())).collect();
         assert_eq!(out, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// Parking an in-memory result moves its REMAINING rows to disk, in order,
+    /// and keeps nothing on the heap but the merge head.
+    #[test]
+    fn into_disk_backed_keeps_the_remaining_rows_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let order = RowOrder::new(vec![(0, true)]);
+        let mut s = ExternalSorter::new(dir.path(), order.clone(), u64::MAX);
+        for v in [5i64, 1, 3, 2, 4] {
+            s.push(irow(v)).unwrap();
+        }
+        let mut rows = s.finish().unwrap();
+        assert!(!rows.is_disk_backed());
+        assert_eq!(ival(&rows.next().unwrap().unwrap()), 1);
+        let rows = rows.into_disk_backed(dir.path(), order.clone()).unwrap();
+        assert!(rows.is_disk_backed());
+        let out: Vec<i64> = rows.map(|r| ival(&r.unwrap())).collect();
+        assert_eq!(out, vec![2, 3, 4, 5]);
+        // A second park into the same directory must not overwrite the first.
+        let mut again = ExternalSorter::new(dir.path(), order.clone(), u64::MAX);
+        again.push(irow(1)).unwrap();
+        assert!(again
+            .finish()
+            .unwrap()
+            .into_disk_backed(dir.path(), order)
+            .is_err());
     }
 
     #[test]

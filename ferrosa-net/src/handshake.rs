@@ -14,6 +14,9 @@ type HmacSha256 = Hmac<Sha256>;
 /// Current protocol version.
 pub const PROTOCOL_VERSION: u8 = 1;
 
+// Capability bits, carried as a trailing `u32` on Handshake and HandshakeAck.
+// A peer built before capabilities sends none (read as 0) and ignores ours.
+
 /// Capability bit: the initiator understands error-reply frames
 /// ([`crate::codec::FLAG_RPC_ERROR`]). A server sends one only to an initiator
 /// that advertised this bit; an older initiator would misread the frame (an
@@ -21,8 +24,14 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// drop the whole connection.
 pub const CAP_RPC_ERROR_REPLY: u32 = 1 << 0;
 
-/// Every capability this build understands, advertised in its Handshake.
-pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY;
+/// The node serves `MsgType::ResultCursorPage`: it can return the next page of
+/// a CQL result cursor parked on it. A peer without the bit must never be sent
+/// that type — an unknown type byte drops the whole internode connection.
+pub const CAP_RESULT_CURSOR_PAGE: u32 = 1 << 1;
+
+/// Every capability this build understands, advertised in its Handshake and
+/// HandshakeAck.
+pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY | CAP_RESULT_CURSOR_PAGE;
 
 /// Peer metadata learned from a completed handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,9 +43,9 @@ pub struct HandshakePeer {
     /// The peer's advertised internode broadcast hostname (host:port), if any.
     /// When present, this is the re-resolvable target stored in `NodeInfo.addr`.
     pub internode_broadcast: Option<String>,
-    /// Capability bits the peer advertised (`CAP_*`). Known only on the
-    /// accepting side: the Handshake carries them, the HandshakeAck does not,
-    /// so the initiator records `0`.
+    /// Capability bits the peer advertised (`CAP_*`), 0 for a peer that
+    /// predates them. Learned on both sides: from the Handshake when accepting,
+    /// from the HandshakeAck when initiating.
     pub capabilities: u32,
 }
 
@@ -93,7 +102,7 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         auth_token,
         cql_broadcast: config.cql_broadcast.clone(),
         internode_broadcast: config.internode_broadcast.clone(),
-        capabilities: LOCAL_CAPABILITIES,
+        capabilities: config.advertised_capabilities,
     };
     let mut body = BytesMut::new();
     handshake.encode(&mut body)?;
@@ -122,6 +131,7 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             reason,
             cql_broadcast,
             internode_broadcast,
+            capabilities,
             ..
         } => {
             if accepted {
@@ -129,7 +139,7 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     host_id,
                     cql_broadcast,
                     internode_broadcast,
-                    capabilities: 0,
+                    capabilities,
                 })
             } else {
                 Err(NetError::HandshakeFailed(reason))
@@ -197,6 +207,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             &reason,
             &config.cql_broadcast,
             &config.internode_broadcast,
+            config.advertised_capabilities,
         )
         .await?;
         return Err(NetError::HandshakeFailed(reason));
@@ -211,6 +222,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             &reason,
             &config.cql_broadcast,
             &config.internode_broadcast,
+            config.advertised_capabilities,
         )
         .await?;
         return Err(NetError::HandshakeFailed(reason));
@@ -226,6 +238,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
                 &reason,
                 &config.cql_broadcast,
                 &config.internode_broadcast,
+                config.advertised_capabilities,
             )
             .await?;
             return Err(NetError::HandshakeFailed(reason));
@@ -246,6 +259,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
                 &reason,
                 &config.cql_broadcast,
                 &config.internode_broadcast,
+                config.advertised_capabilities,
             )
             .await?;
             return Err(NetError::HandshakeFailed(reason));
@@ -259,6 +273,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
         "",
         &config.cql_broadcast,
         &config.internode_broadcast,
+        config.advertised_capabilities,
     )
     .await?;
     Ok(HandshakePeer {
@@ -276,6 +291,7 @@ async fn send_handshake_ack<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     reason: &str,
     cql_broadcast: &Option<String>,
     internode_broadcast: &Option<String>,
+    capabilities: u32,
 ) -> Result<()> {
     use futures::SinkExt;
     let ack = Message::HandshakeAck {
@@ -286,6 +302,7 @@ async fn send_handshake_ack<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
         reason: reason.to_string(),
         cql_broadcast: cql_broadcast.clone(),
         internode_broadcast: internode_broadcast.clone(),
+        capabilities,
     };
     let mut body = BytesMut::new();
     ack.encode(&mut body)?;
@@ -435,6 +452,34 @@ mod tests {
         let server_peer = server_res.unwrap();
         assert_eq!(server_peer.host_id, client_id);
         assert_eq!(server_peer.cql_broadcast, Some("client-host:19042".into()));
+    }
+
+    /// Both sides learn the other's capability bits: the acceptor from the
+    /// Handshake, the initiator from the HandshakeAck. A node gates a new
+    /// message type on the capability of the peer it SENDS to, and it is
+    /// usually the initiator of that connection.
+    #[tokio::test]
+    async fn handshake_exchanges_capabilities_both_ways() {
+        let (client_io, server_io) = duplex(8192);
+        let mut client_config = test_config("ferrosa", None);
+        client_config.advertised_capabilities = CAP_RESULT_CURSOR_PAGE;
+        let mut server_config = test_config("ferrosa", None);
+        server_config.advertised_capabilities = 0;
+
+        let mut client_framed = Framed::new(
+            client_io,
+            InternodeCodec::new(client_config.max_frame_body_size),
+        );
+        let mut server_framed = Framed::new(
+            server_io,
+            InternodeCodec::new(server_config.max_frame_body_size),
+        );
+        let (client_res, server_res) = tokio::join!(
+            initiate_handshake(&mut client_framed, &client_config, Uuid::new_v4()),
+            accept_handshake(&mut server_framed, &server_config, Uuid::new_v4())
+        );
+        assert_eq!(client_res.unwrap().capabilities, 0);
+        assert_eq!(server_res.unwrap().capabilities, CAP_RESULT_CURSOR_PAGE);
     }
 
     #[tokio::test]
