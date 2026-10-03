@@ -80,8 +80,8 @@ const TBL_WIDE: &str = "test_wide";
 /// The ORIGINAL reason was that tests mutated the process-global
 /// `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` env var, so a mutation in one test
 /// could corrupt a scan another test was running. That env mutation is gone:
-/// tests now call `ferrosa_storage::range_merger::set_rows_per_fragment`, which
-/// is the supported single entry point.
+/// tests now call `ferrosa_storage::range_merger::set_rows_per_fragment`, whose
+/// guard restores the cap on drop (including when a test panics).
 ///
 /// The guard is still required, though — and removing it proved it, rather than
 /// reasoning about it. The cap remains PROCESS-GLOBAL by nature (it bounds a
@@ -920,7 +920,7 @@ fn multi_replica_many_windows_per_page_scan_is_not_silently_truncated() {
     // Force tiny windows: 1 row per fragment ⇒ 1 row per chunk ⇒ a 16-chunk
     // window is ~16 rows, so a wide partition spans hundreds of windows and the
     // continuation loop is exercised heavily.
-    ferrosa_storage::range_merger::set_rows_per_fragment(1);
+    let _k = ferrosa_storage::range_merger::set_rows_per_fragment(1);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -978,8 +978,6 @@ fn multi_replica_many_windows_per_page_scan_is_not_silently_truncated() {
 
         cluster.shutdown().await;
     });
-
-    ferrosa_storage::range_merger::reset_rows_per_fragment();
 }
 
 /// Seed a chosen subset of wide partitions on one replica. Models the live
@@ -1005,7 +1003,7 @@ fn seed_wide_pks(engine: &StorageEngine, pks: &[&str], rows_per: usize) {
 #[test]
 fn multi_replica_disjoint_data_many_windows_scan_unions_completely() {
     let _serial = serial_guard();
-    ferrosa_storage::range_merger::set_rows_per_fragment(1);
+    let _k = ferrosa_storage::range_merger::set_rows_per_fragment(1);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -1103,8 +1101,6 @@ fn multi_replica_disjoint_data_many_windows_scan_unions_completely() {
          the merged output was gone — a replica's failure vanished and the scan \
          could look complete while rows remained (t_a0f922a3 bug #2)"
     );
-
-    ferrosa_storage::range_merger::reset_rows_per_fragment();
 }
 
 /// A replica node whose streaming range-read handler is backed by a REAL

@@ -39,22 +39,25 @@ pub const DEFAULT_ROWS_PER_FRAGMENT: usize = 4_096;
 
 /// Resolved fragment row cap `K`.
 ///
-/// `None` means "not resolved yet": the value is read from the environment on
-/// first use and cached, rather than calling `std::env::var` on every fragment
+/// The value is read from the environment on first use and cached, rather than calling `std::env::var` on every fragment
 /// flush. Both this crate's merger and `ferrosa_cluster`'s wire-frame chunker
 /// must agree on `K` (a frame must be able to carry one full fragment), so this
 /// is the ONE resolver; the cluster-side helper delegates here rather than
 /// re-reading the variable.
 ///
-/// `ArcSwap` rather than a plain atomic because the override is a set-once
-/// configuration action, and a scan in flight must observe a consistent value
-/// for its lifetime: it loads the current cap once per flush and keeps using
-/// it, which is exactly `ArcSwap`'s read-mostly shape. It also removes the
-/// process-global mutation the tests previously had to serialize with a
-/// `static Mutex` — a lock that cannot work at all under nextest, which runs
-/// one process per test.
+/// `ArcSwap` keeps the read side lock-free: a scan loads the cap once per
+/// fragment flush. Only an override (tests) ever stores to it, and an
+/// override holds [`OVERRIDE_EXCLUSIVE`] for its whole lifetime — see
+/// [`RowsPerFragmentOverride`].
 static ROWS_PER_FRAGMENT: std::sync::OnceLock<arc_swap::ArcSwap<usize>> =
     std::sync::OnceLock::new();
+
+/// Serializes overrides of `K`. `cargo test` runs a crate's tests on parallel
+/// threads in ONE process, so without this a second test's override (or its
+/// reset) changed `K` under a first test mid-scan — a test asserting
+/// fragments of `<= 16` rows then saw 37- or 4096-row fragments. Never taken
+/// on a production path: nothing outside tests overrides `K`.
+static OVERRIDE_EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn slot() -> &'static arc_swap::ArcSwap<usize> {
     ROWS_PER_FRAGMENT
@@ -80,28 +83,45 @@ pub fn rows_per_fragment() -> usize {
     **slot().load()
 }
 
-/// Override the fragment row cap for this process.
+/// Override the fragment row cap for this process until the returned guard
+/// drops.
 ///
-/// The supported way to change `K`. Tests call this instead of mutating the
-/// process environment, so they no longer depend on cross-test mutual
-/// exclusion to be correct — and a test that sets a cap cannot corrupt a scan
-/// running in another test. A value of `0` is refused (it would loop forever);
-/// pass the default explicitly if that is what you want.
+/// The supported way to change `K` (tests). The guard holds exclusive
+/// ownership of `K`: a concurrent override blocks until this one drops, so a
+/// test's scan cannot have `K` changed underneath it. Dropping the guard puts
+/// `K` back to the environment-derived value, including on panic unwind. A
+/// value of `0` is refused (it would loop forever).
 ///
 /// Process-global by nature: `K` bounds a wire frame, so every scan in the
 /// process must agree. Making it per-scan would require threading it through
 /// the coordinator, the storage engine and the stream handlers — a much wider
 /// change for no additional safety.
-pub fn set_rows_per_fragment(cap: usize) {
+pub fn set_rows_per_fragment(cap: usize) -> RowsPerFragmentOverride {
     assert!(cap >= 1, "a fragment row cap of 0 would loop forever");
+    // A poisoned lock means an earlier holder panicked; its guard's `Drop`
+    // already restored `K` during unwind, so the protected state is sound.
+    let exclusive = OVERRIDE_EXCLUSIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     slot().store(std::sync::Arc::new(cap));
+    RowsPerFragmentOverride {
+        _exclusive: exclusive,
+    }
 }
 
-/// Put the cap back to whatever the environment says (or the default).
-///
-/// For tests that must not leak their override into a later test.
-pub fn reset_rows_per_fragment() {
-    slot().store(std::sync::Arc::new(resolve_rows_per_fragment_from_env()));
+/// Exclusive override of `K`, from [`set_rows_per_fragment`]. Restores the
+/// configured value on drop, before releasing exclusivity.
+#[must_use = "the override lasts only while this guard is alive"]
+pub struct RowsPerFragmentOverride {
+    _exclusive: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for RowsPerFragmentOverride {
+    fn drop(&mut self) {
+        // Runs before the `_exclusive` field drops, so the next override
+        // cannot observe this one's value.
+        slot().store(std::sync::Arc::new(resolve_rows_per_fragment_from_env()));
+    }
 }
 
 /// One bounded slice of a merged partition emitted by [`RangeMerger`].
@@ -1847,8 +1867,8 @@ mod tests {
 
     use super::{
         group_disjoint_runs, group_disjoint_runs_by_key, merger_for_projected_sources,
-        merger_for_sources, reset_rows_per_fragment, resolve_rows_per_fragment_from_env,
-        rows_per_fragment, set_rows_per_fragment, DEFAULT_ROWS_PER_FRAGMENT,
+        merger_for_sources, resolve_rows_per_fragment_from_env, rows_per_fragment,
+        set_rows_per_fragment, DEFAULT_ROWS_PER_FRAGMENT,
     };
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
     use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
@@ -2612,17 +2632,51 @@ mod tests {
     /// The override is honoured, and it is what `rows_per_fragment` returns.
     ///
     /// This replaces mutating `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` via
-    /// `env::set_var`. The env route is process-global mutable state that a scan
-    /// in flight reads on every fragment flush, so tests using it had to be
-    /// mutually excluded -- which a `static Mutex` cannot do under nextest (one
-    /// process per test). The explicit setter has no such coupling.
+    /// `env::set_var`, which a scan in flight read on every fragment flush.
     #[test]
     fn set_rows_per_fragment_overrides_the_value_in_force() {
-        set_rows_per_fragment(1);
-        assert_eq!(rows_per_fragment(), 1);
-        set_rows_per_fragment(37);
+        {
+            let _k = set_rows_per_fragment(1);
+            assert_eq!(rows_per_fragment(), 1);
+        }
+        let _k = set_rows_per_fragment(37);
         assert_eq!(rows_per_fragment(), 37);
-        reset_rows_per_fragment();
+    }
+
+    /// An override is isolated from a concurrent test's override.
+    ///
+    /// `cargo test` runs a crate's tests on parallel threads in ONE process,
+    /// so a second test overriding K while the first is mid-scan must not
+    /// change the K the first observes: the second override waits for the
+    /// first to drop. Before the guard, the other thread's store landed at
+    /// once and this test saw K = 1.
+    #[test]
+    fn an_override_is_not_changed_by_a_concurrent_override() {
+        let first = set_rows_per_fragment(16);
+        let (took_tx, took_rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let _k = set_rows_per_fragment(1);
+            took_tx.send(rows_per_fragment()).expect("report");
+        });
+        // Give the other override every chance to land; it must not.
+        let raced = took_rx.recv_timeout(std::time::Duration::from_millis(200));
+        assert!(
+            raced.is_err(),
+            "a concurrent override ran while this one was held (saw K = {raced:?})"
+        );
+        assert_eq!(
+            rows_per_fragment(),
+            16,
+            "another test's override leaked into this one"
+        );
+        drop(first);
+        other.join().expect("other test thread");
+        assert_eq!(
+            took_rx
+                .recv()
+                .expect("the other override runs once this one drops"),
+            1
+        );
     }
 
     /// A cap of zero is refused rather than accepted.
@@ -2633,21 +2687,39 @@ mod tests {
     #[test]
     #[should_panic(expected = "loop forever")]
     fn a_zero_cap_is_refused() {
-        set_rows_per_fragment(0);
+        let _k = set_rows_per_fragment(0);
     }
 
-    /// `reset` restores the environment-derived value, not the override.
+    /// Dropping the override restores the environment-derived value.
     #[test]
-    fn reset_returns_to_the_configured_value() {
-        set_rows_per_fragment(1);
+    fn dropping_the_override_returns_to_the_configured_value() {
+        let k = set_rows_per_fragment(1);
         assert_eq!(rows_per_fragment(), 1);
-        reset_rows_per_fragment();
-        let expected = resolve_rows_per_fragment_from_env();
+        drop(k);
+        // Every override holds the exclusion, so while WE hold it none is
+        // active and K must be the configured value.
+        let _none_active = super::OVERRIDE_EXCLUSIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             rows_per_fragment(),
-            expected,
-            "reset must fall back to the environment, not leave the override in place"
+            resolve_rows_per_fragment_from_env(),
+            "dropping must fall back to the environment, not leave the override in place"
         );
+    }
+
+    /// A test that panics while holding the override still restores K and
+    /// does not wedge every later override behind a poisoned lock.
+    #[test]
+    fn a_panicking_holder_restores_k_and_releases_the_override() {
+        let joined = std::thread::spawn(|| {
+            let _k = set_rows_per_fragment(3);
+            panic!("simulated test failure while holding the override");
+        })
+        .join();
+        assert!(joined.is_err(), "the holder thread must have panicked");
+        let _k = set_rows_per_fragment(5);
+        assert_eq!(rows_per_fragment(), 5);
     }
 
     /// The env-derived resolver always produces a terminating cap.

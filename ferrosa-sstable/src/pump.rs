@@ -1293,11 +1293,21 @@ static PUMP_BLOCKED_FREE_NANOS: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static PUMP_PARK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PUMP_FREE_RECEIVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn pump_park_count() -> u64 {
     PUMP_PARK_COUNT.with(std::cell::Cell::get)
+}
+
+/// How many times the CALLING THREAD went to the `free` channel for a
+/// segment, parked or not — the channel crossings the thread-local batch
+/// exists to avoid (CD4). Test-only and thread-local, like
+/// [`pump_park_count`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn pump_free_receives() -> u64 {
+    PUMP_FREE_RECEIVES.with(std::cell::Cell::get)
 }
 
 /// T-034 (L6 stress): how many flusher threads are currently alive,
@@ -1829,6 +1839,8 @@ impl AlignedPump {
     /// (the flusher keeps up) this is the only branch steady-state traffic
     /// ever takes; genuine waits retain the same cancellation and watchdog logic.
     fn wait_for_free_segment_blocking(&mut self) -> Result<AlignedBuf> {
+        #[cfg(any(test, feature = "test-support"))]
+        PUMP_FREE_RECEIVES.with(|c| c.set(c.get() + 1));
         let backend = self
             .backend
             .as_async_mut()
@@ -3955,6 +3967,70 @@ mod pump_async_tests {
              {segments} segments (depth {depth}). A park yields at least one buffer, so \
              anything below {segments} is batching working; {segments} means the producer \
              is parked on every segment and the thread-local batch absorbs nothing."
+        );
+    }
+
+    /// CD4, deterministically. The park-count test above cannot see the
+    /// thread-local batch: a park is counted only when `free` is EMPTY, and
+    /// the quick receive that serves a non-empty `free` is uncounted, so
+    /// taking one segment per channel crossing parks no more than batching
+    /// does (removing the drain left it green).
+    ///
+    /// Here every buffer is back in `free` before the producer asks for one:
+    /// `depth + 1` segments are written (the whole ring), the flusher is let
+    /// through, and the test waits until all `depth + 1` buffers have
+    /// returned. The next `depth + 1` segments must then cost ONE crossing —
+    /// the first take drains the rest into the batch — not one per segment.
+    #[test]
+    fn pump_async_a_refilled_ring_is_taken_in_one_channel_crossing() {
+        let block = 4096usize;
+        let segment = block;
+        let depth = 3usize;
+        let ring = depth + 1;
+        let (sink, tx, handle) = GateSink::new(DirectMode::Direct, Duration::from_secs(5));
+        let mut pump = AlignedPump::open_with_depth(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("cd4-ring.db"),
+            depth,
+            never_abort(),
+        );
+        let data: Vec<u8> = (0..(2 * ring * segment)).map(|i| (i % 251) as u8).collect();
+        let (first, second) = data.split_at(ring * segment);
+        pump.write_all(first).expect("write the whole ring");
+        // One permit per sink call; unused permits stay buffered for later.
+        for _ in 0..(2 * ring + 4) {
+            tx.send(()).expect("permit");
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let free = pump
+                .backend
+                .as_async_mut()
+                .expect("async backend")
+                .free_rx
+                .len();
+            if free == ring {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the flusher returned only {free} of {ring} buffers within 5 s"
+            );
+            // Test-thread scaffolding, not a pump wait.
+            #[allow(clippy::disallowed_methods)]
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let before = pump_free_receives();
+        pump.write_all(second).expect("write a second ring");
+        let crossings = pump_free_receives() - before;
+        pump.finish().expect("finish");
+        assert_eq!(handle.bytes(), data);
+        assert_eq!(
+            crossings, 1,
+            "{ring} segments with every buffer already in `free` must take one channel \
+             crossing (the first take drains the rest into the batch), took {crossings}"
         );
     }
 }

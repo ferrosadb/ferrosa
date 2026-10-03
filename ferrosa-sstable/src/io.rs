@@ -381,11 +381,22 @@ pub fn register_file_read_len_hook(hook: Arc<FileReadLenHook>) {
         .push(hook);
 }
 
-fn try_read_file_range(path: &Path, offset: u64, buf: &mut [u8]) -> Result<Option<usize>> {
-    let hooks = file_read_range_hooks()
+/// The registered hooks, copied out so they are CALLED with no registry lock
+/// held. A hook does network I/O — a rehydration downloads whole components,
+/// minutes for a large `Data.db` — and a read guard held across that let a
+/// registration queue as a writer, after which every evicted read in the
+/// process blocked behind it until the download finished. Cloning a handful
+/// of `Arc`s happens only on the NotFound path, which goes to object storage.
+fn snapshot_hooks<H: ?Sized>(registry: &RwLock<Vec<Arc<H>>>, name: &str) -> Vec<Arc<H>> {
+    registry
         .read()
-        .expect("file read range hook registry poisoned");
-    for hook in hooks.iter() {
+        .unwrap_or_else(|_| panic!("file read {name} hook registry poisoned"))
+        .clone()
+}
+
+fn try_read_file_range(path: &Path, offset: u64, buf: &mut [u8]) -> Result<Option<usize>> {
+    let hooks = snapshot_hooks(file_read_range_hooks(), "range");
+    for hook in &hooks {
         if let Some(bytes) = hook(path, offset, buf.len())? {
             let n = bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&bytes[..n]);
@@ -396,10 +407,8 @@ fn try_read_file_range(path: &Path, offset: u64, buf: &mut [u8]) -> Result<Optio
 }
 
 fn try_file_len(path: &Path) -> Result<Option<u64>> {
-    let hooks = file_read_len_hooks()
-        .read()
-        .expect("file read len hook registry poisoned");
-    for hook in hooks.iter() {
+    let hooks = snapshot_hooks(file_read_len_hooks(), "len");
+    for hook in &hooks {
         if let Some(len) = hook(path)? {
             return Ok(Some(len));
         }
@@ -408,10 +417,8 @@ fn try_file_len(path: &Path) -> Result<Option<u64>> {
 }
 
 fn try_rehydrate_file(path: &Path) -> Result<bool> {
-    let hooks = file_read_rehydration_hooks()
-        .read()
-        .expect("file read rehydration hook registry poisoned");
-    for hook in hooks.iter() {
+    let hooks = snapshot_hooks(file_read_rehydration_hooks(), "rehydration");
+    for hook in &hooks {
         if hook(path)? {
             return Ok(true);
         }
@@ -1254,6 +1261,106 @@ mod tests {
             rehydrations.load(Ordering::Relaxed),
             0,
             "a servable range must not trigger a whole-generation rehydrate"
+        );
+    }
+
+    /// A hook call in flight must not hold the hook registry. Hooks do network
+    /// I/O (a rehydration downloads whole components, minutes for a large
+    /// `Data.db`); with the registry's read guard held across the call, a
+    /// registration queued as a writer and every later evicted read in the
+    /// process blocked behind it until that download finished.
+    #[test]
+    fn a_hook_call_in_flight_does_not_block_hook_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slow-remote-Data.db");
+        let (entered_tx, entered_rx) = crossbeam_channel::unbounded::<()>();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded::<()>();
+        let hook_path = path.clone();
+        register_file_read_range_hook(Arc::new(move |p, _offset, len| {
+            if p != hook_path {
+                return Ok(None);
+            }
+            entered_tx.send(()).expect("test is waiting");
+            release_rx.recv().expect("test releases the hook");
+            Ok(Some(vec![7u8; len]))
+        }));
+
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4];
+            FileReadAt::open_evicted(&reader_path)
+                .read_at(&mut buf, 0)
+                .map(|n| buf[..n].to_vec())
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read reaches the hook");
+
+        let (registered_tx, registered_rx) = crossbeam_channel::unbounded::<()>();
+        let registrar = std::thread::spawn(move || {
+            // The SAME registry the in-flight call is reading.
+            register_file_read_range_hook(Arc::new(|_, _, _| Ok(None)));
+            registered_tx.send(()).expect("test is waiting");
+        });
+        let registered_in_flight = registered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        // Release before asserting: a hook left parked would wedge every
+        // other test that reads through the shared registry.
+        release_tx.send(()).expect("hook is parked");
+        let read = reader.join().expect("reader thread");
+        registrar.join().expect("registrar thread");
+
+        assert!(
+            registered_in_flight,
+            "registering a hook waited for an unrelated hook call to finish"
+        );
+        assert_eq!(read.expect("the read is served"), vec![7u8; 4]);
+    }
+
+    /// The same for the rehydration registry, whose hooks download whole
+    /// components: a `rehydrate_file` in flight must not block registration.
+    #[test]
+    fn a_rehydration_in_flight_does_not_block_hook_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slow-rehydrate-Data.db");
+        let (entered_tx, entered_rx) = crossbeam_channel::unbounded::<()>();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded::<()>();
+        let hook_path = path.clone();
+        register_file_read_rehydration_hook(Arc::new(move |p| {
+            if p != hook_path {
+                return Ok(false);
+            }
+            entered_tx.send(()).expect("test is waiting");
+            release_rx.recv().expect("test releases the hook");
+            Ok(true)
+        }));
+
+        let rehydrate_path = path.clone();
+        let rehydrator = std::thread::spawn(move || rehydrate_file(&rehydrate_path));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the rehydration reaches the hook");
+
+        let (registered_tx, registered_rx) = crossbeam_channel::unbounded::<()>();
+        let registrar = std::thread::spawn(move || {
+            register_file_read_rehydration_hook(Arc::new(|_| Ok(false)));
+            registered_tx.send(()).expect("test is waiting");
+        });
+        let registered_in_flight = registered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        release_tx.send(()).expect("hook is parked");
+        let rehydrated = rehydrator.join().expect("rehydrator thread");
+        registrar.join().expect("registrar thread");
+
+        assert!(
+            registered_in_flight,
+            "registering a hook waited for an in-flight rehydration to finish"
+        );
+        assert!(
+            rehydrated.expect("rehydration result"),
+            "the hook reported success"
         );
     }
 

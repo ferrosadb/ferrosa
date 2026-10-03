@@ -142,9 +142,20 @@ fn cql_value_payload_bytes(v: &CqlValue) -> usize {
         // The canonical cell bytes are the heap payload (jsonb is document-sized,
         // so it must never account as 0: ST-T150-01).
         CqlValue::Jsonb(j) => j.as_bytes().len(),
-        // Heap-allocated payloads whose size is not tracked precisely.
-        // Listed explicitly so a new variant must choose its accounting.
-        CqlValue::Decimal { .. } | CqlValue::Varint(_) | CqlValue::Udt(_) => 0,
+        // A UDT owns its field names and values; counting it as 0 let rows of
+        // large UDTs accumulate past the spill threshold unaccounted.
+        CqlValue::Udt(fields) => fields
+            .iter()
+            .map(|(name, value)| {
+                name.len()
+                    + std::mem::size_of::<(String, Option<CqlValue>)>()
+                    + value.as_ref().map_or(0, cql_value_payload_bytes)
+            })
+            .sum(),
+        // Arbitrary precision: the digit buffer grows with the magnitude.
+        CqlValue::Varint(n) | CqlValue::Decimal { unscaled: n, .. } => {
+            usize::try_from(n.bits().div_ceil(8)).unwrap_or(usize::MAX)
+        }
     }
 }
 
@@ -524,6 +535,47 @@ mod tests {
         assert_eq!(cql_value_payload_bytes(&v), len);
         let row: Row = vec![Some(v)];
         assert!(estimate_row_bytes(&row) > 1000);
+    }
+
+    /// A UDT owns its fields' payloads. Counting it as 0 let an ORDER BY over
+    /// rows of large UDTs accumulate without ever reaching the spill
+    /// threshold — the unbounded in-memory sort this module exists to prevent.
+    #[test]
+    fn udt_payload_counts_its_fields() {
+        let big = "x".repeat(10_000);
+        let udt = CqlValue::Udt(vec![
+            ("name".to_string(), Some(CqlValue::Text(big))),
+            ("tags".to_string(), Some(CqlValue::Blob(vec![0; 5_000]))),
+            ("gone".to_string(), None),
+        ]);
+        let bytes = cql_value_payload_bytes(&udt);
+        assert!(
+            bytes >= 15_000,
+            "a UDT holding 15,000 payload bytes accounted as {bytes}"
+        );
+        // Nested: a list of UDTs accounts each element's fields.
+        let list = CqlValue::List(vec![udt.clone(), udt]);
+        assert!(cql_value_payload_bytes(&list) >= 30_000);
+    }
+
+    /// Arbitrary-precision numbers own a heap buffer proportional to their
+    /// magnitude; a 10,000-digit varint is several KiB, not 0.
+    #[test]
+    fn varint_and_decimal_payload_counts_their_magnitude() {
+        let huge: num_bigint::BigInt = "9".repeat(10_000).parse().expect("decimal digits");
+        let varint = cql_value_payload_bytes(&CqlValue::Varint(huge.clone()));
+        assert!(
+            varint >= 4_000,
+            "a 10,000-digit varint accounted as {varint}"
+        );
+        let decimal = cql_value_payload_bytes(&CqlValue::Decimal {
+            scale: 2,
+            unscaled: huge,
+        });
+        assert!(
+            decimal >= 4_000,
+            "a 10,000-digit decimal accounted as {decimal}"
+        );
     }
 
     #[test]

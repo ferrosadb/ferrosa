@@ -193,7 +193,7 @@ volume or changing query results.
     any callback, blocking send or long scan); a table's `IndexCatalog` is
     immutable and bound to its memtable; index DDL and `ALTER` rotate the
     memtable. Invariant: a memtable's index postings are exactly the sidecars
-    its flush writes for the catalog it is bound to (ST-66).
+    its flush writes for the catalog it is bound to (ST-70).
 
 ## Concurrency
 

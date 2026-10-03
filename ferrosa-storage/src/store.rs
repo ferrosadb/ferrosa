@@ -1451,11 +1451,29 @@ where
         move |slot| producer(slot),
     );
     tokio::spawn(async move {
-        if let Ok(ferrosa_sched::ScanOutcome::Overloaded) = handle.await {
-            let _ = tx.try_send(Err(ferrosa_common::Error::InvalidData(
+        let failure = match handle.await {
+            Ok(ferrosa_sched::ScanOutcome::Ran(())) | Ok(ferrosa_sched::ScanOutcome::Cancelled) => {
+                return;
+            }
+            Ok(ferrosa_sched::ScanOutcome::Overloaded) => ferrosa_common::Error::InvalidData(
                 "overloaded: scan admission queue full — retry".to_string(),
-            )));
-        }
+            ),
+            // The producer panicked (or its task was torn down). Its sender
+            // dropped during unwind, so without this error the consumer would
+            // read the partitions delivered so far followed by a normal close:
+            // a truncated scan reported as complete.
+            Err(join) => {
+                tracing::error!(error = %join, "range scan producer panicked; failing the scan");
+                ferrosa_common::Error::InvalidData(format!(
+                    "range scan producer panicked; the scan is incomplete: {join}"
+                ))
+            }
+        };
+        // `send().await`, not `try_send`: the error queues behind partitions
+        // already buffered (it must not be lost to a full channel, which would
+        // end the stream cleanly), and this sender keeps the channel open until
+        // it lands. It fails only when the consumer is already gone.
+        let _ = tx.send(Err(failure)).await;
     });
 }
 
@@ -10270,7 +10288,7 @@ mod tests {
     /// This is the storage-level OOM-bound + equivalence oracle.
     #[tokio::test]
     async fn range_iter_fragmented_flattens_to_range_iter_across_sources() {
-        crate::range_merger::set_rows_per_fragment(16);
+        let _k = crate::range_merger::set_rows_per_fragment(16);
         let store = test_store();
 
         // One wide partition "hot": half its rows flushed to an SSTable, half
@@ -10334,7 +10352,50 @@ mod tests {
         // The hot partition must have fragmented (40 distinct cks > K=16).
         let hot = whole.iter().find(|p| p.key == make_key("hot")).unwrap();
         assert!(hot.rows.len() > 16, "fixture must produce a wide partition");
-        crate::range_merger::reset_rows_per_fragment();
+    }
+
+    /// A scan producer that panics must end its stream with an ERROR, never a
+    /// clean end-of-stream. The producer's sender drops during unwind, so
+    /// without one the consumer sees the partitions delivered so far followed
+    /// by a normal close: a truncated scan that reads as complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_scan_producer_ends_the_stream_with_an_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Partition>>(4);
+        let producer_tx = tx.clone();
+        drop(tx);
+        // Fill the channel to capacity before panicking, so the error has to
+        // wait behind buffered partitions rather than find a free slot.
+        super::spawn_bounded_range_scan(producer_tx.clone(), move |_slot| {
+            for i in 0..4 {
+                producer_tx
+                    .blocking_send(Ok(make_partition(&format!("before-panic-{i}"), b"v", 1)))
+                    .expect("consumer is alive");
+            }
+            panic!("simulated producer bug mid-scan");
+        });
+        // Let the panic land while the buffer is still full.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for _ in 0..4 {
+            let item = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("buffered item within 10 s")
+                .expect("a partition sent before the panic");
+            assert!(item.is_ok(), "partitions sent before the panic arrive");
+        }
+        let last = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the stream must not hang after a producer panic");
+        match last {
+            Some(Err(e)) => assert!(
+                e.to_string().contains("panicked"),
+                "the error must say the scan producer panicked, got: {e}"
+            ),
+            Some(Ok(p)) => panic!("unexpected partition after the panic: {:?}", p.key),
+            None => panic!(
+                "the scan ended cleanly after its producer panicked: a truncated \
+                 result would be reported as complete"
+            ),
+        }
     }
 
     #[test]
