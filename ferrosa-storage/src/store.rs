@@ -618,7 +618,7 @@ pub struct TableStore<F: FlushTarget> {
     /// so remembering which scopes were flushed lets the index-consult path in
     /// [`ann_search_partitions`] enumerate those scoped sidecars and recover the
     /// actual partition keys without a full table scan.
-    vector_index_scopes: parking_lot::Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
+    vector_index_scopes: ArcSwap<VectorIndexScopes>,
     /// SSTable generations the read path has quarantined because a read
     /// exhausted the view-retry bound against them (genuine corruption, not a
     /// transient compaction window). Subsequent reads SKIP these generations so
@@ -626,10 +626,10 @@ pub struct TableStore<F: FlushTarget> {
     /// repair targets their covered token range to refill from a healthy
     /// replica. Keyed by `gen`; the covered range is recovered from the live
     /// descriptor (still in the view until repair swaps it out).
-    quarantined_sstables: parking_lot::RwLock<std::collections::HashSet<String>>,
+    quarantined_sstables: crate::lockfree::SharedSet,
     /// Generations whose secondary-index sidecars could not all be opened.
     /// Their data is intact and still read; only index consults refuse them.
-    index_unavailable_sstables: parking_lot::RwLock<std::collections::HashSet<String>>,
+    index_unavailable_sstables: crate::lockfree::SharedSet,
     /// Generations whose object recently failed to open: they fail fast for a
     /// short TTL instead of costing a reopen per retry per read.
     missing_sstables: MissingSstableCache,
@@ -1053,6 +1053,11 @@ fn new_memtable() -> Arc<dyn Memtable> {
         Arc::new(ShardedBTreeMemtable::with_default_shards())
     }
 }
+
+/// Partition-key scopes flushed per vector index (see
+/// `TableStore::vector_index_scopes`). Each index's set is its own `Arc`, so
+/// recording scopes for one index copies only that index's set.
+type VectorIndexScopes = HashMap<String, Arc<std::collections::HashSet<Vec<u8>>>>;
 
 /// The memtable indexes of ONE active memtable, together with the catalog
 /// they were built from.
@@ -2044,9 +2049,11 @@ impl<F: FlushTarget> TableStore<F> {
             options,
             next_gen: std::sync::atomic::AtomicU64::new(1),
             retired: std::sync::atomic::AtomicBool::new(false),
-            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
-            quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            vector_index_scopes: ArcSwap::from_pointee(VectorIndexScopes::new()),
+            quarantined_sstables: crate::lockfree::SharedSet::new("quarantined SSTables"),
+            index_unavailable_sstables: crate::lockfree::SharedSet::new(
+                "index-unavailable SSTables",
+            ),
             missing_sstables: MissingSstableCache::default(),
             fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
@@ -2244,9 +2251,11 @@ impl<F: FlushTarget> TableStore<F> {
             options,
             next_gen: std::sync::atomic::AtomicU64::new(1),
             retired: std::sync::atomic::AtomicBool::new(false),
-            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
-            quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            vector_index_scopes: ArcSwap::from_pointee(VectorIndexScopes::new()),
+            quarantined_sstables: crate::lockfree::SharedSet::new("quarantined SSTables"),
+            index_unavailable_sstables: crate::lockfree::SharedSet::new(
+                "index-unavailable SSTables",
+            ),
             missing_sstables: MissingSstableCache::default(),
             fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
@@ -2323,9 +2332,11 @@ impl<F: FlushTarget> TableStore<F> {
             options,
             next_gen: std::sync::atomic::AtomicU64::new(1),
             retired: std::sync::atomic::AtomicBool::new(false),
-            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
-            quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            vector_index_scopes: ArcSwap::from_pointee(VectorIndexScopes::new()),
+            quarantined_sstables: crate::lockfree::SharedSet::new("quarantined SSTables"),
+            index_unavailable_sstables: crate::lockfree::SharedSet::new(
+                "index-unavailable SSTables",
+            ),
             missing_sstables: MissingSstableCache::default(),
             fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
@@ -2846,10 +2857,15 @@ impl<F: FlushTarget> TableStore<F> {
     /// generation leaves the view (FMEA ST-56). What it buys is that those
     /// reads fail fast instead of re-opening the file on each attempt.
     fn quarantine_sstable(&self, corrupt: &CorruptSstableId) -> bool {
-        let inserted = self
-            .quarantined_sstables
-            .write()
-            .insert(corrupt.gen.clone());
+        let inserted = match self.quarantined_sstables.insert(&corrupt.gen) {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                // The read that found it still fails with the typed error;
+                // only the fast-fail on later reads is lost.
+                tracing::error!(corrupt = %corrupt, %e, "could not record an SSTable quarantine");
+                false
+            }
+        };
         if inserted {
             tracing::warn!(
                 corrupt = %corrupt,
@@ -2865,11 +2881,19 @@ impl<F: FlushTarget> TableStore<F> {
     /// consults over a view holding it fail with the typed corrupt-SSTable
     /// error; data reads are unaffected (FMEA ST-59).
     pub(crate) fn mark_index_unavailable(&self, gen: &str) {
-        if self
-            .index_unavailable_sstables
-            .write()
-            .insert(gen.to_string())
-        {
+        let inserted = match self.index_unavailable_sstables.insert(gen) {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                tracing::error!(
+                    gen,
+                    %e,
+                    "could not record that this SSTable's index sidecars are unavailable; \
+                     index consults over it are NOT refused"
+                );
+                false
+            }
+        };
+        if inserted {
             tracing::error!(
                 gen,
                 "secondary-index sidecars of this SSTable could not be opened; index consults \
@@ -2883,7 +2907,13 @@ impl<F: FlushTarget> TableStore<F> {
     /// probes it for real. Returns whether it was quarantined.
     pub fn resolve_sstable_quarantine(&self, gen: &str) -> bool {
         self.missing_sstables.forget(gen);
-        self.quarantined_sstables.write().remove(gen)
+        match self.quarantined_sstables.remove(gen) {
+            Ok(removed) => removed,
+            Err(e) => {
+                tracing::error!(gen, %e, "could not clear an SSTable quarantine; it stays quarantined");
+                false
+            }
+        }
     }
 
     /// Open attempts that failed for real (reached storage), not fast-failed.
@@ -2904,14 +2934,14 @@ impl<F: FlushTarget> TableStore<F> {
     /// Whether `gen` is currently quarantined (reads overlapping it fail fast).
     /// Used by the repair path to target the SSTable's range and by tests.
     pub fn is_sstable_quarantined(&self, gen: &str) -> bool {
-        self.quarantined_sstables.read().contains(gen)
+        self.quarantined_sstables.contains(gen)
     }
 
     /// Snapshot of all currently-quarantined SSTable generations. The
     /// anti-entropy repair scheduler drains this to learn which ranges to
     /// refill from a healthy replica.
     pub fn quarantined_sstable_gens(&self) -> Vec<String> {
-        self.quarantined_sstables.read().iter().cloned().collect()
+        self.quarantined_sstables.to_vec()
     }
 
     /// Refuse an index consult while a generation overlapping it is
@@ -2930,14 +2960,12 @@ impl<F: FlushTarget> TableStore<F> {
         token: Option<i64>,
         op: &'static str,
     ) -> Result<()> {
-        if self.quarantined_sstables.read().is_empty()
-            && self.index_unavailable_sstables.read().is_empty()
-        {
+        if self.quarantined_sstables.is_empty() && self.index_unavailable_sstables.is_empty() {
             return Ok(());
         }
         let overlapping = view.sstables.iter().find(|desc| {
             (self.is_sstable_quarantined(&desc.gen)
-                || self.index_unavailable_sstables.read().contains(&desc.gen))
+                || self.index_unavailable_sstables.contains(&desc.gen))
                 && token.is_none_or(|t| t >= desc.min_token && t <= desc.max_token)
         });
         let Some(desc) = overlapping else {
@@ -4205,15 +4233,11 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                 }
 
+                // Remember these scopes so `ann_search_partitions` can later
+                // enumerate the scoped sidecars and recover partition keys
+                // (the global sidecar drops the scope on write).
+                self.record_vector_scopes(&cfg.index_name, by_scope.keys());
                 for (scope, scoped_entries) in by_scope {
-                    // Remember this scope so `ann_search_partitions` can later
-                    // enumerate the scoped sidecar and recover partition keys
-                    // (the global sidecar drops the scope on write).
-                    self.vector_index_scopes
-                        .lock()
-                        .entry(cfg.index_name.clone())
-                        .or_default()
-                        .insert(scope.clone());
                     let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, &scope);
                     match ferrosa_index::vector::hnsw::build_and_serialize(
                         cfg.m,
@@ -6834,6 +6858,54 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(partitions)
     }
 
+    /// Add `scopes` to the scopes recorded for vector index `index_name`.
+    ///
+    /// A failure is logged, not returned: the flush that calls this has
+    /// written its sidecars, and a scope left unrecorded makes
+    /// `ann_search_partitions` miss that scope's sidecar until the next
+    /// flush records it again.
+    fn record_vector_scopes<'a>(
+        &self,
+        index_name: &str,
+        scopes: impl Iterator<Item = &'a Vec<u8>>,
+    ) {
+        let scopes: Vec<&Vec<u8>> = scopes.collect();
+        let recorded =
+            crate::lockfree::update(&self.vector_index_scopes, "vector index scopes", |map| {
+                let known = map.get(index_name);
+                if scopes
+                    .iter()
+                    .all(|scope| known.is_some_and(|set| set.contains(*scope)))
+                {
+                    return (None, ());
+                }
+                let mut set = known.map(|set| (**set).clone()).unwrap_or_default();
+                set.extend(scopes.iter().map(|scope| (*scope).clone()));
+                let mut next = map.clone();
+                next.insert(index_name.to_string(), Arc::new(set));
+                (Some(next), ())
+            });
+        if let Err(e) = recorded {
+            tracing::error!(
+                index_name,
+                %e,
+                "vector index scopes not recorded; scoped ANN reads miss them until the next flush"
+            );
+        }
+    }
+
+    /// Forget every scope recorded for `index_name`; whether there were any.
+    fn forget_vector_scopes(&self, index_name: &str) -> Result<bool> {
+        crate::lockfree::update(&self.vector_index_scopes, "vector index scopes", |map| {
+            if !map.contains_key(index_name) {
+                return (None, false);
+            }
+            let mut next = map.clone();
+            next.remove(index_name);
+            (Some(next), true)
+        })
+    }
+
     /// Run one index DDL: rotate the memtable onto the catalog `edit` derives
     /// from the current one. See [`Self::flush_applying_catalog_edit`] for why
     /// a rotation, and not an edit of the live memtable's indexes, is what
@@ -6910,7 +6982,7 @@ impl<F: FlushTarget> TableStore<F> {
             removed = catalog.remove(index_name);
             removed
         })?;
-        removed |= self.vector_index_scopes.lock().remove(index_name).is_some();
+        removed |= self.forget_vector_scopes(index_name)?;
         Ok((removed, outcome))
     }
 
@@ -7737,7 +7809,7 @@ impl<F: FlushTarget> TableStore<F> {
         // Source (b): flushed scoped sidecars — probe each remembered scope.
         let scopes: Vec<Vec<u8>> = self
             .vector_index_scopes
-            .lock()
+            .load()
             .get(index_name)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default();
@@ -8761,6 +8833,41 @@ mod tests {
         let mut live: Vec<&str> = view.indexes.keys().map(String::as_str).collect();
         live.sort_unstable();
         assert_eq!(live, ["idx_main", "idx_tmp"]);
+    }
+
+    /// `vector_index_scopes` was a `Mutex<HashMap>`; recording scopes from
+    /// concurrent callers must lose none of them, and forgetting an index
+    /// must drop only that index's scopes (t_d938e6ae).
+    #[test]
+    fn concurrent_vector_scope_records_lose_none() {
+        const THREADS: usize = 8;
+        const SCOPES: usize = 50;
+        let store = Arc::new(test_store());
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    let index = format!("vec_{}", t % 2);
+                    (0..SCOPES).for_each(|i| {
+                        let scope = format!("{t}-{i}").into_bytes();
+                        store.record_vector_scopes(&index, std::iter::once(&scope));
+                    });
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .for_each(|handle| handle.join().unwrap());
+        let scopes = store.vector_index_scopes.load();
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes["vec_0"].len(), THREADS / 2 * SCOPES);
+        assert_eq!(scopes["vec_1"].len(), THREADS / 2 * SCOPES);
+        assert!(store.forget_vector_scopes("vec_0").unwrap());
+        assert!(!store.forget_vector_scopes("vec_0").unwrap());
+        assert_eq!(
+            store.vector_index_scopes.load()["vec_1"].len(),
+            THREADS / 2 * SCOPES
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //! does the same but retries without bound; [`update`] caps the retries (JPL
 //! rule 2) and reports the cap as an error instead of spinning forever.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -59,6 +60,63 @@ pub(crate) fn update<T, R>(
     )))
 }
 
+/// A set of names published as one immutable `HashSet` through an
+/// `ArcSwap`: membership checks never wait, and every change is a
+/// compare-and-swap derived from the set it replaces, so concurrent changes
+/// never lose one another.
+#[derive(Debug)]
+pub(crate) struct SharedSet {
+    /// Named in the error when a change loses every race (see [`update`]).
+    what: &'static str,
+    items: ArcSwap<HashSet<String>>,
+}
+
+impl SharedSet {
+    pub(crate) fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            items: ArcSwap::from_pointee(HashSet::new()),
+        }
+    }
+
+    /// Add `item`; whether it was absent.
+    pub(crate) fn insert(&self, item: &str) -> ferrosa_common::Result<bool> {
+        update(&self.items, self.what, |items| {
+            if items.contains(item) {
+                return (None, false);
+            }
+            let mut next = items.clone();
+            next.insert(item.to_string());
+            (Some(next), true)
+        })
+    }
+
+    /// Remove `item`; whether it was present.
+    pub(crate) fn remove(&self, item: &str) -> ferrosa_common::Result<bool> {
+        update(&self.items, self.what, |items| {
+            if !items.contains(item) {
+                return (None, false);
+            }
+            let mut next = items.clone();
+            next.remove(item);
+            (Some(next), true)
+        })
+    }
+
+    pub(crate) fn contains(&self, item: &str) -> bool {
+        self.items.load().contains(item)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.load().is_empty()
+    }
+
+    /// Every member, as of one snapshot.
+    pub(crate) fn to_vec(&self) -> Vec<String> {
+        self.items.load().iter().cloned().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +156,43 @@ mod tests {
             handle.join().unwrap();
         }
         assert_eq!(**cell.load(), THREADS * PER_THREAD);
+    }
+
+    /// The quarantine sets were `RwLock<HashSet>`; their replacement must not
+    /// lose a concurrent insert or remove (t_d938e6ae).
+    #[test]
+    fn concurrent_set_changes_lose_no_update() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 100;
+        let set = Arc::new(SharedSet::new("test set"));
+        // Every thread inserts its own names, then removes the odd ones.
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let set = Arc::clone(&set);
+                std::thread::spawn(move || {
+                    (0..PER_THREAD).for_each(|i| {
+                        assert!(set.insert(&format!("{t}-{i}")).unwrap());
+                    });
+                    (1..PER_THREAD).step_by(2).for_each(|i| {
+                        assert!(set.remove(&format!("{t}-{i}")).unwrap());
+                    });
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .for_each(|handle| handle.join().unwrap());
+        let mut members = set.to_vec();
+        members.sort();
+        let mut expected: Vec<String> = (0..THREADS)
+            .flat_map(|t| (0..PER_THREAD).step_by(2).map(move |i| format!("{t}-{i}")))
+            .collect();
+        expected.sort();
+        assert_eq!(members, expected);
+        assert!(
+            !set.insert("0-0").unwrap(),
+            "a member is not inserted twice"
+        );
+        assert!(!set.remove("0-1").unwrap(), "a non-member is not removed");
     }
 }
