@@ -647,6 +647,17 @@ pub fn dec_compaction_running() {
     });
 }
 
+static COMPACTION_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// A compaction task panicked; it was failed and its input claims released.
+pub fn inc_compaction_panics() {
+    COMPACTION_PANICS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn compaction_panics_total() -> u64 {
+    COMPACTION_PANICS_TOTAL.load(Ordering::Relaxed)
+}
+
 pub fn inc_compaction_failed() {
     COMPACTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -1396,6 +1407,12 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_compaction_failed_total {}\n",
         COMPACTION_FAILED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_panics_total Compaction tasks that panicked; each was failed, its input claims released and its worker kept running.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_panics_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_panics_total {}\n",
+        COMPACTION_PANICS_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_compaction_paused_tables Tables paused after repeated output digest or verification failures.\n");
     out.push_str("# TYPE ferrosa_storage_compaction_paused_tables gauge\n");
