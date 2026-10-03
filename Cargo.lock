@@ -2367,6 +2367,7 @@ dependencies = [
  "ferrosa-cdc",
  "ferrosa-cluster",
  "ferrosa-common",
+ "ferrosa-cql",
  "ferrosa-index",
  "ferrosa-jsonb",
  "ferrosa-net",

@@ -2514,6 +2514,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         txn_registry: ferrosa_cql::txn_registry::TransactionRegistry::shared_with_config(
             txn_registry_config,
         ),
+        result_cursors: Arc::new(ferrosa_cql::result_cursor::ResultCursorRegistry::new(
+            ferrosa_cql::result_cursor::ResultCursorConfig::from_env(),
+        )),
     });
     // Start the open-transaction reaper (A1b): sweep cadence is configured with
     // the registry bounds; expired transactions are evicted without client input.

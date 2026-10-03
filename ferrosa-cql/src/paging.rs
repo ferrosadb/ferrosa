@@ -126,6 +126,31 @@ fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Append the HMAC-SHA256 tag over `payload` (FMEA CQL-2). Every paging token
+/// this server issues, whatever its layout, is signed this way.
+pub(crate) fn sign_paging_payload(mut payload: Vec<u8>) -> Vec<u8> {
+    let mut mac =
+        HmacSha256::new_from_slice(paging_hmac_key()).expect("HMAC accepts a 32-byte key");
+    mac.update(&payload);
+    payload.extend_from_slice(&mac.finalize().into_bytes());
+    payload
+}
+
+/// Verify a token's tag (constant time) and return the payload it covers.
+/// Nothing in a token is parsed or trusted before this succeeds.
+pub(crate) fn verify_paging_payload(bytes: &[u8]) -> Result<&[u8], CqlError> {
+    if bytes.len() < PAGING_HMAC_LEN {
+        return Err(CqlError::Protocol("paging_state too short".into()));
+    }
+    let (payload, tag) = bytes.split_at(bytes.len() - PAGING_HMAC_LEN);
+    let mut mac =
+        HmacSha256::new_from_slice(paging_hmac_key()).expect("HMAC accepts a 32-byte key");
+    mac.update(payload);
+    mac.verify_slice(tag)
+        .map_err(|_| CqlError::Protocol("paging_state: invalid or forged signature".into()))?;
+    Ok(payload)
+}
+
 /// Opaque cursor encoding the position to resume from.
 ///
 /// Contains enough info to find the next row after the last returned row.
@@ -154,12 +179,7 @@ impl PagingState {
         buf.extend_from_slice(&(self.clustering_key.len() as u32).to_be_bytes());
         buf.extend_from_slice(&self.clustering_key);
         buf.push(if self.remaining_in_partition { 1 } else { 0 });
-
-        let mut mac =
-            HmacSha256::new_from_slice(paging_hmac_key()).expect("HMAC accepts a 32-byte key");
-        mac.update(&buf);
-        buf.extend_from_slice(&mac.finalize().into_bytes());
-        buf
+        sign_paging_payload(buf)
     }
 
     /// Deserialize from opaque bytes received in QUERY/EXECUTE frames.
@@ -168,15 +188,14 @@ impl PagingState {
     /// parsed or trusted — a client-forged cursor cannot redirect the read to
     /// another partition/tenant.
     pub fn decode(bytes: &[u8]) -> Result<Self, CqlError> {
-        if bytes.len() < PAGING_HMAC_LEN {
-            return Err(CqlError::Protocol("paging_state too short".into()));
+        let payload = verify_paging_payload(bytes)?;
+        if payload.starts_with(&crate::result_cursor::CURSOR_TOKEN_MAGIC) {
+            return Err(CqlError::Invalid(
+                "paging_state is a server-side result-cursor token, which this query does not \
+                 page through; re-run the query from its first page"
+                    .into(),
+            ));
         }
-        let (payload, tag) = bytes.split_at(bytes.len() - PAGING_HMAC_LEN);
-        let mut mac =
-            HmacSha256::new_from_slice(paging_hmac_key()).expect("HMAC accepts a 32-byte key");
-        mac.update(payload);
-        mac.verify_slice(tag)
-            .map_err(|_| CqlError::Protocol("paging_state: invalid or forged signature".into()))?;
 
         // Signature verified — the payload is authentic; parse it.
         if payload.len() < 9 {

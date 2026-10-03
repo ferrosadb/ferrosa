@@ -29,6 +29,20 @@ use crate::virtual_tables::{FullScanTracker, IndexUsageTracker};
 /// rooted at `data_dir`. Auth is disabled; DML/DDL execute against a real local
 /// `StorageEngine`. The caller owns `data_dir` (e.g. a `tempfile::TempDir`).
 pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
+    standalone_for_test_with_flush_threshold(data_dir, 4096)
+}
+
+/// [`standalone_for_test`] with an explicit memtable flush threshold.
+///
+/// The default fixture flushes every 4 KiB, so a few thousand padded rows
+/// become hundreds of SSTables, and a range scan's per-source buffers then
+/// grow with the table. A memory-bound test that compares two table sizes
+/// needs the scan's own footprint held constant, so it keeps the data in the
+/// memtable with a large threshold.
+pub fn standalone_for_test_with_flush_threshold(
+    data_dir: &Path,
+    flush_threshold_bytes: u64,
+) -> Arc<SharedState> {
     let commit_log = CommitLogConfig {
         log_dir: data_dir.join("commitlog"),
         checkpoint_dir: data_dir.join("commitlog"),
@@ -41,7 +55,7 @@ pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
         object_store: None,
         local_cache_max_bytes: 1024 * 1024,
         local_disk_free_reserve_bytes: 0,
-        flush_threshold_bytes: 4096,
+        flush_threshold_bytes,
         memtable_backpressure_bytes: u64::MAX,
         flush_max_age_secs: 5,
         data_dir: data_dir.to_path_buf(),
@@ -121,5 +135,6 @@ pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
         txn_registry: std::sync::Arc::new(parking_lot::Mutex::new(
             crate::txn_registry::TransactionRegistry::default(),
         )),
+        result_cursors: Default::default(),
     })
 }

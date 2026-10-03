@@ -59,6 +59,9 @@ test-util = []
 slow-tests = []
 
 [dev-dependencies]
+# Self dev-dependency: turns on `test-util` in this crate's own integration
+# tests (tests/result_streaming_memory_bound.rs builds a standalone node).
+ferrosa-cql = { path = ".", features = ["test-util"] }
 # Builds `CqlValue::Jsonb` cells for the T-150 refusal / D6a wire tests.
 ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 criterion = "0.5"

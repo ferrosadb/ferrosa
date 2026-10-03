@@ -70,19 +70,35 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   accumulator (`stream_builtin_aggregates`) over the uncapped
   `range_read_stream_all_with` (exact over the whole table, no `all_rows`
   materialization); a user `LIMIT N` above the storage OOM guard streams
-  (take-`N`) instead of a `Vec` materialization. The unbounded `ORDER BY` (no
-  `LIMIT`) global sort now **spills** (step 5): it streams the uncapped scan
-  through `sort_rows_from_partition_stream_spilling` → `ferrosa_storage::ExternalSorter`
-  (bounded-memory external merge sort, cascade k-way merge), returning the fully,
-  correctly ordered result with no cap and memory bounded by the spill threshold
-  (`FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`). The remaining complex shapes —
-  a `DISTINCT` over a non-partition-key column, a per-row function projection,
-  or any other full `ALLOW FILTERING` scan with no user bound — **stream** the
-  uncapped scan too, so no shape fail-louds on a query the engine can answer:
-  a per-row projection is computed inline and `DISTINCT` de-duplicates through
-  the spill-backed `SpillingDedup` set (`reserve_distinct_temp_table`). Results
-  are bounded only by the query's own `LIMIT`, never a server-side row cap
-  (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
+  (take-`N`) instead of a `Vec` materialization.
+  **Result cursors** (`result_cursor.rs`). A full-table SELECT whose result
+  cannot be produced in scan order — `ORDER BY` (with or without `LIMIT`),
+  `DISTINCT` over an arbitrary projection, or a non-aggregate function
+  projection — is answered from a server-side `ResultCursor`
+  (`serve_result_cursor` / `build_result_cursor`). The first request scans the
+  table ONCE: with `ORDER BY`, filtered rows go into a spilling
+  `ferrosa_storage::ExternalSorter`; otherwise rows are projected,
+  de-duplicated for `DISTINCT` (`SpillingDedup`, resident keys
+  `FERROSA_CQL_DISTINCT_RESIDENT_KEYS`) and spooled in arrival order, and a
+  `LIMIT` stops the scan. Each response reads ONE page from the cursor; if rows
+  remain, the cursor is parked in the node's `ResultCursorRegistry` and the
+  client gets a signed, versioned cursor token (`CursorToken`) as its
+  `paging_state`. Paging is O(page) per page and O(table) in total; the result
+  is never collected. A parked cursor holds files and a merge head only — no
+  storage scan, scan-pool slot or thread — and is deleted with its spill
+  directory when idle past `FERROSA_CQL_RESULT_CURSOR_TTL_SECS` (default 300),
+  when its connection closes, when its last page is read, or when the request
+  reading it is cancelled. A node holds at most `FERROSA_CQL_RESULT_CURSOR_MAX`
+  (default 256) open cursors and refuses more with `Overloaded` before
+  scanning. A token for an expired/closed cursor, from another node or a
+  restarted one, for another query or role, a stale page, or a pre-cursor
+  (offset or scan-position) paging state is a clear `Invalid` error — never a
+  silent restart or a partial result. Cursors are node-local: a driver must
+  send a cursor query's next page to the node that served the previous one.
+  An UNPAGED request (no page size) still receives the whole result in one
+  frame, as the protocol requires, so its heap is O(result).
+  Results are bounded only by the query's own `LIMIT`, never a server-side row
+  cap (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
   Global secondary-index reads (`SingleIndex`, `IndexScanWithFilter`,
   `IndexIntersection`) stream in row order — `(partition key, clustering)` —
   through `WritePath::index_read_stream(.., after)`, and hold O(sources) at
@@ -171,7 +187,11 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `duration`, `decimal`, and arbitrarily large `varint`) until the value is
   decoded against its prepared column type.
 - **Pagination** (`paging.rs`) — opaque `paging_state` cursor (pk + ck +
-  remaining-in-partition flag, HMAC-signed) for CQL v5 paging. Paged full-table
+  remaining-in-partition flag, HMAC-signed) for CQL v5 paging. Queries served
+  from a result cursor carry a different token instead (`result_cursor::CursorToken`:
+  magic `FF 52 43`, version byte, node epoch, cursor id, page sequence, query
+  fingerprint; signed with the same key); each decoder refuses the other's
+  token by name. Paged full-table
   scans resume WITHIN a wide partition (t_a0f922a3): the router decodes the
   cursor into `ferrosa_cluster::write_path::ScanResume { key, clustering }` so
   every producer (local iterator and each remote replica) skips the delivered
