@@ -837,7 +837,7 @@ pub fn add_index_reload_skipped(n: u64) {
 }
 
 /// A generation's vector sidecars were rebuilt from its rows by the vector
-/// repair (FMEA ST-71).
+/// repair (FMEA ST-79).
 pub fn vector_generation_repaired() {
     VECTOR_GENERATIONS_REPAIRED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }

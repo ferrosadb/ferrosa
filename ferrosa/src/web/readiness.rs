@@ -7,7 +7,7 @@
 //! returns 503 without awaiting a Raft handle.
 //! Last revised: 2026-10-03
 //! Last changed: A ready answer names vector indexes being rebuilt under
-//!   `degraded_recall` (ST-73).
+//!   `degraded_recall` (ST-81).
 //!
 //! ## Readiness criteria
 //!
@@ -34,7 +34,7 @@
 //! answers `503 {"waiting_for":"set_aside_mutations"}` with the counts, until
 //! they are re-ingested.
 //!
-//! A vector index whose generations are being rebuilt (FMEA ST-72/ST-73) does
+//! A vector index whose generations are being rebuilt (FMEA ST-80/ST-81) does
 //! NOT hold readiness: every other query is unaffected. A ready answer then
 //! carries `"degraded_recall": [{"table","index","generations"}]`, because ANN
 //! over that index refuses (retryable) until the rebuild finishes.

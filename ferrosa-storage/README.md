@@ -41,7 +41,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   durability window (see FMEA). Open-time replay re-logs every mutation it
   keeps only in memory into the new log generation (`ReplayRelog`) and fsyncs
   it before deleting the old segment, so a second crash before the table
-  flushes loses nothing (FMEA ST-72).
+  flushes loses nothing (FMEA ST-78).
   durability window: writes are refused with `CommitLogNotDurable` while the
   sync thread is dead, fsync is failing, or the oldest unsynced write is past
   `FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS` (2000). The sync thread exposes
@@ -553,14 +553,14 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   the scoped sidecar files of live generations, so `ann_search_partitions`
   (CQL `ORDER BY .. ANN OF`) still finds flushed vectors after a restart; a
   sidecar that cannot be listed, decoded or searched is an error, never a
-  shorter answer, and DROP INDEX deletes the index's vector sidecars (ST-71).
+  shorter answer, and DROP INDEX deletes the index's vector sidecars (ST-79).
   Compaction writes its output's scoped vector sidecars before the swap, and
   every generation's scoped sidecars end with a manifest; a live generation
   without a matching one (compacted before this, flushed before manifests,
   or a crashed build) makes ANN over the index refuse with retryable
   backpressure until the background vector repair rebuilds it from its rows,
   a partition at a time. Registration starts that repair, so existing data is
-  re-indexed on the first start with no operator action (ST-72).
+  re-indexed on the first start with no operator action (ST-80).
   A global index read (`read_by_index_each`) of an index the table does not
   declare returns an error naming the index, never zero rows: the planner
   chooses indexes from the CQL schema, so a consult of an undeclared index
@@ -696,7 +696,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
   quarantines them under a safety rail. It also checks every vector index each
-  tick (`IssueKind::InvalidVectorIndex`, ST-73): a generation with missing
+  tick (`IssueKind::InvalidVectorIndex`, ST-81): a generation with missing
   sidecars, a sidecar that does not decode, a vector/scope count that
   disagrees with the manifest, a dimension that disagrees with the column, or
   a scope set that disagrees with the sidecars on disk. An invalid generation
