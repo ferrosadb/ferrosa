@@ -478,6 +478,9 @@ struct StoreView {
     /// between the memtable swap and the sidecar install misses every row the
     /// frozen memtable holds: `indexes` is already the new memtable's.
     flushing_indexes: Option<Arc<HashMap<String, Arc<MemtableIndex>>>>,
+    /// Vector indexes of the `flushing` memtable, readable until the flush
+    /// installs its vector sidecars (the vector form of `flushing_indexes`).
+    flushing_vector_indexes: Option<Arc<HashMap<String, Arc<VectorMemtableIndex>>>>,
     /// Completed SSTables, newest first. Lightweight descriptors only — the
     /// readers are opened on demand through the engine-wide reader pool so
     /// resident memory is `O(reader_cap)` rather than `O(sstable_count)`.
@@ -2093,6 +2096,19 @@ fn index_posting_sources<'a>(
     sources
 }
 
+/// The generation `ann_search` files flushing-memtable results under, so
+/// their placeholder positions cannot collide with the active memtable's or
+/// a real SSTable's (flush generations never reach it).
+const FLUSHING_MEMTABLE_GENERATION: u64 = u64::MAX;
+
+/// The flushing memtable's vector index named `index_name`, if any.
+fn flushing_vector_index<'a>(
+    view: &'a StoreView,
+    index_name: &str,
+) -> Option<&'a Arc<VectorMemtableIndex>> {
+    view.flushing_vector_indexes.as_ref()?.get(index_name)
+}
+
 /// The flushing memtable's postings for `key` in `index_name`, if any.
 fn flushing_posting_list(
     view: &StoreView,
@@ -2249,6 +2265,7 @@ impl<F: FlushTarget> TableStore<F> {
             active,
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
             indexes,
@@ -2460,6 +2477,7 @@ impl<F: FlushTarget> TableStore<F> {
             active,
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(descriptors),
             sstable_ids: Arc::new(initial_ids),
             indexes,
@@ -2550,6 +2568,7 @@ impl<F: FlushTarget> TableStore<F> {
             active,
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(descriptors),
             sstable_ids: Arc::new(initial_ids),
             indexes,
@@ -4166,6 +4185,7 @@ impl<F: FlushTarget> TableStore<F> {
                     active: Arc::clone(&new_active),
                     flushing: Some(Arc::clone(&old_active)),
                     flushing_indexes: Some(Arc::new(old_indexes.by_name.clone())),
+                    flushing_vector_indexes: Some(Arc::clone(&old_vector_indexes)),
                     sstables: Arc::clone(&current.sstables),
                     sstable_ids: Arc::clone(&current.sstable_ids),
                     indexes: Arc::clone(&fresh_indexes),
@@ -4261,6 +4281,7 @@ impl<F: FlushTarget> TableStore<F> {
                     active: Arc::clone(&live.active),
                     flushing: None,
                     flushing_indexes: None,
+                    flushing_vector_indexes: None,
                     sstables: Arc::clone(&live.sstables),
                     sstable_ids: Arc::clone(&live.sstable_ids),
                     indexes: Arc::clone(&live.indexes),
@@ -4352,6 +4373,7 @@ impl<F: FlushTarget> TableStore<F> {
                     active: Arc::clone(&live.active),
                     flushing: None,
                     flushing_indexes: None,
+                    flushing_vector_indexes: None,
                     sstables: Arc::clone(&live.sstables),
                     sstable_ids: Arc::clone(&live.sstable_ids),
                     indexes: Arc::clone(&live.indexes),
@@ -4487,6 +4509,22 @@ impl<F: FlushTarget> TableStore<F> {
         // frozen rows too, and one it dropped no longer answers from them.
         let published: Arc<HashMap<String, Arc<MemtableIndex>>> =
             Arc::new(sidecar_indexes.iter().cloned().collect());
+        // The vector indexes the target catalog declares, for the frozen rows:
+        // its own index, or one built from the rows for an index the rotating
+        // DDL added. The same map feeds the vector sidecars below.
+        let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
+            target_catalog
+                .vector_index_configs
+                .iter()
+                .map(|cfg| {
+                    let index = match old_vector_indexes.get(&cfg.index_name) {
+                        Some(index) => Arc::clone(index),
+                        None => vector_index_from_rows(cfg, &partitions),
+                    };
+                    (cfg.index_name.clone(), index)
+                })
+                .collect(),
+        );
         self.update_view("flush:publish_flushing_postings", |current| {
             if current.flushing.is_none() {
                 return (None, ());
@@ -4495,6 +4533,7 @@ impl<F: FlushTarget> TableStore<F> {
                 active: Arc::clone(&current.active),
                 flushing: current.flushing.clone(),
                 flushing_indexes: Some(Arc::clone(&published)),
+                flushing_vector_indexes: Some(Arc::clone(&flush_vector_indexes)),
                 sstables: Arc::clone(&current.sstables),
                 sstable_ids: Arc::clone(&current.sstable_ids),
                 indexes: Arc::clone(&current.indexes),
@@ -4631,18 +4670,10 @@ impl<F: FlushTarget> TableStore<F> {
         //   - Never silently skip: a missing vector sidecar causes ANN queries
         //     to fall back to full scans without the caller knowing.
         for cfg in &target_catalog.vector_index_configs {
-            // A vector index the rotating DDL added has no memtable index on
-            // the frozen memtable; build it from the frozen rows instead.
-            let built_from_rows;
-            let vi = match old_vector_indexes.get(&cfg.index_name) {
-                Some(vi) => Some(vi),
-                None => {
-                    built_from_rows = vector_index_from_rows(cfg, &partitions);
-                    Some(&built_from_rows)
-                }
-            };
-            if let Some(vi) = vi {
-                let drained_with_scopes = vi.drain_with_scopes();
+            // Read, not drained: readers keep searching this index through
+            // `flushing_vector_indexes` until the sidecar is installed.
+            if let Some(vi) = flush_vector_indexes.get(&cfg.index_name) {
+                let drained_with_scopes = vi.entries_with_scopes();
                 if drained_with_scopes.is_empty() {
                     continue;
                 }
@@ -4826,6 +4857,7 @@ impl<F: FlushTarget> TableStore<F> {
                 active: Arc::clone(&current_view.active),
                 flushing: None,
                 flushing_indexes: None,
+                flushing_vector_indexes: None,
                 sstables: Arc::new(new_sstables),
                 sstable_ids: Arc::new(new_ids),
                 indexes: Arc::clone(&current_view.indexes),
@@ -5028,6 +5060,7 @@ impl<F: FlushTarget> TableStore<F> {
                 active: Arc::clone(&current_view.active),
                 flushing: None,
                 flushing_indexes: None,
+                flushing_vector_indexes: None,
                 sstables: Arc::new(new_sstables),
                 sstable_ids: Arc::new(new_ids),
                 indexes: Arc::clone(&current_view.indexes),
@@ -8132,6 +8165,19 @@ impl<F: FlushTarget> TableStore<F> {
                 merged.insert(VectorRowRef::memtable(result.position), result);
             }
         }
+        if let Some(vi) = flushing_vector_index(&guard, index_name) {
+            let results = vi.search(query, k, ef_search).map_err(|e| {
+                ferrosa_common::Error::InvalidData(format!(
+                    "ann_search flushing memtable failed: {e}"
+                ))
+            })?;
+            for result in results {
+                merged.insert(
+                    VectorRowRef::sstable(FLUSHING_MEMTABLE_GENERATION, result.position),
+                    result,
+                );
+            }
+        }
 
         for (gen_str, _dir) in guard.sstable_ids.iter() {
             if let Ok(gen) = gen_str.parse::<u64>() {
@@ -8229,6 +8275,21 @@ impl<F: FlushTarget> TableStore<F> {
                 merged.insert(VectorRowRef::memtable(result.position), result);
             }
         }
+        if let Some(vi) = flushing_vector_index(&guard, index_name) {
+            let results = vi
+                .search_with_scope(query, k, ef_search, partition_scope)
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidData(format!(
+                        "ann_search scoped flushing memtable failed: {e}"
+                    ))
+                })?;
+            for result in results {
+                merged.insert(
+                    VectorRowRef::sstable(FLUSHING_MEMTABLE_GENERATION, result.position),
+                    result,
+                );
+            }
+        }
 
         let scoped_index_name = scoped_vector_sidecar_name(index_name, partition_scope);
         for (gen_str, _dir) in guard.sstable_ids.iter() {
@@ -8319,7 +8380,12 @@ impl<F: FlushTarget> TableStore<F> {
         // Source (a): active memtable — scope carried inline.
         let guard = self.view.load();
         let mut scopeless_memtable_hits = 0usize;
-        if let Some(vi) = guard.vector_indexes.get(index_name) {
+        let memtable_vector_indexes = guard
+            .vector_indexes
+            .get(index_name)
+            .into_iter()
+            .chain(flushing_vector_index(&guard, index_name));
+        for vi in memtable_vector_indexes {
             let results = vi.search_with_scopes(query, k, ef_search).map_err(|e| {
                 ferrosa_common::Error::InvalidData(format!(
                     "ann_search_partitions memtable failed: {e}"
@@ -8630,6 +8696,7 @@ impl<F: FlushTarget> TableStore<F> {
             active: new_memtable(),
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
             indexes: new_indexes(Arc::clone(&catalog), self.schema.load_full()),
@@ -8814,6 +8881,7 @@ impl<F: FlushTarget> TableStore<F> {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
             flushing_indexes: current.flushing_indexes.clone(),
+            flushing_vector_indexes: current.flushing_vector_indexes.clone(),
             sstables: Arc::new(new_sstables),
             sstable_ids: Arc::new(new_ids),
             indexes: Arc::clone(&current.indexes),
@@ -8892,6 +8960,7 @@ impl<F: FlushTarget> TableStore<F> {
                 active: Arc::clone(&guard.active),
                 flushing: guard.flushing.clone(),
                 flushing_indexes: guard.flushing_indexes.clone(),
+                flushing_vector_indexes: guard.flushing_vector_indexes.clone(),
                 sstables: Arc::clone(&guard.sstables),
                 sstable_ids: Arc::clone(&guard.sstable_ids),
                 indexes: Arc::clone(&guard.indexes),
@@ -9974,6 +10043,7 @@ mod tests {
             active: Arc::new(SnapshotMemtable { partitions }),
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::clone(&current.sstables),
             sstable_ids: Arc::clone(&current.sstable_ids),
             indexes: Arc::clone(&current.indexes),
@@ -10963,6 +11033,7 @@ mod tests {
             active: new_memtable(),
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![good_desc, corrupt_desc]),
             sstable_ids: Arc::new(vec![
                 ("good".to_string(), std::path::PathBuf::new()),
@@ -11027,6 +11098,7 @@ mod tests {
             active: new_memtable(),
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![("truncated".to_string(), std::path::PathBuf::new())]),
             indexes: Arc::clone(&current.indexes),
@@ -11086,6 +11158,7 @@ mod tests {
             active: new_memtable(),
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![("corrupt-gen".to_string(), std::path::PathBuf::new())]),
             indexes: Arc::clone(&current.indexes),
@@ -11152,6 +11225,7 @@ mod tests {
             active: Arc::clone(&current.active),
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![(
                 "corrupt-gen-2".to_string(),
@@ -11241,6 +11315,7 @@ mod tests {
             active: new_memtable(),
             flushing: None,
             flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(descs),
             sstable_ids: Arc::new(ids),
             indexes: Arc::clone(&current.indexes),
@@ -11767,6 +11842,7 @@ mod tests {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
             flushing_indexes: current.flushing_indexes.clone(),
+            flushing_vector_indexes: current.flushing_vector_indexes.clone(),
             sstables: Arc::new(keep.iter().map(|i| current.sstables[*i].clone()).collect()),
             sstable_ids: Arc::new(
                 keep.iter()
@@ -14590,6 +14666,67 @@ mod tests {
             "first result score should be near 0.0 for exact-match vector, got {}",
             results[0].score
         );
+    }
+
+    /// ANN during a flush must find rows written before the memtable rotated:
+    /// the vector-index form of T1. The flush is held between the swap and
+    /// the sidecar install by its swap callback.
+    #[test]
+    fn ann_during_a_flush_finds_rows_written_before_the_rotation() {
+        let store = Arc::new(TableStore::new(
+            vector_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        ));
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+
+        let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let flush = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.flush_with_swap_callback(move || {
+                    rotated_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        rotated_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let during = store.ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20);
+        let raw = store.ann_search("vec_idx", &[1.0, 0.0, 0.0], 1, 20);
+        release_tx.send(()).unwrap();
+        assert_eq!(flush.join().unwrap().unwrap(), FlushOutcome::Published);
+
+        assert_eq!(
+            during.unwrap().len(),
+            1,
+            "ANN during the flush missed the frozen row"
+        );
+        assert_eq!(
+            raw.unwrap().len(),
+            1,
+            "raw ANN during the flush missed the frozen row"
+        );
+        let after = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+            .unwrap();
+        assert_eq!(after.len(), 1);
     }
 
     /// A vector index declared AFTER rows were written must answer for those
