@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-net
 status: implemented
-last_updated: 2026-09-09
+last_updated: 2026-10-03
 executive_summary: >
   The internode transport for ferrosa: a custom framed TCP wire protocol with a
   44-byte header, a PSK-HMAC handshake, three priority lanes (Raft/Data/Bulk) per
@@ -40,8 +40,9 @@ that is wrong — see `Cargo.toml` and `src/task_pool.rs`.)
 | `pool` | `PriorityPool`: 3 lanes per peer, connect/send/fire/shutdown, reconnect-host selection |
 | `lane_actor` | Per-lane actor task, `LaneHandle`, `LaneCommand`, stream-window dispatch, reconnect/dormant driving |
 | `reconnect` | `LaneState`, backoff constants, `connect_with_retry_cancelable`, alive watcher, dormant counters |
-| `rpc/server` | `RpcServer`: accept loop, acceptor handshake, dispatch, graceful drain, TLS acceptor |
-| `rpc/client` | `RpcClient`: outbound connection, frame reader/writer loops, bandwidth metrics |
+| `rpc/server` | `RpcServer`: accept loop, acceptor handshake, dispatch (panic-catching `run_handler`; every request answered or failed via `ReplyRoute`), graceful drain, TLS acceptor |
+| `rpc/client` | `RpcClient`: outbound connection, frame reader/writer loops, error-reply decoding, fails pending requests on close, bandwidth metrics |
+| `rpc/error_reply` | `RpcErrorReply` / `RemoteFailureKind`: the error-reply frame body (`FLAG_RPC_ERROR`), gated on `CAP_RPC_ERROR_REPLY` |
 | `rpc/handler` | `HandlerRegistry` (`MsgType`→handler, dynamic), `RpcHandler` trait, `PingHandler` |
 | `tls` | rustls (ring) `TlsAcceptor`/`TlsConnector` from PEM paths; `require_tls` enforcement |
 | `stream_router` | Per-`request_id` dispatch for multi-message streaming RPCs; `is_registered` route-liveness predicate for callers' per-request state |

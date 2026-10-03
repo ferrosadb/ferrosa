@@ -49,9 +49,13 @@ sequenceDiagram
         Codec->>Net: header + body
         Net->>Server: bytes
         Server->>Codec: decode Frame (version must match negotiated format)
-        Server->>Reg: dispatch(peer_id, msg_type, Message)
+        Server->>Reg: dispatch(peer_id, msg_type, Message) under catch_unwind
         Reg-->>Server: Option&lt;Message&gt; (None = fire-and-forget)
-        Server-->>Client: response Frame (stream_id correlated)
+        alt handler panicked / response unencodable or too large / request undecodable
+            Server-->>Client: error-reply Frame (FLAG_RPC_ERROR, same stream_id), if peer has CAP_RPC_ERROR_REPLY
+        else
+            Server-->>Client: response Frame (stream_id correlated)
+        end
         Client-->>Actor: LaneCommand::SendComplete(Result&lt;Message&gt;)
         Actor-->>Caller: Result&lt;Message&gt;
     else window full / pending cap exceeded
@@ -83,6 +87,12 @@ sequenceDiagram
 - **Cancel safety.** The caller never holds a lock across the network round-trip;
   it only owns a `oneshot` receiver. If the caller future is dropped mid-send,
   the reserved mpsc permit is released and no half-sent state remains.
+- **Every request ends.** A stream slot is released by the response, by an
+  error-reply frame (the peer could not serve it), by the connection closing
+  (the client fails all pending requests), or by the lane deadline (1 s / 10 s
+  / 60 s, or the caller's override), whichever comes first. Before 2026-10-03
+  only the response or the deadline released it, so failing handlers held every
+  slot for the full timeout and pinned the lanes at their cap.
 - **Backpressure is explicit.** The actor enforces a per-lane stream window
   (`max_streams_per_lane`) and a process-wide `data_lane_max_in_flight` cap;
   overflow returns `NetError::Overloaded` rather than queuing unboundedly.
