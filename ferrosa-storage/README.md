@@ -735,6 +735,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   bounded k-way merge (`SortedRows`, `RowOrder`). Peak working set is
   `O(MERGE_FANIN)` — independent of the row count. Spill/merge I/O errors fail
   loud; runs live under the `TempSortTableReservation` dir (cleaned up on drop).
+  `SortedRows::into_disk_backed` moves an un-spilled (in-memory) remainder to a
+  run file so a CQL result cursor can be parked between pages holding only a
+  merge head, not up to a spill threshold of rows. With an empty `RowOrder` the
+  sorter is a spill-backed FIFO (stable runs, run-index tie-break).
 - **Range merger run grouping** (`range_merger.rs`) — to keep the merge heap
   small, token-disjoint SSTables are grouped into concatenated "runs"
   (`partition_into_disjoint_runs`), one heap source per run instead of one per
