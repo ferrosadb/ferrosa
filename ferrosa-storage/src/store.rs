@@ -3791,12 +3791,12 @@ impl<F: FlushTarget> TableStore<F> {
             flush_catalog,
             target_catalog,
         ) = {
-            let old_view = self.view.load();
+            let old_view = self.view.load_full();
             // The schema and index catalog the frozen memtable's rows were
             // written under. The flush serializes them with these even if
             // `new_schema` replaces them below: an ALTER remaps index
             // ordinals, and the frozen rows still carry the old ones.
-            let flush_schema = self.schema.load_full();
+            let flush_schema = Arc::clone(&old_view.indexes.schema);
             let flush_catalog = Arc::clone(&old_view.indexes.catalog);
             // The catalog the new memtable is bound to, and whose index set the
             // frozen memtable's sidecars must cover.
@@ -3820,22 +3820,34 @@ impl<F: FlushTarget> TableStore<F> {
                 "the active memtable's gate is sealed before its flush"
             );
             let old_vector_indexes = Arc::clone(&old_view.vector_indexes);
-            let current_sstables = Arc::clone(&old_view.sstables);
-            let current_ids = Arc::clone(&old_view.sstable_ids);
-            let current_sidecars = Arc::clone(&old_view.sidecar_indexes);
             drop(old_view);
 
-            let new_view = StoreView {
-                active: new_active,
-                flushing: Some(Arc::clone(&old_active)),
-                sstables: Arc::clone(&current_sstables),
-                sstable_ids: Arc::clone(&current_ids),
-                indexes: fresh_indexes,
-                sidecar_indexes: Arc::clone(&current_sidecars),
-                vector_indexes: fresh_vector_indexes,
-            };
-            new_view.check_invariants("flush:swap_active");
-            self.view.store(Arc::new(new_view));
+            // Only a rotation replaces the active memtable, and rotations run
+            // one at a time, so the view this derives from still holds
+            // `old_active`; compaction swaps and sidecar installs that landed
+            // since are kept.
+            let swapped = self.update_view("flush:swap_active", |current| {
+                if !Arc::ptr_eq(&current.active, &old_active) {
+                    return (None, false);
+                }
+                let next = StoreView {
+                    active: Arc::clone(&new_active),
+                    flushing: Some(Arc::clone(&old_active)),
+                    sstables: Arc::clone(&current.sstables),
+                    sstable_ids: Arc::clone(&current.sstable_ids),
+                    indexes: Arc::clone(&fresh_indexes),
+                    sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+                    vector_indexes: Arc::clone(&fresh_vector_indexes),
+                };
+                (Some(next), true)
+            })?;
+            if !swapped {
+                tracing::error!("flush: the active memtable changed under a rotation");
+                return Err(ferrosa_common::Error::InvalidData(
+                    "flush: the active memtable was replaced while this rotation held it"
+                        .to_string(),
+                ));
+            }
             // Writers that load the view from here on write to the new
             // memtable; seal the old one and wait out the writes inside it.
             old_indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE)?;
@@ -3909,21 +3921,20 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Step 3: No-op if the memtable was empty.
         if partitions.is_empty() {
-            // Re-load the live view to get current sstables (not the stale
-            // capture from the top of flush) — defensive against future
-            // changes to locking discipline.
-            let live = self.view.load();
-            let new_view = StoreView {
-                active: Arc::clone(&live.active),
-                flushing: None,
-                sstables: Arc::clone(&live.sstables),
-                sstable_ids: Arc::clone(&live.sstable_ids),
-                indexes: Arc::clone(&live.indexes),
-                sidecar_indexes: Arc::clone(&live.sidecar_indexes),
-                vector_indexes: Arc::clone(&live.vector_indexes),
-            };
-            new_view.check_invariants("flush:clear_flushing");
-            self.view.store(Arc::new(new_view));
+            // Derived from the live view, so a compaction swap or sidecar
+            // install since the swap above is kept.
+            self.update_view("flush:clear_flushing", |live| {
+                let next = StoreView {
+                    active: Arc::clone(&live.active),
+                    flushing: None,
+                    sstables: Arc::clone(&live.sstables),
+                    sstable_ids: Arc::clone(&live.sstable_ids),
+                    indexes: Arc::clone(&live.indexes),
+                    sidecar_indexes: Arc::clone(&live.sidecar_indexes),
+                    vector_indexes: Arc::clone(&live.vector_indexes),
+                };
+                (Some(next), ())
+            })?;
             return Ok(FlushOutcome::NothingToFlush);
         }
 
@@ -4002,18 +4013,18 @@ impl<F: FlushTarget> TableStore<F> {
                 quarantined_rows = total_quarantined,
                 "flush: all rows were quarantined; skipping empty SSTable publish"
             );
-            let live = self.view.load();
-            let new_view = StoreView {
-                active: Arc::clone(&live.active),
-                flushing: None,
-                sstables: Arc::clone(&live.sstables),
-                sstable_ids: Arc::clone(&live.sstable_ids),
-                indexes: Arc::clone(&live.indexes),
-                sidecar_indexes: Arc::clone(&live.sidecar_indexes),
-                vector_indexes: Arc::clone(&live.vector_indexes),
-            };
-            new_view.check_invariants("flush:clear_all_quarantined");
-            self.view.store(Arc::new(new_view));
+            self.update_view("flush:clear_all_quarantined", |live| {
+                let next = StoreView {
+                    active: Arc::clone(&live.active),
+                    flushing: None,
+                    sstables: Arc::clone(&live.sstables),
+                    sstable_ids: Arc::clone(&live.sstable_ids),
+                    indexes: Arc::clone(&live.indexes),
+                    sidecar_indexes: Arc::clone(&live.sidecar_indexes),
+                    vector_indexes: Arc::clone(&live.vector_indexes),
+                };
+                (Some(next), ())
+            })?;
             return Ok(FlushOutcome::NothingToFlush);
         }
 
@@ -4428,8 +4439,6 @@ impl<F: FlushTarget> TableStore<F> {
             prior_sstable_count = self.sstable_count(),
             "flush: SSTable written, updating view"
         );
-        let current_view = self.view.load();
-
         // Use the actual base directory from the flush target, not empty PathBuf.
         // An empty path causes ID collisions with compaction output:
         // swap_compacted_sstables matches by ID only, so a flush SSTable with
@@ -4442,14 +4451,7 @@ impl<F: FlushTarget> TableStore<F> {
         let new_desc =
             SstableDescriptor::from_reader(format!("{gen}"), flush_dir.clone(), &new_reader);
         self.seed_reader(&new_desc, new_reader);
-        let mut new_sstables = vec![new_desc];
-        new_sstables.extend(current_view.sstables.iter().cloned());
-
-        let mut new_ids = vec![(format!("{gen}"), flush_dir)];
-        new_ids.extend(current_view.sstable_ids.iter().cloned());
-
-        let mut new_sidecars = vec![Arc::new(sidecar_map)];
-        new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
+        let new_sidecar_map = Arc::new(sidecar_map);
 
         // Once the SSTable reader is installed, the flushed memtable must leave
         // the live view. Writers cannot be racing against `old_active`: its
@@ -4457,17 +4459,24 @@ impl<F: FlushTarget> TableStore<F> {
         // `old_active` in `flushing` after a successful flush makes subsequent
         // flushes re-ingest already-flushed rows and can cascade wide-partition
         // snapshots under aggressive concurrent flush loops.
-        let new_view = StoreView {
-            active: Arc::clone(&current_view.active),
-            flushing: None,
-            sstables: Arc::new(new_sstables),
-            sstable_ids: Arc::new(new_ids),
-            indexes: Arc::clone(&current_view.indexes),
-            sidecar_indexes: Arc::new(new_sidecars),
-            vector_indexes: Arc::clone(&current_view.vector_indexes),
-        };
-        new_view.check_invariants("flush:install_new_sstable");
-        self.view.store(Arc::new(new_view));
+        self.update_view("flush:install_new_sstable", |current_view| {
+            let mut new_sstables = vec![new_desc.clone()];
+            new_sstables.extend(current_view.sstables.iter().cloned());
+            let mut new_ids = vec![(format!("{gen}"), flush_dir.clone())];
+            new_ids.extend(current_view.sstable_ids.iter().cloned());
+            let mut new_sidecars = vec![Arc::clone(&new_sidecar_map)];
+            new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
+            let next = StoreView {
+                active: Arc::clone(&current_view.active),
+                flushing: None,
+                sstables: Arc::new(new_sstables),
+                sstable_ids: Arc::new(new_ids),
+                indexes: Arc::clone(&current_view.indexes),
+                sidecar_indexes: Arc::new(new_sidecars),
+                vector_indexes: Arc::clone(&current_view.vector_indexes),
+            };
+            (Some(next), ())
+        })?;
 
         Ok(FlushOutcome::Published)
     }
@@ -4640,34 +4649,35 @@ impl<F: FlushTarget> TableStore<F> {
         // Step 6 (publish) — prepend ALL shard SSTables to the view, clear
         // flushing. Each shard carries an empty sidecar map (no secondary
         // indexes on a shardable table).
-        let current_view = self.view.load();
-        let mut new_sstables = Vec::with_capacity(published.len() + current_view.sstables.len());
-        let mut new_ids = Vec::with_capacity(published.len() + current_view.sstable_ids.len());
-        let mut new_sidecars =
-            Vec::with_capacity(published.len() + current_view.sidecar_indexes.len());
+        let mut shard_sstables = Vec::with_capacity(published.len());
+        let mut shard_ids = Vec::with_capacity(published.len());
         for (gen, reader) in &published {
             let desc = SstableDescriptor::from_reader(format!("{gen}"), flush_dir.clone(), reader);
             self.seed_reader(&desc, Arc::clone(reader));
-            new_sstables.push(desc);
-            new_ids.push((format!("{gen}"), flush_dir.clone()));
-            new_sidecars.push(Arc::new(HashMap::<String, SidecarReader>::new()));
+            shard_sstables.push(desc);
+            shard_ids.push((format!("{gen}"), flush_dir.clone()));
         }
-        new_sstables.extend(current_view.sstables.iter().cloned());
-        new_ids.extend(current_view.sstable_ids.iter().cloned());
-        new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
-
-        let new_view = StoreView {
-            active: Arc::clone(&current_view.active),
-            flushing: None,
-            sstables: Arc::new(new_sstables),
-            sstable_ids: Arc::new(new_ids),
-            indexes: Arc::clone(&current_view.indexes),
-            sidecar_indexes: Arc::new(new_sidecars),
-            vector_indexes: Arc::clone(&current_view.vector_indexes),
-        };
-        new_view.check_invariants("flush:install_sharded_sstables");
-        self.view.store(Arc::new(new_view));
-        Ok(())
+        // Derived from the live view, so a compaction swap or sidecar install
+        // since the memtable swap is kept.
+        self.update_view("flush:install_sharded_sstables", |current_view| {
+            let mut new_sstables = shard_sstables.clone();
+            new_sstables.extend(current_view.sstables.iter().cloned());
+            let mut new_ids = shard_ids.clone();
+            new_ids.extend(current_view.sstable_ids.iter().cloned());
+            let mut new_sidecars: Vec<Arc<HashMap<String, SidecarReader>>> =
+                shard_ids.iter().map(|_| Arc::new(HashMap::new())).collect();
+            new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
+            let next = StoreView {
+                active: Arc::clone(&current_view.active),
+                flushing: None,
+                sstables: Arc::new(new_sstables),
+                sstable_ids: Arc::new(new_ids),
+                indexes: Arc::clone(&current_view.indexes),
+                sidecar_indexes: Arc::new(new_sidecars),
+                vector_indexes: Arc::clone(&current_view.vector_indexes),
+            };
+            (Some(next), ())
+        })
     }
 
     /// Reads partitions from the memtable in token order with an optional
@@ -6992,6 +7002,26 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(partitions)
     }
 
+    /// Replace the view with one derived from the current view, by
+    /// compare-and-swap: if another writer (a flush, a compaction swap, a
+    /// sidecar install) replaced the view meanwhile, `derive` runs again on
+    /// the newer one, so no change is lost. `derive` must be a pure function
+    /// of the view it is given; it returns the next view (or `None` to leave
+    /// the view alone) and a result for the caller.
+    fn update_view<R>(
+        &self,
+        what: &'static str,
+        mut derive: impl FnMut(&StoreView) -> (Option<StoreView>, R),
+    ) -> Result<R> {
+        crate::lockfree::update(&self.view, what, |current| {
+            let (next, result) = derive(current);
+            if let Some(next) = next.as_ref() {
+                next.check_invariants(what);
+            }
+            (next, result)
+        })
+    }
+
     /// Add `scopes` to the scopes recorded for vector index `index_name`.
     ///
     /// A failure is logged, not returned: the flush that calls this has
@@ -8306,17 +8336,49 @@ impl<F: FlushTarget> TableStore<F> {
         add: Arc<SSTableReader<F::Reader>>,
         output_sidecars: HashMap<String, SidecarReader>,
     ) -> Result<()> {
-        let _guard = self.flush_guard.lock();
-        let current = self.view.load();
+        // Build the descriptor for the compacted output and seed its reader
+        // into the pool once; the view swap below may derive more than once.
+        let out_desc = SstableDescriptor::from_reader(output_id.clone(), output_path.clone(), &add);
+        self.seed_reader(&out_desc, add);
+        let output_sidecars = Arc::new(output_sidecars);
+        let input_id_set: std::collections::HashSet<&str> =
+            input_ids.iter().map(|(id, _)| id.as_str()).collect();
 
+        // Derived from the live view by compare-and-swap: a flush installing
+        // its SSTable meanwhile is kept, never overwritten (this used to be
+        // excluded by the table's flush lock).
+        let removed = self.update_view("swap_compacted", |current| {
+            Self::view_with_compaction_output(
+                current,
+                &input_id_set,
+                &out_desc,
+                (&output_id, &output_path),
+                &output_sidecars,
+            )
+        })?;
+
+        // Evict every removed input generation from the pool so a stale reader
+        // can never be served or reopened after its files are deleted (FMEA #4).
+        for desc in &removed {
+            self.reader_pool.remove(&self.pool_key(desc));
+        }
+        Ok(())
+    }
+
+    /// `current` with the compaction inputs removed and the output prepended,
+    /// plus the input descriptors it removed.
+    fn view_with_compaction_output(
+        current: &StoreView,
+        input_id_set: &std::collections::HashSet<&str>,
+        out_desc: &SstableDescriptor,
+        (output_id, output_path): (&String, &std::path::PathBuf),
+        output_sidecars: &Arc<HashMap<String, SidecarReader>>,
+    ) -> (Option<StoreView>, Vec<SstableDescriptor>) {
         // Keep SSTables whose ID is NOT in the compaction input set.
         // Match on ID only — the path in the view may be empty (from flush)
         // while the compaction task resolves it to the table directory. Matching
         // on (id, path) caused inputs to never be removed, leaving stale
         // references to deleted files that silently lost data on reads.
-        let input_id_set: std::collections::HashSet<&str> =
-            input_ids.iter().map(|(id, _)| id.as_str()).collect();
-
         let mut new_sstables = Vec::with_capacity(current.sstables.len());
         let mut new_ids = Vec::with_capacity(current.sstable_ids.len());
         let mut new_sidecars = Vec::with_capacity(current.sidecar_indexes.len());
@@ -8333,23 +8395,19 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // Evict every removed input generation from the pool so a stale reader
-        // can never be served or reopened after its files are deleted (FMEA #4).
-        for desc in current.sstables.iter() {
-            if input_id_set.contains(desc.gen.as_str()) {
-                self.reader_pool.remove(&self.pool_key(desc));
-            }
-        }
+        let removed: Vec<SstableDescriptor> = current
+            .sstables
+            .iter()
+            .filter(|desc| input_id_set.contains(desc.gen.as_str()))
+            .cloned()
+            .collect();
 
-        // Build the descriptor for the compacted output, seed its reader into
-        // the pool, then prepend it.
-        let out_desc = SstableDescriptor::from_reader(output_id.clone(), output_path.clone(), &add);
-        self.seed_reader(&out_desc, add);
-        new_sstables.insert(0, out_desc);
-        new_ids.insert(0, (output_id, output_path));
-        new_sidecars.insert(0, Arc::new(output_sidecars));
+        // Prepend the compacted output.
+        new_sstables.insert(0, out_desc.clone());
+        new_ids.insert(0, (output_id.clone(), output_path.clone()));
+        new_sidecars.insert(0, Arc::clone(output_sidecars));
 
-        let new_view = StoreView {
+        let next = StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
             sstables: Arc::new(new_sstables),
@@ -8358,9 +8416,7 @@ impl<F: FlushTarget> TableStore<F> {
             sidecar_indexes: Arc::new(new_sidecars),
             vector_indexes: Arc::clone(&current.vector_indexes),
         };
-        new_view.check_invariants("swap_compacted");
-        self.view.store(Arc::new(new_view));
-        Ok(())
+        (Some(next), removed)
     }
 
     /// Collects sidecar entries from SSTables matching the given `(id, path)` pairs for merging.
@@ -8405,39 +8461,52 @@ impl<F: FlushTarget> TableStore<F> {
         index_name: &str,
         reader: crate::index::sidecar::SidecarReader,
     ) -> bool {
-        let guard = self.view.load();
-        let Some(position) = guard
-            .sstable_ids
-            .iter()
-            .position(|(gen, _)| gen == generation_id)
-        else {
-            return false;
-        };
-
-        let mut sidecars: Vec<Arc<HashMap<String, SidecarReader>>> =
-            Vec::with_capacity(guard.sidecar_indexes.len());
-        for (i, existing) in guard.sidecar_indexes.iter().enumerate() {
-            if i == position {
-                let mut map: HashMap<String, SidecarReader> = existing.as_ref().clone();
-                map.insert(index_name.to_string(), reader.clone());
-                sidecars.push(Arc::new(map));
-            } else {
-                sidecars.push(Arc::clone(existing));
+        // By compare-and-swap: this used to load and store the view with no
+        // exclusion at all, so a flush or compaction swap landing in between
+        // was overwritten — an SSTable dropped from the view, or this
+        // sidecar lost.
+        let installed = self.update_view("install_sidecar", |guard| {
+            let Some(position) = guard
+                .sstable_ids
+                .iter()
+                .position(|(gen, _)| gen == generation_id)
+            else {
+                return (None, false);
+            };
+            let mut sidecars: Vec<Arc<HashMap<String, SidecarReader>>> =
+                Vec::with_capacity(guard.sidecar_indexes.len());
+            for (i, existing) in guard.sidecar_indexes.iter().enumerate() {
+                if i == position {
+                    let mut map: HashMap<String, SidecarReader> = existing.as_ref().clone();
+                    map.insert(index_name.to_string(), reader.clone());
+                    sidecars.push(Arc::new(map));
+                } else {
+                    sidecars.push(Arc::clone(existing));
+                }
+            }
+            let next = StoreView {
+                active: Arc::clone(&guard.active),
+                flushing: guard.flushing.clone(),
+                sstables: Arc::clone(&guard.sstables),
+                sstable_ids: Arc::clone(&guard.sstable_ids),
+                indexes: Arc::clone(&guard.indexes),
+                sidecar_indexes: Arc::new(sidecars),
+                vector_indexes: Arc::clone(&guard.vector_indexes),
+            };
+            (Some(next), true)
+        });
+        match installed {
+            Ok(installed) => installed,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    generation_id,
+                    index_name,
+                    "install_sidecar: the view stayed contended; sidecar NOT installed"
+                );
+                false
             }
         }
-
-        let new_view = StoreView {
-            active: Arc::clone(&guard.active),
-            flushing: guard.flushing.clone(),
-            sstables: Arc::clone(&guard.sstables),
-            sstable_ids: Arc::clone(&guard.sstable_ids),
-            indexes: Arc::clone(&guard.indexes),
-            sidecar_indexes: Arc::new(sidecars),
-            vector_indexes: Arc::clone(&guard.vector_indexes),
-        };
-        new_view.check_invariants("install_sidecar");
-        self.view.store(Arc::new(new_view));
-        true
     }
 
     /// Collect metadata for all current SSTables.
@@ -9037,6 +9106,69 @@ mod tests {
         );
         let rows = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec())).unwrap();
         assert_eq!(rows.len(), WRITERS * ROWS_PER_WRITER, "a write was lost");
+    }
+
+    /// Every view change is a compare-and-swap derived from the current view
+    /// (t_d938e6ae). `install_sidecar` used to load and store the view with
+    /// no exclusion, so a flush installing its SSTable in between was
+    /// overwritten (the SSTable vanished from reads) or overwrote the
+    /// sidecar. Race the two and check neither loses the other's change.
+    #[test]
+    fn sidecar_installs_and_flushes_lose_no_view_change() {
+        const ROUNDS: usize = 200;
+        let store = Arc::new(test_store());
+        let _rotation: FlushOutcome = store
+            .add_index("idx_main".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        store
+            .write(&make_key("first"), make_row(b"v", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let first_gen = store.view.load().sstable_ids[0].0.clone();
+        let reader = store.view.load().sidecar_indexes[0]["idx_main"].clone();
+
+        let flusher = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                (0..ROUNDS).for_each(|i| {
+                    store
+                        .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000))
+                        .unwrap();
+                    store.flush().unwrap();
+                });
+            })
+        };
+        let installer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                (0..ROUNDS).for_each(|i| {
+                    assert!(store.install_sidecar(
+                        &first_gen,
+                        &format!("extra_{i}"),
+                        reader.clone()
+                    ));
+                });
+            })
+        };
+        flusher.join().unwrap();
+        installer.join().unwrap();
+
+        let view = store.view.load();
+        assert_eq!(
+            view.sstables.len(),
+            ROUNDS + 1,
+            "an SSTable a flush installed was dropped from the view"
+        );
+        let first = view
+            .sidecar_indexes
+            .last()
+            .expect("the first flush's SSTable is the oldest");
+        (0..ROUNDS).for_each(|i| {
+            assert!(
+                first.contains_key(&format!("extra_{i}")),
+                "sidecar extra_{i} was installed and then lost"
+            );
+        });
     }
 
     /// `vector_index_scopes` was a `Mutex<HashMap>`; recording scopes from
