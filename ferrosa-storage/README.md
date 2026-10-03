@@ -45,6 +45,30 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   concurrency across *all* concurrent flushes, so flush parallelism is a
   capacity-aware knob rather than a per-flush thread count.
 
+  **The table registry and index DDL take no lock (t_d938e6ae).** The engine's
+  table map is `Arc<ArcSwap<HashMap<TableId, Arc<TableState>>>>`: readers
+  `load()` it and clone a table's `Arc` out before any callback, blocking send
+  or long scan; registration and DROP install a new map with a bounded
+  compare-and-swap (`lockfree::update`, which fails loud after 1,000 lost
+  races instead of spinning). It used to be a `parking_lot::RwLock`; on
+  2026-10-03 an index-stream producer parked in `blocking_send` holding the read
+  guard, a raft `register_table` queued for the write guard, writer preference
+  parked every later reader, and node2 deadlocked. A table's index declarations
+  are one immutable `IndexCatalog` bound to the memtable it was created with.
+  Index DDL (`add_index*`, `remove_index`, `add_*_index`) and `ALTER`
+  (`update_schema`) take `&self` and **rotate the memtable**: the frozen one is
+  flushed with sidecars for the new catalog (its own postings, or postings built
+  from its now-immutable rows for an index the DDL added), and the new one
+  starts empty under the new catalog and schema. So a memtable's postings are
+  exactly its flushed sidecars by construction
+  (`index_postings_equal_flushed_sidecars_under_racing_ddl_and_flush`). Every
+  store flush, rotations included, runs the engine's post-flush bookkeeping
+  (`StorageEngine::finish_flush`: index tracker, pin cap, commit-log checkpoint).
+  A table's NVMe pin is one `ArcSwap<PinState>`. DROP TABLE no longer waits for
+  the table's readers; a reader racing it finishes or fails loud, and
+  `TableStore::retire` stops any later flush of the dropped store from writing
+  into the deleted directory.
+
   **Publication safety — verify before promote (`publication-safety.md` M2):**
   `FileFlushTarget::flush_files` (used by both flush and compaction promotion)
   renames staged output to `.tmp`, checks every component's length, fsyncs the
