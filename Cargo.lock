@@ -2652,6 +2652,7 @@ dependencies = [
  "ferrosa-jsonb",
  "ferrosa-net",
  "ferrosa-row-bridge",
+ "ferrosa-sched",
  "ferrosa-schema",
  "ferrosa-sql",
  "ferrosa-sstable",

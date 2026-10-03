@@ -75,3 +75,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7"
 tempfile = "3"
 parking_lot = "0.12"
+# Pins the scan-pool size in `pg_stalled_consumer_liveness.rs`.
+ferrosa-sched = { path = "../ferrosa-sched" }
