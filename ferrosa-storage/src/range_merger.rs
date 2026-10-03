@@ -1022,19 +1022,20 @@ pub fn group_disjoint_runs(bounds: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<usize>> {
 }
 
 /// Convenience constructor: build a merger from explicit source
-/// inputs. `active_iter` and `flushing_iter` are memtable iterators;
+/// inputs. `active_iter` and `flushing_iters` (one per sealed memtable)
+/// are memtable iterators;
 /// `sstables` are the per-SSTable Arcs whose `partitions_iter()`
 /// will be consumed.
 pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
     build_merger_with_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         RunMode::Full,
         start,
@@ -1046,18 +1047,18 @@ pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
 /// from one or more SSTable SerializationHeaders.
 pub fn merger_for_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mappings: &'a [ColumnOrdinalMapping],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
     if mappings.iter().all(ColumnOrdinalMapping::is_identity) {
-        return merger_for_sources(active_iter, flushing_iter, sstables, start, end);
+        return merger_for_sources(active_iter, flushing_iters, sstables, start, end);
     }
     build_merger_without_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         Some(mappings),
         RunMode::Full,
@@ -1075,7 +1076,7 @@ pub fn merger_for_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
 /// path.
 pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     wanted: &'a [u16],
     start: Option<DecoratedKey>,
@@ -1083,7 +1084,7 @@ pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
 ) -> Result<RangeMerger<'a, R>> {
     build_merger_with_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         RunMode::Projected(wanted),
         start,
@@ -1094,7 +1095,7 @@ pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
 /// Compatibility projection variant for mixed current/SSTable column order.
 pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mappings: &'a [ColumnOrdinalMapping],
     wanted: &'a [u16],
@@ -1104,7 +1105,7 @@ pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 
     if mappings.iter().all(ColumnOrdinalMapping::is_identity) {
         return merger_for_projected_sources(
             active_iter,
-            flushing_iter,
+            flushing_iters,
             sstables,
             wanted,
             start,
@@ -1113,7 +1114,7 @@ pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 
     }
     build_merger_without_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         Some(mappings),
         RunMode::Projected(wanted),
@@ -1131,14 +1132,14 @@ pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 
 /// output). Used by the COUNT(*) fast path.
 pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
     build_merger_with_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         RunMode::Metadata,
         start,
@@ -1148,19 +1149,19 @@ pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
 
 fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mappings: Option<&'a [ColumnOrdinalMapping]>,
     mode: RunMode<'a>,
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
-    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + sstables.len());
+    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(1 + sstables.len());
     sources.push(MergeSource::Memtable {
         iter: active_iter,
         peeked: None,
     });
-    if let Some(it) = flushing_iter {
+    for it in flushing_iters {
         sources.push(MergeSource::Memtable {
             iter: it,
             peeked: None,
@@ -1203,7 +1204,7 @@ fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
 /// SSTables on a single table.
 fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mode: RunMode<'a>,
     start: Option<DecoratedKey>,
@@ -1232,12 +1233,12 @@ fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
     // leaking the slab to the merger's lifetime. We allocate it
     // into a `Box<[Vec<Arc<...>>]>` and stash on the merger so it
     // lives as long as the iterators borrowing from it.
-    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + runs.len());
+    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(1 + runs.len());
     sources.push(MergeSource::Memtable {
         iter: active_iter,
         peeked: None,
     });
-    if let Some(it) = flushing_iter {
+    for it in flushing_iters {
         sources.push(MergeSource::Memtable {
             iter: it,
             peeked: None,
@@ -1998,7 +1999,8 @@ mod tests {
         k: usize,
     ) -> (Vec<Partition>, usize) {
         let empty_active: Box<dyn Iterator<Item = Partition> + Send> = Box::new(std::iter::empty());
-        let mut merger = merger_for_sources(empty_active, None, sstables, None, None).unwrap();
+        let mut merger =
+            merger_for_sources(empty_active, Vec::new(), sstables, None, None).unwrap();
 
         let mut out: Vec<Partition> = Vec::new();
         let mut cur: Option<Partition> = None;
@@ -2058,7 +2060,8 @@ mod tests {
     /// must reproduce.
     fn drain_whole(sstables: &[Arc<SSTableReader<Vec<u8>>>]) -> Vec<Partition> {
         let empty_active: Box<dyn Iterator<Item = Partition> + Send> = Box::new(std::iter::empty());
-        let mut merger = merger_for_sources(empty_active, None, sstables, None, None).unwrap();
+        let mut merger =
+            merger_for_sources(empty_active, Vec::new(), sstables, None, None).unwrap();
         let mut out = Vec::new();
         while let Some(p) = merger.next_merged_partition().unwrap() {
             out.push(p);
@@ -2092,8 +2095,14 @@ mod tests {
         let readers = vec![a, b];
 
         // Truth: whole-partition merge is monotonic 0..=9.
-        let mut mm =
-            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut mm = merger_for_sources(
+            Box::new(std::iter::empty()),
+            Vec::new(),
+            &readers,
+            None,
+            None,
+        )
+        .unwrap();
         let merged = mm.next_merged_partition().unwrap().unwrap();
         let merged_cks: Vec<i32> = merged
             .rows
@@ -2103,8 +2112,14 @@ mod tests {
         assert_eq!(merged_cks, (0..=9).collect::<Vec<_>>());
 
         // Fragment path must match, in monotonic order, across the two runs.
-        let mut m =
-            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut m = merger_for_sources(
+            Box::new(std::iter::empty()),
+            Vec::new(),
+            &readers,
+            None,
+            None,
+        )
+        .unwrap();
         let mut cks: Vec<i32> = Vec::new();
         while let Some(frag) = m.next_fragment(2).unwrap() {
             for r in &frag.rows {
@@ -2140,8 +2155,14 @@ mod tests {
         };
         let a = std::sync::Arc::new(reader_from_partitions(&[p]));
         let readers = vec![a];
-        let mut m =
-            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut m = merger_for_sources(
+            Box::new(std::iter::empty()),
+            Vec::new(),
+            &readers,
+            None,
+            None,
+        )
+        .unwrap();
         let mut err = None;
         loop {
             match m.next_fragment(2) {
@@ -2570,8 +2591,14 @@ mod tests {
         let good_reader = reader_from_partitions(std::slice::from_ref(&first));
         let corrupt_reader = reader_with_truncated_tail(&[first, second]);
         let sstables = vec![Arc::new(good_reader), Arc::new(corrupt_reader)];
-        let mut merger =
-            merger_for_sources(Box::new(std::iter::empty()), None, &sstables, None, None).unwrap();
+        let mut merger = merger_for_sources(
+            Box::new(std::iter::empty()),
+            Vec::new(),
+            &sstables,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(
             merger.next_merged_partition().unwrap().is_some(),
@@ -2605,7 +2632,7 @@ mod tests {
 
         let mut merger = merger_for_projected_sources(
             Box::new(std::iter::empty()),
-            None,
+            Vec::new(),
             &sstables,
             &wanted,
             None,

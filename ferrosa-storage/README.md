@@ -45,9 +45,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   Memtable rotations (flush, index DDL, ALTER, TRUNCATE) run one at a time
   through a lock-free queue that one caller runs for everyone; reads and
   writes are never blocked. A flush that fails or panics after its swap
-  leaves its memtable in `flushing`; the next rotation stacks it
-  (`memtable/stacked.rs`) so its rows stay readable and are flushed once by
-  the next success. Optional
+  leaves its memtable in `flushing`, a list of sealed memtables (newest
+  first) that reads consult row by row and posting by posting; the next
+  rotation writes each one to its own SSTable, and a memtable leaves the list
+  only in the view change that installs its SSTable, so it is flushed exactly
+  once. Overlapping SSTables are merged by reads and compaction. Optional
   `write_verify` self-readback after every flush. The durability barrier
   (`fsync_components`) fsyncs a generation's component files **concurrently** on
   a shared, bounded flush pool (`flush_executor`, a rayon `ThreadPool` whose

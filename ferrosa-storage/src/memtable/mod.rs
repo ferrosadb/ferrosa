@@ -10,7 +10,6 @@ pub mod mem_index;
 pub mod sharded;
 #[cfg(feature = "skiplist-memtable")]
 pub mod skiplist;
-pub mod stacked;
 
 use std::sync::Arc;
 
