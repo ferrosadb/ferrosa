@@ -26,7 +26,7 @@ use ferrosa_storage::StorageEngine;
 use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::observer::AdjacencyIndexObserver;
-use crate::adjacency::reconcile::{reconcile_once, spawn_reconciliation};
+use crate::adjacency::reconcile::{reconcile_once, record_heal, spawn_reconciliation};
 use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, is_aggregate_function};
@@ -485,6 +485,11 @@ pub struct GraphEngine {
     reconciliation_cancel: CancellationToken,
     subscription_registry: Arc<SubscriptionRegistry>,
     registered_adjacency_keyspaces: Mutex<HashSet<String>>,
+    /// Per-keyspace first-use heal gate (see `ensure_adjacency_ready`). A cell
+    /// is set once that keyspace's index has been reconciled completely in
+    /// this process; until then every adjacency query on it awaits the cell.
+    /// Copy-on-write map: a keyspace is added once, read on every query.
+    adjacency_heals: ArcSwap<HashMap<String, Arc<tokio::sync::OnceCell<()>>>>,
     /// Routes adjacency-keyspace and adjacency-table DDL through the
     /// cluster's replication path. Defaults to a local-only coordinator
     /// (`LocalGraphSchemaCoordinator`) when `GraphEngine::new` is used.
@@ -587,6 +592,7 @@ impl GraphEngine {
             reconciliation_cancel: CancellationToken::new(),
             subscription_registry: Arc::new(SubscriptionRegistry::new(max_subscriptions())),
             registered_adjacency_keyspaces: Mutex::new(HashSet::new()),
+            adjacency_heals: ArcSwap::from_pointee(HashMap::new()),
             schema_coordinator,
             reconciliation_interval,
         }
@@ -713,6 +719,98 @@ impl GraphEngine {
         Ok(should_register_observer)
     }
 
+    /// Make `keyspace`'s adjacency index ready to answer traversals: register
+    /// it, then — once per process — reconcile it completely before any
+    /// traversal on it runs.
+    ///
+    /// This is the deploy heal. Builds before 330a0c29 tombstoned every
+    /// adjacency entry of an edge table not keyed exactly (source)/(target)
+    /// (agent_memory's `typed_edges`), and left live entries for edges they
+    /// deleted. Traversals now honour tombstones, so an unhealed index answers
+    /// with edges missing. Every adjacency query on the keyspace awaits the
+    /// same heal: concurrent first queries wait for it rather than read a
+    /// half-repaired index. A heal that hit any error is not marked done; the
+    /// query fails with a retryable [`GraphError::Unavailable`] and the next
+    /// query runs the heal again. Repairs are logged at WARN and counted in
+    /// `ferrosa_graph_adjacency_entries_{repaired,removed}_total`.
+    async fn ensure_adjacency_ready(&self, keyspace: &str) -> Result<()> {
+        let snap = self.schema.snapshot();
+        let has_edge_table = snap.tables.iter().any(|((ks, _), meta)| {
+            ks == keyspace && meta.extensions.get("graph.type") == Some(&"edge".to_string())
+        });
+        if !has_edge_table {
+            // Nothing to heal yet; a later edge table gets the heal on the
+            // first query after it exists.
+            return Ok(());
+        }
+        let cell = self.adjacency_heal_cell(keyspace);
+        cell.get_or_try_init(|| self.heal_adjacency(keyspace))
+            .await
+            .map(|_| ())
+    }
+
+    /// The heal cell for `keyspace`, created on first use.
+    fn adjacency_heal_cell(&self, keyspace: &str) -> Arc<tokio::sync::OnceCell<()>> {
+        if let Some(cell) = self.adjacency_heals.load().get(keyspace) {
+            return Arc::clone(cell);
+        }
+        let mut created = None;
+        self.adjacency_heals.rcu(|heals| {
+            let mut heals = HashMap::clone(heals);
+            let cell = heals
+                .entry(keyspace.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()));
+            created = Some(Arc::clone(cell));
+            heals
+        });
+        created.expect("rcu runs its closure at least once")
+    }
+
+    /// One complete reconcile of `keyspace` before it serves traversals.
+    async fn heal_adjacency(&self, keyspace: &str) -> Result<()> {
+        self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
+        let started = std::time::Instant::now();
+        let wp = self.write_path.load_full();
+        let metrics = reconcile_once(&self.schema, &wp, keyspace).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        record_heal(metrics.is_complete());
+        if !metrics.is_complete() {
+            tracing::warn!(
+                keyspace,
+                errors = metrics.errors,
+                entries_checked = metrics.entries_checked,
+                entries_repaired = metrics.entries_repaired,
+                entries_removed = metrics.orphans_removed,
+                elapsed_ms,
+                "graph engine: adjacency heal incomplete; traversals on this keyspace \
+                 fail retryably until a heal completes"
+            );
+            return Err(GraphError::Unavailable(format!(
+                "graph adjacency index for keyspace {keyspace} is being repaired \
+                 ({} reconcile errors); retry",
+                metrics.errors
+            )));
+        }
+        if metrics.entries_repaired > 0 || metrics.orphans_removed > 0 {
+            tracing::warn!(
+                keyspace,
+                entries_checked = metrics.entries_checked,
+                entries_repaired = metrics.entries_repaired,
+                entries_removed = metrics.orphans_removed,
+                elapsed_ms,
+                "graph engine: adjacency heal repaired the index before serving traversals"
+            );
+        } else {
+            tracing::info!(
+                keyspace,
+                entries_checked = metrics.entries_checked,
+                elapsed_ms,
+                "graph engine: adjacency index consistent; serving traversals"
+            );
+        }
+        Ok(())
+    }
+
     /// Execute a Cypher query: parse -> validate -> plan -> execute.
     pub async fn execute(
         &self,
@@ -821,17 +919,7 @@ impl GraphEngine {
         auth: &AuthContext,
     ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
         if statement_requires_adjacency(&statement) {
-            let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
-            if adjacency_registered {
-                let wp = self.write_path.load();
-                let metrics = reconcile_once(&self.schema, &wp, keyspace).await;
-                tracing::info!(
-                    keyspace,
-                    entries_checked = metrics.entries_checked,
-                    entries_repaired = metrics.entries_repaired,
-                    "graph engine: reconciled newly registered adjacency keyspace"
-                );
-            }
+            self.ensure_adjacency_ready(keyspace).await?;
         }
         let snap = self.schema.snapshot();
         let logical = match validate(&snap, auth, keyspace, statement.clone()) {
@@ -969,7 +1057,7 @@ impl GraphEngine {
                     }
                     leaf => {
                         if statement_requires_adjacency(&leaf) {
-                            self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
+                            self.ensure_adjacency_ready(keyspace).await?;
                         }
                         let snap = self.schema.snapshot();
                         let logical = validate(&snap, auth, keyspace, leaf)?;

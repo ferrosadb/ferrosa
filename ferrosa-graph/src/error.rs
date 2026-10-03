@@ -24,6 +24,9 @@ pub enum GraphError {
     Schema(ferrosa_schema::SchemaError),
     /// Internal error.
     Internal(String),
+    /// Temporarily unable to answer correctly (e.g. the adjacency index is
+    /// still being repaired). Retryable: the same query can succeed later.
+    Unavailable(String),
 }
 
 impl fmt::Display for GraphError {
@@ -38,6 +41,7 @@ impl fmt::Display for GraphError {
             Self::Storage(e) => write!(f, "storage error: {e}"),
             Self::Schema(e) => write!(f, "schema error: {e}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
+            Self::Unavailable(msg) => write!(f, "unavailable: {msg}"),
         }
     }
 }
