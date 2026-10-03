@@ -1,15 +1,16 @@
 ---
 crate: ferrosa-storage
 doc: data-flow
-last_updated: 2026-09-01
+last_updated: 2026-10-03
 ---
 
 # ferrosa-storage — Data Flow
 
 Two canonical paths: the **write path** (memtable → commit log → flush → S3) and
 the **read path** (memtable → cache → S3). All view transitions are
-`ArcSwap<StoreView>` swaps, so reads are wait-free and only flushes contend (on a
-per-table `Mutex`).
+`ArcSwap<StoreView>` compare-and-swaps, so reads are wait-free and nothing takes a
+lock: writers pass a per-memtable write gate, and memtable rotations run one at a
+time through a lock-free queue (t_d938e6ae).
 
 ## Write path
 
@@ -40,13 +41,13 @@ flowchart TD
     AUTO -- yes --> FL
     AUTO -- no --> DONE["ack write<br/>smaller memtable remains WAL-backed"]
 
-    subgraph FlushPath["Flush (per-table Mutex; reads/writes continue)"]
-      FL["flush_guard.lock<br/>swap in fresh memtable<br/>old → flushing"] --> SER["snapshot + sort<br/>build_serialization_header"]
+    subgraph FlushPath["Flush (rotation queue; reads/writes continue)"]
+      FL["rotate: queue, combiner runs it<br/>swap in fresh memtable, old → flushing<br/>seal old write gate, drain writers"] --> SER["snapshot + sort<br/>build_serialization_header"]
       SER --> WR["FlushTarget::flush → BTI SSTable<br/>(+ FTI / vector sidecars)"]
       WR --> VERIFY{"write_verify?"}
       VERIFY -- yes --> RB["reopen + self-readback"]
       VERIFY -- no --> PUB
-      RB --> PUB["ArcSwap: prepend SstableDescriptor<br/>clear flushing"]
+      RB --> PUB["ArcSwap CAS: prepend SstableDescriptor<br/>clear flushing"]
       PUB --> COMP["maybe_compact (STCS / UCS)"]
       PUB --> UP["UploadManager: submit components"]
     end

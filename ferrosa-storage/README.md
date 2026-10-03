@@ -33,8 +33,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   (`Batch`, `Periodic`, `Group`); **default is `Periodic`** → a bounded
   durability window (see FMEA).
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
-  memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`. Flush is
-  serialized by a per-table `Mutex`; reads/writes are never blocked. Optional
+  memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`, and
+  every view change is a compare-and-swap derived from the current view.
+  Memtable rotations (flush, index DDL, ALTER, TRUNCATE) run one at a time
+  through a lock-free queue that one caller runs for everyone; reads and
+  writes are never blocked. Optional
   `write_verify` self-readback after every flush. The durability barrier
   (`fsync_components`) fsyncs a generation's component files **concurrently** on
   a shared, bounded flush pool (`flush_executor`, a rayon `ThreadPool` whose
@@ -68,6 +71,22 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   the table's readers; a reader racing it finishes or fails loud, and
   `TableStore::retire` stops any later flush of the dropped store from writing
   into the deleted directory.
+
+  **No per-table lock either.** Writers enter a memtable through its
+  `WriteGate` (one atomic word: sealed bit + writers inside); a flush publishes
+  the next memtable, seals the old gate and waits only for writes already
+  inside, and a writer that meets a sealed gate writes to the new memtable
+  instead of waiting. Every `StoreView` change (flush install, compaction
+  swap, sidecar install) is a compare-and-swap (`TableStore::update_view`), so
+  a compaction swap never waits on a flush and none overwrites another; the
+  sidecar install used to be a blind store that could drop a just-flushed
+  SSTable from the view. Rotations go through `TableStore::rotate`: requests
+  queue on a channel, whichever caller wins a compare-and-swap flag runs the
+  queue in order, and requests queued together are one rotation. The
+  quarantine sets, vector-index scopes and FTI build claims are `ArcSwap`
+  values changed by compare-and-swap (`lockfree::SharedSet`); an FTI build is
+  single-flight per sidecar, and a query that finds one in flight scans that
+  SSTable instead of waiting.
 
   **Publication safety — verify before promote (`publication-safety.md` M2):**
   `FileFlushTarget::flush_files` (used by both flush and compaction promotion)
