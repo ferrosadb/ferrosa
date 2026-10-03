@@ -586,12 +586,12 @@ pub struct TableStore<F: FlushTarget> {
     /// the engine's post-flush bookkeeping. Shared by pointer, so reading it
     /// copies no names: the engine only asks whether a name is in the set.
     last_flush_indexes: ArcSwap<Vec<String>>,
-    /// Write barrier: writes hold shared (read), flush holds exclusive (write)
-    /// during the memtable swap. This ensures no writer is mid-put when the
-    /// active memtable is swapped, preventing writes to a stale memtable.
-    write_barrier: parking_lot::RwLock<()>,
     /// Counter of SSTable read errors during get_partition.
     pub sstable_read_errors: std::sync::atomic::AtomicU64,
+    /// Partitions a flush found changed in its frozen memtable after the
+    /// snapshot. The sealed write gate makes this impossible; non-zero means
+    /// admission is broken (see `TableStore::write`).
+    late_writes_after_seal: std::sync::atomic::AtomicU64,
     /// Counter of reads that exhausted the store-view retry bound while an
     /// SSTable was still failing to open. Non-zero in steady state means a
     /// genuinely corrupt/missing file (not a transient compaction swap) and a
@@ -1117,6 +1117,17 @@ fn new_memtable() -> Arc<dyn Memtable> {
 /// recording scopes for one index copies only that index's set.
 type VectorIndexScopes = HashMap<String, Arc<std::collections::HashSet<Vec<u8>>>>;
 
+/// How many sealed memtables one write may meet before it is refused. A
+/// flush publishes the next memtable before sealing the old one, so a retry
+/// normally finds an open gate at once; this many in a row means rotations
+/// are not completing.
+const MAX_SEALED_MEMTABLE_RETRIES: usize = 10_000;
+
+/// How long a flush waits for the writers inside a memtable it sealed. Those
+/// writes are in-memory puts; still inside after this, one is stuck and the
+/// flush fails loud rather than snapshot an incomplete memtable.
+const MEMTABLE_SEAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The memtable indexes of ONE active memtable, together with the catalog
 /// they were built from.
 ///
@@ -1129,7 +1140,15 @@ type VectorIndexScopes = HashMap<String, Arc<std::collections::HashSet<Vec<u8>>>
 /// name→index map, which is what reads use.
 pub(crate) struct MemtableIndexes {
     catalog: Arc<IndexCatalog>,
+    /// The schema the memtable's rows are put under: the one current when
+    /// the memtable was created, so an `ALTER` publishing a new schema at a
+    /// rotation never reaches a write still inside the old memtable.
+    schema: Arc<TableSchema>,
     by_name: HashMap<String, Arc<MemtableIndex>>,
+    /// Admission to the memtable. The flush that freezes it seals the gate
+    /// and waits for the writers inside, so its snapshot holds every row
+    /// written to it and no later write lands in it (see `TableStore::write`).
+    gate: crate::lockfree::WriteGate,
 }
 
 impl std::ops::Deref for MemtableIndexes {
@@ -1249,7 +1268,7 @@ fn vector_index_from_rows(
 
 /// Build a fresh empty `MemtableIndex` per secondary index `catalog`
 /// declares — cell, clustering (t_430c4188) and partition-key indexes alike.
-fn new_indexes(catalog: Arc<IndexCatalog>) -> Arc<MemtableIndexes> {
+fn new_indexes(catalog: Arc<IndexCatalog>, schema: Arc<TableSchema>) -> Arc<MemtableIndexes> {
     // EVERY declared index must appear here. A flush installs this map
     // wholesale, so a family of indexes omitted from it exists in the
     // declaration and nowhere else: `guard.indexes.get(name)` then returns
@@ -1261,7 +1280,12 @@ fn new_indexes(catalog: Arc<IndexCatalog>) -> Arc<MemtableIndexes> {
         .chain(catalog.indexed_partition_key_columns.iter())
         .map(|(name, _)| (name.clone(), Arc::new(MemtableIndex::new())))
         .collect();
-    Arc::new(MemtableIndexes { catalog, by_name })
+    Arc::new(MemtableIndexes {
+        catalog,
+        schema,
+        by_name,
+        gate: crate::lockfree::WriteGate::default(),
+    })
 }
 
 /// Default per-index types for a freshly-declared set of secondary indexes.
@@ -2085,9 +2109,11 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(Arc::new(IndexCatalog::with_indexed_columns(
-            indexed_columns,
-        )));
+        let schema = Arc::new(schema);
+        let indexes = new_indexes(
+            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
+            Arc::clone(&schema),
+        );
         let initial_view = StoreView {
             active,
             flushing: None,
@@ -2099,7 +2125,7 @@ impl<F: FlushTarget> TableStore<F> {
         };
         initial_view.check_invariants("new:empty");
         Self {
-            schema: ArcSwap::from_pointee(schema),
+            schema: ArcSwap::new(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
@@ -2116,8 +2142,8 @@ impl<F: FlushTarget> TableStore<F> {
             fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
                 "FTI sidecar builds in flight",
             )),
-            write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            late_writes_after_seal: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
             reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
                 crate::reader_pool::configured_reader_cache_cap(),
@@ -2248,9 +2274,11 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(Arc::new(IndexCatalog::with_indexed_columns(
-            indexed_columns,
-        )));
+        let schema = Arc::new(schema);
+        let indexes = new_indexes(
+            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
+            Arc::clone(&schema),
+        );
         let sidecar_count = initial_sstables.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -2303,7 +2331,7 @@ impl<F: FlushTarget> TableStore<F> {
         };
         initial_view.check_invariants("new_with_sstables");
         Self {
-            schema: ArcSwap::from_pointee(schema),
+            schema: ArcSwap::new(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
@@ -2320,8 +2348,8 @@ impl<F: FlushTarget> TableStore<F> {
             fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
                 "FTI sidecar builds in flight",
             )),
-            write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            late_writes_after_seal: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
             pool_table_key,
@@ -2348,9 +2376,11 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(Arc::new(IndexCatalog::with_indexed_columns(
-            indexed_columns,
-        )));
+        let schema = Arc::new(schema);
+        let indexes = new_indexes(
+            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
+            Arc::clone(&schema),
+        );
         let sstable_count = descriptors.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -2386,7 +2416,7 @@ impl<F: FlushTarget> TableStore<F> {
         };
         initial_view.check_invariants("new_with_descriptors");
         Self {
-            schema: ArcSwap::from_pointee(schema),
+            schema: ArcSwap::new(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
@@ -2403,8 +2433,8 @@ impl<F: FlushTarget> TableStore<F> {
             fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
                 "FTI sidecar builds in flight",
             )),
-            write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            late_writes_after_seal: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
             pool_table_key: String::new(),
@@ -2474,15 +2504,36 @@ impl<F: FlushTarget> TableStore<F> {
     /// `put`. After the memtable write, each declared secondary index is
     /// updated by extracting the indexed column value from the row cells.
     ///
-    /// The whole write — index postings and memtable put — runs inside the
-    /// shared write barrier against ONE loaded view, and posts under the
-    /// catalog bound to that view's memtable. The barrier is exclusive only
-    /// for a flush's memtable swap, so a write can never post into one
-    /// memtable's indexes and put its row into another, and never posts under
-    /// a catalog its memtable's flush will not write sidecars for.
+    /// The whole write — index postings and memtable put — runs against ONE
+    /// loaded view, admitted through that view's memtable gate, and posts
+    /// under the catalog and schema bound to that memtable. A flush publishes
+    /// the next memtable before it seals this one, and waits for the writers
+    /// inside before it snapshots, so a write never posts into one memtable's
+    /// indexes and puts its row into another, never lands in a frozen
+    /// memtable after its snapshot, and never posts under a catalog its
+    /// memtable's flush will not write sidecars for. A writer that meets a
+    /// sealed gate reloads the view and writes to the new memtable; no writer
+    /// ever waits for a flush.
     pub fn write(&self, key: &DecoratedKey, row: Row) -> Result<()> {
-        let _wb = self.write_barrier.read();
-        let guard = self.view.load();
+        for _ in 0..MAX_SEALED_MEMTABLE_RETRIES {
+            let guard = self.view.load();
+            if let Some(_admitted) = guard.indexes.gate.try_enter() {
+                return self.write_admitted(&guard, key, row);
+            }
+            // Sealed: a flush already published the next memtable.
+            std::thread::yield_now();
+        }
+        tracing::error!(
+            attempts = MAX_SEALED_MEMTABLE_RETRIES,
+            "store: every memtable this write loaded was already sealed; the write is refused"
+        );
+        Err(ferrosa_common::Error::InvalidData(format!(
+            "write refused: met a sealed memtable {MAX_SEALED_MEMTABLE_RETRIES} times in a row"
+        )))
+    }
+
+    /// [`Self::write`] once it holds an admission to `guard`'s memtable.
+    fn write_admitted(&self, guard: &StoreView, key: &DecoratedKey, row: Row) -> Result<()> {
         let catalog = Arc::clone(&guard.indexes.catalog);
 
         // Secondary index maintenance: extract indexed column values and insert
@@ -2643,11 +2694,10 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // The shared write barrier taken at the top is still held, so the
-        // flush cannot have swapped the active memtable since `guard` was
-        // loaded: the row lands in the memtable its postings were added for.
-        let schema = self.schema.load();
-        guard.active.put(key, row, &schema)
+        // The caller holds an admission to this memtable's gate, so the flush
+        // that freezes it has not snapshotted it yet: the row lands in the
+        // memtable its postings were added for, under that memtable's schema.
+        guard.active.put(key, row, &guard.indexes.schema)
     }
 
     /// Read a partition by merging all sources: active memtable, flushing
@@ -3725,11 +3775,11 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(FlushOutcome::NothingToFlush);
         }
 
-        // Step 1: Swap in a fresh active memtable, move old to flushing.
-        // Take the write barrier (exclusive) to ensure no writer is mid-put
-        // during the swap. This is the critical section: after the swap, all
-        // new writes go to the new active memtable, and the old memtable
-        // contains a complete snapshot.
+        // Step 1: Swap in a fresh active memtable, move old to flushing, then
+        // seal the old memtable's gate and wait for the writers already
+        // inside it. After that every new write goes to the new active
+        // memtable and the old one holds a complete, final snapshot. Writers
+        // never wait here: one that meets the sealed gate reloads the view.
         let new_active: Arc<dyn Memtable> = new_memtable();
         let phase_start = Instant::now();
         let (
@@ -3741,7 +3791,6 @@ impl<F: FlushTarget> TableStore<F> {
             flush_catalog,
             target_catalog,
         ) = {
-            let _wb = self.write_barrier.write(); // block all writers
             let old_view = self.view.load();
             // The schema and index catalog the frozen memtable's rows were
             // written under. The flush serializes them with these even if
@@ -3755,15 +3804,21 @@ impl<F: FlushTarget> TableStore<F> {
                 Some(edited) => Arc::new(edited),
                 None => Arc::clone(&flush_catalog),
             };
+            let mut target_schema = Arc::clone(&flush_schema);
             if let Some(new_schema) = new_schema {
                 target_catalog = Arc::new(target_catalog.remapped_onto(&flush_schema, &new_schema));
-                self.schema.store(Arc::new(new_schema));
+                target_schema = Arc::new(new_schema);
+                self.schema.store(Arc::clone(&target_schema));
             }
-            let fresh_indexes = new_indexes(Arc::clone(&target_catalog));
+            let fresh_indexes = new_indexes(Arc::clone(&target_catalog), target_schema);
             let fresh_vector_indexes = new_vector_indexes(&target_catalog.vector_index_configs);
             let old_active = Arc::clone(&old_view.active);
             let old_view_flushing = old_view.flushing.clone();
             let old_indexes = Arc::clone(&old_view.indexes);
+            debug_assert!(
+                !old_indexes.gate.is_sealed(),
+                "the active memtable's gate is sealed before its flush"
+            );
             let old_vector_indexes = Arc::clone(&old_view.vector_indexes);
             let current_sstables = Arc::clone(&old_view.sstables);
             let current_ids = Arc::clone(&old_view.sstable_ids);
@@ -3781,7 +3836,9 @@ impl<F: FlushTarget> TableStore<F> {
             };
             new_view.check_invariants("flush:swap_active");
             self.view.store(Arc::new(new_view));
-            // Write barrier released here — writers resume with the new active.
+            // Writers that load the view from here on write to the new
+            // memtable; seal the old one and wait out the writes inside it.
+            old_indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE)?;
             (
                 old_active,
                 old_view_flushing,
@@ -4344,10 +4401,17 @@ impl<F: FlushTarget> TableStore<F> {
                 partitions.iter().map(|p| (p.key.clone(), p)).collect();
             for p in &late_partitions {
                 if late_partition_needs_replay(&flushed_by_key, p) {
-                    // Late write into either a brand-new partition or an existing
-                    // partition that changed after the flush snapshot. Replay the
-                    // current partition image into the new active memtable so the
-                    // post-swap view retains those rows.
+                    // The sealed gate makes this impossible: a write after the
+                    // snapshot means admission is broken. Keep the rows (replay
+                    // them into the new memtable), and say so loudly — their
+                    // index postings are NOT carried over.
+                    self.late_writes_after_seal
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        partition = ?p.key,
+                        "flush: a row reached a sealed memtable after its snapshot; replaying \
+                         it without its index postings"
+                    );
                     for row in &p.rows {
                         if let Err(e) = current_view.active.put(&p.key, row.clone(), &schema) {
                             tracing::error!(%e, "flush: late-writer replay put failed");
@@ -4388,9 +4452,8 @@ impl<F: FlushTarget> TableStore<F> {
         new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
 
         // Once the SSTable reader is installed, the flushed memtable must leave
-        // the live view. Writers cannot be racing against `old_active`: Store::write
-        // takes `write_barrier.read()` and loads the active view inside that guard,
-        // while the flush swap above takes `write_barrier.write()`. Keeping
+        // the live view. Writers cannot be racing against `old_active`: its
+        // gate was sealed and drained before the snapshot. Keeping
         // `old_active` in `flushing` after a successful flush makes subsequent
         // flushes re-ingest already-flushed rows and can cascade wide-partition
         // snapshots under aggressive concurrent flush loops.
@@ -4557,6 +4620,13 @@ impl<F: FlushTarget> TableStore<F> {
             let current_view = self.view.load();
             for p in &late_partitions {
                 if late_partition_needs_replay(&flushed_by_key, p) {
+                    // Impossible behind the sealed gate; see the unsharded path.
+                    self.late_writes_after_seal
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        partition = ?p.key,
+                        "flush: a row reached a sealed memtable after its snapshot; replaying it"
+                    );
                     for row in &p.rows {
                         if let Err(e) = current_view.active.put(&p.key, row.clone(), &schema) {
                             tracing::error!(%e, "flush(sharded): late-writer replay put failed");
@@ -8152,12 +8222,17 @@ impl<F: FlushTarget> TableStore<F> {
             flushing: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
-            indexes: new_indexes(Arc::clone(&catalog)),
+            indexes: new_indexes(Arc::clone(&catalog), self.schema.load_full()),
             sidecar_indexes: Arc::new(vec![]),
             vector_indexes: new_vector_indexes(&catalog.vector_index_configs),
         };
         new_view.check_invariants("truncate");
-        self.view.store(Arc::new(new_view));
+        let old_view = self.view.swap(Arc::new(new_view));
+        // A writer that loaded the old view must not land in the discarded
+        // memtable after this returns: seal it, so such a writer reloads.
+        if let Err(e) = old_view.indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE) {
+            tracing::error!(%e, "truncate: writes still inside the discarded memtable");
+        }
     }
 
     /// Atomically replace input SSTables with a compacted output SSTable.
@@ -8898,6 +8973,70 @@ mod tests {
         let mut live: Vec<&str> = view.indexes.keys().map(String::as_str).collect();
         live.sort_unstable();
         assert_eq!(live, ["idx_main", "idx_tmp"]);
+    }
+
+    /// `write_barrier` (an `RwLock` every write took shared and every flush
+    /// took exclusive) is gone: a flush seals the frozen memtable's gate
+    /// instead, and writers that meet it move to the new memtable. The
+    /// invariant the barrier protected: no write lands in a memtable after
+    /// its flush snapshot. Race writers against back-to-back flushes; the
+    /// flush counts any partition that changed after its snapshot, and every
+    /// row must be readable through the index afterwards (t_d938e6ae).
+    #[test]
+    fn no_write_lands_in_a_sealed_memtable() {
+        const WRITERS: usize = 4;
+        const ROWS_PER_WRITER: usize = 1_500;
+        let store = Arc::new(test_store());
+        let _rotation: FlushOutcome = store
+            .add_index("idx_main".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let writers_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let store = Arc::clone(&store);
+                let done = Arc::clone(&writers_done);
+                std::thread::spawn(move || {
+                    (0..ROWS_PER_WRITER).for_each(|i| {
+                        store
+                            .write(&make_key(&format!("w{w}-{i:05}")), make_row(b"v", 1000))
+                            .unwrap();
+                    });
+                    done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+            .collect();
+        let flushes = {
+            let store = Arc::clone(&store);
+            let done = Arc::clone(&writers_done);
+            std::thread::spawn(move || {
+                let mut flushes = 0_usize;
+                while done.load(std::sync::atomic::Ordering::SeqCst) < WRITERS {
+                    store.flush().unwrap();
+                    flushes += 1;
+                    assert!(flushes < 1_000_000, "writers never finished");
+                }
+                flushes
+            })
+        };
+        writers
+            .into_iter()
+            .for_each(|writer| writer.join().unwrap());
+        let flushes = flushes.join().unwrap();
+        store.flush().unwrap();
+
+        assert!(
+            flushes > 1,
+            "the test must race flushes against the writers"
+        );
+        assert_eq!(
+            store
+                .late_writes_after_seal
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a write landed in a memtable after its flush snapshot"
+        );
+        let rows = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec())).unwrap();
+        assert_eq!(rows.len(), WRITERS * ROWS_PER_WRITER, "a write was lost");
     }
 
     /// `vector_index_scopes` was a `Mutex<HashMap>`; recording scopes from

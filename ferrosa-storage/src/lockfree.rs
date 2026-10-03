@@ -117,6 +117,92 @@ impl SharedSet {
     }
 }
 
+/// Admission of writers to one memtable, which a flush seals.
+///
+/// One atomic word: the top bit says sealed, the rest count the writers
+/// inside. A writer enters with one `fetch_add` and backs out if the word it
+/// replaced was sealed; a flush seals with one `fetch_or` and then waits for
+/// the count to reach zero. Both act on the same word, so every writer either
+/// entered before the seal (and the flush waits for it) or sees the seal and
+/// writes elsewhere. Writers never wait; only the sealing flush does, and only
+/// for writes already in progress.
+#[derive(Debug, Default)]
+pub(crate) struct WriteGate {
+    state: std::sync::atomic::AtomicU64,
+}
+
+const SEALED: u64 = 1 << 63;
+
+/// One writer's admission through a [`WriteGate`]; leaving drops it.
+#[must_use = "the writer is admitted only while the ticket is held"]
+pub(crate) struct GateTicket<'a>(&'a WriteGate);
+
+impl Drop for GateTicket<'_> {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl WriteGate {
+    /// Admit a writer, or `None` once the gate is sealed.
+    pub(crate) fn try_enter(&self) -> Option<GateTicket<'_>> {
+        let before = self.state.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if before & SEALED != 0 {
+            self.state
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            return None;
+        }
+        Some(GateTicket(self))
+    }
+
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) & SEALED != 0
+    }
+
+    /// Seal the gate and wait for the writers already inside to leave.
+    ///
+    /// # Errors
+    ///
+    /// Fails after `deadline` with writers still inside. The gate stays
+    /// sealed: no new writer enters, and the caller must not treat the
+    /// memtable as complete.
+    pub(crate) fn seal_and_drain(
+        &self,
+        deadline: std::time::Duration,
+    ) -> ferrosa_common::Result<()> {
+        self.state
+            .fetch_or(SEALED, std::sync::atomic::Ordering::AcqRel);
+        let start = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_micros(1);
+        loop {
+            let inside = self.state.load(std::sync::atomic::Ordering::Acquire) & !SEALED;
+            if inside == 0 {
+                return Ok(());
+            }
+            if start.elapsed() >= deadline {
+                tracing::error!(
+                    inside,
+                    waited_ms = start.elapsed().as_millis() as u64,
+                    "memtable seal: writers still inside after the deadline"
+                );
+                return Err(ferrosa_common::Error::InvalidData(format!(
+                    "{inside} writers were still inside a sealed memtable after {deadline:?}"
+                )));
+            }
+            // A writer inside is mid-put on an in-memory memtable: spin
+            // briefly, then back off so a descheduled writer gets a core.
+            if pause < std::time::Duration::from_micros(64) {
+                std::hint::spin_loop();
+            } else {
+                std::thread::sleep(pause.min(std::time::Duration::from_millis(1)));
+            }
+            pause = pause.saturating_mul(2);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +242,40 @@ mod tests {
             handle.join().unwrap();
         }
         assert_eq!(**cell.load(), THREADS * PER_THREAD);
+    }
+
+    #[test]
+    fn a_sealed_gate_admits_no_writer_and_waits_for_those_inside() {
+        let gate = Arc::new(WriteGate::default());
+        let inside = gate.try_enter().expect("an open gate admits a writer");
+        let sealer = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || gate.seal_and_drain(std::time::Duration::from_secs(5)))
+        };
+        // The sealer must still be waiting for the writer inside.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(gate.is_sealed());
+        assert!(
+            !sealer.is_finished(),
+            "the seal returned with a writer inside"
+        );
+        assert!(
+            gate.try_enter().is_none(),
+            "a sealed gate admitted a writer"
+        );
+        drop(inside);
+        sealer.join().unwrap().unwrap();
+        assert!(gate.try_enter().is_none());
+    }
+
+    #[test]
+    fn a_seal_that_cannot_drain_fails_loud() {
+        let gate = WriteGate::default();
+        let _stuck = gate.try_enter().unwrap();
+        let error = gate
+            .seal_and_drain(std::time::Duration::from_millis(20))
+            .unwrap_err();
+        assert!(error.to_string().contains("still inside"), "{error}");
     }
 
     /// The quarantine sets were `RwLock<HashSet>`; their replacement must not
