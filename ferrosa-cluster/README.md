@@ -309,7 +309,7 @@ early acknowledgement.
   fetch/apply chunks; deterministic single-initiator selection (no thundering
   herd); timestamp ties surfaced, never auto-resolved (Aphyr-safe).
 - Every path that moves a partition between nodes carries the whole partition:
-  rows, static row and partition deletion (P0-3, CL-33). Row streaming encodes
+  rows, static row and partition deletion (P0-3, CL-43). Row streaming encodes
   through `StreamedMutation::from_partition` (legacy `Vec<RowWire>` bytes when
   there is nothing else, otherwise the versioned envelope old nodes refuse
   with a decode error); repair apply, `RepairApplyHandler`, the stream receiver
