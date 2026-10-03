@@ -453,6 +453,19 @@ impl AccordStateMachine {
             }
         }
 
+        // A transaction this replica already finalized (a no-write finalize can
+        // land before a delayed PreAccept, CL-20/CL-23) must not be registered
+        // again: nothing would finalize it a second time, so it would block
+        // every read and snapshot barrier on its keys. Abstain, as on a persist
+        // failure.
+        if self.apply_engine.is_applied(&txn_id) {
+            tracing::warn!(
+                txn_id = ?txn_id,
+                "accord: refusing PreAccept for a transaction already finalized on this replica"
+            );
+            return SmResponse::None;
+        }
+
         // Check before registering this transaction, so an aborted stale
         // snapshot never becomes a dependency that can block subsequent reads.
         if let Some(snapshot_ts) = snapshot_ts {
@@ -1447,6 +1460,39 @@ mod tests {
             "an absent dependency finalized as no-write must release dependent writes"
         );
         assert_eq!(capturing.captured(), [(waiting_txn, mutation, ts(1002))]);
+    }
+
+    /// FMEA CL-20 / CL-23: a doomed transaction is finalized as a no-write on
+    /// every replica at once (#470), while its PreAccept to a paused replica is
+    /// still in flight. If that replica processes the finalize FIRST (it had no
+    /// state for the txn, so the finalize only records it applied) and the
+    /// PreAccept AFTER, the PreAccept must not register the finalized txn as a
+    /// pending conflict: nothing would ever finalize it again, and every read
+    /// and PostgreSQL snapshot barrier on its keys would dep-wait and abstain.
+    /// The coordinator's background re-finalize only covers a late PreAccept
+    /// whose OK it receives; one that lands after its RPC timed out is never
+    /// re-finalized.
+    #[test]
+    fn a_preaccept_after_its_no_write_finalize_does_not_register_a_conflict() {
+        let mut sm = AccordStateMachine::new(1, Arc::new(MockSyncWriter::new()));
+        let doomed = txn(2, 1000);
+
+        assert!(matches!(
+            sm.handle_apply_writeset(doomed, Vec::new()),
+            SmResponse::NoWriteFinalized
+        ));
+        let late = sm.handle_preaccept(doomed, ts(1000), b"key", BallotNumber(0), 0);
+
+        assert!(
+            sm.unapplied_conflicts_before(b"key", &ts(u64::MAX / 2))
+                .is_empty(),
+            "a PreAccept that arrives after its txn was finalized registered it as a \
+             pending conflict forever (response: {late:?})"
+        );
+        assert!(
+            !matches!(late, SmResponse::PreAcceptOK { .. }),
+            "a finalized txn must not be PreAccepted again: {late:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
