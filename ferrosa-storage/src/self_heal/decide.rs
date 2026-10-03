@@ -30,6 +30,9 @@ pub enum Action {
         table: TableKey,
         generations: Vec<u64>,
     },
+    /// Rebuild the table's invalid vector-index generations from their rows
+    /// (local, nothing is moved or lost; no replica posture needed).
+    RebuildVectorIndexes { table: TableKey },
     /// The issue cannot be remediated safely or has exhausted its attempts.
     /// The controller logs a loud ERROR, marks health = degraded, and stops
     /// retrying this issue. Covers FMEA #1 (no healthy replica) and FMEA #5
@@ -90,6 +93,9 @@ fn action_for(issue: &TableIssue) -> Option<Action> {
                 generations,
             })
         }
+        IssueKind::InvalidVectorIndex => Some(Action::RebuildVectorIndexes {
+            table: issue.table.clone(),
+        }),
         // Drain (bloat) and converge (divergence) are explicit follow-ups.
         // The fold already routes them here; returning None means "no action
         // wired yet" so the controller stays inert for them in this slice.

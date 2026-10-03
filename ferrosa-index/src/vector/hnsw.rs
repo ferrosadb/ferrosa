@@ -440,6 +440,54 @@ pub fn search_from_bytes(
     reader.nearest(query, k, ef_search)
 }
 
+/// What a serialized HNSW sidecar holds, as [`inspect_bytes`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswSidecarStats {
+    /// Vectors (graph nodes) in the sidecar.
+    pub vectors: usize,
+    /// Their common dimension; `None` for an empty sidecar.
+    pub dimension: Option<usize>,
+}
+
+/// Decode a vector sidecar written by [`build_and_serialize`] and check it
+/// is internally consistent, without searching it.
+///
+/// # Errors
+///
+/// `IndexError::Format` if the bytes do not decode, if the node, position
+/// and layer tables disagree in length, if the entry point or a neighbour is
+/// out of range, or if two vectors differ in dimension.
+pub fn inspect_bytes(bytes: &[u8]) -> Result<HnswSidecarStats, IndexError> {
+    let data: HnswGraphData = serde_json::from_slice(bytes)
+        .map_err(|e| IndexError::Format(format!("HNSW deserialize failed: {e}")))?;
+    let nodes = data.vectors.len();
+    let malformed = |what: &str| IndexError::Format(format!("HNSW sidecar is malformed: {what}"));
+    if data.positions.len() != nodes {
+        return Err(malformed("positions and vectors differ in length"));
+    }
+    if data.entry_point.is_some_and(|entry| entry >= nodes)
+        || (nodes > 0) != data.entry_point.is_some()
+    {
+        return Err(malformed("entry point does not match the nodes"));
+    }
+    for layer in &data.layers {
+        if layer.len() != nodes {
+            return Err(malformed("a layer does not cover every node"));
+        }
+        if layer.iter().flatten().any(|&neighbour| neighbour >= nodes) {
+            return Err(malformed("a neighbour is out of range"));
+        }
+    }
+    let dimension = data.vectors.first().map(Vec::len);
+    if data.vectors.iter().any(|v| Some(v.len()) != dimension) {
+        return Err(malformed("vectors differ in dimension"));
+    }
+    Ok(HnswSidecarStats {
+        vectors: nodes,
+        dimension,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // HnswReader
 // ---------------------------------------------------------------------------
@@ -551,6 +599,38 @@ mod tests {
 
     fn make_vector_cell(v: &[f32]) -> CellValue {
         CellValue::live(vec_f32_to_bytes(v), 1)
+    }
+
+    #[test]
+    fn inspect_reports_count_and_dimension_and_refuses_damage() {
+        let entries: Vec<(RowPosition, Vec<f32>)> = (0..20)
+            .map(|i| (RowPosition::new(i), vec![i as f32, 1.0, 2.0]))
+            .collect();
+        let bytes = build_and_serialize(8, 50, DistanceMetric::L2, entries).unwrap();
+        assert_eq!(
+            inspect_bytes(&bytes).unwrap(),
+            HnswSidecarStats {
+                vectors: 20,
+                dimension: Some(3)
+            }
+        );
+        assert!(
+            inspect_bytes(&bytes[..bytes.len() / 2]).is_err(),
+            "truncated"
+        );
+        let empty = build_and_serialize(8, 50, DistanceMetric::L2, Vec::new()).unwrap();
+        assert_eq!(inspect_bytes(&empty).unwrap().vectors, 0);
+        let mixed = build_and_serialize(
+            8,
+            50,
+            DistanceMetric::L2,
+            vec![
+                (RowPosition::new(0), vec![1.0, 2.0]),
+                (RowPosition::new(1), vec![1.0, 2.0, 3.0]),
+            ],
+        )
+        .unwrap();
+        assert!(inspect_bytes(&mixed).is_err(), "mixed dimensions");
     }
 
     #[test]

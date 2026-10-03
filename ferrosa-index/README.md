@@ -56,6 +56,10 @@ vector search has a different query shape and result/capability model):
 
 - **HNSW** (`vector::hnsw`) — Hierarchical Navigable Small World graph for ANN;
   serialized to JSON on disk, loaded whole into memory on open.
+  `inspect_bytes` decodes a serialized sidecar and checks it is internally
+  consistent (tables agree, neighbours in range, one dimension), reporting its
+  vector count and dimension without searching it; storage's vector-index
+  self-heal uses it to find corrupt sidecars.
 - **IVFFlat** (`vector::ivfflat`) — k-means inverted-file + flat rerank; JSON on
   disk, simpler/cheaper build than HNSW, accuracy tuned by `probes`.
 - **Quantized** (`vector::quantized`) — page-addressable `.qvec` artifacts:

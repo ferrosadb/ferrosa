@@ -26,6 +26,9 @@ pub enum ActionOutcome {
     /// The action could not be performed safely or hit an error. The issue
     /// is escalated: health = degraded, files left in place.
     Escalated { table: TableKey, reason: String },
+    /// Rebuilds of `indexes` of the table's vector indexes were started; the
+    /// next ticks verify they cleared.
+    VectorRebuildStarted { table: TableKey, indexes: usize },
 }
 
 /// Resolve the on-disk table directory for an action. Injected so unit tests
@@ -147,6 +150,19 @@ pub fn execute_action(
             ActionOutcome::Quarantined {
                 table,
                 generations: moved,
+            }
+        }
+        // Executed by the controller, which holds the engine; reaching here
+        // means a caller bypassed it. Refuse loudly rather than drop it.
+        Action::RebuildVectorIndexes { table } => {
+            tracing::error!(
+                keyspace = %table.keyspace,
+                table = %table.table,
+                "self-heal: a vector rebuild reached execute_action, which cannot run it"
+            );
+            ActionOutcome::Escalated {
+                table,
+                reason: "vector rebuild dispatched to the wrong executor".to_string(),
             }
         }
         Action::Escalate { table, reason, .. } => {

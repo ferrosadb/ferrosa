@@ -104,12 +104,17 @@ pub struct TableSchema {
 pub fn vector_dimension(type_name: &str) -> Option<usize> {
     let trimmed = type_name.trim();
 
-    // Marshal form: `[org.apache.cassandra.db.marshal.]VectorType(<elem>,<dim>)`.
-    // Matched before lowercasing so the element type keeps its own case.
-    let marshal = trimmed
-        .rsplit_once('.')
-        .map(|(_, tail)| tail)
-        .unwrap_or(trimmed);
+    // Marshal form: `[org.apache.cassandra.db.marshal.]VectorType(<elem>,<dim>)`,
+    // where `<elem>` may itself be fully qualified. The class prefix is
+    // stripped up to `VectorType(`, never at the last `.`: that dot can sit
+    // inside the arguments (t_ad6d3122). Matched before lowercasing so the
+    // element type keeps its own case.
+    let marshal = match trimmed.find("VectorType(") {
+        Some(start) if trimmed[..start].is_empty() || trimmed[..start].ends_with('.') => {
+            &trimmed[start..]
+        }
+        _ => trimmed,
+    };
     if let Some(args) = marshal
         .strip_prefix("VectorType(")
         .and_then(|rest| rest.strip_suffix(')'))
@@ -442,6 +447,10 @@ mod tests {
             "org.apache.cassandra.db.marshal.VectorType(FloatType,3)",
             "org.apache.cassandra.db.marshal.VectorType(FloatType, 3)",
             "VectorType(FloatType,3)",
+            // Cassandra's own spelling qualifies the element class too; the
+            // last `.` then sits inside the arguments (t_ad6d3122).
+            "org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FloatType,3)",
+            "VectorType(org.apache.cassandra.db.marshal.FloatType, 3)",
         ] {
             assert_eq!(
                 vector_dimension(spelling),

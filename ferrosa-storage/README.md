@@ -552,6 +552,18 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   their HNSW/HVQ method from the persisted options. It returns `Ok(false)`, with
   a log line saying why, for a non-scalar index on a key column or a vector
   target whose declared type carries no dimension.
+  Registering a vector index also rebuilds its set of partition scopes from
+  the scoped sidecar files of live generations, so `ann_search_partitions`
+  (CQL `ORDER BY .. ANN OF`) still finds flushed vectors after a restart; a
+  sidecar that cannot be listed, decoded or searched is an error, never a
+  shorter answer, and DROP INDEX deletes the index's vector sidecars (ST-71).
+  Compaction writes its output's scoped vector sidecars before the swap, and
+  every generation's scoped sidecars end with a manifest; a live generation
+  without a matching one (compacted before this, flushed before manifests,
+  or a crashed build) makes ANN over the index refuse with retryable
+  backpressure until the background vector repair rebuilds it from its rows,
+  a partition at a time. Registration starts that repair, so existing data is
+  re-indexed on the first start with no operator action (ST-72).
   A global index read (`read_by_index_each`) of an index the table does not
   declare returns an error naming the index, never zero rows: the planner
   chooses indexes from the CQL schema, so a consult of an undeclared index
@@ -686,7 +698,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Quarantine + self-heal** (`quarantine.rs`, `self_heal/`) — malformed rows
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
-  quarantines them under a safety rail.
+  quarantines them under a safety rail. It also checks every vector index each
+  tick (`IssueKind::InvalidVectorIndex`, ST-73): a generation with missing
+  sidecars, a sidecar that does not decode, a vector/scope count that
+  disagrees with the manifest, a dimension that disagrees with the column, or
+  a scope set that disagrees with the sidecars on disk. An invalid generation
+  is rebuilt from its rows (`Action::RebuildVectorIndexes`), at most
+  `FERROSA_VECTOR_REPAIR_CONCURRENCY` (default 1) rebuilds at once; ANN over
+  the index refuses (retryable) meanwhile, `/readyz` stays ready with
+  `degraded_recall`, and `ferrosa_index_repairs_total{index,reason}` /
+  `ferrosa_index_invalid{table,index}` report it.
 - **Replay without a schema degrades instead of exiting** (`replay_set_aside.rs`,
   FMEA ST-52) — when no `schema.json`/`storage-schema.json` is usable, replay
   buffers up to `FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA` mutations in memory
