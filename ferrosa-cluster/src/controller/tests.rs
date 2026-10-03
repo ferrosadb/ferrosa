@@ -4512,6 +4512,43 @@ async fn downgrade_to_pair_succeeds_after_a_node_is_brought_down() {
     );
 }
 
+/// Shortcut: the node is not a cluster member. A node already in Pair would
+/// tear down and reinstall a live pair coordinator; a Standalone node has no
+/// cluster to leave. Both are refused with the node untouched, even when every
+/// other precondition holds. (Folded in from review/membership-invariants.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_unless_the_node_is_a_cluster_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let peer = Uuid::new_v4();
+    install_downgrade_ring(&controller, peer, &[Uuid::new_v4()]);
+    connect(&controller, peer);
+
+    controller.set_mode_for_test(DeploymentMode::Pair);
+    let err = controller
+        .downgrade_to_pair(Some(peer))
+        .await
+        .expect_err("a node already in pair mode must be refused");
+    assert!(err.to_string().contains("not a cluster member"), "{err}");
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "the node is unchanged"
+    );
+
+    controller.set_mode_for_test(DeploymentMode::Standalone);
+    let err = controller
+        .downgrade_to_pair(Some(peer))
+        .await
+        .expect_err("a standalone node must be refused");
+    assert!(err.to_string().contains("not a cluster member"), "{err}");
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Standalone,
+        "the node is unchanged"
+    );
+}
+
 /// Shortcut: no peer named. The old action paired with
 /// `connected_peers.first()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

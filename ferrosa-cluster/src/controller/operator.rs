@@ -58,7 +58,8 @@ impl ModeController {
     /// 3. this node stops its Raft group(s) BEFORE it installs the pair path,
     ///    so it is never a voter committing beside a pair write path (P0-5).
     ///
-    /// Every shortcut is refused loudly, leaving the node untouched: no named
+    /// Every shortcut is refused loudly, leaving the node untouched: the node is
+    /// not a `Cluster` member (already `Pair`, or `Standalone`); no named
     /// peer (the old action used `connected_peers.first()`); no committed ring
     /// to check; a named peer outside the ring or not connected; no member
     /// down; any other member still up; the T-300 jsonb guard; no peer manager.
@@ -76,6 +77,13 @@ impl ModeController {
                     .into(),
             );
         };
+        let current = **self.mode.load();
+        if current != DeploymentMode::Cluster {
+            return refuse(format!(
+                "downgrade to pair refused: this node is not a cluster member (mode is \
+                 {current}); the node is unchanged"
+            ));
+        }
         let Some(ring) = self.token_ring() else {
             return refuse(
                 "downgrade to pair refused: no committed token ring, so this node \
@@ -143,6 +151,20 @@ impl ModeController {
             // Hold `transition_guard` across the transition so the mode cannot
             // move underneath the check-and-install in `transition_to_pair`.
             let _guard = self.transition_guard.lock();
+            // Raft was stopped outside the guard (an await); re-check that
+            // nothing moved this node out of Cluster meanwhile.
+            let now = **self.mode.load();
+            if now != DeploymentMode::Cluster {
+                tracing::error!(
+                    %now,
+                    "OPERATOR ACTION FAILED: Raft was stopped to downgrade but the mode \
+                     changed underneath it; not installing the pair path"
+                );
+                return Err(ClusterError::ModeTransitionRejected(format!(
+                    "Raft was stopped but the mode changed to {now} before the pair \
+                     transition; restart the node to rejoin the cluster"
+                )));
+            }
             self.transition_to_pair_operator_override(peer_host_id, peer_addr);
         }
         if **self.mode.load() != DeploymentMode::Pair {
