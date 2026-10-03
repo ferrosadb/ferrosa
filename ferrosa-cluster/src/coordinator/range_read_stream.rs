@@ -2086,10 +2086,13 @@ impl ClusterCoordinator {
             clustering: Some(cursor.clustering_key.clone()),
         });
         let mut sources: Vec<ClusterPartitionStream> = Vec::with_capacity(remotes.len() + 1);
-        sources.push(Box::pin(
-            self.storage
-                .read_by_index_stream_after(table_id, index_name, index_key, after.cloned())
-                .map(|item| item.map_err(ClusterError::Storage)),
+        sources.push(bounded_local_index_source(
+            Box::pin(
+                self.storage
+                    .read_by_index_stream_after(table_id, index_name, index_key, after.cloned())
+                    .map(|item| item.map_err(ClusterError::Storage)),
+            ),
+            merge_source_fragment_timeout(),
         ));
 
         let index_key_bytes = index_key.0.as_slice();
@@ -2436,6 +2439,44 @@ fn index_hit_position(partition: &Partition) -> (&[u8], &[u8]) {
 /// the previous row, so no set of rows seen is kept: memory is one head per
 /// node plus the previous row's key. A node's error ends the merged stream
 /// with that error — its undelivered rows are never passed off as absent.
+/// Bound each row pull from the LOCAL engine index walk by the merge-source
+/// budget ([`merge_source_fragment_timeout`], 30 s).
+///
+/// `merge_index_streams_in_row_order` awaits its sources in order. Remote
+/// sources carry the idle watchdog and the no-data deadline; the local walk
+/// carried nothing, so a walk blocked behind its own node's tables lock parked
+/// the merge and every remote route behind it. A source that produces no row
+/// within the budget now yields one loud error and ends.
+///
+/// Only the local source is wrapped: a remote whose walk is slow but
+/// progressing (an R2 rehydrate) keeps its stream open through progress-gated
+/// heartbeats, and a per-row bound on it would undo that.
+fn bounded_local_index_source(
+    source: ClusterPartitionStream,
+    budget: Duration,
+) -> ClusterPartitionStream {
+    Box::pin(futures::stream::unfold(
+        Some(source),
+        move |state| async move {
+            let mut source = state?;
+            match tokio::time::timeout(budget, source.next()).await {
+                Ok(Some(item)) => Some((item, Some(source))),
+                Ok(None) => None,
+                // Dropping `source` here releases the walker behind it.
+                Err(_elapsed) => Some((
+                    Err(ClusterError::Internal(format!(
+                        "streaming index read: the local index walk produced no row within \
+                         {}ms; failing loudly rather than waiting forever (a silent local \
+                         source must not stall the merge or the remote routes behind it)",
+                        budget.as_millis()
+                    ))),
+                    None,
+                )),
+            }
+        },
+    ))
+}
+
 pub(crate) fn merge_index_streams_in_row_order(
     sources: Vec<ClusterPartitionStream>,
 ) -> ClusterPartitionStream {
@@ -2695,6 +2736,59 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "DDL still blocked: the local index walker kept tables.read() after the merge failed"
         );
+    }
+
+    /// INVARIANT: a silent LOCAL index source cannot wedge the index merge.
+    /// The merge awaits sources in order and the local engine walk has no idle
+    /// watchdog of its own (remotes have the watchdog and the no-data
+    /// deadline), so a walk blocked on its own node's tables lock parked the
+    /// merge -- and every remote route behind it -- forever. The same hazard
+    /// 1cfedfb2 closed for `FragmentCursor`.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_local_index_source_fails_the_merge_loudly() {
+        let silent_local: ClusterPartitionStream = bounded_local_index_source(
+            Box::pin(futures::stream::pending()),
+            DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT,
+        );
+        let ready_remote = replica(vec![index_hit(b"a", b"1"), index_hit(b"b", b"1")]);
+        let mut merged = merge_index_streams_in_row_order(vec![silent_local, ready_remote]);
+
+        let first = tokio::time::timeout(
+            DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT + Duration::from_secs(5),
+            merged.next(),
+        )
+        .await
+        .expect("a silent local source wedged the index merge");
+        let err = first
+            .expect("the merge must report the stall")
+            .expect_err("a silent local source must be an error, not a short result");
+        assert!(
+            err.to_string().contains("produced no row"),
+            "the error must name the condition: {err}"
+        );
+    }
+
+    /// Control: a slow but live local source is not killed by the bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_local_index_source_is_not_killed() {
+        let slow = futures::stream::unfold(0u8, |n| async move {
+            if n == 3 {
+                return None;
+            }
+            tokio::time::sleep(DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT / 2).await;
+            Some((index_hit(&[b'a' + n], b"1"), n + 1))
+        });
+        // Explicit budget: the process-wide test override is shared with
+        // concurrently running tests.
+        let local =
+            bounded_local_index_source(Box::pin(slow), DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT);
+        let mut merged = merge_index_streams_in_row_order(vec![local, replica(vec![])]);
+        let mut rows = 0;
+        while let Some(item) = merged.next().await {
+            item.expect("a slow but live source must not be errored");
+            rows += 1;
+        }
+        assert_eq!(rows, 3);
     }
 
     /// Control: a stream that delivers data keeps going past the no-data
