@@ -2147,10 +2147,13 @@ mod tests {
         assert_eq!(partition_from_wire(wire), original);
     }
 
-    /// The borrowed serializer (range-read stream, chunked repair Apply) must
-    /// emit the same bytes as the owned path for complex cells too. It used to
-    /// skip the path without a word, so a receiver got each list element as a
-    /// LIVE path-less cell: exactly the cell the SSTable writer rejects.
+    /// The borrowed serializer must emit the same bytes as the owned path for
+    /// complex cells too. It used to skip the path without a word, which would
+    /// hand a receiver each list element as a LIVE path-less cell. Its only
+    /// caller today is `stream_range_response`, which only tests reach
+    /// (production range streaming uses `partition_to_wire`), so this was not
+    /// the source of the 2026-10-03 writer refusals; the defect is real all
+    /// the same.
     #[test]
     fn borrowed_serializer_carries_complex_cell_paths() {
         let original = make_complex_partition(b"pA");
