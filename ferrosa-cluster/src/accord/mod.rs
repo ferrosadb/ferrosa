@@ -18,6 +18,7 @@ pub mod durability;
 pub mod electorate;
 pub mod epoch;
 pub mod epoch_drain;
+pub mod finalized;
 /// RPC handlers for inbound Accord consensus messages.
 pub mod handlers;
 mod jepsen_bank;
