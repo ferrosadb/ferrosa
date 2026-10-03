@@ -592,9 +592,11 @@ pub struct ScanSlot {
     /// The bulk-I/O permit (B2 T2.1) this scan holds for its producing lifetime,
     /// bounding concurrent bulk I/O on the `Lane::Bulk` reservation. Held only
     /// for its `Drop` (returned when the scan ends, panics, or is cancelled).
-    /// `None` only inside [`park`](Self::park).
+    /// `None` only inside [`park`](Self::park) and `tick`'s re-compete: every
+    /// path that can give up the CPU slot gives this up too, so permits are
+    /// only ever held by slot holders.
     _io_permit: Option<io_permits::IoPermit>,
-    /// Where [`park`](Self::park) re-acquires the permit.
+    /// Where [`park`](Self::park) and `tick` re-acquire the permit.
     io_permits: io_permits::IoPermits,
     finished: bool,
 }
@@ -636,7 +638,19 @@ impl ScanSlot {
             // still advances the clock.
             let service = self.window_micros.max(1);
             self.window_micros = 0;
+            // The re-compete may hand the CPU slot to a waiter and block until
+            // it comes back, so the I/O permit goes back with it, as in `park`.
+            // A scan waiting for the slot while holding its permit deadlocks
+            // against the scan it yielded to: that one is admitted to the slot
+            // and then waits, holding it, for the permit. On a 1-slot pool
+            // (a 2-core node) neither ever runs again.
+            drop(self._io_permit.take());
             self.admit.reschedule(&self.handle, self.id, service);
+            let io_permits = self.io_permits.clone();
+            self._io_permit = Some(
+                self.handle
+                    .block_on(async move { io_permits.acquire().await }),
+            );
         }
         self.last_tick = Instant::now();
     }
@@ -1073,6 +1087,126 @@ mod tests {
         if let Err(join_error) = outcome {
             std::panic::resume_unwind(join_error.into_panic());
         }
+    }
+
+    /// A scan parked inside `park` holds neither its CPU slot nor its I/O
+    /// permit, so a second scan runs to completion meanwhile; the parked scan
+    /// then gets both back. Capacity 1 (one slot, one I/O permit) makes the
+    /// hold-and-wait shape deterministic: the parked scan waits for the second
+    /// scan to FINISH, which needs that slot and that permit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn park_frees_the_slot_and_io_permit_for_the_wait() {
+        let pool = SchedPool::new(Reservation::new(1, 0));
+        assert_eq!(pool.capacity(), 1);
+        assert_eq!(pool.io_permits().capacity(), 1);
+        let parks_before = scan_parks_total();
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel::<()>();
+        let (a_parked_tx, a_parked_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let a_pool = pool.clone();
+        let a = pool.submit_scan(
+            SchedClass::Bulk,
+            64,
+            std::future::pending::<()>(),
+            move |slot| {
+                slot.park(|| {
+                    a_parked_tx
+                        .send(())
+                        .expect("the test awaits A's parked signal");
+                    b_done_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("scan B never ran while scan A was parked: A kept its slot")
+                });
+                (a_pool.active(), a_pool.io_permits().in_flight())
+            },
+        );
+        // B is submitted only once A is parked: if B were admitted first it
+        // would finish without A ever having to give anything up.
+        tokio::time::timeout(Duration::from_secs(10), a_parked_rx)
+            .await
+            .expect("scan A never reached its wait")
+            .expect("scan A dropped its parked signal");
+
+        let b = pool.submit_scan(
+            SchedClass::Bulk,
+            64,
+            std::future::pending::<()>(),
+            move |_slot| {
+                b_done_tx.send(()).expect("scan A is waiting on this");
+            },
+        );
+        ran(b.await.expect("scan B joined"));
+        let resumed_view = ran(a.await.expect("scan A joined"));
+
+        assert_eq!(
+            resumed_view,
+            (1, 1),
+            "after the wait the scan holds its slot and its I/O permit again"
+        );
+        assert_eq!(pool.available_permits(), 1, "no slot leaked");
+        assert_eq!(pool.io_permits().in_flight(), 0, "no I/O permit leaked");
+        assert!(scan_parks_total() > parks_before, "the park is counted");
+    }
+
+    /// A scan that yields its CPU slot at a budget boundary must yield its I/O
+    /// permit too. Capacity 1 (one slot, one permit): A ticks with budget 1, so
+    /// every tick re-competes; once B is queued, A yields the slot to B. If A
+    /// kept the permit, B would sit on the slot waiting for it while A waits for
+    /// the slot — neither ever runs again.
+    ///
+    /// Own runtime with `shutdown_timeout`, so a regression FAILS with a message
+    /// instead of hanging the test binary on the wedged blocking thread.
+    #[test]
+    fn a_tick_yield_returns_the_io_permit_with_the_slot() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = rt.block_on(async {
+            let pool = SchedPool::new(Reservation::new(1, 0));
+            let (b_done_tx, b_done_rx) = std::sync::mpsc::channel::<()>();
+            let (a_running_tx, a_running_rx) = tokio::sync::oneshot::channel::<()>();
+            let a = pool.submit_scan(
+                SchedClass::Bulk,
+                1,
+                std::future::pending::<()>(),
+                move |slot| {
+                    a_running_tx.send(()).expect("the test awaits A");
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while Instant::now() < deadline {
+                        if b_done_rx.try_recv().is_ok() {
+                            return true;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        slot.tick();
+                    }
+                    false
+                },
+            );
+            a_running_rx.await.expect("scan A started");
+            let b = pool.submit_scan(
+                SchedClass::Bulk,
+                64,
+                std::future::pending::<()>(),
+                move |_slot| {
+                    // A may already have given up waiting; that is the failure
+                    // this test reports, not a reason to panic here.
+                    let _a_listening = b_done_tx.send(()).is_ok();
+                },
+            );
+            tokio::time::timeout(Duration::from_secs(15), async {
+                ran(b.await.expect("scan B joined"));
+                ran(a.await.expect("scan A joined"))
+            })
+            .await
+        });
+        rt.shutdown_timeout(Duration::from_secs(1));
+        let a_saw_b = outcome.expect(
+            "deadlock: A yielded its slot to B but kept the I/O permit B needs, so B holds \
+             the slot waiting for the permit and A waits for the slot",
+        );
+        assert!(a_saw_b, "B never ran while A was yielding at every tick");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

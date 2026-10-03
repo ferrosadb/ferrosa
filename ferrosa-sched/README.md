@@ -49,6 +49,10 @@ a CheckQuorum leader step-down.
   own cursor (metric `scan_releases_total`; any further use of the slot
   panics). `ferrosa-storage`'s whole-partition range scans use it, because a
   parked thread per idle client still exhausts the runtime's bounded blocking
+  pool. `tick`'s re-compete gives back the I/O permit with the slot, as `park`
+  does, so a permit is only ever held by a slot holder: a scan that waited for
+  the slot while keeping its permit deadlocked against the scan it yielded to
+  (admitted to the slot, then waiting for the permit) — permanently on a 1-slot
   pool. `submit`/`submit_blocking` are the generic (Bulk-weight) entries.
 - `runqueue::{RunQueue, SchedEntity, weight_for_class}` +
   `scheduler::{advance_vruntime, should_switch}` — the pure vruntime primitives
