@@ -314,6 +314,14 @@ early acknowledgement.
 - `repair/{coordinator,executor}.rs` — Merkle-then-stream sessions with bounded
   fetch/apply chunks; deterministic single-initiator selection (no thundering
   herd); timestamp ties surfaced, never auto-resolved (Aphyr-safe).
+- Every path that moves a partition between nodes carries the whole partition:
+  rows, static row and partition deletion (P0-3, CL-43). Row streaming encodes
+  through `StreamedMutation::from_partition` (legacy `Vec<RowWire>` bytes when
+  there is nothing else, otherwise the versioned envelope old nodes refuse
+  with a decode error); repair apply, `RepairApplyHandler`, the stream receiver
+  and local read repair call `StorageEngine::apply_partition`; read repair
+  encodes `read_repair_body` from borrowed rows (deletion and static marker
+  rows) and applies the same decoded body locally.
 - `repair/scheduler.rs` — `AutoRepairScheduler` / `AutoRepairConfig` (24 h default
   interval, round-robin tables), Prometheus metrics.
 - `repair/trigger.rs` — quarantine → anti-entropy refill: a corrupt SSTable

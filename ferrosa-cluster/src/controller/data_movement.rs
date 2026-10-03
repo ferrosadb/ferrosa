@@ -728,6 +728,24 @@ mod tests {
     /// - token 50  -> [1, 2]  (node 1 PRIMARY)
     /// - token 350 -> [4, 1]  (node 1 a NON-primary replica)
     /// - token 250 -> [3, 4]  (node 1 not a replica)
+    /// Decommission and bootstrap stream through this one encoder, so it must
+    /// carry a partition's static row and partition deletion (P0-3), not only
+    /// its clustered rows: without the deletion, rows the source deleted
+    /// resurrect on the new owner.
+    #[test]
+    fn membership_transfer_encodes_static_row_and_partition_deletion() {
+        use crate::partition_state_fixture as fx;
+        let source = fx::source_partition();
+        assert!(source.static_row.is_some() && !source.deletion.is_live());
+
+        let mutation = partition_to_streamed_mutation(&fx::table_id(), source.clone()).unwrap();
+        let decoded = crate::streaming::decode_partition_envelope(&mutation.row).unwrap();
+
+        assert_eq!(decoded.deletion, source.deletion, "partition deletion dropped");
+        assert_eq!(decoded.static_row, source.static_row, "static row dropped");
+        assert_eq!(decoded.rows.count(), source.rows.len());
+    }
+
     fn four_node_ring(leaving: u64) -> TokenRing {
         let mut ring = TokenRing::new();
         for id in 1..=4u64 {

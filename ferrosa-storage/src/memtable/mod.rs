@@ -43,6 +43,20 @@ pub(crate) fn is_partition_tombstone(row: &Row) -> bool {
     row.clustering.is_empty() && row.cells.is_empty() && row.deletion != DeletionTime::LIVE
 }
 
+/// True when `row` is the in-memory marker for a partition's STATIC row: empty
+/// clustering, at least one cell, on a table that declares clustering columns.
+/// A clustered table's real rows always carry clustering bytes (rejected
+/// otherwise by `validate_clustering_shape`), so the marker cannot collide
+/// with one; on a table without clustering columns an empty-clustering row is
+/// its single regular row and statics do not exist. The marker is lifted into
+/// [`Partition::static_row`] instead of being stored as a clustered row, which
+/// is how a static row reaches the memtable and the commit log through the
+/// ordinary row write path (row streaming, repair, read repair). Its cells
+/// must all be static ordinals (`0..static_columns.len()`).
+pub(crate) fn is_static_row_marker(row: &Row, schema: &TableSchema) -> bool {
+    !schema.clustering_columns.is_empty() && row.clustering.is_empty() && !row.cells.is_empty()
+}
+
 #[derive(Clone, Copy)]
 enum RawCollectionKind {
     List,
@@ -600,7 +614,28 @@ pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Re
     // through even on a clustered table — it carries no payload that
     // the strict-shape check is protecting.
     let is_partition_tombstone = is_partition_tombstone(row);
-    if !is_partition_tombstone {
+    if is_static_row_marker(row, schema) {
+        let static_count = schema.static_columns.len();
+        if let Some((idx, _)) = row
+            .cells
+            .iter()
+            .find(|(idx, _)| usize::from(*idx) >= static_count)
+        {
+            return Err(Error::InvalidData(format!(
+                "{}.{} (static row): cell index {idx} is not a static column \
+                 (table has {static_count} static column(s)); an empty-clustering \
+                 row on a clustered table is the static row",
+                schema.keyspace, schema.table
+            )));
+        }
+        if row.deletion != DeletionTime::LIVE || row.primary_key_liveness.has_timestamp() {
+            return Err(Error::InvalidData(format!(
+                "{}.{} (static row): a static row carries cells only, got row deletion \
+                 {:?} and liveness {:?}",
+                schema.keyspace, schema.table, row.deletion, row.primary_key_liveness
+            )));
+        }
+    } else if !is_partition_tombstone {
         if let Err(reason) = validate_clustering_shape(&schema.clustering_columns, &row.clustering)
         {
             return Err(Error::InvalidData(format!(

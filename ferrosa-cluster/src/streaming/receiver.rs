@@ -189,10 +189,9 @@ impl StreamSession {
         }
 
         let mut applied = 0u64;
-        // Mutations whose partition had no clustered rows. The senders stream
-        // `partition.rows` only, so such a partition's static row and
-        // partition-level deletion do not travel; counted so the session log
-        // shows it rather than reporting the mutation as applied data.
+        // Mutations whose partition carried nothing at all (no rows, no
+        // static row, LIVE deletion); counted so the session log shows it
+        // rather than reporting the mutation as applied data.
         let mut empty_row_payloads = 0u64;
         let mut staged = std::fs::File::open(&self.staging_path).map_err(|e| {
             ClusterError::Internal(format!(
@@ -222,26 +221,30 @@ impl StreamSession {
                 ClusterError::Internal(format!("stream: failed to decode staged mutation: {e}"))
             })?;
             // Decode BEFORE writing anything for this partition, so an
-            // undecodable row set fails the session instead of being stored.
-            let rows = decode_partition_rows(&mutation)?;
+            // undecodable payload fails the session instead of being stored.
+            let streamed = decode_partition_payload(&mutation)?;
             let table_id = TableId::new(&mutation.keyspace, &mutation.table);
             // Decorate with the key's real Murmur3 token. `DecoratedKey`
             // orders by token first, so a placeholder token files the
             // partition where no read at its real token will look.
             let key = DecoratedKey::new(PartitionKey::new(mutation.key));
-
-            let mut wrote_any = false;
-            for row in rows {
-                wrote_any = true;
-                storage
-                    .write(&table_id, &key, row, mutation.timestamp)
-                    .map_err(|e| {
-                        ClusterError::Internal(format!("stream: storage write failed: {e}"))
-                    })?;
-            }
-            // An empty row list writes nothing; count it so the session log
-            // shows it rather than reporting the mutation as applied data.
-            if !wrote_any {
+            // The whole partition: deletion, static row and rows, the rows
+            // pulled one at a time from the decoded payload. Writing `rows`
+            // alone resurrected what the source had deleted (P0-3).
+            let written = storage
+                .apply_partition_parts(
+                    &table_id,
+                    &key,
+                    streamed.deletion,
+                    streamed.static_row,
+                    streamed.rows,
+                )
+                .map_err(|e| {
+                    ClusterError::Internal(format!("stream: storage write failed: {e}"))
+                })?;
+            // A payload that carried nothing writes nothing; count it so the
+            // session log shows it rather than reporting it as applied data.
+            if written == 0 {
                 empty_row_payloads += 1;
             }
             applied += 1;
@@ -261,33 +264,24 @@ impl StreamSession {
     }
 }
 
-/// Decode a streamed partition's rows (`Vec<RowWire>`, bincode).
+/// Decode a streamed partition (legacy `Vec<RowWire>` or the versioned
+/// envelope, see [`super::decode_partition_envelope`]). Its clustered rows are
+/// yielded one at a time, never collected into a second vector.
 ///
-/// Every sender encodes `Vec<RowWire>`. Bytes that do not decode are refused:
-/// this used to store the raw bytes as a single live cell in column 0
-/// ("backwards compat with pre-RowWire streams"), so a corrupt or truncated
-/// payload -- or a sender's `unwrap_or_default()` empty encoding -- became a
-/// plausible-looking row. An empty row list writes nothing; it used to take
-/// the same fallback and store the encoded empty vector as a cell.
-///
-/// The payload is ONE partition's rows, already bounded by the session byte
-/// limit when it was staged; the decoded rows are yielded one at a time
-/// rather than converted into a second `Vec`.
-fn decode_partition_rows(
-    mutation: &StreamedMutation,
-) -> Result<impl Iterator<Item = ferrosa_sstable::types::Row>> {
-    use crate::raft::handlers::RowWire;
-    let wire_rows: Vec<RowWire> = bincode::deserialize(&mutation.row).map_err(|e| {
+/// Bytes that do not decode are refused: this used to store the raw bytes as
+/// a single live cell in column 0 ("backwards compat with pre-RowWire
+/// streams"), so a corrupt or truncated payload -- or a sender's
+/// `unwrap_or_default()` empty encoding -- became a plausible-looking row.
+fn decode_partition_payload(mutation: &StreamedMutation) -> Result<super::StreamedPartition> {
+    super::decode_partition_envelope(&mutation.row).map_err(|e| {
         ClusterError::Internal(format!(
-            "stream: rows for {}.{} partition {:02x?} do not decode as RowWire ({} bytes): {e}; \
-             refusing to store them",
+            "stream: rows for {}.{} partition {:02x?} ({} bytes) {e}; refusing to store them",
             mutation.keyspace,
             mutation.table,
             &mutation.key[..mutation.key.len().min(16)],
             mutation.row.len()
         ))
-    })?;
-    Ok(wire_rows.into_iter().map(ferrosa_sstable::types::Row::from))
+    })
 }
 
 impl Drop for StreamSession {
@@ -919,6 +913,52 @@ mod tests {
             .unwrap()
             .expect("partition stored");
         assert_eq!(stored.rows[0].cells, cells);
+    }
+
+    /// P0-3: bootstrap/decommission/rebalance stream a partition's static row
+    /// and partition deletion, not just its clustered rows. Without the
+    /// deletion, rows the source deleted resurrect on the receiver.
+    #[tokio::test]
+    async fn streamed_partition_carries_static_row_and_partition_deletion() {
+        use crate::partition_state_fixture as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = fx::storage(dir.path());
+        fx::seed_stale_row(&storage);
+
+        let mutation =
+            StreamedMutation::from_partition(fx::KEYSPACE, fx::TABLE, &fx::source_partition())
+                .unwrap();
+        apply_one(&storage, 9301, mutation).await.unwrap();
+
+        fx::assert_receiver_matches_source(&storage, "row streaming");
+    }
+
+    /// The streamed static row and partition deletion live in the memtable
+    /// first; they must also survive the flush to an SSTable. (Clustered rows
+    /// are left out: on a table with statics the memtable numbers regular
+    /// cells after the statics while the SSTable writer numbers them from 0,
+    /// a separate pre-existing defect tracked on the board.)
+    #[tokio::test]
+    async fn streamed_static_row_and_deletion_survive_flush() {
+        use crate::partition_state_fixture as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = fx::storage(dir.path());
+        let mut source = fx::source_partition();
+        source.rows.clear();
+
+        let mutation = StreamedMutation::from_partition(fx::KEYSPACE, fx::TABLE, &source).unwrap();
+        apply_one(&storage, 9302, mutation).await.unwrap();
+        storage.flush(&fx::table_id()).unwrap();
+
+        let got = storage
+            .read(&fx::table_id(), &fx::key())
+            .unwrap()
+            .expect("partition after flush");
+        assert_eq!(got.deletion, source.deletion, "deletion lost in flush");
+        assert_eq!(
+            got.static_row, source.static_row,
+            "static row lost in flush"
+        );
     }
 
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {

@@ -228,7 +228,7 @@ pub use row::{
 
 // Liveness helpers are re-exported for `ferrosa-cql`'s remaining metadata
 // decomposition variants, which still live in `ferrosa-cql` but reuse these.
-pub use row::{cell_is_live, ldt_is_expired};
+pub use row::{cell_is_live, ldt_is_expired, overlay_static_cells};
 
 // Collection (CRDT per-element) cell encoding/assembly. Lives here (not in
 // `ferrosa-cql`) because both the write builder and the read assembly use this

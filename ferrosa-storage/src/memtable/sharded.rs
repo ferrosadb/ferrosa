@@ -181,21 +181,15 @@ impl Memtable for ShardedBTreeMemtable {
             // into `Partition::deletion` instead of storing a phantom row, so a
             // subsequent read suppresses every clustered row at or below the
             // tombstone timestamp (see `super::is_partition_tombstone`).
-            let partition = if super::is_partition_tombstone(&row) {
-                Partition {
-                    key: key.clone(),
-                    deletion: row.deletion,
-                    static_row: None,
-                    rows: Vec::new(),
-                }
-            } else {
-                Partition {
-                    key: key.clone(),
-                    deletion: DeletionTime::LIVE,
-                    static_row: None,
-                    rows: vec![row],
-                }
+            // The same merge as an existing partition, so a static-row marker
+            // lands in `Partition::static_row` here too.
+            let mut partition = Partition {
+                key: key.clone(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: Vec::with_capacity(1),
             };
+            merge_row_into_partition(&mut partition, row, schema)?;
             let size = Self::estimate_partition_size(&partition);
             shard.insert(key.clone(), Arc::new(partition));
             self.count.fetch_add(1, Ordering::Relaxed);
@@ -327,7 +321,7 @@ impl Memtable for ShardedBTreeMemtable {
 /// Otherwise inserts the row at the correct sorted position.
 pub(crate) fn merge_row_into_partition(
     partition: &mut Partition,
-    mut new_row: Row,
+    new_row: Row,
     schema: &TableSchema,
 ) -> Result<()> {
     // A partition-tombstone marker is a partition-level DELETE: merge it into
@@ -341,59 +335,116 @@ pub(crate) fn merge_row_into_partition(
         return Ok(());
     }
 
+    // A static-row marker (empty clustering + cells on a clustered table) is
+    // the partition's static row: merge it into `Partition::static_row` with
+    // the same cell-level rules as a clustered row, never into `rows`.
+    if super::is_static_row_marker(&new_row, schema) {
+        match partition.static_row.as_mut() {
+            Some(existing) => merge_into_existing_row(existing, new_row, schema)?,
+            None => partition.static_row = Some(new_row),
+        }
+        return Ok(());
+    }
+
+    // A clustered row may carry static cells (CQL writes them with the row).
+    // A static column has one value per partition, so lift them into the
+    // static row here, exactly as the flush does (crate::ordinal_space), and
+    // every read before and after a flush sees the same partition.
+    let new_row = lift_static_cells(partition, new_row, schema)?;
+
     // Binary search by clustering key
     let pos = partition
         .rows
         .binary_search_by(|existing| existing.clustering.cmp(&new_row.clustering));
 
     match pos {
-        Ok(idx) => {
-            // Row with same clustering key exists — merge cells
-            let existing_row = &mut partition.rows[idx];
-
-            super::normalize_collection_rows_for_merge(existing_row, &mut new_row, schema)?;
-
-            // Update row-level deletion: newer tombstone wins (LWW).
-            if new_row.deletion.marked_for_delete_at > existing_row.deletion.marked_for_delete_at {
-                existing_row.deletion = new_row.deletion;
-            }
-
-            // Update primary key liveness to the newer timestamp
-            if new_row.primary_key_liveness.timestamp > existing_row.primary_key_liveness.timestamp
-            {
-                existing_row.primary_key_liveness = new_row.primary_key_liveness;
-            }
-
-            // Merge cells, keyed by (column index, cell path). A simple column
-            // has one cell (path == None); a complex (collection) column has many
-            // cells sharing the column index, one per element, distinguished by
-            // path. Cells stay sorted by (col_idx, path) — for simple cells (all
-            // None) this is identical to the historical col_idx order, so existing
-            // data and searches are unaffected. Reconciliation uses the CRDT rule
-            // (higher timestamp wins; tombstone wins an equal-timestamp tie), which
-            // is what makes concurrent per-element appends converge.
-            for (col_idx, new_cell) in new_row.cells {
-                let key = (col_idx, &new_cell.path);
-                let cell_pos = existing_row
-                    .cells
-                    .binary_search_by(|(idx, cell)| (*idx, &cell.path).cmp(&key));
-
-                match cell_pos {
-                    Ok(ci) => {
-                        let existing_cell = &existing_row.cells[ci].1;
-                        existing_row.cells[ci].1 =
-                            ferrosa_common::reconcile(existing_cell, &new_cell);
-                    }
-                    Err(ci) => {
-                        // New (col_idx, path) — insert at sorted position.
-                        existing_row.cells.insert(ci, (col_idx, new_cell));
-                    }
-                }
-            }
-        }
+        // Row with same clustering key exists — merge cells
+        Ok(idx) => merge_into_existing_row(&mut partition.rows[idx], new_row, schema)?,
         Err(idx) => {
             // No row with this clustering key — insert at sorted position
             partition.rows.insert(idx, new_row);
+        }
+    }
+    Ok(())
+}
+
+/// On a clustered table, move `row`'s static cells (flat ordinals
+/// `0..static_columns.len()`) into `partition`'s static row and return the
+/// row without them. The row itself stays, with its clustering, liveness and
+/// regular cells. Without clustering columns a partition has one row and no
+/// separate static row (Cassandra refuses statics there); the flush still
+/// moves such cells into the SSTable static row, and readers overlay it.
+fn lift_static_cells(partition: &mut Partition, mut row: Row, schema: &TableSchema) -> Result<Row> {
+    let static_count = schema.static_columns.len();
+    if static_count == 0
+        || schema.clustering_columns.is_empty()
+        || !row
+            .cells
+            .iter()
+            .any(|(idx, _)| usize::from(*idx) < static_count)
+    {
+        return Ok(row);
+    }
+    let (statics, regulars): (Vec<_>, Vec<_>) = std::mem::take(&mut row.cells)
+        .into_iter()
+        .partition(|(idx, _)| usize::from(*idx) < static_count);
+    row.cells = regulars;
+    let marker = Row {
+        clustering: Vec::new(),
+        cells: statics,
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
+    };
+    match partition.static_row.as_mut() {
+        Some(existing) => merge_into_existing_row(existing, marker, schema)?,
+        None => partition.static_row = Some(marker),
+    }
+    Ok(row)
+}
+
+/// Merge `new_row` into `existing_row` (same clustering, or both the static
+/// row) using row-level LWW for deletion and liveness and cell-level LWW for
+/// cells.
+fn merge_into_existing_row(
+    existing_row: &mut Row,
+    mut new_row: Row,
+    schema: &TableSchema,
+) -> Result<()> {
+    super::normalize_collection_rows_for_merge(existing_row, &mut new_row, schema)?;
+
+    // Update row-level deletion: newer tombstone wins (LWW).
+    if new_row.deletion.marked_for_delete_at > existing_row.deletion.marked_for_delete_at {
+        existing_row.deletion = new_row.deletion;
+    }
+
+    // Update primary key liveness to the newer timestamp
+    if new_row.primary_key_liveness.timestamp > existing_row.primary_key_liveness.timestamp {
+        existing_row.primary_key_liveness = new_row.primary_key_liveness;
+    }
+
+    // Merge cells, keyed by (column index, cell path). A simple column
+    // has one cell (path == None); a complex (collection) column has many
+    // cells sharing the column index, one per element, distinguished by
+    // path. Cells stay sorted by (col_idx, path) — for simple cells (all
+    // None) this is identical to the historical col_idx order, so existing
+    // data and searches are unaffected. Reconciliation uses the CRDT rule
+    // (higher timestamp wins; tombstone wins an equal-timestamp tie), which
+    // is what makes concurrent per-element appends converge.
+    for (col_idx, new_cell) in new_row.cells {
+        let key = (col_idx, &new_cell.path);
+        let cell_pos = existing_row
+            .cells
+            .binary_search_by(|(idx, cell)| (*idx, &cell.path).cmp(&key));
+
+        match cell_pos {
+            Ok(ci) => {
+                let existing_cell = &existing_row.cells[ci].1;
+                existing_row.cells[ci].1 = ferrosa_common::reconcile(existing_cell, &new_cell);
+            }
+            Err(ci) => {
+                // New (col_idx, path) — insert at sorted position.
+                existing_row.cells.insert(ci, (col_idx, new_cell));
+            }
         }
     }
     Ok(())
@@ -1229,6 +1280,43 @@ mod tests {
             paths,
             vec![Some(b"k1".to_vec()), Some(b"k2".to_vec())],
             "both set elements live under the static column"
+        );
+    }
+
+    /// On a clustered table a static column has one value per partition: a
+    /// static cell written with a clustered row lands in the static row, the
+    /// newest write winning, and the clustered rows keep only their regulars.
+    #[test]
+    fn static_cells_written_with_clustered_rows_merge_into_the_static_row() {
+        let schema = TableSchema {
+            clustering_columns: vec![column("ck", "org.apache.cassandra.db.marshal.Int32Type")],
+            static_columns: vec![column("s", UTF8)],
+            regular_columns: vec![column("a", UTF8)],
+            ..test_schema()
+        };
+        let row = |ck: i32, s: &[u8], a: &[u8], ts: i64| Row {
+            clustering: ck.to_be_bytes().to_vec(),
+            cells: vec![
+                (0, CellValue::live(s.to_vec(), ts)),
+                (1, CellValue::live(a.to_vec(), ts)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+        };
+        let mut p = empty_partition();
+        merge_row_into_partition(&mut p, row(1, b"s-new", b"a1", 20), &schema).unwrap();
+        merge_row_into_partition(&mut p, row(2, b"s-old", b"a2", 10), &schema).unwrap();
+
+        let statics = &p.static_row.as_ref().expect("static row").cells;
+        assert_eq!(statics, &vec![(0, CellValue::live(b"s-new".to_vec(), 20))]);
+        assert_eq!(p.rows.len(), 2);
+        assert_eq!(
+            p.rows[0].cells,
+            vec![(1, CellValue::live(b"a1".to_vec(), 20))]
+        );
+        assert_eq!(
+            p.rows[1].cells,
+            vec![(1, CellValue::live(b"a2".to_vec(), 10))]
         );
     }
 

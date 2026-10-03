@@ -1379,7 +1379,9 @@ impl CompactionExecutor {
         }
         let mappings: Vec<ColumnOrdinalMapping> = readers
             .iter()
-            .map(|reader| ColumnOrdinalMapping::for_header(&task.schema, reader.header()))
+            // Compaction rewrites SSTables into an SSTable, so it stays in
+            // SSTable ordinal space (crate::ordinal_space).
+            .map(|reader| ColumnOrdinalMapping::for_rewrite(&task.schema, reader.header()))
             .collect();
 
         // 2. Build the output serialization header by combining the inputs'

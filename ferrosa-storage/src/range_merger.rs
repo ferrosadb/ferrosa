@@ -177,7 +177,30 @@ pub struct ColumnOrdinalMapping {
 }
 
 impl ColumnOrdinalMapping {
+    /// Mapping for READING an SSTable: from its header's per-section ordinals
+    /// to the schema's FLAT ordinals (statics at `0..static_columns.len()`,
+    /// regulars after), the space every reader of storage uses
+    /// (`crate::ordinal_space`). On a table with static columns this is never
+    /// the identity, because every regular ordinal moves.
     pub fn for_header(schema: &TableSchema, header: &SerializationHeader) -> Self {
+        let mut mapping = Self::for_rewrite(schema, header);
+        let shift = schema.static_columns.len();
+        if shift > 0 {
+            let shift = u16::try_from(shift).unwrap_or(u16::MAX);
+            for target in mapping.regular_columns.iter_mut().flatten() {
+                *target = target.saturating_add(shift);
+            }
+            mapping.identity =
+                is_identity(&mapping.static_columns) && mapping.regular_columns.is_empty();
+        }
+        mapping
+    }
+
+    /// Mapping for REWRITING SSTables into an SSTable (compaction, spill
+    /// runs): from the header's per-section ordinals to the schema's
+    /// per-section positions, each from 0 — the space the SSTable writer
+    /// expects. Never use it to hand rows to a reader.
+    pub fn for_rewrite(schema: &TableSchema, header: &SerializationHeader) -> Self {
         fn build_map(
             source: &[(Vec<u8>, String)],
             target: &[ferrosa_common::schema::ColumnDefinition],

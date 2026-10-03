@@ -217,18 +217,13 @@ impl RepairStore for StorageEngineRepairStore {
         let parts = partitions.to_vec();
         TaskPool::current("repair-apply")
             .spawn_blocking(move || {
+                // The whole partition — deletion, static row and rows. The plan
+                // carries all three; writing rows alone resurrected deleted
+                // data on the repaired replica (P0-3).
                 for partition in parts {
-                    for row in partition.rows.iter() {
-                        let ts = row
-                            .cells
-                            .iter()
-                            .map(|(_, c)| c.timestamp)
-                            .max()
-                            .unwrap_or(row.primary_key_liveness.timestamp);
-                        engine
-                            .write(&table, &partition.key, row.clone(), ts)
-                            .map_err(|e| format!("apply write: {e}"))?;
-                    }
+                    engine
+                        .apply_partition(&table, partition)
+                        .map_err(|e| format!("apply write: {e}"))?;
                 }
                 Ok(())
             })
@@ -679,6 +674,24 @@ mod tests {
             .and_then(|p| p.rows.first())
             .and_then(|r| r.cells.first())
             .and_then(|(_, c)| c.value.as_deref())
+    }
+
+    /// P0-3: repair's plan carries the newer side's static row and partition
+    /// deletion, but the local apply wrote `partition.rows` only, so a
+    /// partition deleted on one replica resurrected on the other.
+    #[tokio::test]
+    async fn local_repair_apply_lands_static_row_and_partition_deletion() {
+        use crate::partition_state_fixture as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = fx::storage(dir.path());
+        fx::seed_stale_row(&storage);
+
+        StorageEngineRepairStore::new(storage.clone())
+            .apply_partitions(&fx::table_id(), &[fx::source_partition()])
+            .await
+            .unwrap();
+
+        fx::assert_receiver_matches_source(&storage, "repair local apply");
     }
 
     #[tokio::test]

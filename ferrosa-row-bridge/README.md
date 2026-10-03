@@ -33,6 +33,9 @@ ordering — the top FMEA risk for the SQL front-end — so it lives here once.
   `partition_to_rows_with_storage_mapping`, `partition_to_rows_with_clustering`,
   `write_partition_raw_rows_with_storage_mapping`, plus `decode_pk` /
   `decode_clustering` and the liveness helpers `cell_is_live` / `ldt_is_expired`.
+  A partition's `static_row` is overlaid on every clustered row
+  (`overlay_static_cells`, cell last-write-wins by `(ordinal, path)`); cell
+  ordinals are storage's flat space, statics first (t_65661473).
 - **`RowDecodeError`** — returned by every read-direction function when a stored
   key or cell is corrupt: carries column, partition key and reason, and the
   caller attaches the table (`in_table`). Reads fail; they never yield NULL.

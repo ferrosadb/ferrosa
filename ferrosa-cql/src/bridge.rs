@@ -1160,7 +1160,18 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
         // decoded cell-by-cell as if each were the whole column.
         let mut cells_by_col: std::collections::BTreeMap<usize, Vec<&ferrosa_common::CellValue>> =
             std::collections::BTreeMap::new();
-        for (col_index, cell) in &row.cells {
+        // The partition's static cells are part of every row, as in the
+        // primary SELECT decoder (`ferrosa_row_bridge::overlay_static_cells`).
+        let overlaid;
+        let row_cells: &mut dyn Iterator<Item = (&u16, &ferrosa_common::CellValue)> =
+            match partition.static_row.as_ref() {
+                Some(static_row) if !static_row.cells.is_empty() => {
+                    overlaid = ferrosa_row_bridge::overlay_static_cells(static_row, row);
+                    &mut overlaid.iter().map(|((idx, _), cell)| (idx, *cell))
+                }
+                _ => &mut row.cells.iter().map(|(idx, cell)| (idx, cell)),
+            };
+        for (col_index, cell) in row_cells {
             let storage_idx = *col_index as usize;
             let table_idx = match storage_to_table.get(storage_idx) {
                 Some(&idx) => idx,

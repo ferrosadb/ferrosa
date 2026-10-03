@@ -239,9 +239,9 @@ fn prepare_order_by_execution(
 /// bytes, CK from `Row.clustering` — both are already present in
 /// every row regardless of cell projection.
 ///
-/// Ordinal mapping mirrors `ferrosa_schema::convert` (Vec of regular
-/// columns sorted by `ColumnMetadata.position`) so the indexes match
-/// `SerializationHeader::regular_columns` on disk.
+/// Ordinals are storage's FLAT space (`TableMetadata::storage_column_index`:
+/// statics first, then regulars in name order); the storage layer maps them
+/// to each SSTable's own header ordinals.
 ///
 /// The caller must additionally confirm WHERE is empty — a predicate
 /// on a non-projected regular column would silently evaluate against
@@ -389,9 +389,8 @@ fn projection_storage_ordinals(
         .collect::<Option<Vec<_>>>()?;
 
     // Build the regular column list in Cassandra **name-sorted** order —
-    // exactly what `ferrosa_schema::convert::to_storage_schema` emits into the
-    // SSTable's `SerializationHeader.regular_columns` (and what
-    // `storage_column_index` indexes against). Sorting by declared `position`
+    // exactly the order `storage_column_index` uses after the statics.
+    // Sorting by declared `position`
     // here is WRONG: for a table whose declared column order differs from
     // name order, the projected SSTable read would then decode the wrong
     // column and the requested column would come back NULL once the memtable
@@ -403,6 +402,15 @@ fn projection_storage_ordinals(
         .collect();
     regulars.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
 
+    // Storage ordinals are FLAT: statics first, then the name-sorted
+    // regulars (`TableMetadata::storage_column_index`). Every storage read
+    // returns that space, SSTable reads included (t_65661473), so a projected
+    // regular column is `statics + position`.
+    let static_count = table_meta
+        .columns
+        .values()
+        .filter(|c| c.kind == ColumnKind::Static)
+        .count();
     let mut wanted: Vec<u16> = Vec::new();
     for name in &names {
         // Unknown column name — bail out so the legacy path returns the right
@@ -419,7 +427,7 @@ fn projection_storage_ordinals(
                         .iter()
                         .position(|c| c.name.eq_ignore_ascii_case(name))
                     {
-                        wanted.push(idx as u16);
+                        wanted.push((static_count + idx) as u16);
                     }
                 }
                 ColumnKind::PartitionKey | ColumnKind::Clustering => {
