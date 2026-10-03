@@ -91,7 +91,7 @@ thread (`result_stream`), with the next fetch started as each batch arrives;
 each batch is encoded and written to the socket, so response memory is
 O(batch). A fetch never waits on the client, so a query waiting for its client
 (suspended portal, undrained socket) holds no thread; its storage scan pauses
-after 10 ms and holds none either (ferrosa-storage ST-73). Extended `Execute`
+after 10 ms and holds none either (ferrosa-storage ST-82). Extended `Execute`
 honours `max_rows` with `PortalSuspended`; suspended portals are capped per
 connection and per node (`53000` past either) and closed after an idle
 timeout (`portal_limits`, PG-14/PG-15). → `RowDescription`
