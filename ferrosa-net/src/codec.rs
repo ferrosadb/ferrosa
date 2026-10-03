@@ -24,6 +24,11 @@ pub const FLAG_COMPRESSED: u8 = 0x01;
 pub const FLAG_STREAM_START: u8 = 0x02;
 pub const FLAG_STREAM_END: u8 = 0x04;
 pub const FLAG_FIRE_AND_FORGET: u8 = 0x08;
+/// The frame answers a request with a failure instead of a response: the body
+/// is an [`crate::rpc::error_reply::RpcErrorReply`], and `msg_type` echoes the
+/// request's type. Sent only to peers that advertised
+/// [`crate::handshake::CAP_RPC_ERROR_REPLY`].
+pub const FLAG_RPC_ERROR: u8 = 0x10;
 
 /// Priority lane for a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

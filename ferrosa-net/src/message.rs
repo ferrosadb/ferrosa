@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::codec::MsgType;
 use crate::error::{NetError, Result};
 
-fn put_string(buf: &mut BytesMut, s: &str) -> Result<()> {
+pub(crate) fn put_string(buf: &mut BytesMut, s: &str) -> Result<()> {
     let len = u16::try_from(s.len())
         .map_err(|_| NetError::Protocol("string exceeds u16::MAX bytes".into()))?;
     buf.put_u16(len);
@@ -13,7 +13,7 @@ fn put_string(buf: &mut BytesMut, s: &str) -> Result<()> {
     Ok(())
 }
 
-fn get_string(buf: &mut Bytes) -> Result<String> {
+pub(crate) fn get_string(buf: &mut Bytes) -> Result<String> {
     if buf.remaining() < 2 {
         return Err(NetError::Protocol("truncated string length".into()));
     }
@@ -103,6 +103,11 @@ pub enum Message {
         /// Raw internode broadcast hostname:port (re-resolvable). Peers store
         /// this in `NodeInfo.addr` so they can re-resolve it across IP churn.
         internode_broadcast: Option<String>,
+        /// Optional-feature bits the initiator understands (see
+        /// `handshake::CAP_*`). A trailing v1 extension: a peer that predates
+        /// it writes nothing here and decodes as `0`, and a peer that predates
+        /// it ignores the trailing bytes.
+        capabilities: u32,
     },
     HandshakeAck {
         host_id: Uuid,
@@ -433,6 +438,7 @@ impl Message {
                 auth_token,
                 cql_broadcast,
                 internode_broadcast,
+                capabilities,
             } => {
                 put_string(buf, cluster_name)?;
                 put_uuid(buf, host_id);
@@ -447,6 +453,9 @@ impl Message {
                 // Optional internode broadcast hostname (v1 extension — appended
                 // after cql_broadcast; absent on pre-extension peers)
                 put_optional_string(buf, internode_broadcast)?;
+                // Capability bits (v1 extension — appended after
+                // internode_broadcast; absent on pre-extension peers)
+                buf.put_u32(*capabilities);
             }
             Self::HandshakeAck {
                 host_id,
@@ -609,6 +618,13 @@ impl Message {
                 let cql_broadcast = get_optional_string(body)?;
                 // Optional internode broadcast hostname (v1 extension)
                 let internode_broadcast = get_optional_string(body)?;
+                // Capability bits (v1 extension). Absent on a pre-extension
+                // peer, which therefore understands no optional feature.
+                let capabilities = if body.remaining() >= 4 {
+                    body.get_u32()
+                } else {
+                    0
+                };
                 Self::Handshake {
                     cluster_name,
                     host_id,
@@ -617,6 +633,7 @@ impl Message {
                     auth_token,
                     cql_broadcast,
                     internode_broadcast,
+                    capabilities,
                 }
             }
             MsgType::HandshakeAck => {
@@ -885,6 +902,7 @@ mod tests {
             auth_token: vec![0xAB; 32],
             cql_broadcast: Some("host:19042".into()),
             internode_broadcast: Some("host:17000".into()),
+            capabilities: 0x5,
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
@@ -902,11 +920,77 @@ mod tests {
             auth_token: vec![],
             cql_broadcast: None,
             internode_broadcast: None,
+            capabilities: 0,
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    /// A peer that predates the capability field ends its Handshake after
+    /// `internode_broadcast`. It must decode as advertising no capability, so
+    /// it is never sent a frame it cannot parse.
+    #[test]
+    fn handshake_without_capabilities_decodes_as_none() {
+        let mut buf = BytesMut::new();
+        put_string(&mut buf, "ferrosa").unwrap();
+        put_uuid(&mut buf, &Uuid::new_v4());
+        buf.put_u8(1); // protocol_version
+        buf.put_u8(1); // compression list length
+        buf.put_u8(0); // supported_compression[0] = none
+        put_bytes(&mut buf, &[]).unwrap(); // auth_token (empty)
+        buf.put_u8(0); // cql_broadcast absent
+        buf.put_u8(1); // internode_broadcast present
+        put_string(&mut buf, "10.0.0.1:17000").unwrap();
+        // No trailing capability bits.
+
+        let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
+        match decoded {
+            Message::Handshake {
+                internode_broadcast,
+                capabilities,
+                ..
+            } => {
+                assert_eq!(internode_broadcast.as_deref(), Some("10.0.0.1:17000"));
+                assert_eq!(capabilities, 0);
+            }
+            other => panic!("expected Handshake, got {other:?}"),
+        }
+    }
+
+    /// The capability bits are a pure trailing extension: the encoding is the
+    /// pre-extension encoding plus four bytes, so a peer that predates the
+    /// field reads every field it knows unchanged and ignores the rest.
+    #[test]
+    fn handshake_capabilities_are_a_trailing_extension() {
+        let host_id = Uuid::new_v4();
+        let msg = Message::Handshake {
+            cluster_name: "ferrosa".to_string(),
+            host_id,
+            protocol_version: 1,
+            supported_compression: vec![0],
+            auth_token: vec![],
+            cql_broadcast: None,
+            internode_broadcast: Some("h:17000".into()),
+            capabilities: 0x1,
+        };
+        let mut new_format = BytesMut::new();
+        msg.encode(&mut new_format).unwrap();
+
+        let mut old_format = BytesMut::new();
+        put_string(&mut old_format, "ferrosa").unwrap();
+        put_uuid(&mut old_format, &host_id);
+        old_format.put_u8(1);
+        old_format.put_u8(1);
+        old_format.put_u8(0);
+        put_bytes(&mut old_format, &[]).unwrap();
+        old_format.put_u8(0);
+        old_format.put_u8(1);
+        put_string(&mut old_format, "h:17000").unwrap();
+
+        assert_eq!(&new_format[..old_format.len()], &old_format[..]);
+        assert_eq!(&new_format[old_format.len()..], &0x1u32.to_be_bytes()[..]);
     }
 
     #[test]

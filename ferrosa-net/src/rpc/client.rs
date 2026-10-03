@@ -8,11 +8,14 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::Framed;
 
-use crate::codec::{Frame, FrameHeader, InternodeCodec, Lane, FLAG_FIRE_AND_FORGET};
+use crate::codec::{
+    Frame, FrameHeader, InternodeCodec, Lane, FLAG_FIRE_AND_FORGET, FLAG_RPC_ERROR,
+};
 use crate::config::NetConfig;
 use crate::error::{NetError, Result};
 use crate::handshake::initiate_handshake;
 use crate::message::Message;
+use crate::rpc::error_reply::RpcErrorReply;
 use crate::task_pool::TaskPool;
 
 /// Process-wide counter of orphan RPC responses — replies that arrived after
@@ -49,6 +52,78 @@ impl Default for BandwidthMetrics {
     }
 }
 
+/// Requests awaiting their reply, by stream_id. Each holds one stream slot.
+type PendingReplies = DashMap<u32, oneshot::Sender<Result<Message>>>;
+
+/// Turn one inbound frame into the reply its requester receives.
+fn decode_reply(frame: &Frame, peer: std::net::SocketAddr) -> Result<Message> {
+    let msg_type = frame.header.msg_type;
+    let stream_id = frame.header.stream_id;
+    if frame.header.flags & FLAG_RPC_ERROR != 0 {
+        return match RpcErrorReply::decode(&mut frame.body.clone()) {
+            Ok(reply) => Err(NetError::RemoteHandlerFailed {
+                msg_type,
+                kind: reply.kind,
+                detail: reply.detail,
+            }),
+            Err(e) => {
+                tracing::error!(%peer, stream_id, ?msg_type, %e, "RPC error reply could not be decoded");
+                Err(NetError::Protocol(format!(
+                    "peer sent an undecodable error reply for {msg_type:?}: {e}"
+                )))
+            }
+        };
+    }
+    Message::decode(msg_type, &mut frame.body.clone()).map_err(|e| {
+        tracing::error!(%peer, stream_id, ?msg_type, %e, "RPC response could not be decoded");
+        NetError::Protocol(format!("undecodable {msg_type:?} response: {e}"))
+    })
+}
+
+/// Hand a reply to the request waiting on `stream_id`, releasing its slot.
+fn deliver_reply(
+    pending: &PendingReplies,
+    peer: std::net::SocketAddr,
+    stream_id: u32,
+    reply: Result<Message>,
+) {
+    // Lock-free: DashMap::remove is a single atomic operation.
+    let Some((_, sender)) = pending.remove(&stream_id) else {
+        ORPHAN_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(%peer, stream_id, "orphan RPC response: no pending caller for stream");
+        return;
+    };
+    // Caller-gone (Err): the response future was dropped before the reply
+    // arrived. Log + count so the failure is observable; the connection itself
+    // stays healthy for other in-flight streams.
+    if sender.send(reply).is_err() {
+        ORPHAN_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(%peer, stream_id, "orphan RPC response: caller dropped before reply");
+    }
+}
+
+/// Fail every request still waiting on a connection that has closed, so each
+/// releases its slot now instead of at its lane timeout.
+fn fail_pending_on_close(pending: &PendingReplies, peer: std::net::SocketAddr) {
+    let stranded: Vec<u32> = pending.iter().map(|entry| *entry.key()).collect();
+    let mut failed = 0usize;
+    for stream_id in stranded {
+        if let Some((_, sender)) = pending.remove(&stream_id) {
+            let closed = Err(NetError::Protocol(
+                "connection closed before the response arrived".into(),
+            ));
+            // Err means that caller already gave up (timed out or was
+            // cancelled); there is nobody left to tell.
+            if sender.send(closed).is_ok() {
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(%peer, failed, "RPC connection closed; failed the requests pending on it");
+    }
+}
+
 #[derive(Clone)]
 pub struct RpcClient {
     #[allow(dead_code)] // used in future phases (reconnection, pool management)
@@ -59,7 +134,7 @@ pub struct RpcClient {
     peer_cql_broadcast: Option<String>,
     /// Internode broadcast hostname the peer advertised during handshake.
     peer_internode_broadcast: Option<String>,
-    pending: Arc<DashMap<u32, oneshot::Sender<Message>>>,
+    pending: Arc<PendingReplies>,
     tx: mpsc::Sender<Frame>,
     next_stream_id: Arc<AtomicU32>,
     /// Signals `false` when the TCP connection drops.
@@ -162,6 +237,29 @@ impl RpcClient {
         }
     }
 
+    /// Connect over an already-open byte stream (an in-memory duplex in
+    /// tests), so a test can run on tokio's paused clock without real sockets.
+    #[cfg(test)]
+    pub(crate) async fn connect_over_stream<S>(
+        config: Arc<NetConfig>,
+        local_host_id: uuid::Uuid,
+        peer_addr: std::net::SocketAddr,
+        stream: S,
+    ) -> Result<Self>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let framed = Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
+        let task_pool = TaskPool::current("rpc-client-test");
+        Self::finish_connect(config, local_host_id, peer_addr, framed, task_pool).await
+    }
+
+    /// Requests awaiting a response on this connection (their stream slots).
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     async fn finish_connect<S>(
         config: Arc<NetConfig>,
         local_host_id: uuid::Uuid,
@@ -182,7 +280,7 @@ impl RpcClient {
         let peer_cql_broadcast = peer.cql_broadcast;
         let peer_internode_broadcast = peer.internode_broadcast;
 
-        let pending: Arc<DashMap<u32, oneshot::Sender<Message>>> = Arc::new(DashMap::new());
+        let pending: Arc<PendingReplies> = Arc::new(DashMap::new());
         let (tx, mut rx) = mpsc::channel::<Frame>(256);
 
         let (alive_tx, _alive_rx_init) = watch::channel(true);
@@ -205,56 +303,22 @@ impl RpcClient {
         task_pool.spawn(async move {
             while let Some(read) = stream.next().await {
                 // A frame the codec rejects (e.g. `FrameTooLarge`) ends the
-                // connection. Say so: the request waiting on that frame is
-                // only released by its lane timeout, which otherwise reads
-                // exactly like a slow peer.
+                // connection, and with it every request still pending on it.
                 let frame = match read {
                     Ok(frame) => frame,
                     Err(e) => {
                         tracing::error!(
                             peer = %read_loop_peer,
                             %e,
-                            "RPC response stream failed; closing the connection. Requests \
-                             pending on it fail at their lane timeout"
+                            "RPC response stream failed; closing the connection and failing \
+                             the requests pending on it"
                         );
                         break;
                     }
                 };
                 let stream_id = frame.header.stream_id;
-                let decoded = Message::decode(frame.header.msg_type, &mut frame.body.clone());
-                if let Err(e) = &decoded {
-                    tracing::error!(
-                        peer = %read_loop_peer,
-                        stream_id,
-                        msg_type = ?frame.header.msg_type,
-                        %e,
-                        "RPC response could not be decoded; its caller fails at the lane timeout"
-                    );
-                }
-                if let Ok(msg) = decoded {
-                    // Lock-free: DashMap::remove is a single atomic operation.
-                    if let Some((_, sender)) = pending_clone.remove(&stream_id) {
-                        // Caller-gone (Err): the response future was dropped
-                        // before the wire response arrived. Log + count so the
-                        // failure is observable; the connection itself stays
-                        // healthy for other in-flight streams.
-                        if let Err(_returned_msg) = sender.send(msg) {
-                            ORPHAN_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(
-                                peer = %read_loop_peer,
-                                stream_id,
-                                "orphan RPC response: caller dropped before reply"
-                            );
-                        }
-                    } else {
-                        ORPHAN_RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            peer = %read_loop_peer,
-                            stream_id,
-                            "orphan RPC response: no pending caller for stream"
-                        );
-                    }
-                }
+                let reply = decode_reply(&frame, read_loop_peer);
+                deliver_reply(&pending_clone, read_loop_peer, stream_id, reply);
             }
             // Stream ended — peer is gone. Record it unconditionally with
             // `send_replace`: `send` discards the value when no receiver
@@ -262,8 +326,13 @@ impl RpcClient {
             // after a reconnected client has sat in the actor's mailbox), so a
             // connection that dies in that gap would read as alive to every
             // later subscriber and its lane would never reconnect.
+            //
+            // Mark dead BEFORE failing the pending requests: a sender inserts
+            // its slot and then checks liveness, so it either sees `false`
+            // here or its slot is already in the map for the drain below.
             let had_subscribers = alive_tx_clone.receiver_count() > 0;
             alive_tx_clone.send_replace(false);
+            fail_pending_on_close(&pending_clone, read_loop_peer);
             if had_subscribers {
                 tracing::info!(peer = %read_loop_peer, "RPC peer connection closed");
             } else {
@@ -323,16 +392,26 @@ impl RpcClient {
             drop(_enter);
             // Span is recorded but not held across await points.
         }
+        // Encode before taking a slot: an encode error returned after the
+        // insert below would leave the slot in `pending` forever.
+        let mut body = BytesMut::new();
+        msg.encode(&mut body)?;
+        let body_len = u32::try_from(body.len())
+            .map_err(|_| NetError::Protocol("request body exceeds u32::MAX".into()))?;
+
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let (resp_tx, resp_rx) = oneshot::channel();
 
         // Lock-free: DashMap::insert is a single atomic operation.
         self.pending.insert(stream_id, resp_tx);
+        // The read loop marks the connection dead and then fails every slot
+        // in `pending`. Checking after the insert means this slot is either
+        // failed by that drain or refused here, never stranded.
+        if !*self.alive_tx.borrow() {
+            self.pending.remove(&stream_id);
+            return Err(NetError::Protocol("connection closed".into()));
+        }
 
-        let mut body = BytesMut::new();
-        msg.encode(&mut body)?;
-        let body_len = u32::try_from(body.len())
-            .map_err(|_| NetError::Protocol("request body exceeds u32::MAX".into()))?;
         self.bandwidth
             .bytes_sent
             .fetch_add(body_len as u64, std::sync::atomic::Ordering::Relaxed);
@@ -358,7 +437,7 @@ impl RpcClient {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let result = match tokio::time::timeout(timeout, resp_rx).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(reply)) => reply,
             Ok(Err(_)) => Err(NetError::Protocol("response channel dropped".into())),
             Err(_) => {
                 self.pending.remove(&stream_id);
