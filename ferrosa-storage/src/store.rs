@@ -8641,6 +8641,128 @@ mod tests {
         assert_eq!(rows.len(), 1, "pre-existing memtable row must be indexed");
     }
 
+    /// Index DDL is lock-free (t_d938e6ae): it rotates the memtable instead of
+    /// editing the live one's indexes under a table-map write lock. The
+    /// invariant that rotation must keep is "a memtable's postings are exactly
+    /// the flushed sidecars of the catalog it is bound to". So race writers,
+    /// index DDL and flushes, then check every SSTable: each sidecar holds one
+    /// posting per row of its SSTable (none lost, none from another
+    /// memtable), and no SSTable flushed after an index was dropped has a
+    /// sidecar for it.
+    #[test]
+    fn index_postings_equal_flushed_sidecars_under_racing_ddl_and_flush() {
+        const WRITERS: usize = 2;
+        const ROWS_PER_WRITER: usize = 400;
+        const DDL_ROUNDS: usize = 25;
+
+        let store = Arc::new(test_store());
+        let _rotation: FlushOutcome = store
+            .add_index("idx_main".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let writers_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let store = Arc::clone(&store);
+                let done = Arc::clone(&writers_done);
+                std::thread::spawn(move || {
+                    for i in 0..ROWS_PER_WRITER {
+                        store
+                            .write(&make_key(&format!("w{w}-{i:04}")), make_row(b"v", 1000))
+                            .unwrap();
+                    }
+                    done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+            .collect();
+        let ddl = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                for _ in 0..DDL_ROUNDS {
+                    let _added: FlushOutcome = store
+                        .add_index("idx_tmp".to_string(), 0, IndexType::BTree)
+                        .unwrap();
+                    let (removed, _flushed) = store.remove_index("idx_tmp").unwrap();
+                    assert!(removed, "idx_tmp was declared and must be removed");
+                }
+                let _added: FlushOutcome = store
+                    .add_index("idx_tmp".to_string(), 0, IndexType::BTree)
+                    .unwrap();
+                let _added: FlushOutcome = store
+                    .add_index("idx_gone".to_string(), 0, IndexType::BTree)
+                    .unwrap();
+                let (removed, _flushed) = store.remove_index("idx_gone").unwrap();
+                assert!(removed, "idx_gone was declared and must be removed");
+            })
+        };
+        let flusher = {
+            let store = Arc::clone(&store);
+            let done = Arc::clone(&writers_done);
+            std::thread::spawn(move || {
+                // Bounded by the writers finishing; each round is one flush.
+                for _ in 0..100_000 {
+                    if done.load(std::sync::atomic::Ordering::SeqCst) == WRITERS {
+                        return;
+                    }
+                    store.flush().unwrap();
+                }
+                panic!("writers did not finish within 100,000 flushes");
+            })
+        };
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        ddl.join().unwrap();
+        flusher.join().unwrap();
+        // One more row, so the final flush publishes an SSTable whose memtable
+        // was created after every DDL above.
+        store
+            .write(&make_key("zz-last"), make_row(b"v", 1000))
+            .unwrap();
+        store.flush().unwrap();
+
+        let total = WRITERS * ROWS_PER_WRITER + 1;
+        let main = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec())).unwrap();
+        assert_eq!(main.len(), total, "a posting of idx_main was lost");
+
+        let view = store.view.load();
+        assert_eq!(view.sstables.len(), view.sidecar_indexes.len());
+        for (sstable, sidecars) in view.sstables.iter().zip(view.sidecar_indexes.iter()) {
+            assert!(
+                sidecars.contains_key("idx_main"),
+                "generation {} has no idx_main sidecar",
+                sstable.gen
+            );
+            for (name, reader) in sidecars.iter() {
+                assert!(
+                    ["idx_main", "idx_tmp", "idx_gone"].contains(&name.as_str()),
+                    "generation {} has a sidecar for unknown index {name}",
+                    sstable.gen
+                );
+                assert_eq!(
+                    reader.entries_in_order().count() as u64,
+                    sstable.partition_count,
+                    "generation {}'s {name} sidecar must hold one posting per row",
+                    sstable.gen
+                );
+            }
+        }
+        let last = view
+            .sidecar_indexes
+            .last()
+            .expect("the final flush published");
+        let mut last_names: Vec<&str> = last.keys().map(String::as_str).collect();
+        last_names.sort_unstable();
+        assert_eq!(
+            last_names,
+            ["idx_main", "idx_tmp"],
+            "the last flush's sidecars must be exactly the declared indexes"
+        );
+        let mut live: Vec<&str> = view.indexes.keys().map(String::as_str).collect();
+        live.sort_unstable();
+        assert_eq!(live, ["idx_main", "idx_tmp"]);
+    }
+
     #[test]
     fn remove_index_unwires_future_index_reads() {
         let store = test_store();

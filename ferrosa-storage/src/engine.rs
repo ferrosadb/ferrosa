@@ -2809,10 +2809,7 @@ impl StorageEngine {
             return Ok(());
         }
         let notifier = {
-            let tables = self.tables.load();
-            let state = tables.get(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-            })?;
+            let state = self.require_table(table_id)?;
             Arc::clone(&state.write_pressure_notify)
         };
         let mut notified = std::pin::pin!(notifier.notified_owned());
@@ -2822,16 +2819,13 @@ impl StorageEngine {
 
         let hard_limit = self.config.memtable_backpressure_bytes.max(1);
         let (pressure, memtable_pressure, memtable_size) = {
-            let tables = self.tables.load();
-            let state = tables.get(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-            })?;
+            let state = self.require_table(table_id)?;
             let memtable_size = state.store.memtable_size() as u64;
             let memtable_pressure = (memtable_size as f64 / hard_limit as f64).min(1.0);
             let pressure = memtable_pressure
                 .max(self.sample_write_pump_blocked_rate())
                 .clamp(0.0, 1.0);
-            self.update_write_pressure(state, table_id, pressure);
+            self.update_write_pressure(&state, table_id, pressure);
             (pressure, memtable_pressure, memtable_size)
         };
 
@@ -2869,16 +2863,13 @@ impl StorageEngine {
         // One bounded re-check after the wake/deadline. Do not sleep or poll;
         // continued soft pressure is admitted after this single grace period.
         let (pressure, memtable_pressure, memtable_size) = {
-            let tables = self.tables.load();
-            let state = tables.get(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-            })?;
+            let state = self.require_table(table_id)?;
             let memtable_size = state.store.memtable_size() as u64;
             let memtable_pressure = (memtable_size as f64 / hard_limit as f64).min(1.0);
             let pressure = memtable_pressure
                 .max(self.sample_write_pump_blocked_rate())
                 .clamp(0.0, 1.0);
-            self.update_write_pressure(state, table_id, pressure);
+            self.update_write_pressure(&state, table_id, pressure);
             (pressure, memtable_pressure, memtable_size)
         };
         if pressure >= 1.0 {
@@ -6409,10 +6400,7 @@ impl StorageEngine {
         table_id: &TableId,
         index_name: &str,
     ) -> ferrosa_common::Result<VectorIndexMethod> {
-        let tables = self.tables.load();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         Ok(state.store.vector_index_method(index_name))
     }
 
@@ -6425,10 +6413,7 @@ impl StorageEngine {
         k: usize,
         ef_search: usize,
     ) -> ferrosa_common::Result<Vec<ferrosa_index::vector::IndexResult>> {
-        let tables = self.tables.load();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         state.store.ann_search(index_name, query, k, ef_search)
     }
 
@@ -6447,10 +6432,7 @@ impl StorageEngine {
         k: usize,
         ef_search: usize,
     ) -> ferrosa_common::Result<Vec<Partition>> {
-        let tables = self.tables.load();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         state
             .store
             .ann_search_partitions(index_name, query, k, ef_search)
@@ -6466,10 +6448,7 @@ impl StorageEngine {
         k: usize,
         ef_search: usize,
     ) -> ferrosa_common::Result<Vec<ferrosa_index::vector::IndexResult>> {
-        let tables = self.tables.load();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         state
             .store
             .ann_search_in_partition_scope(index_name, partition_scope, query, k, ef_search)
@@ -7489,8 +7468,7 @@ impl StorageEngine {
     where
         Cb: FnMut(&Row) -> ferrosa_common::Result<()>,
     {
-        let tables = self.tables.load();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok(0);
         };
         state.store.visit_time_series_window_rows(
@@ -8867,8 +8845,7 @@ impl StorageEngine {
             table = %table_id,
         )
         .entered();
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.read_limited_rows(key, row_limit)
@@ -8910,8 +8887,7 @@ impl StorageEngine {
         start_clustering: &[u8],
         row_limit: usize,
     ) -> ferrosa_common::Result<Option<Partition>> {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -8928,8 +8904,7 @@ impl StorageEngine {
     /// signal that anti-entropy repair must refill those generations' token
     /// ranges from a healthy replica. Empty (or an unknown table) yields `[]`.
     pub fn table_quarantined_sstable_gens(&self, table_id: &TableId) -> Vec<String> {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => state.store.quarantined_sstable_gens(),
             None => Vec::new(),
         }
@@ -8948,8 +8923,7 @@ impl StorageEngine {
             table = %table_id,
         )
         .entered();
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.read_clustering_row(key, clustering)
@@ -8991,8 +8965,7 @@ impl StorageEngine {
         if start_token >= end_token || limit == 0 {
             return Ok(Vec::new());
         }
-        let tables = self.tables.load();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok(Vec::new());
         };
         state.store.read_token_range(start_token, end_token, limit)
@@ -9014,8 +8987,7 @@ impl StorageEngine {
         if start_token >= end_token || max_partitions == 0 {
             return Ok((Vec::new(), None));
         }
-        let tables = self.tables.load();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok((Vec::new(), None));
         };
         state
@@ -9052,8 +9024,7 @@ impl StorageEngine {
         if start_token >= end_token {
             return Ok(());
         }
-        let tables = self.tables.load();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok(());
         };
         state
@@ -9080,8 +9051,7 @@ impl StorageEngine {
         if start_token >= end_token {
             return Ok(());
         }
-        let tables = self.tables.load();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok(());
         };
         state.store.walk_token_range(start_token, end_token, cb)
@@ -9096,8 +9066,7 @@ impl StorageEngine {
         limit: usize,
         row_limit: usize,
     ) -> ferrosa_common::Result<Vec<Partition>> {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -9131,8 +9100,7 @@ impl StorageEngine {
         end: Option<&DecoratedKey>,
         matches: &dyn Fn(&DecoratedKey) -> bool,
     ) -> ferrosa_common::Result<u64> {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.count_range_matching(start, end, matches)
@@ -9156,8 +9124,7 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -9185,8 +9152,7 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.range_iter(start, end)
@@ -9208,8 +9174,7 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.range_iter_fragmented(start, end)
@@ -9229,8 +9194,7 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -9273,10 +9237,7 @@ impl StorageEngine {
                  incomplete results while index backfill is pending or failed"
             )));
         }
-        let tables = self.tables.load();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         state.note_foreground_read();
         state
             .store
@@ -9328,7 +9289,16 @@ impl StorageEngine {
                 },
             );
             if let Err(error) = result {
-                let _ = tx.blocking_send(Err(error));
+                if let Err(undelivered) = tx.blocking_send(Err(error)) {
+                    // The consumer dropped the stream, so nobody is left to
+                    // return this to; say so rather than lose it.
+                    tracing::warn!(
+                        table = %table_id,
+                        index = %index_name,
+                        error = ?undelivered.0,
+                        "index stream failed after its consumer went away"
+                    );
+                }
             }
         });
 
@@ -9347,8 +9317,7 @@ impl StorageEngine {
         index_name: &str,
         key: &ferrosa_index::IndexKey,
     ) -> ferrosa_common::Result<bool> {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => state.store.index_key_is_unselective(index_name, key),
             None => Ok(false),
         }
@@ -9370,8 +9339,7 @@ impl StorageEngine {
         key: &ferrosa_index::IndexKey,
         partition_key: &[u8],
     ) -> ferrosa_common::Result<Vec<Partition>> {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -9397,8 +9365,7 @@ impl StorageEngine {
         index_name: &str,
         ranges: &[(u64, u64)],
     ) -> ferrosa_common::Result<Vec<Partition>> {
-        let tables = self.tables.load();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.read_by_index_cell_ranges(index_name, ranges)
@@ -9473,8 +9440,7 @@ impl StorageEngine {
         };
 
         {
-            let tables = self.tables.load();
-            let Some(state) = tables.get(table_id) else {
+            let Some(state) = self.table_state(table_id) else {
                 return Ok(vec![]);
             };
             state.note_foreground_read();
@@ -9748,8 +9714,7 @@ impl StorageEngine {
 
         // Memtable overlay — collect under the lock, forward after release.
         let memtable_hits = {
-            let tables = self.tables.load();
-            let Some(state) = tables.get(table_id) else {
+            let Some(state) = self.table_state(table_id) else {
                 return Ok(());
             };
             state
@@ -9832,8 +9797,7 @@ impl StorageEngine {
         // Missing-sidecar fallback (transient rebuild window) — collect under
         // the lock, forward after release.
         let fallback_hits = {
-            let tables = self.tables.load();
-            match tables.get(table_id) {
+            match self.table_state(table_id) {
                 Some(state) => state.store.fulltext_sstable_scan_missing_sidecar(
                     index_name,
                     query,
@@ -9894,13 +9858,9 @@ impl StorageEngine {
     }
 
     fn truncate_local(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
-        let tables = self.tables.load();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         // Clear in-memory state (memtable + SSTable references).
         state.store.truncate();
-        drop(tables);
 
         // Delete local SSTable files so data doesn't reappear on restart.
         let table_dir = self
@@ -12128,8 +12088,7 @@ impl StorageEngine {
             });
         };
         let (available_sstables, inputs, schema, purge) = {
-            let tables = self.tables.load();
-            let Some(state) = tables.get(table_id) else {
+            let Some(state) = self.table_state(table_id) else {
                 return Ok(IncrementalCompactionSchedule::TableNotFound);
             };
             let table_dir = self
@@ -12142,7 +12101,7 @@ impl StorageEngine {
                 max_sstables,
                 max_input_bytes,
             );
-            let purge = self.purge_policy_for(table_id, state, &inputs);
+            let purge = self.purge_policy_for(table_id, &state, &inputs);
             (
                 available_sstables,
                 inputs,
@@ -23047,6 +23006,103 @@ mod tests {
             "register_table must not wait on a paused index stream: the stream's \
              producer may not hold the engine-wide tables guard across a blocking send"
         );
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        engine.shutdown().unwrap();
+    }
+
+    /// DROP TABLE no longer waits for the table's readers: it used to, by
+    /// taking the table-map write lock, which is the wait that wedged node2
+    /// (t_d938e6ae). A reader still holding the dropped table therefore
+    /// races the directory delete. It may finish or fail, loudly — never
+    /// return a short answer as `Ok`. And nothing it does may put files back
+    /// into the directory a re-created table of the same name now owns.
+    #[test]
+    fn a_reader_of_a_dropped_table_fails_loud_and_resurrects_nothing() {
+        use ferrosa_index::IndexKey;
+        use futures::StreamExt;
+
+        const ROWS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        let indexes = vec![("val_idx".to_string(), 0_usize)];
+        engine
+            .register_table_with_indexes(test_schema(), indexes.clone())
+            .unwrap();
+        let tid = table_id();
+        for i in 0..ROWS {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("user{i}")),
+                    make_row(b"alice", 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = runtime.block_on(async {
+            engine.read_by_index_stream(&tid, "val_idx", &IndexKey(b"alice".to_vec()))
+        });
+        let first = runtime.block_on(stream.next());
+        assert!(matches!(first, Some(Ok(_))), "first row: {first:?}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let ddl_engine = Arc::clone(&engine);
+        let ddl_tid = tid.clone();
+        let drop_thread = std::thread::spawn(move || {
+            done_tx
+                .send(
+                    ddl_engine
+                        .unregister_table(&ddl_tid)
+                        .map_err(|e| e.to_string()),
+                )
+                .unwrap();
+        });
+        let dropped = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let drained = if dropped.is_ok() {
+            engine
+                .register_table_with_indexes(test_schema(), indexes)
+                .unwrap();
+            runtime.block_on(async {
+                let mut items = Vec::new();
+                while let Some(item) = stream.next().await {
+                    items.push(item.map(|_| ()).map_err(|e| e.to_string()));
+                }
+                items
+            })
+        } else {
+            drop(stream);
+            Vec::new()
+        };
+        drop_thread.join().unwrap();
+        assert_eq!(
+            dropped,
+            Ok(Ok(())),
+            "DROP TABLE must not wait for a paused reader of the table"
+        );
+
+        let delivered = 1 + drained.iter().filter(|item| item.is_ok()).count();
+        let failed = drained.iter().any(Result::is_err);
+        assert!(
+            failed || delivered == ROWS,
+            "a reader racing DROP TABLE returned {delivered} of {ROWS} rows and no error: \
+             a short answer reported as complete ({drained:?})"
+        );
+        let recreated = engine.read_range(&tid, None, None, 1_000).unwrap();
+        assert!(
+            recreated.is_empty(),
+            "the re-created table must start empty, found {} partitions",
+            recreated.len()
+        );
+        assert_eq!(engine.sstable_count(&tid), 0);
         runtime.shutdown_timeout(std::time::Duration::from_secs(5));
         engine.shutdown().unwrap();
     }
