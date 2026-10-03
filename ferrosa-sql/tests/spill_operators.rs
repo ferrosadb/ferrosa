@@ -353,6 +353,102 @@ fn a_spill_io_failure_fails_loud_rather_than_truncating() {
     );
 }
 
+/// A spill that fails AFTER runs were written (the disk filled, the temp dir
+/// vanished) must fail the whole operator — never hand back the rows that
+/// happened to reach earlier runs as if they were the result — and the
+/// reservation must still be removed.
+#[test]
+fn a_spill_write_failure_mid_sort_fails_loud_and_cleans_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = spilling_ctx(dir.path());
+    let probe = ctx.clone();
+    // Halfway through the input, take the reserved directory away, so the
+    // next run file cannot be created.
+    let rows = (0..BIG).rev().enumerate().map(move |(i, v)| {
+        if i == BIG as usize / 2 {
+            for path in probe.stats().reserved_paths() {
+                std::fs::remove_dir_all(&path).expect("remove the reserved dir");
+            }
+        }
+        Ok(row(vec![Value::Int(v)]))
+    });
+
+    let outcome = sort(
+        Box::new(rows),
+        &[SortKey {
+            col: 0,
+            dir: SortDir::Asc,
+        }],
+        &ctx,
+    )
+    .and_then(|stream| stream.collect::<Result<Vec<Row>, _>>());
+    match outcome {
+        Err(err) => assert!(
+            format!("{err}").contains("spill") || format!("{err}").contains("sort"),
+            "error must name the spill path: {err}"
+        ),
+        Ok(rows) => panic!(
+            "a failed spill returned {} of {BIG} rows as a complete result",
+            rows.len()
+        ),
+    }
+    for path in ctx.stats().reserved_paths() {
+        assert!(
+            !path.exists(),
+            "{} survived the failed sort",
+            path.display()
+        );
+    }
+}
+
+/// The same failure with the earlier runs still readable: the directory turns
+/// read-only, so only the NEXT run cannot be written. A sorter that swallowed
+/// that error would merge the earlier runs and return a short, sorted,
+/// plausible-looking result.
+#[cfg(unix)]
+#[test]
+fn a_run_that_cannot_be_written_fails_the_sort_even_when_earlier_runs_are_readable() {
+    use std::os::unix::fs::PermissionsExt;
+    // Few enough rows that the runs stay under the merge fan-in: a cascade
+    // merge would itself write to the directory and fail for another reason.
+    const N: i64 = 100;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = spilling_ctx(dir.path());
+    let probe = ctx.clone();
+    let rows = (0..N).rev().enumerate().map(move |(i, v)| {
+        if i == N as usize / 2 {
+            for path in probe.stats().reserved_paths() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500))
+                    .expect("make the reserved dir read-only");
+            }
+        }
+        Ok(row(vec![Value::Int(v)]))
+    });
+
+    let outcome = sort(
+        Box::new(rows),
+        &[SortKey {
+            col: 0,
+            dir: SortDir::Asc,
+        }],
+        &ctx,
+    )
+    .and_then(|stream| stream.collect::<Result<Vec<Row>, _>>());
+    // Hand the directory back so the TempDir can be removed.
+    for path in ctx.stats().reserved_paths() {
+        if path.exists() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("restore the reserved dir");
+        }
+    }
+    if let Ok(rows) = outcome {
+        panic!(
+            "an unwritable run returned {} of {N} rows as a complete result",
+            rows.len()
+        );
+    }
+}
+
 /// The operators are wired into the query path, not just callable in isolation:
 /// a whole `SELECT ... JOIN ... GROUP BY ... ORDER BY` runs through the spilling
 /// operators and still returns every row it should.
