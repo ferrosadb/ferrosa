@@ -50,9 +50,10 @@ pub use mutation::{Mutation, CELL_REBIND_LIST_PATH_FLAG};
 /// durable data volume while bounding retained WAL disk usage.
 const RETAINED_WAL_SEGMENT_EQUIVALENTS: u64 = 8;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -419,6 +420,27 @@ pub struct CommitLog {
     cdc: ArcSwapOption<CdcBus>,
 }
 
+/// What a replay consumer uses to keep a replayed mutation durable.
+///
+/// Replay deletes each segment of the previous generation once its entries
+/// have been delivered. A consumer that keeps a mutation only in memory —
+/// a memtable, a deferral buffer — must [`retain`](Self::retain) it first:
+/// the mutation is appended to the new generation, fsynced before the old
+/// segment is deleted, and discarded like any other entry once its table
+/// flushes past the returned position. A consumer that made the mutation
+/// durable elsewhere (the replay set-aside file) need not.
+pub struct ReplayRelog<'a> {
+    log: &'a CommitLog,
+}
+
+impl ReplayRelog<'_> {
+    /// Re-logs `mutation` (same id, timestamp and rows) into the new
+    /// generation and returns its new position.
+    pub fn retain(&self, mutation: &Mutation) -> ferrosa_common::Result<CommitLogPosition> {
+        self.log.append(mutation)
+    }
+}
+
 impl CommitLog {
     /// Creates a new commit log with the given configuration.
     ///
@@ -549,14 +571,25 @@ impl CommitLog {
     /// append order.
     ///
     /// See `specs/todo/bug-commitlog-replay-oom-on-large-log.md`.
+    ///
+    /// Every delivered mutation is re-logged into the new log generation
+    /// first (see [`ReplayRelog`]), because the callback's consumer is
+    /// assumed to hold it only in memory.
     pub fn open_and_replay_streaming<F>(
         config: Config,
-        on_mutation: F,
+        mut on_mutation: F,
     ) -> ferrosa_common::Result<Self>
     where
         F: FnMut(Mutation) -> ferrosa_common::Result<()>,
     {
-        Self::open_and_replay_streaming_with_barrier(config, on_mutation, || Ok(()))
+        Self::open_and_replay_streaming_with_barrier(
+            config,
+            |mutation, relog| {
+                relog.retain(&mutation)?;
+                on_mutation(mutation)
+            },
+            || Ok(()),
+        )
     }
 
     /// Like [`open_and_replay_streaming`](Self::open_and_replay_streaming), but
@@ -564,83 +597,88 @@ impl CommitLog {
     /// and BEFORE that segment file is deleted. A caller that persists
     /// mutations elsewhere (the no-schema set-aside) makes them durable there;
     /// if `segment_done` fails, replay stops and the segment stays on disk.
+    ///
+    /// The callback decides each mutation's durability: one it keeps only in
+    /// memory (a memtable, a deferral buffer) it MUST re-log through the
+    /// [`ReplayRelog`] it is handed, before the old segment is deleted.
     pub fn open_and_replay_streaming_with_barrier<F, B>(
         config: Config,
-        mut on_mutation: F,
-        mut segment_done: B,
+        on_mutation: F,
+        segment_done: B,
     ) -> ferrosa_common::Result<Self>
     where
-        F: FnMut(Mutation) -> ferrosa_common::Result<()>,
+        F: FnMut(Mutation, &ReplayRelog<'_>) -> ferrosa_common::Result<()>,
         B: FnMut() -> ferrosa_common::Result<()>,
     {
         let checkpoint = CommitLogCheckpoint::load(&config.checkpoint_dir)?;
-        let max_checkpoint_segment_id = checkpoint.values().map(|pos| pos.segment_id).max();
+        let segment_files = Self::scan_segment_files(&config.log_dir)?;
+        // The new generation starts above every id on disk or in the
+        // checkpoint, so its positions sort after anything replayed from.
+        let first_segment_id = segment_files
+            .last()
+            .map(|(id, _)| *id)
+            .into_iter()
+            .chain(checkpoint.values().map(|pos| pos.segment_id))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        // The new log exists before replay so a replayed mutation can be
+        // re-logged into it; see `ReplayRelog`.
+        let log = Self::new_with_first_segment_id(config, first_segment_id)?;
+        if let Err(e) = log.replay_segments(&segment_files, &checkpoint, on_mutation, segment_done)
+        {
+            if let Err(stop) = log.shutdown() {
+                tracing::error!(%stop, "commitlog: shutting down the new log after a failed replay");
+            }
+            return Err(e);
+        }
+        Ok(log)
+    }
 
-        // Scan for segment files in log_dir.
-        let mut segment_files: Vec<(u64, std::path::PathBuf)> = Vec::new();
-        if config.log_dir.exists() {
-            for entry in fs::read_dir(&config.log_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if let Some(id) = parse_segment_id(name) {
-                        segment_files.push((id, path));
-                    }
+    /// Segment files in `log_dir`, sorted by segment id.
+    fn scan_segment_files(log_dir: &Path) -> ferrosa_common::Result<Vec<(u64, PathBuf)>> {
+        let mut segment_files: Vec<(u64, PathBuf)> = Vec::new();
+        if log_dir.exists() {
+            for entry in fs::read_dir(log_dir)? {
+                let path = entry?.path();
+                if let Some(id) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(parse_segment_id)
+                {
+                    segment_files.push((id, path));
                 }
             }
         }
-
-        // Sort by segment ID for deterministic replay order.
         segment_files.sort_by_key(|(id, _)| *id);
-        let max_segment_file_id = segment_files.iter().map(|(id, _)| *id).max();
+        Ok(segment_files)
+    }
 
+    /// Streams the previous generation's `segment_files` to `on_mutation`,
+    /// deleting each one only after the mutations its consumer re-logged into
+    /// `self` are fsynced.
+    fn replay_segments<F, B>(
+        &self,
+        segment_files: &[(u64, PathBuf)],
+        checkpoint: &HashMap<TableId, CommitLogPosition>,
+        mut on_mutation: F,
+        mut segment_done: B,
+    ) -> ferrosa_common::Result<()>
+    where
+        F: FnMut(Mutation, &ReplayRelog<'_>) -> ferrosa_common::Result<()>,
+        B: FnMut() -> ferrosa_common::Result<()>,
+    {
+        let relog = ReplayRelog { log: self };
         // Stream segment by segment. The reader's `data` buffer (~segment_size)
         // and the per-segment entries Vec are dropped before the next iteration,
         // so peak memory is bounded by one segment regardless of how many
         // segments exist on disk. Each fully-replayed segment file is deleted
         // before moving on; on callback error, remaining segments are left
         // intact for retry.
-        for (id, path) in &segment_files {
-            // A too-short segment is the torn-create/torn-header state: the
-            // writer rolled to a new segment file, but was killed (OOM,
-            // kill -9, host reboot) before the header was durably completed.
-            // It carries no complete records, so it is safe — and mandatory —
-            // to skip it on replay rather than refuse to start. (See
-            // specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md.)
-            match fs::metadata(path) {
-                Ok(meta) if meta.len() < descriptor::HEADER_SIZE as u64 => {
-                    EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        segment_id = id,
-                        path = %path.display(),
-                        bytes = meta.len(),
-                        "commitlog: skipping too-short segment on replay (torn create/header from previous crash); \
-                         file will be cleaned up below"
-                    );
-                    if let Err(e) = fs::remove_file(path) {
-                        tracing::warn!(%e, "commitlog: failed to remove torn segment file");
-                    }
-                    continue;
-                }
-                Ok(_) if is_zeroed_segment_header(path)? => {
-                    EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        segment_id = id,
-                        path = %path.display(),
-                        "commitlog: skipping segment with all-zero header on replay \
-                         (preallocated/torn segment from previous crash); file will be cleaned up below"
-                    );
-                    if let Err(e) = fs::remove_file(path) {
-                        tracing::warn!(%e, "commitlog: failed to remove torn segment file");
-                    }
-                    continue;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(ferrosa_common::Error::from(e));
-                }
+        for (id, path) in segment_files {
+            if Self::skip_torn_segment(*id, path)? {
+                continue;
             }
-
             {
                 let mut reader = SegmentReader::open(path)?;
                 let entries = reader.read_all()?;
@@ -649,25 +687,60 @@ impl CommitLog {
                     let table_id = TableId::new(&mutation.keyspace, &mutation.table);
                     let dominated = checkpoint.get(&table_id).is_some_and(|cp| pos <= *cp);
                     if !dominated {
-                        on_mutation(mutation)?;
+                        on_mutation(mutation, &relog)?;
                     }
                 }
             }
 
+            // DURABILITY BARRIER (do not reorder): this segment is the only
+            // durable copy of what the callback re-logged until the new
+            // generation is fsynced. Deleting it first lost every replayed,
+            // still-unflushed mutation to a second crash (a confirmed DELETE
+            // came back). Rotated segments of the new generation were already
+            // fsynced by `force_rotate`; this covers the active one.
+            self.force_sync()?;
             segment_done()?;
             if let Err(e) = fs::remove_file(path) {
                 tracing::warn!(%e, "commitlog: failed to remove segment file");
             }
         }
+        Ok(())
+    }
 
-        let first_segment_id = max_segment_file_id
-            .into_iter()
-            .chain(max_checkpoint_segment_id)
-            .max()
-            .unwrap_or(0)
-            + 1;
-
-        Self::new_with_first_segment_id(config, first_segment_id)
+    /// Whether `path` is a torn segment to skip (and remove) on replay.
+    ///
+    /// A too-short segment is the torn-create/torn-header state: the writer
+    /// rolled to a new segment file, but was killed (OOM, kill -9, host
+    /// reboot) before the header was durably completed. It carries no
+    /// complete records, so it is safe — and mandatory — to skip it on replay
+    /// rather than refuse to start. (See
+    /// specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md.)
+    fn skip_torn_segment(id: u64, path: &Path) -> ferrosa_common::Result<bool> {
+        let meta = fs::metadata(path)?;
+        if meta.len() < descriptor::HEADER_SIZE as u64 {
+            EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                segment_id = id,
+                path = %path.display(),
+                bytes = meta.len(),
+                "commitlog: skipping too-short segment on replay (torn create/header from previous crash); \
+                 file will be cleaned up below"
+            );
+        } else if is_zeroed_segment_header(path)? {
+            EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                segment_id = id,
+                path = %path.display(),
+                "commitlog: skipping segment with all-zero header on replay \
+                 (preallocated/torn segment from previous crash); file will be cleaned up below"
+            );
+        } else {
+            return Ok(false);
+        }
+        if let Err(e) = fs::remove_file(path) {
+            tracing::warn!(%e, "commitlog: failed to remove torn segment file");
+        }
+        Ok(true)
     }
 
     /// Appends a mutation to the commit log.
@@ -1918,6 +1991,69 @@ mod tests {
             "fresh mutation written after reopen must survive crash replay"
         );
         assert_eq!(replayed[0].timestamp, fresh.timestamp);
+    }
+
+    /// P0 regression: replay hands mutations to a volatile consumer (the
+    /// memtable), so deleting the replayed segment left them nowhere durable.
+    /// A second crash before the table flushed lost them for good — a
+    /// confirmed DELETE came back as the value it deleted.
+    #[test]
+    fn replayed_mutation_survives_a_second_crash_before_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config.clone()).unwrap();
+        let written = simple_mutation();
+        cl.append(&written).unwrap();
+        drop(cl);
+
+        let (first, replayed) = CommitLog::open_and_replay(config.clone()).unwrap();
+        assert_eq!(replayed.len(), 1, "first restart replays the write");
+        drop(first);
+
+        let (_second, replayed) = CommitLog::open_and_replay(config).unwrap();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "a mutation replayed but never flushed must survive the next crash"
+        );
+        assert_eq!(replayed[0].mutation_id, written.mutation_id);
+        assert_eq!(replayed[0].timestamp, written.timestamp);
+    }
+
+    /// The re-logged copy is an ordinary entry of the new generation: once
+    /// its table flushes past the position `retain` returned, the next
+    /// restart replays nothing, so re-logging cannot accumulate.
+    #[test]
+    fn relogged_replay_copy_is_discarded_by_the_next_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config.clone()).unwrap();
+        cl.append(&simple_mutation()).unwrap();
+        drop(cl);
+
+        let mut retained = Vec::new();
+        let reopened = CommitLog::open_and_replay_streaming_with_barrier(
+            config.clone(),
+            |mutation, relog| {
+                retained.push(relog.retain(&mutation)?);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        let [position] = retained[..] else {
+            panic!("expected exactly one replayed mutation, got {retained:?}");
+        };
+        reopened
+            .discard_completed(&TableId::new("test_ks", "test_table"), position)
+            .unwrap();
+        drop(reopened);
+
+        let (_again, replayed) = CommitLog::open_and_replay(config).unwrap();
+        assert!(
+            replayed.is_empty(),
+            "a flushed re-logged copy must not replay again: {replayed:?}"
+        );
     }
 
     #[test]

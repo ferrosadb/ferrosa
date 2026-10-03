@@ -3519,23 +3519,27 @@ impl StorageEngine {
             std::collections::BTreeMap::new();
         let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming_with_barrier(
             config.commit_log.clone(),
-            |mutation| {
+            |mutation, relog| {
                 if !mutation.has_legacy_id() && !seen_replay_ids.insert(mutation.mutation_id) {
                     return Ok(());
                 }
 
+                // Every branch that keeps the mutation only in memory re-logs
+                // it first: replay deletes its segment next (see `ReplayRelog`).
                 if tables.load().is_empty() {
                     if pending_mutations.len() >= max_pending_without_schema {
                         return set_aside.lock().append(&mutation);
                     }
+                    relog.retain(&mutation)?;
                     pending_mutations.push(mutation);
-                } else if !Self::apply_replay_mutation_to_tables(&tables, &mutation) {
+                } else if !Self::replay_into_registered_table(&tables, &mutation, relog)? {
                     Self::defer_or_set_aside_absent_table_mutation(
                         &deferred_replay_mutations,
                         &set_aside,
                         &mut absent_table_spilled,
                         max_deferred_absent_table,
                         mutation,
+                        relog,
                     )?;
                 }
                 Ok(())
@@ -4211,9 +4215,11 @@ impl StorageEngine {
         spilled: &mut std::collections::BTreeMap<String, u64>,
         max_deferred: usize,
         mutation: Mutation,
+        relog: &crate::commitlog::ReplayRelog<'_>,
     ) -> ferrosa_common::Result<()> {
         let mut deferred = deferred.lock();
         if deferred.len() < max_deferred {
+            relog.retain(&mutation)?;
             deferred.push(mutation);
             return Ok(());
         }
@@ -4223,6 +4229,29 @@ impl StorageEngine {
             .entry(format!("{}.{}", mutation.keyspace, mutation.table))
             .or_insert(0) += 1;
         Ok(())
+    }
+
+    /// Open-time replay into a registered table: re-logs `mutation` into the
+    /// new commit-log generation, applies it to the memtable, and records the
+    /// new position as the table's flush checkpoint candidate, so the table's
+    /// next flush discards the re-logged copy like any other write.
+    /// `Ok(false)` when the table is not registered (nothing is re-logged).
+    fn replay_into_registered_table(
+        tables: &ArcSwap<TableMap>,
+        mutation: &Mutation,
+        relog: &crate::commitlog::ReplayRelog<'_>,
+    ) -> ferrosa_common::Result<bool> {
+        let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        let Some(state) = tables.load().get(&table_id).cloned() else {
+            return Ok(false);
+        };
+        let position = relog.retain(mutation)?;
+        let applied = Self::apply_replay_mutation_to_tables(tables, mutation);
+        debug_assert!(applied, "table {table_id} vanished during open-time replay");
+        state
+            .last_commit_log_position
+            .store(Arc::new(Some(position)));
+        Ok(true)
     }
 
     fn apply_replay_mutation_if_registered(&self, mutation: &Mutation) -> bool {
@@ -20544,6 +20573,49 @@ mod tests {
                 .expect("crash replay must recover unflushed table_a row after table_b flush");
             assert_eq!(partition.rows.len(), 1);
         }
+    }
+
+    /// Open-time replay re-logs what it applies (P0: a replayed, unflushed
+    /// DELETE was lost to a second crash). The re-logged copy must carry the
+    /// table's flush checkpoint candidate, or the table's next flush records
+    /// no checkpoint and the copy replays on every restart forever.
+    #[test]
+    fn flush_after_replay_checkpoints_the_relogged_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_a = table_id();
+        let key = make_key("replayed-then-flushed");
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_table(test_schema_2()).unwrap();
+            engine
+                .write(&table_a, &key, make_row(b"replayed", 3000), 3000)
+                .unwrap();
+            // Persist the local schema so the restart replays into table_a.
+            engine.flush(&table_id_2()).unwrap();
+            drop(engine);
+        }
+        let config = StorageEngineConfig::test_config(dir.path());
+        let checkpoint_dir = config.commit_log.checkpoint_dir.clone();
+        let before = crate::commitlog::checkpoint::CommitLogCheckpoint::load(&checkpoint_dir)
+            .unwrap()
+            .get(&table_a)
+            .copied();
+        assert_eq!(before, None, "table_a never flushed before the crash");
+
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        assert!(pending.is_empty(), "local schema was present at replay");
+        engine.flush(&table_a).unwrap();
+        let after = crate::commitlog::checkpoint::CommitLogCheckpoint::load(&checkpoint_dir)
+            .unwrap()
+            .get(&table_a)
+            .copied();
+        assert!(
+            after.is_some(),
+            "flushing replayed data must checkpoint its re-logged copy"
+        );
+        assert!(engine.read(&table_a, &key).unwrap().is_some());
     }
 
     /// Layer 3 of the timeuuid-flush-wedge fix: a malformed mutation

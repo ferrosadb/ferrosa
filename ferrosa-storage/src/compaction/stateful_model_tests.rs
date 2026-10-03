@@ -317,6 +317,21 @@ proptest! {
     }
 }
 
+/// Shrunk counterexample found at PROPTEST_CASES=5000: key 0 is deleted, the
+/// node crashes and restarts (replaying the delete into the memtable only),
+/// then crashes and restarts again before any flush. The cancelled
+/// compaction in the shrunk program is incidental; replay deleting the
+/// segments it had only replayed into memory was the bug.
+#[test]
+fn delete_survives_second_crash_after_replay() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build model runtime")
+        .block_on(run_program(&[236, 150, 17, 21, 142, 253, 254, 143, 43]));
+}
+
 #[tokio::test]
 async fn purge_readiness_drops_old_tombstones_without_resurrection() {
     let purged_before = crate::metrics::compaction_purged_markers_total();
