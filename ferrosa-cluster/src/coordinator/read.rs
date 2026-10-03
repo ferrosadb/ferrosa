@@ -992,15 +992,11 @@ impl ClusterCoordinator {
             "read repair needed: digest mismatch among replicas"
         );
 
+        // Newest anything — partition deletion and static row included, so a
+        // replica holding a newer partition deletion counts as newer.
         let full_ts = full_partition
             .as_ref()
-            .map(|p| {
-                p.rows
-                    .iter()
-                    .flat_map(|r| r.cells.iter().map(|(_, c)| c.timestamp))
-                    .max()
-                    .unwrap_or(i64::MIN)
-            })
+            .map(ferrosa_storage::partition_apply::partition_write_timestamp)
             .unwrap_or(i64::MIN);
 
         // Find the remote replica with the newest timestamp so we can attempt
@@ -2202,6 +2198,27 @@ use ferrosa_net::peer::PeerManager;
 
 use super::metrics::ReadRepairMetrics;
 
+/// The `RepairWrite` mutation for `partition`: its partition deletion, static
+/// row and clustered rows, as the rows the write path accepts (see
+/// [`ferrosa_storage::partition_apply`]). The `Mutation` wire format is
+/// unchanged. A receiver that predates the static-row marker rejects that row
+/// with a clustering-shape error instead of storing or dropping it silently.
+pub(crate) fn read_repair_mutation(
+    table_id: &TableId,
+    partition: &Partition,
+) -> ferrosa_common::Result<Mutation> {
+    // A Mutation owns its rows, so this one collect is the message itself.
+    let rows: Vec<_> = ferrosa_storage::partition_apply::partition_rows(partition)?.collect();
+    let newest = ferrosa_storage::partition_apply::partition_write_timestamp(partition);
+    Ok(Mutation::new(
+        table_id.keyspace.clone(),
+        table_id.table.clone(),
+        partition.key.clone(),
+        rows,
+        if newest == i64::MIN { 0 } else { newest },
+    ))
+}
+
 /// Send repair writes to stale replicas.
 ///
 /// Builds a [`Mutation`] from the newest partition data and sends a
@@ -2216,31 +2233,29 @@ async fn send_repair_writes(
     partition: &Partition,
     stale_host_ids: &[uuid::Uuid],
 ) {
-    let mutation = Mutation::new(
-        table_id.keyspace.clone(),
-        table_id.table.clone(),
-        partition.key.clone(),
-        partition.rows.clone(),
-        partition
-            .rows
-            .iter()
-            .flat_map(|r| r.cells.iter().map(|(_, c)| c.timestamp))
-            .max()
-            .unwrap_or(0),
-    );
+    let mutation = match read_repair_mutation(table_id, partition) {
+        Ok(mutation) => mutation,
+        Err(e) => {
+            tracing::error!(
+                table = %table_id,
+                %e,
+                stale_replicas = stale_host_ids.len(),
+                "read repair: newest partition cannot be expressed as a mutation; \
+                 stale replicas NOT repaired"
+            );
+            for _ in stale_host_ids {
+                metrics.inc_attempted();
+                metrics.inc_failed();
+            }
+            return;
+        }
+    };
     let body = encode_mutation(&mutation);
 
     for &host_id in stale_host_ids {
         metrics.inc_attempted();
         if Some(host_id) == local_host_id {
-            let mut failed = None;
-            for row in mutation.rows.iter().cloned() {
-                if let Err(e) = storage.write(table_id, &mutation.key, row, mutation.timestamp) {
-                    failed = Some(e);
-                    break;
-                }
-            }
-            if let Some(e) = failed {
+            if let Err(e) = storage.apply_partition(table_id, partition) {
                 tracing::warn!(
                     %host_id,
                     table = %table_id,
@@ -4139,6 +4154,43 @@ mod tests {
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(attempted, 1, "should attempt repair for 1 stale replica");
         assert_eq!(failed, 1, "should fail when peer is unreachable");
+    }
+
+    /// P0-3: read repair built its `Mutation` from `partition.rows` only, so a
+    /// stale replica never received the newest copy's partition deletion (the
+    /// rows it shadows stayed live) or its static row.
+    #[tokio::test]
+    async fn read_repair_carries_static_row_and_partition_deletion() {
+        use crate::partition_state_fixture as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = fx::storage(dir.path());
+        fx::seed_stale_row(&storage);
+
+        let local_node_id = 1u64;
+        let local_host_id = Uuid::new_v4();
+        let mut local_info = make_node("10.0.0.1:7000");
+        local_info.host_id = local_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_info);
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        coordinator
+            .repair_stale_replicas(&fx::table_id(), &fx::source_partition(), &[local_host_id])
+            .await;
+
+        let failed = coordinator
+            .repair_metrics
+            .read_repairs_failed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(failed, 0, "read repair write failed");
+        fx::assert_receiver_matches_source(&storage, "read repair");
     }
 
     #[tokio::test]

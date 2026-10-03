@@ -287,23 +287,16 @@ impl RpcHandler for RepairApplyHandler {
             .collect();
         let mut applied: u64 = 0;
         let mut last_err: Option<String> = None;
+        // The whole partition — deletion, static row and rows. `PartitionWire`
+        // carries all three; writing rows alone dropped the other two (P0-3).
         for partition in &partitions {
-            for row in &partition.rows {
-                let ts = row
-                    .cells
-                    .iter()
-                    .map(|(_, c)| c.timestamp)
-                    .max()
-                    .unwrap_or(row.primary_key_liveness.timestamp);
-                if let Err(e) = self
-                    .storage
-                    .write(&table_id, &partition.key, row.clone(), ts)
-                {
+            match self.storage.apply_partition(&table_id, partition) {
+                Ok(written) => applied += written as u64,
+                Err(e) => {
+                    tracing::warn!(%e, ?table_id, "RepairApplyHandler: partition apply failed");
                     last_err = Some(format!("apply write: {e}"));
-                    // Continue applying the rest — a single failed row
+                    // Continue applying the rest — a single failed partition
                     // shouldn't lose convergence on the others.
-                } else {
-                    applied += 1;
                 }
             }
         }
@@ -538,6 +531,38 @@ mod tests {
         let bytes = bincode::serialize(&resp).unwrap();
         let decoded: RepairMerkleResponsePayload = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.tree, tree);
+    }
+
+    /// P0-3: `PartitionWire` carries the static row and partition deletion
+    /// over the wire, but the remote apply handler wrote `partition.rows`
+    /// only, so both were dropped on the replica being repaired.
+    #[tokio::test]
+    async fn remote_repair_apply_lands_static_row_and_partition_deletion() {
+        use crate::partition_state_fixture as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = fx::storage(dir.path());
+        fx::seed_stale_row(&storage);
+
+        let req = RepairApplyRequestPayload {
+            keyspace: fx::KEYSPACE.to_string(),
+            table: fx::TABLE.to_string(),
+            partitions: vec![partition_to_wire(fx::source_partition())],
+        };
+        let body = Bytes::from(bincode::serialize(&req).unwrap());
+        let reply = RepairApplyHandler::new(storage.clone())
+            .handle(
+                (Uuid::nil(), "127.0.0.1:7000".parse().unwrap()),
+                Message::RepairApplyRequest(body),
+            )
+            .await
+            .expect("apply handler replies");
+        let Message::RepairApplyResponse(resp) = reply else {
+            panic!("unexpected reply {reply:?}");
+        };
+        let resp: RepairApplyResponsePayload = bincode::deserialize(&resp).unwrap();
+        assert_eq!(resp.error, None);
+
+        fx::assert_receiver_matches_source(&storage, "repair RPC apply");
     }
 
     #[test]

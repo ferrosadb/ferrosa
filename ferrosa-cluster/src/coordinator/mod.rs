@@ -1111,6 +1111,34 @@ mod tests {
         assert_eq!(coordinator.local_dc(), Some("us-east-1".to_string()));
     }
 
+    /// P0-3, remote leg of read repair: the `RepairWrite` a coordinator sends
+    /// must land the newest copy's static row and partition deletion on the
+    /// stale replica, through the unchanged `Mutation` wire format.
+    #[tokio::test]
+    async fn remote_read_repair_carries_static_row_and_partition_deletion() {
+        use crate::partition_state_fixture as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = fx::storage(dir.path());
+        fx::seed_stale_row(&storage);
+        let metrics = Arc::new(super::metrics::ReadRepairMetrics::new());
+        let handler = super::RepairWriteHandler::new(storage.clone(), metrics.clone());
+
+        let mutation =
+            super::read::read_repair_mutation(&fx::table_id(), &fx::source_partition()).unwrap();
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        handler
+            .handle(peer_id, Message::RepairWrite(encode_mutation(&mutation)))
+            .await;
+
+        assert_eq!(
+            metrics
+                .read_repairs_failed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        fx::assert_receiver_matches_source(&storage, "remote read repair");
+    }
+
     #[tokio::test]
     async fn repair_write_handler_applies_mutation() {
         let dir = tempfile::tempdir().unwrap();

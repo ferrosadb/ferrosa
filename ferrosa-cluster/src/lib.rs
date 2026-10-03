@@ -16,6 +16,8 @@ pub mod index_coordination;
 pub mod membership;
 pub mod mode;
 pub mod pair;
+#[cfg(test)]
+pub(crate) mod partition_state_fixture;
 pub mod raft;
 pub mod raft_forward;
 pub mod rebalance;

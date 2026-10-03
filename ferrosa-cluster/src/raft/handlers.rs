@@ -749,42 +749,12 @@ fn serialize_deletion_time<W: std::io::Write>(
     Ok(())
 }
 
-/// Extract the newest timestamp from any row in the partition (including the
-/// static row), or `i64::MIN` if there are no rows.
+/// Newest timestamp anywhere in the partition — rows, static row, row and
+/// partition deletions — or `i64::MIN` if it holds nothing. The read
+/// coordinator compares this against its own full read with the same
+/// definition, so a replica holding a newer partition deletion is "newer".
 fn newest_timestamp(partition: &Partition) -> i64 {
-    let mut ts = i64::MIN;
-
-    if let Some(ref sr) = partition.static_row {
-        let row_ts = row_max_timestamp(sr);
-        if row_ts > ts {
-            ts = row_ts;
-        }
-    }
-
-    for row in &partition.rows {
-        let row_ts = row_max_timestamp(row);
-        if row_ts > ts {
-            ts = row_ts;
-        }
-    }
-
-    ts
-}
-
-fn row_max_timestamp(row: &Row) -> i64 {
-    let mut ts = if row.primary_key_liveness.has_timestamp() {
-        row.primary_key_liveness.timestamp
-    } else {
-        i64::MIN
-    };
-
-    for (_, cell) in &row.cells {
-        if cell.timestamp > ts {
-            ts = cell.timestamp;
-        }
-    }
-
-    ts
+    ferrosa_storage::partition_apply::partition_write_timestamp(partition)
 }
 
 // ---------------------------------------------------------------------------
