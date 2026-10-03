@@ -1,11 +1,20 @@
 //! Upload manager: async task that uploads SSTables to S3-compatible storage.
+//!
+//! Each upload and delete task runs inside its worker's panic boundary
+//! (t_31e0929c): a panicking task fails that task (its caller's completion
+//! channel gets `Err`), is counted in `ferrosa_storage_upload_task_panics_total`
+//! and logged at ERROR, and its worker goes on to the next task. Before, the
+//! panic ended the worker, the dispatcher stopped at its next send to it, and
+//! every later `submit` failed with "upload channel closed".
 
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::FutureExt;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use parking_lot::Mutex;
@@ -138,6 +147,55 @@ impl UploadTask {
     fn counts_toward_queue_depth(&self) -> bool {
         !matches!(self, Self::Shutdown)
     }
+
+    /// Stable label for logs.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::SSTable { .. } => "sstable",
+            Self::SSTableBytes { .. } => "sstable_bytes",
+            Self::DeleteSSTable { .. } => "delete_sstable",
+            Self::IndexFiles { .. } => "index_files",
+            Self::CommitLogSegment { .. } => "commitlog_segment",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+type CompletionSender = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+/// An upload's completion channel that cannot be left unanswered: dropped
+/// without [`finish`](Self::finish) (the task panicked mid-upload), it sends
+/// `Err` so the caller does not mistake the silence for anything else.
+///
+/// A send to a receiver that is gone is not an error: the caller timed out or
+/// stopped waiting, and the outcome is already logged here.
+struct Completion(Option<CompletionSender>);
+
+impl Completion {
+    fn finish(mut self, result: Result<(), String>) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(Err(
+                "upload task ended without reporting; its worker panicked".to_string(),
+            ));
+        }
+    }
+}
+
+/// The text of a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 enum DeleteTask {
@@ -242,23 +300,35 @@ impl UploadManager {
             delete_worker_txs.push(worker_tx);
             delete_handles.push(runtime.spawn(async move {
                 while let Some(task) = worker_rx.recv().await {
-                    match task {
-                        DeleteReadyTask::SSTable {
-                            table_id,
-                            sstable_id,
-                            on_complete,
-                        } => {
-                            let result = Self::delete_sstable_after_grace(
-                                &store,
-                                &prefix,
-                                &table_id,
-                                &sstable_id,
-                                Duration::ZERO,
-                            )
-                            .await;
-                            if let Some(tx) = on_complete {
-                                let _ = tx.send(result);
-                            }
+                    let DeleteReadyTask::SSTable {
+                        table_id,
+                        sstable_id,
+                        on_complete,
+                    } = task;
+                    let completion = Completion(on_complete);
+                    let outcome = AssertUnwindSafe(Self::delete_sstable_after_grace(
+                        &store,
+                        &prefix,
+                        &table_id,
+                        &sstable_id,
+                        Duration::ZERO,
+                    ))
+                    .catch_unwind()
+                    .await;
+                    match outcome {
+                        Ok(result) => completion.finish(result),
+                        Err(payload) => {
+                            crate::metrics::inc_upload_task_panics();
+                            let message = panic_message(payload.as_ref());
+                            tracing::error!(
+                                worker_id,
+                                table_id,
+                                sstable_id,
+                                panic = %message,
+                                "object-store delete panicked; its caller was told it failed and \
+                                 the worker continues with the next task"
+                            );
+                            completion.finish(Err(format!("delete panicked: {message}")));
                         }
                     }
                 }
@@ -314,187 +384,33 @@ impl UploadManager {
             worker_txs.push(worker_tx);
             handles.push(runtime.spawn(async move {
                 while let Some(task) = worker_rx.recv().await {
-                let count_queue_depth = task.counts_toward_queue_depth();
-                let task_start = Instant::now();
-                match task {
-                    UploadTask::SSTable {
-                        table_id,
-                        sstable_id,
-                        files,
-                        on_complete,
-                    } => {
-                        // Distribute across 256 S3 prefixes for parallelism.
-                        // S3 partitions by prefix — using the first 2 hex chars
-                        // of a hash of the sstable_id gives even distribution
-                        // and avoids the 3,500 PUT/s per-prefix limit.
-                        let hex_prefix = hex_prefix_for(&sstable_id);
-                        let mut upload_err: Option<String> = None;
-                        for file in files {
-                            // `name` is already in `{sstable_id}-{component}` form
-                            // (e.g. "1-Data.db"). Strip the id prefix to get the bare
-                            // component name so we can route through the shared key
-                            // constructor and guarantee upload/download alignment.
-                            let component = file
-                                .name
-                                .strip_prefix(&format!("{sstable_id}-"))
-                                .unwrap_or(&file.name);
-                            let path = sstable_object_key(
-                                &prefix,
-                                &hex_prefix,
-                                &table_id,
-                                &sstable_id,
-                                component,
-                            );
-                            match Self::put_file_with_retry(&store, &path, &file.path, 5).await {
-                                Ok(()) => {}
-                                Err(UploadFileError::Missing) => {
-                                    // The SSTable was compacted away (or
-                                    // explicitly deleted) between the scan that
-                                    // produced `files` and this read. Not a real
-                                    // upload error — the compacted output is the
-                                    // authoritative copy and will be uploaded
-                                    // separately. Mark the task as "compacted
-                                    // away" so the caller doesn't add it to the
-                                    // manifest, but don't surface a tracing
-                                    // ERROR for a benign race.
-                                    let msg = format!(
-                                        "skipped: source compacted away before upload \
-                                         ({path}: {})",
-                                        file.path.display()
-                                    );
-                                    tracing::info!(
-                                        path = %file.path.display(),
-                                        "s3 upload skipped — SSTable file compacted away before upload"
-                                    );
-                                    if upload_err.is_none() {
-                                        upload_err = Some(msg);
-                                    }
-                                }
-                                Err(UploadFileError::Read(e)) => {
-                                    let msg = format!(
-                                        "upload failed for {path}: failed to read {}: {e}",
-                                        file.path.display()
-                                    );
-                                    tracing_or_eprintln(msg.clone());
-                                    if upload_err.is_none() {
-                                        upload_err = Some(msg);
-                                    }
-                                }
-                                Err(UploadFileError::Store(e)) => {
-                                    let msg = format!("upload failed for {path}: {e}");
-                                    tracing_or_eprintln(msg.clone());
-                                    // Record first error; continue so all files are attempted.
-                                    if upload_err.is_none() {
-                                        upload_err = Some(msg);
-                                    }
-                                }
-                            }
-                        }
-                        // Notify caller of upload outcome when a completion channel
-                        // was provided.  Receiver drop is silently ignored — the
-                        // caller may have timed out or crashed.
-                        if let Some(tx) = on_complete {
-                            let result = match upload_err {
-                                None => Ok(()),
-                                Some(msg) => Err(msg),
-                            };
-                            let _ = tx.send(result);
-                        }
+                    if matches!(task, UploadTask::Shutdown) {
+                        break;
                     }
-                    UploadTask::SSTableBytes {
-                        table_id,
-                        sstable_id,
-                        files,
-                        on_complete,
-                    } => {
-                        let hex_prefix = hex_prefix_for(&sstable_id);
-                        let mut upload_err: Option<String> = None;
-                        for file in files {
-                            let path = sstable_object_key(
-                                &prefix,
-                                &hex_prefix,
-                                &table_id,
-                                &sstable_id,
-                                &file.component,
-                            );
-                            if let Err(e) =
-                                Self::put_component_bytes_with_retry(&store, &path, file.data, 5)
-                                    .await
-                            {
-                                let msg = format!("upload failed for {path}: {e}");
-                                tracing_or_eprintln(msg.clone());
-                                if upload_err.is_none() {
-                                    upload_err = Some(msg);
-                                }
-                            }
-                        }
-                        if let Some(tx) = on_complete {
-                            let result = match upload_err {
-                                None => Ok(()),
-                                Some(msg) => Err(msg),
-                            };
-                            let _ = tx.send(result);
-                        }
+                    let task_start = Instant::now();
+                    let kind = task.kind();
+                    // One task's panic is that task's failure, not the
+                    // worker's: before, it ended this loop, the dispatcher's
+                    // next send to it failed, and the dispatcher stopped,
+                    // closing the whole write-behind pipeline (t_31e0929c).
+                    // The task's completion guard reports the failure to its
+                    // caller while the panic unwinds.
+                    let outcome =
+                        AssertUnwindSafe(Self::process_task(&store, &prefix, &delete_tx, task))
+                            .catch_unwind()
+                            .await;
+                    if let Err(payload) = outcome {
+                        crate::metrics::inc_upload_task_panics();
+                        tracing::error!(
+                            worker_id,
+                            task = kind,
+                            panic = %panic_message(payload.as_ref()),
+                            "upload task panicked; its caller was told it failed and the worker \
+                             continues with the next task"
+                        );
                     }
-                    UploadTask::DeleteSSTable {
-                        table_id,
-                        sstable_id,
-                        grace_period,
-                        on_complete,
-                    } => {
-                        let task = DeleteTask::SSTable {
-                            table_id,
-                            sstable_id,
-                            grace_period,
-                            on_complete,
-                        };
-                        if let Err(e) = delete_tx.send(task).await {
-                            let DeleteTask::SSTable { on_complete, .. } = e.0;
-                            if let Some(tx) = on_complete {
-                                let _ = tx.send(Err("delete channel closed".into()));
-                            }
-                            tracing_or_eprintln("delete channel closed".to_string());
-                        }
-                    }
-                    UploadTask::IndexFiles {
-                        table_id,
-                        sstable_id,
-                        files,
-                    } => {
-                        // Use the same S3 prefix distribution as SSTables.
-                        let hex_prefix = hex_prefix_for(&sstable_id);
-                        for (name, data) in files {
-                            let path = ObjectPath::from(format!(
-                                "{prefix}/{hex_prefix}/{table_id}/{sstable_id}/{name}"
-                            ));
-                            if let Err(e) =
-                                Self::put_with_retry(&store, &path, data.clone(), 5).await
-                            {
-                                tracing_or_eprintln(format!("index upload failed for {path}: {e}"));
-                            }
-                        }
-                    }
-                    UploadTask::CommitLogSegment {
-                        segment_id,
-                        data,
-                        sha256: _,
-                    } => {
-                        let hex = hex_prefix_for(&segment_id.to_string());
-                        let path = ObjectPath::from(format!(
-                            "{prefix}/commitlog-archive/{hex}/{segment_id}.log"
-                        ));
-                        if let Err(e) = Self::put_with_retry(&store, &path, data.clone(), 5).await {
-                            tracing_or_eprintln(format!(
-                                "commitlog segment upload failed for {path}: {e}"
-                            ));
-                        }
-                    }
-                    UploadTask::Shutdown => break,
-                }
-                if count_queue_depth {
                     crate::metrics::observe_upload_task(task_start.elapsed());
                     crate::metrics::dec_upload_queue_depth();
-                }
                 }
                 tracing::debug!(worker_id, "upload worker stopped");
             }));
@@ -516,6 +432,14 @@ impl UploadManager {
                 let idx = next_worker % worker_txs.len();
                 next_worker = next_worker.wrapping_add(1);
                 if worker_txs[idx].send(task).await.is_err() {
+                    // A worker ends only on Shutdown; tasks no longer panic
+                    // it to death. If one is gone anyway, say so loudly: every
+                    // later submit fails with "upload channel closed".
+                    tracing::error!(
+                        worker = idx,
+                        "upload worker is gone; the upload dispatcher stops and the \
+                         write-behind pipeline is closed"
+                    );
                     break;
                 }
             }
@@ -589,6 +513,178 @@ impl UploadManager {
                     ),
                 }
             }
+        }
+    }
+
+    /// Process one upload task. Runs inside the worker's panic boundary.
+    async fn process_task(
+        store: &Arc<dyn ObjectStore>,
+        prefix: &str,
+        delete_tx: &mpsc::Sender<DeleteTask>,
+        task: UploadTask,
+    ) {
+        let prefix = prefix.to_string();
+        match task {
+            UploadTask::SSTable {
+                table_id,
+                sstable_id,
+                files,
+                on_complete,
+            } => {
+                let completion = Completion(on_complete);
+                // Distribute across 256 S3 prefixes for parallelism.
+                // S3 partitions by prefix — using the first 2 hex chars
+                // of a hash of the sstable_id gives even distribution
+                // and avoids the 3,500 PUT/s per-prefix limit.
+                let hex_prefix = hex_prefix_for(&sstable_id);
+                let mut upload_err: Option<String> = None;
+                for file in files {
+                    // `name` is already in `{sstable_id}-{component}` form
+                    // (e.g. "1-Data.db"). Strip the id prefix to get the bare
+                    // component name so we can route through the shared key
+                    // constructor and guarantee upload/download alignment.
+                    let component = file
+                        .name
+                        .strip_prefix(&format!("{sstable_id}-"))
+                        .unwrap_or(&file.name);
+                    let path =
+                        sstable_object_key(&prefix, &hex_prefix, &table_id, &sstable_id, component);
+                    match Self::put_file_with_retry(store.as_ref(), &path, &file.path, 5).await {
+                        Ok(()) => {}
+                        Err(UploadFileError::Missing) => {
+                            // The SSTable was compacted away (or
+                            // explicitly deleted) between the scan that
+                            // produced `files` and this read. Not a real
+                            // upload error — the compacted output is the
+                            // authoritative copy and will be uploaded
+                            // separately. Mark the task as "compacted
+                            // away" so the caller doesn't add it to the
+                            // manifest, but don't surface a tracing
+                            // ERROR for a benign race.
+                            let msg = format!(
+                                "skipped: source compacted away before upload \
+                                 ({path}: {})",
+                                file.path.display()
+                            );
+                            tracing::info!(
+                                path = %file.path.display(),
+                                "s3 upload skipped — SSTable file compacted away before upload"
+                            );
+                            if upload_err.is_none() {
+                                upload_err = Some(msg);
+                            }
+                        }
+                        Err(UploadFileError::Read(e)) => {
+                            let msg = format!(
+                                "upload failed for {path}: failed to read {}: {e}",
+                                file.path.display()
+                            );
+                            tracing_or_eprintln(msg.clone());
+                            if upload_err.is_none() {
+                                upload_err = Some(msg);
+                            }
+                        }
+                        Err(UploadFileError::Store(e)) => {
+                            let msg = format!("upload failed for {path}: {e}");
+                            tracing_or_eprintln(msg.clone());
+                            // Record first error; continue so all files are attempted.
+                            if upload_err.is_none() {
+                                upload_err = Some(msg);
+                            }
+                        }
+                    }
+                }
+                // Notify caller of upload outcome when a completion channel
+                // was provided. See `Completion` for a dropped receiver.
+                completion.finish(match upload_err {
+                    None => Ok(()),
+                    Some(msg) => Err(msg),
+                });
+            }
+            UploadTask::SSTableBytes {
+                table_id,
+                sstable_id,
+                files,
+                on_complete,
+            } => {
+                let completion = Completion(on_complete);
+                let hex_prefix = hex_prefix_for(&sstable_id);
+                let mut upload_err: Option<String> = None;
+                for file in files {
+                    let path = sstable_object_key(
+                        &prefix,
+                        &hex_prefix,
+                        &table_id,
+                        &sstable_id,
+                        &file.component,
+                    );
+                    if let Err(e) =
+                        Self::put_component_bytes_with_retry(store.as_ref(), &path, file.data, 5)
+                            .await
+                    {
+                        let msg = format!("upload failed for {path}: {e}");
+                        tracing_or_eprintln(msg.clone());
+                        if upload_err.is_none() {
+                            upload_err = Some(msg);
+                        }
+                    }
+                }
+                completion.finish(match upload_err {
+                    None => Ok(()),
+                    Some(msg) => Err(msg),
+                });
+            }
+            UploadTask::DeleteSSTable {
+                table_id,
+                sstable_id,
+                grace_period,
+                on_complete,
+            } => {
+                let task = DeleteTask::SSTable {
+                    table_id,
+                    sstable_id,
+                    grace_period,
+                    on_complete,
+                };
+                if let Err(e) = delete_tx.send(task).await {
+                    let DeleteTask::SSTable { on_complete, .. } = e.0;
+                    if let Some(tx) = on_complete {
+                        let _ = tx.send(Err("delete channel closed".into()));
+                    }
+                    tracing_or_eprintln("delete channel closed".to_string());
+                }
+            }
+            UploadTask::IndexFiles {
+                table_id,
+                sstable_id,
+                files,
+            } => {
+                // Use the same S3 prefix distribution as SSTables.
+                let hex_prefix = hex_prefix_for(&sstable_id);
+                for (name, data) in files {
+                    let path = ObjectPath::from(format!(
+                        "{prefix}/{hex_prefix}/{table_id}/{sstable_id}/{name}"
+                    ));
+                    if let Err(e) =
+                        Self::put_with_retry(store.as_ref(), &path, data.clone(), 5).await
+                    {
+                        tracing_or_eprintln(format!("index upload failed for {path}: {e}"));
+                    }
+                }
+            }
+            UploadTask::CommitLogSegment {
+                segment_id,
+                data,
+                sha256: _,
+            } => {
+                let hex = hex_prefix_for(&segment_id.to_string());
+                let path =
+                    ObjectPath::from(format!("{prefix}/commitlog-archive/{hex}/{segment_id}.log"));
+                if let Err(e) = Self::put_with_retry(store.as_ref(), &path, data.clone(), 5).await {
+                    tracing_or_eprintln(format!("commitlog segment upload failed for {path}: {e}"));
+                }
+            }
+            UploadTask::Shutdown => {}
         }
     }
 
@@ -1881,6 +1977,153 @@ mod tests {
             if self.put_count.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.first_put_started.notify_one();
                 self.release_first_put.notified().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// t_31e0929c: one panicking upload must fail that upload, not close the
+    /// write-behind pipeline. One worker, so the panic and the next task hit
+    /// the same worker.
+    #[test]
+    fn a_panicking_upload_fails_only_itself_and_the_pipeline_keeps_uploading() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let inner = Arc::new(InMemory::new());
+            let store = Arc::new(PanicFirstPutStore {
+                inner: Arc::clone(&inner) as Arc<dyn ObjectStore>,
+                puts: AtomicUsize::new(0),
+            });
+            let manager = UploadManager::new_with_pools(
+                store as Arc<dyn ObjectStore>,
+                "p".into(),
+                16,
+                1,
+                1,
+                &tokio::runtime::Handle::current(),
+            );
+            let upload = |id: &str| {
+                let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+                (
+                    UploadTask::SSTableBytes {
+                        table_id: "ks.t".into(),
+                        sstable_id: id.into(),
+                        files: vec![SstableComponentBytes::new(
+                            "Data.db",
+                            Bytes::from_static(b"bytes"),
+                        )],
+                        on_complete: Some(tx),
+                    },
+                    rx,
+                )
+            };
+            let panics_before = crate::metrics::upload_task_panics_total();
+
+            let (first, first_rx) = upload("1");
+            manager.submit(first).await.unwrap();
+            let first_result = first_rx
+                .await
+                .expect("a panicked upload still answers its caller");
+            assert!(
+                first_result.as_ref().is_err_and(|e| e.contains("panicked")),
+                "{first_result:?}"
+            );
+            assert!(crate::metrics::upload_task_panics_total() > panics_before);
+
+            let (second, second_rx) = upload("2");
+            manager
+                .submit(second)
+                .await
+                .expect("the pipeline is still open after a panic");
+            second_rx
+                .await
+                .expect("the worker survived the panic and ran the next upload")
+                .expect("the next upload succeeds");
+            let hex = hex_prefix_for("2");
+            let path = sstable_object_key("p", &hex, "ks.t", "2", "Data.db");
+            inner.get(&path).await.expect("uploaded after the panic");
+            manager.shutdown().await;
+        });
+    }
+
+    struct PanicFirstPutStore {
+        inner: Arc<dyn ObjectStore>,
+        puts: AtomicUsize,
+    }
+
+    impl std::fmt::Display for PanicFirstPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PanicFirstPutStore")
+        }
+    }
+
+    impl std::fmt::Debug for PanicFirstPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PanicFirstPutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PanicFirstPutStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.puts.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("object store client panicked mid-put");
             }
             self.inner.put_opts(location, payload, opts).await
         }

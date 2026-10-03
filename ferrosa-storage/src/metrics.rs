@@ -592,6 +592,17 @@ pub fn observe_upload_file(bytes: u64, duration: Duration) {
     observe_upload_phase(UploadPhase::FilePut, duration);
 }
 
+static UPLOAD_TASK_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// An upload, delete or index task panicked; its worker survived it.
+pub fn inc_upload_task_panics() {
+    UPLOAD_TASK_PANICS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn upload_task_panics_total() -> u64 {
+    UPLOAD_TASK_PANICS_TOTAL.load(Ordering::Relaxed)
+}
+
 pub fn observe_upload_task(duration: Duration) {
     UPLOAD_TASKS_TOTAL.fetch_add(1, Ordering::Relaxed);
     observe_upload_phase(UploadPhase::WorkerTask, duration);
@@ -1302,6 +1313,14 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_upload_queue_depth {}\n",
         UPLOAD_QUEUE_DEPTH.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_upload_task_panics_total Object-store upload/delete tasks that panicked; the task's caller was told it failed and its worker kept running.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_upload_task_panics_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_upload_task_panics_total {}\n",
+        UPLOAD_TASK_PANICS_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str(
         "# HELP ferrosa_storage_upload_queue_depth_max Maximum observed upload queue depth.\n",
