@@ -935,6 +935,41 @@ where
     });
 }
 
+/// Hand `item` to a bounded range scan's consumer; `false` when the consumer
+/// is gone.
+///
+/// The send blocks while the consumer is not reading — a suspended PG portal,
+/// a client that stopped draining its socket — and that can last as long as
+/// the client likes. The producer holds one of the node's few pool slots, so a
+/// blocking send made while holding it lets one idle client stall every other
+/// scan on the node. Only a send that would block gives the slot up
+/// ([`ferrosa_sched::ScanSlot::park`]); one with room costs nothing extra.
+fn deliver(
+    slot: &mut ferrosa_sched::ScanSlot,
+    tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+    item: Result<Partition>,
+) -> bool {
+    use tokio::sync::mpsc::error::TrySendError;
+    match tx.try_send(item) {
+        Ok(()) => true,
+        Err(TrySendError::Closed(_)) => false,
+        Err(TrySendError::Full(item)) => slot.park(|| tx.blocking_send(item).is_ok()),
+    }
+}
+
+/// [`deliver`] a scan failure. Designed fallback: a consumer that has already
+/// gone has nobody to tell, so the error is logged rather than delivered.
+fn deliver_error(
+    slot: &mut ferrosa_sched::ScanSlot,
+    tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+    error: ferrosa_common::Error,
+) {
+    let message = error.to_string();
+    if !deliver(slot, tx, Err(error)) {
+        tracing::debug!(error = %message, "range scan failed after its consumer went away");
+    }
+}
+
 /// Open (pooled) the readers for every descriptor whose byte-comparable key
 /// range overlaps `[start, end]`, newest-first. Same logic as
 /// [`TableStore::open_readers_for_key_range`] but over cloned, `'static`-owned
@@ -4225,7 +4260,7 @@ impl<F: FlushTarget> TableStore<F> {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                    deliver_error(slot, &tx, e);
                     return;
                 }
             };
@@ -4250,7 +4285,7 @@ impl<F: FlushTarget> TableStore<F> {
             ) {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                    deliver_error(slot, &tx, e);
                     return;
                 }
             };
@@ -4263,7 +4298,7 @@ impl<F: FlushTarget> TableStore<F> {
                 }
                 match merger.next_merged_partition() {
                     Ok(Some(partition)) => {
-                        if tx.blocking_send(Ok(partition)).is_err() {
+                        if !deliver(slot, &tx, Ok(partition)) {
                             return;
                         }
                         emitted += 1;
@@ -4271,7 +4306,7 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                     Ok(None) => return,
                     Err(e) => {
-                        let _ = tx.blocking_send(Err(e));
+                        deliver_error(slot, &tx, e);
                         return;
                     }
                 }
@@ -4344,7 +4379,7 @@ impl<F: FlushTarget> TableStore<F> {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                    deliver_error(slot, &tx, e);
                     return;
                 }
             };
@@ -4372,7 +4407,7 @@ impl<F: FlushTarget> TableStore<F> {
             ) {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                    deliver_error(slot, &tx, e);
                     return;
                 }
             };
@@ -4380,7 +4415,7 @@ impl<F: FlushTarget> TableStore<F> {
             loop {
                 match merger.next_merged_partition() {
                     Ok(Some(partition)) => {
-                        if tx.blocking_send(Ok(partition)).is_err() {
+                        if !deliver(slot, &tx, Ok(partition)) {
                             // Consumer dropped (cancelled stream).
                             return;
                         }
@@ -4391,7 +4426,7 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                     Ok(None) => return,
                     Err(e) => {
-                        let _ = tx.blocking_send(Err(e));
+                        deliver_error(slot, &tx, e);
                         return;
                     }
                 }
@@ -4462,7 +4497,7 @@ impl<F: FlushTarget> TableStore<F> {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                    deliver_error(slot, &tx, e);
                     return;
                 }
             };
@@ -4486,7 +4521,7 @@ impl<F: FlushTarget> TableStore<F> {
             ) {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                    deliver_error(slot, &tx, e);
                     return;
                 }
             };
@@ -4495,14 +4530,14 @@ impl<F: FlushTarget> TableStore<F> {
             loop {
                 match merger.next_fragment(k) {
                     Ok(Some(fragment)) => {
-                        if tx.blocking_send(Ok(fragment.into_partition())).is_err() {
+                        if !deliver(slot, &tx, Ok(fragment.into_partition())) {
                             return;
                         }
                         slot.tick(); // B1 T1.2 cooperative yield
                     }
                     Ok(None) => return,
                     Err(e) => {
-                        let _ = tx.blocking_send(Err(e));
+                        deliver_error(slot, &tx, e);
                         return;
                     }
                 }
@@ -4564,7 +4599,7 @@ impl<F: FlushTarget> TableStore<F> {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                    deliver_error(slot, &tx, e);
                     return;
                 }
             };
@@ -4589,7 +4624,7 @@ impl<F: FlushTarget> TableStore<F> {
             ) {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
+                    deliver_error(slot, &tx, e);
                     return;
                 }
             };
@@ -4598,14 +4633,14 @@ impl<F: FlushTarget> TableStore<F> {
             loop {
                 match merger.next_fragment(k) {
                     Ok(Some(fragment)) => {
-                        if tx.blocking_send(Ok(fragment.into_partition())).is_err() {
+                        if !deliver(slot, &tx, Ok(fragment.into_partition())) {
                             return;
                         }
                         slot.tick(); // B1 T1.2 cooperative yield
                     }
                     Ok(None) => return,
                     Err(e) => {
-                        let _ = tx.blocking_send(Err(e));
+                        deliver_error(slot, &tx, e);
                         return;
                     }
                 }

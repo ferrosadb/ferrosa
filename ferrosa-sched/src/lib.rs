@@ -95,6 +95,19 @@ pub(crate) fn record_io_permit_acquired() {
     IO_PERMITS_ACQUIRED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+static SCAN_PARKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Times a scan producer released its pool slot to wait on a consumer that
+/// stopped reading ([`ScanSlot::park`]). Each is one wait, however long, so a
+/// rising rate means clients are leaving results unread, not that scans fail.
+pub fn scan_parks_total() -> u64 {
+    SCAN_PARKS_TOTAL.load(Ordering::Relaxed)
+}
+
+fn record_scan_park() {
+    SCAN_PARKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 // Chunk-budget tripwire (B1 T1.3 / FMEA FM-2). A scan chunk is the work between
 // two `ScanSlot::tick`s; a chunk longer than the budget is a *yield-point gap* —
 // the producer held the pool slot too long without a chance to cede it, which
@@ -222,6 +235,14 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_sched_io_permits_in_flight {}\n",
         pool.io_permits().in_flight()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_scan_parks_total Times a scan producer gave up its pool slot to wait on a consumer that stopped reading.\n\
+         # TYPE ferrosa_sched_scan_parks_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_scan_parks_total {}\n",
+        scan_parks_total()
     ));
     // Runtime-stall detector (Phase 3): async-runtime freeze visibility. Kept as
     // its own module (process-global counters, no dependence on the pool) so it
@@ -480,6 +501,7 @@ impl SchedPool {
                     // is immediate, and it becomes the tighter bound when the I/O
                     // reservation is lowered below CPU capacity.
                     let io_permit = io_permits.acquire().await;
+                    let io_permits = io_permits.clone();
                     let handle = tokio::runtime::Handle::current();
                     let out = tokio::task::spawn_blocking(move || {
                         let mut slot = ScanSlot {
@@ -491,7 +513,8 @@ impl SchedPool {
                             handle,
                             last_tick: Instant::now(),
                             window_micros: 0,
-                            _io_permit: io_permit,
+                            _io_permit: Some(io_permit),
+                            io_permits,
                             finished: false,
                         };
                         let out = f(&mut slot);
@@ -547,7 +570,10 @@ pub struct ScanSlot {
     /// The bulk-I/O permit (B2 T2.1) this scan holds for its producing lifetime,
     /// bounding concurrent bulk I/O on the `Lane::Bulk` reservation. Held only
     /// for its `Drop` (returned when the scan ends, panics, or is cancelled).
-    _io_permit: io_permits::IoPermit,
+    /// `None` only inside [`park`](Self::park).
+    _io_permit: Option<io_permits::IoPermit>,
+    /// Where [`park`](Self::park) re-acquires the permit.
+    io_permits: io_permits::IoPermits,
     finished: bool,
 }
 
@@ -590,6 +616,37 @@ impl ScanSlot {
             self.admit.reschedule(&self.handle, self.id, service);
         }
         self.last_tick = Instant::now();
+    }
+
+    /// Run `wait` — a block on something other than this scan's own work, such
+    /// as a send to a consumer that stopped reading — without holding a pool
+    /// slot or I/O permit, then re-compete for both before returning.
+    ///
+    /// A slot is a node-wide resource (`cores − reserved` of them). A producer
+    /// that blocks in its channel send while holding one hands its consumer —
+    /// a client with a suspended PG portal, or one that stopped draining its
+    /// socket — the power to stall every other scan on the node. Producers
+    /// must therefore try a non-blocking send first and wrap only the blocking
+    /// fallback here.
+    ///
+    /// Re-acquires in admission order (CPU slot, then I/O permit), and the same
+    /// deadlock rule as [`tick`](Self::tick) applies: hold no lock across it.
+    pub fn park<R>(&mut self, wait: impl FnOnce() -> R) -> R {
+        let suspended = self.admit.suspend(self.id);
+        drop(self._io_permit.take());
+        let out = wait();
+        if let Some(suspended) = suspended {
+            self.admit.resume(&self.handle, suspended);
+        }
+        let io_permits = self.io_permits.clone();
+        self._io_permit = Some(
+            self.handle
+                .block_on(async move { io_permits.acquire().await }),
+        );
+        crate::record_scan_park();
+        // Time spent parked is not this scan's service.
+        self.last_tick = Instant::now();
+        out
     }
 
     /// How many times this scan re-competed for its slot at a budget boundary.
@@ -793,6 +850,116 @@ mod tests {
             .expect("scan task joined"));
         assert_eq!(yields, 0);
         assert_eq!(pool.available_permits(), 1);
+    }
+
+    /// A producer blocked on a consumer that stopped reading (a suspended PG
+    /// portal, a client not draining its socket) must not hold its pool slot
+    /// or I/O permit while it waits: with the pool at capacity, every other
+    /// scan on the node would wait for that client. On resuming it re-competes,
+    /// so the pool is never over capacity.
+    ///
+    /// Run with the I/O bound equal to the CPU bound (each is the binding
+    /// constraint in turn) and above it (only the CPU slot serializes, so a
+    /// resume that skipped re-competing for it would show).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_parked_on_its_consumer_frees_its_slot_and_permit() {
+        parked_scan_scenario(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_resuming_from_park_re_competes_for_its_slot() {
+        parked_scan_scenario(2).await;
+    }
+
+    async fn parked_scan_scenario(io_capacity: usize) {
+        let mut pool = SchedPool::new(Reservation::new(1, 0));
+        pool.io_permits = io_permits::IoPermits::new(io_capacity);
+        let running = Arc::new(AtomicUsize::new(0));
+        let max_running = Arc::new(AtomicUsize::new(0));
+        let enter = {
+            let (running, max_running) = (running.clone(), max_running.clone());
+            move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                max_running.fetch_max(now, Ordering::SeqCst);
+            }
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
+        let (parking, parked) = tokio::sync::oneshot::channel::<()>();
+        let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stalled = {
+            let (enter, running) = (enter.clone(), running.clone());
+            let resumed = resumed.clone();
+            pool.submit_scan(SchedClass::Bulk, 64, std::future::pending::<()>(), {
+                move |slot| {
+                    enter();
+                    tx.try_send(0).expect("room for the first item");
+                    parking.send(()).expect("test is waiting");
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    let sent = slot.park(|| tx.blocking_send(1));
+                    resumed.store(true, Ordering::SeqCst);
+                    enter();
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    sent.is_ok()
+                }
+            })
+        };
+        parked.await.expect("the stalled scan started");
+
+        // The other scan holds the slot until released, so the stalled scan's
+        // resume below must wait for it.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let other = {
+            let running = running.clone();
+            pool.submit_scan(
+                SchedClass::Bulk,
+                64,
+                std::future::pending::<()>(),
+                move |_slot| {
+                    enter();
+                    hold.recv().expect("test releases the slot");
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    7u32
+                },
+            )
+        };
+        let mut admitted = false;
+        for _ in 0..1_000 {
+            if running.load(Ordering::SeqCst) == 1 {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            admitted,
+            "a scan parked on its consumer held the only slot: another scan was \
+             never admitted"
+        );
+
+        // The consumer reads; the stalled scan's send completes, and it must
+        // now wait for the slot the other scan holds.
+        assert_eq!(rx.recv().await, Some(0));
+        assert_eq!(rx.recv().await, Some(1));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !resumed.load(Ordering::SeqCst),
+            "a parked scan resumed without a slot while another scan held the only one"
+        );
+        release.send(()).expect("other scan is holding");
+        assert_eq!(ran(other.await.expect("other scan joined")), 7);
+        assert!(ran(stalled.await.expect("stalled scan joined")));
+        assert_eq!(
+            max_running.load(Ordering::SeqCst),
+            1,
+            "a resumed scan ran beside the scan holding the only slot"
+        );
+        assert_eq!(pool.available_permits(), 1, "every slot returned");
+        assert_eq!(
+            pool.io_permits.available(),
+            io_capacity,
+            "every I/O permit returned"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
