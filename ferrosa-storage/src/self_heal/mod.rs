@@ -256,7 +256,7 @@ impl SelfHealController {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                controller.run_one_tick();
+                controller.run_one_tick_guarded();
             }
         }))
     }
@@ -332,6 +332,32 @@ impl SelfHealController {
 
         self.publish_health(&snapshot, outcome.as_ref());
         self.tick = self.tick.saturating_add(1);
+    }
+
+    /// Run one tick inside a panic boundary. A panic is that tick's failure:
+    /// logged at ERROR, counted in `tick_panics_total`, and the next tick
+    /// runs. Before, a panic ended the controller's task for good, silently:
+    /// its JoinHandle is dropped by the caller (t_396d4c80). Returns whether
+    /// the tick completed.
+    pub(crate) fn run_one_tick_guarded(&mut self) -> bool {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_one_tick())) {
+            Ok(()) => true,
+            Err(payload) => {
+                metrics::inc_tick_panics();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                tracing::error!(
+                    tick = self.tick,
+                    panic = %message,
+                    "self-heal: controller tick panicked; the next tick runs"
+                );
+                self.tick = self.tick.saturating_add(1);
+                false
+            }
+        }
     }
 
     /// Execute the chosen action (if any) and update the ledger.
@@ -454,6 +480,39 @@ mod controller_tests {
         fn replica_posture(&self, _t: &TableKey) -> ReplicaPosture {
             self.posture
         }
+    }
+
+    struct PanickingCluster;
+    impl ClusterView for PanickingCluster {
+        fn this_host(&self) -> u64 {
+            0
+        }
+        fn owners(&self, _t: &TableKey) -> Option<Vec<u64>> {
+            panic!("cluster view exploded")
+        }
+        fn replica_posture(&self, _t: &TableKey) -> ReplicaPosture {
+            panic!("cluster view exploded")
+        }
+    }
+
+    /// t_396d4c80: a panicking tick must not end the controller.
+    #[test]
+    #[serial]
+    fn a_panicking_tick_is_counted_and_the_next_tick_runs() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        let engine = table_dir_with_n_generations_engine(2);
+        let mut c = SelfHealController::new(
+            engine,
+            Arc::new(PanickingCluster),
+            SelfHealConfig::default(),
+        );
+        assert!(!c.run_one_tick_guarded(), "the tick panicked");
+        assert!(
+            !c.run_one_tick_guarded(),
+            "and the controller ran the next one"
+        );
+        assert_eq!(metrics::self_heal_metrics().tick_panics_total, 2);
+        assert_eq!(c.tick(), 2, "a panicked tick still advances the clock");
     }
 
     #[test]
