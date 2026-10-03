@@ -47,7 +47,7 @@ machine but are otherwise loosely coupled:
 | `rebalance.rs` | token-skew rebalancing with data streaming |
 | `repair/` | Merkle trees, repair coordinator/executor, scheduler, quarantine→refill trigger, RPC, cluster view |
 | `hints/` | per-peer hint segments, delivery/replay, CRC + crash recovery |
-| `accord/` | EPaxos-family transactions: coordinator, state machine, recovery, dep-wait, cross-shard/DC, electorate, durability, deterministic test cluster |
+| `accord/` | EPaxos-family transactions: coordinator, state machine, bounded decided-txn record (`finalized.rs`, CL-33), recovery, dep-wait, cross-shard/DC, electorate, durability, deterministic test cluster |
 | `state.rs` | `SingleNodeClusterState` / `PairClusterState` / `RaftClusterState` |
 | `write_path.rs`, `raft_forward.rs`, `ddl_path.rs`, `index_coordination.rs`, `streaming/`, `system_table_*` | write routing, leader forwarding, DDL routing, index build coordination, SSTable streaming, system-table persistence |
 

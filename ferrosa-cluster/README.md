@@ -355,6 +355,15 @@ early acknowledgement.
   this, two transactions whose PreAccepts crossed each waited on the other until
   the 5 s dependency wait failed both, with every replica live (FMEA CL-28). A
   dependency cycle among parked transactions is refused loudly, never dropped.
+  A PreAccept for a transaction the replica already knows is decided is
+  refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)
+  and registers nothing; otherwise a PreAccept queued behind a no-write
+  finalize, or delayed past `prune_applied`, would register a conflict nothing
+  ever clears (FMEA CL-33). The record is `finalized.rs`'s `FinalizedTxns`:
+  exact tombstones plus a monotone floor, bounded by a 60 s retention horizon
+  (advanced by `prune_applied` from the shared HLC), a 250 000-id cap that
+  evicts into the floor, and a restart floor set when the HLC is wired, since
+  the replica does not replay its Accord log.
   `accord/quorum_availability.rs` drives real replicas through the real committer
   to pin the criterion: a live quorum commits while one replica is paused, and a
   lost quorum fails promptly naming the quorum.
