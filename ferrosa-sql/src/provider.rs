@@ -1,5 +1,7 @@
 //! The scan contract the engine pulls rows from.
 
+use std::sync::Arc;
+
 use crate::types::{RelSchema, Row};
 
 /// A source of rows with a known schema — the `TableProvider` equivalent the
@@ -8,19 +10,26 @@ use crate::types::{RelSchema, Row};
 pub trait TableProvider {
     fn schema(&self) -> &RelSchema;
     /// A pull-based scan over the table's rows.
-    fn scan(&self) -> Box<dyn Iterator<Item = Row> + '_>;
+    ///
+    /// The iterator owns what it reads and is `Send`: a query suspended between
+    /// pulls (a PostgreSQL portal stopped by `max_rows`) keeps its scans
+    /// without keeping a thread, and resumes them on whichever thread is free.
+    fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send>;
 }
 
 /// In-memory table for tests and small fixtures.
 #[derive(Debug, Clone)]
 pub struct InMemoryTable {
     schema: RelSchema,
-    rows: Vec<Row>,
+    rows: Arc<[Row]>,
 }
 
 impl InMemoryTable {
     pub fn new(schema: RelSchema, rows: Vec<Row>) -> Self {
-        Self { schema, rows }
+        Self {
+            schema,
+            rows: rows.into(),
+        }
     }
 
     pub fn rows(&self) -> &[Row] {
@@ -33,21 +42,21 @@ impl TableProvider for InMemoryTable {
         &self.schema
     }
 
-    fn scan(&self) -> Box<dyn Iterator<Item = Row> + '_> {
-        // The trait's `Item = Row` and the `'_` borrow make an owned-row scan
-        // impossible to express (the engine-wide contract is out of scope here).
+    fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
         // What matters is WHEN the copy happens: the old `self.rows.iter()
         // .cloned()` adapter eagerly cloned EVERY row the instant the scan was
         // requested, even if the consumer short-circuited after one. `LazyRows`
         // defers each clone to `next()`, so a `LIMIT`, `first()`, or key-
-        // predicate early-exit copies only the rows it actually pulls.
+        // predicate early-exit copies only the rows it actually pulls. It shares
+        // the rows through an `Arc` rather than borrowing them, so the scan
+        // owns what it reads.
         //
         // Residual cost: draining a whole scan is still O(table) — e.g.
         // `seq_scan(...).collect()` in the relational planner, tracked under
         // t_50d99192 (that is the executor's `Vec<Row>`, not this provider).
         // This change removes the eager copy that preceded it, not that.
         Box::new(LazyRows {
-            rows: &self.rows,
+            rows: Arc::clone(&self.rows),
             idx: 0,
         })
     }
@@ -56,12 +65,12 @@ impl TableProvider for InMemoryTable {
 /// A deferred clone over an [`InMemoryTable`]'s rows: each `next()` clones
 /// exactly one row, so work and peak are proportional to what the consumer
 /// pulls, never to the table size.
-struct LazyRows<'a> {
-    rows: &'a [Row],
+struct LazyRows {
+    rows: Arc<[Row]>,
     idx: usize,
 }
 
-impl Iterator for LazyRows<'_> {
+impl Iterator for LazyRows {
     type Item = Row;
 
     fn next(&mut self) -> Option<Row> {

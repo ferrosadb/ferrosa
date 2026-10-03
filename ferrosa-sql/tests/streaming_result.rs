@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use ferrosa_sql::spill::{DirReserver, SpillCtx};
 use ferrosa_sql::{
-    execute_streaming, parse_statement, Column, ColumnType, MapCatalog, RelSchema, Row, RowSink,
-    SelectStmt, Statement, TableProvider, Value,
+    execute_streaming, open_cursor, parse_statement, Column, ColumnType, MapCatalog, RelSchema,
+    Row, RowSink, SelectStmt, Statement, TableProvider, Value,
 };
 
 /// A table that yields `n` single-int rows and counts how many it has produced.
@@ -40,7 +40,7 @@ impl TableProvider for CountingTable {
         &self.schema
     }
 
-    fn scan(&self) -> Box<dyn Iterator<Item = Row> + '_> {
+    fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
         let produced = Arc::clone(&self.produced);
         // Descending so an ORDER BY has real work to do.
         Box::new((0..self.n).rev().map(move |i| {
@@ -187,4 +187,78 @@ fn a_sink_that_stops_early_stops_the_scan() {
         "the scan produced {} rows for a consumer that took 10",
         produced.load(Ordering::SeqCst)
     );
+}
+
+/// A cursor owns its pipeline, so it can be parked between pulls and each
+/// chunk pulled on a different thread (a suspended PG portal resumed by
+/// whichever blocking thread is free), with no gap, duplicate or reordering.
+#[test]
+fn a_cursor_resumes_on_another_thread_exactly_where_it_stopped() {
+    const N: i64 = 3_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A tiny budget forces the ORDER BY to spill, so spilled runs must move too.
+    let ctx = SpillCtx::new(Arc::new(DirReserver::new(dir.path())), 256);
+    let produced = Arc::new(AtomicUsize::new(0));
+    let cat = catalog(N, &produced);
+    let mut cursor = open_cursor(
+        &select("SELECT id FROM t WHERE id >= $1 ORDER BY id"),
+        &cat,
+        "public",
+        &[Value::Int(10)],
+        &ctx,
+    )
+    .expect("query opens");
+    // The parsed statement and the parameters are gone; the cursor owns copies.
+    assert_eq!(cursor.columns().len(), 1);
+
+    let mut seen = Vec::new();
+    loop {
+        let (back, chunk, done) = std::thread::spawn(move || {
+            let mut chunk = Vec::new();
+            let mut done = false;
+            for _ in 0..7 {
+                match cursor.next_row() {
+                    Some(row) => chunk.push(row.expect("no spill failure")),
+                    None => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            (cursor, chunk, done)
+        })
+        .join()
+        .expect("puller thread");
+        cursor = back;
+        seen.extend(chunk.into_iter().map(|row| match row.get(0) {
+            Value::Int(i) => *i,
+            other => panic!("expected int, got {other:?}"),
+        }));
+        if done {
+            break;
+        }
+    }
+    assert_eq!(seen, (10..N).collect::<Vec<_>>());
+    assert!(ctx.stats().spilled(), "the tiny budget must force a spill");
+}
+
+/// A plain scan through a cursor is pulled, not pushed: opening it reads
+/// nothing, and each pull reads only what it returns.
+#[test]
+fn a_cursor_reads_nothing_until_pulled() {
+    let produced = Arc::new(AtomicUsize::new(0));
+    let cat = catalog(5_000, &produced);
+    let mut cursor = open_cursor(
+        &select("SELECT id FROM t"),
+        &cat,
+        "public",
+        &[],
+        &SpillCtx::default(),
+    )
+    .expect("query opens");
+    assert_eq!(produced.load(Ordering::SeqCst), 0, "opening read rows");
+    for _ in 0..3 {
+        cursor.next_row().expect("a row").expect("no failure");
+    }
+    assert_eq!(produced.load(Ordering::SeqCst), 3);
 }

@@ -485,7 +485,7 @@ impl TableProvider for StreamingTable {
         &self.schema
     }
 
-    fn scan(&self) -> Box<dyn Iterator<Item = Row> + '_> {
+    fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
         let (tx, rx) = mpsc::channel(self.scan_buffer_rows);
         self.handle.spawn(guard_scan_producer(
             produce_scan(self.ctx.clone(), tx, self.failure.clone()),

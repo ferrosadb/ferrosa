@@ -29,8 +29,8 @@ pub use exec::{
 };
 pub use parser::{parse, parse_statement, ParseError};
 pub use plan::{
-    describe, execute, execute_streaming, execute_with, infer_param_types, ExecError, QueryResult,
-    RowSink,
+    describe, execute, execute_streaming, execute_with, infer_param_types, open_cursor, ExecError,
+    QueryResult, RowCursor, RowSink,
 };
 pub use provider::{InMemoryTable, TableProvider};
 pub use spill::{

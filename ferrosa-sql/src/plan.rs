@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use std::cmp::Ordering;
 
@@ -272,6 +273,73 @@ pub fn execute_streaming(
     ctx: &SpillCtx,
     sink: &mut dyn RowSink,
 ) -> Result<(), ExecError> {
+    let mut cursor = open_cursor(stmt, catalog, default_schema, params, ctx)?;
+    if sink.columns(cursor.columns()).is_break() {
+        return Ok(());
+    }
+    while let Some(row) = cursor.next_row() {
+        if sink.row(row?).is_break() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// An open query: its output columns and the lazy stream of its rows.
+///
+/// It owns everything its stream reads (the scans, copies of the predicates
+/// and bound parameters) and is `Send`. So a consumer that wants rows only on
+/// demand — a PostgreSQL portal suspended by `max_rows` — can hold it between
+/// pulls without holding a thread, and pull the next rows on whichever thread
+/// is free. Pulling may block (on storage, on spilled runs), so pull from a
+/// blocking-capable thread, never an async worker.
+pub struct RowCursor {
+    columns: Vec<Column>,
+    rows: TryRowStream<'static>,
+}
+
+impl fmt::Debug for RowCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RowCursor")
+            .field("columns", &self.columns)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RowCursor {
+    /// The output columns, known before any row is pulled.
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    /// The next output row, or `None` at the end of the result.
+    ///
+    /// # Errors
+    ///
+    /// A spill failure. The rows returned before it are an incomplete result;
+    /// the caller MUST report the error rather than treat the stream as done.
+    pub fn next_row(&mut self) -> Option<Result<Row, ExecError>> {
+        self.rows.next().map(|row| row.map_err(ExecError::Spill))
+    }
+}
+
+/// Resolve, plan and open `stmt` without pulling any output row.
+///
+/// Blocking operators (sort, aggregate, join, distinct) consume their input
+/// here, so this can take as long as those operators do. Every resolution error
+/// is returned before any row exists, as [`execute_streaming`] promises.
+///
+/// # Errors
+///
+/// Any [`ExecError`] from resolution, parameter validation or a blocking
+/// operator's spill.
+pub fn open_cursor(
+    stmt: &SelectStmt,
+    catalog: &dyn Catalog,
+    default_schema: &str,
+    params: &[Value],
+    ctx: &SpillCtx,
+) -> Result<RowCursor, ExecError> {
     // Fail loud up front if a referenced `$N` has no bound value.
     if let Some(f) = &stmt.filter {
         validate_params(f, params)?;
@@ -281,7 +349,6 @@ pub fn execute_streaming(
     }
     let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
 
-    // The providers must outlive the pipeline that scans them.
     let from = resolve_table(catalog, &stmt.from, default_schema)?;
     let join = match &stmt.join {
         Some(j) => Some(resolve_table(catalog, &j.table, default_schema)?),
@@ -291,21 +358,13 @@ pub fn execute_streaming(
         from: &*from,
         join: join.as_ref().map(|table| &**table as &dyn TableProvider),
     };
+    let params: Arc<[Value]> = params.into();
     let (columns, rows) = build_pipeline(stmt, &scope, &combined_schema, sources, params, ctx)?;
-
-    if sink.columns(&columns).is_break() {
-        return Ok(());
-    }
-    for row in rows {
-        let row = row.map_err(ExecError::Spill)?;
-        if sink.row(row).is_break() {
-            break;
-        }
-    }
-    Ok(())
+    Ok(RowCursor { columns, rows })
 }
 
-/// The scan sources of one query, borrowed for the life of its pipeline.
+/// The scan sources of one query. Their scans own what they read, so the
+/// pipeline does not borrow them.
 #[derive(Clone, Copy)]
 struct Sources<'a> {
     from: &'a dyn TableProvider,
@@ -313,11 +372,11 @@ struct Sources<'a> {
 }
 
 /// Scan the FROM (and hash-join the JOIN, if any) into the base row stream.
-fn base_stream<'a>(
+fn base_stream(
     stmt: &SelectStmt,
-    sources: Sources<'a>,
+    sources: Sources<'_>,
     ctx: &SpillCtx,
-) -> Result<TryRowStream<'a>, ExecError> {
+) -> Result<TryRowStream<'static>, ExecError> {
     let (Some(join), Some(join_provider)) = (&stmt.join, sources.join) else {
         return Ok(fallible(seq_scan(sources.from)));
     };
@@ -343,23 +402,25 @@ fn base_stream<'a>(
 
 /// WHERE: pre-resolve every comparison's column operand to a scope index
 /// (aggregates are illegal here), then keep rows that evaluate to `Some(true)`
-/// under Kleene logic. Streaming — a filter holds nothing.
-fn filter_stream<'a>(
-    stmt: &'a SelectStmt,
+/// under Kleene logic. Streaming — a filter holds nothing but its own copy of
+/// the predicate and parameters.
+fn filter_stream(
+    stmt: &SelectStmt,
     scope: &[Bound],
-    base_rows: TryRowStream<'a>,
-    params: &'a [Value],
-) -> Result<TryRowStream<'a>, ExecError> {
+    base_rows: TryRowStream<'static>,
+    params: Arc<[Value]>,
+) -> Result<TryRowStream<'static>, ExecError> {
     let Some(f) = &stmt.filter else {
         return Ok(base_rows);
     };
     let idx_map = resolve_where_operands(f, scope)?;
+    let f = f.clone();
     Ok(Box::new(base_rows.filter(move |r| match r {
         // Never swallow a spill failure to make a predicate tidy.
         Err(_) => true,
         Ok(row) => {
             let resolve = |op: &Operand| idx_map[&OperandKey::of(op)];
-            eval_kleene(f, row, params, &resolve) == Some(true)
+            eval_kleene(&f, row, &params, &resolve) == Some(true)
         }
     })))
 }
@@ -367,16 +428,16 @@ fn filter_stream<'a>(
 /// Build the whole operator pipeline for `stmt` and return its output columns
 /// with the lazy row stream. Nothing is pulled from the sources here except by
 /// blocking operators, which spill.
-fn build_pipeline<'a>(
-    stmt: &'a SelectStmt,
+fn build_pipeline(
+    stmt: &SelectStmt,
     scope: &[Bound],
     combined_schema: &RelSchema,
-    sources: Sources<'a>,
-    params: &'a [Value],
+    sources: Sources<'_>,
+    params: Arc<[Value]>,
     ctx: &SpillCtx,
-) -> Result<(Vec<Column>, TryRowStream<'a>), ExecError> {
+) -> Result<(Vec<Column>, TryRowStream<'static>), ExecError> {
     let base_rows = base_stream(stmt, sources, ctx)?;
-    let filtered = filter_stream(stmt, scope, base_rows, params)?;
+    let filtered = filter_stream(stmt, scope, base_rows, Arc::clone(&params))?;
 
     // Aggregate mode iff GROUP BY is present, any select item is an aggregate,
     // or HAVING is present.
@@ -591,13 +652,13 @@ fn simple_projection(
 /// scope (so it may name a non-selected column) and is applied before
 /// projection. With DISTINCT, the rows are projected and deduped first, then
 /// ORDER BY resolves against the OUTPUT columns.
-fn plan_simple<'a>(
+fn plan_simple(
     stmt: &SelectStmt,
     scope: &[Bound],
     combined_schema: &RelSchema,
-    rows: TryRowStream<'a>,
+    rows: TryRowStream<'static>,
     ctx: &SpillCtx,
-) -> Result<(Vec<Column>, TryRowStream<'a>), ExecError> {
+) -> Result<(Vec<Column>, TryRowStream<'static>), ExecError> {
     // Resolve the projection into output columns + source indices.
     let (columns, indices) = simple_projection(stmt, scope, combined_schema)?;
 
@@ -618,7 +679,7 @@ fn plan_simple<'a>(
     }
 
     // No DISTINCT: ORDER BY against the input scope, applied before projecting.
-    let ordered: TryRowStream<'a> = if stmt.order_by.is_empty() {
+    let ordered: TryRowStream<'static> = if stmt.order_by.is_empty() {
         rows
     } else {
         let mut keys = Vec::with_capacity(stmt.order_by.len());
@@ -637,14 +698,14 @@ fn plan_simple<'a>(
 /// evaluate HAVING against that layout (keep groups where it is `Some(true)`),
 /// then project the SELECT items, dedup if DISTINCT, and ORDER BY against the
 /// output columns.
-fn plan_aggregate<'a>(
-    stmt: &'a SelectStmt,
+fn plan_aggregate(
+    stmt: &SelectStmt,
     scope: &[Bound],
     combined_schema: &RelSchema,
-    rows: TryRowStream<'a>,
-    params: &'a [Value],
+    rows: TryRowStream<'static>,
+    params: Arc<[Value]>,
     ctx: &SpillCtx,
-) -> Result<(Vec<Column>, TryRowStream<'a>), ExecError> {
+) -> Result<(Vec<Column>, TryRowStream<'static>), ExecError> {
     // Resolve GROUP BY columns to global indices.
     let mut group_cols = Vec::with_capacity(stmt.group_by.len());
     for cr in &stmt.group_by {
@@ -730,20 +791,23 @@ fn plan_aggregate<'a>(
 
     // HAVING filter over the internal layout (Kleene; keep Some(true)).
     let group_len = group_cols.len();
-    let kept: TryRowStream<'a> = match (&stmt.having, having_map) {
-        (Some(h), Some(map)) => Box::new(internal_rows.filter(move |r| match r {
-            // Never swallow a spill failure to make a predicate tidy.
-            Err(_) => true,
-            Ok(row) => {
-                let resolve = |op: &Operand| map[&OperandKey::of(op)];
-                eval_kleene(h, row, params, &resolve) == Some(true)
-            }
-        })),
+    let kept: TryRowStream<'static> = match (&stmt.having, having_map) {
+        (Some(h), Some(map)) => {
+            let h = h.clone();
+            Box::new(internal_rows.filter(move |r| match r {
+                // Never swallow a spill failure to make a predicate tidy.
+                Err(_) => true,
+                Ok(row) => {
+                    let resolve = |op: &Operand| map[&OperandKey::of(op)];
+                    eval_kleene(&h, row, &params, &resolve) == Some(true)
+                }
+            }))
+        }
         _ => internal_rows,
     };
 
     // Project the SELECT items out of the internal layout.
-    let projected: TryRowStream<'a> = Box::new(kept.map(move |r| {
+    let projected: TryRowStream<'static> = Box::new(kept.map(move |r| {
         r.map(|r| {
             Row(slots
                 .iter()

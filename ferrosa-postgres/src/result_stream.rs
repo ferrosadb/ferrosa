@@ -382,7 +382,7 @@ mod tests {
             &self.schema
         }
 
-        fn scan(&self) -> Box<dyn Iterator<Item = Row> + '_> {
+        fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
             let produced = Arc::clone(&self.produced);
             let poison_at = self.poison_at;
             Box::new((0..self.n).map(move |i| {
