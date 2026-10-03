@@ -38,7 +38,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   allocation, forward-linked sync markers, crash-recovery replay, CDC reader,
   S3 archiver for PITR, and per-table checkpoints. Three sync strategies
   (`Batch`, `Periodic`, `Group`); **default is `Periodic`** → a bounded
-  durability window (see FMEA).
+  durability window (see FMEA). Open-time replay re-logs every mutation it
+  keeps only in memory into the new log generation (`ReplayRelog`) and fsyncs
+  it before deleting the old segment, so a second crash before the table
+  flushes loses nothing (FMEA ST-72).
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
   memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`, and
   every view change is a compare-and-swap derived from the current view.
