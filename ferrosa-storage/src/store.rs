@@ -50,9 +50,9 @@ use ferrosa_index::DistanceMetric;
 use crate::flush::{self, FlushTarget};
 use crate::index::sidecar::{RowPositionRef, SidecarReader};
 use crate::memtable::index::MemtableIndex;
-#[cfg(not(feature = "skiplist-memtable"))]
+#[cfg(any(not(feature = "skiplist-memtable"), miri))]
 use crate::memtable::sharded::ShardedBTreeMemtable;
-#[cfg(feature = "skiplist-memtable")]
+#[cfg(all(feature = "skiplist-memtable", not(miri)))]
 use crate::memtable::skiplist::SkipListMemtable;
 use crate::memtable::vector_index::VectorMemtableIndex;
 use crate::memtable::Memtable;
@@ -820,12 +820,17 @@ impl<F: FlushTarget> FulltextSidecarBuild<F> {
     }
 }
 
+/// Under Miri the sharded BTree memtable is used whatever the features say:
+/// crossbeam-skiplist 0.1.3 / crossbeam-epoch 0.9.18 trip Miri's aliasing
+/// models inside their own code (upstream, crossbeam#545), which would stop
+/// Miri before it reaches ferrosa's own unsafe (`OwnedMerger`). Production
+/// builds never set `miri`.
 fn new_memtable() -> Arc<dyn Memtable> {
-    #[cfg(feature = "skiplist-memtable")]
+    #[cfg(all(feature = "skiplist-memtable", not(miri)))]
     {
         Arc::new(SkipListMemtable::new())
     }
-    #[cfg(not(feature = "skiplist-memtable"))]
+    #[cfg(any(not(feature = "skiplist-memtable"), miri))]
     {
         Arc::new(ShardedBTreeMemtable::with_default_shards())
     }
@@ -1068,7 +1073,10 @@ impl<R: ReadAt + Send + Sync + 'static> OwnedMerger<R> {
         // `Box` pointers, not the allocations, so the references stay valid
         // for as long as `merger` can use them; nothing hands them out beyond
         // the struct. This is the stable-allocation pattern the merger itself
-        // uses for its SSTable runs (`runs_arena`).
+        // uses for its SSTable runs (`runs_arena`). On unwind the struct drops
+        // like any other value, merger first. Checked under Miri (Tree
+        // Borrows): `owned_merger_*` tests, which a projection freed early
+        // turns into a reported use-after-free.
         let view_ref: &'static StoreView = unsafe { &*Arc::as_ptr(&view) };
         let readers_ref: &'static [Arc<SSTableReader<R>>] =
             unsafe { &*(&*readers as *const [Arc<SSTableReader<R>>]) };
@@ -15122,6 +15130,118 @@ mod tests {
             }
         }
         store
+    }
+
+    /// An `OwnedMerger` over the whole of `store`.
+    fn owned_merger_over(
+        store: &TableStore<InMemoryFlushTarget>,
+    ) -> OwnedMerger<<InMemoryFlushTarget as FlushTarget>::Reader> {
+        let view = store.view.load_full();
+        let readers = open_pooled_readers(
+            &store.reader_pool,
+            &store.pool_table_key,
+            &*store.flush_target,
+            &view.sstables,
+            None,
+            None,
+        )
+        .unwrap();
+        let schema = store.schema.load_full();
+        OwnedMerger::open(view, readers, &schema, None, None, None).unwrap()
+    }
+
+    /// The `OwnedMerger` self-reference (unsafe) under the conditions it must
+    /// survive, with no async runtime so Miri can run it
+    /// (`cargo +nightly miri test -p ferrosa-storage --lib owned_merger`):
+    /// moved between threads mid-scan, outliving the store it came from, and
+    /// dropped, all yielding exactly what a plain merger yields.
+    #[test]
+    fn owned_merger_keeps_its_place_across_threads_and_outlives_its_store() {
+        let store = store_across_sources(24);
+        let reference: Vec<DecoratedKey> = {
+            let mut owned = owned_merger_over(&store);
+            std::iter::from_fn(|| owned.merger.next_merged_partition().unwrap())
+                .map(|p| p.key)
+                .collect()
+        };
+        assert_eq!(reference.len(), 24);
+
+        let mut owned = owned_merger_over(&store);
+        // The merger owns what it borrows: the store can go first.
+        drop(store);
+        let mut keys = Vec::new();
+        loop {
+            let (back, chunk, done) = std::thread::spawn(move || {
+                let mut chunk = Vec::new();
+                for _ in 0..5 {
+                    match owned.merger.next_merged_partition().unwrap() {
+                        Some(p) => chunk.push(p.key),
+                        None => return (owned, chunk, true),
+                    }
+                }
+                (owned, chunk, false)
+            })
+            .join()
+            .expect("puller thread");
+            owned = back;
+            keys.extend(chunk);
+            if done {
+                break;
+            }
+        }
+        drop(owned);
+        assert_eq!(keys, reference);
+    }
+
+    /// The projected variant: the merger reads the owned projection (`wanted`)
+    /// on every SSTable partition it decodes, so Miri sees each use of that
+    /// self-borrow after the struct has moved threads and the store is gone.
+    #[test]
+    fn owned_merger_reads_its_owned_projection_after_moving() {
+        let store = store_across_sources(18);
+        let view = store.view.load_full();
+        let readers = open_pooled_readers(
+            &store.reader_pool,
+            &store.pool_table_key,
+            &*store.flush_target,
+            &view.sstables,
+            None,
+            None,
+        )
+        .unwrap();
+        let schema = store.schema.load_full();
+        let mut owned =
+            OwnedMerger::open(view, readers, &schema, Some(vec![0]), None, None).unwrap();
+        drop(store);
+        let keys = std::thread::spawn(move || {
+            let mut keys = Vec::new();
+            while let Some(p) = owned.merger.next_merged_partition().unwrap() {
+                keys.push(p.key);
+            }
+            keys
+        })
+        .join()
+        .expect("puller thread");
+        assert_eq!(keys.len(), 18);
+    }
+
+    /// A panic mid-scan unwinds through the `OwnedMerger`: the merger is
+    /// dropped before the readers, mappings and view it borrows.
+    #[test]
+    fn owned_merger_unwinds_cleanly_from_a_panic_mid_scan() {
+        let store = store_across_sources(12);
+        let mut owned = owned_merger_over(&store);
+        drop(store);
+        let outcome = std::thread::spawn(move || {
+            owned
+                .merger
+                .next_merged_partition()
+                .unwrap()
+                .expect("a partition");
+            panic!("mid-scan");
+        })
+        .join();
+        assert!(outcome.is_err(), "the puller panicked and unwound");
     }
 
     /// A scan whose consumer keeps stalling pauses (no slot, no thread) and
