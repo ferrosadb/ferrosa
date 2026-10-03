@@ -12,28 +12,39 @@ use uuid::Uuid;
 /// Used both after a force-promote rejoin (to sync schema + data replay) and
 /// after a normal pair reconnection (to catch up schema changes the secondary
 /// missed while it was offline).
+///
+/// Returns whether the peer acknowledged the snapshot, so a caller that counts
+/// pushes counts deliveries rather than attempts.
 pub(super) async fn send_schema_sync_to_peer(
     pm: &PeerManager,
     peer_host_id: Uuid,
     schema: &Schema,
-) {
+) -> bool {
     let snap = schema.snapshot();
     let wire_snap = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snap);
-    match serde_json::to_vec(&wire_snap) {
-        Ok(json) => {
-            match pm
-                .send(
-                    peer_host_id,
-                    Message::PairSchemaSync(Bytes::from(json)),
-                    Lane::Bulk,
-                )
-                .await
-            {
-                Ok(_) => tracing::info!("schema snapshot sent to rejoined peer"),
-                Err(e) => tracing::warn!(%e, "failed to send schema snapshot"),
-            }
+    let json = match serde_json::to_vec(&wire_snap) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::error!(%e, peer = %peer_host_id, "failed to serialize schema snapshot");
+            return false;
         }
-        Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot"),
+    };
+    match pm
+        .send(
+            peer_host_id,
+            Message::PairSchemaSync(Bytes::from(json)),
+            Lane::Bulk,
+        )
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(peer = %peer_host_id, "schema snapshot sent to rejoined peer");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(%e, peer = %peer_host_id, "failed to send schema snapshot");
+            false
+        }
     }
 }
 

@@ -4455,6 +4455,31 @@ async fn downgrade_to_pair_is_refused_unless_the_node_is_a_cluster_member() {
     }
 }
 
+/// A schema push that never reached the peer must not report as delivered.
+///
+/// `SCHEMA_SNAPSHOT_PUSHES_TOTAL` is documented as the only signal that the
+/// rejoin schema push ran, and it was incremented after the send regardless of
+/// its outcome. The helper now reports delivery so the counter counts pushes
+/// the peer acknowledged.
+#[tokio::test]
+async fn schema_sync_to_an_unreachable_peer_reports_not_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let pm = PeerManager::new(
+        Arc::new(NetConfig::default()),
+        controller.host_id(),
+        controller.clone(),
+    );
+    let schema = test_schema();
+
+    let delivered = super::token::send_schema_sync_to_peer(&pm, Uuid::new_v4(), &schema).await;
+
+    assert!(
+        !delivered,
+        "a schema snapshot sent to a peer with no connection must report not delivered"
+    );
+}
+
 /// The automatic path still cannot do this.
 ///
 /// The override must not have widened the normal transition. If it had, the
