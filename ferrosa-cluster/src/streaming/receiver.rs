@@ -43,7 +43,7 @@ impl Default for StreamSessionLimits {
 }
 
 use ferrosa_common::key::DecoratedKey;
-use ferrosa_common::{PartitionKey, Token};
+use ferrosa_common::PartitionKey;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
@@ -217,14 +217,10 @@ impl StreamSession {
                 ClusterError::Internal(format!("stream: failed to decode staged mutation: {e}"))
             })?;
             let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-            // Reconstruct a minimal DecoratedKey from the raw key bytes.
-            // We use Token(0) as a placeholder — the storage engine uses the
-            // key bytes for lookup, not the token, so this is safe for
-            // mutation application during bootstrap streaming.
-            let key = DecoratedKey {
-                token: Token(0),
-                key: PartitionKey::new(mutation.key.clone()),
-            };
+            // Decorate with the key's real Murmur3 token. `DecoratedKey`
+            // orders by token first, so a placeholder token files the
+            // partition where no read at its real token will look.
+            let key = DecoratedKey::new(PartitionKey::new(mutation.key.clone()));
 
             // Decode the row bytes. The sender serializes rows as
             // Vec<RowWire> via bincode. Fall back to a single-cell
@@ -838,6 +834,66 @@ mod tests {
         assert_eq!(result.session_id, 1);
     }
 
+    /// A streamed row must be readable afterwards by its partition key. The
+    /// receiver decorated every key with `Token(0)` ("the storage engine uses
+    /// the key bytes for lookup, not the token"), but `DecoratedKey` orders by
+    /// token first, so the partition landed at token 0 and a read at the
+    /// key's real Murmur3 token did not find it.
+    #[tokio::test]
+    async fn a_streamed_row_is_readable_by_its_partition_key() {
+        use crate::raft::handlers::RowWire;
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_table(&storage, "ks", "tbl");
+
+        let key = b"streamed-partition".to_vec();
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"v".to_vec(), 7))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(7),
+        };
+        let mutation = StreamedMutation {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key: key.clone(),
+            row: bincode::serialize(&vec![RowWire::from(row)]).unwrap(),
+            timestamp: 7,
+        };
+        let checksum = compute_checksum(std::slice::from_ref(&mutation));
+        let start = StreamStartPayload {
+            session_id: 41,
+            source_node: 10,
+            token_range_start: i64::MIN,
+            token_range_end: i64::MAX,
+            estimated_bytes: 0,
+        };
+        let chunks = vec![StreamChunkPayload {
+            session_id: 41,
+            mutations: vec![mutation],
+        }];
+        let end = StreamEndPayload {
+            session_id: 41,
+            total_mutations: 1,
+            checksum,
+        };
+        StreamReceiver::receive_and_apply(&storage, start, chunks, end)
+            .await
+            .unwrap();
+
+        let table_id = TableId::new("ks", "tbl");
+        let read = storage
+            .read(&table_id, &DecoratedKey::new(PartitionKey::new(key)))
+            .unwrap();
+        assert!(
+            read.is_some_and(|p| !p.rows.is_empty()),
+            "a bootstrap-streamed partition must be readable at its real token"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 2. Bad checksum → error, storage not corrupted
     // -----------------------------------------------------------------------
@@ -1196,10 +1252,11 @@ mod tests {
 
         // Read back from storage and verify the full row was applied.
         let table_id = ferrosa_storage::TableId::new("ks", "tbl");
-        let key = ferrosa_common::key::DecoratedKey {
-            token: ferrosa_common::Token(0),
-            key: ferrosa_common::PartitionKey::new(42u64.to_be_bytes().to_vec()),
-        };
+        // At the key's REAL token: this test used to read back at `Token(0)`,
+        // which pinned the placeholder-token bug instead of catching it.
+        let key = ferrosa_common::key::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            42u64.to_be_bytes().to_vec(),
+        ));
         let partition = storage.read(&table_id, &key).unwrap();
         assert!(partition.is_some(), "should find stored partition");
         let partition = partition.unwrap();
