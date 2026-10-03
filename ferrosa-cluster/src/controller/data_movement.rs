@@ -388,7 +388,12 @@ pub fn partition_to_streamed_mutation(
     partition: Partition,
 ) -> std::result::Result<crate::streaming::StreamedMutation, String> {
     crate::streaming::StreamedMutation::from_partition(table.keyspace(), table.table(), &partition)
-        .map_err(|e| format!("{table}: failed to encode partition {:?}: {e}", partition.key))
+        .map_err(|e| {
+            format!(
+                "{table}: failed to encode partition {:?}: {e}",
+                partition.key
+            )
+        })
 }
 
 /// Production [`PartitionStreamer`]: one row-stream session per batch, with
@@ -725,7 +730,10 @@ mod tests {
         let mutation = partition_to_streamed_mutation(&fx::table_id(), source.clone()).unwrap();
         let decoded = crate::streaming::decode_partition_envelope(&mutation.row).unwrap();
 
-        assert_eq!(decoded.deletion, source.deletion, "partition deletion dropped");
+        assert_eq!(
+            decoded.deletion, source.deletion,
+            "partition deletion dropped"
+        );
         assert_eq!(decoded.static_row, source.static_row, "static row dropped");
         assert_eq!(decoded.rows.count(), source.rows.len());
     }
