@@ -334,6 +334,21 @@ impl PeerManager {
             pool.shutdown().await;
             return false;
         }
+        // The single admission point for every pool, so the identity check
+        // `dial_verified` performs also covers callers that dial with
+        // `PriorityPool::connect` and register through `add_peer` (t_b78e8e9a).
+        let answered_by = pool.peer_host_id();
+        if answered_by != host_id {
+            tracing::error!(
+                expected = %host_id,
+                %answered_by,
+                addr = %peer_id.1,
+                answered_by_self = answered_by == self.local_host_id,
+                "refusing to pool a connection: the handshake was answered by a different node"
+            );
+            pool.shutdown().await;
+            return false;
+        }
         // Extract the peer's broadcasts from the handshake before wrapping in Arc.
         let cql_broadcast = pool.peer_cql_broadcast().map(str::to_owned);
         let internode_broadcast = pool.peer_internode_broadcast().map(str::to_owned);
@@ -1854,6 +1869,63 @@ mod tests {
         );
         assert!(fx.pm.has_peer(fx.peer_id), "the peer entry must be kept");
         fx.pm.remove_peer(fx.peer_id).await;
+    }
+
+    /// `add_peer` must refuse a pool whose handshake was answered by a
+    /// different node than the id it is being registered under.
+    ///
+    /// `ensure_peer` and the re-dial path verify identity (`dial_verified`), but
+    /// six controller paths (pair reverse dial, formation, membership refresh,
+    /// inbound reverse dial, pair node) call `PriorityPool::connect` and then
+    /// `add_peer` directly. Without the check at the install point, any of them
+    /// pools whoever answers the address under the expected id: the
+    /// t_b78e8e9a "unknown peer: <local>" shape when that is this node, and an
+    /// impostor otherwise. The other side of the boundary (a matching id is
+    /// installed) is `install_after_removal_is_refused_and_leaves_no_trace`'s
+    /// sibling flow and every `ensure_peer` test.
+    #[tokio::test]
+    async fn add_peer_refuses_a_pool_answered_by_a_different_node() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let actual_id = uuid::Uuid::new_v4();
+        let server = Arc::new(RpcServer::new(
+            config.clone(),
+            actual_id,
+            registry_with_ping(),
+        ));
+        let addr = server.start_and_get_addr().await.unwrap();
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(
+            Arc::new(config.clone()),
+            uuid::Uuid::new_v4(),
+            listener.clone(),
+        );
+        let pool = PriorityPool::connect(
+            Arc::new(config),
+            pm.local_host_id(),
+            &addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pool.peer_host_id(), actual_id);
+
+        let expected_id = uuid::Uuid::new_v4();
+        pm.add_peer((expected_id, addr), pool).await;
+
+        assert!(
+            !pm.has_peer(expected_id),
+            "a pool answered by {actual_id} was registered under {expected_id}"
+        );
+        assert_eq!(
+            listener.connected_count.load(Ordering::Relaxed),
+            0,
+            "a refused pool must not announce a connected peer"
+        );
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     /// A re-dial that completes after its peer was removed must be refused:
