@@ -10636,6 +10636,12 @@ async fn route_create_table(
 
 /// Persist the registry snapshot before a DDL statement is acknowledged.
 ///
+/// Called by CREATE, ALTER and DROP TABLE. ALTER matters as much as CREATE:
+/// without it a node killed after an acknowledged ALTER restarts with the
+/// pre-ALTER table in `schema.json`, binds that column layout, and reads rows
+/// written after the ALTER against the wrong ordinals (the pair smoke's
+/// `v = null`, 2026-10-01).
+///
 /// The storage-side record (`storage-schema.json`) alone cannot rebuild a
 /// CQL-nameable table after a crash: it carries the partition key's *type*
 /// (`org.apache.cassandra.db.marshal.Int32Type`) but never the key column's
@@ -10664,7 +10670,7 @@ fn persist_registry_snapshot_before_ack(
         .persist(&snapshot)
         .map_err(|e| {
             CqlError::ServerError(format!(
-                "CREATE TABLE durability barrier: registry snapshot persist failed for \
+                "DDL durability barrier: registry snapshot persist failed for \
                  {table_name}: {e}"
             ))
         })
@@ -10907,17 +10913,25 @@ async fn route_alter_table(
             let snap = state.schema.snapshot();
             if let Some(tbl) = snap.tables.get(&(ks.to_string(), s.table.clone())) {
                 let tid = ferrosa_storage::TableId::new(ks, &s.table);
-                if let Err(e) = state
+                // Fail the statement rather than acknowledge an ALTER the
+                // engine did not take: the registry now has the new columns
+                // and the engine the old ones, so writes would be misplaced.
+                state
                     .engine
                     .update_table_schema(&tid, tbl.to_storage_schema())
-                {
-                    tracing::error!(
-                        %e,
-                        keyspace = %ks,
-                        table = %s.table,
-                        "Direct ALTER: engine.update_table_schema failed — future flushes may panic on stale column count"
-                    );
-                }
+                    .map_err(|e| {
+                        tracing::error!(
+                            %e,
+                            keyspace = %ks,
+                            table = %s.table,
+                            "Direct ALTER: engine.update_table_schema failed; ALTER NOT acknowledged"
+                        );
+                        CqlError::ServerError(format!(
+                            "ALTER TABLE {ks}.{}: storage engine did not apply the new column \
+                             set: {e}",
+                            s.table
+                        ))
+                    })?;
             }
         }
         DdlPath::Pair(coordinator) => {
@@ -10942,6 +10956,8 @@ async fn route_alter_table(
             ));
         }
     }
+
+    persist_registry_snapshot_before_ack(state, &s.table)?;
 
     emit_schema_change(
         state,
@@ -11019,6 +11035,8 @@ async fn route_drop_table(
             ));
         }
     }
+
+    persist_registry_snapshot_before_ack(state, &s.table)?;
 
     emit_schema_change(
         state,
@@ -21090,6 +21108,70 @@ mod tests {
             vec!["id".to_string()],
             "the registry snapshot must carry the partition-key column NAME, which \
              is the field the storage-side record cannot express"
+        );
+    }
+
+    /// RED (nightly pair smoke, 2026-10-01..03): the CREATE TABLE barrier
+    /// above persisted the registry snapshot, but ALTER TABLE did not, so a
+    /// node killed after an acknowledged ALTER restarted with the pre-ALTER
+    /// table in schema.json while storage-schema.json held the post-ALTER
+    /// layout. The engine binds the registry definition, so rows written after
+    /// the ALTER were read against the old column ordinals.
+    #[tokio::test]
+    async fn alter_and_drop_table_persist_the_registry_snapshot_before_acknowledging() {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let persisted = || {
+            ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(dir.path())
+                .load()
+                .expect("registry snapshot must load")
+                .expect("registry snapshot must exist")
+        };
+
+        for cql in [
+            "CREATE KEYSPACE dur_ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE dur_ks.t (id int PRIMARY KEY, v text)",
+            "CREATE TABLE dur_ks.gone (id int PRIMARY KEY, v text)",
+            "ALTER TABLE dur_ks.t ADD extra text",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let altered = persisted()
+            .tables
+            .get(&("dur_ks".to_string(), "t".to_string()))
+            .cloned()
+            .expect("t must be in the registry snapshot");
+        assert!(
+            altered.columns.contains_key("extra"),
+            "ALTER TABLE was acknowledged but schema.json still holds the pre-ALTER \
+             table (columns {:?}); a crash now restarts with the old column layout",
+            altered.columns.keys().collect::<Vec<_>>()
+        );
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP TABLE dur_ks.gone").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !persisted()
+                .tables
+                .contains_key(&("dur_ks".to_string(), "gone".to_string())),
+            "DROP TABLE was acknowledged but schema.json still names the table; a \
+             crash now resurrects it in the registry over a deleted SSTable directory"
         );
     }
 

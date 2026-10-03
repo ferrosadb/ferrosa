@@ -3011,6 +3011,9 @@ impl ModeController {
                         Arc::new(PairSchemaSyncHandler::for_cluster(
                             schema_for_replay.clone(),
                             storage_for_bootstrap.clone(),
+                            // A returning member only ever RECEIVES the
+                            // cluster's schema here, so it is a receiver.
+                            Arc::new(ArcSwap::from_pointee(crate::pair::PairRole::Secondary)),
                         )),
                     );
 

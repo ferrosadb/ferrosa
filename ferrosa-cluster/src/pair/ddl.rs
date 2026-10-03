@@ -687,6 +687,7 @@ impl WireSchemaSnapshot {
 pub struct PairSchemaSyncHandler {
     schema: Arc<Schema>,
     engine: Arc<StorageEngine>,
+    role: Arc<ArcSwap<PairRole>>,
     /// Refuse a snapshot that lacks a table holding local data, instead of
     /// dropping it. Set for the cluster shape: see [`Self::for_cluster`].
     refuse_ambiguous_drops: bool,
@@ -694,11 +695,17 @@ pub struct PairSchemaSyncHandler {
 
 impl PairSchemaSyncHandler {
     /// Pair mode: the peer is the one primary, so a table missing from its
-    /// snapshot is a DROP this node missed, and is finished as one.
-    pub fn new(schema: Arc<Schema>, engine: Arc<StorageEngine>) -> Self {
+    /// snapshot is a DROP this node missed, and is finished as one. `role` is
+    /// this node's live pair role.
+    pub fn new(
+        schema: Arc<Schema>,
+        engine: Arc<StorageEngine>,
+        role: Arc<ArcSwap<PairRole>>,
+    ) -> Self {
         Self {
             schema,
             engine,
+            role,
             refuse_ambiguous_drops: false,
         }
     }
@@ -710,10 +717,15 @@ impl PairSchemaSyncHandler {
     /// (`DropTable`, or a snapshot install that already refuses this case,
     /// CL-22). A snapshot that would drop a table holding local data is
     /// refused whole, loudly, rather than deleting it.
-    pub fn for_cluster(schema: Arc<Schema>, engine: Arc<StorageEngine>) -> Self {
+    pub fn for_cluster(
+        schema: Arc<Schema>,
+        engine: Arc<StorageEngine>,
+        role: Arc<ArcSwap<PairRole>>,
+    ) -> Self {
         Self {
             schema,
             engine,
+            role,
             refuse_ambiguous_drops: true,
         }
     }
@@ -727,6 +739,21 @@ impl RpcHandler for PairSchemaSyncHandler {
             _ => return None,
         };
 
+        // Only a receiver applies a peer's schema. A snapshot arriving at a
+        // primary comes from a node that wrongly believes it leads (a restarted,
+        // unpromoted node elects itself by host-id order until the promoted
+        // peer corrects it). Applying it would read every table the stale node
+        // lacks as a missed DROP and delete it, SSTables included.
+        if **self.role.load() == PairRole::Primary {
+            tracing::error!(
+                peer = %from.0,
+                "PairSchemaSync REFUSED: this node is the pair primary and its schema is \
+                 authoritative; a peer pushing its own schema believes it leads and is \
+                 stale. Nothing was applied or dropped."
+            );
+            return None;
+        }
+
         let wire: WireSchemaSnapshot = match serde_json::from_slice(&body) {
             Ok(s) => s,
             Err(e) => {
@@ -735,14 +762,44 @@ impl RpcHandler for PairSchemaSyncHandler {
             }
         };
         let snapshot = wire.into_snapshot();
+        let primary_version = snapshot.version;
+
+        if let Err(e) = self.converge(&snapshot) {
+            tracing::error!(%e, "PairSchemaSync: catch-up failed; not acknowledging");
+            return None;
+        }
+        let divergent = schema_divergence(&snapshot, &self.schema.snapshot());
+        if !divergent.is_empty() {
+            tracing::error!(
+                ?divergent,
+                "PairSchemaSync: applied the primary's schema but this node still differs; \
+                 not acknowledging, so a switchover to this node is refused"
+            );
+            return None;
+        }
+
+        // Converged: adopt the primary's version so the primary can verify it
+        // from the ack before ever handing this node the primary role.
+        self.schema.set_schema_version(primary_version);
+        Some(Message::PairDdlAck(Bytes::copy_from_slice(
+            primary_version.as_bytes(),
+        )))
+    }
+}
+
+impl PairSchemaSyncHandler {
+    /// Bring this node's registry and engine to the primary's snapshot:
+    /// insert what is missing, replace what differs (a missed ALTER, or a
+    /// missed DROP + CREATE when the table id changed), and drop what the
+    /// primary no longer has (a missed DROP).
+    fn converge(&self, snapshot: &SchemaSnapshot) -> std::result::Result<(), String> {
+        let local = self.schema.snapshot();
 
         // Tables this node's schema held that the snapshot no longer does:
         // DROPs this peer missed. Only schema-owned tables are candidates, so
         // engine-internal registrations (graph adjacency, the PostgreSQL KV
         // table) are never touched.
-        let dropped: Vec<(String, String)> = self
-            .schema
-            .snapshot()
+        let dropped: Vec<(String, String)> = local
             .tables
             .keys()
             .filter(|key| !snapshot.tables.contains_key(*key) && !is_system_keyspace(&key.0))
@@ -750,73 +807,175 @@ impl RpcHandler for PairSchemaSyncHandler {
             .collect();
 
         // Cluster shape: absence is not drop proof. Refuse the whole snapshot
-        // before anything is registered-over or deleted (CL-22's rule, applied
-        // to the schema push).
+        // before anything is applied or deleted (CL-22's rule, applied to the
+        // schema push).
         if self.refuse_ambiguous_drops {
-            for (keyspace, table) in &dropped {
-                let tid = ferrosa_storage::TableId::new(keyspace, table);
-                let data_bearing = match crate::raft::state_machine::table_has_local_artifacts(
-                    &self.engine,
-                    &tid,
-                ) {
-                    Ok(found) => found,
-                    Err(e) => {
-                        tracing::error!(
-                            %e, table = %tid, from = %from.0,
-                            "schema sync refused: could not check the absent table for local data"
-                        );
-                        return None;
-                    }
-                };
-                if data_bearing {
-                    tracing::error!(
-                        table = %tid, from = %from.0, snapshot_version = %snapshot.version,
-                        "schema sync refused: the pushed snapshot lacks a table that holds local \
-                         data, and in a cluster absence is not proof of a DROP (the sender may be \
-                         a deposed or lagging leader); nothing applied, nothing deleted"
-                    );
-                    return None;
-                }
-            }
+            self.refuse_data_bearing_drops(&dropped, snapshot)?;
         }
 
-        // Register each non-system table with the storage engine.
-        for ((keyspace, _table_name), table) in &snapshot.tables {
+        for (keyspace, ks) in &snapshot.keyspaces {
+            let stale = local.keyspaces.get(keyspace).is_some_and(|mine| mine != ks);
+            if is_system_keyspace(keyspace) || !stale {
+                continue;
+            }
+            let updates = KeyspaceUpdates {
+                replication: Some(ks.replication.clone()),
+                durable_writes: Some(ks.durable_writes),
+            };
+            self.schema
+                .alter_keyspace_internal(keyspace, updates)
+                .map_err(|e| format!("alter keyspace {keyspace}: {e}"))?;
+        }
+        for ((keyspace, name), table) in &snapshot.tables {
             if is_system_keyspace(keyspace) {
                 continue;
             }
-            let storage_schema = table.to_storage_schema();
-            if let Err(e) = self.engine.register_table(storage_schema) {
-                tracing::error!("failed to register table during schema sync: {e}");
-                return None;
+            match local.tables.get(&(keyspace.clone(), name.clone())) {
+                Some(mine) if table_definition_matches(mine, table) => {}
+                Some(mine) => self.replace_table(mine, table)?,
+                None => self
+                    .engine
+                    .register_table(table.to_storage_schema())
+                    .map_err(|e| format!("register {keyspace}.{name}: {e}"))?,
             }
         }
 
-        // Apply snapshot to schema registry.
-        if let Err(e) = self.schema.apply_snapshot(snapshot) {
-            tracing::error!("failed to apply schema snapshot: {e}");
-            return None;
-        }
+        // Insert everything this node lacks (keyspaces, tables, roles, ...).
+        self.schema
+            .apply_snapshot(snapshot.clone())
+            .map_err(|e| format!("apply snapshot: {e}"))?;
 
-        // Finish those DROPs as `DropTable` would have: release the table in
-        // the engine and delete its local SSTable directory.
         for (keyspace, table) in dropped {
-            let tid = ferrosa_storage::TableId::new(&keyspace, &table);
-            match self.engine.unregister_table(&tid) {
-                Ok(()) => tracing::info!(
-                    table = %tid,
-                    "schema sync: unregistered a table dropped while this peer was behind"
-                ),
-                Err(e) => tracing::error!(
-                    %e, table = %tid,
-                    "schema sync: unregister of a dropped table failed — its local SSTables remain \
-                     and a recreated table of the same name would read them"
-                ),
+            self.finish_missed_drop(&keyspace, &table)?;
+        }
+        Ok(())
+    }
+
+    /// Cluster shape: fail when a table the snapshot lacks still holds local
+    /// data (SSTables or persisted index registrations). Nothing is applied.
+    fn refuse_data_bearing_drops(
+        &self,
+        dropped: &[(String, String)],
+        snapshot: &SchemaSnapshot,
+    ) -> std::result::Result<(), String> {
+        for (keyspace, table) in dropped {
+            let tid = ferrosa_storage::TableId::new(keyspace, table);
+            let data_bearing =
+                crate::raft::state_machine::table_has_local_artifacts(&self.engine, &tid)
+                    .map_err(|e| {
+                        format!("schema sync refused: could not check absent table {tid} for local data: {e}")
+                    })?;
+            if data_bearing {
+                return Err(format!(
+                    "schema sync refused: snapshot {} lacks table {tid}, which holds local data, \
+                     and in a cluster absence is not proof of a DROP (the sender may be a deposed \
+                     or lagging leader); nothing applied, nothing deleted",
+                    snapshot.version
+                ));
             }
         }
-
-        Some(Message::PairDdlAck(Bytes::new()))
+        Ok(())
     }
+
+    /// Replace a table this node holds under a different definition.
+    fn replace_table(
+        &self,
+        mine: &TableMetadata,
+        theirs: &TableMetadata,
+    ) -> std::result::Result<(), String> {
+        let tid = ferrosa_storage::TableId::new(&theirs.keyspace, &theirs.name);
+        if mine.id != theirs.id {
+            // A different incarnation: the primary dropped and recreated it.
+            // The local SSTables belong to the dropped one.
+            self.engine
+                .unregister_table(&tid)
+                .map_err(|e| format!("unregister superseded {tid}: {e}"))?;
+            self.engine
+                .register_table(theirs.to_storage_schema())
+                .map_err(|e| format!("register recreated {tid}: {e}"))?;
+        } else if self.engine.table_schema(&tid).is_some() {
+            // A missed ALTER. update_table_schema flushes rows written under
+            // the old layout first, so they keep their write-time ordinals.
+            self.engine
+                .update_table_schema(&tid, theirs.to_storage_schema())
+                .map_err(|e| format!("update {tid} to the primary's layout: {e}"))?;
+        } else {
+            self.engine
+                .register_table(theirs.to_storage_schema())
+                .map_err(|e| format!("register {tid}: {e}"))?;
+        }
+        self.schema
+            .replace_table_internal(theirs.clone())
+            .map_err(|e| format!("replace {tid} in the registry: {e}"))?;
+        tracing::info!(
+            table = %tid,
+            "schema sync: applied the primary's definition of a table this peer held stale"
+        );
+        Ok(())
+    }
+
+    /// Finish a DROP this peer missed, as `DropTable` would have: release the
+    /// table in the engine, delete its local SSTable directory, and remove it
+    /// from the registry.
+    fn finish_missed_drop(&self, keyspace: &str, table: &str) -> std::result::Result<(), String> {
+        let tid = ferrosa_storage::TableId::new(keyspace, table);
+        self.engine.unregister_table(&tid).map_err(|e| {
+            format!(
+                "unregister of dropped {tid} failed; its local SSTables remain and a \
+                 recreated table of the same name would read them: {e}"
+            )
+        })?;
+        self.schema
+            .drop_table_internal(keyspace, table)
+            .map_err(|e| format!("drop {tid} from the registry: {e}"))?;
+        tracing::info!(
+            table = %tid,
+            "schema sync: unregistered a table dropped while this peer was behind"
+        );
+        Ok(())
+    }
+}
+
+/// Whether two definitions of the same table lay data out identically and
+/// describe the same incarnation.
+pub(crate) fn table_definition_matches(a: &TableMetadata, b: &TableMetadata) -> bool {
+    a.id == b.id
+        && a.partition_key == b.partition_key
+        && a.clustering_key == b.clustering_key
+        && a.columns == b.columns
+        && a.flags == b.flags
+        && serde_json::to_value(&a.params).ok() == serde_json::to_value(&b.params).ok()
+        && serde_json::to_value(&a.extensions).ok() == serde_json::to_value(&b.extensions).ok()
+}
+
+/// User keyspaces and tables on which `local` differs from the primary's
+/// `snapshot`. Empty means converged.
+///
+/// Scope: keyspaces and tables (the definitions that decide data layout).
+/// Roles, grants, indexes, types and functions are applied insert-only and
+/// are not checked here.
+pub(crate) fn schema_divergence(snapshot: &SchemaSnapshot, local: &SchemaSnapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, ks) in &snapshot.keyspaces {
+        if !is_system_keyspace(name) && local.keyspaces.get(name) != Some(ks) {
+            out.push(format!("keyspace {name}"));
+        }
+    }
+    for (key, table) in &snapshot.tables {
+        if is_system_keyspace(&key.0) {
+            continue;
+        }
+        match local.tables.get(key) {
+            Some(mine) if table_definition_matches(mine, table) => {}
+            _ => out.push(format!("table {}.{}", key.0, key.1)),
+        }
+    }
+    for key in local.tables.keys() {
+        if !is_system_keyspace(&key.0) && !snapshot.tables.contains_key(key) {
+            out.push(format!("extra table {}.{}", key.0, key.1));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -991,7 +1150,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = pair_test_engine(dir.path());
         let schema = test_replication_schema();
-        let handler = PairSchemaSyncHandler::new(Arc::clone(&schema), Arc::clone(&engine));
+        let handler = sync_handler(&schema, &engine, PairRole::Secondary);
         let keep = test_table();
         let mut gone = test_table();
         gone.name = "gone_tbl".to_string();
@@ -1034,7 +1193,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = pair_test_engine(dir.path());
         let schema = test_replication_schema();
-        let handler = PairSchemaSyncHandler::for_cluster(Arc::clone(&schema), Arc::clone(&engine));
+        let handler = PairSchemaSyncHandler::for_cluster(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            Arc::new(ArcSwap::from_pointee(PairRole::Secondary)),
+        );
         let keep = test_table();
         let mut newer = test_table();
         newer.name = "newer_tbl".to_string();
@@ -1549,5 +1712,240 @@ mod tests {
             .get(&("ks".to_string(), "address".to_string()));
         assert!(udt.is_some());
         assert_eq!(udt.unwrap().fields.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rejoin catch-up after a missed ALTER (nightly pair smoke, 2026-10-01..03)
+    //
+    // node1 created `kv (k, v)`, ALTERed it to add `extra`, wrote key1, and was
+    // SIGKILLed. Its schema.json still held the pre-ALTER table. On rejoin the
+    // promoted node2 pushed its post-ALTER schema, but catch-up only INSERTED
+    // tables the secondary lacked, so node1 kept `kv (k, v)`. node2 then
+    // replayed key1 laid out for `[extra, v]` (v at ordinal 1) into node1's
+    // `[v]` layout, and after switchover node1 answered key1 with v = null.
+    // -----------------------------------------------------------------------
+
+    fn kv_table(id: Uuid, with_extra: bool) -> TableMetadata {
+        use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+        let column = |name: &str, kind: ColumnKind| ColumnMetadata {
+            name: name.to_string(),
+            kind,
+            position: 0,
+            column_type: "text".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        };
+        let mut columns = IndexMap::new();
+        columns.insert("k".to_string(), column("k", ColumnKind::PartitionKey));
+        columns.insert("v".to_string(), column("v", ColumnKind::Regular));
+        if with_extra {
+            columns.insert("extra".to_string(), column("extra", ColumnKind::Regular));
+        }
+        TableMetadata {
+            keyspace: "test_ks".to_string(),
+            name: "kv".to_string(),
+            id,
+            columns,
+            partition_key: vec!["k".to_string()],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        }
+    }
+
+    fn sync_msg(tables: Vec<TableMetadata>) -> (Uuid, Message) {
+        let wire = wire_with(tables);
+        let version = wire.version;
+        let body = serde_json::to_vec(&wire).unwrap();
+        (version, Message::PairSchemaSync(Bytes::from(body)))
+    }
+
+    fn sync_handler(
+        schema: &Arc<ferrosa_schema::Schema>,
+        engine: &Arc<StorageEngine>,
+        role: PairRole,
+    ) -> PairSchemaSyncHandler {
+        PairSchemaSyncHandler::new(
+            Arc::clone(schema),
+            Arc::clone(engine),
+            Arc::new(ArcSwap::from_pointee(role)),
+        )
+    }
+
+    /// RED (a): a secondary that missed an ALTER must converge to the
+    /// primary's table definition — registry AND storage engine — when the
+    /// primary's schema snapshot arrives.
+    #[tokio::test]
+    async fn pair_schema_sync_applies_an_alter_the_secondary_missed() {
+        use ferrosa_storage::TableId;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = pair_test_engine(dir.path());
+        let schema = test_replication_schema();
+        let handler = sync_handler(&schema, &engine, PairRole::Secondary);
+        let peer = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let id = Uuid::new_v4();
+
+        // The secondary holds the pre-ALTER table (what node1 restarted with).
+        let (_, stale) = sync_msg(vec![kv_table(id, false)]);
+        assert!(handler.handle(peer, stale).await.is_some());
+
+        // The primary's snapshot carries the ALTERed table.
+        let (primary_version, current) = sync_msg(vec![kv_table(id, true)]);
+        let ack = handler.handle(peer, current).await;
+
+        let registry = schema.snapshot();
+        let table = registry
+            .tables
+            .get(&("test_ks".to_string(), "kv".to_string()))
+            .expect("kv must stay in the registry");
+        assert!(
+            table.columns.contains_key("extra"),
+            "catch-up left the secondary's registry at the pre-ALTER definition \
+             (columns {:?}); apply_snapshot only inserts tables the receiver lacks, so \
+             an ALTER missed while offline is never applied",
+            table.columns.keys().collect::<Vec<_>>()
+        );
+        let storage = engine
+            .table_schema(&TableId::new("test_ks", "kv"))
+            .expect("kv must stay registered with the engine");
+        let regulars: Vec<&str> = storage
+            .regular_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            regulars,
+            vec!["extra", "v"],
+            "the storage layout must match the primary's, or positional cells \
+             replicated from the primary land on the wrong column"
+        );
+        match ack {
+            Some(Message::PairDdlAck(payload)) => assert_eq!(
+                payload.as_ref(),
+                primary_version.as_bytes(),
+                "the ack must report the schema version the secondary converged to"
+            ),
+            other => panic!("expected PairDdlAck carrying the converged version, got {other:?}"),
+        }
+        assert_eq!(schema.snapshot().version, primary_version);
+    }
+
+    /// RED (data-loss guard): a schema snapshot sent TO a primary comes from a
+    /// node that wrongly believes it leads -- in the smoke run, the restarted
+    /// unpromoted node1 elected itself by host-id order and pushed its stale
+    /// schema to the promoted node2. Applying it would treat every table the
+    /// stale node lacks as a missed DROP and delete it, SSTables included.
+    #[tokio::test]
+    async fn pair_schema_sync_is_refused_by_a_primary_and_drops_nothing() {
+        use ferrosa_storage::TableId;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = pair_test_engine(dir.path());
+        let schema = test_replication_schema();
+        let peer = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let id = Uuid::new_v4();
+
+        // Install kv while this node is a secondary, as it would have been.
+        let seed = sync_handler(&schema, &engine, PairRole::Secondary);
+        let (_, install) = sync_msg(vec![kv_table(id, true)]);
+        assert!(seed.handle(peer, install).await.is_some());
+        let kv = TableId::new("test_ks", "kv");
+        let kv_dir = dir.path().join("sstables").join(kv.to_string());
+        assert!(engine.table_schema(&kv).is_some() && kv_dir.exists());
+
+        // Now this node is the primary and a stale peer pushes a snapshot
+        // without kv.
+        let primary = sync_handler(&schema, &engine, PairRole::Primary);
+        let (_, stale) = sync_msg(vec![]);
+        let reply = primary.handle(peer, stale).await;
+
+        assert!(
+            !matches!(reply, Some(Message::PairDdlAck(_))),
+            "a primary must refuse a peer's schema snapshot, got {reply:?}"
+        );
+        assert!(
+            engine.table_schema(&kv).is_some(),
+            "a stale peer's snapshot unregistered a table on the primary"
+        );
+        assert!(
+            kv_dir.exists(),
+            "a stale peer's snapshot deleted the primary's SSTable directory"
+        );
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("test_ks".to_string(), "kv".to_string())));
+    }
+
+    /// RED (c): the value written before failover must read back after the
+    /// rejoined secondary catches up. The primary replays key1 laid out for
+    /// its own storage schema `[extra, v]`; once the secondary has converged,
+    /// reading `v` by name must return `from_node1`, not null.
+    #[tokio::test]
+    async fn value_written_before_failover_reads_back_after_catch_up() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        use ferrosa_storage::TableId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = pair_test_engine(dir.path());
+        let schema = test_replication_schema();
+        let handler = sync_handler(&schema, &engine, PairRole::Secondary);
+        let peer = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let id = Uuid::new_v4();
+
+        let (_, stale) = sync_msg(vec![kv_table(id, false)]);
+        assert!(handler.handle(peer, stale).await.is_some());
+        let (_, current) = sync_msg(vec![kv_table(id, true)]);
+        handler.handle(peer, current).await;
+
+        // The primary's layout: regular columns sorted by name, `[extra, v]`.
+        let primary_layout = kv_table(id, true).to_storage_schema();
+        let v_on_primary = primary_layout
+            .regular_columns
+            .iter()
+            .position(|c| c.name == "v")
+            .unwrap() as u16;
+        assert_eq!(v_on_primary, 1);
+
+        let kv = TableId::new("test_ks", "kv");
+        let key = DecoratedKey {
+            token: Token(7),
+            key: PartitionKey::new(b"key1".to_vec()),
+        };
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(v_on_primary, CellValue::live(b"from_node1".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        engine
+            .write(&kv, &key, row, 1000)
+            .expect("catch-up replay of key1 must apply");
+
+        let local = engine.table_schema(&kv).expect("kv registered");
+        let v_local = local
+            .regular_columns
+            .iter()
+            .position(|c| c.name == "v")
+            .expect("v must exist locally") as u16;
+        let partition = engine
+            .read(&kv, &key)
+            .unwrap()
+            .expect("key1 must be present");
+        let v = partition
+            .rows
+            .iter()
+            .flat_map(|r| r.cells.iter())
+            .find(|(idx, _)| *idx == v_local)
+            .and_then(|(_, cell)| cell.value.clone());
+        assert_eq!(
+            v.as_deref(),
+            Some(&b"from_node1"[..]),
+            "key1's v read back as {v:?}: the replayed cell was laid out for the \
+             primary's [extra, v] but the secondary still had [v], so it landed on \
+             the wrong ordinal -- the silent v = null of the nightly smoke"
+        );
     }
 }

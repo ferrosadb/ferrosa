@@ -124,10 +124,10 @@ fn peer_connect_transitions_to_pair() {
     );
 
     // Create a PeerManager and set it
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
 
@@ -158,10 +158,10 @@ fn peer_disconnect_transitions_to_degraded() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
 
@@ -218,10 +218,10 @@ async fn promote_from_degraded_pair_restores_writes() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
 
@@ -267,10 +267,10 @@ async fn degraded_pair_serves_stale_reads() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm);
 
@@ -330,10 +330,10 @@ async fn second_peer_transitions_to_cluster() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm);
 
@@ -375,10 +375,10 @@ async fn pair_mode_reaches_an_inbound_peer_at_its_advertised_internode_address()
         test_schema(),
         Arc::new(HandlerRegistry::new()),
     );
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm);
 
@@ -414,10 +414,10 @@ async fn cluster_formation_keeps_each_co_located_peers_own_port() {
         test_schema(),
         Arc::new(HandlerRegistry::new()),
     );
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm);
 
@@ -458,7 +458,11 @@ fn co_located_controller(
         test_schema(),
         Arc::new(HandlerRegistry::new()),
     );
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
     controller
 }
@@ -479,16 +483,32 @@ fn on_runtime<F: std::future::Future<Output = ()>>(f: F) {
         .block_on(f);
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
+/// Run a co-located-layout property over a FIXED number of cases.
+///
+/// Each case builds a real controller and storage engine. `proptest!`
+/// contextualizes its config with `PROPTEST_CASES`, so the nightly fuzz job's
+/// 5000 overrode `with_cases(8)`; combined with the leaked controllers (CL-35)
+/// that exhausted the runner. A runner built from an explicit config keeps 8.
+fn run_co_located_layouts(case: impl Fn((u16, u16, u16))) {
+    let config = ProptestConfig {
+        cases: 8,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    };
+    proptest::test_runner::TestRunner::new(config)
+        .run(&co_located_ports(), |ports| {
+            case(ports);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("co-located layout property failed: {e}"));
+}
 
-    /// Pair path (t_7c01df7e): over generated co-located layouts, an inbound
-    /// peer that advertised its internode address is reverse-dialled THERE --
-    /// never at its ephemeral source port, never at its IP plus our port.
-    #[test]
-    fn pair_formation_dials_the_advertised_address_on_any_co_located_layout(
-        (own_port, peer_port, ephemeral) in co_located_ports(),
-    ) {
+/// Pair path (t_7c01df7e): over generated co-located layouts, an inbound
+/// peer that advertised its internode address is reverse-dialled THERE --
+/// never at its ephemeral source port, never at its IP plus our port.
+#[test]
+fn pair_formation_dials_the_advertised_address_on_any_co_located_layout() {
+    run_co_located_layouts(|(own_port, peer_port, ephemeral)| {
         on_runtime(async move {
             let dir = tempfile::tempdir().unwrap();
             let peer = Uuid::from_u128(1);
@@ -501,21 +521,31 @@ proptest! {
             );
             assert_eq!(controller.mode(), DeploymentMode::Pair);
             assert_eq!(controller.dial_target(peer), Some(advertised));
-        });
-    }
+        })
+    });
+}
 
-    /// Cluster path (t_7c01df7e): over generated co-located layouts, forming
-    /// the cluster reverse-dials and records every peer at its own port.
-    #[test]
-    fn cluster_formation_dials_each_peer_at_its_own_port_on_any_co_located_layout(
-        (own_port, p1_port, p2_port) in co_located_ports(),
-    ) {
+/// Cluster path (t_7c01df7e): over generated co-located layouts, forming
+/// the cluster reverse-dials and records every peer at its own port.
+#[test]
+fn cluster_formation_dials_each_peer_at_its_own_port_on_any_co_located_layout() {
+    run_co_located_layouts(|(own_port, p1_port, p2_port)| {
         on_runtime(async move {
             let dir = tempfile::tempdir().unwrap();
             let controller = co_located_controller(dir.path(), own_port, Uuid::from_u128(3));
             let peers = [
-                (Uuid::from_u128(1), format!("127.0.0.1:{p1_port}").parse::<SocketAddr>().unwrap()),
-                (Uuid::from_u128(2), format!("127.0.0.1:{p2_port}").parse::<SocketAddr>().unwrap()),
+                (
+                    Uuid::from_u128(1),
+                    format!("127.0.0.1:{p1_port}")
+                        .parse::<SocketAddr>()
+                        .unwrap(),
+                ),
+                (
+                    Uuid::from_u128(2),
+                    format!("127.0.0.1:{p2_port}")
+                        .parse::<SocketAddr>()
+                        .unwrap(),
+                ),
             ];
             for peer in peers {
                 controller.on_peer_connected(peer);
@@ -524,19 +554,21 @@ proptest! {
             let ring = controller.token_ring().expect("ring after formation");
             for (peer, addr) in peers {
                 assert_eq!(controller.dial_target(peer), Some(addr), "{peer} dial");
-                let info = ring.get_node(crate::raft::uuid_to_node_id(peer)).expect("in ring");
+                let info = ring
+                    .get_node(crate::raft::uuid_to_node_id(peer))
+                    .expect("in ring");
                 assert_eq!(info.addr, addr.to_string(), "{peer} ring");
             }
-        });
-    }
+        })
+    });
+}
 
-    /// Invite path (t_7c01df7e): over generated co-located layouts, a
-    /// `ClusterInvite` naming a peer makes this node dial that peer's own
-    /// address, through the real handler.
-    #[test]
-    fn invite_handler_dials_the_invited_address_on_any_co_located_layout(
-        (own_port, peer_port, initiator_port) in co_located_ports(),
-    ) {
+/// Invite path (t_7c01df7e): over generated co-located layouts, a
+/// `ClusterInvite` naming a peer makes this node dial that peer's own
+/// address, through the real handler.
+#[test]
+fn invite_handler_dials_the_invited_address_on_any_co_located_layout() {
+    run_co_located_layouts(|(own_port, peer_port, initiator_port)| {
         on_runtime(async move {
             let dir = tempfile::tempdir().unwrap();
             let local = Uuid::from_u128(3);
@@ -545,7 +577,12 @@ proptest! {
             // does not also start a cluster transition -- whose own reverse
             // dials would record the peer too and hide a wrong invite dial.
             controller.mode.store(Arc::new(DeploymentMode::Cluster));
-            let pm = controller.peer_manager.load().as_ref().clone().expect("peer manager");
+            let pm = controller
+                .peer_manager
+                .load()
+                .as_ref()
+                .clone()
+                .expect("peer manager");
             let handler = super::cluster::ClusterInviteHandler::new(
                 local,
                 pm,
@@ -559,12 +596,15 @@ proptest! {
             handler
                 .handle(
                     (initiator, from_addr),
-                    Message::ClusterInvite { initiator, peers: vec![(peer, invited)] },
+                    Message::ClusterInvite {
+                        initiator,
+                        peers: vec![(peer, invited)],
+                    },
                 )
                 .await;
             assert_eq!(controller.dial_target(peer), Some(invited));
-        });
-    }
+        })
+    });
 }
 
 /// A formation path that computes our own address for another peer is
@@ -599,10 +639,10 @@ fn connected_peers_tracked_and_cleared() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm);
 
@@ -643,7 +683,11 @@ async fn setup_cluster_controller() -> (Arc<ModeController>, tempfile::TempDir) 
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     // First peer -> pair, second peer -> cluster (spawns raft init)
@@ -1161,7 +1205,11 @@ async fn peer_manager_registration_installs_membership_forward_nack_before_clust
         schema,
         registry.clone(),
     );
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
 
     controller.set_peer_manager(pm);
 
@@ -1581,10 +1629,10 @@ async fn former_cluster_member_registers_schema_sync_handler() {
         schema,
         registry,
     );
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         host_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm);
 
@@ -1781,7 +1829,11 @@ async fn approved_peer_triggers_join_in_cluster_mode() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     // First peer -> pair, second peer -> cluster
@@ -1838,7 +1890,11 @@ async fn on_peer_connected_registers_peer_host_id_in_raft_node_map() {
         schema,
         registry,
     );
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     // Two peers → cluster mode (this runs transition_to_cluster, which captures
@@ -1910,10 +1966,10 @@ async fn existing_cluster_member_does_not_queue_duplicate_join() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
 
@@ -1987,10 +2043,10 @@ async fn existing_cluster_member_without_outbound_pool_requeues_join_refresh() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
 
@@ -2034,10 +2090,10 @@ async fn existing_cluster_member_with_placeholder_peer_entry_requeues_join_refre
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
 
@@ -2090,10 +2146,10 @@ async fn existing_inbound_cluster_member_with_ephemeral_source_port_does_not_que
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
 
@@ -2171,7 +2227,11 @@ async fn existing_cluster_member_with_changed_addr_requeues_join_refresh() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm.clone());
 
     controller.on_peer_connected((peer1_id, "10.0.0.2:7000".parse().unwrap()));
@@ -2238,7 +2298,11 @@ fn self_connection_does_not_advance_cluster_formation() {
         schema,
         registry,
     );
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     controller.on_peer_connected((local_id, "127.0.0.1:7000".parse().unwrap()));
@@ -2295,7 +2359,11 @@ fn configured_three_node_pair_primary_is_not_cql_ready() {
         schema,
         registry,
     );
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     controller.on_peer_connected((peer_id, "127.0.0.2:7000".parse().unwrap()));
@@ -2371,7 +2439,11 @@ fn lower_host_id_takes_primary_role() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
@@ -2428,7 +2500,11 @@ fn is_cql_ready_pair_secondary_returns_false() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     // Outbound connection to a lower host-id peer keeps this node secondary.
@@ -2462,7 +2538,11 @@ async fn reverse_inbound_race_does_not_promote_joiner_to_primary() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     use ferrosa_net::rpc::InboundPeerCallback;
@@ -2616,10 +2696,10 @@ async fn cluster_invite_triggers_transition_from_pair_mode() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
 
@@ -2688,10 +2768,10 @@ async fn cluster_invite_transition_registers_raft_handlers() {
         registry.clone(),
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         local_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
 
@@ -2765,7 +2845,11 @@ async fn standalone_mode_accepts_peer_and_transitions_to_pair() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     assert_eq!(controller.mode(), DeploymentMode::Standalone);
@@ -2803,7 +2887,11 @@ async fn progressive_join_standalone_to_pair_to_cluster() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     // Start standalone.
@@ -2843,7 +2931,11 @@ async fn standalone_inbound_peer_transitions_to_pair() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     assert_eq!(controller.mode(), DeploymentMode::Standalone);
@@ -3350,10 +3442,10 @@ async fn forming_falls_back_to_degraded_pair_on_timeout() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         host_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm);
 
@@ -3670,7 +3762,11 @@ async fn formation_emits_reduced_durability_warning_counter_when_rf_less_than_co
         schema,
         registry,
     );
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     // Transition with 1 peer → cluster_size = 2, configured_rf = 3 → counter increments.
@@ -3714,7 +3810,11 @@ async fn transition_to_cluster_uses_keyspace_rf_not_hardcoded_1() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     // Transition directly to cluster (skip pair step — transition_to_cluster
@@ -3865,10 +3965,10 @@ async fn a_former_cluster_member_never_falls_back_to_pair_on_timeout() {
         schema,
         registry,
     );
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         net_config.clone(),
         host_id,
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm);
 
@@ -3962,7 +4062,11 @@ async fn a_refused_pair_transition_must_not_leave_a_pair_write_path() {
         schema,
         registry,
     );
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     let peer1_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
@@ -4144,7 +4248,11 @@ async fn an_inbound_peer_is_registered_in_the_raft_node_map() {
         schema,
         registry,
     );
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     // Stand in for the map `transition_to_cluster` installs at Raft init.
@@ -4329,10 +4437,10 @@ fn cluster_mode_controller(dir: &std::path::Path) -> Arc<ModeController> {
         test_schema(),
         Arc::new(HandlerRegistry::new()),
     );
-    let pm = Arc::new(PeerManager::new(
+    let pm = Arc::new(PeerManager::with_weak_listener(
         Arc::new(NetConfig::default()),
         controller.host_id(),
-        controller.clone(),
+        controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm);
     controller.set_mode_for_test(DeploymentMode::Cluster);
@@ -4456,4 +4564,261 @@ fn only_the_raft_leader_may_send_a_schema_snapshot() {
         "with no known leader this node cannot speak for the cluster schema, so \
          it must not send"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Switchover guard (nightly pair smoke, 2026-10-01..03): node2 switched over
+// to a rejoined node1 whose schema had never caught up, and node1 then served
+// a written key with v = null.
+// ---------------------------------------------------------------------------
+
+fn switchover_kv_table(with_extra: bool) -> ferrosa_schema::metadata::table::TableMetadata {
+    use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+    use ferrosa_schema::metadata::table::{TableMetadata, TableParams};
+    let column = |name: &str, kind: ColumnKind| ColumnMetadata {
+        name: name.to_string(),
+        kind,
+        position: 0,
+        column_type: "text".to_string(),
+        clustering_order: ClusteringOrder::None,
+        mask: None,
+    };
+    let mut columns = indexmap::IndexMap::new();
+    columns.insert("k".to_string(), column("k", ColumnKind::PartitionKey));
+    columns.insert("v".to_string(), column("v", ColumnKind::Regular));
+    if with_extra {
+        columns.insert("extra".to_string(), column("extra", ColumnKind::Regular));
+    }
+    TableMetadata {
+        keyspace: "smoke_ks".to_string(),
+        name: "kv".to_string(),
+        id: Uuid::from_u128(0x5eed),
+        columns,
+        partition_key: vec!["k".to_string()],
+        clustering_key: vec![],
+        params: TableParams::default(),
+        flags: std::collections::HashSet::new(),
+        extensions: HashMap::new(),
+        is_system: false,
+    }
+}
+
+fn install_kv(schema: &Schema, storage: &StorageEngine, with_extra: bool) {
+    use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+    schema
+        .create_keyspace_internal(KeyspaceMetadata {
+            name: "smoke_ks".to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: [("replication_factor".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        })
+        .unwrap();
+    let table = switchover_kv_table(with_extra);
+    storage.register_table(table.to_storage_schema()).unwrap();
+    schema.create_table_internal(table).unwrap();
+}
+
+/// A schema-sync handler that acknowledges without converging -- what an old
+/// peer (empty ack) or a peer that failed to apply looks like to the primary.
+struct UnconvergedSchemaSync;
+
+#[async_trait::async_trait]
+impl RpcHandler for UnconvergedSchemaSync {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        match msg {
+            Message::PairSchemaSync(_) => Some(Message::PairDdlAck(bytes::Bytes::new())),
+            _ => None,
+        }
+    }
+}
+
+struct SwitchoverPeer {
+    _server: Arc<RpcServer>,
+    addr: SocketAddr,
+    role: Arc<ArcSwap<PairRole>>,
+}
+
+/// A live peer at `peer_id`, a pair secondary, with `schema_sync` answering
+/// `PairSchemaSync` and a real `RoleSwapHandler`.
+async fn start_switchover_peer(
+    peer_id: Uuid,
+    schema_sync: Arc<dyn RpcHandler>,
+    role: Arc<ArcSwap<PairRole>>,
+) -> SwitchoverPeer {
+    let config = NetConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        ..NetConfig::default()
+    };
+    let registry = Arc::new(HandlerRegistry::new());
+    registry.register(MsgType::PairSchemaSync, schema_sync);
+    registry.register(
+        MsgType::RoleSwap,
+        Arc::new(crate::pair::switchover::RoleSwapHandler::new(
+            peer_id,
+            role.clone(),
+        )),
+    );
+    let server = Arc::new(RpcServer::new(config, peer_id, registry));
+    let addr = server.start_and_get_addr().await.unwrap();
+    SwitchoverPeer {
+        _server: server,
+        addr,
+        role,
+    }
+}
+
+/// A controller that is the pair primary for `peer`, with its reverse
+/// connection to the peer established.
+async fn primary_paired_with(
+    peer_id: Uuid,
+    peer: &SwitchoverPeer,
+    storage: Arc<StorageEngine>,
+    schema: Arc<Schema>,
+) -> Arc<ModeController> {
+    let local_id = Uuid::from_u128(1);
+    assert!(local_id < peer_id, "lower host id elects primary");
+    let net_config = Arc::new(NetConfig::default());
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm.clone());
+    controller.on_inbound_peer((peer_id, peer.addr), None, Some(peer.addr.to_string()));
+    assert_eq!(controller.role(), Some(PairRole::Primary));
+    for _ in 0..100 {
+        if pm.has_peer(peer_id) {
+            return controller;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("reverse connection to the switchover peer never came up");
+}
+
+/// RED (b): a switchover must not promote a peer that cannot confirm it has
+/// the primary's schema. Promoting it is how node1 came to serve v = null.
+#[tokio::test]
+async fn switchover_is_refused_when_the_peer_does_not_confirm_schema_convergence() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, true);
+
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let peer = start_switchover_peer(peer_id, Arc::new(UnconvergedSchemaSync), peer_role).await;
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+
+    let result = controller.switchover().await;
+
+    let err = result.expect_err(
+        "switchover promoted a peer that never confirmed it holds the primary's schema",
+    );
+    assert!(
+        err.to_string().contains("schema"),
+        "the refusal must say the peer's schema is not confirmed, got: {err}"
+    );
+    assert_eq!(
+        **peer.role.load(),
+        PairRole::Secondary,
+        "the peer must not have been told to become primary"
+    );
+    assert_eq!(controller.role(), Some(PairRole::Primary));
+}
+
+/// RED (b): a switchover must not promote a peer whose data catch-up replay
+/// is still running or has failed.
+#[tokio::test]
+async fn switchover_is_refused_while_the_catch_up_replay_is_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, true);
+
+    let peer_dir = tempfile::tempdir().unwrap();
+    let peer_storage = test_storage(peer_dir.path());
+    let peer_schema = test_schema();
+    install_kv(&peer_schema, &peer_storage, true);
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let sync = Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+        peer_schema,
+        peer_storage,
+        peer_role.clone(),
+    ));
+    let peer = start_switchover_peer(peer_id, sync, peer_role).await;
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+
+    let gate = controller
+        .pair_context
+        .lock()
+        .as_ref()
+        .map(|ctx| ctx.catch_up.clone())
+        .expect("pair context");
+    gate.begin();
+    let in_progress = controller.switchover().await;
+    gate.fail();
+    let failed = controller.switchover().await;
+
+    assert!(
+        in_progress.is_err() && failed.is_err(),
+        "switchover must be refused while catch-up is running ({in_progress:?}) and \
+         after it failed ({failed:?})"
+    );
+    assert_eq!(**peer.role.load(), PairRole::Secondary);
+    assert_eq!(controller.role(), Some(PairRole::Primary));
+}
+
+/// (b), the positive half: a switchover first pushes the primary's schema,
+/// so a peer that missed an ALTER converges before it is promoted.
+#[tokio::test]
+async fn switchover_converges_the_peer_schema_before_swapping_roles() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, true);
+
+    let peer_dir = tempfile::tempdir().unwrap();
+    let peer_storage = test_storage(peer_dir.path());
+    let peer_schema = test_schema();
+    install_kv(&peer_schema, &peer_storage, false);
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let sync = Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+        peer_schema.clone(),
+        peer_storage,
+        peer_role.clone(),
+    ));
+    let peer = start_switchover_peer(peer_id, sync, peer_role).await;
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+
+    controller
+        .switchover()
+        .await
+        .expect("switchover to a peer that converges must succeed");
+
+    let kv = peer_schema
+        .snapshot()
+        .tables
+        .get(&("smoke_ks".to_string(), "kv".to_string()))
+        .cloned()
+        .expect("kv on the peer");
+    assert!(
+        kv.columns.contains_key("extra"),
+        "the peer was promoted still holding the pre-ALTER table"
+    );
+    assert_eq!(**peer.role.load(), PairRole::Primary);
+    assert_eq!(controller.role(), Some(PairRole::Secondary));
 }

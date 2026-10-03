@@ -2240,10 +2240,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime::install_consensus_panic_hook(mode_controller.consensus_health());
 
     // 6. Create PeerManager — ModeController is the PeerEventListener
-    let peer_manager = Arc::new(ferrosa_net::peer::PeerManager::new(
+    let peer_manager = Arc::new(ferrosa_net::peer::PeerManager::with_weak_listener(
         net_config.clone(),
         host_id,
-        mode_controller.clone(),
+        mode_controller.as_peer_listener(),
     ));
     peer_manager.set_raft_runtime(runtimes.raft.clone());
     peer_manager.set_data_runtime(runtimes.data.clone());

@@ -1818,7 +1818,11 @@ mod tests {
         let state = make_state();
         let mc = state.mode_controller.clone();
         let net_config = Arc::new(ferrosa_net::config::NetConfig::default());
-        let pm = Arc::new(PeerManager::new(net_config, mc.host_id(), mc.clone()));
+        let pm = Arc::new(PeerManager::with_weak_listener(
+            net_config,
+            mc.host_id(),
+            mc.as_peer_listener(),
+        ));
         mc.set_peer_manager(pm);
         mc.set_mode_for_test(ferrosa_common::deployment_mode::DeploymentMode::Cluster);
         // Drive the REAL production path rather than reaching into controller
