@@ -1565,6 +1565,38 @@ mod tests {
         );
     }
 
+    /// Only a COMMITTED `t` is final. A dependency that is merely PreAccepted
+    /// here carries this replica's PROPOSED `t`, and the final `t` is chosen
+    /// from a quorum this replica may not be in, so it can still come out
+    /// below ours. Waiving on a proposed `t` would let this transaction apply
+    /// ahead of a dependency that executes before it.
+    #[test]
+    fn apply_waits_for_a_dependency_whose_later_t_is_only_proposed() {
+        let capturing = Arc::new(CapturingApplier::new());
+        let mut sm =
+            AccordStateMachine::with_applier(1, Arc::new(MockSyncWriter::new()), capturing.clone());
+        let (waiting, dep) = (txn(1, 1001), txn(2, 1000));
+        // A conflicting txn bumps `dep`'s proposed t past `waiting`'s final t.
+        let bumper = txn(3, 5000);
+        sm.handle_preaccept(bumper, ts(5000), b"key", BallotNumber(0), 0);
+        sm.handle_preaccept(dep, ts(1000), b"key", BallotNumber(0), 0);
+        assert!(
+            sm.get_state(&dep).unwrap().t > ts(1002),
+            "setup: dep's proposed t must be later than the waiter's final t"
+        );
+        sm.handle_preaccept(waiting, ts(1001), b"other", BallotNumber(0), 0);
+        sm.handle_commit(waiting, ts(1001), ts(1002), vec![dep]);
+
+        sm.handle_apply_writeset(waiting, vec![b"write".to_vec()]);
+
+        assert_eq!(
+            sm.get_state(&waiting).unwrap().phase,
+            TxnPhase::Committed,
+            "a dependency whose later t is only proposed may still execute first"
+        );
+        assert!(capturing.captured().is_empty());
+    }
+
     #[test]
     fn apply_still_waits_for_a_dependency_that_executes_before_it() {
         let capturing = Arc::new(CapturingApplier::new());
