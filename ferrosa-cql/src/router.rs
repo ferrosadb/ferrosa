@@ -25763,7 +25763,10 @@ mod tests {
         let body = source
             .split("async fn read_index_intersection_stream(")
             .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
+            .and_then(|rest| {
+                rest.split("\nfn intersect_index_streams_by_partition")
+                    .next()
+            })
             .expect("read_index_intersection_stream must exist");
         for forbidden in ["HashSet", "HashMap", ".collect::<Vec", "BTreeSet"] {
             assert!(
@@ -31813,28 +31816,77 @@ mod tests {
         // Any other outcome (Ok or a different error) is acceptable.
     }
 
-    #[test]
-    fn broad_select_paths_must_not_materialize_full_range_before_paging() {
-        let source = include_str!("router.rs");
-        let broad_scan = source
-            .split("let scan_bound =")
-            .nth(1)
-            .and_then(|rest| rest.split("let mut all_rows = Vec::new();").next())
-            .expect("broad select scan block must be present");
+    /// INV: an unpaged broad SELECT returns every row, and a paged one returns
+    /// one bounded page plus a continuation — without first materializing the
+    /// whole range.
+    ///
+    /// Behavioural replacement for a vacuous source-text assertion. The old test
+    /// asserted `!source.contains(".range_read(&table_id).await?")` inside a
+    /// region it could not actually locate — and even had it located it, "the
+    /// streaming API is called" is not the same property as "nothing
+    /// materializes".
+    ///
+    /// The observable properties here are the two that matter to a user:
+    /// completeness (every row comes back) and boundedness (a paged read stops
+    /// at its page and advertises a continuation).
+    #[tokio::test]
+    async fn broad_select_is_complete_and_pages_without_materializing_the_range() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let current_keyspace = None;
+        let ctx = test_ctx(&auth, &current_keyspace);
 
-        assert!(
-            !broad_scan.contains(".range_read(&table_id).await?"),
-            "broad SELECT scans must consume a partition stream directly instead of materializing range_read Vec<Partition>"
+        for cql in [
+            "CREATE KEYSPACE broad_sel WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            "CREATE TABLE broad_sel.events (bucket bigint PRIMARY KEY, payload text)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let total: usize = 250;
+        for bucket in 1..=total {
+            let insert = format!(
+                "INSERT INTO broad_sel.events (bucket, payload) VALUES ({bucket}, 'p-{bucket}')"
+            );
+            route(&state, &ctx, crate::parser::parse(&insert).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let select = || match crate::parser::parse("SELECT bucket, payload FROM broad_sel.events")
+            .unwrap()
+        {
+            Statement::Select(s) => s,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+
+        // (a) completeness: the unpaged read returns every row.
+        let complete = route_select_raw(&state, &test_ctx(&auth, &current_keyspace), &select())
+            .await
+            .unwrap();
+        assert_eq!(
+            complete.rows.len(),
+            total,
+            "INV: an unpaged broad SELECT must return every matching row"
+        );
+
+        // (b) boundedness: a paged read stops at the page and continues.
+        let page = route_select_raw(
+            &state,
+            &paging_ctx(&auth, &current_keyspace, Some(25), None),
+            &select(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.rows.len(),
+            25,
+            "INV: a page holds at most page_size rows"
         );
         assert!(
-            broad_scan.contains("range_read_stream_all"),
-            "broad SELECT scans must use the stream boundary for unbounded scans"
-        );
-        assert!(
-            broad_scan.contains("range_read_stream_all_with")
-                && broad_scan.contains("ctx.consistency")
-                && broad_scan.contains("&table_strategy"),
-            "broad SELECT streams must propagate the request consistency and keyspace replication strategy"
+            page.paging_state.is_some(),
+            "INV: a non-exhausted paged read must advertise a continuation"
         );
     }
 
@@ -31975,73 +32027,279 @@ mod tests {
     /// The last `Err` in the arm is a genuinely unreachable internal invariant
     /// (a future arm that selects none of partitions / projected stream /
     /// spilling sort); it must read as a bug, not as a query-shape refusal.
-    #[test]
-    fn degraded_scan_arm_serves_all_shapes_by_streaming_never_refuses() {
-        const START: &str = "let partitions: Option<Vec<ferrosa_sstable::types::Partition>> =";
-        const END: &str = "\n                            filter_rows_by_select_predicates(";
-        let source = include_str!("router.rs");
-        let after = source
-            .split(START)
-            .nth(1)
-            .expect("degraded scan arm must bind `partitions` with an explicit Vec type");
-        let arm = after
-            .split(END)
-            .next()
-            .expect("degraded scan arm must be terminated by the post-scan predicate filter");
 
-        for forbidden in [
-            "materialization is disabled",
-            "cannot be bounded for this shape",
-            "range_read_limited_rows_checked(",
-        ] {
-            assert!(
-                !arm.contains(forbidden),
-                "the degraded full-scan arm must not refuse a servable shape ({forbidden:?} found) \
-                 — every shape is bounded only by the query's LIMIT, streamed, or spilled"
-            );
+    // ── Meta-guard: no source-text assertion may be vacuous ────────────────
+    //
+    // The defect class this prevents: a test reads a source file with
+    // `include_str!` and splits on an anchor that does not occur in that file's
+    // production code. The region it then inspects is not production code, so
+    // `contains(..)` is satisfied by whatever text it did find -- typically the
+    // test's own literal naming the thing being asserted -- and the test cannot
+    // fail. `count_filtering_scans_project_only_predicate_columns` was in
+    // exactly this state: its anchor existed only inside its own string
+    // literal, so it inspected 64 characters of its own source.
+    //
+    // This guard's own correctness matters as much as the guard: a check that
+    // reports false positives gets switched off. Two adjustments make it
+    // precise:
+    //   * anchors are compared AFTER Rust string-escape expansion, because
+    //     "\n}\n" in source is newline-brace-newline at runtime;
+    //   * each anchor is checked against the file its own `include_str!` names,
+    //     and a boundary marker that delimits production rather than asserting
+    //     about it (the `mod tests` declaration) is skipped.
+    #[test]
+    fn no_source_text_assertion_splits_on_an_anchor_absent_from_its_file() {
+        let router = include_str!("router.rs");
+        let row_bridge = include_str!("../../ferrosa-row-bridge/src/row.rs");
+
+        // The production part of a file: everything before its test module.
+        fn production_of(text: &str) -> &str {
+            const DECL: &str = concat!("mod tests", " {");
+            match text.find(DECL) {
+                Some(i) => &text[..i],
+                None => text,
+            }
         }
+
+        // Expand the escapes this comparison can encounter, so source text and
+        // runtime value are not confused.
+        fn unescape(lit: &str) -> String {
+            let mut out = String::with_capacity(lit.len());
+            let mut chars = lit.chars();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('0') => out.push('\0'),
+                    Some(other) => out.push(other),
+                    None => out.push('\\'),
+                }
+            }
+            out
+        }
+
+        let mut violations: Vec<String> = Vec::new();
+
+        for (idx, _) in router.match_indices(r#"include_str!(""#) {
+            // The file this `include_str!` names.
+            let after = idx + r#"include_str!(""#.len();
+            let Some(close) = router[after..].find('"') else {
+                continue;
+            };
+            let file = &router[after..after + close];
+            let text = match file {
+                "router.rs" => Some(router),
+                "../../ferrosa-row-bridge/src/row.rs" => Some(row_bridge),
+                // A file this guard does not track: skip rather than guess.
+                _ => None,
+            };
+            let Some(text) = text else {
+                continue;
+            };
+            let production = production_of(text);
+
+            // The anchors this test uses, up to the next include_str!.
+            let window_end = router[after + close..]
+                .find(r#"include_str!(""#)
+                .map_or(router.len(), |n| after + close + n);
+            let window = &router[after + close..window_end];
+
+            // Local `<ident> = "<literal>"` bindings in this test, so
+            // `split(START)` (a const anchor) is resolved as well as
+            // `split("...")`. Consts evade a literal-only scan.
+            let mut bindings: Vec<(String, String)> = Vec::new();
+            for kw in ["const ", "let "] {
+                for (ki, _) in window.match_indices(kw) {
+                    let after_kw = ki + kw.len();
+                    let ident: String = window[after_kw..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if ident.is_empty() {
+                        continue;
+                    }
+                    // Find `= "` after the ident (allowing a type annotation).
+                    let tail = &window[after_kw + ident.len()..];
+                    let Some(eq) = tail.find("= ") else {
+                        continue;
+                    };
+                    let lit_start = &tail[eq + 2..];
+                    if !lit_start.starts_with('"') {
+                        continue;
+                    }
+                    let body = &lit_start[1..];
+                    let Some(endq) = body.find('"') else {
+                        continue;
+                    };
+                    bindings.push((ident, unescape(&body[..endq])));
+                }
+            }
+
+            for (si, _) in window.match_indices(".split(") {
+                let rest = &window[si + ".split(".len()..];
+                // The argument runs to the closing paren of this call.
+                let Some(close) = rest.find(')') else {
+                    continue;
+                };
+                let arg = rest[..close].trim();
+                let anchor = if let Some(inner) = arg.strip_prefix('"') {
+                    match inner.find('"') {
+                        Some(e) => unescape(&inner[..e]),
+                        None => continue,
+                    }
+                } else if let Some((_, v)) = bindings.iter().find(|(n, _)| n == arg) {
+                    v.clone()
+                } else {
+                    continue;
+                };
+                if anchor.is_empty() {
+                    continue;
+                }
+                // A boundary marker delimits production; it is not an assertion
+                // about it, so its absence from production is expected.
+                if anchor.contains("mod tests") || anchor.contains("include_str!") {
+                    continue;
+                }
+                if !production.contains(&anchor) {
+                    violations.push(format!("{file}: {anchor:?}"));
+                }
+            }
+        }
+        violations.sort();
+        violations.dedup();
+
         assert!(
-            arm.contains("range_read_stream_all_with"),
-            "the arm must stream the uncapped scan through range_read_stream_all_with"
-        );
-        assert!(
-            arm.contains("sort_rows_from_partition_stream_spilling"),
-            "the unbounded ORDER BY shape must spill instead of refusing"
-        );
-        assert!(
-            arm.contains("internal: full-table scan produced no result source"),
-            "the only remaining error in the arm must be the unreachable internal \
-             no-result-source invariant, not a shape refusal"
+            violations.is_empty(),
+            "these source-text assertions split on anchors that do not occur in \
+             the production part of the file they name, so they assert nothing \
+             about it:\n  {}\n\
+             Delete them if a behaviour test covers the invariant, or rewrite \
+             them to assert on observed behaviour -- a counter, returned rows, or \
+             allocator peak -- never on source text.",
+            violations.join("\n  ")
         );
     }
 
-    #[test]
-    fn count_filtering_scans_project_only_predicate_columns() {
-        let source = include_str!("router.rs");
-        let broad_scan = source
-            .split("let projection_wanted =")
-            .nth(1)
-            .and_then(|rest| rest.split("let partitions =").next())
-            .expect("projection decision block must be present");
-        let projected_scan = source
-            .split("let partitions = if let Some(wanted) = projection_wanted")
-            .nth(1)
-            .and_then(|rest| rest.split("if count_only_select {").next())
-            .expect("projected scan block must be present");
+    /// INV: a COUNT over an index must be exact past the legacy 10_000 cap and
+    /// must not materialize its match set; a LIMIT-bounded index read must stop
+    /// the consumer at its bound.
+    ///
+    /// Behavioural replacement for `count_filtering_scans_project_only_predicate_columns`,
+    /// which asserted on `include_str!("router.rs")` source text. Its split
+    /// anchor (`let partitions = if let Some(wanted) = projection_wanted`)
+    /// occurred ONLY inside its own string literal, so the region it inspected
+    /// was 64 characters of its own source and the test could not fail — it was
+    /// one of the OOM guard tests, silently proving nothing.
+    ///
+    /// The observable properties, both falsifiable against the legacy cap:
+    ///   * exactness — a capped fold would report 10_000 here, not `n`;
+    ///   * boundedness — `INDEX_ROWS_VISITED` stops at the LIMIT, which also
+    ///     proves the counter is live (see the non-vacuity note below).
+    #[tokio::test]
+    async fn indexed_count_is_exact_past_the_cap_and_limit_stops_the_consumer() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let current_keyspace: Option<String> = None;
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &current_keyspace,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE count_exact WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE count_exact.edges (id int, seq int, tenant text, PRIMARY KEY (id, seq))",
+            "CREATE INDEX count_exact_tenant ON count_exact.edges (tenant)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
 
-        assert!(
-            broad_scan.contains("count_projection_wanted")
-                && broad_scan.contains("projection_storage_ordinals_for_count_predicates"),
-            "COUNT(*) filtered scans must push predicate-only projection into storage"
+        // Seed past the legacy `DEFAULT_RANGE_READ_LIMIT` (10_000) directly
+        // through storage: routing 10_001 INSERTs would measure CQL write
+        // overhead, not COUNT consumption.
+        let n = 10_001_i32;
+        let table_id = TableId::new("count_exact", "edges");
+        let rows: Vec<ferrosa_sstable::types::Row> = (0..n)
+            .map(|seq| {
+                let ts = seq as i64 + 1;
+                ferrosa_sstable::types::Row {
+                    clustering: encode_value(&CqlValue::Int(seq)),
+                    cells: vec![(
+                        0,
+                        ferrosa_common::CellValue::live(
+                            encode_value(&CqlValue::Text("tenant-a".to_string())),
+                            ts,
+                        ),
+                    )],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+                }
+            })
+            .collect();
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            encode_value(&CqlValue::Int(1)),
+        ));
+        let mutations: Vec<ferrosa_storage::Mutation> = rows
+            .chunks(40)
+            .map(|chunk| {
+                ferrosa_storage::Mutation::new(
+                    table_id.keyspace.clone(),
+                    table_id.table.clone(),
+                    key.clone(),
+                    chunk.to_vec(),
+                    n as i64,
+                )
+            })
+            .collect();
+        state.engine.write_atomic_batch(mutations).unwrap();
+
+        // (a) exactness: the count must see every matching row.
+        let count_stmt = match crate::parser::parse(
+            "SELECT COUNT(*) FROM count_exact.edges WHERE tenant = 'tenant-a'",
+        )
+        .unwrap()
+        {
+            Statement::Select(statement) => statement,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        let count = route_select_raw(&state, &ctx, &count_stmt).await.unwrap();
+        assert_eq!(
+            count.rows,
+            vec![vec![Some(CqlValue::Bigint(n as i64))]],
+            "INV: an indexed COUNT must be exact past the legacy 10_000 cap — a              capped count silently under-reports (data loss to the user)"
         );
-        assert!(
-            source.contains("range_read_projected_stream_all_with"),
-            "COUNT(*) filtered scans must use the projected streaming range path when possible"
+
+        // (b) boundedness: LIMIT stops the consumer at its bound.
+        INDEX_ROWS_VISITED.with(|count| count.set(0));
+        let limit_stmt = match crate::parser::parse(
+            "SELECT id FROM count_exact.edges WHERE tenant = 'tenant-a' LIMIT 10",
+        )
+        .unwrap()
+        {
+            Statement::Select(statement) => statement,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        let limited = route_select_raw(&state, &ctx, &limit_stmt).await.unwrap();
+        assert_eq!(limited.rows.len(), 10, "INV: LIMIT 10 returns 10 rows");
+        assert_eq!(
+            INDEX_ROWS_VISITED.with(|count| count.get()),
+            10,
+            "INV: an indexed LIMIT must stop the CQL consumer at the requested              row count instead of draining the posting list"
         );
-        assert!(
-            !projected_scan.contains("range_read(&table_id).await?"),
-            "COUNT(*) filtered scans must not materialize full partitions"
-        );
+        // Non-vacuity note: the assertion above demonstrates that
+        // INDEX_ROWS_VISITED IS live for this exact fixture. `n` is 10_001 and
+        // the counter reads 10, so it cannot be a constant. That is what makes
+        // (a)'s exactness claim falsifiable rather than decorative.
     }
 
     #[test]
