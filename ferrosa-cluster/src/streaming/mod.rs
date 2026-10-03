@@ -65,6 +65,34 @@ pub struct StreamEndPayload {
     pub checksum: u32,
 }
 
+/// What the receiver did with a row stream, carried in the `StreamEnd` reply.
+///
+/// The reply used to be a bare `b"ok"` sent whether the session applied, failed
+/// its checksum, or was never found, so a sender could not tell a delivered
+/// stream from a discarded one. Membership changes gate on this verdict (P0-2).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum StreamEndOutcome {
+    /// Count and checksum matched and every mutation was applied.
+    Applied {
+        /// Mutations applied to the receiver's storage.
+        applied: u64,
+    },
+    /// The session was not applied. Nothing from it should be counted as moved.
+    Rejected {
+        /// Why, as the receiver logged it.
+        reason: String,
+    },
+}
+
+/// Payload of the `StreamEnd` reply.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StreamEndAck {
+    /// Session the verdict is for.
+    pub session_id: u64,
+    /// The receiver's verdict.
+    pub outcome: StreamEndOutcome,
+}
+
 // ---------------------------------------------------------------------------
 // SSTable file-based streaming wire types
 // ---------------------------------------------------------------------------
