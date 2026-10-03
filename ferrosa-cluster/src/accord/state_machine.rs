@@ -907,6 +907,12 @@ impl AccordStateMachine {
         // failure so the caller does not advance a non-durable apply.
         let data = format!("Applied:{}", txn_id.0.time);
         if !self.sync_writer.write_and_sync(data.as_bytes()).is_ok() {
+            // Every caller discards this Err (it only leaves the txn Committed
+            // for the Apply retry), so this line is the only trace of it.
+            tracing::error!(
+                txn_id = ?txn_id,
+                "accord: Applied marker fsync failed — leaving the txn Committed for its Apply retry"
+            );
             return Err(());
         }
 
