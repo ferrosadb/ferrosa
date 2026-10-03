@@ -687,17 +687,41 @@ impl WireSchemaSnapshot {
 pub struct PairSchemaSyncHandler {
     schema: Arc<Schema>,
     engine: Arc<StorageEngine>,
+    /// Refuse a snapshot that lacks a table holding local data, instead of
+    /// dropping it. Set for the cluster shape: see [`Self::for_cluster`].
+    refuse_ambiguous_drops: bool,
 }
 
 impl PairSchemaSyncHandler {
+    /// Pair mode: the peer is the one primary, so a table missing from its
+    /// snapshot is a DROP this node missed, and is finished as one.
     pub fn new(schema: Arc<Schema>, engine: Arc<StorageEngine>) -> Self {
-        Self { schema, engine }
+        Self {
+            schema,
+            engine,
+            refuse_ambiguous_drops: false,
+        }
+    }
+
+    /// Cluster shape. The sender is whichever node believed it was the Raft
+    /// leader, which can be a deposed leader or one still applying its log, so
+    /// a table absent from its snapshot is ambiguous: a missed DROP or a sender
+    /// that never learned the CREATE. Drops in a cluster come from Raft
+    /// (`DropTable`, or a snapshot install that already refuses this case,
+    /// CL-22). A snapshot that would drop a table holding local data is
+    /// refused whole, loudly, rather than deleting it.
+    pub fn for_cluster(schema: Arc<Schema>, engine: Arc<StorageEngine>) -> Self {
+        Self {
+            schema,
+            engine,
+            refuse_ambiguous_drops: true,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl RpcHandler for PairSchemaSyncHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
         let body = match msg {
             Message::PairSchemaSync(b) => b,
             _ => return None,
@@ -712,18 +736,6 @@ impl RpcHandler for PairSchemaSyncHandler {
         };
         let snapshot = wire.into_snapshot();
 
-        // Register each non-system table with the storage engine.
-        for ((keyspace, _table_name), table) in &snapshot.tables {
-            if is_system_keyspace(keyspace) {
-                continue;
-            }
-            let storage_schema = table.to_storage_schema();
-            if let Err(e) = self.engine.register_table(storage_schema) {
-                tracing::error!("failed to register table during schema sync: {e}");
-                return None;
-            }
-        }
-
         // Tables this node's schema held that the snapshot no longer does:
         // DROPs this peer missed. Only schema-owned tables are candidates, so
         // engine-internal registrations (graph adjacency, the PostgreSQL KV
@@ -736,6 +748,49 @@ impl RpcHandler for PairSchemaSyncHandler {
             .filter(|key| !snapshot.tables.contains_key(*key) && !is_system_keyspace(&key.0))
             .cloned()
             .collect();
+
+        // Cluster shape: absence is not drop proof. Refuse the whole snapshot
+        // before anything is registered-over or deleted (CL-22's rule, applied
+        // to the schema push).
+        if self.refuse_ambiguous_drops {
+            for (keyspace, table) in &dropped {
+                let tid = ferrosa_storage::TableId::new(keyspace, table);
+                let data_bearing = match crate::raft::state_machine::table_has_local_artifacts(
+                    &self.engine,
+                    &tid,
+                ) {
+                    Ok(found) => found,
+                    Err(e) => {
+                        tracing::error!(
+                            %e, table = %tid, from = %from.0,
+                            "schema sync refused: could not check the absent table for local data"
+                        );
+                        return None;
+                    }
+                };
+                if data_bearing {
+                    tracing::error!(
+                        table = %tid, from = %from.0, snapshot_version = %snapshot.version,
+                        "schema sync refused: the pushed snapshot lacks a table that holds local \
+                         data, and in a cluster absence is not proof of a DROP (the sender may be \
+                         a deposed or lagging leader); nothing applied, nothing deleted"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        // Register each non-system table with the storage engine.
+        for ((keyspace, _table_name), table) in &snapshot.tables {
+            if is_system_keyspace(keyspace) {
+                continue;
+            }
+            let storage_schema = table.to_storage_schema();
+            if let Err(e) = self.engine.register_table(storage_schema) {
+                tracing::error!("failed to register table during schema sync: {e}");
+                return None;
+            }
+        }
 
         // Apply snapshot to schema registry.
         if let Err(e) = self.schema.apply_snapshot(snapshot) {
@@ -965,6 +1020,56 @@ mod tests {
         assert!(engine
             .table_schema(&TableId::new("test_ks", "test_tbl"))
             .is_some());
+    }
+
+    /// The cluster-shape handler must not delete a data-bearing table because
+    /// a pushed snapshot lacks it. The sender is whichever node thought it led
+    /// Raft; a deposed or lagging leader's snapshot lacks tables created after
+    /// its view, and this handler used to unregister them and delete their
+    /// SSTables -- the same inference from absence CL-22 refuses for Raft
+    /// snapshot installs.
+    #[tokio::test]
+    async fn cluster_schema_sync_refuses_to_drop_a_data_bearing_table() {
+        use ferrosa_storage::TableId;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = pair_test_engine(dir.path());
+        let schema = test_replication_schema();
+        let handler = PairSchemaSyncHandler::for_cluster(Arc::clone(&schema), Arc::clone(&engine));
+        let keep = test_table();
+        let mut newer = test_table();
+        newer.name = "newer_tbl".to_string();
+        newer.id = Uuid::new_v4();
+        let peer = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+
+        let current = serde_json::to_vec(&wire_with(vec![keep.clone(), newer.clone()])).unwrap();
+        assert!(handler
+            .handle(peer, Message::PairSchemaSync(Bytes::from(current)))
+            .await
+            .is_some());
+        let newer_id = TableId::new("test_ks", "newer_tbl");
+        let newer_dir = dir.path().join("sstables").join(newer_id.to_string());
+        std::fs::write(newer_dir.join("1-Data.db"), b"local durable artifact").unwrap();
+
+        let stale = serde_json::to_vec(&wire_with(vec![keep])).unwrap();
+        let reply = handler
+            .handle(peer, Message::PairSchemaSync(Bytes::from(stale)))
+            .await;
+        assert!(reply.is_none(), "a refused sync must not be acknowledged");
+        assert!(
+            engine.table_schema(&newer_id).is_some(),
+            "a data-bearing table absent from a pushed snapshot must stay registered"
+        );
+        assert!(
+            newer_dir.join("1-Data.db").exists(),
+            "and its SSTables must survive"
+        );
+        assert!(
+            schema
+                .snapshot()
+                .tables
+                .contains_key(&("test_ks".to_string(), "newer_tbl".to_string())),
+            "a refused snapshot must not replace the schema either"
+        );
     }
 
     fn test_replication_schema() -> Arc<ferrosa_schema::Schema> {
