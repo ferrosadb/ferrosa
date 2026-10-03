@@ -8379,19 +8379,16 @@ impl<F: FlushTarget> TableStore<F> {
             } else {
                 None
             };
-            match invalid {
-                Some(reason) => {
-                    tracing::warn!(
-                        index_name,
-                        gen,
-                        reason = reason.as_str(),
-                        "vector index: a generation's sidecars are invalid; ANN over the index \
-                         refuses until the repair rebuilds them from its rows"
-                    );
-                    self.invalidate_vector_generation(gen_str, index_name, reason);
-                    outcome.invalidated.push((gen_str.clone(), reason));
-                }
-                None => {}
+            if let Some(reason) = invalid {
+                tracing::warn!(
+                    index_name,
+                    gen,
+                    reason = reason.as_str(),
+                    "vector index: a generation's sidecars are invalid; ANN over the index \
+                     refuses until the repair rebuilds them from its rows"
+                );
+                self.invalidate_vector_generation(gen_str, index_name, reason);
+                outcome.invalidated.push((gen_str.clone(), reason));
             }
         }
         if !missing_scopes.is_empty() {
