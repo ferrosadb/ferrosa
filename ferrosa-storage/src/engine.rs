@@ -11271,23 +11271,41 @@ impl StorageEngine {
                         }
                     };
                     cancel_point!(&table_id.to_string(), CancelPoint::BeforeSwap);
-                    if let Err(e) = state.store.swap_compacted_sstables(
+                    match state.store.swap_compacted_sstables(
                         &input_id_paths,
                         output_id,
                         output.path.clone(),
                         reader,
                         output_sidecars,
                     ) {
-                        tracing::error!(%e, "compaction: swap failed");
-                        drop(tables);
-                        Self::rollback_compaction_intent(
-                            table_id,
-                            &table_dir,
-                            &task_id,
-                            Some(&output.path),
-                            "swap failed",
-                        );
-                        continue;
+                        Ok(crate::store::CompactionSwap::Swapped) => {}
+                        Ok(crate::store::CompactionSwap::InputsGone) => {
+                            // A TRUNCATE (or another compaction) removed an
+                            // input first. The output would resurrect its
+                            // rows: discard it, files and record.
+                            tracing::warn!(%table_id, %task_id, "compaction: inputs left the view before the swap; discarding the output");
+                            drop(tables);
+                            Self::rollback_compaction_intent(
+                                table_id,
+                                &table_dir,
+                                &task_id,
+                                Some(&output.path),
+                                "inputs left the view before the swap",
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!(%e, "compaction: swap failed");
+                            drop(tables);
+                            Self::rollback_compaction_intent(
+                                table_id,
+                                &table_dir,
+                                &task_id,
+                                Some(&output.path),
+                                "swap failed",
+                            );
+                            continue;
+                        }
                     }
                     cancel_point!(&table_id.to_string(), CancelPoint::AfterSwap);
                     let post_swap_count = state.store.sstable_count();

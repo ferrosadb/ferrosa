@@ -1128,6 +1128,18 @@ type VectorIndexScopes = HashMap<String, Arc<std::collections::HashSet<Vec<u8>>>
 /// An index DDL's change to a catalog: the next catalog, or `None` for none.
 type CatalogEdit = Box<dyn FnOnce(&IndexCatalog) -> Option<IndexCatalog> + Send>;
 
+/// What [`TableStore::swap_compacted_sstables`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an output that was not swapped in must be deleted by the caller"]
+pub enum CompactionSwap {
+    /// The output replaced its inputs in the view.
+    Swapped,
+    /// At least one input had already left the view (a TRUNCATE, or another
+    /// compaction): installing the output would bring back rows the view no
+    /// longer holds, so nothing changed and the output must be discarded.
+    InputsGone,
+}
+
 /// What one queued memtable rotation asks for (see `TableStore::rotate`).
 enum RotationKind {
     /// Flush the active memtable; `on_release` runs right after the swap.
@@ -8637,7 +8649,7 @@ impl<F: FlushTarget> TableStore<F> {
         output_path: std::path::PathBuf,
         add: Arc<SSTableReader<F::Reader>>,
         output_sidecars: HashMap<String, SidecarReader>,
-    ) -> Result<()> {
+    ) -> Result<CompactionSwap> {
         // Build the descriptor for the compacted output and seed its reader
         // into the pool once; the view swap below may derive more than once.
         let out_desc = SstableDescriptor::from_reader(output_id.clone(), output_path.clone(), &add);
@@ -8658,24 +8670,46 @@ impl<F: FlushTarget> TableStore<F> {
                 &output_sidecars,
             )
         })?;
+        let Some(removed) = removed else {
+            // An input already left the view (a TRUNCATE or another
+            // compaction got there first). The output holds rows the view no
+            // longer has; installing it would resurrect them.
+            self.reader_pool.remove(&self.pool_key(&out_desc));
+            tracing::warn!(
+                output = %output_id,
+                inputs = ?input_id_set,
+                "compaction swap refused: an input is no longer in the view; the output must be discarded"
+            );
+            return Ok(CompactionSwap::InputsGone);
+        };
 
         // Evict every removed input generation from the pool so a stale reader
         // can never be served or reopened after its files are deleted (FMEA #4).
         for desc in &removed {
             self.reader_pool.remove(&self.pool_key(desc));
         }
-        Ok(())
+        Ok(CompactionSwap::Swapped)
     }
 
     /// `current` with the compaction inputs removed and the output prepended,
-    /// plus the input descriptors it removed.
+    /// plus the input descriptors it removed; `(None, None)` when an input is
+    /// no longer in `current`.
     fn view_with_compaction_output(
         current: &StoreView,
         input_id_set: &std::collections::HashSet<&str>,
         out_desc: &SstableDescriptor,
         (output_id, output_path): (&String, &std::path::PathBuf),
         output_sidecars: &Arc<HashMap<String, SidecarReader>>,
-    ) -> (Option<StoreView>, Vec<SstableDescriptor>) {
+    ) -> (Option<StoreView>, Option<Vec<SstableDescriptor>>) {
+        let all_present = input_id_set.iter().all(|input| {
+            current
+                .sstable_ids
+                .iter()
+                .any(|(id, _)| id.as_str() == *input)
+        });
+        if !all_present {
+            return (None, None);
+        }
         // Keep SSTables whose ID is NOT in the compaction input set.
         // Match on ID only — the path in the view may be empty (from flush)
         // while the compaction task resolves it to the table directory. Matching
@@ -8718,7 +8752,7 @@ impl<F: FlushTarget> TableStore<F> {
             sidecar_indexes: Arc::new(new_sidecars),
             vector_indexes: Arc::clone(&current.vector_indexes),
         };
-        (Some(next), removed)
+        (Some(next), Some(removed))
     }
 
     /// Collects sidecar entries from SSTables matching the given `(id, path)` pairs for merging.
@@ -12407,7 +12441,7 @@ mod tests {
         let input_id_paths: Vec<(String, std::path::PathBuf)> =
             current_id_paths.iter().rev().take(2).cloned().collect();
 
-        store
+        let swap = store
             .swap_compacted_sstables(
                 &input_id_paths,
                 "compacted".to_string(),
@@ -12416,6 +12450,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
+        assert_eq!(swap, CompactionSwap::Swapped);
         assert_eq!(store.sstable_count(), 3); // 4 - 2 + 1 = 3
 
         // Verify output is present and inputs are gone.
@@ -12433,6 +12468,53 @@ mod tests {
                 "input {id} should be removed"
             );
         }
+    }
+
+    /// A compaction swap must not install its output once its inputs have left
+    /// the view (T2). Compaction merges inputs A and B; TRUNCATE commits while
+    /// it runs; then the swap arrives. Installing the merged output would bring
+    /// the truncated rows back. The swap must refuse, and change nothing.
+    #[test]
+    fn a_compaction_swap_after_truncate_does_not_resurrect_rows() {
+        let store = test_store();
+        store.write(&make_key("a"), make_row(b"va", 1000)).unwrap();
+        store.flush().unwrap();
+        store.write(&make_key("b"), make_row(b"vb", 2000)).unwrap();
+        store.flush().unwrap();
+        let inputs: Vec<(String, std::path::PathBuf)> =
+            store.view.load().sstable_ids.iter().cloned().collect();
+        // Stand in for the merged output: an SSTable holding both rows.
+        let merged = sstable_reader_from_partitions(
+            &test_schema(),
+            &[
+                make_partition("a", b"va", 1000),
+                make_partition("b", b"vb", 2000),
+            ],
+            None,
+        );
+
+        store.truncate().unwrap();
+        let swapped = store.swap_compacted_sstables(
+            &inputs,
+            "merged".to_string(),
+            std::path::PathBuf::new(),
+            Arc::new(merged),
+            HashMap::new(),
+        );
+
+        assert!(
+            matches!(swapped, Ok(CompactionSwap::InputsGone)),
+            "the swap must refuse an output whose inputs were truncated: {swapped:?}"
+        );
+        assert_eq!(store.sstable_count(), 0);
+        assert!(
+            store.read(&make_key("a")).unwrap().is_none(),
+            "truncated row a resurrected"
+        );
+        assert!(
+            store.read(&make_key("b")).unwrap().is_none(),
+            "truncated row b resurrected"
+        );
     }
 
     /// P0 data loss: two flushes to same partition key, different clustering
@@ -12681,7 +12763,7 @@ mod tests {
 
         // Swap: this MUST remove the 2 inputs even though their paths
         // don't match the view's empty PathBuf.
-        store
+        let swap = store
             .swap_compacted_sstables(
                 &input_ids_with_real_path,
                 "output".to_string(),
@@ -12690,6 +12772,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
+        assert_eq!(swap, CompactionSwap::Swapped);
 
         // Before the fix, this was 4 (2 inputs kept + output + merged).
         // After the fix, inputs are removed: 3 - 2 + 1 = 2.
@@ -15571,7 +15654,7 @@ mod tests {
         // lives in the high-bit synthetic space — no collision with inputs).
         let out_gen = "compacted".to_string();
 
-        store
+        let swap = store
             .swap_compacted_sstables(
                 &input_id_paths,
                 out_gen.clone(),
@@ -15580,6 +15663,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
+        assert_eq!(swap, CompactionSwap::Swapped);
         // 3 inputs removed, 1 compacted output inserted → exactly 1 remaining.
         assert_eq!(store.sstable_count(), 1, "3 inputs - 3 + 1 output = 1");
 
