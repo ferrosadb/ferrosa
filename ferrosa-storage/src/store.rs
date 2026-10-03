@@ -8138,7 +8138,7 @@ impl<F: FlushTarget> TableStore<F> {
                 match method {
                     VectorIndexMethod::Hnsw => {
                         if let Some(vec_bytes) =
-                            self.flush_target.read_vector_sidecar(gen, index_name)
+                            self.flush_target.read_vector_sidecar(gen, index_name)?
                         {
                             match ferrosa_index::vector::hnsw::search_from_bytes(
                                 &vec_bytes, query, k, ef_search,
@@ -8235,7 +8235,7 @@ impl<F: FlushTarget> TableStore<F> {
             if let Ok(gen) = gen_str.parse::<u64>() {
                 if let Some(vec_bytes) = self
                     .flush_target
-                    .read_vector_sidecar(gen, &scoped_index_name)
+                    .read_vector_sidecar(gen, &scoped_index_name)?
                 {
                     match ferrosa_index::vector::hnsw::search_from_bytes(
                         &vec_bytes, query, k, ef_search,
@@ -14225,6 +14225,7 @@ mod tests {
             store
                 .flush_target
                 .read_vector_sidecar(gen, "vec_idx")
+                .unwrap()
                 .is_none(),
             "quantized method must not write the legacy HNSW/VEC sidecar"
         );
@@ -14557,6 +14558,7 @@ mod tests {
         let sidecar_bytes = store
             .flush_target
             .read_vector_sidecar(gen, "vec_idx")
+            .unwrap()
             .expect("vector sidecar must be present after flush");
         assert!(
             !sidecar_bytes.is_empty(),
@@ -14588,6 +14590,47 @@ mod tests {
             "first result score should be near 0.0 for exact-match vector, got {}",
             results[0].score
         );
+    }
+
+    /// A vector index declared AFTER rows were written must answer for those
+    /// rows. Its DDL rotates the memtable, so the rows leave with the frozen
+    /// memtable; the rotation's flush must give them a vector sidecar that ANN
+    /// reads find (regression: `vector_index_registered_and_ann_orders_correctly`).
+    #[test]
+    fn a_vector_index_added_after_rows_answers_ann_for_them() {
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
+
+        let partitions = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+            .unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "ANN found no row written before the index"
+        );
+        assert_eq!(partitions[0].key.key.as_bytes(), b"k0");
     }
 
     #[test]

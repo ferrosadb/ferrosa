@@ -23071,6 +23071,70 @@ mod tests {
         engine.shutdown().unwrap();
     }
 
+    /// The full-text form: rows first, then the full-text index (its DDL
+    /// rotates the memtable), then a search must find them.
+    #[test]
+    fn engine_fulltext_index_added_after_rows_finds_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .write(
+                &tid,
+                &make_key("doc0"),
+                make_row(b"ferrosarotationprobe one", 1000),
+                1000,
+            )
+            .unwrap();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+        let hits = engine
+            .fulltext_search(&tid, "idx_body", "ferrosarotationprobe", Some(10))
+            .unwrap();
+        assert_eq!(fts_partition_keys(&hits), vec!["doc0".to_string()]);
+        engine.shutdown().unwrap();
+    }
+
+    /// Engine form of the `vector_index_registered_and_ann_orders_correctly`
+    /// regression: rows first, then the vector index, then ANN.
+    #[test]
+    fn engine_vector_index_added_after_rows_answers_ann_for_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let mut schema = test_schema();
+        schema.regular_columns[0].type_name =
+            "org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FloatType,3)"
+                .to_string();
+        engine.register_table(schema).unwrap();
+        let tid = table_id();
+        let vector_row = |v: &[f32; 3]| Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::live(ferrosa_index::vec_f32_to_bytes(v), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        engine
+            .write(&tid, &make_key("k0"), vector_row(&[1.0, 0.0, 0.0]), 1000)
+            .unwrap();
+        engine
+            .write(&tid, &make_key("k1"), vector_row(&[0.0, 1.0, 0.0]), 1000)
+            .unwrap();
+        engine.add_vector_index(&tid, "vec_idx", 0, 3).unwrap();
+
+        let partitions = engine
+            .ann_search_partitions(&tid, "vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+            .unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "ANN found no row written before the index"
+        );
+        assert_eq!(partitions[0].key.key.as_bytes(), b"k0");
+        engine.shutdown().unwrap();
+    }
+
     /// An index stream whose producer panics must end with an ERROR, never a
     /// clean end of stream: the producer's sender drops during unwind, so the
     /// consumer would read the rows delivered so far and then a normal close —
