@@ -99,6 +99,10 @@ pub async fn get_metrics(
     // Background client listeners (Postgres, SPARQL, graph HTTP, Bolt): 0 means the
     // listener failed to bind or exited, and `/readyz` reports not ready.
     listeners.render_prometheus(&mut body);
+    // PostgreSQL portals suspended by max_rows (ferrosa_pg_suspended_portals),
+    // refused at the per-connection/per-node limit (SQLSTATE 53000), and
+    // closed by the idle timeout.
+    ferrosa_postgres::portal_limits::render_prometheus(&mut body);
     // Client request rate, outcome and latency (ferrosa_cql_requests_total,
     // ferrosa_cql_request_duration_seconds, ferrosa_cql_requests_in_flight).
     ferrosa_cql::request_metrics::render_prometheus(&mut body);

@@ -24,6 +24,8 @@
 //! the `Session::error_pending` flag implements that skip; `Sync` clears it.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ferrosa_sql::{
     parse_statement, DeleteStmt, InsertStmt, ScalarItem, ScalarValue, SelectStmt, Statement,
@@ -32,6 +34,7 @@ use ferrosa_sql::{
 
 use crate::messages::{BackendMessage, TransactionStatus};
 use crate::mvcc::{MvccSnapshot, PgWrite};
+use crate::portal_limits::{expired_portal_error, PortalSlot, SuspendedPortals};
 use crate::query::{
     decode_param_checked, error_response, exec_error_response, row_description_fields,
 };
@@ -93,9 +96,31 @@ pub struct Session {
     /// set through the PostgreSQL MVCC manager atomically; `ROLLBACK`/`end_txn` clears it
     /// so a discarded transaction never touches storage (FMEA PG-1).
     txn_writes: Vec<PgWrite>,
-    /// Running queries of suspended portals (`Execute` with `max_rows` stopped
-    /// short), keyed by portal name. Dropping an entry stops its executor.
-    streams: HashMap<String, ResultStream>,
+    /// What each executed `SELECT` portal's query is doing, keyed by portal
+    /// name: suspended (`Execute` with `max_rows` stopped short), finished, or
+    /// closed by the server. A portal absent here has not started. Dropping a
+    /// suspended entry stops its executor and gives back its node slot.
+    runs: HashMap<String, PortalRun>,
+}
+
+/// A query suspended by `max_rows`, waiting for the next `Execute`.
+pub(crate) struct SuspendedQuery {
+    pub(crate) stream: ResultStream,
+    /// Its place under the node-wide limit; released on drop.
+    pub(crate) slot: PortalSlot,
+    /// When an `Execute` last touched it, for the idle timeout.
+    pub(crate) idle_since: Instant,
+}
+
+/// The state of an executed `SELECT` portal's query.
+pub(crate) enum PortalRun {
+    Suspended(SuspendedQuery),
+    /// It ran to its end. Executing it again returns no rows, as in
+    /// PostgreSQL; it never re-runs the query.
+    Finished,
+    /// The server closed it (idle timeout, or refused suspension). Executing
+    /// it again answers this error rather than silently starting over.
+    Closed(BackendMessage),
 }
 
 /// The format code (0 text / 1 binary) for parameter `i` under the Bind fan-out
@@ -121,7 +146,7 @@ impl Session {
             txn_snapshot: None,
             txn_read_tables: HashSet::new(),
             txn_writes: Vec::new(),
-            streams: HashMap::new(),
+            runs: HashMap::new(),
         }
     }
 
@@ -166,24 +191,101 @@ impl Session {
     pub fn on_sync(&mut self) {
         self.error_pending = false;
         if matches!(self.txn, TransactionStatus::Idle) {
-            self.streams.clear();
+            self.runs.clear();
         }
     }
 
-    /// Take a suspended portal's running query, to continue it. The caller must
-    /// [`Session::park_stream`] it again if it suspends once more.
-    pub(crate) fn take_stream(&mut self, portal: &str) -> Option<ResultStream> {
-        self.streams.remove(portal)
+    /// Take a portal's query state, to continue it. A suspended query must be
+    /// handed back with [`Session::park`] if it suspends once more.
+    pub(crate) fn take_run(&mut self, portal: &str) -> Option<PortalRun> {
+        self.runs.remove(portal)
     }
 
-    /// Park a query whose portal was suspended, so the next `Execute` resumes it.
-    pub(crate) fn park_stream(&mut self, portal: String, stream: ResultStream) {
-        self.streams.insert(portal, stream);
+    /// Admit a newly suspended query against the connection and node limits.
+    ///
+    /// # Errors
+    ///
+    /// The SQLSTATE 53000 `ErrorResponse` when either limit is reached.
+    pub(crate) fn admit_suspension(
+        &self,
+        portals: &Arc<SuspendedPortals>,
+    ) -> Result<PortalSlot, BackendMessage> {
+        portals.admit(self.suspended_portals())
+    }
+
+    /// Park a suspended query so the next `Execute` resumes it.
+    pub(crate) fn park(
+        &mut self,
+        portal: String,
+        stream: ResultStream,
+        slot: PortalSlot,
+        now: Instant,
+    ) {
+        let parked = SuspendedQuery {
+            stream,
+            slot,
+            idle_since: now,
+        };
+        self.runs.insert(portal, PortalRun::Suspended(parked));
+    }
+
+    /// Record that a portal's query ran to its end.
+    pub(crate) fn finish(&mut self, portal: String) {
+        self.runs.insert(portal, PortalRun::Finished);
+    }
+
+    /// Close a portal's query on the server's side; a later `Execute` gets
+    /// `error`.
+    pub(crate) fn close_run(&mut self, portal: String, error: BackendMessage) {
+        self.runs.insert(portal, PortalRun::Closed(error));
     }
 
     /// How many portals currently hold a running, suspended query.
     pub fn suspended_portals(&self) -> usize {
-        self.streams.len()
+        self.runs
+            .values()
+            .filter(|run| matches!(run, PortalRun::Suspended(_)))
+            .count()
+    }
+
+    /// When the longest-idle suspended portal reaches `timeout`, if any is
+    /// suspended.
+    pub(crate) fn next_expiry(&self, timeout: Duration) -> Option<Instant> {
+        self.runs
+            .values()
+            .filter_map(|run| match run {
+                PortalRun::Suspended(query) => Some(query.idle_since + timeout),
+                PortalRun::Finished | PortalRun::Closed(_) => None,
+            })
+            .min()
+    }
+
+    /// Close every suspended portal idle for `timeout` or longer at `now`,
+    /// freeing its query, scans, spill files and node slot. A later `Execute`
+    /// on one gets an error saying it expired. Returns how many closed.
+    pub(crate) fn expire_idle(&mut self, now: Instant, timeout: Duration) -> usize {
+        let expired: Vec<String> = self
+            .runs
+            .iter()
+            .filter_map(|(name, run)| match run {
+                PortalRun::Suspended(query)
+                    if now.saturating_duration_since(query.idle_since) >= timeout =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for name in &expired {
+            tracing::info!(
+                portal = %name,
+                idle_ms = timeout.as_millis() as u64,
+                "closing a PostgreSQL portal left suspended past the idle timeout"
+            );
+            let error = expired_portal_error(name, timeout);
+            self.runs.insert(name.clone(), PortalRun::Closed(error));
+        }
+        expired.len()
     }
 
     /// The protocol transaction status to report in `ReadyForQuery`.
@@ -223,6 +325,9 @@ impl Session {
     /// the buffered write-set. After `end_txn` no buffered write survives, so a
     /// rolled-back (or committed) transaction never re-applies on the next one.
     pub fn end_txn(&mut self) {
+        // PostgreSQL destroys a transaction's portals when it ends; their
+        // queries and node slots go with them.
+        self.runs.clear();
         self.txn = TransactionStatus::Idle;
         self.txn_isolation = None;
         self.txn_snapshot = None;
@@ -386,7 +491,7 @@ impl Session {
         };
 
         // Rebinding a name replaces the portal, and with it any suspended query.
-        self.streams.remove(&portal);
+        self.runs.remove(&portal);
         self.portals.insert(
             portal,
             Portal {
@@ -408,7 +513,7 @@ impl Session {
             b'P' => {
                 self.portals.remove(name);
                 // Releases the running query of a suspended portal.
-                self.streams.remove(name);
+                self.runs.remove(name);
             }
             _ => {}
         }
@@ -710,20 +815,92 @@ mod tests {
         .expect("query starts")
     }
 
-    /// `Close` on a portal releases its suspended query.
+    /// Suspend a running query on portal `name`, admitted under `portals`.
+    async fn suspend(s: &mut Session, portals: &Arc<SuspendedPortals>, name: &str, now: Instant) {
+        let slot = s.admit_suspension(portals).expect("under the limits");
+        s.park(name.into(), running_query().await, slot, now);
+    }
+
+    fn error_code(message: &BackendMessage) -> String {
+        match message {
+            BackendMessage::ErrorResponse { fields } => fields[1].1.clone(),
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    /// `Close` on a portal releases its suspended query and its node slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_releases_a_suspended_portals_query() {
+        let portals = Arc::new(SuspendedPortals::default());
         let mut s = Session::new(test_auth());
-        s.park_stream("p".into(), running_query().await);
+        suspend(&mut s, &portals, "p", Instant::now()).await;
         assert_eq!(s.suspended_portals(), 1);
+        assert_eq!(portals.suspended(), 1);
         s.on_close(b'P', "p");
         assert_eq!(s.suspended_portals(), 0);
-        assert!(s.take_stream("p").is_none());
+        assert_eq!(portals.suspended(), 0, "the node slot came back");
+        assert!(s.take_run("p").is_none());
+    }
+
+    /// The (limit+1)th suspended portal on a connection is refused with
+    /// 53000; closing one frees a place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_connection_limit_refuses_one_more_suspended_portal() {
+        let portals = Arc::new(SuspendedPortals::new(crate::PortalLimits {
+            per_connection: 2,
+            per_node: 100,
+            idle_timeout: Duration::from_secs(60),
+        }));
+        let mut s = Session::new(test_auth());
+        suspend(&mut s, &portals, "a", Instant::now()).await;
+        suspend(&mut s, &portals, "b", Instant::now()).await;
+        let refusal = s
+            .admit_suspension(&portals)
+            .expect_err("a third is refused");
+        assert_eq!(error_code(&refusal), "53000");
+        s.on_close(b'P', "a");
+        suspend(&mut s, &portals, "c", Instant::now()).await;
+        assert_eq!(s.suspended_portals(), 2);
+    }
+
+    /// A portal left suspended past the idle timeout is closed: its query and
+    /// node slot are freed, and a later `Execute` finds an error, not a fresh
+    /// run of the query. One touched more recently survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_suspended_portal_expires_and_answers_an_error() {
+        let timeout = Duration::from_secs(60);
+        let portals = Arc::new(SuspendedPortals::default());
+        let mut s = Session::new(test_auth());
+        let start = Instant::now();
+        suspend(&mut s, &portals, "old", start).await;
+        suspend(&mut s, &portals, "new", start + Duration::from_secs(30)).await;
+        assert_eq!(s.next_expiry(timeout), Some(start + timeout));
+
+        assert_eq!(
+            s.expire_idle(start + timeout - Duration::from_millis(1), timeout),
+            0
+        );
+        assert_eq!(s.expire_idle(start + timeout, timeout), 1);
+        assert_eq!(s.suspended_portals(), 1);
+        assert_eq!(
+            portals.suspended(),
+            1,
+            "the expired portal's slot came back"
+        );
+        match s.take_run("old") {
+            Some(PortalRun::Closed(error)) => assert_eq!(error_code(&error), "57014"),
+            _ => panic!("an expired portal must answer an error"),
+        }
+        assert_eq!(
+            s.next_expiry(timeout),
+            Some(start + Duration::from_secs(30) + timeout)
+        );
     }
 
     /// Rebinding a portal name replaces it, and its suspended query with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rebind_releases_a_suspended_portals_query() {
+        let portals = Arc::new(SuspendedPortals::default());
         let mut s = Session::new(test_auth());
         s.on_parse("st".into(), "SELECT id FROM users", vec![]);
         s.on_bind(
@@ -734,7 +911,7 @@ mod tests {
             vec![],
             &crate::jsonb_wire::test_limits(),
         );
-        s.park_stream("p".into(), running_query().await);
+        suspend(&mut s, &portals, "p", Instant::now()).await;
         s.on_bind(
             "p".into(),
             "st".into(),
@@ -744,14 +921,16 @@ mod tests {
             &crate::jsonb_wire::test_limits(),
         );
         assert_eq!(s.suspended_portals(), 0);
+        assert_eq!(portals.suspended(), 0, "the node slot came back");
     }
 
     /// Outside a transaction block `Sync` ends the unit of work and releases
     /// suspended portals; inside one they survive until closed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sync_releases_suspended_portals_only_outside_a_transaction() {
+        let portals = Arc::new(SuspendedPortals::default());
         let mut s = Session::new(test_auth());
-        s.park_stream("p".into(), running_query().await);
+        suspend(&mut s, &portals, "p", Instant::now()).await;
         s.begin_txn(None, crate::mvcc::MvccManager::default().snapshot());
         s.on_sync();
         assert_eq!(s.suspended_portals(), 1, "a transaction keeps its portals");

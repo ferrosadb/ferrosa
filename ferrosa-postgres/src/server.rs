@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 use crate::authz;
 use crate::codec::{self, CodecError};
 use crate::connection::{ConnError, Connection, TlsPolicy};
-use crate::extended::{self, PreparedKind, Session};
+use crate::extended::{self, PortalRun, PreparedKind, Session};
 use crate::handshake::{HandshakeError, VerifierStore};
 use crate::messages::{BackendMessage, FrontendMessage};
 use crate::mvcc::{MvccCommitError, MvccManager};
@@ -55,6 +55,10 @@ pub struct QueryContext {
     /// every constructor must supply the resolved value. They gate INSERT and
     /// UPDATE input only; reads use the codec's fixed hard ceilings.
     pub jsonb_limits: ferrosa_jsonb::Limits,
+    /// Node-wide accounting and limits for portals suspended by `max_rows`:
+    /// per connection, per node, and an idle timeout. Shared by every
+    /// connection on this listener.
+    pub portals: Arc<crate::SuspendedPortals>,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -323,6 +327,7 @@ where
     St: AsyncRead + AsyncWrite + Unpin,
 {
     let mut session = Session::new(auth);
+    let idle_timeout = ctx.portals.limits().idle_timeout;
     loop {
         match codec::read_frontend(frames) {
             Ok(Some(msg)) => {
@@ -331,8 +336,23 @@ where
                 }
             }
             Ok(None) => {
-                // Need more bytes for a complete frame.
-                let n = stream.read(read_buf).await?;
+                // Need more bytes for a complete frame. A client that sends
+                // nothing must not keep its suspended portals forever, so the
+                // wait ends early when the longest-idle one expires.
+                let n = match session.next_expiry(idle_timeout) {
+                    None => stream.read(read_buf).await?,
+                    Some(deadline) => tokio::select! {
+                        // `read` is cancel-safe: no bytes are lost if the
+                        // deadline wins.
+                        read = stream.read(read_buf) => read?,
+                        () = tokio::time::sleep_until(deadline.into()) => {
+                            let closed =
+                                session.expire_idle(std::time::Instant::now(), idle_timeout);
+                            ctx.portals.record_expiries(closed);
+                            continue;
+                        }
+                    },
+                };
                 if n == 0 {
                     return Ok(()); // EOF: client closed
                 }
@@ -1347,10 +1367,22 @@ async fn execute_select_portal<O: ReplySink>(
     max_rows: i32,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
-    let mut stream = match session.take_stream(portal_name) {
-        Some(stream) => stream,
+    let (mut stream, slot) = match session.take_run(portal_name) {
+        Some(PortalRun::Suspended(query)) => (query.stream, Some(query.slot)),
+        Some(PortalRun::Finished) => {
+            // PostgreSQL answers a portal already run to its end with no rows;
+            // re-running its query would return them all again.
+            session.finish(portal_name.to_string());
+            return Ok(vec![BackendMessage::CommandComplete {
+                tag: "SELECT 0".to_string(),
+            }]);
+        }
+        Some(PortalRun::Closed(error)) => {
+            session.close_run(portal_name.to_string(), error.clone());
+            return Ok(vec![session.fail(error)]);
+        }
         None => match open_portal_stream(ctx, session, portal_name).await {
-            Ok(stream) => stream,
+            Ok(stream) => (stream, None),
             Err(error) => return Ok(vec![session.fail(error)]),
         },
     };
@@ -1367,10 +1399,32 @@ async fn execute_select_portal<O: ReplySink>(
     let limit = usize::try_from(max_rows).ok().filter(|n| *n > 0);
     let end = stream.pump(limit, &result_formats, out).await?;
     match &end {
-        PumpEnd::Suspended => session.park_stream(portal_name.to_string(), stream),
+        PumpEnd::Suspended => {
+            // A portal suspending for the first time must fit under the
+            // connection and node limits; one resuming keeps its place.
+            let slot = match slot {
+                Some(slot) => slot,
+                None => match session.admit_suspension(&ctx.portals) {
+                    Ok(slot) => slot,
+                    Err(refusal) => {
+                        // The rows already sent stand, as after any
+                        // mid-result error; the query is dropped here.
+                        drop(stream);
+                        session.close_run(portal_name.to_string(), refusal.clone());
+                        return Ok(vec![session.fail(refusal)]);
+                    }
+                },
+            };
+            session.park(
+                portal_name.to_string(),
+                stream,
+                slot,
+                std::time::Instant::now(),
+            );
+        }
         // Skip the rest of the sequence until Sync (PostgreSQL semantics).
         PumpEnd::Failed(_) => session.mark_error(),
-        PumpEnd::Complete { .. } => {}
+        PumpEnd::Complete { .. } => session.finish(portal_name.to_string()),
     }
     Ok(end.into_messages())
 }
@@ -1723,6 +1777,7 @@ mod txn_atomicity_tests {
             accord: AccordAccess::disabled(),
             ddl: None,
             jsonb_limits: crate::jsonb_wire::test_limits(),
+            portals: Default::default(),
         }
     }
 
@@ -2521,6 +2576,16 @@ mod txn_atomicity_tests {
             "UPDATE kv SET v = 'after' WHERE k = 'extended-snapshot'",
         )
         .await;
+        // A portal run to its end returns no more rows (PostgreSQL), so read
+        // again through a fresh bind of the same statement.
+        reader.on_bind(
+            "portal".to_string(),
+            "read".to_string(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         let second = execute_portal(&ctx, &mut reader, "portal").await;
         assert_eq!(read_first_text_column(&second).as_deref(), Some("before"));
         execute_simple(&ctx, &mut reader, "ROLLBACK").await;

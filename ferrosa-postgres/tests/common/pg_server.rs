@@ -206,11 +206,18 @@ pub fn write_row(engine: &StorageEngine, i: usize) {
 pub struct TestServer {
     pub port: u16,
     pub engine: Arc<StorageEngine>,
+    /// The listener's suspended-portal accounting.
+    pub portals: Arc<ferrosa_postgres::SuspendedPortals>,
     pub dir: tempfile::TempDir,
 }
 
 /// Start a PG listener over a fresh engine seeded with `rows` partitions.
 pub async fn start_server(rows: usize) -> TestServer {
+    start_server_with(rows, ferrosa_postgres::PortalLimits::default()).await
+}
+
+/// [`start_server`] with explicit suspended-portal limits.
+pub async fn start_server_with(rows: usize, limits: ferrosa_postgres::PortalLimits) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = StorageEngine::new(engine_config(dir.path()), None).expect("engine");
     engine.register_table(storage_schema()).expect("register");
@@ -218,6 +225,7 @@ pub async fn start_server(rows: usize) -> TestServer {
         write_row(&engine, i);
     }
     let engine = Arc::new(engine);
+    let portals = Arc::new(ferrosa_postgres::SuspendedPortals::new(limits));
     let ctx = Arc::new(QueryContext {
         engine: Arc::clone(&engine),
         schema: Arc::new(schema_with_table()),
@@ -226,6 +234,7 @@ pub async fn start_server(rows: usize) -> TestServer {
         accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
+        portals: Arc::clone(&portals),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -240,7 +249,12 @@ pub async fn start_server(rows: usize) -> TestServer {
         ctx,
         server::PgTls::plaintext(),
     ));
-    TestServer { port, engine, dir }
+    TestServer {
+        port,
+        engine,
+        portals,
+        dir,
+    }
 }
 
 /// A SCRAM-authenticated `tokio-postgres` client.

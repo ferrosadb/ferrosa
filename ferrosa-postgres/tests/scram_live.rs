@@ -108,6 +108,7 @@ fn minimal_ctx() -> (Arc<QueryContext>, tempfile::TempDir) {
         accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
+        portals: Default::default(),
     });
     (ctx, dir)
 }
