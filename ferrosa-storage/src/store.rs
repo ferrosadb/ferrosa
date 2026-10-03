@@ -8905,7 +8905,7 @@ mod tests {
     /// This is the storage-level OOM-bound + equivalence oracle.
     #[tokio::test]
     async fn range_iter_fragmented_flattens_to_range_iter_across_sources() {
-        crate::range_merger::set_rows_per_fragment(16);
+        let _k = crate::range_merger::set_rows_per_fragment(16);
         let store = test_store();
 
         // One wide partition "hot": half its rows flushed to an SSTable, half
@@ -8969,7 +8969,6 @@ mod tests {
         // The hot partition must have fragmented (40 distinct cks > K=16).
         let hot = whole.iter().find(|p| p.key == make_key("hot")).unwrap();
         assert!(hot.rows.len() > 16, "fixture must produce a wide partition");
-        crate::range_merger::reset_rows_per_fragment();
     }
 
     #[test]
