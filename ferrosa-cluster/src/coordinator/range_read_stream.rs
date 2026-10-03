@@ -3851,7 +3851,7 @@ mod tests {
         ) -> Vec<Partition> {
             let mut merger = ferrosa_storage::range_merger::merger_for_sources(
                 Box::new(std::iter::empty()),
-                None,
+                Vec::new(),
                 readers,
                 start,
                 None,
