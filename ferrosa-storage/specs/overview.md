@@ -81,7 +81,9 @@ bounded deadline expires; pressure is checked once more before dispatch. The
 hard zone returns typed `Error::Overloaded`. Synchronous storage callers keep
 the hard admission check. On flush: a per-table `Mutex` serializes; a fresh
 memtable is swapped in and the old one becomes `flushing` (writes resume
-immediately); the flushing snapshot is serialized to a BTI SSTable via
+immediately; a memtable a failed flush left in `flushing` is stacked under it
+with `StackedMemtable`, so it stays readable and flushes with it — FMEA ST-66);
+the flushing snapshot is serialized to a BTI SSTable via
 `FlushTarget`; the new descriptor is prepended; index/FTI sidecars are built;
 the SSTable components are submitted to `UploadManager` for S3 write-behind;
 STCS/UCS is evaluated.

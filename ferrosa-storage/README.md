@@ -34,7 +34,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   durability window (see FMEA).
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
   memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`. Flush is
-  serialized by a per-table `Mutex`; reads/writes are never blocked. Optional
+  serialized by a per-table `Mutex`; reads/writes are never blocked. A flush
+  that fails or panics after its swap leaves its memtable in `flushing`; the
+  next swap stacks it (`memtable/stacked.rs`) so its rows stay readable and are
+  flushed once by the next success (FMEA ST-66). Optional
   `write_verify` self-readback after every flush. The durability barrier
   (`fsync_components`) fsyncs a generation's component files **concurrently** on
   a shared, bounded flush pool (`flush_executor`, a rayon `ThreadPool` whose
