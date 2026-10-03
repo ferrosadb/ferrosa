@@ -79,7 +79,7 @@ pub enum SmResponse {
     /// is at or below the retention/restart floor (see
     /// [`crate::accord::finalized`]). Nothing was registered. On the wire it is
     /// the empty `AccordPreAcceptOK`, indistinguishable from a lost message
-    /// (FMEA CL-33).
+    /// (FMEA CL-36).
     AlreadyDecided { txn_id: TxnId, by: DecidedBy },
 }
 
@@ -145,7 +145,7 @@ pub struct AccordStateMachine {
     /// Bounded record of decided transactions, consulted before a PreAccept
     /// registers anything, so a PreAccept that arrives after the decision
     /// cannot resurrect the transaction as a conflict nothing will clear
-    /// (FMEA CL-33). The bound and its justification live in
+    /// (FMEA CL-36). The bound and its justification live in
     /// [`crate::accord::finalized`].
     finalized: FinalizedTxns,
     /// Edge state for the floor-refusal warning: set on the first PreAccept
@@ -278,7 +278,7 @@ impl AccordStateMachine {
     /// Wiring the clock also sets the finalized-txn restart floor to the
     /// clock's `now`: this replica does not replay its Accord log, so it has
     /// no record of anything it decided before it was constructed, and every
-    /// transaction minted before then is refused at PreAccept (FMEA CL-33; see
+    /// transaction minted before then is refused at PreAccept (FMEA CL-36; see
     /// [`crate::accord::finalized`] for why that is safe and its residual).
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<HybridLogicalClock>) -> Self {
@@ -462,7 +462,7 @@ impl AccordStateMachine {
     ) -> SmResponse {
         // A PreAccept for a decided transaction must register nothing: nothing
         // would ever finalize it again, so it would sit as a pending conflict
-        // and every later read on its keys would dep-wait and abstain (CL-33).
+        // and every later read on its keys would dep-wait and abstain (CL-36).
         if let Some(by) = self.finalized.decided(&txn_id) {
             self.note_refused_preaccept(txn_id, by);
             return SmResponse::AlreadyDecided { txn_id, by };
@@ -826,7 +826,7 @@ impl AccordStateMachine {
             // no-write Apply as terminal and cascade its waiters so they can apply.
             None => {
                 // Leaves no TxnState, so remember the decision: the txn's own
-                // PreAccept may still be queued behind this finalize (CL-33).
+                // PreAccept may still be queued behind this finalize (CL-36).
                 self.finalized.record(txn_id);
                 self.conflict_index.remove(&txn_id);
                 let woken = self.apply_engine.notify_applied(txn_id);
@@ -1106,7 +1106,7 @@ impl AccordStateMachine {
             self.committed_txns.remove(id);
             self.dep_waiters.remove(id);
             // Forgetting the state must not forget the decision: a PreAccept
-            // delayed past this prune would otherwise register it again (CL-33).
+            // delayed past this prune would otherwise register it again (CL-36).
             self.finalized.record(*id);
         }
 
@@ -1127,7 +1127,7 @@ impl AccordStateMachine {
 
     /// Log a PreAccept refused because its transaction is already decided.
     ///
-    /// A tombstone refusal is the CL-33 late PreAccept itself: rare, and logged
+    /// A tombstone refusal is the CL-36 late PreAccept itself: rare, and logged
     /// per transaction at DEBUG (the hot-path rule forbids INFO with a txn id).
     /// A floor refusal can repeat for every transaction from a coordinator
     /// whose clock lags, so it WARNs on the edge only.
@@ -1218,7 +1218,7 @@ pub fn build_accord_state_machine(
         None => {
             tracing::warn!(
                 "accord: no shared HLC wired; the decided-txn record has no restart floor or \
-                 retention horizon and is bounded by capacity alone (FMEA CL-33)"
+                 retention horizon and is bounded by capacity alone (FMEA CL-36)"
             );
             sm
         }

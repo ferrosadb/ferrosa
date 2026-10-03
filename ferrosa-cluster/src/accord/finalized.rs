@@ -1,6 +1,6 @@
 //! Bounded memory of transactions this replica knows are decided, so a
 //! PreAccept that arrives after the decision is refused instead of
-//! registering a conflict nothing will ever clear (FMEA CL-33).
+//! registering a conflict nothing will ever clear (FMEA CL-36).
 //!
 //! # The hole this closes
 //!

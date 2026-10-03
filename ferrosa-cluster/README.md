@@ -359,7 +359,7 @@ early acknowledgement.
   refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)
   and registers nothing; otherwise a PreAccept queued behind a no-write
   finalize, or delayed past `prune_applied`, would register a conflict nothing
-  ever clears (FMEA CL-33). The record is `finalized.rs`'s `FinalizedTxns`:
+  ever clears (FMEA CL-36). The record is `finalized.rs`'s `FinalizedTxns`:
   exact tombstones plus a monotone floor, bounded by a 60 s retention horizon
   (advanced by `prune_applied` from the shared HLC), a 250 000-id cap that
   evicts into the floor, and a restart floor set when the HLC is wired, since
