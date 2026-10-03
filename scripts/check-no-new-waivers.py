@@ -22,7 +22,12 @@ import re
 import subprocess
 import sys
 
-IGNORE = re.compile(r"#\[\s*ignore\b")
+# An #[ignore] attribute in attribute position (line start, optionally after other
+# attributes like #[test]), or the conditional form #[cfg_attr(..., ignore)].
+# Prose that merely mentions "#[ignore]" mid-sentence is not a waiver.
+IGNORE = re.compile(
+    r"^\s*(#\[[^\]]*\]\s*)*#\[\s*ignore\b|#\[\s*cfg_attr\s*\(.*\bignore\b"
+)
 DATED = re.compile(
     r"\b(expires|until|deadline|review[-_ ]by|sunset)\b\W{0,4}(\d{4}-\d{2}-\d{2})",
     re.IGNORECASE,

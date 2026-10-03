@@ -80,6 +80,26 @@ class WaiverCheck(unittest.TestCase):
         code, out = self.run_check()
         self.assertEqual(code, 0, out)
 
+    def test_mentioning_ignore_in_prose_or_yaml_passes(self):
+        # Describing the rule (a CI step name, a comment) is not a waiver.
+        self.write(".github/ci.yml", "- name: No new waivers (#[ignore] or dated exemptions)\n"
+                                     "  # An added #[ignore] needs Ben's trailer.\n")
+        self.commit("describe the rule")
+        code, out = self.run_check()
+        self.assertEqual(code, 0, out)
+
+    def test_cfg_attr_ignore_fails(self):
+        self.write("src/lib.rs", '#[test]\n#[cfg_attr(target_os = "linux", ignore)]\nfn a() {}\n')
+        self.commit("sneaky skip")
+        code, out = self.run_check()
+        self.assertEqual(code, 1, out)
+
+    def test_ignore_after_another_attribute_on_one_line_fails(self):
+        self.write("src/lib.rs", "#[test] #[ignore]\nfn a() {}\n")
+        self.commit("skip a")
+        code, out = self.run_check()
+        self.assertEqual(code, 1, out)
+
     def test_a_past_until_date_in_prose_passes(self):
         # History ("these were asserts until 2020-01-01") is not an exemption:
         # a waiver's date is in the future.
