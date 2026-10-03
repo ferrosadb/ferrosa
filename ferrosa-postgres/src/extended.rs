@@ -112,12 +112,13 @@ pub(crate) struct SuspendedQuery {
     pub(crate) idle_since: Instant,
 }
 
-/// The state of an executed `SELECT` portal's query.
+/// The state of an executed portal.
 pub(crate) enum PortalRun {
     Suspended(SuspendedQuery),
-    /// It ran to its end. Executing it again returns no rows, as in
-    /// PostgreSQL; it never re-runs the query.
-    Finished,
+    /// It ran to its end. Executing it again answers this completion tag and
+    /// nothing else, as in PostgreSQL; it never re-runs the statement, so a
+    /// DML portal is never applied twice. (`SELECT 0` for a query.)
+    Finished(String),
     /// The server closed it (idle timeout, or refused suspension). Executing
     /// it again answers this error rather than silently starting over.
     Closed(BackendMessage),
@@ -230,8 +231,16 @@ impl Session {
     }
 
     /// Record that a portal's query ran to its end.
-    pub(crate) fn finish(&mut self, portal: String) {
-        self.runs.insert(portal, PortalRun::Finished);
+    /// The completion tag of a portal that has run to its end, if it has.
+    pub(crate) fn finished_tag(&self, portal: &str) -> Option<&str> {
+        match self.runs.get(portal)? {
+            PortalRun::Finished(tag) => Some(tag),
+            PortalRun::Suspended(_) | PortalRun::Closed(_) => None,
+        }
+    }
+
+    pub(crate) fn finish(&mut self, portal: String, tag: String) {
+        self.runs.insert(portal, PortalRun::Finished(tag));
     }
 
     /// Close a portal's query on the server's side; a later `Execute` gets
@@ -255,7 +264,7 @@ impl Session {
             .values()
             .filter_map(|run| match run {
                 PortalRun::Suspended(query) => Some(query.idle_since + timeout),
-                PortalRun::Finished | PortalRun::Closed(_) => None,
+                PortalRun::Finished(_) | PortalRun::Closed(_) => None,
             })
             .min()
     }

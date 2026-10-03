@@ -1303,15 +1303,33 @@ async fn execute_portal_body<O: ReplySink>(
     max_rows: i32,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
+    // PostgreSQL answers a portal already run to its end with its completion
+    // tag and nothing else. Re-running it would return a query's rows again,
+    // or apply a DML statement a second time.
+    if let Some(tag) = session.finished_tag(portal_name) {
+        return Ok(vec![BackendMessage::CommandComplete {
+            tag: tag.to_string(),
+        }]);
+    }
     let is_select = session
         .portal(portal_name)
         .and_then(|portal| session.statement(&portal.stmt_name))
         .is_some_and(|stmt| matches!(&stmt.parsed, PreparedKind::Select(_)));
     if is_select {
-        execute_select_portal(ctx, session, portal_name, max_rows, out).await
-    } else {
-        Ok(execute_portal_inner(ctx, session, portal_name).await)
+        return execute_select_portal(ctx, session, portal_name, max_rows, out).await;
     }
+    let messages = execute_portal_inner(ctx, session, portal_name).await;
+    let succeeded = !messages
+        .iter()
+        .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }));
+    let tag = messages.iter().rev().find_map(|m| match m {
+        BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+        _ => None,
+    });
+    if let (true, Some(tag)) = (succeeded, tag) {
+        session.finish(portal_name.to_string(), tag);
+    }
+    Ok(messages)
 }
 
 /// The `SELECT` a portal is bound to, with its bound parameters.
@@ -1369,13 +1387,10 @@ async fn execute_select_portal<O: ReplySink>(
 ) -> std::io::Result<Vec<BackendMessage>> {
     let (mut stream, slot) = match session.take_run(portal_name) {
         Some(PortalRun::Suspended(query)) => (query.stream, Some(query.slot)),
-        Some(PortalRun::Finished) => {
-            // PostgreSQL answers a portal already run to its end with no rows;
-            // re-running its query would return them all again.
-            session.finish(portal_name.to_string());
-            return Ok(vec![BackendMessage::CommandComplete {
-                tag: "SELECT 0".to_string(),
-            }]);
+        Some(PortalRun::Finished(tag)) => {
+            // Answered in `execute_portal_body`; kept for the exhaustive match.
+            session.finish(portal_name.to_string(), tag.clone());
+            return Ok(vec![BackendMessage::CommandComplete { tag }]);
         }
         Some(PortalRun::Closed(error)) => {
             session.close_run(portal_name.to_string(), error.clone());
@@ -1432,7 +1447,8 @@ async fn execute_select_portal<O: ReplySink>(
         }
         // Skip the rest of the sequence until Sync (PostgreSQL semantics).
         PumpEnd::Failed(_) => session.mark_error(),
-        PumpEnd::Complete { .. } => session.finish(portal_name.to_string()),
+        // A further Execute returns no rows: "SELECT 0".
+        PumpEnd::Complete { .. } => session.finish(portal_name.to_string(), "SELECT 0".into()),
     }
     Ok(end.into_messages())
 }
@@ -1875,6 +1891,59 @@ mod txn_atomicity_tests {
             "a refused portal sent rows before its error: {second:?}"
         );
         assert_eq!(ctx.portals.suspended(), 1);
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// A DML portal that has run to completion is never applied twice: as in
+    /// PostgreSQL, a second `Execute` returns its completion tag and does not
+    /// re-run the statement. An INSERT here is an upsert, so the row count
+    /// alone cannot show a second apply (it would still silently overwrite a
+    /// concurrent writer); inside a transaction every apply is buffered, so
+    /// the write-set shows it.
+    #[tokio::test]
+    async fn a_completed_dml_portal_is_not_applied_twice() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut s = Session::new(superuser());
+        execute_simple(&ctx, &mut s, "BEGIN").await;
+        s.on_parse(
+            "ins".into(),
+            "INSERT INTO kv (k, v) VALUES ($1, 'v')",
+            vec![25],
+        );
+        s.on_bind(
+            "p".into(),
+            "ins".into(),
+            &[0],
+            &[Some(b"once".to_vec())],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
+        let first = execute_portal(&ctx, &mut s, "p").await;
+        let second = execute_portal(&ctx, &mut s, "p").await;
+        assert_eq!(
+            s.txn_writes().len(),
+            1,
+            "the second Execute applied the INSERT again"
+        );
+        execute_simple(&ctx, &mut s, "COMMIT").await;
+        assert_eq!(row_count(&ctx, "once").await, 1, "inserted exactly once");
+        let tag = |msgs: &[BackendMessage]| -> Option<String> {
+            msgs.iter().find_map(|m| match m {
+                BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+                _ => None,
+            })
+        };
+        assert!(
+            tag(&first).is_some(),
+            "the first Execute completes: {first:?}"
+        );
+        assert_eq!(
+            second,
+            vec![BackendMessage::CommandComplete {
+                tag: tag(&first).expect("a tag")
+            }],
+            "the second Execute only repeats the completion"
+        );
         ctx.engine.shutdown().unwrap();
     }
 
