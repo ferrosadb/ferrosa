@@ -98,24 +98,30 @@ pub(crate) fn derive_adjacency_mutations(
             continue;
         };
 
-        derived.push(make_adjacency_mutation(
-            &adj_ks,
-            &source_id,
-            DIRECTION_OUT,
-            &edge_label,
-            &target_id,
-            &edge_table,
-            mutation.timestamp,
-        ));
-        derived.push(make_adjacency_mutation(
-            &adj_ks,
-            &target_id,
-            DIRECTION_IN,
-            &edge_label,
-            &source_id,
-            &edge_table,
-            mutation.timestamp,
-        ));
+        for (vertex, direction, neighbor) in [
+            (&source_id, DIRECTION_OUT, &target_id),
+            (&target_id, DIRECTION_IN, &source_id),
+        ] {
+            let mut entry = make_adjacency_mutation(
+                &adj_ks,
+                vertex,
+                direction,
+                &edge_label,
+                neighbor,
+                &edge_table,
+                mutation.timestamp,
+            );
+            // A deleted edge must delete its entries. Deriving live entries
+            // from the edge's tombstone would keep the edge traversable.
+            if crate::adjacency::schema::row_is_deleted(row) {
+                for adjacency_row in &mut entry.rows {
+                    adjacency_row.cells.clear();
+                    adjacency_row.deletion = row.deletion;
+                    adjacency_row.primary_key_liveness = ferrosa_sstable::types::LivenessInfo::NONE;
+                }
+            }
+            derived.push(entry);
+        }
     }
 
     derived

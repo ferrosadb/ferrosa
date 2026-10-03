@@ -97,6 +97,11 @@ pub async fn get_metrics(
     // `_fallbacks_total` MUST stay 0 when FERROSA_SSTABLE_DIRECT_IO=1 — non-zero
     // means the fs rejected O_DIRECT and Data.db is page-cached (mitigation inert).
     ferrosa_sstable::direct::render_prometheus(&mut body);
+    // Graph adjacency reconcile + first-use heal (ferrosa_graph_adjacency_*).
+    // `_entries_repaired_total` > 0 after a deploy is the heal of an index the
+    // pre-330a0c29 reconcile damaged; `_heals_failed_total` > 0 means graph
+    // traversals were refused retryably until a heal completed.
+    ferrosa_graph::adjacency::reconcile::render_prometheus(&mut body);
     // Background client listeners (Postgres, SPARQL, graph HTTP, Bolt): 0 means the
     // listener failed to bind or exited, and `/readyz` reports not ready.
     listeners.render_prometheus(&mut body);
