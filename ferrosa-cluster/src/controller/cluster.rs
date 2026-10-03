@@ -2806,6 +2806,31 @@ impl ModeController {
                                 "proceeding to promote joining nodes"
                             );
                             for &nid in &all_node_ids_for_bootstrap {
+                                // P0-4: a member still `Joining` without a
+                                // verified bootstrap record must not be
+                                // promoted here either. Formation peers are
+                                // committed `Normal`, so this only bites a
+                                // joiner that arrived through another path.
+                                let unverified_joiner = ring_for_bootstrap
+                                    .load()
+                                    .as_ref()
+                                    .as_ref()
+                                    .and_then(|ring| {
+                                        ring.get_node(nid).map(|info| {
+                                            info.state == NodeState::Joining
+                                                && !ring.bootstrap_complete(nid)
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                if unverified_joiner {
+                                    tracing::error!(
+                                        node_id = nid,
+                                        "not promoting a Joining member with no verified \
+                                         bootstrap record; it stays Joining until its \
+                                         bootstrap completes"
+                                    );
+                                    continue;
+                                }
                                 if nid != local_node_id {
                                     let cmd = crate::raft::RaftCommand {
                                         op: crate::raft::RaftOp::SetNodeState {
@@ -2836,10 +2861,16 @@ impl ModeController {
                         // skips non-Normal members, so that node's tokens were
                         // silently served by other nodes (repair run from it
                         // saw zero owned ranges, and its own full scans missed
-                        // a partition). The recovered topology is COMMITTED, so
-                        // a `Joining` member in it is a join whose promotion the
-                        // restart lost — not a node still streaming data.
-                        // Finish that promotion instead of leaving it stuck.
+                        // a partition).
+                        //
+                        // P0-4: a `Joining` member is EITHER a join whose
+                        // promotion the restart lost OR a join whose bootstrap
+                        // stream the restart cut off. Only the committed
+                        // `RecordBootstrapComplete` tells them apart, so only
+                        // recorded joiners are promoted here. The others stay
+                        // `Joining` (out of `replicas()`) and must rerun their
+                        // bootstrap; promoting them would make a replica with
+                        // no data.
                         let member_states: std::collections::BTreeMap<u64, NodeState> =
                             match ring_for_bootstrap.load().as_ref().as_ref() {
                                 Some(ring) => ring
@@ -2849,9 +2880,32 @@ impl ModeController {
                                     .collect(),
                                 None => std::collections::BTreeMap::new(),
                             };
+                        let recorded: std::collections::BTreeSet<u64> =
+                            match ring_for_bootstrap.load().as_ref().as_ref() {
+                                Some(ring) => member_states
+                                    .keys()
+                                    .copied()
+                                    .filter(|id| ring.bootstrap_complete(*id))
+                                    .collect(),
+                                None => std::collections::BTreeSet::new(),
+                            };
                         let promote_plan = crate::repair::coordinator::promote_joining_members(
                             &member_states,
+                            &recorded,
                         );
+                        let awaiting = crate::repair::coordinator::joiners_awaiting_bootstrap(
+                            &member_states,
+                            &recorded,
+                        );
+                        if !awaiting.is_empty() {
+                            tracing::error!(
+                                ?awaiting,
+                                local = local_node_id,
+                                "recovered topology has Joining members with no verified \
+                                 bootstrap record; they are NOT promoted and stay out of \
+                                 replicas() until their bootstrap reruns and records completion"
+                            );
+                        }
                         if !promote_plan.is_empty() {
                             let stuck: Vec<(u64, NodeState)> = member_states
                                 .iter()

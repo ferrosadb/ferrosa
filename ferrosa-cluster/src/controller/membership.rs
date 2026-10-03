@@ -708,7 +708,7 @@ mod decommission_drain_tests {
         ]
         .into();
         assert!(
-            promote_joining_members(&members).is_empty(),
+            promote_joining_members(&members, &[draining].into()).is_empty(),
             "the recovery promote pass would undo the decommission of node {draining} \
              (drain state {state:?})"
         );
