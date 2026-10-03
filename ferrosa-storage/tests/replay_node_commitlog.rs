@@ -38,7 +38,13 @@ fn copied_node_commitlog_replays_and_flushes() {
     config.flush_max_age_secs = 3600;
 
     let (engine, pending) = StorageEngine::open(config, None).expect("open copied data dir");
-    eprintln!("replaying {} pending mutations", pending.len());
+    let mutations = pending.len();
+    let rows: usize = pending.iter().map(|m| m.rows.len()).sum();
+    let cells: usize = pending
+        .iter()
+        .flat_map(|m| m.rows.iter())
+        .map(|r| r.cells.len())
+        .sum();
     engine.replay_mutations(pending).expect("replay");
     engine
         .flush_all()
@@ -51,11 +57,30 @@ fn copied_node_commitlog_replays_and_flushes() {
         .filter(|l| l.starts_with("ferrosa_storage_collection_blob_expansions_total{"))
         .map(str::to_string)
         .collect();
-    let report = if expansions.is_empty() {
-        "none\n".to_string()
-    } else {
-        expansions.join("\n") + "\n"
-    };
+    let tables_with_sstables = std::fs::read_dir(dir.join("sstables"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    std::fs::read_dir(e.path()).is_ok_and(|mut files| {
+                        files.any(|f| {
+                            f.is_ok_and(|f| f.file_name().to_string_lossy().ends_with("-Data.db"))
+                        })
+                    })
+                })
+                .count()
+        })
+        .expect("read the copy's sstables dir");
+    let report = format!(
+        "replayed mutations={mutations} rows={rows} cells={cells}\n\
+         tables flushed to SSTables={tables_with_sstables}\n\
+         collection blob expansions: {}\n",
+        if expansions.is_empty() {
+            "none".to_string()
+        } else {
+            expansions.join("; ")
+        }
+    );
     eprintln!("whole-value collection cells expanded:\n{report}");
     // Also left beside the copy, since a passing test's stderr is not kept.
     std::fs::write(dir.join("collection-blob-expansions.txt"), &report)
