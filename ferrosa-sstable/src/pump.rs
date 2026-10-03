@@ -1009,10 +1009,83 @@ impl AbortSignal for NeverAbort {
 /// One segment handed from the producer to the flusher by ownership
 /// (decisions.md D2): the buffer, how many of its bytes are valid, and the
 /// logical offset those bytes start at.
+///
+/// Carries the [`InflightSegment`] token that holds this segment's share of
+/// `write_pump_inflight_segments`, so the gauge counts exactly the `Filled`
+/// values alive between the producer's send and the flusher returning the
+/// buffer — on every exit path, with no hand-paired increment/decrement.
 struct Filled {
     buf: AlignedBuf,
     len: usize,
     offset: u64,
+    inflight: InflightSegment,
+}
+
+impl Filled {
+    fn new(buf: AlignedBuf, len: usize, offset: u64) -> Self {
+        Self {
+            buf,
+            len,
+            offset,
+            inflight: InflightSegment::acquire(),
+        }
+    }
+}
+
+/// One unit of `write_pump_inflight_segments`: incremented on construction,
+/// decremented exactly once when dropped (t_a594d4ee). Lives inside
+/// [`Filled`], so the flusher moving `buf` back to `free` (a partial move
+/// that drops the token), a failed send (the `SendError` drops the `Filled`),
+/// and a flusher exiting on error with segments still queued all release it
+/// the same way.
+///
+/// The gauge used to be paired by hand — incremented after each send and
+/// decremented each time the producer received a buffer from `free`. The
+/// `depth + 1` buffers pre-filled into `free` at open were never sent, yet
+/// each was counted as a return, so every async pump drove the gauge down by
+/// up to `depth + 1`; buffers sent but never received back after `finish`
+/// were never counted down at all. On the live cluster the net drift wrapped
+/// the `u64`.
+struct InflightSegment(());
+
+impl InflightSegment {
+    fn acquire() -> Self {
+        PUMP_INFLIGHT_SEGMENTS.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for InflightSegment {
+    fn drop(&mut self) {
+        let released = release_inflight(&PUMP_INFLIGHT_SEGMENTS, &PUMP_INFLIGHT_UNDERFLOW_REPORTED);
+        debug_assert!(
+            released,
+            "write_pump_inflight_segments released below zero: an InflightSegment was \
+             dropped without a matching acquire"
+        );
+    }
+}
+
+/// Decrement `gauge` by one unless it is already zero. Returns `false` on an
+/// attempted underflow, leaving `gauge` at zero rather than wrapping, and logs
+/// one ERROR on the first such event per process (`reported` latches it —
+/// edges, not events). An underflow means the token pairing above is broken,
+/// so the gauge is no longer trustworthy until restart.
+fn release_inflight(gauge: &AtomicU64, reported: &AtomicBool) -> bool {
+    if gauge
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+        .is_ok()
+    {
+        return true;
+    }
+    if !reported.swap(true, Ordering::Relaxed) {
+        tracing::error!(
+            "write_pump_inflight_segments would have gone below zero; held at 0. \
+             The in-flight segment accounting is broken and the gauge under-reports \
+             until restart (t_a594d4ee)"
+        );
+    }
+    false
 }
 
 /// The flusher's one allowed report to the producer: at most one is ever
@@ -1186,9 +1259,13 @@ fn run_flusher(
             match result {
                 Ok(()) => {
                     for _ in 0..run_len {
-                        let f = batch
+                        let Filled { buf, inflight, .. } = batch
                             .pop_front()
                             .expect("run_len was computed from batch.len()");
+                        // Release the gauge BEFORE the buffer can reach the
+                        // producer, so its next send's acquire never overlaps
+                        // this release and the gauge stays <= depth + 1.
+                        drop(inflight);
                         // Best-effort: a disconnected `free` means the pump
                         // was dropped without `finish` while we were
                         // mid-batch. There is no one left to return the
@@ -1196,7 +1273,7 @@ fn run_flusher(
                         // `Drop` still runs), the same "nothing more to do"
                         // case `finish`'s own `Drop`-without-finish path
                         // documents.
-                        let _ = free_tx.send(f.buf);
+                        let _ = free_tx.send(buf);
                     }
                 }
                 Err(e) => {
@@ -1279,6 +1356,7 @@ static PUMP_STALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PUMP_ABORTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PUMP_SYNC_FALLBACKS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PUMP_INFLIGHT_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static PUMP_INFLIGHT_UNDERFLOW_REPORTED: AtomicBool = AtomicBool::new(false);
 static PUMP_BLOCKED_FREE_NANOS: AtomicU64 = AtomicU64::new(0);
 
 // L6 contention budget: how many times the CALLING THREAD has actually
@@ -1356,15 +1434,11 @@ fn record_blocked_free(elapsed: Duration) {
     );
 }
 
-/// A segment the producer previously handed off has come back via `free` —
-/// the counterpart to the increment in `send_filled_low_level`.
-fn record_segment_returned() {
-    PUMP_INFLIGHT_SEGMENTS.fetch_sub(1, Ordering::Relaxed);
-}
-
-/// Segments the producer has handed to a flusher but not yet gotten back —
-/// the live value of `write_pump_inflight_segments`. Bounded by `depth`
-/// (architecture.md § Backpressure chain, `write_pump_inflight_segments`).
+/// Segments the producer has handed to a flusher that the flusher has not yet
+/// written and returned to `free` — the live value of
+/// `write_pump_inflight_segments`, one per live [`InflightSegment`]. Bounded
+/// per pump by `depth + 1` (architecture.md § Backpressure chain,
+/// `write_pump_inflight_segments`); summed across every open pump.
 pub fn write_pump_inflight_segments() -> u64 {
     PUMP_INFLIGHT_SEGMENTS.load(Ordering::Relaxed)
 }
@@ -1718,7 +1792,7 @@ impl AlignedPump {
         self.filled = 0;
         self.physical += len as u64;
         self.wrote_anything = true;
-        self.send_filled_low_level(Filled { buf, len, offset })
+        self.send_filled_low_level(Filled::new(buf, len, offset))
     }
 
     /// The one place a `Filled` is actually sent on `full` (decisions.md D2
@@ -1736,7 +1810,8 @@ impl AlignedPump {
         // `self.path` is only ever touched to format the (rare/never, in
         // steady state) disconnection error — never cloned on the hot path
         // (that would be a `PathBuf` allocation per segment).
-        send_result.map_err(|_| disconnected_error(&self.path))?;
+        // A failed send drops the `Filled` inside the `SendError`, releasing
+        // its `InflightSegment` — no separate gauge bookkeeping here.
         // `PUMP_INFLIGHT_SEGMENTS` is process-global (one gauge feeds
         // Prometheus for every pump this process ever opens), so it cannot
         // be asserted `<= this pump's depth` in general — concurrently open
@@ -1745,8 +1820,7 @@ impl AlignedPump {
         // a time" is instead structural here: `full`/`free` are each sized
         // `depth + 1` and pre-filled exactly once at open, so no send can
         // ever create a segment that did not already exist.
-        PUMP_INFLIGHT_SEGMENTS.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        send_result.map_err(|_| disconnected_error(&self.path))
     }
 
     /// Check the flusher's one-slot error channel before every send
@@ -1779,19 +1853,16 @@ impl AlignedPump {
                 .as_async_mut()
                 .expect("take_or_wait_for_segment only runs on the async backend");
             if let Some(buf) = backend.local_free.pop_front() {
-                // No `record_segment_returned()` here: that accounting
-                // happens once, when a segment actually arrives via `free`
-                // (below, or in the drain loop) — popping it back out of the
-                // already-primed local batch later is reuse, not a second
-                // return, and double-counting would eventually underflow the
-                // (unsigned) gauge.
+                // No gauge accounting on this side: a segment stops counting
+                // as in flight when the flusher drops its `Filled` (and the
+                // `InflightSegment` inside it), not when the producer picks
+                // the buffer back up.
                 return Ok(buf);
             }
         }
         let started = Instant::now();
         let buf = self.wait_for_free_segment_blocking()?;
         record_blocked_free(started.elapsed());
-        record_segment_returned();
         let backend = self
             .backend
             .as_async_mut()
@@ -1801,7 +1872,6 @@ impl AlignedPump {
         // batch, not one per segment (CD4).
         for extra in backend.free_rx.try_iter() {
             backend.local_free.push_back(extra);
-            record_segment_returned();
         }
         Ok(buf)
     }
@@ -2082,11 +2152,7 @@ impl AlignedPump {
                 self.physical += send_len as u64;
                 self.wrote_anything = true;
                 self.check_error_async()?;
-                self.send_filled_low_level(Filled {
-                    buf,
-                    len: send_len,
-                    offset,
-                })?;
+                self.send_filled_low_level(Filled::new(buf, send_len, offset))?;
             }
             // else: nothing was staged; `buf` (a still-untouched spare
             // segment) is simply dropped/freed here — never sent, never
@@ -2611,6 +2677,30 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// t_a594d4ee: an unmatched release holds the gauge at zero instead of
+    /// wrapping to ~u64::MAX, reports `false` (the `debug_assert` in
+    /// `InflightSegment::drop` turns that into a panic), and latches the
+    /// one-shot ERROR edge. Uses local atomics so no concurrently running
+    /// pump test can perturb (or be perturbed by) the process-wide gauge.
+    #[test]
+    fn release_inflight_never_wraps_below_zero() {
+        let gauge = AtomicU64::new(2);
+        let reported = AtomicBool::new(false);
+        assert!(release_inflight(&gauge, &reported));
+        assert!(release_inflight(&gauge, &reported));
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+        assert!(!reported.load(Ordering::Relaxed));
+
+        assert!(!release_inflight(&gauge, &reported));
+        assert_eq!(gauge.load(Ordering::Relaxed), 0, "must hold at 0, not wrap");
+        assert!(
+            reported.load(Ordering::Relaxed),
+            "first underflow latches the edge"
+        );
+        assert!(!release_inflight(&gauge, &reported));
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn backpressure_invalid_tunables_log_error_once_and_continue_with_defaults() {
