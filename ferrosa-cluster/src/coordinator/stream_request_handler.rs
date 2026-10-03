@@ -118,6 +118,14 @@ pub trait StreamRangeReader: Send + Sync {
             "streaming index reads are not supported by this reader".into(),
         ))
     }
+
+    /// Monotonic I/O progress behind this reader's walks (bytes downloaded by
+    /// rehydration, for the engine). A walk that yields no rows while this
+    /// advances is waiting on I/O, not stuck, and may still heartbeat.
+    /// Readers with no I/O of their own report a constant.
+    fn io_progress(&self) -> u64 {
+        0
+    }
 }
 
 impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
@@ -167,6 +175,10 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
     ) -> ferrosa_common::Result<PartitionStream<'a>> {
         let key = ferrosa_index::IndexKey(index_key.to_vec());
         Ok(self.read_by_index_stream_after(table_id, index_name, &key, after.cloned()))
+    }
+
+    fn io_progress(&self) -> u64 {
+        ferrosa_storage::metrics::object_store_download_progress()
     }
 }
 
@@ -286,6 +298,15 @@ pub async fn handle_stream_request_with_cancel<R, S>(
     // Flow-control window (t_a0f922a3 mode 2): `0` = unbounded.
     let max_chunks = req.max_chunks;
     let mut window_exhausted = false;
+    // Heartbeat gate: a heartbeat means "this walk progressed since the last
+    // one", never merely "this task is alive". `progress` is the items pulled
+    // from the walk plus the reader's I/O progress (rehydrate bytes). A walk
+    // stuck behind a lock moves neither, goes quiet, and the coordinator's
+    // idle watchdog releases its merge -- including the coordinator's own
+    // local walker, which the merge holds parked inside `tables.read()`.
+    let mut items_pulled: u64 = 0;
+    let mut last_heartbeat_progress = (items_pulled, reader.io_progress());
+    let mut withholding = false;
 
     'pull: loop {
         tokio::select! {
@@ -300,6 +321,7 @@ pub async fn handle_stream_request_with_cancel<R, S>(
             }
             next = stream.next() => match next {
                 Some(Ok(partition)) => {
+                    items_pulled = items_pulled.saturating_add(1);
                     let partition = match resume_filter_rows(partition, &start_key, &req) {
                         Some(p) => p,
                         None => continue,
@@ -354,6 +376,31 @@ pub async fn handle_stream_request_with_cancel<R, S>(
                 None => break 'pull, // stream exhausted
             },
             _ = ticker.tick() => {
+                let progress = (items_pulled, reader.io_progress());
+                if progress == last_heartbeat_progress {
+                    // Edge-logged: once when the walk stops progressing.
+                    if !withholding {
+                        withholding = true;
+                        tracing::warn!(
+                            request_id = req.request_id,
+                            keyspace = req.keyspace,
+                            table = req.table,
+                            items_pulled,
+                            "stream request: walk made no progress since the last heartbeat; \
+                             withholding heartbeats so the requester's idle timeout can fire"
+                        );
+                    }
+                    continue;
+                }
+                if withholding {
+                    withholding = false;
+                    tracing::info!(
+                        request_id = req.request_id,
+                        items_pulled,
+                        "stream request: walk progressing again; heartbeats resumed"
+                    );
+                }
+                last_heartbeat_progress = progress;
                 let hb = RangeReadStreamHeartbeatPayload {
                     request_id: req.request_id,
                     seq: heartbeat_seq,
@@ -1172,6 +1219,114 @@ mod tests {
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst) && handler.is_finished(),
             "a cancel during a blocked send must release the local stream"
+        );
+    }
+
+    /// A reader whose walk never yields (stuck behind a lock, or a dead
+    /// rehydrate). `io` stands in for the node's I/O progress counter.
+    struct StuckWalkReader {
+        io: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl StreamRangeReader for StuckWalkReader {
+        fn range_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+            _projected_regular_ordinals: Option<&'a [u16]>,
+            _start: Option<&'a ferrosa_common::key::DecoratedKey>,
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn io_progress(&self) -> u64 {
+            self.io.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn heartbeats(sink: &VecSink) -> usize {
+        sink.take()
+            .iter()
+            .filter(|m| matches!(m, Message::RangeReadStreamHeartbeat(_)))
+            .count()
+    }
+
+    /// INVARIANT: a heartbeat proves PROGRESS, not that the handler task is
+    /// alive. A walk that yields nothing and moves no I/O sends no heartbeat,
+    /// so the coordinator's idle watchdog can fire and release its merge.
+    /// Unconditional heartbeats kept a stuck replica's stream "alive" forever
+    /// and pinned the coordinator's local walker inside `tables.read()`.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_walk_sends_no_heartbeats() {
+        let reader = Arc::new(StuckWalkReader {
+            io: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let sink = Arc::new(VecSink::new());
+        let task_sink = Arc::clone(&sink);
+        let handler = tokio::spawn(async move {
+            handle_stream_request(req(41), reader, task_sink.as_ref(), 2).await;
+        });
+        tokio::time::sleep(HEARTBEAT_INTERVAL * 10).await;
+        handler.abort();
+        assert_eq!(
+            heartbeats(&sink),
+            0,
+            "a walk that made no progress must not heartbeat"
+        );
+    }
+
+    /// The other side of the gate: a walk that yields no ROWS but whose I/O
+    /// moves (an R2 rehydrate in flight) keeps heartbeating, so a slow but
+    /// progressing walk is not killed by the idle watchdog.
+    #[tokio::test(start_paused = true)]
+    async fn a_walk_with_io_progress_keeps_heartbeating() {
+        let io = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reader = Arc::new(StuckWalkReader {
+            io: Arc::clone(&io),
+        });
+        let sink = Arc::new(VecSink::new());
+        let task_sink = Arc::clone(&sink);
+        let handler = tokio::spawn(async move {
+            handle_stream_request(req(42), reader, task_sink.as_ref(), 2).await;
+        });
+        for _ in 0..10 {
+            io.fetch_add(16 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        }
+        handler.abort();
+        assert!(
+            heartbeats(&sink) >= 8,
+            "a walk whose I/O progressed every interval must heartbeat each one"
+        );
+    }
+
+    /// A walk that yields rows too slowly to fill a chunk is progressing and
+    /// must heartbeat, even though no chunk frame goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_walk_yielding_rows_below_a_chunk_keeps_heartbeating() {
+        struct SlowRows;
+        impl StreamRangeReader for SlowRows {
+            fn range_iter<'a>(
+                &'a self,
+                _table_id: &TableId,
+                _projected_regular_ordinals: Option<&'a [u16]>,
+                _start: Option<&'a ferrosa_common::key::DecoratedKey>,
+            ) -> ferrosa_common::Result<PartitionStream<'a>> {
+                Ok(Box::pin(futures::stream::unfold(0u8, |tag| async move {
+                    tokio::time::sleep(HEARTBEAT_INTERVAL / 2).await;
+                    Some((Ok(make_partition(tag)), tag.wrapping_add(1)))
+                })))
+            }
+        }
+        let sink = Arc::new(VecSink::new());
+        let task_sink = Arc::clone(&sink);
+        let handler = tokio::spawn(async move {
+            // chunk_size far above what arrives, so no chunk is emitted.
+            handle_stream_request(req(43), Arc::new(SlowRows), task_sink.as_ref(), 10_000).await;
+        });
+        tokio::time::sleep(HEARTBEAT_INTERVAL * 10).await;
+        handler.abort();
+        assert!(
+            heartbeats(&sink) >= 8,
+            "row progress must keep heartbeats flowing"
         );
     }
 
