@@ -497,6 +497,9 @@ static MEMTABLE_BACKPRESSURE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 static RANGE_READ_TRUNCATED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static INDEX_RELOAD_SKIPPED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VECTOR_GENERATIONS_REPAIRED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VECTOR_GENERATION_REPAIR_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VECTOR_GENERATIONS_PENDING: AtomicI64 = AtomicI64::new(0);
 static INDEX_SIDECAR_MAPPED_BYTES: AtomicI64 = AtomicI64::new(0);
 static INDEX_SIDECAR_MAPPED_FILES: AtomicI64 = AtomicI64::new(0);
 static READ_LIMITED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -809,6 +812,35 @@ pub fn range_read_truncated_total() -> u64 {
 /// boot).
 pub fn add_index_reload_skipped(n: u64) {
     INDEX_RELOAD_SKIPPED_ROWS_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+
+/// A generation's vector sidecars were rebuilt from its rows by the vector
+/// repair (FMEA ST-71).
+pub fn vector_generation_repaired() {
+    VECTOR_GENERATIONS_REPAIRED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A vector repair of one generation failed; ANN over its index keeps
+/// refusing until a later repair succeeds.
+pub fn vector_generation_repair_failed() {
+    VECTOR_GENERATION_REPAIR_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Generations rebuilt by the vector repair since startup.
+pub fn vector_generations_repaired_total() -> u64 {
+    VECTOR_GENERATIONS_REPAIRED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Generations a vector repair run found incomplete and has yet to finish
+/// (`delta` positive when a run starts, negative as it settles each one).
+pub fn add_vector_generations_pending(delta: i64) {
+    VECTOR_GENERATIONS_PENDING.fetch_add(delta, Ordering::Relaxed);
+}
+
+/// Generations awaiting a vector rebuild right now; ANN over their index
+/// refuses while this is non-zero for it.
+pub fn vector_generations_pending() -> i64 {
+    VECTOR_GENERATIONS_PENDING.load(Ordering::Relaxed)
 }
 
 /// A scalar index sidecar of `bytes` was memory-mapped (t_7ac6b0e3).
@@ -1566,6 +1598,30 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_index_reload_skipped_rows_total {}\n",
         INDEX_RELOAD_SKIPPED_ROWS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_vector_generations_repaired_total Generations whose vector sidecars were rebuilt from their rows (compacted without them, flushed before manifests, or a crashed build).\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_vector_generations_repaired_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_vector_generations_repaired_total {}\n",
+        VECTOR_GENERATIONS_REPAIRED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_vector_generation_repair_failures_total Vector sidecar rebuilds of one generation that failed (ANN over that index refuses until one succeeds).\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_vector_generation_repair_failures_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_vector_generation_repair_failures_total {}\n",
+        VECTOR_GENERATION_REPAIR_FAILURES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_vector_generations_pending Generations awaiting a vector sidecar rebuild; ANN over their index refuses (retryable) meanwhile.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_vector_generations_pending gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_vector_generations_pending {}\n",
+        VECTOR_GENERATIONS_PENDING.load(Ordering::Relaxed)
     ));
     out.push_str(
         "# HELP ferrosa_storage_index_sidecar_mapped_bytes Bytes of scalar index sidecars memory-mapped (reclaimable page cache, not heap).\n",

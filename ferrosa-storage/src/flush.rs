@@ -506,8 +506,8 @@ pub trait FlushTarget {
         Ok(None)
     }
 
-    /// Every `(generation, index_name)` with a vector sidecar written by
-    /// [`FlushTarget::write_vector_sidecar`], in no particular order.
+    /// Every vector sidecar written by [`FlushTarget::write_vector_sidecar`],
+    /// in no particular order.
     ///
     /// The store rebuilds its set of partition-scoped sidecars from this when
     /// a vector index is registered, so the set survives a restart: the files
@@ -518,7 +518,7 @@ pub trait FlushTarget {
     ///
     /// The sidecars cannot be listed. The caller must not treat that as "no
     /// sidecars": ANN would silently answer without every flushed row.
-    fn list_vector_sidecars(&self) -> Result<Vec<(u64, String)>> {
+    fn list_vector_sidecars(&self) -> Result<Vec<VectorSidecarFile>> {
         Ok(Vec::new())
     }
 
@@ -729,12 +729,19 @@ impl FlushTarget for InMemoryFlushTarget {
         Ok(bytes)
     }
 
-    fn list_vector_sidecars(&self) -> Result<Vec<(u64, String)>> {
+    fn list_vector_sidecars(&self) -> Result<Vec<VectorSidecarFile>> {
         let map = self
             .vector_sidecars
             .lock()
             .expect("vector_sidecars poisoned");
-        Ok(map.keys().cloned().collect())
+        Ok(map
+            .iter()
+            .map(|((generation, name), bytes)| VectorSidecarFile {
+                generation: *generation,
+                name: name.clone(),
+                len: bytes.len() as u64,
+            })
+            .collect())
     }
 
     fn remove_vector_sidecar(&self, generation: u64, index_name: &str) -> Result<()> {
@@ -2547,10 +2554,25 @@ impl FlushTarget for FileFlushTarget {
         index_name: &str,
         vec_bytes: &[u8],
     ) -> Result<()> {
+        // Through a temp file and a rename, so a reader (or a manifest
+        // check after a crash) sees the whole sidecar or none of it. The temp
+        // name carries no `-VEC-`, so a listing never mistakes it for one.
         let path = self
             .base_dir
             .join(format!("{generation}-VEC-{index_name}.db"));
-        std::fs::write(&path, vec_bytes)?;
+        let tmp = self.base_dir.join(format!(
+            ".vec-{generation}-{index_name}.{}.tmp",
+            std::process::id()
+        ));
+        if let Err(e) = std::fs::write(&tmp, vec_bytes).and_then(|()| std::fs::rename(&tmp, &path))
+        {
+            if let Err(cleanup) = std::fs::remove_file(&tmp) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %tmp.display(), %cleanup, "could not remove temp vector sidecar");
+                }
+            }
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -2577,7 +2599,7 @@ impl FlushTarget for FileFlushTarget {
     /// `write_vector_sidecar` puts every one. Any other file is not a vector
     /// sidecar and is passed over; a directory that cannot be read is an
     /// error.
-    fn list_vector_sidecars(&self) -> Result<Vec<(u64, String)>> {
+    fn list_vector_sidecars(&self) -> Result<Vec<VectorSidecarFile>> {
         let unreadable = |e: std::io::Error| {
             ferrosa_common::Error::InvalidData(format!(
                 "cannot list vector sidecars in {}: {e}",
@@ -2593,13 +2615,19 @@ impl FlushTarget for FileFlushTarget {
         let mut sidecars = Vec::new();
         for entry in entries {
             let entry = entry.map_err(unreadable)?;
-            if let Some(sidecar) = entry
+            let Some((generation, name)) = entry
                 .file_name()
                 .to_str()
                 .and_then(parse_vector_sidecar_name)
-            {
-                sidecars.push(sidecar);
-            }
+            else {
+                continue;
+            };
+            let len = entry.metadata().map_err(unreadable)?.len();
+            sidecars.push(VectorSidecarFile {
+                generation,
+                name,
+                len,
+            });
         }
         Ok(sidecars)
     }
@@ -2655,6 +2683,18 @@ impl FlushTarget for FileFlushTarget {
             .join(format!("{generation}-QVEC-{index_name}.qvec"))
             .exists()
     }
+}
+
+/// One vector sidecar on disk, as [`FlushTarget::list_vector_sidecars`]
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorSidecarFile {
+    /// The SSTable generation it belongs to.
+    pub generation: u64,
+    /// The sidecar's name: the index name, a scoped name, or a manifest.
+    pub name: String,
+    /// Its size in bytes.
+    pub len: u64,
 }
 
 /// `(generation, index_name)` for a `{generation}-VEC-{index_name}.db` file

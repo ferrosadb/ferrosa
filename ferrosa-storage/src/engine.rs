@@ -81,6 +81,19 @@ fn effective_compaction_input_bounds(
 /// Parse `FERROSA_COMPACTION_PURGE_TOMBSTONES`. Purging expired tombstones
 /// (`gc_grace_seconds`) is on by default; `0`/`false`/`off`/`no` is the kill
 /// switch. Any other value, or none, leaves it on.
+/// Remove a rolled-back compaction output's vector sidecars, which live in
+/// the table directory beside, not inside, its component directory.
+fn discard_output_vector_sidecars(store: &TableStore<FileFlushTarget>, output_gen: &str) {
+    if let Err(e) = store.discard_generation_vector_sidecars(output_gen) {
+        tracing::error!(
+            %e,
+            output_gen,
+            "compaction rollback: the output's vector sidecars could not be removed; \
+             they are orphaned until the table directory is cleaned"
+        );
+    }
+}
+
 fn parse_purge_enabled(value: Option<&str>) -> bool {
     !matches!(
         value.map(str::trim),
@@ -6460,7 +6473,66 @@ impl StorageEngine {
                 VectorIndexMethod::QuantizedIvf => store.add_quantized_vector_index(config)?,
             };
             Ok(((), outcome))
-        })
+        })?;
+        // SSTables the index has no complete sidecars for (rows written
+        // before it existed, compacted without vector sidecars, or a restart
+        // after a crashed build) are rebuilt in the background; ANN refuses
+        // over the index until they are.
+        self.spawn_vector_repair_if_needed(table_id, index_name);
+        Ok(())
+    }
+
+    /// Start a background rebuild of `index_name`'s incomplete generations
+    /// on `table_id`, unless none is incomplete or a rebuild is running.
+    fn spawn_vector_repair_if_needed(&self, table_id: &TableId, index_name: &str) {
+        let Some(state) = self.tables.load().get(table_id).cloned() else {
+            return;
+        };
+        if state.store.vector_repair_running(index_name)
+            || state
+                .store
+                .vector_generations_pending(index_name)
+                .is_empty()
+        {
+            return;
+        }
+        let index = index_name.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("vector-repair".into())
+            .spawn(move || {
+                state.store.run_vector_repair(&index);
+            });
+        if let Err(e) = spawned {
+            tracing::error!(
+                %e,
+                table = %table_id,
+                index_name,
+                "could not start the vector repair thread; ANN over the index refuses until \
+                 the next query or registration starts it"
+            );
+        }
+    }
+
+    /// Live generations of `table_id` whose vector sidecars for `index_name`
+    /// are not known complete. ANN over the index refuses while any exist.
+    pub fn vector_generations_pending(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> ferrosa_common::Result<Vec<String>> {
+        let state = self.require_table(table_id)?;
+        Ok(state.store.vector_generations_pending(index_name))
+    }
+
+    /// Rebuild `index_name`'s incomplete generations on `table_id` now, on
+    /// this thread. `Ok(None)` when another rebuild of the index is running.
+    pub fn repair_vector_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> ferrosa_common::Result<Option<crate::store::VectorRepairOutcome>> {
+        let state = self.require_table(table_id)?;
+        Ok(state.store.run_vector_repair(index_name))
     }
 
     /// Report the artifact/search method registered for a table's vector index.
@@ -6483,6 +6555,7 @@ impl StorageEngine {
         ef_search: usize,
     ) -> ferrosa_common::Result<Vec<ferrosa_index::vector::IndexResult>> {
         let state = self.require_table(table_id)?;
+        self.spawn_vector_repair_if_needed(table_id, index_name);
         state.store.ann_search(index_name, query, k, ef_search)
     }
 
@@ -6502,6 +6575,7 @@ impl StorageEngine {
         ef_search: usize,
     ) -> ferrosa_common::Result<Vec<Partition>> {
         let state = self.require_table(table_id)?;
+        self.spawn_vector_repair_if_needed(table_id, index_name);
         state
             .store
             .ann_search_partitions(index_name, query, k, ef_search)
@@ -6518,6 +6592,7 @@ impl StorageEngine {
         ef_search: usize,
     ) -> ferrosa_common::Result<Vec<ferrosa_index::vector::IndexResult>> {
         let state = self.require_table(table_id)?;
+        self.spawn_vector_repair_if_needed(table_id, index_name);
         state
             .store
             .ann_search_in_partition_scope(index_name, partition_scope, query, k, ef_search)
@@ -11233,6 +11308,28 @@ impl StorageEngine {
                 }
             }
 
+            // Vector sidecars for the output, built BEFORE the swap and marked
+            // complete, so ANN finds the compacted rows the moment their
+            // inputs leave the view. Compaction used to write none: every
+            // compacted row dropped out of ANN for good. A failure is logged
+            // by the build; the output swaps in incomplete, ANN over the index
+            // refuses (retryable), and the vector repair rebuilds it.
+            if let Some(state) = self.tables.load().get(table_id) {
+                let vector_start = Instant::now();
+                let outcome = state.store.build_vector_sidecars_for_output(gen, &reader);
+                if outcome.repaired + outcome.failed > 0 {
+                    tracing::info!(
+                        %table_id,
+                        output = %gen,
+                        built = outcome.repaired,
+                        failed = outcome.failed,
+                        vectors = outcome.vectors,
+                        elapsed_ms = vector_start.elapsed().as_millis() as u64,
+                        "compaction: built vector sidecars for output"
+                    );
+                }
+            }
+
             // Swap: remove input SSTables by ID, insert output.
             // Compaction output gen may collide with flush gen (different dirs).
             // Advance the flush target past this gen to prevent future collisions,
@@ -11259,6 +11356,7 @@ impl StorageEngine {
                         Ok(sidecars) => sidecars,
                         Err(e) => {
                             tracing::error!(%e, %table_id, "compaction: output sidecars could not be built; keeping the inputs");
+                            discard_output_vector_sidecars(&state.store, gen);
                             drop(tables);
                             Self::rollback_compaction_intent(
                                 table_id,
@@ -11296,6 +11394,7 @@ impl StorageEngine {
                         }
                         Err(e) => {
                             tracing::error!(%e, "compaction: swap failed");
+                            discard_output_vector_sidecars(&state.store, gen);
                             drop(tables);
                             Self::rollback_compaction_intent(
                                 table_id,
@@ -12662,6 +12761,42 @@ impl StorageEngine {
                     error = %e,
                     "delete_sstable_files: could not enumerate the component directory; \
                      index sidecars may be left behind"
+                ),
+            }
+        }
+
+        // Vector sidecars always live in the table directory (the flush
+        // target's base), even for a generation whose components are in
+        // their own directory, so sweep them there too.
+        if component_dir != table_dir {
+            let prefix = format!("{gen}-VEC-");
+            match std::fs::read_dir(table_dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let ours = entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with(&prefix));
+                        if !ours || !path.is_file() {
+                            continue;
+                        }
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => reclaimed = reclaimed.saturating_add(size),
+                            Err(e) => tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "delete_sstable_files: a vector sidecar could not be removed"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    dir = %table_dir.display(),
+                    error = %e,
+                    "delete_sstable_files: could not enumerate the table directory; \
+                     vector sidecars may be left behind"
                 ),
             }
         }
@@ -23254,6 +23389,181 @@ mod tests {
         engine.shutdown().unwrap();
     }
 
+    /// Drive `vec_idx`'s repair to completion: run it here, or wait for the
+    /// background run registration started. Bounded; fails loud if it never
+    /// finishes.
+    fn finish_vector_repair(engine: &StorageEngine) {
+        for _ in 0..1_000 {
+            if engine
+                .vector_generations_pending(&table_id(), "vec_idx")
+                .unwrap()
+                .is_empty()
+            {
+                return;
+            }
+            if engine
+                .repair_vector_index(&table_id(), "vec_idx")
+                .unwrap()
+                .is_none()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        panic!(
+            "vector repair never finished; pending: {:?}",
+            engine.vector_generations_pending(&table_id(), "vec_idx")
+        );
+    }
+
+    /// Flush `rows` as one SSTable each batch, then compact them into one.
+    async fn flush_batches_and_compact(engine: &StorageEngine, batches: &[&[(&str, [f32; 3])]]) {
+        let tid = table_id();
+        for batch in batches {
+            for (key, vector) in *batch {
+                engine
+                    .write(&tid, &make_key(key), vector_test_row(vector), 1000)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+        }
+        assert_eq!(
+            engine.sstable_count(&tid),
+            batches.len(),
+            "one SSTable per batch"
+        );
+        engine.force_compact_all();
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.sstable_count(&tid), 1, "compaction must swap in");
+    }
+
+    /// An engine over `dir` with the vector test table and a persisted
+    /// `vec_idx`, as `CREATE TABLE` + `CREATE INDEX` leave it.
+    fn engine_with_vector_index(dir: &std::path::Path) -> StorageEngine {
+        let mut config = StorageEngineConfig::test_config(dir);
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(vector_test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+        engine
+            .add_vector_index(&table_id(), "vec_idx", 0, 3)
+            .unwrap();
+        persist_vector_index_row(&engine, "vec_idx");
+        engine
+            .flush(&TableId::new("system_schema", "indexes"))
+            .unwrap();
+        engine
+    }
+
+    const SIX_VECTORS: [(&str, [f32; 3]); 6] = [
+        ("k0", [1.0, 0.0, 0.0]),
+        ("k1", [0.0, 1.0, 0.0]),
+        ("k2", [0.0, 0.0, 1.0]),
+        ("k3", [1.0, 1.0, 0.0]),
+        ("k4", [0.0, 1.0, 1.0]),
+        ("k5", [1.0, 0.0, 1.0]),
+    ];
+
+    /// Compaction wrote no vector sidecars for its output and deleted its
+    /// inputs', so every compacted row dropped out of ANN for good. The
+    /// output now carries complete scoped sidecars from the moment it swaps
+    /// in, and they survive a restart.
+    #[tokio::test]
+    async fn compacted_vectors_answer_ann_before_and_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_with_vector_index(dir.path());
+        flush_batches_and_compact(&engine, &[&SIX_VECTORS[..3], &SIX_VECTORS[3..]]).await;
+        assert_eq!(
+            engine
+                .vector_generations_pending(&table_id(), "vec_idx")
+                .unwrap(),
+            Vec::<String>::new(),
+            "the compaction output must be complete when it swaps in, not left to a repair"
+        );
+        assert_eq!(
+            ann_keys(&engine, &[0.0, 1.0, 0.0], 6).len(),
+            6,
+            "every compacted row must answer ANN"
+        );
+        engine.shutdown().unwrap();
+        drop(engine);
+
+        let engine = reopen_with_indexes(dir.path());
+        assert_eq!(
+            engine
+                .vector_generations_pending(&table_id(), "vec_idx")
+                .unwrap(),
+            Vec::<String>::new(),
+            "the compacted output's manifest must survive a restart"
+        );
+        assert_eq!(ann_keys(&engine, &[0.0, 1.0, 0.0], 6).len(), 6);
+        engine.shutdown().unwrap();
+    }
+
+    /// The on-disk state the live memory cluster is in today, before this
+    /// fix: a generation compacted with no vector sidecars at all, and a
+    /// flushed generation with scoped sidecars but no manifest (written
+    /// before manifests existed). Opening the engine must make every row
+    /// findable by ANN again with no operator action.
+    #[tokio::test]
+    async fn existing_vectors_are_reindexed_after_an_upgrade_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_with_vector_index(dir.path());
+        flush_batches_and_compact(&engine, &[&SIX_VECTORS[..3], &SIX_VECTORS[3..]]).await;
+        let compacted: Vec<String> = vector_sidecar_files(dir.path())
+            .iter()
+            .filter_map(|name| name.split_once("-VEC-").map(|(gen, _)| gen.to_string()))
+            .collect();
+        assert!(
+            !compacted.is_empty(),
+            "sanity: the compaction output has vector sidecars"
+        );
+        for (key, vector) in [("k6", [0.5, 0.5, 0.0]), ("k7", [0.0, 0.5, 0.5])] {
+            engine
+                .write(&table_id(), &make_key(key), vector_test_row(&vector), 1000)
+                .unwrap();
+        }
+        engine.flush(&table_id()).unwrap();
+        engine.shutdown().unwrap();
+        drop(engine);
+
+        // Break the disk the way the old code left it.
+        let table_dir = dir.path().join("sstables").join("test_ks.test_table");
+        for name in vector_sidecar_files(dir.path()) {
+            let compacted_gen = compacted
+                .iter()
+                .any(|gen| name.starts_with(&format!("{gen}-VEC-")));
+            if compacted_gen || name.ends_with("__manifest.db") {
+                std::fs::remove_file(table_dir.join(&name)).unwrap();
+            }
+        }
+        assert!(
+            vector_sidecar_files(dir.path())
+                .iter()
+                .all(|name| !name.ends_with("__manifest.db")),
+            "sanity: no generation has a manifest"
+        );
+
+        let before = crate::metrics::vector_generations_repaired_total();
+        let engine = reopen_with_indexes(dir.path());
+        finish_vector_repair(&engine);
+        assert_eq!(
+            ann_keys(&engine, &[0.0, 1.0, 0.0], 8).len(),
+            8,
+            "every existing row must answer ANN after the repair"
+        );
+        assert!(
+            crate::metrics::vector_generations_repaired_total() >= before + 2,
+            "both broken generations count as repaired"
+        );
+        engine.shutdown().unwrap();
+    }
+
     fn vector_sidecar_files(dir: &std::path::Path) -> Vec<String> {
         let table_dir = dir.join("sstables").join("test_ks.test_table");
         std::fs::read_dir(table_dir)
@@ -23275,8 +23585,8 @@ mod tests {
         );
         assert_eq!(
             vector_sidecar_files(dir.path()).len(),
-            3,
-            "sanity: a global and two scoped sidecars were flushed"
+            4,
+            "sanity: a global sidecar, two scoped ones and their manifest were flushed"
         );
 
         let engine = reopen_with_indexes(dir.path());

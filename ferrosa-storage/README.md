@@ -545,6 +545,13 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   (CQL `ORDER BY .. ANN OF`) still finds flushed vectors after a restart; a
   sidecar that cannot be listed, decoded or searched is an error, never a
   shorter answer, and DROP INDEX deletes the index's vector sidecars (ST-71).
+  Compaction writes its output's scoped vector sidecars before the swap, and
+  every generation's scoped sidecars end with a manifest; a live generation
+  without a matching one (compacted before this, flushed before manifests,
+  or a crashed build) makes ANN over the index refuse with retryable
+  backpressure until the background vector repair rebuilds it from its rows,
+  a partition at a time. Registration starts that repair, so existing data is
+  re-indexed on the first start with no operator action (ST-72).
   A global index read (`read_by_index_each`) of an index the table does not
   declare returns an error naming the index, never zero rows: the planner
   chooses indexes from the CQL schema, so a consult of an undeclared index

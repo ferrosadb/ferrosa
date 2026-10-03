@@ -654,6 +654,14 @@ pub struct TableStore<F: FlushTarget> {
     /// builds its sidecar once instead of tokenizing it once per query at the
     /// same time. A query that finds a build in flight does not wait for it.
     fulltext_sidecars_in_flight: Arc<crate::lockfree::SharedSet>,
+    /// `gen/index` keys of the generations whose scoped vector sidecars are
+    /// complete (a manifest on disk whose sidecars add up). ANN over a live
+    /// generation that is not in this set refuses with a retryable error
+    /// rather than answer without its rows; the vector repair fills it in.
+    vector_ready: crate::lockfree::SharedSet,
+    /// `gen/index` keys of the vector sidecar builds running now:
+    /// single-flight per generation and index, with no lock to wait on.
+    vector_sidecars_in_flight: Arc<crate::lockfree::SharedSet>,
 }
 
 /// The index declarations of one table, as one immutable value.
@@ -983,6 +991,20 @@ pub struct FulltextSidecarOutcome {
     pub in_flight_elsewhere: usize,
     /// Sidecars that could not be built or written. Each is logged at ERROR;
     /// queries keep scanning that SSTable in full until one is built.
+    pub failed: usize,
+}
+
+/// What a vector sidecar repair or compaction-output build did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VectorRepairOutcome {
+    /// Generations whose scoped sidecars were built and marked complete.
+    pub repaired: usize,
+    /// Vectors indexed by those builds.
+    pub vectors: u64,
+    /// Generations another build was working on; not waited for.
+    pub in_flight_elsewhere: usize,
+    /// Generations that could not be built. Each is logged at ERROR, and ANN
+    /// over the index refuses until a later repair succeeds.
     pub failed: usize,
 }
 
@@ -1470,6 +1492,157 @@ fn scope_of_vector_sidecar(index_name: &str, sidecar_name: &str) -> Option<Resul
         .collect::<Option<Vec<u8>>>()
         .ok_or_else(malformed);
     Some(scope)
+}
+
+/// Sidecar name of the manifest that marks `index_name`'s scoped sidecars
+/// of a generation complete. It is a `-VEC-` file, so it lives and dies with
+/// the generation's other vector sidecars.
+fn vector_manifest_name(index_name: &str) -> String {
+    format!("{index_name}__manifest")
+}
+
+/// The record that a generation's scoped vector sidecars for one index are
+/// complete. Written last, after every scoped sidecar: a generation with no
+/// manifest, or whose scoped sidecars on disk do not add up to `bytes`, is
+/// rebuilt from its rows before ANN will answer over it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VectorSidecarManifest {
+    /// Vectors indexed across the generation's scoped sidecars.
+    pub vectors: u64,
+    /// Scoped sidecars written, one per partition with a vector.
+    pub scopes: u64,
+    /// Total bytes of those scoped sidecars.
+    pub bytes: u64,
+}
+
+impl VectorSidecarManifest {
+    const MAGIC: &'static [u8; 4] = b"FVM1";
+    const ENCODED_LEN: usize = 4 + 3 * 8;
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::ENCODED_LEN);
+        out.extend_from_slice(Self::MAGIC);
+        for field in [self.vectors, self.scopes, self.bytes] {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::ENCODED_LEN || &bytes[..4] != Self::MAGIC {
+            return None;
+        }
+        let field = |i: usize| {
+            let start = 4 + i * 8;
+            bytes
+                .get(start..start + 8)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_le_bytes)
+        };
+        Some(Self {
+            vectors: field(0)?,
+            scopes: field(1)?,
+            bytes: field(2)?,
+        })
+    }
+
+    /// Count one scoped sidecar of `vectors` vectors and `bytes` bytes.
+    fn add_scope(&mut self, vectors: usize, bytes: usize) {
+        self.vectors = self.vectors.saturating_add(vectors as u64);
+        self.scopes = self.scopes.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+}
+
+/// Key of `(gen, index_name)` in a store's set of vector-ready generations.
+fn vector_ready_key(gen: &str, index_name: &str) -> String {
+    format!("{gen}/{index_name}")
+}
+
+/// Write one scoped sidecar per partition of `reader` that holds a `cfg`
+/// vector, then the manifest that marks them complete. Calls `on_scope` for
+/// each scope written.
+///
+/// Streams the SSTable a partition at a time: memory is bounded by the
+/// largest partition's vectors (one scope's HNSW graph), never by the
+/// generation. Any read, decode or write failure is returned before the
+/// manifest is written, so a partial build is never taken for a complete one.
+fn build_generation_vector_sidecars<F: FlushTarget>(
+    flush_target: &F,
+    reader: &SSTableReader<F::Reader>,
+    schema: &TableSchema,
+    gen: u64,
+    cfg: &VectorIndexConfig,
+    mut on_scope: impl FnMut(&[u8]),
+) -> Result<VectorSidecarManifest> {
+    let mapping = ColumnOrdinalMapping::for_header(schema, reader.header());
+    let mut iter = reader.partitions_iter()?;
+    let mut manifest = VectorSidecarManifest::default();
+    while let Some(mut partition) = iter.next_partition()? {
+        mapping.remap_partition(&mut partition);
+        let entries = partition_vectors(&partition, cfg.column_position)?;
+        if entries.is_empty() {
+            continue;
+        }
+        let vectors = entries.len();
+        let scope = partition.key.key.as_bytes();
+        let bytes = ferrosa_index::vector::hnsw::build_and_serialize(
+            cfg.m,
+            cfg.ef_construction,
+            cfg.metric,
+            entries,
+        )
+        .map_err(|e| {
+            ferrosa_common::Error::InvalidData(format!(
+                "vector index {}: building generation {gen}'s sidecar for one scope: {e}",
+                cfg.index_name
+            ))
+        })?;
+        flush_target.write_vector_sidecar(
+            gen,
+            &scoped_vector_sidecar_name(&cfg.index_name, scope),
+            &bytes,
+        )?;
+        manifest.add_scope(vectors, bytes.len());
+        on_scope(scope);
+    }
+    flush_target.write_vector_sidecar(
+        gen,
+        &vector_manifest_name(&cfg.index_name),
+        &manifest.encode(),
+    )?;
+    Ok(manifest)
+}
+
+/// The live vectors of `partition`'s `column_position` column, positioned in
+/// row order. A deleted row or cell carries none; a value that is not a
+/// float vector is an error, not a silently unindexed row.
+fn partition_vectors(
+    partition: &Partition,
+    column_position: usize,
+) -> Result<Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>> {
+    let mut entries = Vec::new();
+    for row in partition.static_row.iter().chain(partition.rows.iter()) {
+        if !row.deletion.is_live() {
+            continue;
+        }
+        let Some(value) = row
+            .cells
+            .iter()
+            .find(|(idx, _)| *idx as usize == column_position)
+            .and_then(|(_, cell)| cell.value.as_deref())
+        else {
+            continue;
+        };
+        let vector = ferrosa_index::bytes_to_vec_f32(value).map_err(|e| {
+            ferrosa_common::Error::InvalidData(format!(
+                "a vector-indexed cell does not hold a float vector: {e}"
+            ))
+        })?;
+        let position = ferrosa_index::vector::RowPosition::new(entries.len() as u64);
+        entries.push((position, vector));
+    }
+    Ok(entries)
 }
 
 /// Route a range-scan `producer` through the bounded scheduler pool, wiring the
@@ -2412,6 +2585,10 @@ impl<F: FlushTarget> TableStore<F> {
             fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
                 "FTI sidecar builds in flight",
             )),
+            vector_ready: crate::lockfree::SharedSet::new("vector-ready generations"),
+            vector_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
+                "vector sidecar builds in flight",
+            )),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             late_writes_after_seal: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -2624,6 +2801,10 @@ impl<F: FlushTarget> TableStore<F> {
             fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
                 "FTI sidecar builds in flight",
             )),
+            vector_ready: crate::lockfree::SharedSet::new("vector-ready generations"),
+            vector_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
+                "vector sidecar builds in flight",
+            )),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             late_writes_after_seal: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -2714,6 +2895,10 @@ impl<F: FlushTarget> TableStore<F> {
             missing_sstables: MissingSstableCache::default(),
             fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
                 "FTI sidecar builds in flight",
+            )),
+            vector_ready: crate::lockfree::SharedSet::new("vector-ready generations"),
+            vector_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
+                "vector sidecar builds in flight",
             )),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             late_writes_after_seal: std::sync::atomic::AtomicU64::new(0),
@@ -4789,9 +4974,20 @@ impl<F: FlushTarget> TableStore<F> {
         for cfg in &target_catalog.vector_index_configs {
             // Read, not drained: readers keep searching this index through
             // `flushing_vector_indexes` until the sidecar is installed.
-            if let Some(vi) = flush_vector_indexes.get(&cfg.index_name) {
+            let Some(vi) = flush_vector_indexes.get(&cfg.index_name) else {
+                // No vectors reached this memtable: the generation has none
+                // to index, and its (empty) manifest says so.
+                self.complete_flushed_vector_sidecars(gen, cfg, VectorSidecarManifest::default());
+                continue;
+            };
+            {
                 let drained_with_scopes = vi.entries_with_scopes();
                 if drained_with_scopes.is_empty() {
+                    self.complete_flushed_vector_sidecars(
+                        gen,
+                        cfg,
+                        VectorSidecarManifest::default(),
+                    );
                     continue;
                 }
 
@@ -4863,11 +5059,17 @@ impl<F: FlushTarget> TableStore<F> {
                     Vec<u8>,
                     Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
                 > = HashMap::new();
+                // A vector with no scope is in no scoped sidecar, so the
+                // generation is left without a manifest and rebuilt from its
+                // rows rather than marked complete without that row.
+                let mut complete = true;
                 for (scope, pos, vector) in drained_with_scopes {
-                    if let Some(scope) = scope {
-                        by_scope.entry(scope).or_default().push((pos, vector));
+                    match scope {
+                        Some(scope) => by_scope.entry(scope).or_default().push((pos, vector)),
+                        None => complete = false,
                     }
                 }
+                let mut manifest = VectorSidecarManifest::default();
 
                 // Remember these scopes so `ann_search_partitions` can later
                 // enumerate the scoped sidecars and recover partition keys
@@ -4875,6 +5077,7 @@ impl<F: FlushTarget> TableStore<F> {
                 self.record_vector_scopes(&cfg.index_name, by_scope.keys());
                 for (scope, scoped_entries) in by_scope {
                     let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, &scope);
+                    let vectors = scoped_entries.len();
                     match ferrosa_index::vector::hnsw::build_and_serialize(
                         cfg.m,
                         cfg.ef_construction,
@@ -4887,19 +5090,30 @@ impl<F: FlushTarget> TableStore<F> {
                                 &scoped_index_name,
                                 &vec_bytes,
                             ) {
+                                complete = false;
                                 tracing::error!(%e, index_name = %scoped_index_name, gen,
-                                    "store: scoped vector sidecar persist failed");
-                                #[cfg(debug_assertions)]
-                                panic!("scoped vector sidecar persist failed: {e}");
+                                    "store: scoped vector sidecar persist failed; the generation \
+                                     is rebuilt from its rows before ANN answers over it");
+                                if cfg!(debug_assertions) {
+                                    panic!("scoped vector sidecar persist failed: {e}");
+                                }
+                            } else {
+                                manifest.add_scope(vectors, vec_bytes.len());
                             }
                         }
                         Err(e) => {
+                            complete = false;
                             tracing::error!(%e, index_name = %scoped_index_name, gen,
-                                "store: scoped vector sidecar serialization failed");
-                            #[cfg(debug_assertions)]
-                            panic!("scoped vector sidecar serialize failed: {e}");
+                                "store: scoped vector sidecar serialization failed; the \
+                                 generation is rebuilt from its rows before ANN answers over it");
+                            if cfg!(debug_assertions) {
+                                panic!("scoped vector sidecar serialize failed: {e}");
+                            }
                         }
                     }
+                }
+                if complete {
+                    self.complete_flushed_vector_sidecars(gen, cfg, manifest);
                 }
             }
         }
@@ -7554,23 +7768,7 @@ impl<F: FlushTarget> TableStore<F> {
         index_name: &str,
         scopes: impl Iterator<Item = &'a Vec<u8>>,
     ) {
-        let scopes: Vec<&Vec<u8>> = scopes.collect();
-        let recorded =
-            crate::lockfree::update(&self.vector_index_scopes, "vector index scopes", |map| {
-                let known = map.get(index_name);
-                if scopes
-                    .iter()
-                    .all(|scope| known.is_some_and(|set| set.contains(*scope)))
-                {
-                    return (None, ());
-                }
-                let mut set = known.map(|set| (**set).clone()).unwrap_or_default();
-                set.extend(scopes.iter().map(|scope| (*scope).clone()));
-                let mut next = map.clone();
-                next.insert(index_name.to_string(), Arc::new(set));
-                (Some(next), ())
-            });
-        if let Err(e) = recorded {
+        if let Err(e) = self.try_record_vector_scopes(index_name, scopes) {
             tracing::error!(
                 index_name,
                 %e,
@@ -7579,15 +7777,55 @@ impl<F: FlushTarget> TableStore<F> {
         }
     }
 
-    /// Record every scope that has a scoped sidecar for `index_name` in a
-    /// live SSTable, read from the sidecar files themselves.
+    /// Add `scopes` to the scopes recorded for vector index `index_name`, or
+    /// say why not.
+    fn try_record_vector_scopes<'a>(
+        &self,
+        index_name: &str,
+        scopes: impl Iterator<Item = &'a Vec<u8>>,
+    ) -> Result<()> {
+        let scopes: Vec<&Vec<u8>> = scopes.collect();
+        crate::lockfree::update(&self.vector_index_scopes, "vector index scopes", |map| {
+            let known = map.get(index_name);
+            if scopes
+                .iter()
+                .all(|scope| known.is_some_and(|set| set.contains(*scope)))
+            {
+                return (None, ());
+            }
+            let mut set = known.map(|set| (**set).clone()).unwrap_or_default();
+            set.extend(scopes.iter().map(|scope| (*scope).clone()));
+            let mut next = map.clone();
+            next.insert(index_name.to_string(), Arc::new(set));
+            (Some(next), ())
+        })
+    }
+
+    /// The live generations of this table, by number.
+    fn live_generations(&self) -> std::collections::HashSet<u64> {
+        self.view
+            .load()
+            .sstable_ids
+            .iter()
+            .filter_map(|(gen, _dir)| gen.parse().ok())
+            .collect()
+    }
+
+    /// Rebuild, from the sidecar files themselves, the scopes that have a
+    /// scoped sidecar for `index_name` in a live SSTable and the generations
+    /// whose scoped sidecars are complete.
     ///
-    /// The recorded set lives in memory and is otherwise filled only by
-    /// flushes, so after a restart it was empty: `ann_search_partitions`
+    /// Both live in memory and were otherwise filled only by flushes, so
+    /// after a restart the scope set was empty: `ann_search_partitions`
     /// probed no flushed sidecar and ANN answered from the memtable alone.
-    /// The files are the durable record, so the set is rebuilt from them
-    /// whenever the index is registered, which a restart does from
-    /// `system_schema.indexes`.
+    /// The files are the durable record, so this runs whenever the index is
+    /// registered, which a restart does from `system_schema.indexes`.
+    ///
+    /// A generation is complete when it has a manifest whose byte count
+    /// matches its scoped sidecars on disk. Any other live generation (no
+    /// manifest: compacted before compaction wrote vector sidecars, flushed
+    /// before manifests existed, or a build that crashed) is left for
+    /// [`Self::plan_vector_sidecar_repair`]; ANN refuses over it until then.
     ///
     /// # Errors
     ///
@@ -7595,41 +7833,439 @@ impl<F: FlushTarget> TableStore<F> {
     /// decoded. Registration fails rather than leave the index answering
     /// without those rows.
     fn recover_vector_scopes(&self, index_name: &str) -> Result<()> {
-        let live: std::collections::HashSet<u64> = self
-            .view
-            .load()
-            .sstable_ids
-            .iter()
-            .filter_map(|(gen, _dir)| gen.parse().ok())
-            .collect();
-        let mut scopes = Vec::new();
-        for (gen, sidecar) in self.flush_target.list_vector_sidecars()? {
-            if !live.contains(&gen) {
+        let live = self.live_generations();
+        let manifest_name = vector_manifest_name(index_name);
+        let mut scoped_bytes: HashMap<u64, u64> = HashMap::new();
+        let mut with_manifest = Vec::new();
+        let mut scopes = std::collections::HashSet::new();
+        for file in self.flush_target.list_vector_sidecars()? {
+            if !live.contains(&file.generation) {
                 continue;
             }
-            if let Some(scope) = scope_of_vector_sidecar(index_name, &sidecar) {
-                scopes.push(scope?);
+            if file.name == manifest_name {
+                with_manifest.push(file.generation);
+            } else if let Some(scope) = scope_of_vector_sidecar(index_name, &file.name) {
+                scopes.insert(scope?);
+                let total = scoped_bytes.entry(file.generation).or_default();
+                *total = total.saturating_add(file.len);
             }
         }
-        tracing::debug!(
+        let mut ready = 0usize;
+        for gen in with_manifest {
+            let on_disk = scoped_bytes.get(&gen).copied().unwrap_or(0);
+            match self.read_vector_manifest(gen, index_name) {
+                Ok(Some(manifest)) if manifest.bytes == on_disk => {
+                    self.mark_vector_ready(&gen.to_string(), index_name);
+                    ready += 1;
+                }
+                other => tracing::warn!(
+                    index_name,
+                    gen,
+                    manifest = ?other,
+                    scoped_bytes_on_disk = on_disk,
+                    "vector sidecars of a generation do not match their manifest; \
+                     rebuilding them from its rows"
+                ),
+            }
+        }
+        tracing::info!(
             index_name,
             scopes = scopes.len(),
-            "recovered scoped vector sidecars from disk"
+            ready_generations = ready,
+            pending_generations = live.len().saturating_sub(ready),
+            "recovered vector sidecars from disk"
         );
         self.record_vector_scopes(index_name, scopes.iter());
         Ok(())
     }
 
-    /// Delete every vector sidecar of `index_name`, global and scoped.
+    /// Generation `gen`'s manifest for `index_name`: `Ok(None)` if it has
+    /// none; an `Err` if it exists but is unreadable or malformed.
+    fn read_vector_manifest(
+        &self,
+        gen: u64,
+        index_name: &str,
+    ) -> Result<Option<VectorSidecarManifest>> {
+        let Some(bytes) = self
+            .flush_target
+            .read_vector_sidecar(gen, &vector_manifest_name(index_name))?
+        else {
+            return Ok(None);
+        };
+        VectorSidecarManifest::decode(&bytes)
+            .map(Some)
+            .ok_or_else(|| {
+                ferrosa_common::Error::InvalidData(format!(
+                    "vector manifest of index {index_name} in generation {gen} is malformed"
+                ))
+            })
+    }
+
+    fn mark_vector_ready(&self, gen: &str, index_name: &str) {
+        if let Err(e) = self.vector_ready.insert(&vector_ready_key(gen, index_name)) {
+            // Left unmarked, ANN refuses over this generation and the repair
+            // rebuilds it: slower, never wrong.
+            tracing::error!(%e, gen, index_name, "could not mark a generation's vector sidecars complete");
+        }
+    }
+
+    fn unmark_vector_ready(&self, gen: &str, index_name: &str) {
+        if let Err(e) = self.vector_ready.remove(&vector_ready_key(gen, index_name)) {
+            tracing::error!(%e, gen, index_name, "could not unmark a generation's vector sidecars");
+        }
+    }
+
+    /// Record a flush's scoped sidecars for `cfg` complete: write the
+    /// manifest, then mark the generation ready. Runs before the flush
+    /// installs the generation, so ANN never sees it unmarked. A manifest
+    /// that cannot be written leaves the generation to the repair.
+    fn complete_flushed_vector_sidecars(
+        &self,
+        gen: u64,
+        cfg: &VectorIndexConfig,
+        manifest: VectorSidecarManifest,
+    ) {
+        match self.flush_target.write_vector_sidecar(
+            gen,
+            &vector_manifest_name(&cfg.index_name),
+            &manifest.encode(),
+        ) {
+            Ok(()) => self.mark_vector_ready(&gen.to_string(), &cfg.index_name),
+            Err(e) => tracing::error!(
+                %e,
+                index_name = %cfg.index_name,
+                gen,
+                "store: vector manifest persist failed; the generation is rebuilt from its \
+                 rows before ANN answers over it"
+            ),
+        }
+    }
+
+    /// Live generations whose scoped sidecars for `index_name` are not known
+    /// complete. ANN over the index refuses while any exist.
+    pub fn vector_generations_pending(&self, index_name: &str) -> Vec<String> {
+        let declared = self
+            .catalog()
+            .vector_index_configs
+            .iter()
+            .any(|cfg| cfg.index_name == index_name);
+        if !declared {
+            return Vec::new();
+        }
+        self.view
+            .load()
+            .sstable_ids
+            .iter()
+            .filter(|(gen, _)| !self.is_sstable_quarantined(gen))
+            .filter(|(gen, _)| {
+                !self
+                    .vector_ready
+                    .contains(&vector_ready_key(gen, index_name))
+            })
+            .map(|(gen, _)| gen.clone())
+            .collect()
+    }
+
+    /// Refuse an ANN query over `index_name` while a live generation's vector
+    /// sidecars are incomplete: answering would silently leave out its rows.
+    /// The error is backpressure (retryable); the repair clears it.
+    fn require_vector_generations_ready(&self, index_name: &str) -> Result<()> {
+        let pending = self.vector_generations_pending(index_name);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let schema = self.schema.load();
+        Err(ferrosa_common::Error::Overloaded {
+            reason: format!(
+                "vector index {index_name} is being rebuilt for {} generation(s) (e.g. {}); \
+                 ANN would miss their rows, retry shortly",
+                pending.len(),
+                pending[0]
+            ),
+            table: format!("{}.{}", schema.keyspace, schema.table),
+        })
+    }
+
+    /// Delete every vector sidecar of `index_name` (global, scoped and
+    /// manifests) and forget which generations were complete.
     ///
     /// Registration rebuilds the scope set from these files, so a dropped
     /// index's sidecars must not outlive it: a later index created under the
     /// same name, possibly on another column, would otherwise answer ANN from
     /// the dropped index's vectors.
     fn remove_vector_sidecars(&self, index_name: &str) -> Result<()> {
-        for (gen, sidecar) in self.flush_target.list_vector_sidecars()? {
-            if sidecar == index_name || scope_of_vector_sidecar(index_name, &sidecar).is_some() {
-                self.flush_target.remove_vector_sidecar(gen, &sidecar)?;
+        let manifest_name = vector_manifest_name(index_name);
+        for file in self.flush_target.list_vector_sidecars()? {
+            if file.name == index_name
+                || file.name == manifest_name
+                || scope_of_vector_sidecar(index_name, &file.name).is_some()
+            {
+                self.flush_target
+                    .remove_vector_sidecar(file.generation, &file.name)?;
+            }
+        }
+        let suffix = format!("/{index_name}");
+        for key in self.vector_ready.to_vec() {
+            if key.ends_with(&suffix) {
+                self.vector_ready.remove(&key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete generation `gen`'s scoped sidecars and manifest for
+    /// `index_name` and mark it incomplete, before it is rebuilt. Its global
+    /// sidecar, if a flush wrote one, is kept for [`Self::ann_search`].
+    fn clear_generation_vector_sidecars(&self, gen: u64, index_name: &str) -> Result<()> {
+        self.unmark_vector_ready(&gen.to_string(), index_name);
+        let manifest_name = vector_manifest_name(index_name);
+        for file in self.flush_target.list_vector_sidecars()? {
+            if file.generation == gen
+                && (file.name == manifest_name
+                    || scope_of_vector_sidecar(index_name, &file.name).is_some())
+            {
+                self.flush_target.remove_vector_sidecar(gen, &file.name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Build generation `desc`'s scoped vector sidecars for `cfg` from its
+    /// rows, record their scopes, and only then mark it complete.
+    fn rebuild_generation_vector_sidecars(
+        &self,
+        desc: &SstableDescriptor,
+        cfg: &VectorIndexConfig,
+        schema: &TableSchema,
+    ) -> Result<VectorSidecarManifest> {
+        let gen: u64 = desc.gen.parse().map_err(|_| {
+            ferrosa_common::Error::InvalidData(format!(
+                "generation id {} is not numeric; its vector sidecars cannot be named",
+                desc.gen
+            ))
+        })?;
+        let reader = self.open_reader(desc)?;
+        self.clear_generation_vector_sidecars(gen, &cfg.index_name)?;
+        self.build_vector_sidecars_from(&reader, gen, cfg, schema)
+    }
+
+    /// Write `reader`'s scoped sidecars and manifest for `cfg` as generation
+    /// `gen`, record the scopes, then mark the generation complete.
+    fn build_vector_sidecars_from(
+        &self,
+        reader: &SSTableReader<F::Reader>,
+        gen: u64,
+        cfg: &VectorIndexConfig,
+        schema: &TableSchema,
+    ) -> Result<VectorSidecarManifest> {
+        // Keys only, one per partition with a vector: the scope set this
+        // feeds is held in memory for the whole index anyway.
+        let mut scopes = std::collections::HashSet::new();
+        let manifest =
+            build_generation_vector_sidecars(&*self.flush_target, reader, schema, gen, cfg, |s| {
+                scopes.insert(s.to_vec());
+            })?;
+        self.try_record_vector_scopes(&cfg.index_name, scopes.iter())?;
+        self.mark_vector_ready(&gen.to_string(), &cfg.index_name);
+        Ok(manifest)
+    }
+
+    /// Rebuild, from their rows, the scoped vector sidecars of every live
+    /// generation whose sidecars for `index_name` are not known complete:
+    /// SSTables compacted before compaction wrote vector sidecars, flushed
+    /// before manifests existed, written while the index did not exist, or
+    /// left behind by a build that crashed.
+    ///
+    /// One generation at a time, each streamed a partition at a time, so
+    /// memory is bounded by one partition's vectors. Resumable: a generation
+    /// counts as done only once its manifest is written, so an interrupted
+    /// run redoes just the generation it was in. Single-flight per
+    /// generation and index; a generation another run is building is
+    /// skipped, not waited for.
+    pub fn repair_vector_sidecars(&self, index_name: &str) -> VectorRepairOutcome {
+        let mut outcome = VectorRepairOutcome::default();
+        let Some(cfg) = self
+            .catalog()
+            .vector_index_configs
+            .iter()
+            .find(|cfg| cfg.index_name == index_name)
+            .cloned()
+        else {
+            return outcome;
+        };
+        let schema = self.schema.load_full();
+        let pending = self.vector_generations_pending(index_name);
+        crate::metrics::add_vector_generations_pending(pending.len() as i64);
+        for gen in pending {
+            crate::metrics::add_vector_generations_pending(-1);
+            let key = vector_ready_key(&gen, index_name);
+            let Some(_claim) = SidecarClaim::take(&self.vector_sidecars_in_flight, key.clone())
+            else {
+                outcome.in_flight_elsewhere += 1;
+                continue;
+            };
+            if self.vector_ready.contains(&key) {
+                continue;
+            }
+            // Compacted away since the plan: its successor is its own job.
+            let Some(desc) = self
+                .view
+                .load()
+                .sstables
+                .iter()
+                .find(|desc| desc.gen == gen)
+                .cloned()
+            else {
+                continue;
+            };
+            let start = Instant::now();
+            match self.rebuild_generation_vector_sidecars(&desc, &cfg, &schema) {
+                Ok(manifest) => {
+                    outcome.repaired += 1;
+                    outcome.vectors += manifest.vectors;
+                    crate::metrics::vector_generation_repaired();
+                    tracing::info!(
+                        index_name,
+                        gen = %gen,
+                        vectors = manifest.vectors,
+                        scopes = manifest.scopes,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "vector repair: rebuilt a generation's sidecars from its rows"
+                    );
+                }
+                Err(e) => {
+                    outcome.failed += 1;
+                    crate::metrics::vector_generation_repair_failed();
+                    tracing::error!(
+                        %e,
+                        index_name,
+                        gen = %gen,
+                        "vector repair: could not rebuild a generation's sidecars; ANN over \
+                         the index keeps refusing until it is rebuilt"
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Whether a [`Self::run_vector_repair`] for `index_name` is running.
+    pub fn vector_repair_running(&self, index_name: &str) -> bool {
+        self.vector_sidecars_in_flight
+            .contains(&format!("run/{index_name}"))
+    }
+
+    /// Repair `index_name`'s incomplete generations (see
+    /// [`Self::repair_vector_sidecars`]) unless another run is already doing
+    /// so, logging the edges: a WARN when it starts with work to do, and one
+    /// line when ANN can answer again or why it still cannot. `None` if
+    /// another run holds the index.
+    pub fn run_vector_repair(&self, index_name: &str) -> Option<VectorRepairOutcome> {
+        let _run =
+            SidecarClaim::take(&self.vector_sidecars_in_flight, format!("run/{index_name}"))?;
+        let pending = self.vector_generations_pending(index_name).len();
+        if pending == 0 {
+            return Some(VectorRepairOutcome::default());
+        }
+        let schema = self.schema.load();
+        let table = format!("{}.{}", schema.keyspace, schema.table);
+        tracing::warn!(
+            %table,
+            index_name,
+            pending,
+            "vector repair: generations without complete vector sidecars; ANN over this \
+             index refuses (retryable) until they are rebuilt from their rows"
+        );
+        let start = Instant::now();
+        let outcome = self.repair_vector_sidecars(index_name);
+        let still_pending = self.vector_generations_pending(index_name).len();
+        if still_pending == 0 {
+            tracing::warn!(
+                %table,
+                index_name,
+                repaired = outcome.repaired,
+                vectors = outcome.vectors,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "vector repair: complete; ANN over this index answers again"
+            );
+        } else {
+            tracing::error!(
+                %table,
+                index_name,
+                ?outcome,
+                still_pending,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "vector repair: generations remain incomplete; ANN over this index keeps \
+                 refusing until a later repair succeeds"
+            );
+        }
+        Some(outcome)
+    }
+
+    /// Build a compaction output's scoped vector sidecars for every vector
+    /// index, BEFORE the swap that makes it live, and mark it complete, so
+    /// ANN finds the compacted rows from the instant their inputs leave the
+    /// view. A failure is logged; the output then swaps in incomplete, ANN
+    /// refuses over the index, and the repair rebuilds it.
+    pub fn build_vector_sidecars_for_output(
+        &self,
+        output_gen: &str,
+        reader: &SSTableReader<F::Reader>,
+    ) -> VectorRepairOutcome {
+        let mut outcome = VectorRepairOutcome::default();
+        let catalog = self.catalog();
+        if catalog.vector_index_configs.is_empty() {
+            return outcome;
+        }
+        let Ok(gen) = output_gen.parse::<u64>() else {
+            outcome.failed = catalog.vector_index_configs.len();
+            tracing::error!(
+                output_gen,
+                "compaction: output generation id is not numeric; its vector sidecars cannot \
+                 be named, ANN refuses over the table's vector indexes"
+            );
+            return outcome;
+        };
+        let schema = self.schema.load_full();
+        for cfg in catalog.vector_index_configs.iter() {
+            match self.build_vector_sidecars_from(reader, gen, cfg, &schema) {
+                Ok(manifest) => {
+                    outcome.repaired += 1;
+                    outcome.vectors += manifest.vectors;
+                }
+                Err(e) => {
+                    outcome.failed += 1;
+                    tracing::error!(
+                        %e,
+                        index_name = %cfg.index_name,
+                        output_gen,
+                        "compaction: output vector sidecars could not be built; ANN refuses \
+                         over the index until the repair rebuilds them"
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Forget that generation `gen`'s vector sidecars were complete, for every
+    /// index: it left the view. Its files go with the SSTable's.
+    fn forget_generation_vector_ready(&self, gen: &str) {
+        for cfg in self.catalog().vector_index_configs.iter() {
+            self.unmark_vector_ready(gen, &cfg.index_name);
+        }
+    }
+
+    /// Delete a compaction output's vector sidecars of every index and forget
+    /// it was complete: the output was discarded and never entered the view.
+    pub fn discard_generation_vector_sidecars(&self, gen: &str) -> Result<()> {
+        self.forget_generation_vector_ready(gen);
+        let Ok(gen) = gen.parse::<u64>() else {
+            return Ok(());
+        };
+        for file in self.flush_target.list_vector_sidecars()? {
+            if file.generation == gen {
+                self.flush_target.remove_vector_sidecar(gen, &file.name)?;
             }
         }
         Ok(())
@@ -8338,6 +8974,7 @@ impl<F: FlushTarget> TableStore<F> {
         use ferrosa_index::vector::{IndexResult, VectorRowRef};
         use std::collections::HashMap as StdHashMap;
 
+        self.require_vector_generations_ready(index_name)?;
         let guard = self.view.load();
         let method = self.vector_index_method(index_name);
         let mut merged: StdHashMap<VectorRowRef, IndexResult> = StdHashMap::new();
@@ -8383,6 +9020,17 @@ impl<F: FlushTarget> TableStore<F> {
                             for result in results {
                                 merged.insert(VectorRowRef::sstable(gen, result.position), result);
                             }
+                        } else if self
+                            .read_vector_manifest(gen, index_name)?
+                            .is_some_and(|manifest| manifest.vectors > 0)
+                        {
+                            // Compacted or repaired: its vectors are in scoped
+                            // sidecars only, which this unscoped search cannot
+                            // read. Refuse rather than leave its rows out.
+                            return Err(ferrosa_common::Error::InvalidData(format!(
+                                "ann_search: generation {gen} of vector index {index_name} has \
+                                 only partition-scoped sidecars; use ann_search_partitions"
+                            )));
                         }
                     }
                     VectorIndexMethod::QuantizedIvf => {
@@ -8431,6 +9079,7 @@ impl<F: FlushTarget> TableStore<F> {
         use ferrosa_index::vector::{IndexResult, VectorRowRef};
         use std::collections::HashMap as StdHashMap;
 
+        self.require_vector_generations_ready(index_name)?;
         let guard = self.view.load();
         let mut merged: StdHashMap<VectorRowRef, IndexResult> = StdHashMap::new();
 
@@ -8534,6 +9183,7 @@ impl<F: FlushTarget> TableStore<F> {
         if k == 0 {
             return Ok(Vec::new());
         }
+        self.require_vector_generations_ready(index_name)?;
 
         // Best (lowest) score per partition-key scope. Deduping by scope keeps
         // one entry per partition and lets us bound the fetch by k.
@@ -8981,6 +9631,9 @@ impl<F: FlushTarget> TableStore<F> {
             // compaction got there first). The output holds rows the view no
             // longer has; installing it would resurrect them.
             self.reader_pool.remove(&self.pool_key(&out_desc));
+            if let Err(e) = self.discard_generation_vector_sidecars(&output_id) {
+                tracing::error!(%e, output = %output_id, "compaction swap refused: the discarded output's vector sidecars could not be removed");
+            }
             tracing::warn!(
                 output = %output_id,
                 inputs = ?input_id_set,
@@ -8993,6 +9646,7 @@ impl<F: FlushTarget> TableStore<F> {
         // can never be served or reopened after its files are deleted (FMEA #4).
         for desc in &removed {
             self.reader_pool.remove(&self.pool_key(desc));
+            self.forget_generation_vector_ready(&desc.gen);
         }
         Ok(CompactionSwap::Swapped)
     }
@@ -15009,6 +15663,81 @@ mod tests {
             "ANN found no row written before the index"
         );
         assert_eq!(partitions[0].key.key.as_bytes(), b"k0");
+    }
+
+    /// Rows flushed BEFORE a vector index exists have no vector sidecars.
+    /// ANN must refuse (retryable backpressure) rather than answer without
+    /// them, and the repair must rebuild them from the rows, after which
+    /// every row answers. An interrupted build (scoped sidecars, no manifest)
+    /// is treated the same way.
+    #[test]
+    fn ann_refuses_over_an_incomplete_generation_until_it_is_repaired() {
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        for (key, vector) in [("k0", [1.0, 0.0, 0.0]), ("k1", [0.0, 1.0, 0.0])] {
+            store
+                .write(&make_key(key), make_vector_row(&vector, 1000))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
+
+        let refused = store.ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 2, 20);
+        assert!(
+            matches!(&refused, Err(e) if e.is_backpressure()),
+            "ANN over an unindexed generation must refuse retryably, got {:?}",
+            refused.map(|rows| rows.len())
+        );
+
+        let outcome = store.run_vector_repair("vec_idx").expect("no other run");
+        assert_eq!(
+            (outcome.repaired, outcome.vectors, outcome.failed),
+            (1, 2, 0)
+        );
+        assert_eq!(
+            store
+                .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // An interrupted rebuild: the scoped sidecars survive, the manifest
+        // does not. The generation is incomplete again until rebuilt.
+        let gen: u64 = store.vector_generations_pending("vec_idx").len() as u64;
+        assert_eq!(gen, 0);
+        let live = store.sstable_generation_ids();
+        let gen: u64 = live[0].parse().unwrap();
+        store
+            .flush_target
+            .remove_vector_sidecar(gen, &vector_manifest_name("vec_idx"))
+            .unwrap();
+        store.unmark_vector_ready(&live[0], "vec_idx");
+        assert!(store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+            .is_err());
+        assert_eq!(store.run_vector_repair("vec_idx").unwrap().repaired, 1);
+        assert_eq!(
+            store
+                .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
