@@ -62,9 +62,11 @@ mod cql_broadcast;
 mod listener_status;
 mod listener_tls;
 mod log_rotation;
+mod maintenance;
 mod repair_wiring;
 mod runtime;
 mod sentry_reporting;
+mod supervisor;
 mod web;
 
 use std::path::Path;
@@ -1347,8 +1349,8 @@ fn maintenance_last_schema_version(current: uuid::Uuid) -> uuid::Uuid {
 
 /// Whether the maintenance loop should persist a schema snapshot this tick.
 ///
-/// Pure so the decision is unit-testable: the loop itself is an inline async
-/// block closed over runtime state and can never be driven from a test.
+/// Pure so the decision is unit-testable without driving the maintenance loop
+/// (`maintenance::run_maintenance_loop`).
 fn should_persist_schema(current: uuid::Uuid, last: uuid::Uuid) -> bool {
     current != last
 }
@@ -2649,6 +2651,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `/metrics` report it.
     let listener_status = std::sync::Arc::new(crate::listener_status::ListenerStatus::default());
 
+    // Health of the supervised background tasks (the flusher and the maintenance
+    // loop). A dead or hung flusher used to be one ERROR line while the node kept
+    // answering `/readyz` 200 and flushed nothing (t_7681b32b).
+    let supervision_status = std::sync::Arc::new(crate::supervisor::SupervisionStatus::default());
+
     // 9c. Arrow Flight (gRPC) query endpoint — port 8815, behind the `flight`
     // feature. Auth is enforced per-RPC (signed bearer tokens); only
     // anonymous-safe because every read RPC requires a verified token. TLS from
@@ -2708,6 +2715,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_disabled,
         debug: Some(web::debug::DebugState::new()),
         listeners: listener_status.clone(),
+        supervision: supervision_status.clone(),
     };
     // `[web] bind` is authoritative over FERROSA_WEB_BIND, then the loopback
     // default. The resolved address is the one passed to the listener.
@@ -3159,215 +3167,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .parse()
     .unwrap_or(100);
-    let maintenance_engine = storage.clone();
-    let maintenance_schema = schema.clone();
-    let maintenance_data_dir = data_dir.clone();
-    let has_s3 = maintenance_engine.has_s3();
-    runtimes.background.spawn(async move {
-        let mut flush_interval =
-            tokio::time::interval(std::time::Duration::from_secs(flush_interval_secs));
-        let mut urgent_flush_interval = tokio::time::interval(std::time::Duration::from_millis(
-            urgent_flush_interval_millis.max(1),
-        ));
-        let mut urgent_s3_sync_interval = tokio::time::interval(std::time::Duration::from_secs(
-            urgent_s3_sync_interval_secs.max(1),
-        ));
-        let mut compact_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        // Persist schema snapshot + flush all memtables to S3 every 30s.
-        let mut schema_sync_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    // Supervised (t_7681b32b): the loop is restarted if it panics or returns,
+    // each flush runs as a supervised attempt, and past the restart intensity
+    // the process syncs the commit log and aborts — see `supervisor`.
+    let maintenance_context = maintenance::MaintenanceContext {
+        engine: storage.clone(),
+        schema: schema.clone(),
+        data_dir: data_dir.clone(),
+        intervals: maintenance::MaintenanceIntervals {
+            flush: std::time::Duration::from_secs(flush_interval_secs),
+            urgent_flush: std::time::Duration::from_millis(urgent_flush_interval_millis.max(1)),
+            urgent_s3_sync: std::time::Duration::from_secs(urgent_s3_sync_interval_secs.max(1)),
+        },
         // Seed from the version the registry ALREADY holds so the loop's
         // immediate first tick is a no-op. See `maintenance_last_schema_version`.
-        let mut last_schema_version =
-            maintenance_last_schema_version(maintenance_schema.snapshot().version);
-
-        loop {
-            tokio::select! {
-                _ = flush_interval.tick() => {
-                    // Run flush on a dedicated OS thread so SSTable encoding,
-                    // compression, and disk I/O do not consume Tokio's shared
-                    // blocking pool.
-                    let engine = maintenance_engine.clone();
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    match std::thread::Builder::new()
-                        .name("storage-flush".into())
-                        .spawn(move || {
-                            let _ = tx.send(engine.flush_if_needed());
-                        }) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!(%e, "failed to spawn storage flush thread");
-                            continue;
-                        }
-                    }
-                    match rx.await {
-                        Ok(Err(e)) => tracing::warn!(%e, "periodic flush failed"),
-                        Err(e) => tracing::error!(%e, "flush task panicked"),
-                        _ => {}
-                    }
-
-                    // After flush, sync new SSTables to S3.
-                    // Run on a dedicated thread so HTTP uploads don't starve
-                    // the main tokio runtime (which handles Raft RPCs).
-                    if has_s3 {
-                        let engine = maintenance_engine.clone();
-                        let _ = std::thread::Builder::new()
-                            .name("s3-sync".into())
-                            .spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .expect("s3-sync runtime");
-                                rt.block_on(async {
-                                    match engine.sync_sstables_to_s3().await {
-                                        Ok(n) if n > 0 => {
-                                            tracing::info!(count = n, "synced SSTables to S3");
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(%e, "S3 SSTable sync failed");
-                                        }
-                                        _ => {}
-                                    }
-                                });
-                            });
-                    }
-
-                    // Commit log GC: discard segments with no remaining dirty tables.
-                    match maintenance_engine.discard_completed_commit_log_segments() {
-                        Ok(n) if n > 0 => {
-                            tracing::debug!(segments = n, "commit log GC cleaned up segments");
-                        }
-                        Err(e) => {
-                            tracing::warn!(%e, "commit log GC failed");
-                        }
-                        _ => {}
-                    }
-                }
-                _ = compact_interval.tick() => {
-                    maintenance_engine.poll_compactions().await;
-                }
-                _ = maintenance_engine.wait_for_compaction_retry_wakeup() => {
-                    maintenance_engine.poll_compactions().await;
-                }
-                _ = urgent_flush_interval.tick() => {
-                    if maintenance_engine.take_flush_request() {
-                        let engine = maintenance_engine.clone();
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        match std::thread::Builder::new()
-                            .name("storage-flush-urgent".into())
-                            .spawn(move || {
-                                let _ = tx.send(engine.flush_if_needed());
-                            }) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::error!(%e, "failed to spawn urgent storage flush thread");
-                                continue;
-                            }
-                        }
-                        match rx.await {
-                            Ok(Err(e)) => tracing::warn!(%e, "urgent flush failed"),
-                            Err(e) => tracing::error!(%e, "urgent flush task panicked"),
-                            _ => {}
-                        }
-                    }
-                }
-                _ = urgent_s3_sync_interval.tick(), if has_s3 => {
-                    if maintenance_engine.take_s3_sync_request() {
-                        let engine = maintenance_engine.clone();
-                        let _ = std::thread::Builder::new()
-                            .name("s3-sync-urgent".into())
-                            .spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .expect("s3-sync-urgent runtime");
-                                rt.block_on(async {
-                                    match engine.sync_sstables_to_s3().await {
-                                        Ok(n) => {
-                                            tracing::info!(
-                                                count = n,
-                                                "urgent S3 SSTable sync completed after write backpressure"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(%e, "urgent S3 SSTable sync failed");
-                                        }
-                                    }
-                                });
-                            });
-                    }
-                }
-                _ = schema_sync_interval.tick() => {
-                    let snap = maintenance_schema.snapshot();
-                    if should_persist_schema(snap.version, last_schema_version) {
-                        // Flush all memtables before persisting schema so SSTables
-                        // on disk match the schema snapshot. Run it outside the
-                        // Tokio blocking pool for the same reason as periodic
-                        // flushes: SSTable compression can be CPU-expensive.
-                        let engine = maintenance_engine.clone();
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        match std::thread::Builder::new()
-                            .name("storage-schema-flush".into())
-                            .spawn(move || {
-                                let _ = tx.send(engine.flush_all());
-                            }) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::error!(%e, "failed to spawn schema flush thread");
-                                continue;
-                            }
-                        }
-                        match rx.await {
-                            Ok(Err(e)) => {
-                                tracing::warn!(%e, "pre-schema-persist flush failed, skipping schema persist");
-                                continue; // Don't persist schema without data — retry next tick
-                            }
-                            Err(e) => {
-                                tracing::error!(%e, "pre-schema-persist flush task panicked");
-                                continue;
-                            }
-                            _ => {}
-                        }
-
-                        // Always persist schema locally for restart recovery.
-                        if let Err(e) = persist_schema_locally(
-                            Path::new(&maintenance_data_dir),
-                            &maintenance_schema,
-                        ) {
-                            tracing::error!(%e, "failed to persist authoritative local schema snapshot");
-                        }
-
-                        // Sync to S3 if configured — on a dedicated thread.
-                        if has_s3 {
-                            let engine = maintenance_engine.clone();
-                            let schema_ref = maintenance_schema.clone();
-                            let _ = std::thread::Builder::new()
-                                .name("s3-schema-sync".into())
-                                .spawn(move || {
-                                    let rt = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                        .expect("s3-schema-sync runtime");
-                                    rt.block_on(async {
-                                        match engine.sync_sstables_to_s3().await {
-                                            Ok(n) if n > 0 => {
-                                                tracing::info!(count = n, "pre-schema-persist S3 sync");
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(%e, "pre-schema-persist S3 sync failed");
-                                            }
-                                            _ => {}
-                                        }
-                                        persist_schema_to_s3(&engine, &schema_ref).await;
-                                    });
-                                });
-                        }
-
-                        last_schema_version = snap.version;
-                    }
-                }
-            }
-        }
-    });
+        last_persisted_schema: Arc::new(arc_swap::ArcSwap::from_pointee(
+            maintenance_last_schema_version(schema.snapshot().version),
+        )),
+        supervision: supervision_status.clone(),
+        intensity: supervisor::RestartIntensity::from_env(),
+        flush_stall_deadline: std::time::Duration::from_secs(
+            supervisor::env_or(
+                "FERROSA_FLUSH_STALL_DEADLINE_SECS",
+                supervisor::DEFAULT_FLUSH_STALL_DEADLINE.as_secs(),
+            )
+            .max(1),
+        ),
+        escalation: Arc::new(supervisor::EscalationPolicy::AbortProcess {
+            engine: storage.clone(),
+        }),
+    };
+    // The supervisor never returns: it restarts the loop or aborts the process.
+    runtimes
+        .background
+        .spawn(maintenance::run_supervised(maintenance_context));
 
     // 13. Wait for shutdown signal (SIGINT or SIGTERM)
     //

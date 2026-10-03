@@ -82,7 +82,9 @@ hard zone returns typed `Error::Overloaded`. Synchronous storage callers keep
 the hard admission check. On flush: the request goes through the table's
 rotation queue (one rotation at a time, no lock); a fresh memtable is swapped
 in and the old one becomes `flushing`, its write gate is sealed and the writes
-already inside it drain (new writes go to the new memtable at once); the
+already inside it drain (new writes go to the new memtable at once). A
+memtable a failed flush left in `flushing` is stacked under it with
+`StackedMemtable`, so it stays readable and flushes with it. The
 flushing snapshot is serialized to a BTI SSTable via
 `FlushTarget`; the new descriptor is prepended; index/FTI sidecars are built;
 the SSTable components are submitted to `UploadManager` for S3 write-behind;

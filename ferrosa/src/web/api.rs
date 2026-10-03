@@ -77,6 +77,7 @@ pub fn routes() -> Router<WebAppState> {
 pub async fn get_metrics(
     State(registry): State<Arc<VirtualTableRegistry>>,
     State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
+    State(supervision): State<Arc<crate::supervisor::SupervisionStatus>>,
 ) -> (
     StatusCode,
     [(axum::http::header::HeaderName, &'static str); 1],
@@ -99,6 +100,9 @@ pub async fn get_metrics(
     // Background client listeners (Postgres, SPARQL, graph HTTP, Bolt): 0 means the
     // listener failed to bind or exited, and `/readyz` reports not ready.
     listeners.render_prometheus(&mut body);
+    // Supervised background tasks (flusher, maintenance loop): `_up` 0 means the
+    // task is failing, stalled or restarting, and `/readyz` reports not ready.
+    supervision.render_prometheus(&mut body);
     // Client request rate, outcome and latency (ferrosa_cql_requests_total,
     // ferrosa_cql_request_duration_seconds, ferrosa_cql_requests_in_flight).
     ferrosa_cql::request_metrics::render_prometheus(&mut body);
@@ -970,6 +974,7 @@ mod tests {
             auth_disabled: true,
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
+            supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
         }
     }
 
@@ -2259,9 +2264,15 @@ mod tests {
 
         let state = Arc::new(registry);
         let listeners = Arc::new(crate::listener_status::ListenerStatus::default());
-        let (status, headers, body) = get_metrics(State(state), State(listeners)).await;
+        let supervision = Arc::new(crate::supervisor::SupervisionStatus::default());
+        let (status, headers, body) =
+            get_metrics(State(state), State(listeners), State(supervision)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers[0].1, "text/plain; charset=utf-8");
+        assert!(
+            body.contains("ferrosa_supervised_task_up{task=\"storage_flush\"} 1\n"),
+            "supervised background tasks are exported: {body}"
+        );
         assert!(body.contains("ferrosa_test_table_count"));
         assert!(body.contains("host=\"node1\""));
         assert!(body.contains("5"));

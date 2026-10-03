@@ -55,10 +55,15 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the in-code `TODO`
 
 - **Configurable, observable shutdown drain (FMEA FE-7).** Make the 30 s drain
   timeout configurable and emit a metric/alert when a flush is left incomplete.
-- **Maintenance-loop escalation (FMEA FE-9).** Track consecutive flush/S3-sync
-  failures and escalate (metric + alert) instead of silently retrying each tick.
+- **Supervise the remaining background tasks.** The flusher and maintenance loop
+  are supervised (FMEA FE-9, done 2026-10-03). Compaction workers, index
+  builders, commit-log sync, the S3 upload pipeline, self-heal and auto-repair
+  still die silently on a panic: t_88479cda (commit-log sync), t_31e0929c (S3
+  upload), t_8aae3ed7 (compaction workers), t_396d4c80 (index builders, self-heal,
+  auto-repair, listener panics and the rest).
 - **Split `main.rs`.** ~2.8k LoC in one file; extract the bootstrap, listener
-  wiring, and maintenance loop into focused modules to keep each unit reviewable.
+  wiring and the rest into focused modules (the maintenance loop moved to
+  `maintenance.rs`) to keep each unit reviewable.
 
 ## Non-goals
 
