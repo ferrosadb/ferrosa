@@ -23,6 +23,11 @@ in-memory table in tests and by Ferrosa storage in production.
 
 **Parser** (`parse`, `parse_statement`):
 
+- Boolean expressions nest (parentheses, `NOT`) at most `MAX_EXPR_DEPTH`
+  (256) levels; deeper is `ParseError::TooDeep` (PG `54001`). The parser
+  recurses per level, so an unbounded depth overflows the worker stack and
+  aborts the process (`tests/parser_depth.rs`).
+
 - `SELECT [DISTINCT] <* | items> FROM t [alias] [INNER JOIN t2 [alias] ON a.x = b.y]
   [WHERE <bool-expr>] [GROUP BY ...] [HAVING <bool-expr>]
   [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET m]` — one inner equi-join only.

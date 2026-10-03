@@ -897,6 +897,8 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
         ParseError::DuplicateColumn(_) => "42701",
         ParseError::MultiplePrimaryKeys => "42P16",
         ParseError::UnknownPrimaryKeyColumn(_) => "42703",
+        // PostgreSQL's statement_too_complex, as for max_stack_depth.
+        ParseError::TooDeep => "54001",
         ParseError::Unexpected { .. } | ParseError::UnexpectedEnd | ParseError::BadToken(_) => {
             "42601"
         }
