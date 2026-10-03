@@ -2842,6 +2842,7 @@ dependencies = [
  "hex",
  "libc",
  "memmap2",
+ "num-bigint",
  "object_store",
  "parking_lot 0.12.5",
  "proptest",
