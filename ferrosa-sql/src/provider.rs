@@ -21,19 +21,27 @@ pub trait TableProvider {
 #[derive(Debug, Clone)]
 pub struct InMemoryTable {
     schema: RelSchema,
-    rows: Arc<[Row]>,
+    /// The rows, behind a shared handle so a scan can own them without
+    /// copying any.
+    storage: Arc<[Row]>,
 }
 
 impl InMemoryTable {
     pub fn new(schema: RelSchema, rows: Vec<Row>) -> Self {
         Self {
             schema,
-            rows: rows.into(),
+            storage: rows.into(),
         }
     }
 
     pub fn rows(&self) -> &[Row] {
-        &self.rows
+        &self.storage
+    }
+
+    /// Another handle to the same rows: a reference-count increment, no row
+    /// is copied.
+    fn share(&self) -> Arc<[Row]> {
+        Arc::clone(&self.storage)
     }
 }
 
@@ -56,7 +64,7 @@ impl TableProvider for InMemoryTable {
         // t_50d99192 (that is the executor's `Vec<Row>`, not this provider).
         // This change removes the eager copy that preceded it, not that.
         Box::new(LazyRows {
-            rows: Arc::clone(&self.rows),
+            rows: self.share(),
             idx: 0,
         })
     }
