@@ -1918,6 +1918,11 @@ mod tests {
     #[tokio::test]
     async fn api_downgrade_to_pair_returns_409_without_a_connected_peer() {
         let state = make_state();
+        // A committed cluster member, so the refusal under test is the missing
+        // peer rather than the mode precondition.
+        state
+            .mode_controller
+            .set_mode_for_test(ferrosa_common::deployment_mode::DeploymentMode::Cluster);
         let router = crate::web::build_router(state);
         let req = Request::builder()
             .method("POST")

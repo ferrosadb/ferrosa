@@ -4389,6 +4389,72 @@ async fn downgrade_to_pair_moves_a_cluster_member_when_a_peer_is_connected() {
     );
 }
 
+/// Refused when more than one peer is connected: the target would be ambiguous.
+///
+/// `downgrade_to_pair` takes no peer argument; it replicated to whichever peer
+/// happened to sit first in `connected_peers`. In a three-node cluster that is an
+/// arbitrary choice of one member, while the third member keeps committing
+/// through Raft for the same keys. The other side of this boundary (exactly one
+/// connected peer) is
+/// `downgrade_to_pair_moves_a_cluster_member_when_a_peer_is_connected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_with_more_than_one_connected_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    controller.connected_peers.lock().extend([
+        (a, "127.0.0.1:7000".parse().unwrap()),
+        (b, "127.0.0.1:7001".parse().unwrap()),
+    ]);
+
+    let err = controller
+        .downgrade_to_pair()
+        .expect_err("two connected peers make the pair target ambiguous; it must be refused");
+
+    assert!(
+        err.to_string().contains("more than one"),
+        "the refusal must name the ambiguity, got: {err}"
+    );
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Cluster,
+        "a refused downgrade must leave the node untouched"
+    );
+}
+
+/// Refused unless the node is a committed cluster member.
+///
+/// The action is "take this node out of a Raft cluster". From `Pair` it would
+/// tear down and reinstall a live pair coordinator; from `Standalone` it would
+/// bypass the normal standalone -> pair lifecycle. Either way it must not report
+/// success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_unless_the_node_is_a_cluster_member() {
+    for mode in [DeploymentMode::Standalone, DeploymentMode::Pair] {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = cluster_mode_controller(dir.path());
+        controller.set_mode_for_test(mode);
+        controller
+            .connected_peers
+            .lock()
+            .push((Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap()));
+
+        let err = controller
+            .downgrade_to_pair()
+            .expect_err("only a cluster member may be downgraded to pair");
+        assert!(
+            err.to_string().contains("not a cluster member"),
+            "{mode}: the refusal must name the mode, got: {err}"
+        );
+        assert_eq!(
+            controller.mode(),
+            mode,
+            "{mode}: the node must be untouched"
+        );
+    }
+}
+
 /// The automatic path still cannot do this.
 ///
 /// The override must not have widened the normal transition. If it had, the
