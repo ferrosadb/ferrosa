@@ -1,8 +1,9 @@
 //! Module: Compose lock-free memtable, flush, SSTable read, and metadata views.
 //! Correctness: Correct when every ArcSwap view is internally aligned and read
 //! and compaction planning preserve key bounds without resident-reader fanout.
-//! Last revised: 2026-09-26
-//! Last changed: Opened staged Data.db directly for streaming flush output.
+//! Last revised: 2026-10-03
+//! Last changed: Removed the per-table locks (write gate, view CAS, rotation
+//! queue, ArcSwap sets), t_d938e6ae.
 //!
 //! Lock-free composition of memtable, flush, and SSTable reads.
 //!
@@ -16,7 +17,8 @@
 //!
 //! The read path is lock-free: it uses `ArcSwap::load()` to atomically
 //! snapshot the current view without blocking any writer or flusher.
-//! Flush serialization is enforced by a `parking_lot::Mutex`.
+//! Memtable rotations (flush, index DDL, ALTER, TRUNCATE) run one at a time
+//! through a lock-free queue (`TableStore::rotate`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,7 +34,6 @@ static LAST_READ_FANOUT_ERROR_UNIX_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
@@ -580,8 +581,15 @@ pub struct TableStore<F: FlushTarget> {
     /// Stable identifier for this table, used as the high-order half of the
     /// pool key so generations from different tables never collide.
     pool_table_key: String,
-    /// Serializes concurrent flushes. The read/write paths never touch this.
-    flush_guard: Mutex<()>,
+    /// Memtable rotations (flushes, index DDL, ALTER, TRUNCATE, retire)
+    /// waiting to run; see [`TableStore::rotate`].
+    rotation_tx: crossbeam_channel::Sender<RotationRequest>,
+    rotation_rx: crossbeam_channel::Receiver<RotationRequest>,
+    /// Set while one thread runs queued rotations for everyone (the
+    /// combiner). Claimed by compare-and-swap; nothing ever waits on it.
+    rotating: std::sync::atomic::AtomicBool,
+    /// Memtable swaps performed, for coalescing checks and diagnostics.
+    rotations_started: std::sync::atomic::AtomicU64,
     /// The indexes the most recent flush wrote a sidecar for, published for
     /// the engine's post-flush bookkeeping. Shared by pointer, so reading it
     /// copies no names: the engine only asks whether a name is in the set.
@@ -1116,6 +1124,86 @@ fn new_memtable() -> Arc<dyn Memtable> {
 /// `TableStore::vector_index_scopes`). Each index's set is its own `Arc`, so
 /// recording scopes for one index copies only that index's set.
 type VectorIndexScopes = HashMap<String, Arc<std::collections::HashSet<Vec<u8>>>>;
+
+/// An index DDL's change to a catalog: the next catalog, or `None` for none.
+type CatalogEdit = Box<dyn FnOnce(&IndexCatalog) -> Option<IndexCatalog> + Send>;
+
+/// What one queued memtable rotation asks for (see `TableStore::rotate`).
+enum RotationKind {
+    /// Flush the active memtable; `on_release` runs right after the swap.
+    Flush {
+        on_release: Box<dyn FnOnce() + Send>,
+    },
+    /// Rotate onto a catalog derived from the current one (index DDL);
+    /// `None` from the edit leaves the catalog as it is.
+    Edit(CatalogEdit),
+    /// Rotate onto a new schema (`ALTER TABLE`).
+    Schema {
+        schema: TableSchema,
+        on_release: Box<dyn FnOnce() + Send>,
+    },
+    /// Discard every row and SSTable (`TRUNCATE`).
+    Truncate,
+    /// Change nothing; answered once every rotation queued before it is done.
+    Barrier,
+}
+
+/// A catalog or schema change one rotation applies, in queue order.
+enum RotationChange {
+    Edit(CatalogEdit),
+    Schema(TableSchema),
+}
+
+/// The catalog and schema a rotation's new memtable is bound to: `changes`
+/// applied in queue order to the frozen memtable's. A schema change remaps
+/// the catalog's column ordinals onto the new layout.
+fn apply_rotation_changes(
+    changes: Vec<RotationChange>,
+    catalog: &Arc<IndexCatalog>,
+    schema: &Arc<TableSchema>,
+) -> (Arc<IndexCatalog>, Arc<TableSchema>) {
+    changes.into_iter().fold(
+        (Arc::clone(catalog), Arc::clone(schema)),
+        |(catalog, schema), change| match change {
+            RotationChange::Edit(edit) => match edit(&catalog) {
+                Some(edited) => (Arc::new(edited), schema),
+                None => (catalog, schema),
+            },
+            RotationChange::Schema(next) => {
+                let remapped = catalog.remapped_onto(&schema, &next);
+                (Arc::new(remapped), Arc::new(next))
+            }
+        },
+    )
+}
+
+/// One queued rotation and where to send its result.
+struct RotationRequest {
+    kind: RotationKind,
+    enqueued_at: Instant,
+    reply: crossbeam_channel::Sender<Result<FlushOutcome>>,
+}
+
+/// How often a thread waiting for its rotation re-checks whether it should
+/// run the queue itself (the combiner may have stopped between rounds).
+const ROTATION_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long a thread waits for its rotation before failing loud. A rotation
+/// is a flush, so this is far beyond any healthy one.
+const ROTATION_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How many queue drains one combiner runs before handing the queue back,
+/// so a busy table cannot keep one caller combining for everyone forever.
+const MAX_COMBINE_ROUNDS: usize = 8;
+
+/// Clears `TableStore::rotating` when the combiner stops, panics included.
+struct CombinerSlot<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for CombinerSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// How many sealed memtables one write may meet before it is refused. A
 /// flush publishes the next memtable before sealing the old one, so a retry
@@ -2110,6 +2198,7 @@ impl<F: FlushTarget> TableStore<F> {
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
         let schema = Arc::new(schema);
+        let (rotation_tx, rotation_rx) = crossbeam_channel::unbounded();
         let indexes = new_indexes(
             Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
             Arc::clone(&schema),
@@ -2127,7 +2216,10 @@ impl<F: FlushTarget> TableStore<F> {
         Self {
             schema: ArcSwap::new(schema),
             view: ArcSwap::from_pointee(initial_view),
-            flush_guard: Mutex::new(()),
+            rotation_tx,
+            rotation_rx,
+            rotating: std::sync::atomic::AtomicBool::new(false),
+            rotations_started: std::sync::atomic::AtomicU64::new(0),
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
@@ -2275,6 +2367,7 @@ impl<F: FlushTarget> TableStore<F> {
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
         let schema = Arc::new(schema);
+        let (rotation_tx, rotation_rx) = crossbeam_channel::unbounded();
         let indexes = new_indexes(
             Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
             Arc::clone(&schema),
@@ -2333,7 +2426,10 @@ impl<F: FlushTarget> TableStore<F> {
         Self {
             schema: ArcSwap::new(schema),
             view: ArcSwap::from_pointee(initial_view),
-            flush_guard: Mutex::new(()),
+            rotation_tx,
+            rotation_rx,
+            rotating: std::sync::atomic::AtomicBool::new(false),
+            rotations_started: std::sync::atomic::AtomicU64::new(0),
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
@@ -2377,6 +2473,7 @@ impl<F: FlushTarget> TableStore<F> {
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
         let schema = Arc::new(schema);
+        let (rotation_tx, rotation_rx) = crossbeam_channel::unbounded();
         let indexes = new_indexes(
             Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
             Arc::clone(&schema),
@@ -2418,7 +2515,10 @@ impl<F: FlushTarget> TableStore<F> {
         Self {
             schema: ArcSwap::new(schema),
             view: ArcSwap::from_pointee(initial_view),
-            flush_guard: Mutex::new(()),
+            rotation_tx,
+            rotation_rx,
+            rotating: std::sync::atomic::AtomicBool::new(false),
+            rotations_started: std::sync::atomic::AtomicU64::new(0),
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
@@ -3634,7 +3734,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// Flush the active memtable to an SSTable.
     ///
     /// The flush sequence:
-    /// 1. Lock the flush mutex (serializes concurrent flush calls).
+    /// 1. Queue the rotation; one thread runs the queue (see [`Self::rotate`]).
     /// 2. Install a fresh active memtable; move the old one to `flushing`.
     /// 3. Snapshot the flushing memtable.
     /// 4. If the snapshot is empty, clear `flushing` and return (no-op).
@@ -3657,9 +3757,11 @@ impl<F: FlushTarget> TableStore<F> {
     /// caller must not treat that generation as freshly written.
     pub(crate) fn flush_with_swap_callback(
         &self,
-        on_memtable_release: impl FnOnce(),
+        on_memtable_release: impl FnOnce() + Send + 'static,
     ) -> Result<FlushOutcome> {
-        self.flush_rotating(None, |_| None, on_memtable_release)
+        self.rotate(RotationKind::Flush {
+            on_release: Box::new(on_memtable_release),
+        })
     }
 
     /// Flush every row written under the current schema, then publish
@@ -3675,9 +3777,12 @@ impl<F: FlushTarget> TableStore<F> {
     pub(crate) fn flush_and_update_schema(
         &self,
         new_schema: TableSchema,
-        on_memtable_release: impl FnOnce(),
+        on_memtable_release: impl FnOnce() + Send + 'static,
     ) -> Result<FlushOutcome> {
-        self.flush_rotating(Some(new_schema), |_| None, on_memtable_release)
+        self.rotate(RotationKind::Schema {
+            schema: new_schema,
+            on_release: Box::new(on_memtable_release),
+        })
     }
 
     /// Change the table's index catalog by rotating the memtable: `edit`
@@ -3691,8 +3796,8 @@ impl<F: FlushTarget> TableStore<F> {
     /// it — the new memtable starts empty, and the frozen one gets sidecars for
     /// the NEW catalog built from its own postings, or from its now-immutable
     /// rows for an index the edit added (see `flush_rotating`). `edit` runs at
-    /// the swap against the latest catalog, so concurrent DDLs, which the
-    /// flush already serializes, cannot lose one another's changes.
+    /// the swap against the latest catalog, and rotations run one at a time
+    /// in queue order, so concurrent DDLs cannot lose one another's changes.
     ///
     /// Returns what the rotation's flush did. A published generation's
     /// sidecars already cover every index of the new catalog (see
@@ -3701,9 +3806,188 @@ impl<F: FlushTarget> TableStore<F> {
     /// bookkeeping every flush needs.
     pub(crate) fn flush_applying_catalog_edit(
         &self,
-        edit: impl FnOnce(&IndexCatalog) -> Option<IndexCatalog>,
+        edit: impl FnOnce(&IndexCatalog) -> Option<IndexCatalog> + Send + 'static,
     ) -> Result<FlushOutcome> {
-        self.flush_rotating(None, edit, || {})
+        self.rotate(RotationKind::Edit(Box::new(edit)))
+    }
+
+    /// Run one memtable rotation, with no lock (t_d938e6ae).
+    ///
+    /// Rotations of one table must happen one at a time: each swaps the
+    /// active memtable, and a catalog edit derives from the catalog the
+    /// previous rotation left. That used to be a per-table `Mutex` every
+    /// flush, DDL and truncate queued on. Now the request goes onto a queue,
+    /// and whichever caller claims the `rotating` flag by compare-and-swap
+    /// runs everything queued, in order, for everyone (flat combining):
+    /// flushes, edits and schema changes queued together are ONE rotation.
+    /// The others wait for their own answer, never for a lock, and take over
+    /// the queue if the combiner stops.
+    ///
+    /// # Errors
+    ///
+    /// The rotation's own error, or a loud error if no answer arrives within
+    /// [`ROTATION_WAIT_LIMIT`].
+    fn rotate(&self, kind: RotationKind) -> Result<FlushOutcome> {
+        let (reply, answer) = crossbeam_channel::bounded(1);
+        let request = RotationRequest {
+            kind,
+            enqueued_at: Instant::now(),
+            reply,
+        };
+        if self.rotation_tx.send(request).is_err() {
+            // The store holds the receiver, so this cannot happen while
+            // `self` is alive.
+            return Err(ferrosa_common::Error::InvalidData(
+                "rotation queue closed".to_string(),
+            ));
+        }
+        let start = Instant::now();
+        while start.elapsed() < ROTATION_WAIT_LIMIT {
+            self.combine_rotations();
+            match answer.recv_timeout(ROTATION_POLL) {
+                Ok(result) => return result,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    tracing::error!("store: a rotation was dropped without an answer");
+                    return Err(ferrosa_common::Error::InvalidData(
+                        "the rotation was dropped without an answer (its combiner panicked)"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        tracing::error!(
+            waited_s = start.elapsed().as_secs(),
+            "store: no answer for a queued rotation; it may still run later"
+        );
+        Err(ferrosa_common::Error::InvalidData(format!(
+            "no answer for a queued memtable rotation after {ROTATION_WAIT_LIMIT:?}"
+        )))
+    }
+
+    /// If no other thread is running the rotation queue, run it.
+    fn combine_rotations(&self) {
+        for _ in 0..MAX_COMBINE_ROUNDS {
+            if self
+                .rotating
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return;
+            }
+            let slot = CombinerSlot(&self.rotating);
+            let batch: Vec<RotationRequest> = self.rotation_rx.try_iter().collect();
+            self.run_rotation_batch(batch);
+            drop(slot);
+            // A request queued after the drain but before the flag cleared
+            // found the flag set; pick it up rather than strand it.
+            if self.rotation_rx.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Run one drained batch in queue order: consecutive flushes, edits and
+    /// schema changes as one rotation; a truncate or barrier on its own.
+    fn run_rotation_batch(&self, batch: Vec<RotationRequest>) {
+        let mut group = Vec::new();
+        for request in batch {
+            match request.kind {
+                RotationKind::Truncate | RotationKind::Barrier => {
+                    if !group.is_empty() {
+                        self.run_rotation_group(std::mem::take(&mut group));
+                    }
+                    let result = match request.kind {
+                        RotationKind::Truncate => self.truncate_now(),
+                        _ => Ok(FlushOutcome::NothingToFlush),
+                    };
+                    Self::answer(&request.reply, result);
+                }
+                _ => group.push(request),
+            }
+        }
+        if !group.is_empty() {
+            self.run_rotation_group(group);
+        }
+    }
+
+    /// Send `result` to one waiting caller. The caller may have given up
+    /// (see [`ROTATION_WAIT_LIMIT`]); its answer is then only logged.
+    fn answer(
+        reply: &crossbeam_channel::Sender<Result<FlushOutcome>>,
+        result: Result<FlushOutcome>,
+    ) {
+        if let Err(unsent) = reply.send(result) {
+            tracing::warn!(
+                result = ?unsent.0,
+                "store: a rotation finished after its caller stopped waiting"
+            );
+        }
+    }
+
+    /// Run queued flushes, edits and schema changes as ONE memtable rotation.
+    fn run_rotation_group(&self, group: Vec<RotationRequest>) {
+        let oldest = group
+            .iter()
+            .map(|request| request.enqueued_at)
+            .min()
+            .unwrap_or_else(Instant::now);
+        crate::metrics::observe_flush_phase(crate::metrics::FlushPhase::LockWait, oldest.elapsed());
+        let mut replies = Vec::with_capacity(group.len());
+        let mut changes = Vec::with_capacity(group.len());
+        let mut releases: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        for request in group {
+            replies.push(request.reply);
+            match request.kind {
+                RotationKind::Flush { on_release } => releases.push(on_release),
+                RotationKind::Edit(edit) => changes.push(RotationChange::Edit(edit)),
+                RotationKind::Schema { schema, on_release } => {
+                    changes.push(RotationChange::Schema(schema));
+                    releases.push(on_release);
+                }
+                RotationKind::Truncate | RotationKind::Barrier => {
+                    unreachable!("run_rotation_batch never groups a truncate or barrier")
+                }
+            }
+        }
+        let result = if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!(
+                dir = %self.flush_target.base_dir().display(),
+                "flush skipped: the table was dropped while this flush was pending"
+            );
+            Ok(FlushOutcome::NothingToFlush)
+        } else {
+            self.flush_rotating(
+                |catalog, schema| apply_rotation_changes(changes, catalog, schema),
+                || releases.into_iter().for_each(|release| release()),
+            )
+        };
+        match result {
+            Ok(outcome) => replies
+                .iter()
+                .for_each(|reply| Self::answer(reply, Ok(outcome))),
+            Err(e) => {
+                // The first caller gets the error itself; the rest its text.
+                let message = e.to_string();
+                let mut replies = replies.iter();
+                if let Some(first) = replies.next() {
+                    Self::answer(first, Err(e));
+                }
+                replies.for_each(|reply| {
+                    Self::answer(
+                        reply,
+                        Err(ferrosa_common::Error::InvalidData(format!(
+                            "the memtable rotation this request joined failed: {message}"
+                        ))),
+                    );
+                });
+            }
+        }
     }
 
     /// The memtable indexes a flush writes sidecars from: one per scalar index
@@ -3738,42 +4022,51 @@ impl<F: FlushTarget> TableStore<F> {
             .collect()
     }
 
-    /// Mark this store dropped: wait for a flush already writing to finish,
-    /// then make every later flush a no-op.
+    /// Mark this store dropped: wait for a rotation already running to
+    /// finish, then make every later one a no-op.
     ///
     /// DROP TABLE removes the table from the engine and deletes its directory
     /// so a re-CREATE starts empty. Readers that still hold the table get
     /// I/O errors for files that are gone, which is loud and correct for a
     /// dropped table. A flush still running on it is different: it would
     /// write an SSTable into the deleted directory for the re-created table
-    /// to load. The engine-wide table lock used to make DROP wait for it; this
-    /// waits only for the one in-progress flush of this table.
+    /// to load. So the flag is set first, and then a barrier goes through the
+    /// rotation queue: it is answered only after every rotation queued before
+    /// it has finished, and every rotation after it sees the flag.
     pub fn retire(&self) {
-        let _flush = self.flush_guard.lock();
         self.retired
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Err(e) = self.rotate(RotationKind::Barrier) {
+            tracing::error!(
+                %e,
+                dir = %self.flush_target.base_dir().display(),
+                "retire: could not confirm that no flush of the dropped table is still writing"
+            );
+        }
     }
 
+    /// Memtable swaps this store has performed (see [`Self::rotate`]).
+    #[cfg(test)]
+    pub(crate) fn rotations_started(&self) -> u64 {
+        self.rotations_started
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// One memtable rotation and the flush of the frozen memtable. Runs only
+    /// on the rotation combiner (see [`Self::rotate`]), so never twice at once
+    /// for one table. `plan` gives the catalog and schema the new memtable is
+    /// bound to, from the frozen memtable's.
     fn flush_rotating(
         &self,
-        new_schema: Option<TableSchema>,
-        edit_catalog: impl FnOnce(&IndexCatalog) -> Option<IndexCatalog>,
+        plan: impl FnOnce(
+            &Arc<IndexCatalog>,
+            &Arc<TableSchema>,
+        ) -> (Arc<IndexCatalog>, Arc<TableSchema>),
         on_memtable_release: impl FnOnce(),
     ) -> Result<FlushOutcome> {
         let total_start = Instant::now();
-        let phase_start = Instant::now();
-        let _guard = self.flush_guard.lock();
-        crate::metrics::observe_flush_phase(
-            crate::metrics::FlushPhase::LockWait,
-            phase_start.elapsed(),
-        );
-        if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
-            tracing::info!(
-                dir = %self.flush_target.base_dir().display(),
-                "flush skipped: the table was dropped while this flush was pending"
-            );
-            return Ok(FlushOutcome::NothingToFlush);
-        }
+        self.rotations_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Step 1: Swap in a fresh active memtable, move old to flushing, then
         // seal the old memtable's gate and wait for the writers already
@@ -3800,14 +4093,8 @@ impl<F: FlushTarget> TableStore<F> {
             let flush_catalog = Arc::clone(&old_view.indexes.catalog);
             // The catalog the new memtable is bound to, and whose index set the
             // frozen memtable's sidecars must cover.
-            let mut target_catalog = match edit_catalog(&flush_catalog) {
-                Some(edited) => Arc::new(edited),
-                None => Arc::clone(&flush_catalog),
-            };
-            let mut target_schema = Arc::clone(&flush_schema);
-            if let Some(new_schema) = new_schema {
-                target_catalog = Arc::new(target_catalog.remapped_onto(&flush_schema, &new_schema));
-                target_schema = Arc::new(new_schema);
+            let (target_catalog, target_schema) = plan(&flush_catalog, &flush_schema);
+            if !Arc::ptr_eq(&target_schema, &flush_schema) {
                 self.schema.store(Arc::clone(&target_schema));
             }
             let fresh_indexes = new_indexes(Arc::clone(&target_catalog), target_schema);
@@ -7079,7 +7366,10 @@ impl<F: FlushTarget> TableStore<F> {
     /// re-declaration); the memtable still rotates, which is harmless.
     /// Returns what the rotation's flush did (see
     /// [`Self::flush_applying_catalog_edit`]).
-    fn rotate_catalog(&self, edit: impl FnOnce(&mut IndexCatalog) -> bool) -> Result<FlushOutcome> {
+    fn rotate_catalog(
+        &self,
+        edit: impl FnOnce(&mut IndexCatalog) -> bool + Send + 'static,
+    ) -> Result<FlushOutcome> {
         self.flush_applying_catalog_edit(|current| {
             let mut next = current.clone();
             edit(&mut next).then_some(next)
@@ -7113,7 +7403,7 @@ impl<F: FlushTarget> TableStore<F> {
         index_type: IndexType,
         filter_predicate: Option<FilterPredicate>,
     ) -> Result<FlushOutcome> {
-        self.rotate_catalog(|catalog| {
+        self.rotate_catalog(move |catalog| {
             let wanted = Some((0, column_position, index_type, filter_predicate.as_ref()));
             if catalog.scalar_definition(&index_name) == wanted {
                 return false;
@@ -7141,11 +7431,15 @@ impl<F: FlushTarget> TableStore<F> {
     /// Returns whether anything named `index_name` was declared, and what the
     /// rotation's flush did.
     pub fn remove_index(&self, index_name: &str) -> Result<(bool, FlushOutcome)> {
-        let mut removed = false;
-        let outcome = self.rotate_catalog(|catalog| {
-            removed = catalog.remove(index_name);
+        let declared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let found = Arc::clone(&declared);
+        let name = index_name.to_string();
+        let outcome = self.rotate_catalog(move |catalog| {
+            let removed = catalog.remove(&name);
+            found.store(removed, std::sync::atomic::Ordering::Release);
             removed
         })?;
+        let mut removed = declared.load(std::sync::atomic::Ordering::Acquire);
         removed |= self.forget_vector_scopes(index_name)?;
         Ok((removed, outcome))
     }
@@ -7162,7 +7456,7 @@ impl<F: FlushTarget> TableStore<F> {
         clustering_component: usize,
         index_type: IndexType,
     ) -> Result<FlushOutcome> {
-        self.rotate_catalog(|catalog| {
+        self.rotate_catalog(move |catalog| {
             if catalog.declares(&index_name) {
                 return false;
             }
@@ -7201,7 +7495,7 @@ impl<F: FlushTarget> TableStore<F> {
         partition_key_component: usize,
         index_type: IndexType,
     ) -> Result<FlushOutcome> {
-        self.rotate_catalog(|catalog| {
+        self.rotate_catalog(move |catalog| {
             if catalog.declares(&index_name) {
                 return false;
             }
@@ -7664,7 +7958,7 @@ impl<F: FlushTarget> TableStore<F> {
         index_name: String,
         column_position: usize,
     ) -> Result<FlushOutcome> {
-        self.rotate_catalog(|catalog| {
+        self.rotate_catalog(move |catalog| {
             if catalog
                 .fulltext_indexes
                 .iter()
@@ -7712,7 +8006,7 @@ impl<F: FlushTarget> TableStore<F> {
         // select it and turn a correct brute-force ANN query into an empty
         // result. The rotation avoids that: the rows already written leave
         // with the frozen memtable, whose flush builds their vector sidecar.
-        self.rotate_catalog(|catalog| {
+        self.rotate_catalog(move |catalog| {
             if catalog
                 .vector_index_configs
                 .iter()
@@ -8242,10 +8536,17 @@ impl<F: FlushTarget> TableStore<F> {
     /// Existing readers holding `Arc` references to the old memtable or
     /// SSTables will complete normally; the data is freed once those
     /// references drop. On-disk SSTable files remain until GC.
-    pub fn truncate(&self) {
-        let _guard = self.flush_guard.lock();
-        // Index DDL also holds `flush_guard`, so this catalog cannot change
-        // before the view below is published.
+    ///
+    /// Runs as a rotation (see [`Self::rotate`]), so it never interleaves
+    /// with a flush or an index DDL of this table.
+    pub fn truncate(&self) -> Result<()> {
+        self.rotate(RotationKind::Truncate).map(|_outcome| ())
+    }
+
+    /// [`Self::truncate`], on the rotation combiner.
+    fn truncate_now(&self) -> Result<FlushOutcome> {
+        // Rotations run one at a time, so this catalog cannot change before
+        // the view below is published.
         let catalog = self.catalog();
         let new_view = StoreView {
             active: new_memtable(),
@@ -8263,6 +8564,7 @@ impl<F: FlushTarget> TableStore<F> {
         if let Err(e) = old_view.indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE) {
             tracing::error!(%e, "truncate: writes still inside the discarded memtable");
         }
+        Ok(FlushOutcome::NothingToFlush)
     }
 
     /// Atomically replace input SSTables with a compacted output SSTable.
@@ -9106,6 +9408,65 @@ mod tests {
         );
         let rows = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec())).unwrap();
         assert_eq!(rows.len(), WRITERS * ROWS_PER_WRITER, "a write was lost");
+    }
+
+    /// `flush_guard` (a per-table `Mutex` every flush, DDL and truncate
+    /// queued on) is gone: rotations go onto a queue that one caller runs
+    /// for everyone (t_d938e6ae). Two flushes requested while a third is
+    /// running must become ONE rotation, not two more, and lose no row.
+    #[test]
+    fn flushes_queued_behind_a_running_flush_coalesce_into_one_rotation() {
+        let store = Arc::new(test_store());
+        store.write(&make_key("a"), make_row(b"v", 1000)).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.flush_with_swap_callback(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        // The first flush is inside its rotation, holding the combiner.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(store.rotations_started(), 1);
+
+        store.write(&make_key("b"), make_row(b"v", 1000)).unwrap();
+        store.write(&make_key("c"), make_row(b"v", 1000)).unwrap();
+        let queued: Vec<_> = (0..2)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || store.flush())
+            })
+            .collect();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while store.rotation_rx.len() < 2 {
+            assert!(Instant::now() < deadline, "the two flushes never queued");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        release_tx.send(()).unwrap();
+
+        assert_eq!(first.join().unwrap().unwrap(), FlushOutcome::Published);
+        queued
+            .into_iter()
+            .for_each(|flush| flush.join().unwrap().unwrap());
+        assert_eq!(
+            store.rotations_started(),
+            2,
+            "the two queued flushes must run as one rotation"
+        );
+        assert_eq!(store.sstable_count(), 2);
+        assert_eq!(store.memtable_size(), 0);
+        ["a", "b", "c"].iter().for_each(|key| {
+            assert!(
+                store.read(&make_key(key)).unwrap().is_some(),
+                "row {key} was lost"
+            );
+        });
     }
 
     /// Every view change is a compare-and-swap derived from the current view

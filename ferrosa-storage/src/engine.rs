@@ -4798,7 +4798,7 @@ impl StorageEngine {
         let pressure_notify = Arc::clone(&state.write_pressure_notify);
         let outcome = state
             .store
-            .flush_and_update_schema(new_schema, || pressure_notify.notify_waiters())?;
+            .flush_and_update_schema(new_schema, move || pressure_notify.notify_waiters())?;
         self.finish_flush(table_id, &state, cl_position, outcome)?;
         self.remove_time_series_consolidator(table_id);
         self.install_time_series_consolidator(table_id.clone(), time_series_handle);
@@ -9861,7 +9861,7 @@ impl StorageEngine {
     fn truncate_local(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         let state = self.require_table(table_id)?;
         // Clear in-memory state (memtable + SSTable references).
-        state.store.truncate();
+        state.store.truncate()?;
 
         // Delete local SSTable files so data doesn't reappear on restart.
         let table_dir = self
@@ -10322,7 +10322,7 @@ impl StorageEngine {
         let pressure_notify = Arc::clone(&state.write_pressure_notify);
         let flush_outcome = state
             .store
-            .flush_with_swap_callback(|| pressure_notify.notify_waiters())?;
+            .flush_with_swap_callback(move || pressure_notify.notify_waiters())?;
         self.finish_flush(table_id, &state, cl_position, flush_outcome)
     }
 
