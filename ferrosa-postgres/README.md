@@ -164,17 +164,25 @@ spill error, a storage error during the scan) is reported as an `ErrorResponse`
 after the rows already written — as PostgreSQL does — never as a
 `CommandComplete` and never as a silently short result (FMEA PG-Tf348ba0b).
 
-`ferrosa_sql::execute_streaming` is synchronous and CPU-bound (scan, filter,
-sort, hash-aggregate, hash-join). It must never run inline on the async
-handlers: doing so pins an async worker for the whole query and starves
-connection keepalives — the failure mode PR #131 fixed on the CQL path. Both
-call sites (simple and extended) start it through `result_stream::open_stream`,
-and `result_stream::tests::executor_does_not_run_on_the_async_worker` fails if
-that regresses (forge t_d3b2dec1).
+The executor (`ferrosa_sql::open_cursor`, then `RowCursor::next_row`) is
+synchronous and CPU-bound (scan, filter, sort, hash-aggregate, hash-join). It
+must never run inline on the async handlers: doing so pins an async worker for
+the whole query and starves connection keepalives — the failure mode PR #131
+fixed on the CQL path. Both call sites (simple and extended) start it through
+`result_stream::open_stream`, and
+`result_stream::tests::executor_does_not_run_on_the_async_worker` fails if that
+regresses (forge t_d3b2dec1).
 
-Cost of suspension: a suspended portal parks one `spawn_blocking` thread in a
-channel send until it resumes or is closed. The runtimes cap blocking threads,
-so many concurrently suspended portals consume that budget.
+**A waiting query holds no thread.** The query is an owned `RowCursor`, pulled
+on a blocking thread one fetch (16 rows) at a time; the next fetch starts as
+soon as a batch arrives. A fetch waits only on the executor's inputs, never on
+the client, so a suspended portal or a client that stopped reading its socket
+holds no blocking thread. Below it, the storage range scan pauses after a
+100 ms grace and gives back its pool slot and thread too (ferrosa-storage
+ST-68). Before this, each suspended portal parked two blocking threads, and
+about `cores` idle clients exhausted the listener runtime's bounded blocking
+pool (`tests/pg_suspended_portals_hold_no_thread.rs`: 16 portals beside a
+4-thread pool, every thread free, another session's SELECT completes).
 
 **DDL (`CREATE TABLE [IF NOT EXISTS]`, T-132a).** Simple protocol only. The
 statement is planned into a `TableMetadata` (`ddl.rs`) and applied through the

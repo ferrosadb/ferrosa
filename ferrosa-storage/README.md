@@ -754,6 +754,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   serving a silent partial — compaction's legacy-format rewrite is the at-rest
   fix.
 
+- **A range scan whose consumer stopped reading pauses and gives back its
+  thread (ST-68).** `range_iter` and `range_iter_projected` run a `RangeScan`
+  on the scheduler pool. When the consumer leaves the 4-item channel full for
+  `RANGE_SCAN_PAUSE_GRACE` (100 ms), the producer returns its pool slot, I/O
+  permit AND blocking thread; an async supervisor holds the item it could not
+  hand over, waits for room, delivers it and resumes the scan from that key
+  over the same view and open SSTable readers. A suspended PG portal or an
+  undrained socket therefore holds no thread. The fragment producers still
+  park theirs (`ScanSlot::park`).
+
 ## Public API (key entry points)
 
 | Area | Items |
