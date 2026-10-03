@@ -964,8 +964,8 @@ async fn pattern_predicate_exists(
             for source_key in &source_keys {
                 if let Some(partition) = write_path.read(&adj_table_id, source_key).await? {
                     for row in &partition.rows {
-                        if let Some(neighbor_id) = extract_neighbor_id_for_direction(
-                            &row.clustering,
+                        if let Some(neighbor_id) = traversable_neighbor_id(
+                            row,
                             hop.rel_type.as_deref(),
                             Some(DIRECTION_OUT),
                         ) {
@@ -1266,11 +1266,9 @@ async fn outgoing_neighbor_ids(
     for key in &source_keys {
         if let Some(partition) = write_path.read(&adj_table_id, key).await? {
             for row in &partition.rows {
-                if let Some(neighbor_id) = extract_neighbor_id_for_direction(
-                    &row.clustering,
-                    rel_type,
-                    Some(DIRECTION_OUT),
-                ) {
+                if let Some(neighbor_id) =
+                    traversable_neighbor_id(row, rel_type, Some(DIRECTION_OUT))
+                {
                     neighbor_ids.push(neighbor_id);
                 }
             }
@@ -1874,8 +1872,8 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                     .rows
                     .iter()
                     .filter_map(|row| {
-                        extract_neighbor_id_for_direction(
-                            &row.clustering,
+                        traversable_neighbor_id(
+                            row,
                             hop.edge_label.as_deref(),
                             expected_adjacency_direction(hop.direction),
                         )
@@ -2491,8 +2489,8 @@ async fn execute_optional_hops(
                     if !adjacency_row_matches_direction(&row.clustering, hop.direction) {
                         continue;
                     }
-                    let Some(neighbor_id) = extract_neighbor_id_for_direction(
-                        &row.clustering,
+                    let Some(neighbor_id) = traversable_neighbor_id(
+                        row,
                         hop.edge_label.as_deref(),
                         expected_adjacency_direction(hop.direction),
                     ) else {
@@ -5896,12 +5894,26 @@ async fn execute_delete(
                     .write(
                         &table_id,
                         &key,
-                        tombstone_row,
+                        tombstone_row.clone(),
                         timestamp,
                         graph_write_consistency(),
                         &strategy,
                     )
                     .await?;
+                if is_edge_table {
+                    // The edge's OUT and IN adjacency entries go with it, as
+                    // MERGE writes them explicitly; otherwise every hop over
+                    // the adjacency index still finds the deleted edge.
+                    write_explicit_adjacency_entries(
+                        write_path,
+                        &table_id,
+                        &key,
+                        &tombstone_row,
+                        timestamp,
+                        schema,
+                    )
+                    .await?;
+                }
                 stats.vertices_deleted += 1;
             }
         }
@@ -6448,7 +6460,7 @@ fn label_matches_alternative(actual: &str, expected: &str) -> bool {
         .any(|candidate| actual.eq_ignore_ascii_case(candidate.trim()))
 }
 
-fn expected_adjacency_direction(direction: Direction) -> Option<u8> {
+pub(crate) fn expected_adjacency_direction(direction: Direction) -> Option<u8> {
     match direction {
         Direction::Out => Some(DIRECTION_OUT),
         Direction::In => Some(DIRECTION_IN),
@@ -6456,7 +6468,21 @@ fn expected_adjacency_direction(direction: Direction) -> Option<u8> {
     }
 }
 
-fn extract_neighbor_id_for_direction(
+/// The neighbour a traversal may follow through adjacency `row`: `None` for
+/// a deleted edge (its entries are row tombstones, which reads return), a
+/// label mismatch, or the other direction.
+pub(crate) fn traversable_neighbor_id(
+    row: &Row,
+    expected_label: Option<&str>,
+    expected_direction: Option<u8>,
+) -> Option<Vec<u8>> {
+    if crate::adjacency::schema::row_is_deleted(row) {
+        return None;
+    }
+    extract_neighbor_id_for_direction(&row.clustering, expected_label, expected_direction)
+}
+
+pub(crate) fn extract_neighbor_id_for_direction(
     clustering: &[u8],
     expected_label: Option<&str>,
     expected_direction: Option<u8>,
