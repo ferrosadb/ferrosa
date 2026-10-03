@@ -198,9 +198,12 @@ how long, is bounded:
 | `suspended_portal_idle_timeout_ms` | `FERROSA_POSTGRES_SUSPENDED_PORTAL_IDLE_TIMEOUT_MS` | 600000 |
 
 TOML wins over the environment; a malformed value is logged at ERROR and the
-defaults apply. A portal suspending for the first time past either limit is
-refused with SQLSTATE `53000` after the rows that `Execute` already sent, and
-its query is dropped. A portal left untouched past the idle timeout is closed
+defaults apply. A fresh portal executed with `max_rows` (the only kind that
+can suspend) takes its place under both limits before it runs; past either
+it is refused with SQLSTATE `53000` before any `DataRow`, as PostgreSQL
+refuses a resource limit before output. A portal that completes without
+suspending gives its place back. At the limit, such an `Execute` is refused
+even if its result would have fit in `max_rows`. A portal left untouched past the idle timeout is closed
 by its connection (which wakes for it even when the client sends nothing);
 a later `Execute` on it answers `57014` naming the timeout, never a silent
 restart. `Close`, a rebind, `Sync` outside a block, the end of a transaction

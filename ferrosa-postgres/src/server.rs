@@ -1381,10 +1381,28 @@ async fn execute_select_portal<O: ReplySink>(
             session.close_run(portal_name.to_string(), error.clone());
             return Ok(vec![session.fail(error)]);
         }
-        None => match open_portal_stream(ctx, session, portal_name).await {
-            Ok(stream) => (stream, None),
-            Err(error) => return Ok(vec![session.fail(error)]),
-        },
+        None => {
+            // A portal that may suspend (`max_rows` set) takes its place
+            // under the connection and node limits BEFORE it runs, so a
+            // refusal reaches the client before any `DataRow`, as PostgreSQL
+            // refuses a resource limit before output. If it completes
+            // without suspending, the place is given back.
+            let slot = if max_rows > 0 {
+                match session.admit_suspension(&ctx.portals) {
+                    Ok(slot) => Some(slot),
+                    Err(refusal) => {
+                        session.close_run(portal_name.to_string(), refusal.clone());
+                        return Ok(vec![session.fail(refusal)]);
+                    }
+                }
+            } else {
+                None
+            };
+            match open_portal_stream(ctx, session, portal_name).await {
+                Ok(stream) => (stream, slot),
+                Err(error) => return Ok(vec![session.fail(error)]),
+            }
+        }
     };
     let result_formats = session
         .portal(portal_name)
@@ -1400,20 +1418,10 @@ async fn execute_select_portal<O: ReplySink>(
     let end = stream.pump(limit, &result_formats, out).await?;
     match &end {
         PumpEnd::Suspended => {
-            // A portal suspending for the first time must fit under the
-            // connection and node limits; one resuming keeps its place.
-            let slot = match slot {
-                Some(slot) => slot,
-                None => match session.admit_suspension(&ctx.portals) {
-                    Ok(slot) => slot,
-                    Err(refusal) => {
-                        // The rows already sent stand, as after any
-                        // mid-result error; the query is dropped here.
-                        drop(stream);
-                        session.close_run(portal_name.to_string(), refusal.clone());
-                        return Ok(vec![session.fail(refusal)]);
-                    }
-                },
+            // Only an Execute with `max_rows` suspends, and every such
+            // Execute holds its place (taken above, or kept from before).
+            let Some(slot) = slot else {
+                unreachable!("a portal suspended without max_rows");
             };
             session.park(
                 portal_name.to_string(),
@@ -1810,6 +1818,64 @@ mod txn_atomicity_tests {
         msgs.iter()
             .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
             .count()
+    }
+
+    /// At the suspended-portal limit, a fresh portal executed with `max_rows`
+    /// is refused BEFORE any `DataRow`, as PostgreSQL refuses a resource limit
+    /// before output: the client never sees partial rows followed by 53000.
+    #[tokio::test]
+    async fn a_portal_over_the_suspension_limit_is_refused_before_any_row() {
+        let (_dir, mut ctx) = make_ctx().await;
+        ctx.portals = Arc::new(crate::SuspendedPortals::new(crate::PortalLimits {
+            per_connection: 1,
+            per_node: 100,
+            idle_timeout: Duration::from_secs(600),
+        }));
+        let mut writer = Session::new(superuser());
+        for k in ["a", "b", "c", "d"] {
+            execute_simple(
+                &ctx,
+                &mut writer,
+                &format!("INSERT INTO kv (k, v) VALUES ('{k}', 'v')"),
+            )
+            .await;
+        }
+        let mut s = Session::new(superuser());
+        execute_simple(&ctx, &mut s, "BEGIN").await;
+        s.on_parse("st".into(), "SELECT k FROM kv", vec![]);
+        for portal in ["p1", "p2"] {
+            s.on_bind(
+                portal.into(),
+                "st".into(),
+                &[],
+                &[],
+                vec![],
+                &crate::jsonb_wire::test_limits(),
+            );
+        }
+        async fn execute(ctx: &QueryContext, s: &mut Session, portal: &str) -> Vec<BackendMessage> {
+            let mut messages: Vec<BackendMessage> = Vec::new();
+            let tail = execute_portal_to(ctx, s, portal, 1, &mut messages)
+                .await
+                .expect("an in-memory sink cannot fail");
+            messages.extend(tail);
+            messages
+        }
+        let first = execute(&ctx, &mut s, "p1").await;
+        assert!(
+            matches!(first.last(), Some(BackendMessage::PortalSuspended)),
+            "the first portal suspends: {first:?}"
+        );
+        let second = execute(&ctx, &mut s, "p2").await;
+        assert!(is_error(&second, "53000"), "refused with 53000: {second:?}");
+        assert!(
+            !second
+                .iter()
+                .any(|m| matches!(m, BackendMessage::DataRow { .. })),
+            "a refused portal sent rows before its error: {second:?}"
+        );
+        assert_eq!(ctx.portals.suspended(), 1);
+        ctx.engine.shutdown().unwrap();
     }
 
     fn is_error(msgs: &[BackendMessage], code: &str) -> bool {
