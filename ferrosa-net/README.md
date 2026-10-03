@@ -104,7 +104,10 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   `ferrosa_net_rpc_handler_panics_total{msg_type}`). Error replies go only to
   peers whose Handshake advertised `CAP_RPC_ERROR_REPLY` (a trailing
   `capabilities: u32` field; older peers send none and decode as `0`), and never
-  to fire-and-forget frames. A panic on the inline ordered-stream path no longer
+  to fire-and-forget frames. During a rolling restart both directions are safe:
+  an old server reads the Handshake prefix and ignores the trailing field, and
+  because it never sends error replies, a new client's failed request falls
+  back to the lane deadline. A panic on the inline ordered-stream path no longer
   takes the connection down. On the client, a connection that closes fails every
   request still pending on it immediately ("connection closed before the
   response arrived"), and an undecodable response fails its caller at once.
