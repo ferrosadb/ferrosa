@@ -348,7 +348,7 @@ pub fn replicated_tables(
             .map_err(|e| ClusterError::DataMovementUnverified(format!("keyspace {ks}: {e}")))?;
         out.push((TableId::new(ks, tbl), strategy));
     }
-    out.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+    out.sort_by_key(|(table, _)| table.to_string());
     Ok(out)
 }
 
