@@ -38,6 +38,7 @@ use tokio::sync::Notify;
 use crate::accord::apply::{
     ApplyMutation, DepWaitApplier, NoopStorageApplier, StorageApplier, StorageReader,
 };
+use crate::accord::finalized::{DecidedBy, FinalizedTxns};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -73,6 +74,13 @@ pub enum SmResponse {
     /// Its absence is terminal for dependency ordering, so parked dependents were
     /// released and the handler may acknowledge this no-write finalize.
     NoWriteFinalized,
+    /// A PreAccept for a transaction this replica already knows is decided: a
+    /// no-write finalize landed first, its applied state was pruned, or its id
+    /// is at or below the retention/restart floor (see
+    /// [`crate::accord::finalized`]). Nothing was registered. On the wire it is
+    /// the empty `AccordPreAcceptOK`, indistinguishable from a lost message
+    /// (FMEA CL-36).
+    AlreadyDecided { txn_id: TxnId, by: DecidedBy },
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +142,16 @@ pub struct AccordStateMachine {
     /// monotonicity that makes concurrent list appends strict-serializable
     /// (t_813caf39). `None` in protocol-only tests that mint no timestamps.
     clock: Option<Arc<HybridLogicalClock>>,
+    /// Bounded record of decided transactions, consulted before a PreAccept
+    /// registers anything, so a PreAccept that arrives after the decision
+    /// cannot resurrect the transaction as a conflict nothing will clear
+    /// (FMEA CL-36). The bound and its justification live in
+    /// [`crate::accord::finalized`].
+    finalized: FinalizedTxns,
+    /// Edge state for the floor-refusal warning: set on the first PreAccept
+    /// refused by the floor, cleared (with one INFO) when a PreAccept is next
+    /// accepted. Two lines per episode, never one per transaction.
+    refusing_by_floor: bool,
 }
 
 impl AccordStateMachine {
@@ -165,6 +183,8 @@ impl AccordStateMachine {
             reader: None,
             applied_notify: Arc::new(Notify::new()),
             clock: None,
+            finalized: FinalizedTxns::default(),
+            refusing_by_floor: false,
         }
     }
 
@@ -188,6 +208,8 @@ impl AccordStateMachine {
             reader: None,
             applied_notify: Arc::new(Notify::new()),
             clock: None,
+            finalized: FinalizedTxns::default(),
+            refusing_by_floor: false,
         }
     }
 
@@ -213,6 +235,8 @@ impl AccordStateMachine {
             reader: None,
             applied_notify: Arc::new(Notify::new()),
             clock: None,
+            finalized: FinalizedTxns::default(),
+            refusing_by_floor: false,
         }
     }
 
@@ -241,6 +265,8 @@ impl AccordStateMachine {
             reader: Some(reader),
             applied_notify: Arc::new(Notify::new()),
             clock: None,
+            finalized: FinalizedTxns::default(),
+            refusing_by_floor: false,
         }
     }
 
@@ -248,8 +274,16 @@ impl AccordStateMachine {
     /// transaction committer mints `t0` from — so this replica advances that
     /// clock past every execution timestamp it witnesses through consensus (see
     /// the `clock` field). Builder; returns `self`.
+    ///
+    /// Wiring the clock also sets the finalized-txn restart floor to the
+    /// clock's `now`: this replica does not replay its Accord log, so it has
+    /// no record of anything it decided before it was constructed, and every
+    /// transaction minted before then is refused at PreAccept (FMEA CL-36; see
+    /// [`crate::accord::finalized`] for why that is safe and its residual).
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<HybridLogicalClock>) -> Self {
+        let boot_now = clock.now();
+        self.finalized = std::mem::take(&mut self.finalized).with_restart_floor(boot_now);
         self.clock = Some(clock);
         self
     }
@@ -426,6 +460,18 @@ impl AccordStateMachine {
         _epoch: u64,
         snapshot_ts: Option<Timestamp>,
     ) -> SmResponse {
+        // A PreAccept for a decided transaction must register nothing: nothing
+        // would ever finalize it again, so it would sit as a pending conflict
+        // and every later read on its keys would dep-wait and abstain (CL-36).
+        if let Some(by) = self.finalized.decided(&txn_id) {
+            self.note_refused_preaccept(txn_id, by);
+            return SmResponse::AlreadyDecided { txn_id, by };
+        }
+        if self.refusing_by_floor {
+            self.refusing_by_floor = false;
+            tracing::info!("accord: PreAccepts are being accepted again after floor refusals");
+        }
+
         // Check if we've already promised a higher ballot for this txn.
         if let Some(state) = self.txn_states.get(&txn_id) {
             if ballot < (state.max_ballot_seen.0) {
@@ -779,6 +825,9 @@ impl AccordStateMachine {
             // a committed transaction's merged dependency set. Treat the explicit
             // no-write Apply as terminal and cascade its waiters so they can apply.
             None => {
+                // Leaves no TxnState, so remember the decision: the txn's own
+                // PreAccept may still be queued behind this finalize (CL-36).
+                self.finalized.record(txn_id);
                 self.conflict_index.remove(&txn_id);
                 let woken = self.apply_engine.notify_applied(txn_id);
                 self.bookkeep_applied_dedup(woken);
@@ -1056,13 +1105,59 @@ impl AccordStateMachine {
             self.txn_states.remove(id);
             self.committed_txns.remove(id);
             self.dep_waiters.remove(id);
+            // Forgetting the state must not forget the decision: a PreAccept
+            // delayed past this prune would otherwise register it again (CL-36).
+            self.finalized.record(*id);
         }
 
         // Also GC the conflict index for applied transactions.
         self.conflict_index.gc_applied();
 
+        // Drop decided-txn tombstones the retention floor now covers. Without a
+        // clock there is no time domain, and the record is bounded by its
+        // capacity alone (the production builder warns when that happens).
+        if let Some(clock) = &self.clock {
+            let now = clock.now();
+            self.finalized.advance_horizon(now);
+        }
+
         let after = self.txn_states.len() + self.committed_txns.len();
         before - after
+    }
+
+    /// Log a PreAccept refused because its transaction is already decided.
+    ///
+    /// A tombstone refusal is the CL-36 late PreAccept itself: rare, and logged
+    /// per transaction at DEBUG (the hot-path rule forbids INFO with a txn id).
+    /// A floor refusal can repeat for every transaction from a coordinator
+    /// whose clock lags, so it WARNs on the edge only.
+    fn note_refused_preaccept(&mut self, txn_id: TxnId, by: DecidedBy) {
+        tracing::debug!(
+            txn_id = ?txn_id, ?by,
+            "accord: refusing a PreAccept for an already-decided transaction"
+        );
+        if by == DecidedBy::Floor && !self.refusing_by_floor {
+            self.refusing_by_floor = true;
+            tracing::warn!(
+                floor = ?self.finalized.floor(),
+                "accord: refusing PreAccepts at or below the decided-txn floor (restart, \
+                 retention or eviction); a coordinator whose clock lags this node's will \
+                 see every PreAccept refused here"
+            );
+        }
+    }
+
+    /// Advance the decided-txn retention horizon to `now` (see
+    /// [`crate::accord::finalized::FinalizedTxns::advance_horizon`]). Called by
+    /// [`Self::prune_applied`] with the wired clock; exposed so tests can drive
+    /// the horizon with synthetic time instead of sleeping.
+    pub fn advance_finalized_horizon(&mut self, now: Timestamp) -> usize {
+        self.finalized.advance_horizon(now)
+    }
+
+    /// Number of exact decided-txn tombstones held.
+    pub fn finalized_tombstones(&self) -> usize {
+        self.finalized.len()
     }
 
     /// Number of transactions currently tracked.
@@ -1120,7 +1215,13 @@ pub fn build_accord_state_machine(
     // execution timestamp (t_813caf39). `None` in setups with no shared clock.
     match clock {
         Some(c) => sm.with_clock(c),
-        None => sm,
+        None => {
+            tracing::warn!(
+                "accord: no shared HLC wired; the decided-txn record has no restart floor or \
+                 retention horizon and is bounded by capacity alone (FMEA CL-36)"
+            );
+            sm
+        }
     }
 }
 
@@ -1465,6 +1566,213 @@ mod tests {
             "an absent dependency finalized as no-write must release dependent writes"
         );
         assert_eq!(capturing.captured(), [(waiting_txn, mutation, ts(1002))]);
+    }
+
+    /// A no-write finalize can reach a replica BEFORE that replica's PreAccept
+    /// for the same transaction (a paused replica resumes and processes both;
+    /// the finalize retries for ~25 s while the PreAccept was sent first but
+    /// handled later). The finalized transaction must not then register as a
+    /// fresh pending conflict: nothing will ever finalize it again, so every
+    /// later read or snapshot barrier on its keys dep-waits and abstains.
+    #[test]
+    fn preaccept_after_no_write_finalize_does_not_resurrect_the_conflict() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = AccordStateMachine::new(1, writer);
+        let doomed = txn(2, 1000);
+
+        assert!(matches!(
+            sm.handle_apply_writeset(doomed, Vec::new()),
+            SmResponse::NoWriteFinalized
+        ));
+        sm.handle_preaccept(doomed, ts(1000), b"key", BallotNumber(0), 0);
+
+        assert!(
+            sm.unapplied_conflicts_before(b"key", &ts(u64::MAX / 2))
+                .is_empty(),
+            "a transaction already finalized as a no-write must not become a \
+             pending conflict when its late PreAccept arrives"
+        );
+    }
+
+    /// The refusal is recognizable (not a generic abstain) and leaves no
+    /// state behind, for the single- and the multi-key PreAccept alike.
+    #[test]
+    fn a_late_preaccept_after_finalize_is_refused_as_already_decided() {
+        let (mut sm, _w) = make_sm(1);
+        let doomed = txn(2, 1000);
+        sm.handle_apply_writeset(doomed, Vec::new());
+
+        let single = sm.handle_preaccept(doomed, ts(1000), b"a", BallotNumber(0), 0);
+        let multi = sm.handle_preaccept_multi(doomed, ts(1000), &[b"a", b"b"], BallotNumber(0), 0);
+        for resp in [single, multi] {
+            assert!(
+                matches!(
+                    resp,
+                    SmResponse::AlreadyDecided { txn_id, by: DecidedBy::Tombstone } if txn_id == doomed
+                ),
+                "late PreAccept must be refused as already decided, got {resp:?}"
+            );
+        }
+        assert!(sm.get_state(&doomed).is_none());
+        assert!(sm
+            .conflict_index()
+            .deps_before_t0(b"a", &ts(u64::MAX / 2))
+            .is_empty());
+        assert!(sm
+            .conflict_index()
+            .deps_before_t0(b"b", &ts(u64::MAX / 2))
+            .is_empty());
+    }
+
+    /// The tombstone is per transaction: a new transaction on the same keys
+    /// still PreAccepts, is a pending conflict while in flight, and clears on
+    /// apply. The doomed one is never among its dependencies.
+    #[test]
+    fn a_new_txn_on_the_same_keys_still_works_after_a_late_preaccept_is_refused() {
+        let (mut sm, _w) = make_sm(1);
+        let doomed = txn(2, 1000);
+        sm.handle_apply_writeset(doomed, Vec::new());
+        sm.handle_preaccept(doomed, ts(1000), b"key", BallotNumber(0), 0);
+
+        let fresh = txn(3, 2000);
+        let (t, deps) = match sm.handle_preaccept(fresh, ts(2000), b"key", BallotNumber(0), 0) {
+            SmResponse::PreAcceptOK { t, deps, .. } => (t, deps),
+            other => panic!("a fresh txn must PreAccept, got {other:?}"),
+        };
+        assert!(
+            deps.is_empty(),
+            "the refused txn must not be a dependency: {deps:?}"
+        );
+        assert_eq!(
+            sm.unapplied_conflicts_before(b"key", &ts(u64::MAX / 2)),
+            vec![fresh],
+            "the fresh txn is a real pending conflict while in flight"
+        );
+
+        sm.handle_commit(fresh, ts(2000), t, deps);
+        sm.handle_apply(fresh, b"row".to_vec());
+        assert!(sm
+            .unapplied_conflicts_before(b"key", &ts(u64::MAX / 2))
+            .is_empty());
+    }
+
+    /// A restart between the finalize and the late PreAccept: the restarted
+    /// replica remembers nothing (no Accord log replay), so the restart floor
+    /// set when the clock is wired must refuse every transaction minted
+    /// before it. A transaction minted after the restart still works.
+    #[test]
+    fn a_restart_between_finalize_and_the_late_preaccept_still_refuses_it() {
+        use ferrosa_common::accord::HybridLogicalClock;
+        let before = Arc::new(HybridLogicalClock::new(2, 0));
+        let doomed = TxnId::new(2, before.now());
+        {
+            let (sm, _w) = make_sm(1);
+            let mut sm = sm.with_clock(Arc::new(HybridLogicalClock::new(1, 0)));
+            assert!(matches!(
+                sm.handle_apply_writeset(doomed, Vec::new()),
+                SmResponse::NoWriteFinalized
+            ));
+        } // the replica process dies here
+
+        let restarted_clock = Arc::new(HybridLogicalClock::new(1, 0));
+        let (sm, _w) = make_sm(1);
+        let mut sm = sm.with_clock(restarted_clock.clone());
+        let resp = sm.handle_preaccept(doomed, doomed.0, b"key", BallotNumber(0), 0);
+        assert!(
+            matches!(
+                resp,
+                SmResponse::AlreadyDecided {
+                    by: DecidedBy::Floor,
+                    ..
+                }
+            ),
+            "a PreAccept minted before the restart must be refused, got {resp:?}"
+        );
+        assert!(sm
+            .unapplied_conflicts_before(
+                b"key",
+                &Timestamp {
+                    time: u64::MAX,
+                    ..Timestamp::default()
+                }
+            )
+            .is_empty());
+
+        let fresh_t0 = restarted_clock.now();
+        let fresh = TxnId::new(3, fresh_t0);
+        assert!(matches!(
+            sm.handle_preaccept(fresh, fresh_t0, b"key", BallotNumber(0), 0),
+            SmResponse::PreAcceptOK { .. }
+        ));
+    }
+
+    /// `prune_applied` forgets an applied txn's state; the decision must
+    /// survive it, or a PreAccept delayed past the prune registers it again.
+    #[test]
+    fn a_preaccept_delayed_past_prune_applied_does_not_resurrect_the_txn() {
+        let (mut sm, _w) = make_sm(1);
+        let id = txn(2, 1000);
+        let t = match sm.handle_preaccept(id, ts(1000), b"key", BallotNumber(0), 0) {
+            SmResponse::PreAcceptOK { t, .. } => t,
+            other => panic!("expected PreAcceptOK, got {other:?}"),
+        };
+        sm.handle_commit(id, ts(1000), t, vec![]);
+        sm.handle_apply(id, b"row".to_vec());
+        assert_eq!(sm.prune_applied(), 2);
+        assert!(sm.get_state(&id).is_none());
+
+        let resp = sm.handle_preaccept(id, ts(1000), b"key", BallotNumber(0), 0);
+        assert!(
+            matches!(resp, SmResponse::AlreadyDecided { .. }),
+            "a duplicate PreAccept after prune must be refused, got {resp:?}"
+        );
+        assert!(sm
+            .unapplied_conflicts_before(b"key", &ts(u64::MAX / 2))
+            .is_empty());
+    }
+
+    /// Advancing the retention horizon (what `prune_applied` does with the
+    /// wired clock) drops a tombstone only once the floor covers it: at every
+    /// point the late PreAccept is still refused.
+    #[test]
+    fn pruning_the_finalized_record_never_drops_a_needed_tombstone() {
+        const SEC: u64 = 1_000_000_000;
+        let (mut sm, _w) = make_sm(1);
+        let doomed = txn(2, 100 * SEC);
+        sm.handle_apply_writeset(doomed, Vec::new());
+        assert_eq!(sm.finalized_tombstones(), 1);
+
+        // Inside the retention window: the tombstone is kept.
+        assert_eq!(sm.advance_finalized_horizon(ts(130 * SEC)), 0);
+        assert_eq!(sm.finalized_tombstones(), 1);
+        assert!(matches!(
+            sm.handle_preaccept(doomed, doomed.0, b"key", BallotNumber(0), 0),
+            SmResponse::AlreadyDecided {
+                by: DecidedBy::Tombstone,
+                ..
+            }
+        ));
+
+        // Past it: the tombstone goes, and the floor refuses in its place.
+        assert_eq!(sm.advance_finalized_horizon(ts(200 * SEC)), 1);
+        assert_eq!(sm.finalized_tombstones(), 0);
+        assert!(matches!(
+            sm.handle_preaccept(doomed, doomed.0, b"key", BallotNumber(0), 0),
+            SmResponse::AlreadyDecided {
+                by: DecidedBy::Floor,
+                ..
+            }
+        ));
+        assert!(sm
+            .unapplied_conflicts_before(b"key", &ts(u64::MAX / 2))
+            .is_empty());
+
+        // A txn inside the new window is unaffected.
+        let fresh = txn(3, 190 * SEC);
+        assert!(matches!(
+            sm.handle_preaccept(fresh, fresh.0, b"key", BallotNumber(0), 0),
+            SmResponse::PreAcceptOK { .. }
+        ));
     }
 
     // -----------------------------------------------------------------------
