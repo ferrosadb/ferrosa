@@ -30945,6 +30945,114 @@ mod tests {
         );
     }
 
+    /// The flush expands a legacy whole-value collection cell in place
+    /// (p0-oom-audit: no copy). Index sidecars are built from the rows before
+    /// that, so an index on another column of the blob row still finds it
+    /// through the flushed sidecar, and the blob reads back as its elements.
+    #[test]
+    fn an_indexed_row_holding_a_legacy_blob_is_found_through_the_index_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "blob_indexed");
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "blob_indexed".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "items".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.ListType(\
+                                org.apache.cassandra.db.marshal.UTF8Type)"
+                        .to_string(),
+                },
+                ColumnDefinition {
+                    name: "name".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+        let row = |cells: Vec<(u16, CellValue)>, ts: i64| Row {
+            clustering: vec![],
+            cells,
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+        };
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table_with_indexes(schema, vec![("name_idx".to_string(), 1_usize)])
+            .unwrap();
+        let blob = encode_cql_sequence(&[b"a", b"b"]);
+        engine
+            .write(
+                &tid,
+                &make_key("blob"),
+                row(
+                    vec![
+                        (0, CellValue::live(blob, 1_000)),
+                        (1, CellValue::live(b"alice".to_vec(), 1_000)),
+                    ],
+                    1_000,
+                ),
+                1_000,
+            )
+            .unwrap();
+        // An element write elsewhere frames the flush complex.
+        let element = CellValue::live(b"c".to_vec(), 2_000)
+            .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0));
+        engine
+            .write(
+                &tid,
+                &make_key("elem"),
+                row(
+                    vec![(0, element), (1, CellValue::live(b"bob".to_vec(), 2_000))],
+                    2_000,
+                ),
+                2_000,
+            )
+            .unwrap();
+
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.memtable_size(&tid), 0, "served from the SSTable now");
+
+        let mut found = Vec::new();
+        engine
+            .read_by_index_each(
+                &tid,
+                "name_idx",
+                &ferrosa_index::IndexKey(b"alice".to_vec()),
+                &mut |partition| {
+                    found.push(partition);
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "the blob row must be found through the index"
+        );
+        let cells = &found[0].rows[0].cells;
+        let elements: Vec<_> = cells
+            .iter()
+            .filter(|(idx, c)| *idx == 0 && c.path.is_some() && !c.is_tombstone())
+            .map(|(_, c)| c.value.clone().unwrap())
+            .collect();
+        assert_eq!(
+            elements,
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "the blob read back expanded"
+        );
+        assert!(
+            cells
+                .iter()
+                .any(|(idx, c)| *idx == 1 && c.value.as_deref() == Some(&b"alice"[..])),
+            "the indexed cell is intact"
+        );
+    }
+
     /// A value that is NOT a well-formed collection on a list column (e.g. a
     /// graph write of a plain string) must be refused at the write, loudly,
     /// rather than stored to wedge a later flush.

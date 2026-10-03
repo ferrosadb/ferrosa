@@ -1605,7 +1605,7 @@ impl CompactionExecutor {
                 &mut writer,
                 &output_header,
                 &table_label,
-                &merged,
+                merged,
                 &mut tally,
             )?;
         }
@@ -1623,7 +1623,7 @@ impl CompactionExecutor {
                 "compaction: every partition purged away; writing one unpurged partition \
                  so the output is not empty"
             );
-            emit_partition(&mut writer, &output_header, &table_label, &kept, &mut tally)?;
+            emit_partition(&mut writer, &output_header, &table_label, kept, &mut tally)?;
         }
         if purged_markers > 0 {
             crate::metrics::add_compaction_purged_markers(purged_markers);
@@ -1926,14 +1926,16 @@ fn emit_partition(
     writer: &mut ferrosa_sstable::writer::SSTableWriter,
     header: &ferrosa_sstable::statistics::SerializationHeader,
     table: &str,
-    merged: &ferrosa_sstable::types::Partition,
+    mut merged: ferrosa_sstable::types::Partition,
     tally: &mut OutputTally,
 ) -> std::result::Result<(), String> {
     let write_start = Instant::now();
     // A legacy simple-framed input may carry whole-value collection cells that
-    // a complex-framed output cannot hold as-is.
-    let merged = &*crate::memtable::expand_collection_blobs_for_writer(merged, header, table)
+    // a complex-framed output cannot hold as-is. The merged partition is
+    // owned here, so it is expanded in place, never copied.
+    crate::memtable::expand_collection_blobs_in_place(&mut merged, header, table)
         .map_err(|e| format!("write partition: {e}"))?;
+    let merged = &merged;
     validate_partition_writable(merged, header).map_err(|e| format!("write partition: {e}"))?;
     writer
         .add_partition(merged)

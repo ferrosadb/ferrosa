@@ -4570,6 +4570,85 @@ impl<F: FlushTarget> TableStore<F> {
                 .map(|()| FlushOutcome::Published);
         }
 
+        // Everything a sidecar is built from the rows is built HERE, before
+        // the rows are encoded: encoding expands legacy whole-value collection
+        // cells in place, and the sidecars must describe the rows as the
+        // memtable held and indexed them, the same as the memtable postings.
+        //
+        // The sidecar set is exactly the indexes the TARGET catalog declares —
+        // the one the next memtable is bound to. An index DDL rotated the
+        // memtable to get here: an index it dropped gets no sidecar, and an
+        // index it added is posted now from the frozen rows, which no write
+        // can reach any more.
+        let sidecar_indexes = self.flush_sidecar_indexes(&old_indexes, target_catalog, &partitions);
+        // Serve exactly these postings for the flushing memtable until the
+        // sidecar is installed: an index the rotating DDL added now reads the
+        // frozen rows too, and one it dropped no longer answers from them.
+        let published: Arc<HashMap<String, Arc<MemtableIndex>>> =
+            Arc::new(sidecar_indexes.iter().cloned().collect());
+        // The vector indexes the target catalog declares, for the frozen rows:
+        // its own index, or one built from the rows for an index the rotating
+        // DDL added. The same map feeds the vector sidecars below.
+        let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
+            target_catalog
+                .vector_index_configs
+                .iter()
+                .map(|cfg| {
+                    let index = match old_vector_indexes.get(&cfg.index_name) {
+                        Some(index) => Arc::clone(index),
+                        None => vector_index_from_rows(cfg, &partitions),
+                    };
+                    (cfg.index_name.clone(), index)
+                })
+                .collect(),
+        );
+        sealed.postings.store(Arc::clone(&published));
+        sealed.vectors.store(Arc::clone(&flush_vector_indexes));
+        // FTI documents for the target catalog's full-text indexes, read at the
+        // ordinal the frozen rows were written with (the frozen catalog's,
+        // when it declares the index). Built before encoding, from the rows as
+        // the memtable holds them; written once the generation is known.
+        let mut fti_sidecars: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
+        for (index_name, target_pos) in &target_catalog.fulltext_indexes {
+            let col_pos = flush_catalog
+                .fulltext_indexes
+                .iter()
+                .find(|(name, _)| name == index_name)
+                .map_or(target_pos, |(_, frozen_pos)| frozen_pos);
+            let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
+            for partition in &partitions {
+                let pk_bytes = partition.key.key.as_bytes();
+                // Index ONE document PER ROW, keyed by the full primary key
+                // (partition + clustering). Indexing per-partition with the text
+                // of all rows concatenated made a hit identify only the partition,
+                // leaking non-matching clustering rows (t_da51e20c).
+                for row in &partition.rows {
+                    let mut text = String::new();
+                    for (col_idx, cell) in &row.cells {
+                        if *col_idx as usize == *col_pos {
+                            if let Some(ref val) = cell.value {
+                                if let Ok(s) = std::str::from_utf8(val) {
+                                    text.push_str(s);
+                                    text.push(' ');
+                                }
+                            }
+                        }
+                    }
+                    if !text.is_empty() {
+                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
+                            pk_bytes,
+                            &row.clustering,
+                        );
+                        fti_builder.add_document(doc_key, text.trim());
+                    }
+                }
+            }
+            fti_sidecars.push((
+                index_name.clone(),
+                fti_builder.finish().map_err(|e| e.to_string()),
+            ));
+        }
+
         let header = flush::header_for_flush(&schema, &partitions);
         let staged_output = self.flush_target.file_output_staging_dir()?;
         let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
@@ -4579,9 +4658,14 @@ impl<F: FlushTarget> TableStore<F> {
         };
         let phase_start = Instant::now();
         let table_label = format!("{}.{}", schema.keyspace, schema.table);
-        for p in &partitions {
-            let p = crate::memtable::expand_collection_blobs_for_writer(p, &header, &table_label)?;
-            writer.add_partition(&p)?;
+        // The partitions are owned, so a legacy whole-value collection cell is
+        // expanded in place. The late-writer check below knows which ones.
+        let mut expanded_keys = std::collections::BTreeSet::new();
+        for p in partitions.iter_mut() {
+            if crate::memtable::expand_collection_blobs_in_place(p, &header, &table_label)? {
+                expanded_keys.insert(p.key.clone());
+            }
+            writer.add_partition(p)?;
         }
         let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
             let output = writer.finish_to_directory_deferred_sync(staging_dir)?;
@@ -4661,30 +4745,6 @@ impl<F: FlushTarget> TableStore<F> {
         // memtable to get here: an index it dropped gets no sidecar, and an
         // index it added is posted now from the frozen rows, which no write
         // can reach any more.
-        let sidecar_indexes = self.flush_sidecar_indexes(&old_indexes, target_catalog, &partitions);
-        // Serve exactly these postings for the flushing memtable until the
-        // sidecar is installed: an index the rotating DDL added now reads the
-        // frozen rows too, and one it dropped no longer answers from them.
-        let published: Arc<HashMap<String, Arc<MemtableIndex>>> =
-            Arc::new(sidecar_indexes.iter().cloned().collect());
-        // The vector indexes the target catalog declares, for the frozen rows:
-        // its own index, or one built from the rows for an index the rotating
-        // DDL added. The same map feeds the vector sidecars below.
-        let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
-            target_catalog
-                .vector_index_configs
-                .iter()
-                .map(|cfg| {
-                    let index = match old_vector_indexes.get(&cfg.index_name) {
-                        Some(index) => Arc::clone(index),
-                        None => vector_index_from_rows(cfg, &partitions),
-                    };
-                    (cfg.index_name.clone(), index)
-                })
-                .collect(),
-        );
-        sealed.postings.store(Arc::clone(&published));
-        sealed.vectors.store(Arc::clone(&flush_vector_indexes));
         let pinned_indexes: Vec<(&str, crate::memtable::index::IndexSnapshot)> = sidecar_indexes
             .iter()
             .map(|(index_name, memtable_idx)| (index_name.as_str(), memtable_idx.pin()))
@@ -4749,48 +4809,13 @@ impl<F: FlushTarget> TableStore<F> {
             };
         drop(sidecar_sources);
 
-        // Step 5c: Build FTI sidecar files for the target catalog's full-text
-        // indexes, reading each column at the ordinal the frozen rows were
-        // written with (the frozen catalog's, when it declares the index).
-        for (index_name, target_pos) in &target_catalog.fulltext_indexes {
-            let col_pos = flush_catalog
-                .fulltext_indexes
-                .iter()
-                .find(|(name, _)| name == index_name)
-                .map_or(target_pos, |(_, frozen_pos)| frozen_pos);
-            let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
-            for partition in &partitions {
-                let pk_bytes = partition.key.key.as_bytes();
-                // Index ONE document PER ROW, keyed by the full primary key
-                // (partition + clustering). Indexing per-partition with the text
-                // of all rows concatenated made a hit identify only the partition,
-                // leaking non-matching clustering rows (t_da51e20c).
-                for row in &partition.rows {
-                    let mut text = String::new();
-                    for (col_idx, cell) in &row.cells {
-                        if *col_idx as usize == *col_pos {
-                            if let Some(ref val) = cell.value {
-                                if let Ok(s) = std::str::from_utf8(val) {
-                                    text.push_str(s);
-                                    text.push(' ');
-                                }
-                            }
-                        }
-                    }
-                    if !text.is_empty() {
-                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
-                            pk_bytes,
-                            &row.clustering,
-                        );
-                        fti_builder.add_document(doc_key, text.trim());
-                    }
-                }
-            }
-            match fti_builder.finish() {
+        // Step 5c: Write the FTI sidecars built before the rows were encoded.
+        for (index_name, built) in fti_sidecars {
+            match built {
                 Ok(fti_bytes) => {
-                    if let Err(e) = self
-                        .flush_target
-                        .write_fti_sidecar(gen, index_name, &fti_bytes)
+                    if let Err(e) =
+                        self.flush_target
+                            .write_fti_sidecar(gen, &index_name, &fti_bytes)
                     {
                         tracing::error!(%e, %index_name, gen, "store: FTI sidecar write failed");
                     }
@@ -4941,7 +4966,7 @@ impl<F: FlushTarget> TableStore<F> {
             let flushed_by_key: std::collections::BTreeMap<_, _> =
                 partitions.iter().map(|p| (p.key.clone(), p)).collect();
             for p in &late_partitions {
-                if late_partition_needs_replay(&flushed_by_key, p) {
+                if late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
                     // The sealed gate makes this impossible: a write after the
                     // snapshot means admission is broken. Keep the rows (replay
                     // them into the new memtable), and say so loudly — their
@@ -5039,7 +5064,7 @@ impl<F: FlushTarget> TableStore<F> {
         // `schema` is the one captured at the memtable swap (owned, Send+Sync),
         // so the encode closures share it across the rayon pool and a
         // concurrent ALTER cannot change the layout mid-flush.
-        let shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
+        let mut shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
 
         // Stage directories before entering Rayon: the target need not be Sync.
         // Guards outlive all parallel writers and remove incomplete or unpublished
@@ -5066,37 +5091,51 @@ impl<F: FlushTarget> TableStore<F> {
             .collect::<Result<_>>()?;
         let phase_start = Instant::now();
         let table_label = format!("{}.{}", schema.keyspace, schema.table);
-        let outputs: Vec<ShardOutput> = crate::flush_executor::pool()?.install(|| {
-            shards
-                .par_iter()
-                .zip(staging.par_iter())
-                .map(|(shard, stage)| {
-                    let header = flush::header_for_flush(&schema, shard);
-                    let mut writer = match &stage.0 {
-                        Some(dir) => SSTableWriter::new_file_backed(
-                            options.clone(),
-                            header.clone(),
-                            dir.join("Data.db"),
-                        )?,
-                        None => SSTableWriter::new(options.clone(), header.clone()),
-                    };
-                    for partition in shard {
-                        let partition = crate::memtable::expand_collection_blobs_for_writer(
-                            partition,
-                            &header,
-                            &table_label,
-                        )?;
-                        writer.add_partition(&partition)?;
-                    }
-                    match &stage.0 {
-                        Some(dir) => writer
-                            .finish_to_directory_deferred_sync(dir)
-                            .map(ShardOutput::Files),
-                        None => writer.finish().map(ShardOutput::Memory),
-                    }
-                })
-                .collect::<Result<_>>()
-        })?;
+        // Each shard is owned, so a legacy whole-value collection cell is
+        // expanded in place; the keys that were expanded go to the late-writer
+        // check below.
+        let encoded: Vec<(ShardOutput, Vec<DecoratedKey>)> = crate::flush_executor::pool()?
+            .install(|| {
+                shards
+                    .par_iter_mut()
+                    .zip(staging.par_iter())
+                    .map(|(shard, stage)| {
+                        let header = flush::header_for_flush(&schema, shard);
+                        let mut writer = match &stage.0 {
+                            Some(dir) => SSTableWriter::new_file_backed(
+                                options.clone(),
+                                header.clone(),
+                                dir.join("Data.db"),
+                            )?,
+                            None => SSTableWriter::new(options.clone(), header.clone()),
+                        };
+                        let mut expanded = Vec::new();
+                        for partition in shard.iter_mut() {
+                            if crate::memtable::expand_collection_blobs_in_place(
+                                partition,
+                                &header,
+                                &table_label,
+                            )? {
+                                expanded.push(partition.key.clone());
+                            }
+                            writer.add_partition(partition)?;
+                        }
+                        let output = match &stage.0 {
+                            Some(dir) => writer
+                                .finish_to_directory_deferred_sync(dir)
+                                .map(ShardOutput::Files),
+                            None => writer.finish().map(ShardOutput::Memory),
+                        }?;
+                        Ok((output, expanded))
+                    })
+                    .collect::<Result<_>>()
+            })?;
+        let mut expanded_keys = std::collections::BTreeSet::new();
+        let mut outputs: Vec<ShardOutput> = Vec::with_capacity(encoded.len());
+        for (output, expanded) in encoded {
+            outputs.push(output);
+            expanded_keys.extend(expanded);
+        }
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::EncodeSstable,
             phase_start.elapsed(),
@@ -5164,7 +5203,7 @@ impl<F: FlushTarget> TableStore<F> {
         if !late_partitions.is_empty() {
             let current_view = self.view.load();
             for p in &late_partitions {
-                if late_partition_needs_replay(&flushed_by_key, p) {
+                if late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
                     // Impossible behind the sealed gate; see the unsharded path.
                     self.late_writes_after_seal
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9305,12 +9344,43 @@ fn time_series_row_timestamp(
 
 fn late_partition_needs_replay(
     flushed_by_key: &std::collections::BTreeMap<ferrosa_common::key::DecoratedKey, &Partition>,
+    expanded: &std::collections::BTreeSet<ferrosa_common::key::DecoratedKey>,
     late_partition: &Partition,
 ) -> bool {
     match flushed_by_key.get(&late_partition.key) {
         None => true,
+        // The flush expanded this partition's whole-value collection cells in
+        // place, so its cells differ from the memtable's by design. A late
+        // write would still add a row or a newer timestamp: compare those.
+        Some(flushed_partition) if expanded.contains(&late_partition.key) => {
+            !same_rows_and_timestamps(flushed_partition, late_partition)
+        }
         Some(flushed_partition) => *flushed_partition != late_partition,
     }
+}
+
+/// Whether two images of one partition hold the same rows with the same
+/// deletions and newest timestamps, whatever their collection cells' layout.
+/// Expanding a whole-value collection keeps each row's clustering, deletion,
+/// liveness and newest cell timestamp (the sentinel it adds is one older).
+fn same_rows_and_timestamps(a: &Partition, b: &Partition) -> bool {
+    fn newest(row: &Row) -> Option<i64> {
+        row.cells.iter().map(|(_, cell)| cell.timestamp).max()
+    }
+    fn same_row(a: &Row, b: &Row) -> bool {
+        a.clustering == b.clustering
+            && a.deletion == b.deletion
+            && a.primary_key_liveness == b.primary_key_liveness
+            && newest(a) == newest(b)
+    }
+    a.deletion == b.deletion
+        && a.rows.len() == b.rows.len()
+        && a.rows.iter().zip(&b.rows).all(|(x, y)| same_row(x, y))
+        && match (&a.static_row, &b.static_row) {
+            (Some(x), Some(y)) => same_row(x, y),
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 #[cfg(test)]
@@ -12331,7 +12401,7 @@ mod tests {
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
 
         assert!(
-            late_partition_needs_replay(&flushed_by_key, &late_same_key),
+            late_partition_needs_replay(&flushed_by_key, &Default::default(), &late_same_key),
             "late writes that add rows to an existing partition must be replayed"
         );
     }
@@ -12348,7 +12418,7 @@ mod tests {
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
 
         assert!(
-            !late_partition_needs_replay(&flushed_by_key, &flushed),
+            !late_partition_needs_replay(&flushed_by_key, &Default::default(), &flushed),
             "unchanged partitions should not be replayed into the new active memtable"
         );
     }
