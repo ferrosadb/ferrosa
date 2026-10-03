@@ -1123,12 +1123,9 @@ mod tests {
         let metrics = Arc::new(super::metrics::ReadRepairMetrics::new());
         let handler = super::RepairWriteHandler::new(storage.clone(), metrics.clone());
 
-        let mutation =
-            super::read::read_repair_mutation(&fx::table_id(), &fx::source_partition()).unwrap();
+        let body = super::read::read_repair_body(&fx::table_id(), &fx::source_partition()).unwrap();
         let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
-        handler
-            .handle(peer_id, Message::RepairWrite(encode_mutation(&mutation)))
-            .await;
+        handler.handle(peer_id, Message::RepairWrite(body)).await;
 
         assert_eq!(
             metrics

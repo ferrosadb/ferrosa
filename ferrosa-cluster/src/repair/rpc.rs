@@ -280,16 +280,11 @@ impl RpcHandler for RepairApplyHandler {
             }
         };
         let table_id = TableId::new(&req.keyspace, &req.table);
-        let partitions: Vec<Partition> = req
-            .partitions
-            .into_iter()
-            .map(partition_from_wire)
-            .collect();
         let mut applied: u64 = 0;
         let mut last_err: Option<String> = None;
         // The whole partition — deletion, static row and rows. `PartitionWire`
         // carries all three; writing rows alone dropped the other two (P0-3).
-        for partition in &partitions {
+        for partition in req.partitions.into_iter().map(partition_from_wire) {
             match self.storage.apply_partition(&table_id, partition) {
                 Ok(written) => applied += written as u64,
                 Err(e) => {

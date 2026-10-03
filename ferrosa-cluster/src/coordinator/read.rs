@@ -48,7 +48,6 @@ use std::collections::BTreeMap;
 
 use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
-use crate::pair::coordinator::encode_mutation;
 use crate::raft::handlers::{
     partition_from_wire, FulltextSearchRequestPayload, FulltextSearchResponsePayload,
     IndexReadInPartitionRequestPayload, IndexReadResponsePayload,
@@ -2198,25 +2197,38 @@ use ferrosa_net::peer::PeerManager;
 
 use super::metrics::ReadRepairMetrics;
 
-/// The `RepairWrite` mutation for `partition`: its partition deletion, static
-/// row and clustered rows, as the rows the write path accepts (see
-/// [`ferrosa_storage::partition_apply`]). The `Mutation` wire format is
-/// unchanged. A receiver that predates the static-row marker rejects that row
-/// with a clustering-shape error instead of storing or dropping it silently.
-pub(crate) fn read_repair_mutation(
+/// The `RepairWrite` body for `partition`: a `Mutation` of its partition
+/// deletion, static row and clustered rows, as the rows the write path accepts
+/// (see [`ferrosa_storage::partition_apply`]). Encoded from the borrowed
+/// partition, because the read result keeps it; no row is copied. The
+/// `Mutation` wire format is unchanged. A receiver that predates the
+/// static-row marker rejects that row with a clustering-shape error instead of
+/// storing or dropping it silently.
+pub(crate) fn read_repair_body(
     table_id: &TableId,
     partition: &Partition,
-) -> ferrosa_common::Result<Mutation> {
-    // A Mutation owns its rows, so this one collect is the message itself.
-    let rows: Vec<_> = ferrosa_storage::partition_apply::partition_rows(partition)?.collect();
-    let newest = ferrosa_storage::partition_apply::partition_write_timestamp(partition);
-    Ok(Mutation::new(
-        table_id.keyspace.clone(),
-        table_id.table.clone(),
-        partition.key.clone(),
-        rows,
+) -> ferrosa_common::Result<Bytes> {
+    use ferrosa_storage::partition_apply::{
+        deletion_marker, partition_write_timestamp, static_row_marker,
+    };
+    let deletion = deletion_marker(partition.deletion);
+    let static_marker = static_row_marker(&partition.key, partition.static_row.as_ref())?;
+    let rows: Vec<&ferrosa_sstable::types::Row> = deletion
+        .iter()
+        .chain(static_marker)
+        .chain(partition.rows.iter())
+        .collect();
+    let newest = partition_write_timestamp(partition);
+    let body = Mutation::serialize_borrowed_rows(
+        uuid::Uuid::new_v4().into_bytes(),
+        &table_id.keyspace,
+        &table_id.table,
+        &partition.key,
         if newest == i64::MIN { 0 } else { newest },
-    ))
+        &rows,
+    )
+    .map_err(|e| ferrosa_common::Error::InvalidData(format!("read repair mutation: {e}")))?;
+    Ok(Bytes::from(body))
 }
 
 /// Send repair writes to stale replicas.
@@ -2233,8 +2245,8 @@ async fn send_repair_writes(
     partition: &Partition,
     stale_host_ids: &[uuid::Uuid],
 ) {
-    let mutation = match read_repair_mutation(table_id, partition) {
-        Ok(mutation) => mutation,
+    let body = match read_repair_body(table_id, partition) {
+        Ok(body) => body,
         Err(e) => {
             tracing::error!(
                 table = %table_id,
@@ -2250,12 +2262,17 @@ async fn send_repair_writes(
             return;
         }
     };
-    let body = encode_mutation(&mutation);
 
     for &host_id in stale_host_ids {
         metrics.inc_attempted();
         if Some(host_id) == local_host_id {
-            if let Err(e) = storage.apply_partition(table_id, partition) {
+            // Apply exactly what a remote replica applies: the decoded body.
+            let applied = crate::pair::coordinator::decode_mutation(&body).and_then(|m| {
+                storage
+                    .apply_partition_rows(table_id, &m.key, m.rows)
+                    .map_err(|e| ClusterError::Internal(format!("local read repair write: {e}")))
+            });
+            if let Err(e) = applied {
                 tracing::warn!(
                     %host_id,
                     table = %table_id,

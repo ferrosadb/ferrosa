@@ -68,7 +68,7 @@ struct StreamedPartitionV1 {
 /// storing the rows and silently dropping the static row and partition
 /// deletion. No legacy payload can start with these bytes, because 0xF5 is
 /// not a valid cell tag, so detection is unambiguous.
-fn streamed_partition_prefix() -> Vec<u8> {
+fn envelope_prefix() -> Vec<u8> {
     let mut prefix = Vec::with_capacity(64);
     // Writing into a Vec cannot fail; the expects document that.
     bincode::serialize_into(&mut prefix, &1u64).expect("Vec write");
@@ -106,7 +106,7 @@ fn streamed_rows(rows: Vec<crate::raft::handlers::RowWire>) -> StreamedRows {
 /// built before the envelope. Anything else uses the version-1 envelope,
 /// which such a node refuses with a decode error: it opens with a decoy legacy
 /// row whose first cell tag is [`STREAMED_PARTITION_TAG`].
-pub fn encode_streamed_partition(
+pub fn encode_partition_envelope(
     partition: &ferrosa_sstable::types::Partition,
 ) -> Result<Vec<u8>, bincode::Error> {
     use crate::raft::handlers::RowWire;
@@ -119,7 +119,7 @@ pub fn encode_streamed_partition(
         static_row: partition.static_row.clone().map(RowWire::from),
         rows,
     };
-    let mut out = streamed_partition_prefix();
+    let mut out = envelope_prefix();
     out.push(STREAMED_PARTITION_VERSION);
     bincode::serialize_into(&mut out, &body)?;
     Ok(out)
@@ -127,10 +127,10 @@ pub fn encode_streamed_partition(
 
 /// Decode a [`StreamedMutation::row`] in either format. Unknown envelope
 /// versions and bytes that decode as neither format are errors.
-pub fn decode_streamed_partition(bytes: &[u8]) -> Result<StreamedPartition, String> {
+pub fn decode_partition_envelope(bytes: &[u8]) -> Result<StreamedPartition, String> {
     use crate::raft::handlers::RowWire;
     use bincode::Options;
-    let prefix = streamed_partition_prefix();
+    let prefix = envelope_prefix();
     let Some(rest) = bytes.strip_prefix(prefix.as_slice()) else {
         let rows: Vec<RowWire> = bincode::deserialize(bytes)
             .map_err(|e| format!("do not decode as Vec<RowWire>: {e}"))?;
@@ -171,7 +171,7 @@ impl StreamedMutation {
         table: &str,
         partition: &ferrosa_sstable::types::Partition,
     ) -> Result<Self, bincode::Error> {
-        let row = encode_streamed_partition(partition)?;
+        let row = encode_partition_envelope(partition)?;
         let newest = ferrosa_storage::partition_apply::partition_write_timestamp(partition);
         Ok(Self {
             keyspace: keyspace.to_string(),
@@ -433,7 +433,7 @@ mod tests {
     fn envelope_round_trips_static_row_and_partition_deletion() {
         let deleted = ferrosa_sstable::types::DeletionTime::new(500, 1_700_000_000);
         let p = partition_with(deleted, Some(static_row()));
-        let decoded = decode_streamed_partition(&encode_streamed_partition(&p).unwrap()).unwrap();
+        let decoded = decode_partition_envelope(&encode_partition_envelope(&p).unwrap()).unwrap();
         assert_eq!(decoded.deletion, p.deletion);
         assert_eq!(decoded.static_row, p.static_row);
         assert_eq!(decoded.rows.collect::<Vec<_>>(), p.rows);
@@ -452,7 +452,7 @@ mod tests {
                 Some(static_row()),
             ),
         ] {
-            let bytes = encode_streamed_partition(&p).unwrap();
+            let bytes = encode_partition_envelope(&p).unwrap();
             let err = bincode::deserialize::<Vec<frozen_v0::RowWire>>(&bytes).unwrap_err();
             assert!(
                 matches!(
@@ -470,7 +470,7 @@ mod tests {
     fn complex_cell_receiver_rejects_envelope_with_typed_error() {
         use crate::raft::handlers::RowWire;
         let deleted = ferrosa_sstable::types::DeletionTime::new(500, 1_700_000_000);
-        let bytes = encode_streamed_partition(&partition_with(deleted, None)).unwrap();
+        let bytes = encode_partition_envelope(&partition_with(deleted, None)).unwrap();
         let err = bincode::deserialize::<Vec<RowWire>>(&bytes).unwrap_err();
         assert!(
             err.to_string().contains("unknown leading tag 245"),
@@ -485,7 +485,7 @@ mod tests {
     fn plain_partition_keeps_legacy_bytes_both_directions() {
         use crate::raft::handlers::RowWire;
         let p = partition_with(ferrosa_sstable::types::DeletionTime::LIVE, None);
-        let bytes = encode_streamed_partition(&p).unwrap();
+        let bytes = encode_partition_envelope(&p).unwrap();
         let legacy: Vec<RowWire> = p.rows.iter().cloned().map(RowWire::from).collect();
         assert_eq!(bytes, bincode::serialize(&legacy).unwrap());
         let old: Vec<frozen_v0::RowWire> = bincode::deserialize(&bytes).unwrap();
@@ -512,7 +512,7 @@ mod tests {
                 local_deletion_time: i32::MAX,
             },
         }];
-        let decoded = decode_streamed_partition(&bincode::serialize(&frozen).unwrap()).unwrap();
+        let decoded = decode_partition_envelope(&bincode::serialize(&frozen).unwrap()).unwrap();
         assert!(decoded.deletion.is_live());
         assert_eq!(decoded.static_row, None);
         assert_eq!(decoded.rows.collect::<Vec<_>>(), p.rows);
@@ -522,10 +522,10 @@ mod tests {
     #[test]
     fn unknown_envelope_version_is_refused() {
         let deleted = ferrosa_sstable::types::DeletionTime::new(500, 1_700_000_000);
-        let mut bytes = encode_streamed_partition(&partition_with(deleted, None)).unwrap();
-        let version_at = streamed_partition_prefix().len();
+        let mut bytes = encode_partition_envelope(&partition_with(deleted, None)).unwrap();
+        let version_at = envelope_prefix().len();
         bytes[version_at] = STREAMED_PARTITION_VERSION + 1;
-        let Err(err) = decode_streamed_partition(&bytes) else {
+        let Err(err) = decode_partition_envelope(&bytes) else {
             panic!("an unknown envelope version must be refused");
         };
         assert!(err.contains("version 2 is not supported"), "{err}");

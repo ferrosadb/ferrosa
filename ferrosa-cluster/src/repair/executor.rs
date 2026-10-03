@@ -222,7 +222,7 @@ impl RepairStore for StorageEngineRepairStore {
                 // data on the repaired replica (P0-3).
                 for partition in parts {
                     engine
-                        .apply_partition(&table, &partition)
+                        .apply_partition(&table, partition)
                         .map_err(|e| format!("apply write: {e}"))?;
                 }
                 Ok(())

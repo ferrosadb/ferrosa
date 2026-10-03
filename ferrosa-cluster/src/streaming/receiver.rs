@@ -236,7 +236,7 @@ impl StreamSession {
                     &table_id,
                     &key,
                     streamed.deletion,
-                    streamed.static_row.as_ref(),
+                    streamed.static_row,
                     streamed.rows,
                 )
                 .map_err(|e| {
@@ -265,7 +265,7 @@ impl StreamSession {
 }
 
 /// Decode a streamed partition (legacy `Vec<RowWire>` or the versioned
-/// envelope, see [`super::decode_streamed_partition`]). Its clustered rows are
+/// envelope, see [`super::decode_partition_envelope`]). Its clustered rows are
 /// yielded one at a time, never collected into a second vector.
 ///
 /// Bytes that do not decode are refused: this used to store the raw bytes as
@@ -273,7 +273,7 @@ impl StreamSession {
 /// streams"), so a corrupt or truncated payload -- or a sender's
 /// `unwrap_or_default()` empty encoding -- became a plausible-looking row.
 fn decode_partition_payload(mutation: &StreamedMutation) -> Result<super::StreamedPartition> {
-    super::decode_streamed_partition(&mutation.row).map_err(|e| {
+    super::decode_partition_envelope(&mutation.row).map_err(|e| {
         ClusterError::Internal(format!(
             "stream: rows for {}.{} partition {:02x?} ({} bytes) {e}; refusing to store them",
             mutation.keyspace,
