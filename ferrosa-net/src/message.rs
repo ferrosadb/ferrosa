@@ -277,6 +277,10 @@ pub enum Message {
     PairBatchForward(Bytes),
     /// Acknowledgment for a [`PairBatchForward`](Self::PairBatchForward).
     PairBatchAck(Bytes),
+    /// Operator downgrade phase 1 (opaque payload owned by ferrosa-cluster).
+    PairDissolve(Bytes),
+    /// Reply to [`PairDissolve`](Self::PairDissolve).
+    PairDissolveAck(Bytes),
 
     // Batchlog
     /// Batchlog write request (serialized BatchlogEntry).
@@ -414,6 +418,8 @@ impl Message {
             Self::PairDdlAck(_) => MsgType::PairDdlAck,
             Self::PairBatchForward(_) => MsgType::PairBatchForward,
             Self::PairBatchAck(_) => MsgType::PairBatchAck,
+            Self::PairDissolve(_) => MsgType::PairDissolve,
+            Self::PairDissolveAck(_) => MsgType::PairDissolveAck,
             Self::BatchlogWrite(_) => MsgType::BatchlogWrite,
             Self::BatchlogDelete(_) => MsgType::BatchlogDelete,
             Self::BatchlogReplay(_) => MsgType::BatchlogReplay,
@@ -585,6 +591,8 @@ impl Message {
             | Self::PairDdlAck(b)
             | Self::PairBatchForward(b)
             | Self::PairBatchAck(b)
+            | Self::PairDissolve(b)
+            | Self::PairDissolveAck(b)
             | Self::BatchlogWrite(b)
             | Self::BatchlogDelete(b)
             | Self::BatchlogReplay(b)
@@ -835,6 +843,8 @@ impl Message {
             MsgType::PairDdlAck => Self::PairDdlAck(body.split_to(body.remaining())),
             MsgType::PairBatchForward => Self::PairBatchForward(body.split_to(body.remaining())),
             MsgType::PairBatchAck => Self::PairBatchAck(body.split_to(body.remaining())),
+            MsgType::PairDissolve => Self::PairDissolve(body.split_to(body.remaining())),
+            MsgType::PairDissolveAck => Self::PairDissolveAck(body.split_to(body.remaining())),
             MsgType::BatchlogWrite => Self::BatchlogWrite(body.split_to(body.remaining())),
             MsgType::BatchlogDelete => Self::BatchlogDelete(body.split_to(body.remaining())),
             MsgType::BatchlogReplay => Self::BatchlogReplay(body.split_to(body.remaining())),
@@ -1144,6 +1154,33 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::PairCatchUp, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    /// t_47bbeb66: the downgrade's phase-1 request and reply survive the wire,
+    /// are typed by their own byte, and are only advertised as a capability.
+    #[test]
+    fn pair_dissolve_roundtrip() {
+        let variants = [
+            (
+                MsgType::PairDissolve,
+                Message::PairDissolve(Bytes::from_static(b"request")),
+            ),
+            (
+                MsgType::PairDissolveAck,
+                Message::PairDissolveAck(Bytes::from_static(b"reply")),
+            ),
+        ];
+        for (ty, msg) in variants {
+            assert_eq!(msg.msg_type(), ty);
+            assert_eq!(MsgType::try_from(ty as u8).unwrap(), ty);
+            let mut buf = BytesMut::new();
+            msg.encode(&mut buf).unwrap();
+            assert_eq!(Message::decode(ty, &mut buf.freeze()).unwrap(), msg);
+        }
+        assert_ne!(
+            crate::handshake::LOCAL_CAPABILITIES & crate::handshake::CAP_PAIR_DISSOLVE,
+            0
+        );
     }
 
     #[test]

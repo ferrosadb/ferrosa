@@ -58,6 +58,8 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   sending it on the peer's bit, because an older node drops the whole connection
   on an unknown type byte. Bits: `CAP_RPC_ERROR_REPLY` (1<<0) — the peer
   understands error-reply frames (`FLAG_RPC_ERROR`); `CAP_RESULT_CURSOR_PAGE`
+  `CAP_PAIR_DISSOLVE` gates `PairDissolve` / `PairDissolveAck` (0x4A/0x4B),
+  phase 1 of the operator downgrade from cluster to pair (t_47bbeb66).
   (1<<1) — the peer serves `ResultCursorPage` (`0x68`) /
   `ResultCursorPageReply` (`0x69`), opaque ferrosa-cql payloads forwarding a CQL
   result cursor's next page to the node that owns it.

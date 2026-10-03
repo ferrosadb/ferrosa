@@ -362,8 +362,13 @@ early acknowledgement.
 - `ModeController::downgrade_to_pair(Some(peer))` — operator downgrade, with
   friction by design (t_ad872ac7): accepted only after a node was taken down,
   i.e. every ring member other than this node and the named, connected peer is
-  down. It then STOPS this node's Raft group(s) and installs the pair path.
-  Every shortcut is refused (CL-42). The member taken down must stay down.
+  down, and only if those downed members are a Raft-voter MINORITY. Two-phase
+  and fenced (t_47bbeb66, `controller/dissolution.rs`): the peer durably
+  records `dissolved-into-pair.json` and stops its Raft group first
+  (`PairDissolve`), then this node does the same and installs the pair path.
+  A node holding the marker never starts Raft, restarts `Standalone` rather
+  than as a returning member, and admits only its partner as a peer, so the
+  members taken down can never re-form the old cluster (CL-42, CL-45).
 
 ### Accord transactions (`accord/`)
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →

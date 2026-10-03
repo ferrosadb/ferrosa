@@ -1902,23 +1902,16 @@ mod tests {
         mc.set_token_ring(std::sync::Arc::new(ring));
     }
 
-    /// A committed cluster member WITH a connected peer is downgraded by the
-    /// endpoint, and the node really moves -- not just the response string.
-    ///
-    /// The refusal case is the easy half. This is the one that catches a
-    /// "declare pair, install nothing" implementation: it asserts the status,
-    /// the mode the node reports, and that the pair machinery is actually in
-    /// place, which is what the automatic state machine refuses to do without
-    /// an operator.
+    /// A committed cluster member with a connected peer and a member down, but
+    /// no running Raft group, is refused with 409 and left untouched: the
+    /// downgrade must check the voter majority and have the peer leave Raft
+    /// first (t_47bbeb66). The accepted path, with real Raft on both pair
+    /// nodes and the pair machinery asserted, is
+    /// `ferrosa-cluster/tests/pair_downgrade_fence.rs`.
     #[tokio::test]
-    async fn api_downgrade_to_pair_succeeds_for_a_cluster_member_with_a_peer() {
+    async fn api_downgrade_to_pair_returns_409_without_a_running_raft_group() {
         let state = make_state_in_cluster_with_peer();
         let mc = state.mode_controller.clone();
-        assert_eq!(
-            mc.mode(),
-            ferrosa_common::deployment_mode::DeploymentMode::Cluster,
-            "precondition: the node starts as a committed cluster member"
-        );
         let peer = uuid::Uuid::from_u128(mc.host_id().as_u128() - 1);
 
         let router = crate::web::build_router(state);
@@ -1929,49 +1922,17 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
 
-        assert_eq!(
-            resp.status(),
-            axum::http::StatusCode::OK,
-            "an operator downgrade with a peer connected must succeed"
-        );
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["status"], "downgraded to pair mode");
-        assert_eq!(parsed["mode"], "pair");
-        assert!(
-            parsed["peer"].as_str().is_some_and(|p| !p.is_empty()),
-            "the response must name the replication target"
-        );
-        assert!(
-            parsed["warning"]
-                .as_str()
-                .is_some_and(|w| w.contains("no longer commits through Raft")),
-            "the response must state the guarantee that changed, got: {}",
-            parsed["warning"]
-        );
-
-        // The MODE moved, and the pair machinery came with it.
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(error.contains("no Raft group running"), "{error}");
         assert_eq!(
             mc.mode(),
-            ferrosa_common::deployment_mode::DeploymentMode::Pair,
-            "the endpoint must actually move the node's mode"
-        );
-        // `role` comes from `pair_context`, which ONLY the machinery installs.
-        // This is the assertion that fails for a shortcut that sets the mode and
-        // returns early -- verified by red probe.
-        assert_eq!(
-            mc.role().map(|r| r.to_string()).as_deref(),
-            Some("secondary"),
-            "the pair machinery (pair_context) must be installed, not just the mode; \
-             a node reporting pair with no role is the 'declare pair, install \
-             nothing' bug"
-        );
-        assert_eq!(
-            mc.ddl_path_kind(),
-            "pair",
-            "the DDL path must be the pair path, not left on the cluster/direct path"
+            ferrosa_common::deployment_mode::DeploymentMode::Cluster,
+            "a refused downgrade must leave the node untouched"
         );
     }
 
