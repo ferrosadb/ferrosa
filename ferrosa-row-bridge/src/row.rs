@@ -150,6 +150,7 @@ where
         storage_to_table,
         now_secs,
         partition_key: partition.key.key.as_bytes(),
+        static_row: partition.static_row.as_ref(),
     };
 
     for row in &partition.rows {
@@ -185,7 +186,12 @@ pub fn consume_partition_rows_with_clustering<F>(
 where
     F: FnMut(&[u8], Vec<u8>, Vec<Option<CqlValue>>) -> ControlFlow<()>,
 {
-    let Partition { key, rows, .. } = partition;
+    let Partition {
+        key,
+        rows,
+        static_row,
+        ..
+    } = partition;
     let now_secs = read_now_secs();
     let pk_values = decode_pk(&key, pk_columns.len());
     let decode_context = RowDecodeContext {
@@ -197,6 +203,7 @@ where
         storage_to_table,
         now_secs,
         partition_key: key.key.as_bytes(),
+        static_row: static_row.as_ref(),
     };
 
     {
@@ -264,6 +271,10 @@ struct RowDecodeContext<'a> {
     storage_to_table: &'a [usize],
     now_secs: i32,
     partition_key: &'a [u8],
+    /// The partition's static row. Its cells (static ordinals) are part of
+    /// every clustered row a reader sees (Cassandra semantics); a flush moves
+    /// static cells here from the clustered rows they were written with.
+    static_row: Option<&'a Row>,
 }
 
 impl RowDecodeContext<'_> {
@@ -332,7 +343,15 @@ fn decode_output_row(
     // collection value — not decoded cell-by-cell as if each were the column.
     let mut cells_by_col: std::collections::BTreeMap<usize, Vec<&CellValue>> =
         std::collections::BTreeMap::new();
-    for (col_index, cell) in &row.cells {
+    let overlaid;
+    let cells: &mut dyn Iterator<Item = (&u16, &CellValue)> = match context.static_row {
+        Some(static_row) if !static_row.cells.is_empty() => {
+            overlaid = overlay_static_cells(static_row, row);
+            &mut overlaid.iter().map(|((idx, _), cell)| (idx, *cell))
+        }
+        _ => &mut row.cells.iter().map(|(idx, cell)| (idx, cell)),
+    };
+    for (col_index, cell) in cells {
         let storage_idx = *col_index as usize;
         let table_idx = match context.storage_to_table.get(storage_idx) {
             Some(&idx) => idx,
@@ -364,6 +383,26 @@ fn decode_output_row(
     }
 
     Ok(output_row)
+}
+
+/// `row`'s cells overlaid on the partition's static cells, keyed by
+/// `(ordinal, path)`: where both hold the same cell, the storage engine's
+/// last-write-wins picks it. Borrows every cell; nothing is copied.
+pub fn overlay_static_cells<'a>(
+    static_row: &'a Row,
+    row: &'a Row,
+) -> std::collections::BTreeMap<(u16, Option<&'a [u8]>), &'a CellValue> {
+    let mut cells: std::collections::BTreeMap<(u16, Option<&'a [u8]>), &'a CellValue> =
+        std::collections::BTreeMap::new();
+    for (idx, cell) in static_row.cells.iter().chain(row.cells.iter()) {
+        let key = (*idx, cell.path.as_deref());
+        let winner = match cells.get(&key) {
+            Some(existing) => ferrosa_common::reconcile_ref(existing, cell),
+            None => cell,
+        };
+        cells.insert(key, winner);
+    }
+    cells
 }
 
 /// Decompose a storage `Partition` into raw per-column byte slices, invoking
@@ -686,6 +725,41 @@ mod tests {
             static_row: None,
             rows: vec![row],
         }
+    }
+
+    /// A partition's static row is part of every clustered row a reader sees;
+    /// where a row also holds the static cell, the newer one wins.
+    #[test]
+    fn static_row_cells_are_overlaid_on_every_row() {
+        let mut partition = single_row_partition(vec![(1, CellValue::live(b"a1".to_vec(), 10))]);
+        let mut second = partition.rows[0].clone();
+        second.clustering = vec![1];
+        second.cells = vec![
+            (0, CellValue::live(b"row-old".to_vec(), 5)),
+            (1, CellValue::live(b"a2".to_vec(), 10)),
+        ];
+        partition.rows[0].clustering = vec![0];
+        partition.rows.push(second);
+        partition.static_row = Some(Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"static".to_vec(), 20))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        });
+        let rows = partition_to_rows(
+            &partition,
+            &["id".into(), "s".into(), "a".into()],
+            &[CqlType::Int, CqlType::Blob, CqlType::Blob],
+            &[0],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row[1], Some(CqlValue::Blob(b"static".to_vec())), "{rows:?}");
+        }
+        assert_eq!(rows[0][2], Some(CqlValue::Blob(b"a1".to_vec())));
+        assert_eq!(rows[1][2], Some(CqlValue::Blob(b"a2".to_vec())));
     }
 
     /// The primary SELECT read path assembles a complex `list` column from its

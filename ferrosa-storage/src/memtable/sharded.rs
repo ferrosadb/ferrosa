@@ -346,6 +346,12 @@ pub(crate) fn merge_row_into_partition(
         return Ok(());
     }
 
+    // A clustered row may carry static cells (CQL writes them with the row).
+    // A static column has one value per partition, so lift them into the
+    // static row here, exactly as the flush does (crate::ordinal_space), and
+    // every read before and after a flush sees the same partition.
+    let new_row = lift_static_cells(partition, new_row, schema)?;
+
     // Binary search by clustering key
     let pos = partition
         .rows
@@ -360,6 +366,40 @@ pub(crate) fn merge_row_into_partition(
         }
     }
     Ok(())
+}
+
+/// On a clustered table, move `row`'s static cells (flat ordinals
+/// `0..static_columns.len()`) into `partition`'s static row and return the
+/// row without them. The row itself stays, with its clustering, liveness and
+/// regular cells. Without clustering columns a partition has one row and no
+/// separate static row (Cassandra refuses statics there); the flush still
+/// moves such cells into the SSTable static row, and readers overlay it.
+fn lift_static_cells(partition: &mut Partition, mut row: Row, schema: &TableSchema) -> Result<Row> {
+    let static_count = schema.static_columns.len();
+    if static_count == 0
+        || schema.clustering_columns.is_empty()
+        || !row
+            .cells
+            .iter()
+            .any(|(idx, _)| usize::from(*idx) < static_count)
+    {
+        return Ok(row);
+    }
+    let (statics, regulars): (Vec<_>, Vec<_>) = std::mem::take(&mut row.cells)
+        .into_iter()
+        .partition(|(idx, _)| usize::from(*idx) < static_count);
+    row.cells = regulars;
+    let marker = Row {
+        clustering: Vec::new(),
+        cells: statics,
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
+    };
+    match partition.static_row.as_mut() {
+        Some(existing) => merge_into_existing_row(existing, marker, schema)?,
+        None => partition.static_row = Some(marker),
+    }
+    Ok(row)
 }
 
 /// Merge `new_row` into `existing_row` (same clustering, or both the static
@@ -1240,6 +1280,43 @@ mod tests {
             paths,
             vec![Some(b"k1".to_vec()), Some(b"k2".to_vec())],
             "both set elements live under the static column"
+        );
+    }
+
+    /// On a clustered table a static column has one value per partition: a
+    /// static cell written with a clustered row lands in the static row, the
+    /// newest write winning, and the clustered rows keep only their regulars.
+    #[test]
+    fn static_cells_written_with_clustered_rows_merge_into_the_static_row() {
+        let schema = TableSchema {
+            clustering_columns: vec![column("ck", "org.apache.cassandra.db.marshal.Int32Type")],
+            static_columns: vec![column("s", UTF8)],
+            regular_columns: vec![column("a", UTF8)],
+            ..test_schema()
+        };
+        let row = |ck: i32, s: &[u8], a: &[u8], ts: i64| Row {
+            clustering: ck.to_be_bytes().to_vec(),
+            cells: vec![
+                (0, CellValue::live(s.to_vec(), ts)),
+                (1, CellValue::live(a.to_vec(), ts)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+        };
+        let mut p = empty_partition();
+        merge_row_into_partition(&mut p, row(1, b"s-new", b"a1", 20), &schema).unwrap();
+        merge_row_into_partition(&mut p, row(2, b"s-old", b"a2", 10), &schema).unwrap();
+
+        let statics = &p.static_row.as_ref().expect("static row").cells;
+        assert_eq!(statics, &vec![(0, CellValue::live(b"s-new".to_vec(), 20))]);
+        assert_eq!(p.rows.len(), 2);
+        assert_eq!(
+            p.rows[0].cells,
+            vec![(1, CellValue::live(b"a1".to_vec(), 20))]
+        );
+        assert_eq!(
+            p.rows[1].cells,
+            vec![(1, CellValue::live(b"a2".to_vec(), 10))]
         );
     }
 

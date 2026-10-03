@@ -4445,6 +4445,14 @@ impl<F: FlushTarget> TableStore<F> {
             );
         }
 
+        // Step 5a': the memtable speaks flat ordinals (statics first, static
+        // cells inside clustered rows); an SSTable numbers statics and regulars
+        // separately and holds statics in the static row. Convert here, in
+        // place, before any header is built (t_65661473).
+        for p in partitions.iter_mut() {
+            crate::ordinal_space::flat_into_sstable_space(p, schema.static_columns.len())?;
+        }
+
         if partitions.is_empty() {
             tracing::warn!(
                 keyspace = %schema.keyspace,
@@ -6270,7 +6278,12 @@ impl<F: FlushTarget> TableStore<F> {
             position_iter_at_token(&mut iter, start_token)
                 .map_err(|e| self.merge_reader_failure("bounded_merge", "position", mr, e))?;
             iters.push(iter);
-            mappings.push(ColumnOrdinalMapping::for_header(schema, mr.reader.header()));
+            // A spill run is an SSTable read back later through `for_header`,
+            // so it is written in SSTable ordinal space (crate::ordinal_space).
+            mappings.push(ColumnOrdinalMapping::for_rewrite(
+                schema,
+                mr.reader.header(),
+            ));
         }
 
         // Conservative streaming header: equal to `build_serialization_header`'s
