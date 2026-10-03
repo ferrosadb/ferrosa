@@ -153,12 +153,14 @@ impl From<LivenessInfoWire> for LivenessInfo {
 ///   `timestamp`, `ttl`, `local_deletion_time`.
 ///
 /// bincode rejects any Option tag other than `0`/`1`, so a node built before
-/// this format fails the whole message with a decode error (`invalid value:
-/// integer 2, expected option tag`) rather than reading an element as a
-/// path-less cell. That is the mixed-version contract during a rolling
-/// restart: complex data from a new node is refused by an old one, loudly,
-/// never silently flattened (t_83c4f093). Before this format the sender
-/// asserted and the receiver dropped every path.
+/// this format fails the whole message with the typed
+/// `bincode::ErrorKind::InvalidTagEncoding(2)` rather than reading an element
+/// as a path-less cell (`legacy_decoder_rejects_complex_cells_with_a_decode_error`).
+/// What the old node then does is up to its call site: reads count the replica
+/// as failed and range streams fail, but the old row-stream receiver stored an
+/// undecodable payload as a raw live cell, so topology changes (bootstrap,
+/// decommission, rebalance) must not stream from a new node to an old one.
+/// Before this format the sender asserted and the receiver dropped every path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellValueWire {
     pub value: Option<Vec<u8>>,
@@ -2174,12 +2176,31 @@ mod tests {
     /// is the silent drop this format exists to prevent.
     #[test]
     fn legacy_decoder_rejects_complex_cells_with_a_decode_error() {
-        let bytes = bincode::serialize(&partition_to_wire(make_complex_partition(b"pA"))).unwrap();
-        let err = bincode::deserialize::<legacy::PartitionWire>(&bytes)
-            .expect_err("an old node must not decode a complex cell as a simple one");
-        assert!(
-            err.to_string().contains("tag"),
-            "expected an invalid-tag decode error, got: {err}"
+        let partition = make_complex_partition(b"pA");
+        let expect_tag_error = |err: bincode::Error, what: &str| {
+            assert!(
+                matches!(*err, bincode::ErrorKind::InvalidTagEncoding(2)),
+                "{what}: expected the typed InvalidTagEncoding(2) error, got: {err:?}"
+            );
+        };
+
+        // Coordinator reads, repair Fetch/Apply and range streams carry
+        // `PartitionWire`; the complex cell sits after a simple one, so the
+        // old decoder reads the scalar fine and then hits the tag.
+        let bytes = bincode::serialize(&partition_to_wire(partition.clone())).unwrap();
+        expect_tag_error(
+            bincode::deserialize::<legacy::PartitionWire>(&bytes)
+                .expect_err("an old node must not decode a complex cell as a simple one"),
+            "PartitionWire",
+        );
+
+        // Bootstrap/decommission/rebalance carry `Vec<RowWire>` per partition.
+        let rows: Vec<RowWire> = partition.rows.iter().cloned().map(RowWire::from).collect();
+        let bytes = bincode::serialize(&rows).unwrap();
+        expect_tag_error(
+            bincode::deserialize::<Vec<legacy::RowWire>>(&bytes)
+                .expect_err("an old node must not decode streamed complex rows"),
+            "Vec<RowWire>",
         );
     }
 
