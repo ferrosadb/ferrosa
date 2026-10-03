@@ -850,7 +850,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   fix.
 
 - **A range scan whose consumer stopped reading pauses and gives back its
-  thread (ST-73).** `range_iter` and `range_iter_projected` run a `RangeScan`
+  thread (ST-82).** `range_iter` and `range_iter_projected` run a `RangeScan`
   on the scheduler pool. When the consumer leaves the 4-item channel full for
   `RANGE_SCAN_PAUSE_GRACE` (10 ms), the producer returns its pool slot, I/O
   permit AND blocking thread; an async supervisor holds the item it could not
