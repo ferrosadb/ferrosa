@@ -128,6 +128,12 @@ pub enum StreamConsumeError {
     /// A replica ended its stream with `truncated = true`, which indicates a
     /// storage/decode failure or otherwise incomplete result.
     TruncatedReplica { request_id: u32 },
+    /// The producer sent no DATA frame (chunk or Done) within the no-data
+    /// deadline, though heartbeats may have kept the idle watchdog quiet.
+    NoData {
+        request_id: u32,
+        no_data_deadline: Duration,
+    },
 }
 
 /// Consume a streaming range-read response.

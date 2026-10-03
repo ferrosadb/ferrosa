@@ -49,6 +49,51 @@ use crate::write_path::ScanResume;
 /// 30 s the peer is genuinely stuck and aborting is correct.
 const STREAMING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default longest a remote stream may go without a DATA frame (chunk or Done)
+/// before the coordinator fails it, however many heartbeats arrive meanwhile.
+///
+/// Heartbeats reset the idle watchdog, and a replica built before heartbeats
+/// were progress-gated sends one every 3 s even while its walk is stuck. That
+/// kept a remote stream "alive" forever, and the index merge above it held the
+/// coordinator's own local walker parked inside `tables.read()`. This deadline
+/// is the backstop heartbeats cannot reset.
+///
+/// Budget: 10x the idle timeout (5 min). A current replica heartbeats only on
+/// progress, so its stuck walk is caught by the 30 s idle timeout; this bound
+/// only has to catch the old ones, and it must not fail a legitimately slow
+/// walk. The slowest legitimate gap is a walk rehydrating evicted SSTables
+/// before its next hit: one 16 MiB ranged part per request at the default
+/// `FERROSA_S3_MAX_REQUESTS_PER_SECOND=20` throttle is about 320 MiB/s, so 5
+/// minutes covers a gap of tens of GiB of downloads between two rows.
+/// Override with `FERROSA_STREAM_NO_DATA_DEADLINE_SECS` (read once).
+const DEFAULT_STREAM_NO_DATA_DEADLINE: Duration =
+    Duration::from_secs(STREAMING_IDLE_TIMEOUT.as_secs() * 10);
+
+/// The no-data deadline in force: [`DEFAULT_STREAM_NO_DATA_DEADLINE`] unless
+/// `FERROSA_STREAM_NO_DATA_DEADLINE_SECS` names a positive number of seconds.
+/// An unparsable or zero value is refused loudly at first use and the default
+/// applies.
+fn stream_no_data_deadline() -> Duration {
+    static DEADLINE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *DEADLINE.get_or_init(
+        || match std::env::var("FERROSA_STREAM_NO_DATA_DEADLINE_SECS") {
+            Err(_) => DEFAULT_STREAM_NO_DATA_DEADLINE,
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) if secs > 0 => Duration::from_secs(secs),
+                _ => {
+                    tracing::error!(
+                        value = raw,
+                        default_secs = DEFAULT_STREAM_NO_DATA_DEADLINE.as_secs(),
+                        "FERROSA_STREAM_NO_DATA_DEADLINE_SECS must be a positive integer; \
+                     using the default"
+                    );
+                    DEFAULT_STREAM_NO_DATA_DEADLINE
+                }
+            },
+        },
+    )
+}
+
 /// Default idle budget for one merge source to produce its next fragment.
 ///
 /// The N-way merge picks the next token by walking its cursors **in order** and
@@ -484,6 +529,23 @@ fn next_remote_error(err: StreamConsumeError) -> crate::error::Result<Partition>
                 data_present: false,
             }
         }
+        StreamConsumeError::NoData {
+            request_id,
+            no_data_deadline,
+        } => {
+            tracing::warn!(
+                request_id,
+                ?no_data_deadline,
+                "streaming range read: replica sent heartbeats but no data within the no-data \
+                 deadline — returning retryable ReadTimeout"
+            );
+            ClusterError::ReadTimeout {
+                consistency: "ONE".to_string(),
+                received: 0,
+                required: 1,
+                data_present: false,
+            }
+        }
         // Decode / unexpected-frame faults are genuine protocol bugs — keep them
         // loud (non-retryable) so they surface for diagnosis.
         other => ClusterError::Internal(format!("streaming range read: {other:?}")),
@@ -546,6 +608,10 @@ async fn forward_remote_range_stream_inner(
     let mut watchdog = IdleTimeoutWatchdog::new(receiver, STREAMING_IDLE_TIMEOUT);
     let mut delivered_done = 0usize;
     let mut resume: Option<StreamResumePositionWire> = None;
+    // Heartbeats reset the watchdog but not this: see
+    // [`DEFAULT_STREAM_NO_DATA_DEADLINE`].
+    let no_data_deadline = stream_no_data_deadline();
+    let mut data_deadline = tokio::time::Instant::now() + no_data_deadline;
 
     loop {
         if delivered_done >= expected_done {
@@ -559,6 +625,12 @@ async fn forward_remote_range_stream_inner(
         let next = tokio::select! {
             biased;
             _ = tx.closed() => return Ok(ForwardOutcome::Abandoned),
+            _ = tokio::time::sleep_until(data_deadline) => {
+                return Err(StreamConsumeError::NoData {
+                    request_id,
+                    no_data_deadline,
+                });
+            }
             next = watchdog.next() => next,
         };
         let next = next.map_err(|elapsed| StreamConsumeError::IdleTimeout {
@@ -591,6 +663,9 @@ async fn forward_remote_range_stream_inner(
                         return Ok(ForwardOutcome::Abandoned);
                     }
                 }
+                // Re-armed AFTER the hand-off: time spent waiting on a slow
+                // consumer is not the replica's silence.
+                data_deadline = tokio::time::Instant::now() + no_data_deadline;
             }
             Message::RangeReadStreamHeartbeat(bytes) => {
                 let _heartbeat = bincode::deserialize::<RangeReadStreamHeartbeatPayload>(&bytes)
@@ -618,6 +693,7 @@ async fn forward_remote_range_stream_inner(
                 }
                 resume = done.resume;
                 delivered_done += 1;
+                data_deadline = tokio::time::Instant::now() + no_data_deadline;
             }
             other => {
                 return Err(StreamConsumeError::UnexpectedFrame {
@@ -2443,6 +2519,91 @@ mod tests {
 
     fn replica(hits: Vec<crate::error::Result<Partition>>) -> ClusterPartitionStream {
         Box::pin(futures::stream::iter(hits))
+    }
+
+    fn heartbeat_frame(request_id: u32, seq: u32) -> Message {
+        let hb = RangeReadStreamHeartbeatPayload { request_id, seq };
+        Message::RangeReadStreamHeartbeat(Bytes::from(bincode::serialize(&hb).unwrap()))
+    }
+
+    /// INVARIANT: heartbeats alone never keep a remote stream open past the
+    /// no-data deadline. A replica built before the progress-gated heartbeat
+    /// still heartbeats every 3 s while its walk is stuck; each one resets the
+    /// 30 s idle watchdog, so without a deadline heartbeats cannot reset, the
+    /// forwarder waited forever and the merge above it kept the coordinator's
+    /// local walker parked inside `tables.read()`.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeats_without_data_fail_the_stream_at_the_no_data_deadline() {
+        const REQ: u32 = 9;
+        let (frame_tx, frame_rx) = mpsc::channel::<Message>(STREAM_RECEIVER_BUFFER);
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let forwarder = tokio::spawn(forward_remote_range_stream(frame_rx, REQ, 1, out_tx));
+        let heartbeats = tokio::spawn(async move {
+            let mut seq = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if frame_tx.send(heartbeat_frame(REQ, seq)).await.is_err() {
+                    return;
+                }
+                seq += 1;
+            }
+        });
+
+        let deadline = stream_no_data_deadline();
+        let first = tokio::time::timeout(deadline + Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("heartbeats alone kept the stream open past the no-data deadline");
+        heartbeats.abort();
+        let err = first
+            .expect("the forwarder must deliver its failure")
+            .expect_err("a heartbeat-only stream must fail");
+        assert!(
+            matches!(err, ClusterError::ReadTimeout { .. }),
+            "a no-data stall is a retryable read timeout, got {err:?}"
+        );
+        assert!(matches!(forwarder.await.unwrap(), ForwardOutcome::Failed));
+    }
+
+    /// Control: a stream that delivers data keeps going past the no-data
+    /// deadline. The deadline measures time since the last DATA frame, not
+    /// since the stream began.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_delivering_data_outlives_the_no_data_deadline() {
+        const REQ: u32 = 10;
+        let (frame_tx, frame_rx) = mpsc::channel::<Message>(STREAM_RECEIVER_BUFFER);
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let forwarder = tokio::spawn(forward_remote_range_stream(frame_rx, REQ, 1, out_tx));
+        let deadline = stream_no_data_deadline();
+        let steps = (deadline.as_secs() / 10) * 3;
+        let feeder = tokio::spawn(async move {
+            for seq in 0..steps as u32 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let chunk = crate::raft::handlers::RangeReadStreamChunkPayload {
+                    request_id: REQ,
+                    seq,
+                    partitions: vec![crate::raft::handlers::partition_to_wire(partition(
+                        &seq.to_be_bytes(),
+                    ))],
+                };
+                let bytes = Bytes::from(bincode::serialize(&chunk).unwrap());
+                if frame_tx
+                    .send(Message::RangeReadStreamChunk(bytes))
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
+            }
+            Some(frame_tx)
+        });
+        let mut received = 0u64;
+        while received < steps {
+            let item = out_rx.recv().await.expect("stream ended early");
+            item.expect("a stream delivering data must not be failed");
+            received += 1;
+        }
+        drop(feeder.await.unwrap());
+        forwarder.abort();
     }
 
     /// One partition holding a single row, keyed by `pk`.
