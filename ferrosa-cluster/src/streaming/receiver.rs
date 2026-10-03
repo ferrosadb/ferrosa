@@ -223,24 +223,26 @@ impl StreamSession {
             })?;
             // Decode BEFORE writing anything for this partition, so an
             // undecodable row set fails the session instead of being stored.
-            let rows = decode_streamed_rows(&mutation)?;
+            let rows = decode_partition_rows(&mutation)?;
             let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-            // An empty row list writes nothing; count it so the session log
-            // shows it rather than reporting the mutation as applied data.
-            if rows.is_empty() {
-                empty_row_payloads += 1;
-            }
             // Decorate with the key's real Murmur3 token. `DecoratedKey`
             // orders by token first, so a placeholder token files the
             // partition where no read at its real token will look.
             let key = DecoratedKey::new(PartitionKey::new(mutation.key));
 
+            let mut wrote_any = false;
             for row in rows {
+                wrote_any = true;
                 storage
                     .write(&table_id, &key, row, mutation.timestamp)
                     .map_err(|e| {
                         ClusterError::Internal(format!("stream: storage write failed: {e}"))
                     })?;
+            }
+            // An empty row list writes nothing; count it so the session log
+            // shows it rather than reporting the mutation as applied data.
+            if !wrote_any {
+                empty_row_payloads += 1;
             }
             applied += 1;
         }
@@ -267,7 +269,13 @@ impl StreamSession {
 /// payload -- or a sender's `unwrap_or_default()` empty encoding -- became a
 /// plausible-looking row. An empty row list writes nothing; it used to take
 /// the same fallback and store the encoded empty vector as a cell.
-fn decode_streamed_rows(mutation: &StreamedMutation) -> Result<Vec<ferrosa_sstable::types::Row>> {
+///
+/// The payload is ONE partition's rows, already bounded by the session byte
+/// limit when it was staged; the decoded rows are yielded one at a time
+/// rather than converted into a second `Vec`.
+fn decode_partition_rows(
+    mutation: &StreamedMutation,
+) -> Result<impl Iterator<Item = ferrosa_sstable::types::Row>> {
     use crate::raft::handlers::RowWire;
     let wire_rows: Vec<RowWire> = bincode::deserialize(&mutation.row).map_err(|e| {
         ClusterError::Internal(format!(
@@ -279,10 +287,7 @@ fn decode_streamed_rows(mutation: &StreamedMutation) -> Result<Vec<ferrosa_sstab
             mutation.row.len()
         ))
     })?;
-    Ok(wire_rows
-        .into_iter()
-        .map(ferrosa_sstable::types::Row::from)
-        .collect())
+    Ok(wire_rows.into_iter().map(ferrosa_sstable::types::Row::from))
 }
 
 impl Drop for StreamSession {
