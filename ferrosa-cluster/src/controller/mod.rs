@@ -668,6 +668,18 @@ impl ModeController {
         self.peer_manager.load().as_ref().clone()
     }
 
+    /// This controller as the event listener of the peer manager it will own.
+    ///
+    /// Weak, so `PeerManager::with_weak_listener` does not form a cycle with
+    /// `set_peer_manager`: a strong one kept every controller, its storage
+    /// engine and the engine's threads alive forever (CL-35).
+    pub fn as_peer_listener(
+        self: &Arc<Self>,
+    ) -> std::sync::Weak<dyn ferrosa_net::peer::PeerEventListener> {
+        let listener: Arc<dyn ferrosa_net::peer::PeerEventListener> = self.clone();
+        Arc::downgrade(&listener)
+    }
+
     pub fn set_peer_manager(self: &Arc<Self>, pm: Arc<ferrosa_net::peer::PeerManager>) {
         // Register ClusterInvite handler so this node can process
         // incoming invites and connect to discovered peers.

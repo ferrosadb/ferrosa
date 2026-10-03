@@ -235,10 +235,10 @@ impl TestClusterNode {
         );
 
         // Create PeerManager with ModeController as the listener
-        let pm = Arc::new(PeerManager::new(
+        let pm = Arc::new(PeerManager::with_weak_listener(
             net_config.clone(),
             host_id,
-            controller.clone(),
+            controller.as_peer_listener(),
         ));
         controller.set_peer_manager(pm.clone());
 
@@ -741,7 +741,11 @@ async fn progressive_join_mode_transitions() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
     controller.set_peer_manager(pm);
 
     // Standalone -> Pair

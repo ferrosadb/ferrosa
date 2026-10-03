@@ -34,12 +34,45 @@ pub trait PeerEventListener: Send + Sync {
     fn on_peer_failed(&self, peer_id: uuid::Uuid);
 }
 
+/// How a [`PeerManager`] reaches its event listener.
+///
+/// `Owner` is for a listener that owns the peer manager (the cluster
+/// `ModeController` holds it in `set_peer_manager`). A strong reference there
+/// is a cycle: neither is ever freed, nor the storage engine and threads the
+/// controller holds. Each leaked controller cost ~11 threads; the nightly
+/// fuzz job's per-case controllers exhausted the runner (2026-10-01..03).
+#[derive(Clone)]
+enum ListenerRef {
+    Owned(Arc<dyn PeerEventListener>),
+    Owner(std::sync::Weak<dyn PeerEventListener>),
+}
+
+impl ListenerRef {
+    /// The listener, or `None` once an owning listener has been dropped: the
+    /// owner is gone, so there is no one left to tell. Logged, not silent.
+    fn get(&self, event: &'static str) -> Option<Arc<dyn PeerEventListener>> {
+        match self {
+            Self::Owned(l) => Some(Arc::clone(l)),
+            Self::Owner(w) => {
+                let l = w.upgrade();
+                if l.is_none() {
+                    tracing::info!(
+                        event,
+                        "peer event dropped: its listener (owner) has shut down"
+                    );
+                }
+                l
+            }
+        }
+    }
+}
+
 /// Manages all peer connections and runs failure detection.
 pub struct PeerManager {
     config: Arc<NetConfig>,
     local_host_id: uuid::Uuid,
     peers: RwLock<HashMap<uuid::Uuid, Arc<PeerState>>>,
-    listener: Arc<dyn PeerEventListener>,
+    listener: ListenerRef,
     /// CQL broadcast addresses learned from peer handshakes.
     peer_cql_broadcasts: RwLock<HashMap<uuid::Uuid, String>>,
     /// Internode broadcast hostnames learned from peer handshakes. Used so the
@@ -159,6 +192,14 @@ impl PeerManager {
         local_host_id: uuid::Uuid,
         listener: Arc<dyn PeerEventListener>,
     ) -> Self {
+        Self::with_listener_ref(config, local_host_id, ListenerRef::Owned(listener))
+    }
+
+    fn with_listener_ref(
+        config: Arc<NetConfig>,
+        local_host_id: uuid::Uuid,
+        listener: ListenerRef,
+    ) -> Self {
         Self {
             config,
             local_host_id,
@@ -171,6 +212,16 @@ impl PeerManager {
             started_at: tokio::time::Instant::now(),
             replace_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// A peer manager whose listener OWNS it (the `ModeController`): holds the
+    /// listener weakly so the pair can be freed.
+    pub fn with_weak_listener(
+        config: Arc<NetConfig>,
+        local_host_id: uuid::Uuid,
+        listener: std::sync::Weak<dyn PeerEventListener>,
+    ) -> Self {
+        Self::with_listener_ref(config, local_host_id, ListenerRef::Owner(listener))
     }
 
     pub fn set_raft_runtime(&self, runtime: Arc<tokio::runtime::Runtime>) {
@@ -367,7 +418,9 @@ impl PeerManager {
             self.store_broadcasts(host_id, &cql_broadcast, &internode_broadcast)
                 .await;
         }
-        self.listener.on_peer_connected(peer_id);
+        if let Some(l) = self.listener.get("connected") {
+            l.on_peer_connected(peer_id);
+        }
         if let Some(pool) = old_pool {
             pool.shutdown().await;
         }
@@ -520,7 +573,9 @@ impl PeerManager {
         }
         let state = Arc::new(PeerState::new(peer_id, None, self.now_ms()));
         self.peers.write().await.insert(host_id, state);
-        self.listener.on_peer_connected(peer_id);
+        if let Some(l) = self.listener.get("connected") {
+            l.on_peer_connected(peer_id);
+        }
     }
 
     /// Send a message to a peer on the specified lane.
@@ -652,32 +707,40 @@ impl PeerManager {
 
             // Notify listener and trigger reconnection outside the lock.
             for (peer_id, pool_opt) in suspected {
-                self.listener.on_peer_suspected(peer_id);
+                if let Some(l) = self.listener.get("suspected") {
+                    l.on_peer_suspected(peer_id);
+                }
 
                 let (host_id, _addr) = peer_id;
 
                 if let Some(pool) = pool_opt {
                     pool.reconnect_all_lanes();
 
-                    let listener = Arc::clone(&self.listener);
+                    let listener = self.listener.clone();
                     task_pool.spawn(async move {
                         for _ in 0u32..120 {
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
                             match pool.all_lanes_resolved().await {
                                 LaneOutcome::AllConnected => {
-                                    listener.on_peer_recovered(host_id);
+                                    if let Some(l) = listener.get("recovered") {
+                                        l.on_peer_recovered(host_id);
+                                    }
                                     return;
                                 }
                                 LaneOutcome::AnyFailed => {
-                                    listener.on_peer_failed(host_id);
+                                    if let Some(l) = listener.get("failed") {
+                                        l.on_peer_failed(host_id);
+                                    }
                                     return;
                                 }
                                 LaneOutcome::StillReconnecting => {}
                             }
                         }
 
-                        listener.on_peer_failed(host_id);
+                        if let Some(l) = listener.get("failed") {
+                            l.on_peer_failed(host_id);
+                        }
                     });
                 }
             }
@@ -833,7 +896,9 @@ impl PeerManager {
             if let Some(pool) = &state.pool {
                 pool.shutdown().await;
             }
-            self.listener.on_peer_disconnected(state.peer_id);
+            if let Some(l) = self.listener.get("disconnected") {
+                l.on_peer_disconnected(state.peer_id);
+            }
         }
     }
 

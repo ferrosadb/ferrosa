@@ -76,7 +76,11 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   subscribes is not missed. Reconnects re-resolve the peer's advertised hostname
   so container IP churn is handled automatically. `NetError::LaneShutdown`
   means a pool's actors have exited (peer connection replaced); it is not
-  reconnect exhaustion. `PeerManager` re-issues a request once on the current
+  reconnect exhaustion. A listener that owns its `PeerManager` (the cluster
+  `ModeController`) is passed through `PeerManager::with_weak_listener` and
+  held weakly; `PeerManager::new` holds its listener strongly, for listeners
+  nothing else owns. Events for a dropped owner are logged and discarded.
+  `PeerManager` re-issues a request once on the current
   pool when the one it resolved was replaced mid-request. If the registered
   pool itself is dead, `PeerManager` deregisters it, re-dials once via
   `ensure_peer` (identity-checked), logs the failure and the recovery once
