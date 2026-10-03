@@ -843,6 +843,79 @@ pub fn vector_generations_pending() -> i64 {
     VECTOR_GENERATIONS_PENDING.load(Ordering::Relaxed)
 }
 
+/// `ferrosa_index_repairs_total{index,reason}`: index generations rebuilt
+/// (or scope sets restored) by reason. Labelled, so a lock-free map.
+static INDEX_REPAIRS_TOTAL: OnceLock<
+    arc_swap::ArcSwap<std::collections::BTreeMap<(String, String), u64>>,
+> = OnceLock::new();
+/// `ferrosa_index_invalid{table,index}`: generations of an index currently
+/// incomplete or invalid; ANN over it refuses while non-zero.
+static INDEX_INVALID: OnceLock<
+    arc_swap::ArcSwap<std::collections::BTreeMap<(String, String), u64>>,
+> = OnceLock::new();
+
+fn labelled(
+    cell: &'static OnceLock<arc_swap::ArcSwap<std::collections::BTreeMap<(String, String), u64>>>,
+) -> &'static arc_swap::ArcSwap<std::collections::BTreeMap<(String, String), u64>> {
+    cell.get_or_init(|| arc_swap::ArcSwap::from_pointee(std::collections::BTreeMap::new()))
+}
+
+/// One index repair for `reason` (a rebuilt generation or a restored scope
+/// set).
+pub fn index_repaired(index: &str, reason: &str) {
+    let key = (index.to_string(), reason.to_string());
+    let counted = crate::lockfree::update(
+        labelled(&INDEX_REPAIRS_TOTAL),
+        "index repairs metric",
+        |map| {
+            let mut next = map.clone();
+            *next.entry(key.clone()).or_default() += 1;
+            (Some(next), ())
+        },
+    );
+    if let Err(e) = counted {
+        tracing::error!(%e, index, reason, "ferrosa_index_repairs_total not incremented");
+    }
+}
+
+/// Repairs of `index` for `reason` since startup.
+pub fn index_repairs_total(index: &str, reason: &str) -> u64 {
+    labelled(&INDEX_REPAIRS_TOTAL)
+        .load()
+        .get(&(index.to_string(), reason.to_string()))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Set how many generations of `table`'s `index` are invalid right now.
+pub fn set_index_invalid(table: &str, index: &str, generations: u64) {
+    let key = (table.to_string(), index.to_string());
+    let set = crate::lockfree::update(labelled(&INDEX_INVALID), "index invalid gauge", |map| {
+        if map.get(&key).copied().unwrap_or(0) == generations {
+            return (None, ());
+        }
+        let mut next = map.clone();
+        if generations == 0 {
+            next.remove(&key);
+        } else {
+            next.insert(key.clone(), generations);
+        }
+        (Some(next), ())
+    });
+    if let Err(e) = set {
+        tracing::error!(%e, table, index, "ferrosa_index_invalid not updated");
+    }
+}
+
+/// Generations of `table`'s `index` invalid as last observed.
+pub fn index_invalid(table: &str, index: &str) -> u64 {
+    labelled(&INDEX_INVALID)
+        .load()
+        .get(&(table.to_string(), index.to_string()))
+        .copied()
+        .unwrap_or(0)
+}
+
 /// A scalar index sidecar of `bytes` was memory-mapped (t_7ac6b0e3).
 pub fn index_sidecar_mapped(bytes: u64) {
     INDEX_SIDECAR_MAPPED_BYTES.fetch_add(bytes as i64, Ordering::Relaxed);
@@ -1599,6 +1672,24 @@ pub fn render_prometheus() -> String {
         "ferrosa_storage_index_reload_skipped_rows_total {}\n",
         INDEX_RELOAD_SKIPPED_ROWS_TOTAL.load(Ordering::Relaxed)
     ));
+    out.push_str(
+        "# HELP ferrosa_index_repairs_total Index generations rebuilt from their rows, or scope sets restored, by reason (missing_sidecar, corrupt_sidecar, count_mismatch, dimension_mismatch, scope_set).\n",
+    );
+    out.push_str("# TYPE ferrosa_index_repairs_total counter\n");
+    for ((index, reason), count) in labelled(&INDEX_REPAIRS_TOTAL).load().iter() {
+        out.push_str(&format!(
+            "ferrosa_index_repairs_total{{index=\"{index}\",reason=\"{reason}\"}} {count}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP ferrosa_index_invalid Generations of an index that are incomplete or invalid; ANN over it refuses (retryable) while non-zero.\n",
+    );
+    out.push_str("# TYPE ferrosa_index_invalid gauge\n");
+    for ((table, index), count) in labelled(&INDEX_INVALID).load().iter() {
+        out.push_str(&format!(
+            "ferrosa_index_invalid{{table=\"{table}\",index=\"{index}\"}} {count}\n"
+        ));
+    }
     out.push_str(
         "# HELP ferrosa_storage_vector_generations_repaired_total Generations whose vector sidecars were rebuilt from their rows (compacted without them, flushed before manifests, or a crashed build).\n",
     );

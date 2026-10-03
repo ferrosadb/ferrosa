@@ -686,7 +686,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Quarantine + self-heal** (`quarantine.rs`, `self_heal/`) — malformed rows
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
-  quarantines them under a safety rail.
+  quarantines them under a safety rail. It also checks every vector index each
+  tick (`IssueKind::InvalidVectorIndex`, ST-73): a generation with missing
+  sidecars, a sidecar that does not decode, a vector/scope count that
+  disagrees with the manifest, a dimension that disagrees with the column, or
+  a scope set that disagrees with the sidecars on disk. An invalid generation
+  is rebuilt from its rows (`Action::RebuildVectorIndexes`), at most
+  `FERROSA_VECTOR_REPAIR_CONCURRENCY` (default 1) rebuilds at once; ANN over
+  the index refuses (retryable) meanwhile, `/readyz` stays ready with
+  `degraded_recall`, and `ferrosa_index_repairs_total{index,reason}` /
+  `ferrosa_index_invalid{table,index}` report it.
 - **Replay without a schema degrades instead of exiting** (`replay_set_aside.rs`,
   FMEA ST-52) — when no `schema.json`/`storage-schema.json` is usable, replay
   buffers up to `FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA` mutations in memory
