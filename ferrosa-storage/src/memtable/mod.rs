@@ -10,7 +10,6 @@ pub mod mem_index;
 pub mod sharded;
 #[cfg(feature = "skiplist-memtable")]
 pub mod skiplist;
-pub mod stacked;
 
 use std::sync::Arc;
 
@@ -370,7 +369,7 @@ fn collection_type_at(schema: &TableSchema, idx: u16) -> Option<CollectionType<'
 /// Commit-log segments written before collection writes were normalised can
 /// still carry such cells; replay expands them here. Rows that reach a flush
 /// or compaction unexpanded are handled by
-/// [`expand_collection_blobs_for_writer`].
+/// [`expand_collection_blobs_in_place`].
 pub(crate) fn expand_legacy_collection_blobs(row: &mut Row, schema: &TableSchema) -> Result<()> {
     let expanded = expand_row_collection_blobs(row, |idx| collection_type_at(schema, idx))?;
     record_blob_expansions(
@@ -381,7 +380,7 @@ pub(crate) fn expand_legacy_collection_blobs(row: &mut Row, schema: &TableSchema
 }
 
 /// The expansion behind [`expand_legacy_collection_blobs`] and
-/// [`expand_collection_blobs_for_writer`]; `type_at` maps a cell's column
+/// [`expand_collection_blobs_in_place`]; `type_at` maps a cell's column
 /// index to its collection type under the caller's indexing convention.
 /// Returns the column index of every cell it expanded, so callers can
 /// account for each rewrite.
@@ -432,7 +431,7 @@ fn header_collection_type(columns: &[(Vec<u8>, String)], idx: u16) -> Option<Col
 
 /// True when `partition` holds a live path-less cell on a non-frozen
 /// collection column of `header`: a whole-value cell that
-/// [`expand_collection_blobs_for_writer`] must expand for a complex-framed
+/// [`expand_collection_blobs_in_place`] must expand for a complex-framed
 /// output.
 pub(crate) fn partition_has_collection_blob(
     partition: &Partition,
@@ -456,7 +455,7 @@ pub(crate) fn partition_has_collection_blob(
 }
 
 /// Lower `header`'s minimum timestamp and local deletion time so the
-/// collection-deletion sentinel that [`expand_collection_blobs_for_writer`]
+/// collection-deletion sentinel that [`expand_collection_blobs_in_place`]
 /// mints (timestamp `blob.timestamp - 1`, local deletion time = now) stays
 /// inside the bounds the header advertises. A header built before expansion
 /// can sit one microsecond above that sentinel, which the writer's delta
@@ -475,46 +474,44 @@ pub(crate) fn widen_header_for_blob_sentinels(
     header.min_local_deletion_time = header.min_local_deletion_time.min(now);
 }
 
-/// Make `partition` writable under `header`. A complex-framed SSTable
-/// (`header.complex_collections`) refuses a live path-less cell on a
+/// Make `partition` writable under `header`, in place. A complex-framed
+/// SSTable (`header.complex_collections`) refuses a live path-less cell on a
 /// non-frozen collection column, yet storage legitimately holds whole-value
 /// cells beside element cells: a blob written by a non-CQL or mixed-version
 /// producer, a legacy simple-framed SSTable compacted with a complex one, or
 /// a blob partition flushed beside an element write on another partition.
 /// Each such cell is expanded here into the collection-deletion sentinel plus
 /// its elements, using the writer's own column indexing (statics and regulars
-/// each from 0). A simple-framed header, or a partition with no such cell, is
-/// returned borrowed and untouched.
+/// each from 0). Returns whether anything was expanded; a simple-framed
+/// header, or a partition with no such cell, is left untouched.
+///
+/// The caller owns `partition`, so nothing is copied (it used to clone every
+/// partition holding a blob: p0-oom-audit clone-on-row-data).
 ///
 /// This rewrites stored data, so it is never silent: every expanded cell is
 /// counted in `ferrosa_storage_collection_blob_expansions_total{table}`, and
 /// the first expansion of each (table, column) in this process logs a WARN
 /// naming both. A blob that does not parse, or whose elements are not values
 /// of the declared element types, fails with an error naming the table and
-/// partition key instead of being expanded.
-pub(crate) fn expand_collection_blobs_for_writer<'a>(
-    partition: &'a Partition,
+/// partition key; `partition` may then be partly expanded and must not be
+/// written.
+pub(crate) fn expand_collection_blobs_in_place(
+    partition: &mut Partition,
     header: &ferrosa_sstable::statistics::SerializationHeader,
     table: &str,
-) -> Result<std::borrow::Cow<'a, Partition>> {
-    use std::borrow::Cow;
-    if !header.complex_collections {
-        return Ok(Cow::Borrowed(partition));
+) -> Result<bool> {
+    if !header.complex_collections || !partition_has_collection_blob(partition, header) {
+        return Ok(false);
     }
-    if !partition_has_collection_blob(partition, header) {
-        return Ok(Cow::Borrowed(partition));
-    }
-
-    let mut owned = partition.clone();
     let result = (|| -> Result<(Vec<u16>, Vec<u16>)> {
-        let static_indices = match owned.static_row.as_mut() {
+        let static_indices = match partition.static_row.as_mut() {
             Some(row) => expand_row_collection_blobs(row, |idx| {
                 header_collection_type(&header.static_columns, idx)
             })?,
             None => Vec::new(),
         };
         let mut regular_indices = Vec::new();
-        for row in owned.rows.iter_mut() {
+        for row in partition.rows.iter_mut() {
             regular_indices.extend(expand_row_collection_blobs(row, |idx| {
                 header_collection_type(&header.regular_columns, idx)
             })?);
@@ -535,7 +532,7 @@ pub(crate) fn expand_collection_blobs_for_writer<'a>(
             &regular_indices,
         )),
     );
-    Ok(Cow::Owned(owned))
+    Ok(true)
 }
 
 /// Count whole-value collection cells rewritten into elements and WARN on

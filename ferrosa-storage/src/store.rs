@@ -462,6 +462,43 @@ impl std::fmt::Display for CorruptSstableId {
     }
 }
 
+/// A memtable swapped out of the active slot, with everything a reader and
+/// its flush need: the catalog and schema its rows were written under, and
+/// the index postings and vector indexes readers consult until its SSTable
+/// and sidecars are installed.
+pub(crate) struct SealedMemtable {
+    memtable: Arc<dyn Memtable>,
+    /// The catalog, schema, scalar postings and (sealed) write gate the
+    /// memtable was bound to while it took writes.
+    bound: Arc<MemtableIndexes>,
+    /// The memtable's own vector indexes.
+    vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>>,
+    /// The scalar postings readers consult: the memtable's own at first,
+    /// then, once its flush has built them, the postings for the catalog the
+    /// flush writes sidecars for (an index a rotating DDL added included).
+    postings: ArcSwap<HashMap<String, Arc<MemtableIndex>>>,
+    /// The vector indexes readers consult, published the same way.
+    vectors: ArcSwap<HashMap<String, Arc<VectorMemtableIndex>>>,
+}
+
+impl SealedMemtable {
+    fn new(
+        memtable: Arc<dyn Memtable>,
+        bound: Arc<MemtableIndexes>,
+        vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>>,
+    ) -> Arc<Self> {
+        let postings = ArcSwap::from_pointee(bound.by_name.clone());
+        let vectors = ArcSwap::new(Arc::clone(&vector_indexes));
+        Arc::new(Self {
+            memtable,
+            bound,
+            vector_indexes,
+            postings,
+            vectors,
+        })
+    }
+}
+
 /// Atomic snapshot of the storage engine's current state.
 ///
 /// Held inside an [`ArcSwap`] so any thread can load a consistent view
@@ -470,17 +507,13 @@ impl std::fmt::Display for CorruptSstableId {
 struct StoreView {
     /// The active memtable: accepts all current writes.
     active: Arc<dyn Memtable>,
-    /// A memtable that has been swapped out and is being flushed.
-    /// Readable during the flush; `None` when no flush is in progress.
-    flushing: Option<Arc<dyn Memtable>>,
-    /// Index postings of the `flushing` memtable, readable until the flush
-    /// installs the sidecar built from them (T1). Without them an index read
-    /// between the memtable swap and the sidecar install misses every row the
-    /// frozen memtable holds: `indexes` is already the new memtable's.
-    flushing_indexes: Option<Arc<HashMap<String, Arc<MemtableIndex>>>>,
-    /// Vector indexes of the `flushing` memtable, readable until the flush
-    /// installs its vector sidecars (the vector form of `flushing_indexes`).
-    flushing_vector_indexes: Option<Arc<HashMap<String, Arc<VectorMemtableIndex>>>>,
+    /// Memtables swapped out of `active` and not yet flushed, newest first.
+    /// Each stays readable (rows and index postings) until the flush that
+    /// writes it installs its SSTable. A flush that fails or panics leaves
+    /// its memtable here; the next rotation flushes it to its own SSTable,
+    /// exactly once (t_7681b32b). Overlapping SSTables are normal in the LSM;
+    /// reads merge them and compaction folds them together.
+    flushing: Arc<Vec<Arc<SealedMemtable>>>,
     /// Completed SSTables, newest first. Lightweight descriptors only — the
     /// readers are opened on demand through the engine-wide reader pool so
     /// resident memory is `O(reader_cap)` rather than `O(sstable_count)`.
@@ -2159,18 +2192,19 @@ pub const UNSELECTIVE_INDEX_SHARE_DENOMINATOR: u64 = 10;
 pub const UNSELECTIVE_INDEX_MIN_MATCHES: usize = 50;
 
 /// The row-ordered posting sources for one index key, each positioned at
-/// `from` (inclusive): the active memtable's pinned list, then every SSTable
-/// sidecar that holds the index.
+/// `from` (inclusive): the memtables' posting lists (see
+/// [`memtable_posting_lists`]), then every SSTable sidecar that holds the
+/// index.
 fn index_posting_sources<'a>(
     view: &'a StoreView,
-    memtables: [Option<&'a crate::memtable::index::PostingList>; 2],
+    memtables: &'a [crate::memtable::index::PostingList],
     index_name: &str,
     key: &'a IndexKey,
     from: Option<&RowPosition>,
 ) -> Vec<PostingSource<'a>> {
-    let mut sources: Vec<PostingSource<'a>> = Vec::with_capacity(view.sidecar_indexes.len() + 1);
-    // The active memtable's postings and the flushing memtable's (T1).
-    for list in memtables.into_iter().flatten() {
+    let mut sources: Vec<PostingSource<'a>> =
+        Vec::with_capacity(view.sidecar_indexes.len() + memtables.len());
+    for list in memtables {
         let postings = list.as_slice();
         let start = postings.partition_point(|p| from.is_some_and(|start| p < start));
         sources.push(Box::new(postings[start..].iter().map(RowPositionRef::from)));
@@ -2183,41 +2217,61 @@ fn index_posting_sources<'a>(
     sources
 }
 
-/// The generation `ann_search` files flushing-memtable results under, so
-/// their placeholder positions cannot collide with the active memtable's or
-/// a real SSTable's (flush generations never reach it).
-const FLUSHING_MEMTABLE_GENERATION: u64 = u64::MAX;
-
-/// The flushing memtable's vector index named `index_name`, if any.
-fn flushing_vector_index<'a>(
-    view: &'a StoreView,
-    index_name: &str,
-) -> Option<&'a Arc<VectorMemtableIndex>> {
-    view.flushing_vector_indexes.as_ref()?.get(index_name)
-}
-
-/// The flushing memtable's postings for `key` in `index_name`, if any.
-fn flushing_posting_list(
+/// The posting lists for `key` in `index_name` of the active memtable and of
+/// every sealed memtable not yet flushed (T1): until a sealed memtable's
+/// sidecar is installed, its postings are the only record of its rows.
+fn memtable_posting_lists(
     view: &StoreView,
     index_name: &str,
     key: &IndexKey,
-) -> Option<crate::memtable::index::PostingList> {
-    view.flushing_indexes
-        .as_ref()?
-        .get(index_name)?
-        .posting_list(key)
+) -> Vec<crate::memtable::index::PostingList> {
+    memtable_indexes_named(view, index_name)
+        .iter()
+        .filter_map(|index| index.posting_list(key))
+        .collect()
 }
 
-/// The active and the flushing memtable's index named `index_name`.
-fn memtable_indexes_named<'a>(
-    view: &'a StoreView,
-    index_name: &'a str,
-) -> impl Iterator<Item = &'a Arc<MemtableIndex>> + 'a {
-    view.indexes.get(index_name).into_iter().chain(
-        view.flushing_indexes
-            .as_ref()
-            .and_then(|flushing| flushing.get(index_name)),
+/// `flushing` without the sealed memtable holding `memtable`.
+fn without_sealed(
+    flushing: &[Arc<SealedMemtable>],
+    memtable: &Arc<dyn Memtable>,
+) -> Arc<Vec<Arc<SealedMemtable>>> {
+    let target = Arc::as_ptr(memtable).cast::<()>();
+    Arc::new(
+        flushing
+            .iter()
+            .filter(|sealed| Arc::as_ptr(&sealed.memtable).cast::<()>() != target)
+            .cloned()
+            .collect(),
     )
+}
+
+/// The generation `ann_search` files a sealed memtable's results under: one
+/// per sealed memtable counting down from here, so placeholder positions
+/// cannot collide with the active memtable's or a real SSTable's (flush
+/// generations never reach this range).
+const FLUSHING_MEMTABLE_GENERATION: u64 = u64::MAX;
+
+/// Every sealed memtable's vector index named `index_name`, newest first.
+fn flushing_vector_indexes(view: &StoreView, index_name: &str) -> Vec<Arc<VectorMemtableIndex>> {
+    view.flushing
+        .iter()
+        .filter_map(|sealed| sealed.vectors.load().get(index_name).cloned())
+        .collect()
+}
+
+/// The active memtable's index named `index_name` and every sealed one's.
+fn memtable_indexes_named(view: &StoreView, index_name: &str) -> Vec<Arc<MemtableIndex>> {
+    view.indexes
+        .get(index_name)
+        .cloned()
+        .into_iter()
+        .chain(
+            view.flushing
+                .iter()
+                .filter_map(|sealed| sealed.postings.load().get(index_name).cloned()),
+        )
+        .collect()
 }
 
 /// K-way merge of whole sidecars in `(key, row)` order, yielding each entry
@@ -2350,9 +2404,7 @@ impl<F: FlushTarget> TableStore<F> {
         );
         let initial_view = StoreView {
             active,
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
             indexes,
@@ -2562,9 +2614,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let initial_view = StoreView {
             active,
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(descriptors),
             sstable_ids: Arc::new(initial_ids),
             indexes,
@@ -2653,9 +2703,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let initial_view = StoreView {
             active,
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(descriptors),
             sstable_ids: Arc::new(initial_ids),
             indexes,
@@ -3423,7 +3471,7 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // Flushing memtable
-        if let Some(ref flushing) = guard.flushing {
+        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
             if let Some(p) = flushing.get(key)? {
                 flushing_hits += 1;
                 sources.push(clone_partition_limited(&p, start_clustering, row_limit));
@@ -3598,7 +3646,7 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        if let Some(ref flushing) = guard.flushing {
+        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
             if let Some(p) = flushing.get(key)? {
                 if let Some(filtered) = partition_with_matching_clustering(&p, clustering) {
                     sources.push(filtered);
@@ -3747,7 +3795,7 @@ impl<F: FlushTarget> TableStore<F> {
             rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
             mem_row_iters.push(rows.into_iter());
         }
-        if let Some(flushing) = guard.flushing.as_ref() {
+        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
             if let Some(partition) = flushing.get(key)? {
                 if partition.deletion.marked_for_delete_at
                     > partition_delete_at.marked_for_delete_at
@@ -4207,6 +4255,28 @@ impl<F: FlushTarget> TableStore<F> {
         }
     }
 
+    /// The partition for `key` in SSTable generation `gen` alone.
+    #[cfg(test)]
+    pub(crate) fn read_from_generation_for_test(
+        &self,
+        gen: &str,
+        key: &DecoratedKey,
+    ) -> Result<Option<Partition>> {
+        let view = self.view.load();
+        let desc = view
+            .sstables
+            .iter()
+            .find(|desc| desc.gen == gen)
+            .ok_or_else(|| ferrosa_common::Error::InvalidData(format!("no generation {gen}")))?;
+        self.open_reader(desc)?.get_partition_limited_rows(key, 0)
+    }
+
+    /// Sealed memtables not yet flushed.
+    #[cfg(test)]
+    pub(crate) fn sealed_memtable_count_for_test(&self) -> usize {
+        self.view.load().flushing.len()
+    }
+
     /// Memtable swaps this store has performed (see [`Self::rotate`]).
     #[cfg(test)]
     pub(crate) fn rotations_started(&self) -> u64 {
@@ -4230,78 +4300,55 @@ impl<F: FlushTarget> TableStore<F> {
         self.rotations_started
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Step 1: Swap in a fresh active memtable, move old to flushing, then
-        // seal the old memtable's gate and wait for the writers already
-        // inside it. After that every new write goes to the new active
-        // memtable and the old one holds a complete, final snapshot. Writers
-        // never wait here: one that meets the sealed gate reloads the view.
+        // Step 1: Swap in a fresh active memtable and seal the old one: push it
+        // onto the front of `flushing`, then seal its write gate and wait for
+        // the writers already inside. After that every new write goes to the
+        // new active memtable and the sealed one holds a complete, final
+        // snapshot. Writers never wait here: one that meets the sealed gate
+        // reloads the view.
         let new_active: Arc<dyn Memtable> = new_memtable();
         let phase_start = Instant::now();
-        let (
-            old_active,
-            prev_flushing_present,
-            old_indexes,
-            old_vector_indexes,
-            flush_schema,
-            flush_catalog,
-            target_catalog,
-        ) = {
+        let target_catalog = {
             let old_view = self.view.load_full();
-            // The schema and index catalog the frozen memtable's rows were
-            // written under. The flush serializes them with these even if
-            // `new_schema` replaces them below: an ALTER remaps index
-            // ordinals, and the frozen rows still carry the old ones.
             let flush_schema = Arc::clone(&old_view.indexes.schema);
             let flush_catalog = Arc::clone(&old_view.indexes.catalog);
-            // The catalog the new memtable is bound to, and whose index set the
-            // frozen memtable's sidecars must cover.
+            // The catalog and schema the new memtable is bound to; every
+            // sealed memtable this rotation flushes gets sidecars for this
+            // catalog.
             let (target_catalog, target_schema) = plan(&flush_catalog, &flush_schema);
             if !Arc::ptr_eq(&target_schema, &flush_schema) {
                 self.schema.store(Arc::clone(&target_schema));
             }
             let fresh_indexes = new_indexes(Arc::clone(&target_catalog), target_schema);
             let fresh_vector_indexes = new_vector_indexes(&target_catalog.vector_index_configs);
-            // Rotations run one at a time (see `rotate`) and every finished
-            // flush clears `flushing`, so a memtable still there belongs to a
-            // flush that failed or panicked after its swap. Stack it under the
-            // memtable being frozen: the view has ONE `flushing` slot, and
-            // overwriting it made that memtable's rows unreadable until a
-            // restart replayed the commit log (t_7681b32b). The stack also
-            // makes this flush write both, exactly once.
-            //
-            // `frozen_active` is the view's own active memtable: the swap
-            // below compares against it. `old_active` is what gets flushed
-            // and what readers see in the `flushing` slot.
             let frozen_active = Arc::clone(&old_view.active);
-            let prev_flushing_present = old_view.flushing.is_some();
-            let old_active = match old_view.flushing.as_ref() {
-                Some(prev) => crate::memtable::stacked::StackedMemtable::stack(
-                    Arc::clone(&frozen_active),
-                    Arc::clone(prev),
-                ),
-                None => Arc::clone(&frozen_active),
-            };
             let old_indexes = Arc::clone(&old_view.indexes);
             debug_assert!(
                 !old_indexes.gate.is_sealed(),
                 "the active memtable's gate is sealed before its flush"
             );
-            let old_vector_indexes = Arc::clone(&old_view.vector_indexes);
+            let sealed = SealedMemtable::new(
+                Arc::clone(&frozen_active),
+                Arc::clone(&old_indexes),
+                Arc::clone(&old_view.vector_indexes),
+            );
             drop(old_view);
 
             // Only a rotation replaces the active memtable, and rotations run
             // one at a time, so the view this derives from still holds
-            // `old_active`; compaction swaps and sidecar installs that landed
-            // since are kept.
+            // `frozen_active`; compaction swaps and sidecar installs that
+            // landed since are kept. A memtable a failed flush left in
+            // `flushing` stays there, behind this one (t_7681b32b).
             let swapped = self.update_view("flush:swap_active", |current| {
                 if !Arc::ptr_eq(&current.active, &frozen_active) {
                     return (None, false);
                 }
+                let mut flushing = Vec::with_capacity(current.flushing.len() + 1);
+                flushing.push(Arc::clone(&sealed));
+                flushing.extend(current.flushing.iter().cloned());
                 let next = StoreView {
                     active: Arc::clone(&new_active),
-                    flushing: Some(Arc::clone(&old_active)),
-                    flushing_indexes: Some(Arc::new(old_indexes.by_name.clone())),
-                    flushing_vector_indexes: Some(Arc::clone(&old_vector_indexes)),
+                    flushing: Arc::new(flushing),
                     sstables: Arc::clone(&current.sstables),
                     sstable_ids: Arc::clone(&current.sstable_ids),
                     indexes: Arc::clone(&fresh_indexes),
@@ -4320,15 +4367,7 @@ impl<F: FlushTarget> TableStore<F> {
             // Writers that load the view from here on write to the new
             // memtable; seal the old one and wait out the writes inside it.
             old_indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE)?;
-            (
-                old_active,
-                prev_flushing_present,
-                old_indexes,
-                old_vector_indexes,
-                flush_schema,
-                flush_catalog,
-                target_catalog,
-            )
+            target_catalog
         };
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::SwapMemtable,
@@ -4338,9 +4377,48 @@ impl<F: FlushTarget> TableStore<F> {
         #[cfg(test)]
         flush_fault_test_hook::fire(flush_fault_test_hook::FlushFault::AfterSwap);
 
-        // Step 2: Snapshot the flushing memtable. When a failed flush left a
-        // memtable behind, `old_active` is the stack of both, and its snapshot
-        // merges partitions present in both with read-path semantics.
+        // Step 2: Flush every sealed memtable, oldest first, each to its own
+        // SSTable. More than one means earlier flushes failed after their
+        // swap; each memtable leaves `flushing` only in the same view change
+        // that installs its SSTable, so it is flushed exactly once. A failure
+        // stops here and leaves the rest for the next rotation.
+        let sealed: Vec<Arc<SealedMemtable>> =
+            self.view.load().flushing.iter().rev().cloned().collect();
+        if sealed.len() > 1 {
+            tracing::warn!(
+                sealed = sealed.len(),
+                "flush: writing memtables left by earlier failed flushes, one SSTable each"
+            );
+        }
+        let mut outcome = FlushOutcome::NothingToFlush;
+        for memtable in &sealed {
+            if self.flush_sealed(memtable, &target_catalog, total_start)? == FlushOutcome::Published
+            {
+                outcome = FlushOutcome::Published;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Flush one sealed memtable to its own SSTable, with sidecars for
+    /// `target_catalog`, and take it out of `flushing` in the view change
+    /// that installs that SSTable.
+    fn flush_sealed(
+        &self,
+        sealed: &Arc<SealedMemtable>,
+        target_catalog: &Arc<IndexCatalog>,
+        total_start: Instant,
+    ) -> Result<FlushOutcome> {
+        let old_active = Arc::clone(&sealed.memtable);
+        let old_indexes = Arc::clone(&sealed.bound);
+        let old_vector_indexes = Arc::clone(&sealed.vector_indexes);
+        // The schema and catalog the memtable's rows were written under. The
+        // flush serializes with these even if an ALTER has replaced them: the
+        // rows still carry the old ordinals.
+        let flush_schema = Arc::clone(&sealed.bound.schema);
+        let flush_catalog = Arc::clone(&sealed.bound.catalog);
+
+        // Snapshot the sealed memtable.
         let phase_start = Instant::now();
         let mut partitions = old_active.snapshot();
         crate::metrics::observe_flush_phase(
@@ -4352,7 +4430,6 @@ impl<F: FlushTarget> TableStore<F> {
         tracing::debug!(
             partitions = partitions.len(),
             total_rows,
-            prev_flushing = prev_flushing_present,
             "flush: memtable snapshot captured"
         );
 
@@ -4363,9 +4440,7 @@ impl<F: FlushTarget> TableStore<F> {
             self.update_view("flush:clear_flushing", |live| {
                 let next = StoreView {
                     active: Arc::clone(&live.active),
-                    flushing: None,
-                    flushing_indexes: None,
-                    flushing_vector_indexes: None,
+                    flushing: without_sealed(&live.flushing, &old_active),
                     sstables: Arc::clone(&live.sstables),
                     sstable_ids: Arc::clone(&live.sstable_ids),
                     indexes: Arc::clone(&live.indexes),
@@ -4455,9 +4530,7 @@ impl<F: FlushTarget> TableStore<F> {
             self.update_view("flush:clear_all_quarantined", |live| {
                 let next = StoreView {
                     active: Arc::clone(&live.active),
-                    flushing: None,
-                    flushing_indexes: None,
-                    flushing_vector_indexes: None,
+                    flushing: without_sealed(&live.flushing, &old_active),
                     sstables: Arc::clone(&live.sstables),
                     sstable_ids: Arc::clone(&live.sstable_ids),
                     indexes: Arc::clone(&live.indexes),
@@ -4497,6 +4570,85 @@ impl<F: FlushTarget> TableStore<F> {
                 .map(|()| FlushOutcome::Published);
         }
 
+        // Everything a sidecar is built from the rows is built HERE, before
+        // the rows are encoded: encoding expands legacy whole-value collection
+        // cells in place, and the sidecars must describe the rows as the
+        // memtable held and indexed them, the same as the memtable postings.
+        //
+        // The sidecar set is exactly the indexes the TARGET catalog declares —
+        // the one the next memtable is bound to. An index DDL rotated the
+        // memtable to get here: an index it dropped gets no sidecar, and an
+        // index it added is posted now from the frozen rows, which no write
+        // can reach any more.
+        let sidecar_indexes = self.flush_sidecar_indexes(&old_indexes, target_catalog, &partitions);
+        // Serve exactly these postings for the flushing memtable until the
+        // sidecar is installed: an index the rotating DDL added now reads the
+        // frozen rows too, and one it dropped no longer answers from them.
+        let published: Arc<HashMap<String, Arc<MemtableIndex>>> =
+            Arc::new(sidecar_indexes.iter().cloned().collect());
+        // The vector indexes the target catalog declares, for the frozen rows:
+        // its own index, or one built from the rows for an index the rotating
+        // DDL added. The same map feeds the vector sidecars below.
+        let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
+            target_catalog
+                .vector_index_configs
+                .iter()
+                .map(|cfg| {
+                    let index = match old_vector_indexes.get(&cfg.index_name) {
+                        Some(index) => Arc::clone(index),
+                        None => vector_index_from_rows(cfg, &partitions),
+                    };
+                    (cfg.index_name.clone(), index)
+                })
+                .collect(),
+        );
+        sealed.postings.store(Arc::clone(&published));
+        sealed.vectors.store(Arc::clone(&flush_vector_indexes));
+        // FTI documents for the target catalog's full-text indexes, read at the
+        // ordinal the frozen rows were written with (the frozen catalog's,
+        // when it declares the index). Built before encoding, from the rows as
+        // the memtable holds them; written once the generation is known.
+        let mut fti_sidecars: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
+        for (index_name, target_pos) in &target_catalog.fulltext_indexes {
+            let col_pos = flush_catalog
+                .fulltext_indexes
+                .iter()
+                .find(|(name, _)| name == index_name)
+                .map_or(target_pos, |(_, frozen_pos)| frozen_pos);
+            let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
+            for partition in &partitions {
+                let pk_bytes = partition.key.key.as_bytes();
+                // Index ONE document PER ROW, keyed by the full primary key
+                // (partition + clustering). Indexing per-partition with the text
+                // of all rows concatenated made a hit identify only the partition,
+                // leaking non-matching clustering rows (t_da51e20c).
+                for row in &partition.rows {
+                    let mut text = String::new();
+                    for (col_idx, cell) in &row.cells {
+                        if *col_idx as usize == *col_pos {
+                            if let Some(ref val) = cell.value {
+                                if let Ok(s) = std::str::from_utf8(val) {
+                                    text.push_str(s);
+                                    text.push(' ');
+                                }
+                            }
+                        }
+                    }
+                    if !text.is_empty() {
+                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
+                            pk_bytes,
+                            &row.clustering,
+                        );
+                        fti_builder.add_document(doc_key, text.trim());
+                    }
+                }
+            }
+            fti_sidecars.push((
+                index_name.clone(),
+                fti_builder.finish().map_err(|e| e.to_string()),
+            ));
+        }
+
         let header = flush::header_for_flush(&schema, &partitions);
         let staged_output = self.flush_target.file_output_staging_dir()?;
         let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
@@ -4506,9 +4658,14 @@ impl<F: FlushTarget> TableStore<F> {
         };
         let phase_start = Instant::now();
         let table_label = format!("{}.{}", schema.keyspace, schema.table);
-        for p in &partitions {
-            let p = crate::memtable::expand_collection_blobs_for_writer(p, &header, &table_label)?;
-            writer.add_partition(&p)?;
+        // The partitions are owned, so a legacy whole-value collection cell is
+        // expanded in place. The late-writer check below knows which ones.
+        let mut expanded_keys = std::collections::BTreeSet::new();
+        for p in partitions.iter_mut() {
+            if crate::memtable::expand_collection_blobs_in_place(p, &header, &table_label)? {
+                expanded_keys.insert(p.key.clone());
+            }
+            writer.add_partition(p)?;
         }
         let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
             let output = writer.finish_to_directory_deferred_sync(staging_dir)?;
@@ -4588,46 +4745,6 @@ impl<F: FlushTarget> TableStore<F> {
         // memtable to get here: an index it dropped gets no sidecar, and an
         // index it added is posted now from the frozen rows, which no write
         // can reach any more.
-        let sidecar_indexes =
-            self.flush_sidecar_indexes(&old_indexes, &target_catalog, &partitions);
-        // Serve exactly these postings for the flushing memtable until the
-        // sidecar is installed: an index the rotating DDL added now reads the
-        // frozen rows too, and one it dropped no longer answers from them.
-        let published: Arc<HashMap<String, Arc<MemtableIndex>>> =
-            Arc::new(sidecar_indexes.iter().cloned().collect());
-        // The vector indexes the target catalog declares, for the frozen rows:
-        // its own index, or one built from the rows for an index the rotating
-        // DDL added. The same map feeds the vector sidecars below.
-        let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
-            target_catalog
-                .vector_index_configs
-                .iter()
-                .map(|cfg| {
-                    let index = match old_vector_indexes.get(&cfg.index_name) {
-                        Some(index) => Arc::clone(index),
-                        None => vector_index_from_rows(cfg, &partitions),
-                    };
-                    (cfg.index_name.clone(), index)
-                })
-                .collect(),
-        );
-        self.update_view("flush:publish_flushing_postings", |current| {
-            if current.flushing.is_none() {
-                return (None, ());
-            }
-            let next = StoreView {
-                active: Arc::clone(&current.active),
-                flushing: current.flushing.clone(),
-                flushing_indexes: Some(Arc::clone(&published)),
-                flushing_vector_indexes: Some(Arc::clone(&flush_vector_indexes)),
-                sstables: Arc::clone(&current.sstables),
-                sstable_ids: Arc::clone(&current.sstable_ids),
-                indexes: Arc::clone(&current.indexes),
-                sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-                vector_indexes: Arc::clone(&current.vector_indexes),
-            };
-            (Some(next), ())
-        })?;
         let pinned_indexes: Vec<(&str, crate::memtable::index::IndexSnapshot)> = sidecar_indexes
             .iter()
             .map(|(index_name, memtable_idx)| (index_name.as_str(), memtable_idx.pin()))
@@ -4692,48 +4809,13 @@ impl<F: FlushTarget> TableStore<F> {
             };
         drop(sidecar_sources);
 
-        // Step 5c: Build FTI sidecar files for the target catalog's full-text
-        // indexes, reading each column at the ordinal the frozen rows were
-        // written with (the frozen catalog's, when it declares the index).
-        for (index_name, target_pos) in &target_catalog.fulltext_indexes {
-            let col_pos = flush_catalog
-                .fulltext_indexes
-                .iter()
-                .find(|(name, _)| name == index_name)
-                .map_or(target_pos, |(_, frozen_pos)| frozen_pos);
-            let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
-            for partition in &partitions {
-                let pk_bytes = partition.key.key.as_bytes();
-                // Index ONE document PER ROW, keyed by the full primary key
-                // (partition + clustering). Indexing per-partition with the text
-                // of all rows concatenated made a hit identify only the partition,
-                // leaking non-matching clustering rows (t_da51e20c).
-                for row in &partition.rows {
-                    let mut text = String::new();
-                    for (col_idx, cell) in &row.cells {
-                        if *col_idx as usize == *col_pos {
-                            if let Some(ref val) = cell.value {
-                                if let Ok(s) = std::str::from_utf8(val) {
-                                    text.push_str(s);
-                                    text.push(' ');
-                                }
-                            }
-                        }
-                    }
-                    if !text.is_empty() {
-                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
-                            pk_bytes,
-                            &row.clustering,
-                        );
-                        fti_builder.add_document(doc_key, text.trim());
-                    }
-                }
-            }
-            match fti_builder.finish() {
+        // Step 5c: Write the FTI sidecars built before the rows were encoded.
+        for (index_name, built) in fti_sidecars {
+            match built {
                 Ok(fti_bytes) => {
-                    if let Err(e) = self
-                        .flush_target
-                        .write_fti_sidecar(gen, index_name, &fti_bytes)
+                    if let Err(e) =
+                        self.flush_target
+                            .write_fti_sidecar(gen, &index_name, &fti_bytes)
                     {
                         tracing::error!(%e, %index_name, gen, "store: FTI sidecar write failed");
                     }
@@ -4884,7 +4966,7 @@ impl<F: FlushTarget> TableStore<F> {
             let flushed_by_key: std::collections::BTreeMap<_, _> =
                 partitions.iter().map(|p| (p.key.clone(), p)).collect();
             for p in &late_partitions {
-                if late_partition_needs_replay(&flushed_by_key, p) {
+                if late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
                     // The sealed gate makes this impossible: a write after the
                     // snapshot means admission is broken. Keep the rows (replay
                     // them into the new memtable), and say so loudly — their
@@ -4941,9 +5023,7 @@ impl<F: FlushTarget> TableStore<F> {
             new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
             let next = StoreView {
                 active: Arc::clone(&current_view.active),
-                flushing: None,
-                flushing_indexes: None,
-                flushing_vector_indexes: None,
+                flushing: without_sealed(&current_view.flushing, &old_active),
                 sstables: Arc::new(new_sstables),
                 sstable_ids: Arc::new(new_ids),
                 indexes: Arc::clone(&current_view.indexes),
@@ -4984,7 +5064,7 @@ impl<F: FlushTarget> TableStore<F> {
         // `schema` is the one captured at the memtable swap (owned, Send+Sync),
         // so the encode closures share it across the rayon pool and a
         // concurrent ALTER cannot change the layout mid-flush.
-        let shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
+        let mut shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
 
         // Stage directories before entering Rayon: the target need not be Sync.
         // Guards outlive all parallel writers and remove incomplete or unpublished
@@ -5011,37 +5091,51 @@ impl<F: FlushTarget> TableStore<F> {
             .collect::<Result<_>>()?;
         let phase_start = Instant::now();
         let table_label = format!("{}.{}", schema.keyspace, schema.table);
-        let outputs: Vec<ShardOutput> = crate::flush_executor::pool()?.install(|| {
-            shards
-                .par_iter()
-                .zip(staging.par_iter())
-                .map(|(shard, stage)| {
-                    let header = flush::header_for_flush(&schema, shard);
-                    let mut writer = match &stage.0 {
-                        Some(dir) => SSTableWriter::new_file_backed(
-                            options.clone(),
-                            header.clone(),
-                            dir.join("Data.db"),
-                        )?,
-                        None => SSTableWriter::new(options.clone(), header.clone()),
-                    };
-                    for partition in shard {
-                        let partition = crate::memtable::expand_collection_blobs_for_writer(
-                            partition,
-                            &header,
-                            &table_label,
-                        )?;
-                        writer.add_partition(&partition)?;
-                    }
-                    match &stage.0 {
-                        Some(dir) => writer
-                            .finish_to_directory_deferred_sync(dir)
-                            .map(ShardOutput::Files),
-                        None => writer.finish().map(ShardOutput::Memory),
-                    }
-                })
-                .collect::<Result<_>>()
-        })?;
+        // Each shard is owned, so a legacy whole-value collection cell is
+        // expanded in place; the keys that were expanded go to the late-writer
+        // check below.
+        let encoded: Vec<(ShardOutput, Vec<DecoratedKey>)> = crate::flush_executor::pool()?
+            .install(|| {
+                shards
+                    .par_iter_mut()
+                    .zip(staging.par_iter())
+                    .map(|(shard, stage)| {
+                        let header = flush::header_for_flush(&schema, shard);
+                        let mut writer = match &stage.0 {
+                            Some(dir) => SSTableWriter::new_file_backed(
+                                options.clone(),
+                                header.clone(),
+                                dir.join("Data.db"),
+                            )?,
+                            None => SSTableWriter::new(options.clone(), header.clone()),
+                        };
+                        let mut expanded = Vec::new();
+                        for partition in shard.iter_mut() {
+                            if crate::memtable::expand_collection_blobs_in_place(
+                                partition,
+                                &header,
+                                &table_label,
+                            )? {
+                                expanded.push(partition.key.clone());
+                            }
+                            writer.add_partition(partition)?;
+                        }
+                        let output = match &stage.0 {
+                            Some(dir) => writer
+                                .finish_to_directory_deferred_sync(dir)
+                                .map(ShardOutput::Files),
+                            None => writer.finish().map(ShardOutput::Memory),
+                        }?;
+                        Ok((output, expanded))
+                    })
+                    .collect::<Result<_>>()
+            })?;
+        let mut expanded_keys = std::collections::BTreeSet::new();
+        let mut outputs: Vec<ShardOutput> = Vec::with_capacity(encoded.len());
+        for (output, expanded) in encoded {
+            outputs.push(output);
+            expanded_keys.extend(expanded);
+        }
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::EncodeSstable,
             phase_start.elapsed(),
@@ -5109,7 +5203,7 @@ impl<F: FlushTarget> TableStore<F> {
         if !late_partitions.is_empty() {
             let current_view = self.view.load();
             for p in &late_partitions {
-                if late_partition_needs_replay(&flushed_by_key, p) {
+                if late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
                     // Impossible behind the sealed gate; see the unsharded path.
                     self.late_writes_after_seal
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5150,9 +5244,7 @@ impl<F: FlushTarget> TableStore<F> {
             new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
             let next = StoreView {
                 active: Arc::clone(&current_view.active),
-                flushing: None,
-                flushing_indexes: None,
-                flushing_vector_indexes: None,
+                flushing: without_sealed(&current_view.flushing, old_active),
                 sstables: Arc::new(new_sstables),
                 sstable_ids: Arc::new(new_ids),
                 indexes: Arc::clone(&current_view.indexes),
@@ -5225,10 +5317,15 @@ impl<F: FlushTarget> TableStore<F> {
         let active_iter = view
             .active
             .range_iter(start_owned.as_ref(), end_owned.as_ref());
-        let flushing_iter = view
+        let flushing_iters: Vec<_> = view
             .flushing
-            .as_ref()
-            .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+            .iter()
+            .map(|sealed| {
+                sealed
+                    .memtable
+                    .range_iter(start_owned.as_ref(), end_owned.as_ref())
+            })
+            .collect();
         // Open readers for descriptors overlapping the key window (pooled).
         // Held for the merger's lifetime so they cannot be evicted mid-merge.
         let sst_readers = self.open_readers_for_key_range(
@@ -5240,7 +5337,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let mut merger = crate::range_merger::merger_for_metadata_sources(
             active_iter,
-            flushing_iter,
+            flushing_iters,
             sstables_slice,
             start_owned,
             end_owned,
@@ -5343,15 +5440,20 @@ impl<F: FlushTarget> TableStore<F> {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
+            let flushing_iters: Vec<_> = view
                 .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                .iter()
+                .map(|sealed| {
+                    sealed
+                        .memtable
+                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
+                })
+                .collect();
             let sstables_slice = &sst_readers[..];
 
             let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
                 active_iter,
-                flushing_iter,
+                flushing_iters,
                 sstables_slice,
                 &column_mappings,
                 &wanted_owned,
@@ -5466,15 +5568,20 @@ impl<F: FlushTarget> TableStore<F> {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
+            let flushing_iters: Vec<_> = view
                 .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                .iter()
+                .map(|sealed| {
+                    sealed
+                        .memtable
+                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
+                })
+                .collect();
             let sstables_slice = &sst_readers[..];
 
             let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
                 active_iter,
-                flushing_iter,
+                flushing_iters,
                 sstables_slice,
                 &column_mappings,
                 start_owned,
@@ -5580,15 +5687,20 @@ impl<F: FlushTarget> TableStore<F> {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
+            let flushing_iters: Vec<_> = view
                 .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                .iter()
+                .map(|sealed| {
+                    sealed
+                        .memtable
+                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
+                })
+                .collect();
             let sstables_slice = &sst_readers[..];
 
             let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
                 active_iter,
-                flushing_iter,
+                flushing_iters,
                 sstables_slice,
                 &column_mappings,
                 start_owned,
@@ -5682,15 +5794,20 @@ impl<F: FlushTarget> TableStore<F> {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
+            let flushing_iters: Vec<_> = view
                 .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                .iter()
+                .map(|sealed| {
+                    sealed
+                        .memtable
+                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
+                })
+                .collect();
             let sstables_slice = &sst_readers[..];
 
             let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
                 active_iter,
-                flushing_iter,
+                flushing_iters,
                 sstables_slice,
                 &column_mappings,
                 &wanted_owned,
@@ -5787,7 +5904,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Flushing memtable (if any).
         if matched.len() < limit {
-            if let Some(ref flushing) = guard.flushing {
+            for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
                 for p in flushing.range_iter(None, None) {
                     if matched.len() >= limit {
                         break;
@@ -5981,15 +6098,16 @@ impl<F: FlushTarget> TableStore<F> {
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
-        let mut mem_flushing: Vec<Partition> = match guard.flushing {
-            Some(ref f) => f
+        // One source per sealed memtable: two of them can hold the same key.
+        for sealed in guard.flushing.iter() {
+            let mut mem_flushing: Vec<Partition> = sealed
+                .memtable
                 .range_iter(None, None)
                 .filter(|p: &Partition| in_range(p.key.token.0))
-                .collect(),
-            None => Vec::new(),
-        };
-        mem_flushing.sort_by(|a, b| a.key.cmp(&b.key));
-        vec_sources.push(PartitionSource::new(mem_flushing));
+                .collect();
+            mem_flushing.sort_by(|a, b| a.key.cmp(&b.key));
+            vec_sources.push(PartitionSource::new(mem_flushing));
+        }
 
         // Open one streaming reader per overlapping SSTable. Hold the opened
         // `Arc`s for the lifetime of the borrowed iterators so the pool cannot
@@ -6425,15 +6543,16 @@ impl<F: FlushTarget> TableStore<F> {
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
-        let mut mem_flushing_vec: Vec<Partition> = match guard.flushing {
-            Some(ref f) => f
+        // One source per sealed memtable: two of them can hold the same key.
+        for sealed in guard.flushing.iter() {
+            let mut mem_flushing_vec: Vec<Partition> = sealed
+                .memtable
                 .range_iter(None, None)
                 .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
-                .collect(),
-            None => Vec::new(),
-        };
-        mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
-        vec_sources.push(PartitionSource::new(mem_flushing_vec));
+                .collect();
+            mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
+            vec_sources.push(PartitionSource::new(mem_flushing_vec));
+        }
 
         // Acquire the overlapping SSTable inputs through the BOUNDED multi-pass
         // merge: at most `merge_reader_budget()` readers are ever open at once.
@@ -6769,15 +6888,16 @@ impl<F: FlushTarget> TableStore<F> {
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
-        let mut mem_flushing_vec: Vec<Partition> = match guard.flushing {
-            Some(ref f) => f
+        // One source per sealed memtable: two of them can hold the same key.
+        for sealed in guard.flushing.iter() {
+            let mut mem_flushing_vec: Vec<Partition> = sealed
+                .memtable
                 .range_iter(None, None)
                 .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
-                .collect(),
-            None => Vec::new(),
-        };
-        mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
-        vec_sources.push(PartitionSource::new(mem_flushing_vec));
+                .collect();
+            mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
+            vec_sources.push(PartitionSource::new(mem_flushing_vec));
+        }
 
         // Acquire the overlapping SSTable inputs through the BOUNDED multi-pass
         // merge (see `bounded_overlap_readers`): at most `merge_reader_budget()`
@@ -6941,7 +7061,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Flushing memtable
         if all_partitions.len() < limit {
-            if let Some(ref flushing) = guard.flushing {
+            for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
                 let remaining = limit.saturating_sub(all_partitions.len());
                 let mut flushing_parts = flushing.snapshot_range_limited(start, end, remaining);
                 trim_rows(&mut flushing_parts);
@@ -7068,11 +7188,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let guard = self.view.load();
         self.refuse_index_read_over_quarantine(&guard, None, "read_by_index_each_after")?;
-        let memtable = guard
-            .indexes
-            .get(index_name)
-            .and_then(|index| index.posting_list(&lookup_key));
-        let flushing = flushing_posting_list(&guard, index_name, &lookup_key);
+        let memtables = memtable_posting_lists(&guard, index_name, &lookup_key);
         // Seek to the cursor's PARTITION, inclusive: a partition posting
         // (pk, []) sorts before every row of pk, and a page that stopped
         // inside pk must reopen it. Rows at or before the cursor are dropped
@@ -7081,13 +7197,8 @@ impl<F: FlushTarget> TableStore<F> {
             partition_key: cursor.partition_key.clone(),
             clustering_key: Vec::new(),
         });
-        let sources = index_posting_sources(
-            &guard,
-            [memtable.as_ref(), flushing.as_ref()],
-            index_name,
-            &lookup_key,
-            from.as_ref(),
-        );
+        let sources =
+            index_posting_sources(&guard, &memtables, index_name, &lookup_key, from.as_ref());
 
         // The partition last streamed whole: a row posting for it (a sidecar
         // written before partition postings) names a row already delivered.
@@ -7142,24 +7253,15 @@ impl<F: FlushTarget> TableStore<F> {
             .saturating_add(
                 guard
                     .flushing
-                    .as_ref()
-                    .map_or(0, |memtable| memtable.partition_count() as u64),
+                    .iter()
+                    .map(|sealed| sealed.memtable.partition_count() as u64)
+                    .sum::<u64>(),
             );
         let threshold = usize::try_from(partitions / UNSELECTIVE_INDEX_SHARE_DENOMINATOR)
             .unwrap_or(usize::MAX)
             .max(UNSELECTIVE_INDEX_MIN_MATCHES);
-        let memtable = guard
-            .indexes
-            .get(index_name)
-            .and_then(|index| index.posting_list(&lookup_key));
-        let flushing = flushing_posting_list(&guard, index_name, &lookup_key);
-        let sources = index_posting_sources(
-            &guard,
-            [memtable.as_ref(), flushing.as_ref()],
-            index_name,
-            &lookup_key,
-            None,
-        );
+        let memtables = memtable_posting_lists(&guard, index_name, &lookup_key);
+        let sources = index_posting_sources(&guard, &memtables, index_name, &lookup_key, None);
         Ok(OrderedPostings::new(sources).take(threshold).count() >= threshold)
     }
 
@@ -7890,7 +7992,7 @@ impl<F: FlushTarget> TableStore<F> {
             }
         };
         add_partitions(guard.active.snapshot());
-        if let Some(ref flushing) = guard.flushing {
+        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
             add_partitions(flushing.snapshot());
         }
         drop(guard);
@@ -8257,7 +8359,10 @@ impl<F: FlushTarget> TableStore<F> {
                 merged.insert(VectorRowRef::memtable(result.position), result);
             }
         }
-        if let Some(vi) = flushing_vector_index(&guard, index_name) {
+        for (nth, vi) in flushing_vector_indexes(&guard, index_name)
+            .iter()
+            .enumerate()
+        {
             let results = vi.search(query, k, ef_search).map_err(|e| {
                 ferrosa_common::Error::InvalidData(format!(
                     "ann_search flushing memtable failed: {e}"
@@ -8265,7 +8370,10 @@ impl<F: FlushTarget> TableStore<F> {
             })?;
             for result in results {
                 merged.insert(
-                    VectorRowRef::sstable(FLUSHING_MEMTABLE_GENERATION, result.position),
+                    VectorRowRef::sstable(
+                        FLUSHING_MEMTABLE_GENERATION - nth as u64,
+                        result.position,
+                    ),
                     result,
                 );
             }
@@ -8367,7 +8475,10 @@ impl<F: FlushTarget> TableStore<F> {
                 merged.insert(VectorRowRef::memtable(result.position), result);
             }
         }
-        if let Some(vi) = flushing_vector_index(&guard, index_name) {
+        for (nth, vi) in flushing_vector_indexes(&guard, index_name)
+            .iter()
+            .enumerate()
+        {
             let results = vi
                 .search_with_scope(query, k, ef_search, partition_scope)
                 .map_err(|e| {
@@ -8377,7 +8488,10 @@ impl<F: FlushTarget> TableStore<F> {
                 })?;
             for result in results {
                 merged.insert(
-                    VectorRowRef::sstable(FLUSHING_MEMTABLE_GENERATION, result.position),
+                    VectorRowRef::sstable(
+                        FLUSHING_MEMTABLE_GENERATION - nth as u64,
+                        result.position,
+                    ),
                     result,
                 );
             }
@@ -8475,8 +8589,9 @@ impl<F: FlushTarget> TableStore<F> {
         let memtable_vector_indexes = guard
             .vector_indexes
             .get(index_name)
+            .cloned()
             .into_iter()
-            .chain(flushing_vector_index(&guard, index_name));
+            .chain(flushing_vector_indexes(&guard, index_name));
         for vi in memtable_vector_indexes {
             let results = vi.search_with_scopes(query, k, ef_search).map_err(|e| {
                 ferrosa_common::Error::InvalidData(format!(
@@ -8743,8 +8858,10 @@ impl<F: FlushTarget> TableStore<F> {
         let view = self.view.load();
         let flushing = view
             .flushing
-            .as_ref()
-            .map_or(i64::MAX, |m| m.min_timestamp());
+            .iter()
+            .map(|sealed| sealed.memtable.min_timestamp())
+            .min()
+            .unwrap_or(i64::MAX);
         view.active.min_timestamp().min(flushing)
     }
 
@@ -8786,9 +8903,7 @@ impl<F: FlushTarget> TableStore<F> {
         let catalog = self.catalog();
         let new_view = StoreView {
             active: new_memtable(),
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
             indexes: new_indexes(Arc::clone(&catalog), self.schema.load_full()),
@@ -8972,8 +9087,6 @@ impl<F: FlushTarget> TableStore<F> {
         let next = StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
-            flushing_indexes: current.flushing_indexes.clone(),
-            flushing_vector_indexes: current.flushing_vector_indexes.clone(),
             sstables: Arc::new(new_sstables),
             sstable_ids: Arc::new(new_ids),
             indexes: Arc::clone(&current.indexes),
@@ -9051,8 +9164,6 @@ impl<F: FlushTarget> TableStore<F> {
             let next = StoreView {
                 active: Arc::clone(&guard.active),
                 flushing: guard.flushing.clone(),
-                flushing_indexes: guard.flushing_indexes.clone(),
-                flushing_vector_indexes: guard.flushing_vector_indexes.clone(),
                 sstables: Arc::clone(&guard.sstables),
                 sstable_ids: Arc::clone(&guard.sstable_ids),
                 indexes: Arc::clone(&guard.indexes),
@@ -9233,12 +9344,43 @@ fn time_series_row_timestamp(
 
 fn late_partition_needs_replay(
     flushed_by_key: &std::collections::BTreeMap<ferrosa_common::key::DecoratedKey, &Partition>,
+    expanded: &std::collections::BTreeSet<ferrosa_common::key::DecoratedKey>,
     late_partition: &Partition,
 ) -> bool {
     match flushed_by_key.get(&late_partition.key) {
         None => true,
+        // The flush expanded this partition's whole-value collection cells in
+        // place, so its cells differ from the memtable's by design. A late
+        // write would still add a row or a newer timestamp: compare those.
+        Some(flushed_partition) if expanded.contains(&late_partition.key) => {
+            !same_rows_and_timestamps(flushed_partition, late_partition)
+        }
         Some(flushed_partition) => *flushed_partition != late_partition,
     }
+}
+
+/// Whether two images of one partition hold the same rows with the same
+/// deletions and newest timestamps, whatever their collection cells' layout.
+/// Expanding a whole-value collection keeps each row's clustering, deletion,
+/// liveness and newest cell timestamp (the sentinel it adds is one older).
+fn same_rows_and_timestamps(a: &Partition, b: &Partition) -> bool {
+    fn newest(row: &Row) -> Option<i64> {
+        row.cells.iter().map(|(_, cell)| cell.timestamp).max()
+    }
+    fn same_row(a: &Row, b: &Row) -> bool {
+        a.clustering == b.clustering
+            && a.deletion == b.deletion
+            && a.primary_key_liveness == b.primary_key_liveness
+            && newest(a) == newest(b)
+    }
+    a.deletion == b.deletion
+        && a.rows.len() == b.rows.len()
+        && a.rows.iter().zip(&b.rows).all(|(x, y)| same_row(x, y))
+        && match (&a.static_row, &b.static_row) {
+            (Some(x), Some(y)) => same_row(x, y),
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 #[cfg(test)]
@@ -10133,9 +10275,7 @@ mod tests {
         let current = store.view.load();
         let replacement = StoreView {
             active: Arc::new(SnapshotMemtable { partitions }),
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::clone(&current.sstables),
             sstable_ids: Arc::clone(&current.sstable_ids),
             indexes: Arc::clone(&current.indexes),
@@ -10886,7 +11026,7 @@ mod tests {
                 .unwrap();
             let mut merger = crate::range_merger::merger_for_sources(
                 Box::new(std::iter::empty()),
-                None,
+                Vec::new(),
                 &sst_readers[..],
                 None,
                 None,
@@ -10973,7 +11113,7 @@ mod tests {
             let mut merger = if label == "row-scan" {
                 crate::range_merger::merger_for_sources(
                     Box::new(std::iter::empty()),
-                    None,
+                    Vec::new(),
                     &readers[..],
                     None,
                     None,
@@ -10982,7 +11122,7 @@ mod tests {
             } else {
                 crate::range_merger::merger_for_metadata_sources(
                     Box::new(std::iter::empty()),
-                    None,
+                    Vec::new(),
                     &readers[..],
                     None,
                     None,
@@ -11092,7 +11232,7 @@ mod tests {
         let scanned: u64 = {
             let mut merger = crate::range_merger::merger_for_sources(
                 Box::new(std::iter::empty()),
-                None,
+                Vec::new(),
                 &readers[..],
                 None,
                 None,
@@ -11116,7 +11256,7 @@ mod tests {
         let counted: u64 = {
             let mut merger = crate::range_merger::merger_for_metadata_sources(
                 Box::new(std::iter::empty()),
-                None,
+                Vec::new(),
                 &readers[..],
                 None,
                 None,
@@ -11166,9 +11306,7 @@ mod tests {
         store.seed_reader(&corrupt_desc, corrupt);
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![good_desc, corrupt_desc]),
             sstable_ids: Arc::new(vec![
                 ("good".to_string(), std::path::PathBuf::new()),
@@ -11231,9 +11369,7 @@ mod tests {
         store.seed_reader(&desc, truncated);
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![("truncated".to_string(), std::path::PathBuf::new())]),
             indexes: Arc::clone(&current.indexes),
@@ -11291,9 +11427,7 @@ mod tests {
         store.seed_reader(&desc, truncated);
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![("corrupt-gen".to_string(), std::path::PathBuf::new())]),
             indexes: Arc::clone(&current.indexes),
@@ -11358,9 +11492,7 @@ mod tests {
         store.seed_reader(&desc, truncated);
         store.view.store(Arc::new(StoreView {
             active: Arc::clone(&current.active),
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![(
                 "corrupt-gen-2".to_string(),
@@ -11448,9 +11580,7 @@ mod tests {
         let sidecars = descs.iter().map(|_| Arc::new(HashMap::new())).collect();
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
-            flushing: None,
-            flushing_indexes: None,
-            flushing_vector_indexes: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(descs),
             sstable_ids: Arc::new(ids),
             indexes: Arc::clone(&current.indexes),
@@ -11976,8 +12106,6 @@ mod tests {
         store.view.store(Arc::new(StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
-            flushing_indexes: current.flushing_indexes.clone(),
-            flushing_vector_indexes: current.flushing_vector_indexes.clone(),
             sstables: Arc::new(keep.iter().map(|i| current.sstables[*i].clone()).collect()),
             sstable_ids: Arc::new(
                 keep.iter()
@@ -12273,7 +12401,7 @@ mod tests {
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
 
         assert!(
-            late_partition_needs_replay(&flushed_by_key, &late_same_key),
+            late_partition_needs_replay(&flushed_by_key, &Default::default(), &late_same_key),
             "late writes that add rows to an existing partition must be replayed"
         );
     }
@@ -12290,7 +12418,7 @@ mod tests {
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
 
         assert!(
-            !late_partition_needs_replay(&flushed_by_key, &flushed),
+            !late_partition_needs_replay(&flushed_by_key, &Default::default(), &flushed),
             "unchanged partitions should not be replayed into the new active memtable"
         );
     }
@@ -12383,7 +12511,7 @@ mod tests {
 
         let view = store.view.load();
         assert!(
-            view.flushing.is_none(),
+            view.flushing.is_empty(),
             "completed flush must clear the flushing memtable so future flushes do not re-ingest the already-flushed snapshot"
         );
     }
