@@ -592,6 +592,17 @@ pub fn observe_upload_file(bytes: u64, duration: Duration) {
     observe_upload_phase(UploadPhase::FilePut, duration);
 }
 
+static UPLOAD_TASK_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// An upload, delete or index task panicked; its worker survived it.
+pub fn inc_upload_task_panics() {
+    UPLOAD_TASK_PANICS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn upload_task_panics_total() -> u64 {
+    UPLOAD_TASK_PANICS_TOTAL.load(Ordering::Relaxed)
+}
+
 pub fn observe_upload_task(duration: Duration) {
     UPLOAD_TASKS_TOTAL.fetch_add(1, Ordering::Relaxed);
     observe_upload_phase(UploadPhase::WorkerTask, duration);
@@ -634,6 +645,17 @@ pub fn dec_compaction_running() {
     let _ = COMPACTION_RUNNING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_sub(1))
     });
+}
+
+static COMPACTION_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// A compaction task panicked; it was failed and its input claims released.
+pub fn inc_compaction_panics() {
+    COMPACTION_PANICS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn compaction_panics_total() -> u64 {
+    COMPACTION_PANICS_TOTAL.load(Ordering::Relaxed)
 }
 
 pub fn inc_compaction_failed() {
@@ -1304,6 +1326,14 @@ pub fn render_prometheus() -> String {
         UPLOAD_QUEUE_DEPTH.load(Ordering::Relaxed)
     ));
     out.push_str(
+        "# HELP ferrosa_storage_upload_task_panics_total Object-store upload/delete tasks that panicked; the task's caller was told it failed and its worker kept running.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_upload_task_panics_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_upload_task_panics_total {}\n",
+        UPLOAD_TASK_PANICS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
         "# HELP ferrosa_storage_upload_queue_depth_max Maximum observed upload queue depth.\n",
     );
     out.push_str("# TYPE ferrosa_storage_upload_queue_depth_max gauge\n");
@@ -1377,6 +1407,12 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_compaction_failed_total {}\n",
         COMPACTION_FAILED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_panics_total Compaction tasks that panicked; each was failed, its input claims released and its worker kept running.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_panics_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_panics_total {}\n",
+        COMPACTION_PANICS_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_compaction_paused_tables Tables paused after repeated output digest or verification failures.\n");
     out.push_str("# TYPE ferrosa_storage_compaction_paused_tables gauge\n");

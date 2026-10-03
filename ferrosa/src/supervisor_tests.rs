@@ -159,7 +159,7 @@ async fn exceeding_the_flush_restart_intensity_escalates() {
 
 #[test]
 fn failures_older_than_the_period_leave_the_window() {
-    let mut window = IntensityWindow::new(RestartIntensity {
+    let window = IntensityWindow::new(RestartIntensity {
         max_restarts: 2,
         period: Duration::from_secs(60),
     });
@@ -378,4 +378,398 @@ fn production_escalation_syncs_the_commit_log_and_aborts_with_context() {
 
 fn libc_sigabrt() -> i32 {
     6
+}
+
+// ---------------------------------------------------------------------------
+// P0-6 (t_88479cda): the commit log's fsync thread is supervised
+// ---------------------------------------------------------------------------
+
+use ferrosa_storage::commitlog::SyncHealthSnapshot;
+
+fn healthy_sync() -> SyncHealthSnapshot {
+    SyncHealthSnapshot {
+        has_sync_thread: true,
+        dead: false,
+        failing: false,
+        panics: 0,
+        sync_failures: 0,
+        restarts: 0,
+        unsynced_for: None,
+        stall_deadline: Duration::from_secs(2),
+        last_failure: None,
+    }
+}
+
+/// A sync thread whose health the test sets; a restart revives it.
+struct FakeSync {
+    health: ArcSwap<SyncHealthSnapshot>,
+    restarts: AtomicU64,
+}
+
+impl FakeSync {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            health: ArcSwap::from_pointee(healthy_sync()),
+            restarts: AtomicU64::new(0),
+        })
+    }
+
+    fn set(&self, update: impl FnOnce(&mut SyncHealthSnapshot)) {
+        let mut next = self.health.load_full().as_ref().clone();
+        update(&mut next);
+        self.health.store(Arc::new(next));
+    }
+}
+
+impl CommitLogSyncTarget for FakeSync {
+    fn sync_health(&self) -> SyncHealthSnapshot {
+        self.health.load_full().as_ref().clone()
+    }
+
+    fn restart_sync(&self) -> ferrosa_common::Result<bool> {
+        if !self.health.load().dead {
+            return Ok(false);
+        }
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+        self.set(|h| {
+            h.dead = false;
+            h.restarts += 1;
+        });
+        Ok(true)
+    }
+}
+
+use arc_swap::ArcSwap;
+
+fn sync_supervisor<T: CommitLogSyncTarget>(
+    target: Arc<T>,
+    max_restarts: u32,
+) -> (
+    CommitLogSyncSupervisor<T>,
+    Arc<SupervisionStatus>,
+    Arc<AtomicU64>,
+) {
+    let status = Arc::new(SupervisionStatus::default());
+    let escalations = Arc::new(AtomicU64::new(0));
+    let supervisor = CommitLogSyncSupervisor::new(
+        target,
+        status.clone(),
+        intensity(max_restarts),
+        Arc::new(EscalationPolicy::Record(escalations.clone())),
+    );
+    (supervisor, status, escalations)
+}
+
+fn metrics(status: &SupervisionStatus) -> String {
+    let mut out = String::new();
+    status.render_prometheus(&mut out);
+    out
+}
+
+#[test]
+fn a_dead_commit_log_sync_thread_is_reported_restarted_and_recovers() {
+    let target = FakeSync::new();
+    let (mut supervisor, status, escalations) = sync_supervisor(target.clone(), 3);
+    supervisor.check();
+    assert!(status.impaired().is_empty(), "healthy at start");
+
+    target.set(|h| {
+        h.dead = true;
+        h.panics = 1;
+        h.unsynced_for = Some(Duration::from_millis(5));
+        h.last_failure = Some("commitlog-periodic-sync panicked: boom".into());
+    });
+    supervisor.check();
+
+    assert_eq!(target.restarts.load(Ordering::SeqCst), 1, "restarted");
+    assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Panic), 1);
+    assert_eq!(status.restarts(Child::CommitLogSync), 1);
+    let impaired = status.impaired();
+    assert_eq!(impaired.len(), 1, "{impaired:?}");
+    assert_eq!(impaired[0].0, "commitlog_sync");
+    assert!(impaired[0].1.contains("boom"), "{impaired:?}");
+    let text = metrics(&status);
+    assert!(
+        text.contains("ferrosa_supervised_task_up{task=\"commitlog_sync\"} 0\n"),
+        "readiness and the metric flip while the restarted thread has not synced: {text}"
+    );
+    assert!(
+        text.contains(
+            "ferrosa_supervised_task_failures_total{task=\"commitlog_sync\",kind=\"panic\"} 1\n"
+        ),
+        "{text}"
+    );
+
+    // The restarted thread syncs what the dead one left.
+    target.set(|h| h.unsynced_for = None);
+    supervisor.check();
+    assert!(status.impaired().is_empty(), "recovered");
+    assert!(metrics(&status).contains("ferrosa_supervised_task_up{task=\"commitlog_sync\"} 1\n"));
+    assert_eq!(escalations.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_stalled_commit_log_sync_counts_one_stall_per_deadline_and_escalates() {
+    let target = FakeSync::new();
+    let (mut supervisor, status, escalations) = sync_supervisor(target.clone(), 2);
+
+    target.set(|h| h.unsynced_for = Some(Duration::from_millis(2500)));
+    supervisor.check();
+    assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Stall), 1);
+    assert!(
+        status.impaired()[0]
+            .1
+            .contains("past the 2000ms stall deadline"),
+        "{:?}",
+        status.impaired()
+    );
+    supervisor.check();
+    assert_eq!(
+        status.failures(Child::CommitLogSync, FailureKind::Stall),
+        1,
+        "the same deadline is not counted twice"
+    );
+    assert_eq!(
+        target.restarts.load(Ordering::SeqCst),
+        0,
+        "a stall is not a death"
+    );
+
+    target.set(|h| h.unsynced_for = Some(Duration::from_millis(6100)));
+    supervisor.check();
+    assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Stall), 3);
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        1,
+        "three stalls exceed max_restarts=2"
+    );
+    assert!(
+        !status.impaired().is_empty(),
+        "an escalated child stays impaired"
+    );
+}
+
+#[test]
+fn commit_log_sync_deaths_past_the_intensity_escalate_without_a_restart() {
+    let target = FakeSync::new();
+    let (mut supervisor, _status, escalations) = sync_supervisor(target.clone(), 1);
+    for death in 1..=2u64 {
+        target.set(|h| {
+            h.dead = true;
+            h.panics = death;
+        });
+        supervisor.check();
+    }
+    assert_eq!(escalations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        target.restarts.load(Ordering::SeqCst),
+        1,
+        "the death that exceeds the intensity escalates instead of restarting"
+    );
+}
+
+#[test]
+fn a_failing_commit_log_fsync_is_impaired_until_one_succeeds() {
+    let target = FakeSync::new();
+    let (mut supervisor, status, escalations) = sync_supervisor(target.clone(), 1);
+    target.set(|h| {
+        h.failing = true;
+        h.sync_failures = 4;
+        h.unsynced_for = Some(Duration::from_millis(20));
+        h.last_failure = Some("fsync failed: EIO".into());
+    });
+    supervisor.check();
+    assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Error), 1);
+    assert!(status.impaired()[0].1.contains("EIO"));
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        0,
+        "an error alone is not a crash"
+    );
+
+    target.set(|h| {
+        h.failing = false;
+        h.unsynced_for = None;
+    });
+    supervisor.check();
+    assert!(status.impaired().is_empty());
+}
+
+/// End to end against the real commit log in its production mode
+/// (Periodic): a panicked sync thread refuses writes, the supervisor reports
+/// it and restarts it, and acks resume with every acked write on disk.
+#[test]
+fn the_supervisor_restarts_a_real_dead_commit_log_sync_thread() {
+    use ferrosa_storage::commitlog::{CommitLog, CommitLogConfig, Mutation, SyncStrategyConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(
+        CommitLog::new(CommitLogConfig {
+            segment_size: 1024 * 1024,
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: Duration::from_millis(5),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        })
+        .unwrap(),
+    );
+    let mutation = |table: &str| {
+        Mutation::new(
+            "ks".into(),
+            table.into(),
+            ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"k".to_vec())),
+            Vec::new(),
+            1,
+        )
+    };
+    let wait = |what: &str, condition: &dyn Fn() -> bool| {
+        let started = Instant::now();
+        while !condition() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "timed out: {what}"
+            );
+            std::thread::yield_now();
+        }
+    };
+    let (mut supervisor, status, escalations) = sync_supervisor(log.clone(), 3);
+
+    log.append(&mutation("before")).unwrap();
+    log.inject_sync_panic();
+    log.append(&mutation("wakes_the_panic")).unwrap();
+    wait("the sync thread to die", &|| log.sync_health().dead);
+    let refused = log.append(&mutation("while_dead"));
+    assert!(
+        matches!(
+            refused,
+            Err(ferrosa_common::Error::CommitLogNotDurable { .. })
+        ),
+        "{refused:?}"
+    );
+
+    supervisor.check();
+    assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Panic), 1);
+    assert_eq!(status.restarts(Child::CommitLogSync), 1);
+    assert!(
+        !log.sync_health().dead,
+        "the supervisor restarted the thread"
+    );
+
+    log.append(&mutation("after_restart"))
+        .expect("acks resume after the supervised restart");
+    wait("the restarted thread to sync", &|| {
+        log.sync_health().unsynced_for.is_none()
+    });
+    supervisor.check();
+    assert!(status.impaired().is_empty(), "{:?}", status.impaired());
+    assert_eq!(escalations.load(Ordering::SeqCst), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The flush window survives a loop restart; a hung loop is seen from outside
+// ---------------------------------------------------------------------------
+
+/// Before, each maintenance-loop incarnation built a fresh flush supervisor
+/// with a fresh window, so a flush that panicked and took the loop with it
+/// never reached the intensity.
+#[tokio::test]
+async fn the_flush_restart_window_survives_a_maintenance_loop_restart() {
+    let status = Arc::new(SupervisionStatus::default());
+    let escalations = Arc::new(AtomicU64::new(0));
+    let window = IntensityWindow::new(intensity(3));
+    let escalation = Arc::new(EscalationPolicy::Record(escalations.clone()));
+    let incarnation = || {
+        FlushSupervisor::with_window(
+            status.clone(),
+            window.clone(),
+            Duration::from_secs(30),
+            escalation.clone(),
+        )
+    };
+
+    let mut first = incarnation();
+    first.run("storage-flush", || panic!("p1")).await;
+    first.run("storage-flush", || panic!("p2")).await;
+    let mut second = incarnation();
+    second.run("storage-flush", || panic!("p3")).await;
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        0,
+        "3 panics are within 3"
+    );
+    second.run("storage-flush", || panic!("p4")).await;
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        1,
+        "the 4th panic counts the 3 from before the loop restarted"
+    );
+}
+
+fn watchdog(
+    max_restarts: u32,
+    deadline: Duration,
+) -> (
+    MaintenanceWatchdog,
+    Arc<Heartbeat>,
+    Arc<SupervisionStatus>,
+    Arc<AtomicU64>,
+) {
+    let heartbeat = Arc::new(Heartbeat::new());
+    let status = Arc::new(SupervisionStatus::default());
+    let escalations = Arc::new(AtomicU64::new(0));
+    let watchdog = MaintenanceWatchdog::new(
+        heartbeat.clone(),
+        deadline,
+        status.clone(),
+        intensity(max_restarts),
+        Arc::new(EscalationPolicy::Record(escalations.clone())),
+    );
+    (watchdog, heartbeat, status, escalations)
+}
+
+#[test]
+fn a_hung_maintenance_loop_is_a_stall_per_deadline_and_escalates() {
+    let (mut watchdog, heartbeat, status, escalations) = watchdog(2, Duration::from_secs(10));
+    let t0 = Instant::now();
+    heartbeat.beat_at(t0);
+
+    watchdog.check(t0 + Duration::from_secs(9));
+    assert!(status.impaired().is_empty(), "inside the deadline");
+
+    watchdog.check(t0 + Duration::from_secs(21));
+    assert_eq!(
+        status.failures(Child::MaintenanceLoop, FailureKind::Stall),
+        2,
+        "two elapsed deadlines are two stalls"
+    );
+    let impaired = status.impaired();
+    assert_eq!(impaired[0].0, "maintenance_loop");
+    assert!(impaired[0].1.contains("watchdog deadline"), "{impaired:?}");
+    watchdog.check(t0 + Duration::from_secs(22));
+    assert_eq!(
+        status.failures(Child::MaintenanceLoop, FailureKind::Stall),
+        2,
+        "the same deadline is not counted twice"
+    );
+    assert_eq!(escalations.load(Ordering::SeqCst), 0);
+
+    watchdog.check(t0 + Duration::from_secs(30));
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        1,
+        "a third stall exceeds max_restarts=2"
+    );
+}
+
+#[test]
+fn a_maintenance_loop_that_beats_again_recovers() {
+    let (mut watchdog, heartbeat, status, escalations) = watchdog(5, Duration::from_secs(10));
+    let t0 = Instant::now();
+    heartbeat.beat_at(t0);
+    watchdog.check(t0 + Duration::from_secs(15));
+    assert!(!status.impaired().is_empty());
+
+    heartbeat.beat_at(t0 + Duration::from_secs(16));
+    watchdog.check(t0 + Duration::from_secs(17));
+    assert!(status.impaired().is_empty(), "the loop made progress");
+    assert_eq!(escalations.load(Ordering::SeqCst), 0);
 }

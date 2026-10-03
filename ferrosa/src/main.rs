@@ -1032,18 +1032,6 @@ fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
     load_or_generate_host_id_with(data_dir, std::env::var("FERROSA_HOST_ID").ok())
 }
 
-/// Adapts the live [`PeerManager`](ferrosa_net::peer::PeerManager) into the
-/// self-heal [`PeerHealthProbe`](ferrosa_storage::self_heal::PeerHealthProbe) so
-/// the controller's replica posture reflects currently-reachable peers at each
-/// tick (a healthy peer present ⇒ corrupt SSTables may be quarantined).
-struct LivePeerHealth(std::sync::Arc<ferrosa_net::peer::PeerManager>);
-
-impl ferrosa_storage::self_heal::PeerHealthProbe for LivePeerHealth {
-    fn healthy_peer_count(&self) -> usize {
-        self.0.live_peer_ids().len()
-    }
-}
-
 /// Core implementation that accepts an explicit host_id override.
 /// Avoids process-global env var mutation in tests.
 fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) -> Uuid {
@@ -2281,30 +2269,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_pm.run_heartbeat_loop().await;
     });
 
-    // 6c. Self-healing controller: deterministic autonomous quarantine of
-    // corrupt SSTables. Spawned here (after the PeerManager) so the replica
-    // posture reflects LIVE membership: with a healthy peer reachable, a node
-    // quarantines its OWN local corrupt generations — moving them out of the
-    // active set so they stop being re-detected (and re-logged) every tick;
-    // isolated, it leaves them in place (FMEA #1: never quarantine a possibly-
-    // only copy). Quarantine only moves files, never deletes. Gated by
-    // FERROSA_SELFHEAL_ENABLED (default on). Startup smoke-test warnings fire
-    // independently of this controller.
-    {
-        let selfheal_cfg = ferrosa_storage::self_heal::SelfHealConfig::from_env();
-        let peer_probe: std::sync::Arc<dyn ferrosa_storage::self_heal::PeerHealthProbe> =
-            std::sync::Arc::new(LivePeerHealth(peer_manager.clone()));
-        let cluster_view: std::sync::Arc<dyn ferrosa_storage::self_heal::ClusterView> =
-            std::sync::Arc::new(ferrosa_storage::self_heal::ReplicaAwareClusterView::new(
-                ferrosa_cluster::raft::uuid_to_node_id(host_id),
-                peer_probe,
-            ));
-        ferrosa_storage::self_heal::SelfHealController::spawn(
-            storage.clone(),
-            cluster_view,
-            selfheal_cfg,
-        );
-    }
+    // 6c. The self-healing controller is spawned ONCE, below with the repair
+    // wiring, behind the verified-healthy-replica view. A second controller
+    // used to start here as well (t_396d4c80): two controllers scanned every
+    // table and acted on the same corrupt generations, and this one gated
+    // quarantine on peer LIVENESS, not on a peer proven to hold a good copy
+    // (FMEA #1).
 
     // 7. Start internode RPC server with inbound peer callback
     let rpc_server = Arc::new(
@@ -3183,6 +3153,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Supervised (t_7681b32b): the loop is restarted if it panics or returns,
     // each flush runs as a supervised attempt, and past the restart intensity
     // the process syncs the commit log and aborts — see `supervisor`.
+    let maintenance_intensity = supervisor::RestartIntensity::from_env();
+    let flush_stall_deadline = std::time::Duration::from_secs(
+        supervisor::env_or(
+            "FERROSA_FLUSH_STALL_DEADLINE_SECS",
+            supervisor::DEFAULT_FLUSH_STALL_DEADLINE.as_secs(),
+        )
+        .max(1),
+    );
+    let maintenance_heartbeat = Arc::new(supervisor::Heartbeat::new());
     let maintenance_context = maintenance::MaintenanceContext {
         engine: storage.clone(),
         schema: schema.clone(),
@@ -3198,22 +3177,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             maintenance_last_schema_version(schema.snapshot().version),
         )),
         supervision: supervision_status.clone(),
-        intensity: supervisor::RestartIntensity::from_env(),
-        flush_stall_deadline: std::time::Duration::from_secs(
-            supervisor::env_or(
-                "FERROSA_FLUSH_STALL_DEADLINE_SECS",
-                supervisor::DEFAULT_FLUSH_STALL_DEADLINE.as_secs(),
-            )
-            .max(1),
-        ),
+        intensity: maintenance_intensity,
+        flush_stall_deadline,
         escalation: Arc::new(supervisor::EscalationPolicy::AbortProcess {
             engine: storage.clone(),
         }),
+        heartbeat: maintenance_heartbeat.clone(),
+        flush_window: supervisor::IntensityWindow::new(maintenance_intensity),
     };
     // The supervisor never returns: it restarts the loop or aborts the process.
     runtimes
         .background
         .spawn(maintenance::run_supervised(maintenance_context));
+
+    // A hang inside the loop (an await that never completes, a blocked GC)
+    // is invisible to `supervise`, which only sees panics and returns. The
+    // watchdog reads the loop's heartbeat from its own thread.
+    let maintenance_stall_deadline = std::time::Duration::from_secs(
+        supervisor::env_or(
+            "FERROSA_MAINTENANCE_STALL_DEADLINE_SECS",
+            supervisor::default_maintenance_stall_deadline(flush_stall_deadline).as_secs(),
+        )
+        .max(1),
+    );
+    supervisor::spawn_maintenance_watchdog(supervisor::MaintenanceWatchdog::new(
+        maintenance_heartbeat,
+        maintenance_stall_deadline,
+        supervision_status.clone(),
+        maintenance_intensity,
+        Arc::new(supervisor::EscalationPolicy::AbortProcess {
+            engine: storage.clone(),
+        }),
+    ))?;
+
+    // P0-6 (t_88479cda): supervise the commit log's fsync thread. The commit
+    // log refuses writes on its own while the thread is dead or behind; this
+    // restarts it, reports it on /readyz and the metrics, and escalates past
+    // the intensity. The watcher runs under `supervise` so a panic in the
+    // watcher itself is a counted, restarted failure, not a silent end.
+    {
+        let storage = storage.clone();
+        let status = supervision_status.clone();
+        let intensity = supervisor::RestartIntensity::from_env();
+        let escalation = Arc::new(supervisor::EscalationPolicy::AbortProcess {
+            engine: storage.clone(),
+        });
+        runtimes.background.spawn(supervisor::supervise(
+            supervisor::Child::CommitLogSync,
+            status.clone(),
+            intensity,
+            escalation.clone(),
+            move || {
+                supervisor::run_commit_log_sync_supervisor(
+                    supervisor::CommitLogSyncSupervisor::new(
+                        storage.clone(),
+                        status.clone(),
+                        intensity,
+                        escalation.clone(),
+                    ),
+                    supervisor::COMMIT_LOG_SYNC_POLL,
+                )
+            },
+        ));
+    }
 
     // 13. Wait for shutdown signal (SIGINT or SIGTERM)
     //
@@ -3324,6 +3350,20 @@ fn seeds_to_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// t_396d4c80: `main` spawned two self-heal controllers, one gated on
+    /// mere peer liveness. Startup is imperative code with no other seam to
+    /// test it through, so this guards the source.
+    #[test]
+    fn main_spawns_exactly_one_self_heal_controller() {
+        let source = include_str!("main.rs");
+        let spawns = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains(concat!("SelfHealController", "::spawn")))
+            .count();
+        assert_eq!(spawns, 1, "main must start one self-heal controller");
+    }
 
     fn udf_toml(v: &str) -> toml::Value {
         format!("[udf]\nmax_memory_bytes = {v}\n").parse().unwrap()

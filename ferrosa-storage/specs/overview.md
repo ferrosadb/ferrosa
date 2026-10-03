@@ -143,8 +143,13 @@ volume or changing query results.
 3. **Cell-level last-write-wins everywhere.** Memtable merge-on-write, read-path
    merge, and compaction all resolve conflicts by `(column_index, timestamp)`;
    tombstones (partition/row/cell) suppress older data by `marked_for_delete_at`.
-4. **Durability is governed by the sync strategy.** Only `Batch` fsyncs every
-   write; the **default `Periodic`** has a bounded loss window (`sync_interval`).
+4. **Durability is governed by the sync strategy.** `Batch` fsyncs every
+   write and `Group` makes the writer wait for its fsync; the **default
+   `Periodic`** acknowledges before the fsync, bounded by refusal: a write
+   gets `Error::CommitLogNotDurable` instead of an ack when the sync thread
+   is dead, the last fsync failed, or the oldest unsynced write is older than
+   `sync_stall_deadline` (2 s). A crash therefore loses at most that window of
+   acknowledged writes (`max_delay`, 10 ms, while healthy). See FMEA ST-71.
 5. **Index registration is replay-safe and complete for live rows.** Repeating
    the same index declaration preserves the active memtable index and its
    unflushed postings; a conflicting column position or index type fails loud

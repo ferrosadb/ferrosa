@@ -3293,9 +3293,33 @@ impl StorageEngine {
                 );
 
                 // Spawn background archiver task.
+                // Each segment runs inside a panic boundary: before, one
+                // panic ended this task, and every later rotation's notify
+                // failed (now counted by `archive_notify_dropped_total`).
                 let handle = rt.spawn(async move {
                     while let Some(segment_id) = rx.recv().await {
-                        match archiver.archive_segment(segment_id).await {
+                        let archived = futures::FutureExt::catch_unwind(
+                            std::panic::AssertUnwindSafe(archiver.archive_segment(segment_id)),
+                        )
+                        .await;
+                        let archived = match archived {
+                            Ok(archived) => archived,
+                            Err(payload) => {
+                                let message = payload
+                                    .downcast_ref::<&str>()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                                tracing::error!(
+                                    segment_id,
+                                    panic = %message,
+                                    "commitlog-archiver: archiving a segment panicked; it is not \
+                                     archived and the archiver continues"
+                                );
+                                continue;
+                            }
+                        };
+                        match archived {
                             Ok(result) => {
                                 // Update manifest.
                                 let entry = crate::commitlog::manifest::ArchiveSegmentEntry {
@@ -8816,9 +8840,11 @@ impl StorageEngine {
         }
 
         // Phase 1: Append all mutations to the commit log, tracking positions.
+        // Sync health must not refuse an append partway (that would leave a
+        // torn prefix); the force_sync below is this batch's durability.
         let mut positions: HashMap<TableId, CommitLogPosition> = HashMap::new();
         for m in &mutations {
-            let cl_pos = self.commit_log.append(m)?;
+            let cl_pos = self.commit_log.append_for_explicit_sync(m)?;
             let table_id = TableId::new(&m.keyspace, &m.table);
             positions.insert(table_id, cl_pos);
         }
@@ -10361,6 +10387,23 @@ impl StorageEngine {
     /// the commit log (e.g., for catch-up replay after failover).
     pub fn force_commit_log_sync(&self) -> ferrosa_common::Result<()> {
         self.commit_log.force_sync()
+    }
+
+    /// Health of the commit-log sync thread, for the node supervisor.
+    pub fn commit_log_sync_health(&self) -> crate::commitlog::SyncHealthSnapshot {
+        self.commit_log.sync_health()
+    }
+
+    /// Replace a dead commit-log sync thread. `Ok(false)` when there was
+    /// nothing to restart.
+    pub fn restart_commit_log_sync(&self) -> ferrosa_common::Result<bool> {
+        self.commit_log.restart_sync()
+    }
+
+    /// Make the commit-log sync thread panic at its next sync attempt.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_commit_log_sync_panic(&self) {
+        self.commit_log.inject_sync_panic();
     }
 
     /// Flushes the active memtable for a table to an SSTable on disk.

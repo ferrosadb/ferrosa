@@ -732,8 +732,24 @@ impl CompactionExecutor {
                         };
                         crate::metrics::inc_compaction_running();
                         let task_start = Instant::now();
-                        let result =
-                            Self::execute_task_routed(&task, reader_pool.as_ref(), &cancel);
+                        // A panic is this task's failure, not the worker's
+                        // (t_8aae3ed7): it takes the Err path below, which
+                        // releases the input claims. Before, the panic ended
+                        // the thread with the claims held, so the table never
+                        // drained and TRUNCATE/DROP waited forever; the
+                        // worker's queued tasks leaked their claims too.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || Self::execute_task_routed(&task, reader_pool.as_ref(), &cancel),
+                        ))
+                        .unwrap_or_else(|payload| {
+                            crate::metrics::inc_compaction_panics();
+                            let message = payload
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "non-string panic payload".to_string());
+                            Err(format!("compaction panicked: {message}"))
+                        });
                         crate::metrics::dec_compaction_running();
                         drop(permit);
                         match result {
@@ -2467,6 +2483,46 @@ mod tests {
         executor.release_task_inputs(&task);
         assert!(executor.tracker.try_register(&task, &ticket).is_some());
         executor.release_task_inputs(&task);
+        executor.shutdown();
+    }
+
+    /// t_8aae3ed7: a compaction that panics must release its input claims.
+    /// Before, the panic killed the worker thread with the claims held, so
+    /// the table never drained and TRUNCATE / DROP waited on it forever.
+    #[test]
+    fn a_panicking_compaction_releases_its_input_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = real_compaction_task(tmp.path());
+        // A table no other test uses: the hook below is keyed by table id.
+        task.table_id = crate::TableId::new("panic_ks", "panic_compaction");
+        let table = task.table_id.clone();
+        let executor = CompactionExecutor::new();
+        let hook = crate::compaction::cancel_harness::CancelHookGuard::install(
+            table.to_string(),
+            Arc::new(|_| panic!("injected compaction panic")),
+        );
+        let failed_before = crate::metrics::compaction_panics_total();
+
+        assert!(executor.try_submit(task.clone()).unwrap());
+        let started = Instant::now();
+        while executor.table_has_tasks(&table) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "a panicked compaction leaked its input claims"
+            );
+            std::thread::yield_now();
+        }
+        assert!(crate::metrics::compaction_panics_total() > failed_before);
+        drop(hook);
+
+        assert!(
+            executor.try_submit(task).unwrap(),
+            "the inputs are claimable again"
+        );
+        assert!(
+            executor.await_result_available(std::time::Duration::from_secs(30)),
+            "the same inputs compact once the panic is gone"
+        );
         executor.shutdown();
     }
 

@@ -69,7 +69,8 @@ use checkpoint::CommitLogCheckpoint;
 use config::CommitLogConfig as Config;
 use reader::SegmentReader;
 use segment::Segment;
-use sync::{BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
+pub use sync::SyncHealthSnapshot;
+use sync::{AckPolicy, BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
 
 static COMMITLOG_APPENDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMMITLOG_APPEND_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -112,6 +113,14 @@ fn observe_duration(total: &AtomicU64, max: &AtomicU64, duration: Duration) {
 /// if this rises rapidly (indicates pathological roll-then-crash behaviour);
 /// a small steady-state count is expected on hard kills (OOM, host reboot).
 pub static EMPTY_SEGMENT_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Closed segments the archiver was never told about (queue full or archiver
+/// stopped). Each is missing from PITR and, with archiving on, never deleted.
+static ARCHIVE_NOTIFY_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn archive_notify_dropped_total() -> u64 {
+    ARCHIVE_NOTIFY_DROPPED_TOTAL.load(Ordering::Relaxed)
+}
 
 /// Reads the `EMPTY_SEGMENT_SKIPPED_TOTAL` counter.
 pub fn empty_segment_skipped_total() -> u64 {
@@ -318,6 +327,18 @@ pub fn render_prometheus() -> String {
         "ferrosa_commitlog_periodic_idle_flushes_skipped_total {}\n",
         sync::periodic_idle_flush_skipped_total()
     ));
+    out.push_str("# HELP ferrosa_commitlog_archive_notify_dropped_total Closed commit-log segments never handed to the PITR archiver (queue full or archiver stopped).\n");
+    out.push_str("# TYPE ferrosa_commitlog_archive_notify_dropped_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_archive_notify_dropped_total {}\n",
+        ARCHIVE_NOTIFY_DROPPED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_commitlog_not_durable_refusals_total Writes refused because the commit log could not make them durable (sync thread dead, fsync failing, or past the stall deadline).\n");
+    out.push_str("# TYPE ferrosa_commitlog_not_durable_refusals_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_not_durable_refusals_total {}\n",
+        sync::refused_writes_total()
+    ));
     out.push_str("# HELP ferrosa_commitlog_sync_batches_total Commit-log sync batches flushed.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_batches_total counter\n");
     out.push_str(&format!(
@@ -465,7 +486,7 @@ impl CommitLog {
         let active = Arc::new(ArcSwap::from(first_segment));
 
         let sync_strategy = Self::create_sync_strategy(&config, Arc::clone(&active));
-        sync_strategy.start();
+        sync_strategy.start()?;
 
         Ok(Self {
             config,
@@ -750,7 +771,32 @@ impl CommitLog {
     /// 2. Try to allocate space in the segment (lock-free CAS).
     /// 3. If the segment is full, rotate and retry.
     /// 4. Write the entry, update dirty tracking, notify sync strategy.
+    ///
+    /// `Err(CommitLogNotDurable)` means the sync machinery cannot stand
+    /// behind an acknowledgement (see `sync`): the entry may still reach disk,
+    /// so the write's outcome is unknown and the caller must not ack it.
     pub fn append(&self, mutation: &Mutation) -> ferrosa_common::Result<CommitLogPosition> {
+        self.append_with(mutation, AckPolicy::Durable)
+    }
+
+    /// Appends a mutation that the caller will make durable itself with
+    /// [`force_sync`](Self::force_sync) before acknowledging anything.
+    ///
+    /// Sync health cannot refuse it, so a multi-entry batch cannot be refused
+    /// partway and leave a torn prefix; the batch's `force_sync` is the
+    /// durability barrier instead.
+    pub fn append_for_explicit_sync(
+        &self,
+        mutation: &Mutation,
+    ) -> ferrosa_common::Result<CommitLogPosition> {
+        self.append_with(mutation, AckPolicy::CallerSyncs)
+    }
+
+    fn append_with(
+        &self,
+        mutation: &Mutation,
+        ack: AckPolicy,
+    ) -> ferrosa_common::Result<CommitLogPosition> {
         // DEBUG-level span so it costs nothing at the default INFO filter.
         let _span = tracing::debug_span!(
             "commitlog.write",
@@ -828,15 +874,18 @@ impl CommitLog {
             mark_dirty_start.elapsed(),
         );
 
-        // Notify sync strategy.
+        // Notify sync strategy. A refusal means the write is not durable:
+        // return it before CDC announces the write as done.
         let sync_notify_start = Instant::now();
-        self.sync_strategy
-            .on_write(&segment, offset, total_size as u64);
+        let synced = self
+            .sync_strategy
+            .on_write(&segment, offset, total_size as u64, ack);
         observe_duration(
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL,
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX,
             sync_notify_start.elapsed(),
         );
+        synced?;
 
         // CDC: publish the local change-data-capture event after the write is
         // durable in the segment buffer (WrittenOnNode stream).
@@ -927,13 +976,15 @@ impl CommitLog {
             mark_dirty_start.elapsed(),
         );
         let sync_notify_start = Instant::now();
-        self.sync_strategy
-            .on_write(&segment, offset, total_size as u64);
+        let synced =
+            self.sync_strategy
+                .on_write(&segment, offset, total_size as u64, AckPolicy::Durable);
         observe_duration(
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL,
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX,
             sync_notify_start.elapsed(),
         );
+        synced?;
 
         // CDC: publish the local change-data-capture event (WrittenOnNode).
         self.emit_written_on_node(
@@ -1177,9 +1228,23 @@ impl CommitLog {
         closed.push(old_segment);
         drop(closed);
 
-        // Notify archiver of the closed segment (non-blocking).
+        // Notify archiver of the closed segment (non-blocking). A segment the
+        // archiver never hears about is never archived, and with archiving
+        // on, never deleted either; this used to be dropped silently.
         if let Some(tx) = &self.archive_tx {
-            let _ = tx.try_send(old_id);
+            if let Err(e) = tx.try_send(old_id) {
+                ARCHIVE_NOTIFY_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let why = match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "archiver queue full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "archiver stopped",
+                };
+                tracing::error!(
+                    segment_id = old_id,
+                    why,
+                    "commitlog: closed segment not handed to the archiver; it will not be \
+                     archived and stays on disk"
+                );
+            }
         }
 
         Ok(())
@@ -1312,6 +1377,23 @@ impl CommitLog {
         // backwards patch made this quadratic in the bytes already
         // accumulated, on a path that runs per Accord apply.
         segment.flush_to_disk_repairing_marker(prev_marker_offset)
+    }
+
+    /// Health of the sync machinery, for the node supervisor and metrics.
+    pub fn sync_health(&self) -> SyncHealthSnapshot {
+        self.sync_strategy.health()
+    }
+
+    /// Replace a dead sync thread; the new thread first fsyncs what the dead
+    /// one left. `Ok(false)` when there was nothing to restart.
+    pub fn restart_sync(&self) -> ferrosa_common::Result<bool> {
+        self.sync_strategy.restart()
+    }
+
+    /// Make the sync thread panic at its next sync attempt.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_sync_panic(&self) {
+        self.sync_strategy.inject_panic();
     }
 
     /// Shuts down the commit log cleanly.
@@ -2636,6 +2718,103 @@ mod tests {
             replayed.len(),
             THREADS * ROUNDS
         );
+        cl.shutdown().unwrap();
+    }
+
+    /// A closed segment the archiver cannot be told about is counted and
+    /// logged, not dropped silently (t_396d4c80).
+    #[test]
+    fn a_segment_the_archiver_never_hears_about_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cl = CommitLog::new(CommitLogConfig::test_config(dir.path())).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1);
+        drop(rx);
+        cl.set_archive_channel(tx);
+        let before = archive_notify_dropped_total();
+        cl.force_rotate().unwrap();
+        assert!(
+            archive_notify_dropped_total() > before,
+            "the stopped archiver missed a segment"
+        );
+        cl.shutdown().unwrap();
+    }
+
+    /// P0-6 (t_88479cda): the production Periodic strategy, end to end.
+    ///
+    /// A dead sync thread must stop acknowledgements at once, and after a
+    /// restart every write that WAS acknowledged must be in the segment file
+    /// on disk — read straight from the file, the way a crash would see it,
+    /// before any shutdown flush could paper over a missing sync.
+    #[test]
+    fn acked_appends_reach_disk_across_a_sync_thread_panic_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 1024 * 1024,
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: Duration::from_millis(5),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+        let path = cl.active.load().path().to_path_buf();
+        let mut acked: Vec<String> = Vec::new();
+        let append = |table: &str, acked: &mut Vec<String>| {
+            let result = cl.append(&mutation_for_table("ks", table));
+            if result.is_ok() {
+                acked.push(table.to_string());
+            }
+            result
+        };
+
+        append("before", &mut acked).expect("healthy sync acknowledges");
+        cl.inject_sync_panic();
+        // Wakes the thread into its panic; acknowledged inside the window.
+        append("racing_the_panic", &mut acked).expect("the thread was alive");
+        let started = Instant::now();
+        while !cl.sync_health().dead {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the sync thread never died"
+            );
+            std::thread::yield_now();
+        }
+        match append("while_dead", &mut acked) {
+            Err(ferrosa_common::Error::CommitLogNotDurable { reason }) => {
+                assert!(reason.contains("sync thread died"), "{reason}")
+            }
+            other => panic!("a dead sync thread must refuse the write, got {other:?}"),
+        }
+
+        assert!(cl.restart_sync().unwrap(), "the dead thread is replaced");
+        append("after_restart", &mut acked).expect("acks resume after the restart");
+        let started = Instant::now();
+        while cl.sync_health().unsynced_for.is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the restarted thread never synced: {:?}",
+                cl.sync_health()
+            );
+            std::thread::yield_now();
+        }
+
+        let on_disk: std::collections::HashSet<String> = SegmentReader::open(&path)
+            .unwrap()
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| m.table)
+            .collect();
+        assert_eq!(
+            acked,
+            ["before", "racing_the_panic", "after_restart"],
+            "exactly the writes made while the thread lived were acknowledged"
+        );
+        for table in &acked {
+            assert!(
+                on_disk.contains(table),
+                "acknowledged write {table} is missing from the commit log on disk: {on_disk:?}"
+            );
+        }
         cl.shutdown().unwrap();
     }
 }
