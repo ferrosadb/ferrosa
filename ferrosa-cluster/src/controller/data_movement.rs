@@ -21,11 +21,9 @@
 //!   recorded and the node stays `Joining`. The restart promote pass only
 //!   promotes recorded joiners, and reruns this for an unrecorded local one.
 
-use std::collections::BTreeMap;
-
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::TableId;
@@ -179,10 +177,24 @@ impl DecommissionPlan {
         Ok(after.into_iter().filter(|n| !before.contains(n)).collect())
     }
 
-    /// Ring ranges (by their end token) the leaving node replicates under
-    /// `strategy`. Reported as evidence: every one of them is covered by the
-    /// transfer, whether or not it holds data.
-    pub fn replicated_ranges(&self, strategy: &ReplicationStrategy) -> u64 {
+    /// Every node that receives data for `table` when the node leaves: the
+    /// union of [`Self::targets`] over the ring ranges (replica sets are
+    /// constant within a range, so a range's end token stands for all of it).
+    /// A range the leaving node replicates that would be left with no replica
+    /// is an error even if it holds no data.
+    pub fn range_targets(
+        &self,
+        table: &TableId,
+        strategy: &ReplicationStrategy,
+    ) -> std::result::Result<std::collections::BTreeSet<u64>, DataMovementError> {
+        let mut out = std::collections::BTreeSet::new();
+        for end in self.range_ends() {
+            out.extend(self.targets(table, end, strategy)?);
+        }
+        Ok(out)
+    }
+
+    fn range_ends(&self) -> Vec<i64> {
         let mut ends: Vec<i64> = self
             .before
             .node_ids()
@@ -191,7 +203,15 @@ impl DecommissionPlan {
             .collect();
         ends.sort_unstable();
         ends.dedup();
-        ends.into_iter()
+        ends
+    }
+
+    /// Ring ranges (by their end token) the leaving node replicates under
+    /// `strategy`. Reported as evidence: every one of them is covered by the
+    /// transfer, whether or not it holds data.
+    pub fn replicated_ranges(&self, strategy: &ReplicationStrategy) -> u64 {
+        self.range_ends()
+            .into_iter()
             .filter(|&t| {
                 self.before
                     .replicas_for_strategy(t, strategy)
@@ -203,6 +223,13 @@ impl DecommissionPlan {
 
 /// Stream every local partition of every table in `tables` to each node that
 /// becomes its replica when the plan's node leaves.
+///
+/// One pass over the table per receiving node, each pass moving partitions
+/// straight from the local scan into bounded batches of
+/// [`DECOMMISSION_BATCH_PARTITIONS`] for that node. Partitions are never
+/// copied for a second target and at most one batch is held at a time; the
+/// price is one extra local scan per additional target (at most RF of them
+/// per range).
 ///
 /// All-or-nothing: the first read error, stream error, rejected session or
 /// short apply returns an error and nothing further is sent. Batches already
@@ -220,25 +247,24 @@ where
     let mut evidence = DataMovementEvidence::default();
     for (table, strategy) in tables {
         evidence.ranges += plan.replicated_ranges(strategy);
-        let mut buffers: BTreeMap<u64, Vec<Partition>> = BTreeMap::new();
-        let mut partitions = scan(table);
-        while let Some(item) = partitions.next().await {
-            let partition = item.map_err(|e| DataMovementError::Read {
-                table: table.to_string(),
-                error: e.to_string(),
-            })?;
-            let targets = plan.targets(table, partition.key.token.0, strategy)?;
-            for target in targets {
-                let buffer = buffers.entry(target).or_default();
-                buffer.push(partition.clone());
-                if buffer.len() >= DECOMMISSION_BATCH_PARTITIONS {
-                    let batch = std::mem::take(buffer);
-                    send_verified(streamer, target, table, batch, &mut evidence).await?;
-                }
-            }
-        }
-        for (target, batch) in buffers {
-            if !batch.is_empty() {
+        for target in plan.range_targets(table, strategy)? {
+            let batches = scan(table)
+                .map(|item| {
+                    item.map_err(|e| DataMovementError::Read {
+                        table: table.to_string(),
+                        error: e.to_string(),
+                    })
+                })
+                .try_filter_map(|partition| {
+                    let keep = plan
+                        .targets(table, partition.key.token.0, strategy)
+                        .map(|targets| targets.contains(&target).then_some(partition));
+                    async move { keep }
+                })
+                .try_chunks(DECOMMISSION_BATCH_PARTITIONS);
+            futures::pin_mut!(batches);
+            while let Some(batch) = batches.next().await {
+                let batch = batch.map_err(|e| e.1)?;
                 send_verified(streamer, target, table, batch, &mut evidence).await?;
             }
         }
@@ -359,26 +385,23 @@ pub fn replicated_tables(
 /// deletions are p0-streaming-statics' work) lands here once.
 pub fn partition_to_streamed_mutation(
     table: &TableId,
-    partition: &Partition,
+    partition: Partition,
 ) -> std::result::Result<crate::streaming::StreamedMutation, String> {
     use crate::raft::handlers::RowWire;
-    let wire_rows: Vec<RowWire> = partition.rows.iter().cloned().map(RowWire::from).collect();
-    let row = bincode::serialize(&wire_rows).map_err(|e| {
-        format!(
-            "{table}: failed to encode partition {:?}: {e}",
-            partition.key
-        )
-    })?;
     let timestamp = partition
         .rows
         .first()
         .and_then(|r| r.cells.first())
         .map(|(_, cv)| cv.timestamp)
         .unwrap_or(0);
+    let Partition { key, rows, .. } = partition;
+    let wire_rows: Vec<RowWire> = rows.into_iter().map(RowWire::from).collect();
+    let row = bincode::serialize(&wire_rows)
+        .map_err(|e| format!("{table}: failed to encode partition {key:?}: {e}"))?;
     Ok(crate::streaming::StreamedMutation {
         keyspace: table.keyspace().to_string(),
         table: table.table().to_string(),
-        key: partition.key.key.as_bytes().to_vec(),
+        key: key.key.as_bytes().to_vec(),
         row,
         timestamp,
     })
@@ -407,7 +430,7 @@ impl PartitionStreamer for StreamSenderStreamer {
             .map(|n| n.host_id)
             .ok_or_else(|| format!("node {target} is not in the token ring"))?;
         let mutations = partitions
-            .iter()
+            .into_iter()
             .map(|p| partition_to_streamed_mutation(table, p))
             .collect::<std::result::Result<Vec<_>, String>>()?;
         let session_id = crate::streaming::new_session_id();
