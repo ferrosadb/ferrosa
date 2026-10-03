@@ -760,17 +760,22 @@ impl GraphEngine {
 
     /// The heal cell for `keyspace`, created on first use.
     fn adjacency_heal_cell(&self, keyspace: &str) -> Arc<tokio::sync::OnceCell<()>> {
-        if let Some(cell) = self.adjacency_heals.load().get(keyspace) {
-            return Arc::clone(cell);
+        if let Some(gate) = self.adjacency_heals.load().get(keyspace) {
+            return Arc::clone(gate);
         }
         let mut created = None;
-        self.adjacency_heals.rcu(|heals| {
-            let mut heals = HashMap::clone(heals);
-            let cell = heals
+        self.adjacency_heals.rcu(|gates| {
+            // Copy-on-write of the small keyspace -> gate map (one entry per
+            // graph keyspace), not of any row data.
+            let mut next: HashMap<String, Arc<tokio::sync::OnceCell<()>>> = gates
+                .iter()
+                .map(|(ks, gate)| (ks.clone(), Arc::clone(gate)))
+                .collect();
+            let gate = next
                 .entry(keyspace.to_string())
                 .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()));
-            created = Some(Arc::clone(cell));
-            heals
+            created = Some(Arc::clone(gate));
+            next
         });
         created.expect("rcu runs its closure at least once")
     }
