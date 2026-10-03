@@ -3650,3 +3650,93 @@ mod txn_buffer_tests {
         engine.shutdown().unwrap();
     }
 }
+
+/// Bind parameters are untrusted client bytes: whatever the format code, OID
+/// and payload, decoding returns a value or an error, never panics; and
+/// well-formed binary values decode to exactly what was encoded.
+#[cfg(test)]
+mod param_decode_proptest {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn oid() -> impl Strategy<Value = i32> {
+        prop_oneof![
+            proptest::sample::select(SUPPORTED_PARAM_OIDS.to_vec()),
+            Just(0),
+            any::<i32>(),
+        ]
+    }
+
+    /// Bytes shaped like text values the decoders actually parse, so the
+    /// numeric/date/bytea paths are reached, not only rejected as non-UTF-8.
+    fn text_like() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            "[-+]?[0-9]{0,40}(\\.[0-9]{0,40})?([eE][-+]?[0-9]{0,12})?",
+            "\\\\x[0-9a-fA-F]{0,64}",
+            "[0-9]{1,6}-[0-9]{1,3}-[0-9]{1,3}( [0-9]{1,2}:[0-9]{1,2}:[0-9]{1,2}(\\.[0-9]{0,9})?)?",
+            "[ -~]{0,64}",
+        ]
+        .prop_map(String::into_bytes)
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_parameters_never_panic(
+            format in -2i16..4,
+            type_oid in oid(),
+            raw in prop_oneof![proptest::collection::vec(any::<u8>(), 0..96), text_like()],
+            null in any::<bool>(),
+        ) {
+            let limits = crate::jsonb_wire::test_limits();
+            let bytes = (!null).then_some(raw.as_slice());
+            let _ = decode_param_checked(format, type_oid, bytes, &limits);
+        }
+
+        #[test]
+        fn binary_integers_round_trip(n in any::<i64>()) {
+            let limits = crate::jsonb_wire::test_limits();
+            let int8 = decode_param_checked(1, 20, Some(&n.to_be_bytes()), &limits).unwrap();
+            prop_assert!(matches!(int8, SqlValue::Int(v) if v == n));
+            let n4 = n as i32;
+            let int4 = decode_param_checked(1, 23, Some(&n4.to_be_bytes()), &limits).unwrap();
+            prop_assert!(matches!(int4, SqlValue::Int(v) if v == i64::from(n4)));
+            let n2 = n as i16;
+            let int2 = decode_param_checked(1, 21, Some(&n2.to_be_bytes()), &limits).unwrap();
+            prop_assert!(matches!(int2, SqlValue::Int(v) if v == i64::from(n2)));
+        }
+
+        #[test]
+        fn text_integers_round_trip_or_refuse_out_of_range(n in any::<i64>()) {
+            let limits = crate::jsonb_wire::test_limits();
+            let text = n.to_string();
+            for (oid, fits) in [
+                (20, true),
+                (23, i32::try_from(n).is_ok()),
+                (21, i16::try_from(n).is_ok()),
+            ] {
+                match decode_param_checked(0, oid, Some(text.as_bytes()), &limits) {
+                    Ok(SqlValue::Int(v)) => prop_assert!(fits && v == n, "oid {oid}: {v} from {n}"),
+                    Ok(other) => prop_assert!(false, "oid {oid}: {other:?} from {n}"),
+                    Err(_) => prop_assert!(!fits, "oid {oid} refused in-range {n}"),
+                }
+            }
+        }
+
+        /// A wrong-length binary value is refused, never truncated or padded.
+        #[test]
+        fn wrong_length_binary_is_refused(
+            type_oid in proptest::sample::select(vec![20i32, 23, 21, 700, 701, 2950, 1114, 1082, 1083]),
+            raw in proptest::collection::vec(any::<u8>(), 0..24),
+        ) {
+            let width = match type_oid {
+                20 | 701 | 1114 | 1083 => 8,
+                23 | 700 | 1082 => 4,
+                21 => 2,
+                _ => 16,
+            };
+            prop_assume!(raw.len() != width);
+            let limits = crate::jsonb_wire::test_limits();
+            prop_assert!(decode_param_checked(1, type_oid, Some(&raw), &limits).is_err());
+        }
+    }
+}
