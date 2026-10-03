@@ -183,17 +183,30 @@ async fn an_expired_cursor_is_deleted_and_its_paging_state_errors() {
     assert!(err.contains("no longer holds"), "{err}");
 }
 
-/// The connection that parked a cursor closes: the cursor goes with it.
+/// The connection that parked a cursor closes: the cursor survives the close
+/// grace (a driver whose connection broke retries the page elsewhere), then
+/// goes, and its paging state errors by name.
 #[tokio::test]
-async fn closing_the_connection_deletes_its_cursor() {
+async fn closing_the_connection_starts_the_grace_then_deletes_its_cursor() {
     let (state, _dir, auth, ks) = seed(400).await;
     let (select, token) = first_order_by_page(&state, &auth, &ks).await;
     let dirs = state.result_cursors.parked_spill_dirs();
     // `paging_ctx` leaves `client_address` empty; that is the owner key.
     assert_eq!(state.result_cursors.close_owner(""), 1);
+    assert!(dirs[0].exists(), "the close grace keeps the cursor");
+    let grace = state.result_cursors.config().close_grace;
+    let later = std::time::Instant::now() + grace + std::time::Duration::from_secs(1);
+    assert_eq!(state.result_cursors.sweep_expired_at(later), 1);
     assert!(!dirs[0].exists());
     let ctx = paging_ctx(&auth, &ks, Some(50), Some(token));
-    assert!(route_select_raw(&state, &ctx, &select).await.is_err());
+    let err = match route_select_raw(&state, &ctx, &select).await {
+        Ok(page) => panic!(
+            "a closed and expired cursor served {} rows",
+            page.rows.len()
+        ),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("no longer holds"), "{err}");
 }
 
 /// A paging state from before the cursor (an offset token from an older

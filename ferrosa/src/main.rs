@@ -2212,6 +2212,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ferrosa_net::codec::MsgType::RepairApplyRequest,
         Arc::new(ferrosa_cluster::RepairApplyHandler::new(storage.clone())),
     );
+    // CQL result cursors (paged ORDER BY / DISTINCT) live on the node that
+    // built them; peers forward a client's next-page request here.
+    let result_cursors = Arc::new(ferrosa_cql::result_cursor::ResultCursorRegistry::new(
+        ferrosa_cql::result_cursor::ResultCursorConfig::from_env(),
+        host_id,
+    ));
+    registry.register(
+        ferrosa_net::codec::MsgType::ResultCursorPage,
+        Arc::new(ferrosa_cql::result_cursor::ResultCursorPageHandler::new(
+            result_cursors.clone(),
+        )),
+    );
 
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
         cluster_config,
@@ -2514,9 +2526,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         txn_registry: ferrosa_cql::txn_registry::TransactionRegistry::shared_with_config(
             txn_registry_config,
         ),
-        result_cursors: Arc::new(ferrosa_cql::result_cursor::ResultCursorRegistry::new(
-            ferrosa_cql::result_cursor::ResultCursorConfig::from_env(),
-        )),
+        result_cursors,
     });
     // Start the open-transaction reaper (A1b): sweep cadence is configured with
     // the registry bounds; expired transactions are evicted without client input.

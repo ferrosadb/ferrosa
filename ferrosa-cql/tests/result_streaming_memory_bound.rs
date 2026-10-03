@@ -75,8 +75,12 @@ const PAD_BYTES: usize = 512;
 const PAGE_SIZE: i32 = 100;
 const SMALL_N: usize = 2_000;
 const LARGE_N: usize = 8_000;
-/// Spill threshold for the external sort: far below either table's size.
-const SPILL_THRESHOLD_BYTES: &str = "65536";
+/// Spill threshold of the external sort: far below either table's size, and
+/// small enough that BOTH tables spill more runs than the merge fan-in (64).
+/// The merge holds one reader buffer per run up to the fan-in, so with fewer
+/// runs the small table's peak would sit below that plateau and the ratio
+/// would measure the plateau, not the result.
+const SPILL_THRESHOLD_BYTES: &str = "16384";
 /// DISTINCT keeps this many row keys resident before spilling the rest.
 const DISTINCT_RESIDENT_KEYS: &str = "256";
 

@@ -19,11 +19,28 @@
 //! Only files and a merge head. A cursor never holds a live storage scan, a
 //! scan-pool slot or a blocking thread between pages: the scan runs to
 //! completion inside the request that builds the cursor, so a client that
-//! stops fetching pins nothing but disk until the idle TTL deletes it. An
-//! in-memory result is moved to disk before it is parked
-//! ([`ferrosa_storage::SortedRows::into_disk_backed`]), so its heap cost is
-//! one reader buffer and one row per run (at most the sorter's fan-in), not up
-//! to a spill threshold of rows.
+//! stops fetching pins nothing but disk until it expires. An in-memory result
+//! is moved to disk before it is parked
+//! ([`ferrosa_storage::SortedRows::into_disk_backed`]), so its heap cost is one
+//! reader buffer and one row per run (at most the sorter's fan-in), not up to a
+//! spill threshold of rows.
+//!
+//! The stored rows are FINAL result rows (projected when the cursor was built),
+//! each prefixed by its sort key, so a page needs nothing but the cursor: any
+//! node holding it can serve it, with no statement or schema context.
+//!
+//! # Any coordinator can ask for the next page
+//!
+//! Cassandra drivers treat `paging_state` as portable. scylla-rust-driver pins
+//! an iterator to its first node only until that node fails, then retries the
+//! remaining pages on the next node in its plan, with the same paging state.
+//! So the token names the node that owns the cursor, and a node that receives
+//! a token for another node's cursor forwards the page request over internode
+//! (`MsgType::ResultCursorPage`, [`forward_page`]) and relays the owner's
+//! reply. It forwards only to a peer that advertised
+//! `ferrosa_net::handshake::CAP_RESULT_CURSOR_PAGE`; an older node does not
+//! know the message type and would drop the whole connection, so it gets a
+//! named error instead.
 //!
 //! # Lifecycle
 //!
@@ -31,9 +48,11 @@
 //!   [`CursorPermit`] (at most `max_open` per node; a request past that is
 //!   refused with `Overloaded` before it scans anything).
 //! - **Parked** between pages. A parked cursor is deleted, with its spill
-//!   directory, when it sits idle past `idle_ttl` (swept by a background task
-//!   and on every registry call), when the connection that parked it closes
-//!   ([`ResultCursorRegistry::close_owner`]), or when its last page is read.
+//!   directory, when it sits idle past `idle_ttl`, when its last page is read,
+//!   or `close_grace` after the connection that parked it closes
+//!   ([`ResultCursorRegistry::close_owner`]) unless a page is fetched in the
+//!   meantime (from any connection, on any node). Expiry is swept by a
+//!   background task and on every registry call.
 //! - **Checked out** while a page is read. It is removed from the registry,
 //!   so a concurrent request with the same token finds nothing and errors. If
 //!   the request is cancelled (its future dropped), the cursor drops with it
@@ -41,9 +60,9 @@
 //!
 //! # Fail loud
 //!
-//! A token that names a cursor this node no longer has — expired, closed,
-//! already exhausted, issued by another node or before a restart — is an
-//! error that says which, never a silent restart of the query and never an
+//! A token that names a cursor its owner no longer has — expired, closed and
+//! past its grace, already exhausted, the owner restarted or unreachable — is
+//! an error that says which, never a silent restart of the query and never an
 //! empty or partial page presented as the end of the result.
 //!
 //! # Locks
@@ -60,6 +79,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use ferrosa_storage::{RowOrder, SortedRows, TempSortTableReservation};
+use uuid::Uuid;
 
 use crate::error::CqlError;
 use crate::types::CqlValue;
@@ -75,21 +95,28 @@ pub(crate) const CURSOR_TOKEN_MAGIC: [u8; 3] = [0xFF, b'R', b'C'];
 
 /// Layout version of [`CursorToken`]. Bump it when the payload changes; a
 /// token of another version is refused with a message naming both.
-pub const CURSOR_TOKEN_VERSION: u8 = 1;
+///
+/// - 1: epoch, id, seq, fingerprint (never released).
+/// - 2: adds the owner node's host id, so any node can forward the page.
+pub const CURSOR_TOKEN_VERSION: u8 = 2;
 
-/// magic + version + epoch + id + seq + fingerprint.
-const TOKEN_PAYLOAD_LEN: usize = 3 + 1 + 8 + 8 + 8 + 16;
+/// magic + version + owner + epoch + id + seq + fingerprint.
+const TOKEN_PAYLOAD_LEN: usize = 3 + 1 + 16 + 8 + 8 + 8 + 16;
 
 /// Default idle lifetime of a parked cursor.
 pub const DEFAULT_CURSOR_IDLE_TTL: Duration = Duration::from_secs(300);
 /// Default number of cursors one node keeps open at once.
 pub const DEFAULT_MAX_OPEN_CURSORS: usize = 256;
+/// Default time a cursor survives the connection that parked it closing.
+pub const DEFAULT_CURSOR_CLOSE_GRACE: Duration = Duration::from_secs(30);
 
 /// The opaque `paging_state` handed to a client whose result is a cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorToken {
-    /// Random per-registry value. A token from another node, or from this
-    /// node before a restart, carries a different epoch.
+    /// The node holding the cursor (its host id).
+    pub owner: Uuid,
+    /// Random per-registry value. The owner refuses a token from before it
+    /// restarted: same host id, different epoch.
     pub epoch: u64,
     /// The cursor's id within its registry.
     pub id: u64,
@@ -106,6 +133,7 @@ impl CursorToken {
         let mut buf = Vec::with_capacity(TOKEN_PAYLOAD_LEN + 32);
         buf.extend_from_slice(&CURSOR_TOKEN_MAGIC);
         buf.push(CURSOR_TOKEN_VERSION);
+        buf.extend_from_slice(self.owner.as_bytes());
         buf.extend_from_slice(&self.epoch.to_be_bytes());
         buf.extend_from_slice(&self.id.to_be_bytes());
         buf.extend_from_slice(&self.seq.to_be_bytes());
@@ -151,12 +179,14 @@ impl CursorToken {
                     .expect("length checked above"),
             )
         };
+        let owner = Uuid::from_slice(&payload[4..20]).expect("16 bytes, length checked above");
         let mut fingerprint = [0u8; 16];
-        fingerprint.copy_from_slice(&payload[28..44]);
+        fingerprint.copy_from_slice(&payload[44..60]);
         Ok(Self {
-            epoch: u64_at(4),
-            id: u64_at(12),
-            seq: u64_at(20),
+            owner,
+            epoch: u64_at(20),
+            id: u64_at(28),
+            seq: u64_at(36),
             fingerprint,
         })
     }
@@ -169,6 +199,10 @@ pub struct ResultCursorConfig {
     pub idle_ttl: Duration,
     /// Cursors one node keeps open at once (parked or being read).
     pub max_open: usize,
+    /// How long a parked cursor survives the connection that parked it
+    /// closing. A driver whose connection broke retries the next page on
+    /// another connection or node; zero deletes at close.
+    pub close_grace: Duration,
 }
 
 impl Default for ResultCursorConfig {
@@ -176,35 +210,39 @@ impl Default for ResultCursorConfig {
         Self {
             idle_ttl: DEFAULT_CURSOR_IDLE_TTL,
             max_open: DEFAULT_MAX_OPEN_CURSORS,
+            close_grace: DEFAULT_CURSOR_CLOSE_GRACE,
         }
     }
 }
 
 impl ResultCursorConfig {
-    /// `FERROSA_CQL_RESULT_CURSOR_TTL_SECS` and `FERROSA_CQL_RESULT_CURSOR_MAX`
-    /// override the defaults. A value that does not parse as a positive number
-    /// is reported and ignored.
+    /// `FERROSA_CQL_RESULT_CURSOR_TTL_SECS`, `FERROSA_CQL_RESULT_CURSOR_MAX`
+    /// and `FERROSA_CQL_RESULT_CURSOR_CLOSE_GRACE_SECS` override the defaults.
+    /// A value that does not parse is reported and ignored.
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        if let Some(secs) = positive_env("FERROSA_CQL_RESULT_CURSOR_TTL_SECS") {
+        if let Some(secs) = env_u64("FERROSA_CQL_RESULT_CURSOR_TTL_SECS", false) {
             config.idle_ttl = Duration::from_secs(secs);
         }
-        if let Some(max) = positive_env("FERROSA_CQL_RESULT_CURSOR_MAX") {
+        if let Some(max) = env_u64("FERROSA_CQL_RESULT_CURSOR_MAX", false) {
             config.max_open = usize::try_from(max).unwrap_or(usize::MAX);
+        }
+        if let Some(secs) = env_u64("FERROSA_CQL_RESULT_CURSOR_CLOSE_GRACE_SECS", true) {
+            config.close_grace = Duration::from_secs(secs);
         }
         config
     }
 }
 
-fn positive_env(name: &str) -> Option<u64> {
+fn env_u64(name: &str, zero_ok: bool) -> Option<u64> {
     let raw = std::env::var(name).ok()?;
     match raw.trim().parse::<u64>() {
-        Ok(n) if n > 0 => Some(n),
+        Ok(n) if n > 0 || zero_ok => Some(n),
         _ => {
             tracing::warn!(
                 variable = name,
                 value = %raw,
-                "ignoring result-cursor setting: not a positive integer"
+                "ignoring result-cursor setting: not a valid count of seconds/cursors"
             );
             None
         }
@@ -237,13 +275,12 @@ pub struct ResultCursor {
     rows: Option<SortedRows<Row, RowOrder>>,
     lookahead: Option<Row>,
     order: RowOrder,
+    /// Leading sort-key columns on every stored row, stripped before a row is
+    /// returned.
+    key_len: usize,
     /// Rows still owed under the query's `LIMIT`, if it has one.
     remaining_limit: Option<u64>,
-    /// `true` when the stored rows are already the projected result rows.
-    /// `false` when they are full table rows that each page projects.
-    projected: bool,
     fingerprint: [u8; 16],
-    owner: String,
     seq: u64,
     spool: TempSortTableReservation,
     _permit: CursorPermit,
@@ -253,35 +290,32 @@ impl std::fmt::Debug for ResultCursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResultCursor")
             .field("seq", &self.seq)
-            .field("owner", &self.owner)
+            .field("key_len", &self.key_len)
             .field("remaining_limit", &self.remaining_limit)
-            .field("projected", &self.projected)
             .field("spill_dir", &self.spool.path())
             .finish_non_exhaustive()
     }
 }
 
 impl ResultCursor {
-    /// Wrap a finished sort. `spool` owns the directory `rows` reads from.
-    #[allow(clippy::too_many_arguments)]
+    /// Wrap a finished sort of final result rows, each prefixed by `key_len`
+    /// sort-key columns. `spool` owns the directory `rows` reads from.
     pub fn new(
         rows: SortedRows<Row, RowOrder>,
         order: RowOrder,
+        key_len: usize,
         spool: TempSortTableReservation,
         permit: CursorPermit,
         limit: Option<u64>,
-        projected: bool,
         fingerprint: [u8; 16],
-        owner: String,
     ) -> Self {
         Self {
             rows: Some(rows),
             lookahead: None,
             order,
+            key_len,
             remaining_limit: limit,
-            projected,
             fingerprint,
-            owner,
             seq: 0,
             spool,
             _permit: permit,
@@ -317,62 +351,37 @@ impl ResultCursor {
         Ok(self.lookahead.is_some())
     }
 
-    /// Read the next page of at most `cap` rows. `project` turns a batch of
-    /// stored full rows into result rows (one for one) when the cursor stores
-    /// full rows; it is not called for a cursor that stores projected rows.
-    pub fn next_page(
-        &mut self,
-        cap: usize,
-        project: impl FnOnce(Vec<Row>) -> Result<Vec<Row>, CqlError>,
-    ) -> Result<CursorPage, CqlError> {
+    /// Read the next page of at most `cap` rows.
+    pub fn next_page(&mut self, cap: usize) -> Result<CursorPage, CqlError> {
         assert!(cap > 0, "a zero-row page would never advance the cursor");
         let cap = match self.remaining_limit {
             Some(left) => cap.min(usize::try_from(left).unwrap_or(usize::MAX)),
             None => cap,
         };
-        let mut batch = Vec::with_capacity(cap.min(4096));
-        while batch.len() < cap {
+        let mut rows = Vec::with_capacity(cap.min(4096));
+        while rows.len() < cap {
             match self.pull()? {
-                Some(row) => batch.push(row),
+                Some(mut row) => {
+                    if row.len() < self.key_len {
+                        return Err(CqlError::ServerError(format!(
+                            "result cursor: stored row has {} columns, fewer than its {}-column \
+                             sort key",
+                            row.len(),
+                            self.key_len
+                        )));
+                    }
+                    row.drain(..self.key_len);
+                    rows.push(row);
+                }
                 None => break,
             }
         }
-        let pulled = batch.len();
-        let rows = if self.projected || batch.is_empty() {
-            batch
-        } else {
-            project(batch)?
-        };
-        if rows.len() != pulled {
-            return Err(CqlError::ServerError(format!(
-                "result cursor: projecting {pulled} rows produced {}; projection must be one \
-                 row in, one row out",
-                rows.len()
-            )));
-        }
         if let Some(left) = self.remaining_limit.as_mut() {
-            *left = left.saturating_sub(pulled as u64);
+            *left = left.saturating_sub(rows.len() as u64);
         }
         self.seq += 1;
         let more = self.remaining_limit != Some(0) && self.peek_more()?;
         Ok(CursorPage { rows, more })
-    }
-
-    /// Read every remaining row. For a client that asked for an unpaged
-    /// result: the protocol requires all of it in one response.
-    pub fn drain(
-        &mut self,
-        mut project: impl FnMut(Vec<Row>) -> Result<Vec<Row>, CqlError>,
-    ) -> Result<Vec<Row>, CqlError> {
-        const BATCH: usize = 4096;
-        let mut out = Vec::new();
-        loop {
-            let page = self.next_page(BATCH, &mut project)?;
-            out.extend(page.rows);
-            if !page.more {
-                return Ok(out);
-            }
-        }
     }
 
     /// Move any in-memory remainder to disk so the parked cursor holds no
@@ -394,9 +403,16 @@ struct Parked {
     cursor: ArcSwapOption<ResultCursor>,
     fingerprint: [u8; 16],
     seq: u64,
-    owner: String,
+    /// The client connection that parked it (`None`: parked for a page
+    /// forwarded from another node).
+    owner: Option<String>,
+    /// Set once `owner` closed, so a second close does not extend the grace.
+    owner_closed: AtomicBool,
     spill_dir: PathBuf,
-    parked_at: Instant,
+    /// When it is deleted unless a page is fetched first, in milliseconds
+    /// since the registry's `base`: the idle TTL, lowered to the close grace
+    /// once its connection closes. Atomic so a close updates it in place.
+    deadline_ms: AtomicU64,
 }
 
 /// Counters a registry keeps for operators and tests.
@@ -412,7 +428,10 @@ pub struct CursorStats {
 /// The node's parked result cursors. See the module docs.
 pub struct ResultCursorRegistry {
     config: ResultCursorConfig,
+    node: Uuid,
     epoch: u64,
+    /// Origin of the `deadline_ms` clock.
+    base: Instant,
     next_id: AtomicU64,
     open: Arc<AtomicUsize>,
     parked: ArcSwap<HashMap<u64, Arc<Parked>>>,
@@ -423,13 +442,15 @@ pub struct ResultCursorRegistry {
 }
 
 impl Default for ResultCursorRegistry {
+    /// A registry for a node with the nil host id: single-node tests only.
     fn default() -> Self {
-        Self::new(ResultCursorConfig::default())
+        Self::new(ResultCursorConfig::default(), Uuid::nil())
     }
 }
 
 impl ResultCursorRegistry {
-    pub fn new(config: ResultCursorConfig) -> Self {
+    /// A registry for the node whose host id is `node`.
+    pub fn new(config: ResultCursorConfig, node: Uuid) -> Self {
         assert!(
             config.max_open > 0,
             "a registry must admit at least one cursor"
@@ -440,7 +461,9 @@ impl ResultCursorRegistry {
         );
         Self {
             config,
+            node,
             epoch: rand::random::<u64>(),
+            base: Instant::now(),
             next_id: AtomicU64::new(1),
             open: Arc::new(AtomicUsize::new(0)),
             parked: ArcSwap::from_pointee(HashMap::new()),
@@ -453,6 +476,16 @@ impl ResultCursorRegistry {
 
     pub fn config(&self) -> ResultCursorConfig {
         self.config
+    }
+
+    /// `at` on the registry's deadline clock (saturating at its origin).
+    fn ms(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.base).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The host id of the node this registry belongs to.
+    pub fn node(&self) -> Uuid {
+        self.node
     }
 
     pub fn stats(&self) -> CursorStats {
@@ -507,15 +540,19 @@ impl ResultCursorRegistry {
     }
 
     /// Park `cursor` for its next page and return the token naming it. The
-    /// cursor's in-memory remainder is moved to disk first.
+    /// cursor's in-memory remainder is moved to disk first. `owner` is the
+    /// client connection whose closing starts the close grace; `None` (a page
+    /// served for another node) leaves only the idle TTL.
     pub fn park(
         self: &Arc<Self>,
         mut cursor: ResultCursor,
         id: Option<u64>,
+        owner: Option<String>,
     ) -> Result<CursorToken, CqlError> {
         cursor.make_disk_backed()?;
         let id = id.unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::Relaxed));
         let token = CursorToken {
+            owner: self.node,
             epoch: self.epoch,
             id,
             seq: cursor.seq,
@@ -524,9 +561,10 @@ impl ResultCursorRegistry {
         let parked = Arc::new(Parked {
             fingerprint: cursor.fingerprint,
             seq: cursor.seq,
-            owner: cursor.owner.clone(),
+            owner,
+            owner_closed: AtomicBool::new(false),
             spill_dir: cursor.spill_dir().to_path_buf(),
-            parked_at: Instant::now(),
+            deadline_ms: AtomicU64::new(self.ms(Instant::now() + self.config.idle_ttl)),
             cursor: ArcSwapOption::from_pointee(cursor),
         });
         self.parked.rcu(|map| {
@@ -545,25 +583,33 @@ impl ResultCursorRegistry {
         token: &CursorToken,
         fingerprint: &[u8; 16],
     ) -> Result<(u64, ResultCursor), CqlError> {
+        if token.owner != self.node {
+            return Err(CqlError::Invalid(format!(
+                "paging_state names a result cursor on node {}, not this node ({}); its page \
+                 must be fetched from or forwarded to that node",
+                token.owner, self.node
+            )));
+        }
         if token.epoch != self.epoch {
-            return Err(CqlError::Invalid(
-                "paging_state names a result cursor from another node, or from this node before \
-                 it restarted; cursors live on the node that built them. Re-run the query from \
-                 its first page"
-                    .into(),
-            ));
+            return Err(CqlError::Invalid(format!(
+                "paging_state names a result cursor that node {} held before it restarted; \
+                 cursors do not survive a restart. Re-run the query from its first page",
+                self.node
+            )));
         }
         let now = Instant::now();
         self.sweep_expired_at(now);
         let map = self.parked.load_full();
         let Some(parked) = map.get(&token.id).cloned() else {
             return Err(CqlError::Invalid(format!(
-                "paging_state names result cursor {} which this node no longer holds: it was \
-                 idle longer than {}s, the connection that opened it closed, its last page was \
-                 already read, or another request is reading it. Re-run the query from its \
-                 first page",
+                "paging_state names result cursor {} which node {} no longer holds: it was idle \
+                 longer than {}s, the connection that opened it closed more than {}s ago, its \
+                 last page was already read, or another request is reading it. Re-run the \
+                 query from its first page",
                 token.id,
-                self.config.idle_ttl.as_secs()
+                self.node,
+                self.config.idle_ttl.as_secs(),
+                self.config.close_grace.as_secs()
             )));
         };
         if &parked.fingerprint != fingerprint || &token.fingerprint != fingerprint {
@@ -609,36 +655,77 @@ impl ResultCursorRegistry {
         Ok((token.id, cursor))
     }
 
-    /// Delete every cursor parked by `owner` (a connection's peer address):
-    /// the connection closed, so nothing will ask for their next pages.
-    pub fn close_owner(&self, owner: &str) -> usize {
-        let removed = self.remove_where(|p| p.owner == owner);
-        if removed > 0 {
-            self.closed.fetch_add(removed as u64, Ordering::Relaxed);
-            tracing::info!(
-                owner,
-                cursors = removed,
-                "deleted result cursors: their connection closed"
-            );
-        }
-        removed
+    /// Serve the next page of the local cursor `token` names and, if rows
+    /// remain, park it again. The whole page round trip, shared by a client
+    /// request on this node and a page request forwarded from another node.
+    pub fn serve_page(
+        self: &Arc<Self>,
+        token: &CursorToken,
+        fingerprint: &[u8; 16],
+        cap: usize,
+        owner: Option<String>,
+    ) -> Result<(Vec<Row>, Option<CursorToken>), CqlError> {
+        let (id, mut cursor) = self.take(token, fingerprint)?;
+        let page = cursor.next_page(cap)?;
+        let next = if page.more {
+            Some(self.park(cursor, Some(id), owner)?)
+        } else {
+            None
+        };
+        Ok((page.rows, next))
     }
 
-    /// Delete every cursor idle past the TTL as of `now`.
+    /// The connection `owner` (a client's peer address) closed. Each cursor it
+    /// parked now expires `close_grace` from now unless a page is fetched
+    /// first — a driver whose connection broke retries the page on another
+    /// connection or node. With a zero grace they are deleted at once.
+    pub fn close_owner(&self, owner: &str) -> usize {
+        let mine = |p: &Parked| p.owner.as_deref() == Some(owner);
+        if self.config.close_grace.is_zero() {
+            let removed = self.remove_where(mine);
+            if removed > 0 {
+                self.closed.fetch_add(removed as u64, Ordering::Relaxed);
+                tracing::info!(
+                    owner,
+                    cursors = removed,
+                    "deleted result cursors: connection closed"
+                );
+            }
+            return removed;
+        }
+        let grace_deadline = self.ms(Instant::now() + self.config.close_grace);
+        let mut affected = 0;
+        for parked in self.parked.load().values().filter(|p| mine(p)) {
+            if !parked.owner_closed.swap(true, Ordering::AcqRel) {
+                parked
+                    .deadline_ms
+                    .fetch_min(grace_deadline, Ordering::AcqRel);
+                affected += 1;
+            }
+        }
+        if affected > 0 {
+            self.closed.fetch_add(affected as u64, Ordering::Relaxed);
+            tracing::info!(
+                owner,
+                cursors = affected,
+                grace_secs = self.config.close_grace.as_secs(),
+                "result cursors' connection closed; they expire after the close grace unless read"
+            );
+        }
+        affected
+    }
+
+    /// Delete every cursor past its deadline as of `now`.
     pub fn sweep_expired_at(&self, now: Instant) -> usize {
-        let ttl = self.config.idle_ttl;
-        let expired = |p: &Parked| now.saturating_duration_since(p.parked_at) >= ttl;
+        let now_ms = self.ms(now);
+        let expired = |p: &Parked| now_ms >= p.deadline_ms.load(Ordering::Acquire);
         if !self.parked.load().values().any(|p| expired(p)) {
             return 0;
         }
         let removed = self.remove_where(expired);
         if removed > 0 {
             self.expired.fetch_add(removed as u64, Ordering::Relaxed);
-            tracing::info!(
-                cursors = removed,
-                idle_ttl_secs = ttl.as_secs(),
-                "deleted idle result cursors"
-            );
+            tracing::info!(cursors = removed, "deleted expired result cursors");
         }
         removed
     }
@@ -678,8 +765,15 @@ impl ResultCursorRegistry {
             return;
         };
         let weak: Weak<Self> = Arc::downgrade(self);
-        let period =
-            (self.config.idle_ttl / 4).clamp(Duration::from_millis(50), Duration::from_secs(30));
+        let shortest = self
+            .config
+            .idle_ttl
+            .min(if self.config.close_grace.is_zero() {
+                self.config.idle_ttl
+            } else {
+                self.config.close_grace
+            });
+        let period = (shortest / 4).clamp(Duration::from_millis(50), Duration::from_secs(30));
         handle.spawn(async move {
             let mut tick = tokio::time::interval(period);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -709,14 +803,199 @@ pub fn query_fingerprint(role: &str, keyspace: &str, statement_debug: &str) -> [
     out
 }
 
+// ── Forwarding a page request to the cursor's owner ─────────────────────────
+
+/// Body of `MsgType::ResultCursorPage` (JSON).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ForwardPageRequest {
+    /// The client's paging state, as received.
+    pub token: Vec<u8>,
+    /// Fingerprint of the query the client sent it with, computed on the
+    /// forwarding node; the owner checks it against the cursor's.
+    pub fingerprint: [u8; 16],
+    /// The client's page size.
+    pub page_cap: u32,
+}
+
+/// Body of `MsgType::ResultCursorPageReply` (JSON).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum ForwardPageReply {
+    /// The page, and the token for the next one if rows remain.
+    Page {
+        rows: Vec<Row>,
+        next_token: Option<Vec<u8>>,
+    },
+    /// The owner refused (expired, restarted, stale, other query...). The
+    /// message is the owner's named error; `overloaded` keeps its error class.
+    Refused { message: String, overloaded: bool },
+}
+
+impl ForwardPageReply {
+    fn from_result(result: Result<(Vec<Row>, Option<CursorToken>), CqlError>) -> Self {
+        match result {
+            Ok((rows, next)) => Self::Page {
+                rows,
+                next_token: next.map(|t| t.encode()),
+            },
+            Err(CqlError::Overloaded(message)) => Self::Refused {
+                message,
+                overloaded: true,
+            },
+            Err(other) => Self::Refused {
+                message: other.to_string(),
+                overloaded: false,
+            },
+        }
+    }
+}
+
+/// Serves `MsgType::ResultCursorPage` on the node that owns the cursor.
+///
+/// Reading a page is bounded file I/O on the cursor's spill runs; it holds no
+/// scan slot and no blocking-pool thread, and the requesting node waits on the
+/// internode Data lane's deadline.
+pub struct ResultCursorPageHandler {
+    registry: Arc<ResultCursorRegistry>,
+}
+
+impl ResultCursorPageHandler {
+    pub fn new(registry: Arc<ResultCursorRegistry>) -> Self {
+        Self { registry }
+    }
+
+    /// Serve one decoded request (also the unit-testable core).
+    pub fn serve(&self, request: &ForwardPageRequest) -> ForwardPageReply {
+        let result = CursorToken::decode(&request.token).and_then(|token| {
+            let cap = usize::try_from(request.page_cap)
+                .unwrap_or(usize::MAX)
+                .max(1);
+            self.registry
+                .serve_page(&token, &request.fingerprint, cap, None)
+        });
+        ForwardPageReply::from_result(result)
+    }
+}
+
+#[async_trait::async_trait]
+impl ferrosa_net::rpc::RpcHandler for ResultCursorPageHandler {
+    async fn handle(
+        &self,
+        from: ferrosa_net::rpc::PeerId,
+        msg: ferrosa_net::message::Message,
+    ) -> Option<ferrosa_net::message::Message> {
+        let ferrosa_net::message::Message::ResultCursorPage(body) = msg else {
+            tracing::error!(peer = %from.0, "result-cursor page handler got another message type");
+            return None;
+        };
+        let reply = match serde_json::from_slice::<ForwardPageRequest>(&body) {
+            Ok(request) => self.serve(&request),
+            Err(e) => ForwardPageReply::Refused {
+                message: format!("result-cursor page request could not be decoded: {e}"),
+                overloaded: false,
+            },
+        };
+        match serde_json::to_vec(&reply) {
+            Ok(bytes) => Some(ferrosa_net::message::Message::ResultCursorPageReply(
+                bytes.into(),
+            )),
+            Err(e) => {
+                // Replying nothing would leave the requester waiting out its
+                // lane deadline; reply with the encode failure instead.
+                tracing::error!(peer = %from.0, %e, "result-cursor page reply could not be encoded");
+                let refused = ForwardPageReply::Refused {
+                    message: format!("result-cursor page reply could not be encoded: {e}"),
+                    overloaded: false,
+                };
+                serde_json::to_vec(&refused)
+                    .ok()
+                    .map(|b| ferrosa_net::message::Message::ResultCursorPageReply(b.into()))
+            }
+        }
+    }
+}
+
+/// Fetch the next page of `token`'s cursor from its owner node over
+/// internode, on the Data lane (its deadline bounds the wait).
+///
+/// Refuses by name — never sends — when there is no internode layer, no live
+/// connection to the owner, or the owner did not advertise
+/// [`ferrosa_net::handshake::CAP_RESULT_CURSOR_PAGE`] (an older node, which
+/// would drop the connection on the unknown message type).
+pub async fn forward_page(
+    peers: Option<&Arc<ferrosa_net::peer::PeerManager>>,
+    token: &CursorToken,
+    raw_token: &[u8],
+    fingerprint: [u8; 16],
+    page_cap: usize,
+) -> Result<(Vec<Row>, Option<Vec<u8>>), CqlError> {
+    let owner = token.owner;
+    let Some(peers) = peers else {
+        return Err(CqlError::Invalid(format!(
+            "paging_state names a result cursor on node {owner}, and this node has no \
+             internode connection to forward the page request. Send it to that node or \
+             re-run the query from its first page"
+        )));
+    };
+    match peers.peer_capabilities(owner).await {
+        None => {
+            return Err(CqlError::Invalid(format!(
+                "paging_state names a result cursor on node {owner}, which this node cannot \
+                 reach (down, removed, or not connected). Re-run the query from its first page"
+            )))
+        }
+        Some(caps) if caps & ferrosa_net::handshake::CAP_RESULT_CURSOR_PAGE == 0 => {
+            return Err(CqlError::Invalid(format!(
+                "paging_state names a result cursor on node {owner}, which runs a version that \
+                 cannot serve forwarded cursor pages. Send the page request to that node, or \
+                 re-run the query from its first page"
+            )))
+        }
+        Some(_) => {}
+    }
+    let request = ForwardPageRequest {
+        token: raw_token.to_vec(),
+        fingerprint,
+        page_cap: u32::try_from(page_cap).unwrap_or(u32::MAX),
+    };
+    let body = serde_json::to_vec(&request)
+        .map_err(|e| CqlError::ServerError(format!("result cursor: encode page request: {e}")))?;
+    let reply = peers
+        .send(
+            owner,
+            ferrosa_net::message::Message::ResultCursorPage(body.into()),
+            ferrosa_net::codec::Lane::Data,
+        )
+        .await
+        .map_err(|e| {
+            CqlError::ServerError(format!(
+                "forwarding a result-cursor page request to node {owner} failed: {e}"
+            ))
+        })?;
+    let ferrosa_net::message::Message::ResultCursorPageReply(bytes) = reply else {
+        return Err(CqlError::ServerError(format!(
+            "node {owner} answered a result-cursor page request with {:?}",
+            reply.msg_type()
+        )));
+    };
+    let reply: ForwardPageReply = serde_json::from_slice(&bytes).map_err(|e| {
+        CqlError::ServerError(format!(
+            "node {owner} sent an undecodable result-cursor page reply: {e}"
+        ))
+    })?;
+    match reply {
+        ForwardPageReply::Page { rows, next_token } => Ok((rows, next_token)),
+        ForwardPageReply::Refused {
+            message,
+            overloaded: true,
+        } => Err(CqlError::Overloaded(message)),
+        ForwardPageReply::Refused { message, .. } => Err(CqlError::Invalid(message)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ferrosa_storage::ExternalSorter;
-
-    fn int_row(v: i32) -> Row {
-        vec![Some(CqlValue::Int(v))]
-    }
 
     fn val(row: &Row) -> i32 {
         match row[0] {
@@ -726,40 +1005,49 @@ mod tests {
     }
 
     /// A cursor over `0..n` (pushed in reverse, sorted ascending) whose spool
-    /// is a fresh directory under `root`.
+    /// is a fresh directory under `root`. Each stored row carries its value
+    /// twice: once as the one-column sort key, once as the result.
     fn cursor(
         registry: &ResultCursorRegistry,
         root: &Path,
         n: i32,
         threshold: u64,
-        owner: &str,
     ) -> ResultCursor {
         let permit = registry.admit().unwrap();
         let dir = tempfile::Builder::new().tempdir_in(root).unwrap().keep();
         let order = RowOrder::new(vec![(0, true)]);
         let mut sorter = ExternalSorter::new(&dir, order.clone(), threshold);
         for v in (0..n).rev() {
-            sorter.push(int_row(v)).unwrap();
+            sorter
+                .push(vec![Some(CqlValue::Int(v)), Some(CqlValue::Int(v))])
+                .unwrap();
         }
         ResultCursor::new(
             sorter.finish().unwrap(),
             order,
+            1,
             TempSortTableReservation::claim_dir(dir),
             permit,
             None,
-            true,
             [7; 16],
-            owner.to_string(),
         )
     }
 
-    fn no_projection(_: Vec<Row>) -> Result<Vec<Row>, CqlError> {
-        unreachable!("projected cursors never project")
+    fn registry() -> Arc<ResultCursorRegistry> {
+        Arc::new(ResultCursorRegistry::new(
+            ResultCursorConfig::default(),
+            Uuid::from_u128(0xA),
+        ))
+    }
+
+    fn owned(s: &str) -> Option<String> {
+        Some(s.to_string())
     }
 
     #[test]
     fn token_round_trips_and_is_signed() {
         let token = CursorToken {
+            owner: Uuid::from_u128(5),
             epoch: 1,
             id: 2,
             seq: 3,
@@ -776,10 +1064,11 @@ mod tests {
     }
 
     /// An existing driver resends whatever paging state it was given. A
-    /// scan-position state from an older server must get a clear error, and a
-    /// cursor token sent to an older-format decoder must not parse as a key.
+    /// scan-position state from an older server, and a cursor token of another
+    /// layout version, get a clear error; a cursor token sent to an
+    /// older-format decoder must not parse as a key.
     #[test]
-    fn foreign_and_future_paging_states_are_refused_by_name() {
+    fn foreign_and_other_version_paging_states_are_refused_by_name() {
         let legacy = crate::paging::PagingState {
             partition_key: 40u64.to_be_bytes().to_vec(),
             clustering_key: Vec::new(),
@@ -789,15 +1078,22 @@ mod tests {
         let err = CursorToken::decode(&legacy).unwrap_err().to_string();
         assert!(err.contains("not a result-cursor token"), "{err}");
 
-        let mut future = CURSOR_TOKEN_MAGIC.to_vec();
-        future.push(CURSOR_TOKEN_VERSION + 1);
-        future.extend_from_slice(&[0; TOKEN_PAYLOAD_LEN - 4]);
-        let err = CursorToken::decode(&crate::paging::sign_paging_payload(future))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("version-2"), "{err}");
+        // Version 1 (no owner id), and a future version 3.
+        for (version, len) in [
+            (1u8, 44usize),
+            (CURSOR_TOKEN_VERSION + 1, TOKEN_PAYLOAD_LEN),
+        ] {
+            let mut other = CURSOR_TOKEN_MAGIC.to_vec();
+            other.push(version);
+            other.resize(len, 0);
+            let err = CursorToken::decode(&crate::paging::sign_paging_payload(other))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("version-{version}")), "{err}");
+        }
 
         let token = CursorToken {
+            owner: Uuid::nil(),
             epoch: 1,
             id: 1,
             seq: 0,
@@ -817,23 +1113,27 @@ mod tests {
     }
 
     #[test]
-    fn pages_resume_the_same_cursor_and_finish() {
+    fn pages_resume_the_same_cursor_strip_the_key_and_finish() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ResultCursorRegistry::default());
-        let mut c = cursor(&registry, root.path(), 25, 16, "peer");
-        let first = c.next_page(10, no_projection).unwrap();
+        let registry = registry();
+        let mut c = cursor(&registry, root.path(), 25, 16);
+        let first = c.next_page(10).unwrap();
         assert!(first.more);
+        assert!(
+            first.rows.iter().all(|r| r.len() == 1),
+            "the sort key is stripped"
+        );
         let mut got: Vec<i32> = first.rows.iter().map(val).collect();
-        let mut token = registry.park(c, None).unwrap();
+        let mut token = Some(registry.park(c, None, owned("peer")).unwrap());
         for _ in 0..10 {
-            let (id, mut c) = registry.take(&token, &[7; 16]).unwrap();
-            let page = c.next_page(10, no_projection).unwrap();
-            got.extend(page.rows.iter().map(val));
-            if !page.more {
-                break;
-            }
-            token = registry.park(c, Some(id)).unwrap();
+            let Some(t) = token else { break };
+            let (rows, next) = registry
+                .serve_page(&t, &[7; 16], 10, owned("peer"))
+                .unwrap();
+            got.extend(rows.iter().map(val));
+            token = next;
         }
+        assert!(token.is_none());
         assert_eq!(got, (0..25).collect::<Vec<_>>());
         assert_eq!(
             registry.stats().open,
@@ -846,11 +1146,11 @@ mod tests {
     #[test]
     fn a_parked_in_memory_cursor_moves_to_disk() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ResultCursorRegistry::default());
-        let mut c = cursor(&registry, root.path(), 50, u64::MAX, "peer");
+        let registry = registry();
+        let mut c = cursor(&registry, root.path(), 50, u64::MAX);
         assert!(!c.rows.as_ref().unwrap().is_disk_backed());
-        c.next_page(5, no_projection).unwrap();
-        let token = registry.park(c, None).unwrap();
+        c.next_page(5).unwrap();
+        let token = registry.park(c, None, None).unwrap();
         let (_, c) = registry.take(&token, &[7; 16]).unwrap();
         assert!(c.rows.as_ref().unwrap().is_disk_backed());
     }
@@ -858,11 +1158,11 @@ mod tests {
     #[test]
     fn expiry_deletes_the_spill_dir_and_the_token_errors() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ResultCursorRegistry::default());
-        let mut c = cursor(&registry, root.path(), 30, 16, "peer");
+        let registry = registry();
+        let mut c = cursor(&registry, root.path(), 30, 16);
         let dir = c.spill_dir().to_path_buf();
-        c.next_page(5, no_projection).unwrap();
-        let token = registry.park(c, None).unwrap();
+        c.next_page(5).unwrap();
+        let token = registry.park(c, None, None).unwrap();
         assert!(dir.exists());
         let later = Instant::now() + registry.config().idle_ttl + Duration::from_secs(1);
         assert_eq!(registry.sweep_expired_at(later), 1);
@@ -872,32 +1172,78 @@ mod tests {
         assert!(err.contains("no longer holds"), "{err}");
     }
 
+    /// A closed connection's cursors survive the close grace (a driver retries
+    /// the page elsewhere), only theirs are affected, and they expire at the
+    /// end of the grace — not the idle TTL.
     #[test]
-    fn closing_the_owner_connection_deletes_its_cursors_only() {
+    fn a_closed_connections_cursor_survives_the_grace_then_expires() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ResultCursorRegistry::default());
-        let mine = cursor(&registry, root.path(), 10, 16, "a:1");
-        let theirs = cursor(&registry, root.path(), 10, 16, "b:2");
+        let registry = registry();
+        let mine = cursor(&registry, root.path(), 10, 16);
+        let theirs = cursor(&registry, root.path(), 10, 16);
         let (mine_dir, theirs_dir) = (
             mine.spill_dir().to_path_buf(),
             theirs.spill_dir().to_path_buf(),
         );
-        let mine_token = registry.park(mine, None).unwrap();
-        registry.park(theirs, None).unwrap();
+        registry.park(mine, None, owned("a:1")).unwrap();
+        registry.park(theirs, None, owned("b:2")).unwrap();
         assert_eq!(registry.close_owner("a:1"), 1);
+        assert!(mine_dir.exists(), "the grace keeps it");
+
+        let within = Instant::now() + registry.config().close_grace / 2;
+        assert_eq!(registry.sweep_expired_at(within), 0);
+        let past_grace = Instant::now() + registry.config().close_grace + Duration::from_secs(1);
+        assert!(past_grace < Instant::now() + registry.config().idle_ttl);
+        assert_eq!(registry.sweep_expired_at(past_grace), 1);
         assert!(!mine_dir.exists());
-        assert!(theirs_dir.exists());
-        assert!(registry.take(&mine_token, &[7; 16]).is_err());
+        assert!(
+            theirs_dir.exists(),
+            "another connection's cursor is untouched"
+        );
         assert_eq!(registry.stats().parked, 1);
+    }
+
+    /// Reading a page within the grace re-parks the cursor with a fresh idle
+    /// TTL, so a client that moved to another connection keeps it.
+    #[test]
+    fn a_page_read_within_the_grace_keeps_the_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = registry();
+        let c = cursor(&registry, root.path(), 30, 16);
+        let token = registry.park(c, None, owned("a:1")).unwrap();
+        registry.close_owner("a:1");
+        let (_, next) = registry
+            .serve_page(&token, &[7; 16], 5, owned("b:2"))
+            .unwrap();
+        assert!(next.is_some());
+        let past_grace = Instant::now() + registry.config().close_grace + Duration::from_secs(1);
+        assert_eq!(registry.sweep_expired_at(past_grace), 0);
+    }
+
+    #[test]
+    fn a_zero_grace_deletes_at_close() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ResultCursorRegistry::new(
+            ResultCursorConfig {
+                close_grace: Duration::ZERO,
+                ..ResultCursorConfig::default()
+            },
+            Uuid::nil(),
+        ));
+        let c = cursor(&registry, root.path(), 10, 16);
+        let dir = c.spill_dir().to_path_buf();
+        registry.park(c, None, owned("a:1")).unwrap();
+        assert_eq!(registry.close_owner("a:1"), 1);
+        assert!(!dir.exists());
     }
 
     #[test]
     fn a_cancelled_page_read_deletes_the_cursor() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ResultCursorRegistry::default());
-        let c = cursor(&registry, root.path(), 10, 16, "peer");
+        let registry = registry();
+        let c = cursor(&registry, root.path(), 10, 16);
         let dir = c.spill_dir().to_path_buf();
-        let token = registry.park(c, None).unwrap();
+        let token = registry.park(c, None, None).unwrap();
         let (_, taken) = registry.take(&token, &[7; 16]).unwrap();
         // The request reading the page is dropped mid-flight.
         drop(taken);
@@ -907,37 +1253,47 @@ mod tests {
     }
 
     #[test]
-    fn wrong_query_stale_page_and_other_epoch_are_refused() {
+    fn wrong_query_stale_page_restart_and_other_owner_are_refused() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ResultCursorRegistry::default());
-        let mut c = cursor(&registry, root.path(), 30, 16, "peer");
-        c.next_page(5, no_projection).unwrap();
-        let first = registry.park(c, None).unwrap();
+        let registry = registry();
+        let mut c = cursor(&registry, root.path(), 30, 16);
+        c.next_page(5).unwrap();
+        let first = registry.park(c, None, None).unwrap();
 
         let err = registry.take(&first, &[8; 16]).unwrap_err().to_string();
         assert!(err.contains("different query"), "{err}");
 
         let (id, mut c) = registry.take(&first, &[7; 16]).unwrap();
-        c.next_page(5, no_projection).unwrap();
-        let second = registry.park(c, Some(id)).unwrap();
+        c.next_page(5).unwrap();
+        let second = registry.park(c, Some(id), None).unwrap();
         let err = registry.take(&first, &[7; 16]).unwrap_err().to_string();
         assert!(err.contains("stale"), "{err}");
 
-        let other = CursorToken {
+        let restarted = CursorToken {
             epoch: second.epoch.wrapping_add(1),
             ..second
         };
-        let err = registry.take(&other, &[7; 16]).unwrap_err().to_string();
-        assert!(err.contains("another node"), "{err}");
+        let err = registry.take(&restarted, &[7; 16]).unwrap_err().to_string();
+        assert!(err.contains("before it restarted"), "{err}");
+
+        let elsewhere = CursorToken {
+            owner: Uuid::from_u128(0xB),
+            ..second
+        };
+        let err = registry.take(&elsewhere, &[7; 16]).unwrap_err().to_string();
+        assert!(err.contains("not this node"), "{err}");
         assert!(registry.take(&second, &[7; 16]).is_ok());
     }
 
     #[test]
     fn admission_is_bounded_and_refusal_is_loud() {
-        let registry = ResultCursorRegistry::new(ResultCursorConfig {
-            max_open: 2,
-            ..ResultCursorConfig::default()
-        });
+        let registry = ResultCursorRegistry::new(
+            ResultCursorConfig {
+                max_open: 2,
+                ..ResultCursorConfig::default()
+            },
+            Uuid::nil(),
+        );
         let a = registry.admit().unwrap();
         let _b = registry.admit().unwrap();
         assert!(matches!(registry.admit(), Err(CqlError::Overloaded(_))));
@@ -949,26 +1305,65 @@ mod tests {
     #[test]
     fn limit_counts_across_pages() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ResultCursorRegistry::default());
-        let mut c = cursor(&registry, root.path(), 30, 16, "peer");
+        let registry = registry();
+        let mut c = cursor(&registry, root.path(), 30, 16);
         c.remaining_limit = Some(12);
-        let a = c.next_page(5, no_projection).unwrap();
-        let b = c.next_page(5, no_projection).unwrap();
-        let last = c.next_page(5, no_projection).unwrap();
+        let a = c.next_page(5).unwrap();
+        let b = c.next_page(5).unwrap();
+        let last = c.next_page(5).unwrap();
         assert_eq!((a.rows.len(), b.rows.len(), last.rows.len()), (5, 5, 2));
         assert!(a.more && b.more && !last.more);
+    }
+
+    /// The owner-side handler serves a forwarded request, and turns every
+    /// refusal into a reply carrying the named error (never a silent `None`,
+    /// which would leave the requester waiting out its deadline).
+    #[test]
+    fn the_page_handler_serves_and_refuses_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = registry();
+        let c = cursor(&registry, root.path(), 12, 16);
+        let token = registry.park(c, None, owned("a:1")).unwrap();
+        let handler = ResultCursorPageHandler::new(registry.clone());
+        let reply = handler.serve(&ForwardPageRequest {
+            token: token.encode(),
+            fingerprint: [7; 16],
+            page_cap: 5,
+        });
+        let ForwardPageReply::Page { rows, next_token } = reply else {
+            panic!("expected a page, got {reply:?}");
+        };
+        assert_eq!(
+            rows.iter().map(val).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        let next = CursorToken::decode(&next_token.unwrap()).unwrap();
+        assert_eq!(next.owner, registry.node());
+
+        let stale = handler.serve(&ForwardPageRequest {
+            token: token.encode(),
+            fingerprint: [7; 16],
+            page_cap: 5,
+        });
+        assert!(
+            matches!(&stale, ForwardPageReply::Refused { message, overloaded: false } if message.contains("stale")),
+            "{stale:?}"
+        );
     }
 
     #[tokio::test]
     async fn the_sweeper_deletes_idle_cursors_without_further_requests() {
         let root = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ResultCursorRegistry::new(ResultCursorConfig {
-            idle_ttl: Duration::from_millis(100),
-            ..ResultCursorConfig::default()
-        }));
-        let c = cursor(&registry, root.path(), 10, 16, "peer");
+        let registry = Arc::new(ResultCursorRegistry::new(
+            ResultCursorConfig {
+                idle_ttl: Duration::from_millis(100),
+                ..ResultCursorConfig::default()
+            },
+            Uuid::nil(),
+        ));
+        let c = cursor(&registry, root.path(), 10, 16);
         let dir = c.spill_dir().to_path_buf();
-        registry.park(c, None).unwrap();
+        registry.park(c, None, None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while dir.exists() {
             assert!(

@@ -1908,65 +1908,102 @@ fn result_cursor_shape(
         && !select_is_aggregate(s, resolved_funcs)
 }
 
-/// Serve one response of a cursor-shaped SELECT: build the cursor on the first
-/// request, take it back from the registry on every later one, read a page (or
-/// everything, for an unpaged request), and park it again if rows remain.
+/// Serve one response of a cursor-shaped SELECT.
+///
+/// - No paging state: build the cursor (one scan) and read its first page.
+/// - A paging state for a cursor on THIS node: read its next page here.
+/// - A paging state for a cursor on ANOTHER node (the driver moved to this
+///   coordinator — load balancing, or a retry after its connection broke):
+///   forward the page request to the owner over internode and relay its reply.
+///
+/// An unpaged request receives every remaining row in one response, as the
+/// protocol requires, read a batch at a time.
 async fn serve_result_cursor(q: CursorQuery<'_>) -> Result<SelectRawResult, CqlError> {
     let registry = &q.state.result_cursors;
     let fingerprint =
         crate::result_cursor::query_fingerprint(&q.ctx.auth.role, q.ks, &format!("{:?}", q.s));
-    let (id, mut cursor) = match q.ctx.paging.paging_state.as_deref() {
-        Some(bytes) => {
-            let token = crate::result_cursor::CursorToken::decode(bytes)?;
-            let (id, cursor) = registry.take(&token, &fingerprint)?;
-            (Some(id), cursor)
-        }
-        None => (None, build_result_cursor(&q, fingerprint).await?),
-    };
-    let project = |batch: Vec<Vec<Option<CqlValue>>>| {
-        project_select_rows(
-            q.state,
-            q.s,
-            &batch,
-            q.rows.all_col_names,
-            q.col_names,
-            q.resolved_funcs,
-        )
-    };
-    let (rows, paging_state) = match request_scan_bound(q.ctx).row_cap() {
-        // Unpaged: the protocol requires every row in this one response, and
-        // forbids a continuation.
-        None => (cursor.drain(project)?, None),
-        Some(cap) => {
-            let page = cursor.next_page(cap, project)?;
-            let token = if page.more {
-                Some(registry.park(cursor, id)?.encode())
+    let bound = request_scan_bound(q.ctx);
+    let cap = bound
+        .row_cap()
+        .unwrap_or_else(crate::paging::default_scan_page_size);
+    let owner = Some(q.ctx.client_address.clone());
+
+    let (mut rows, mut next) = match q.ctx.paging.paging_state.as_deref() {
+        None => {
+            let mut cursor = build_result_cursor(&q, fingerprint).await?;
+            let page = cursor.next_page(cap)?;
+            let next = if page.more {
+                Some(registry.park(cursor, None, owner.clone())?.encode())
             } else {
                 None
             };
-            (page.rows, token)
+            (page.rows, next)
         }
+        Some(bytes) => fetch_cursor_page(&q, bytes, fingerprint, cap, owner.clone()).await?,
     };
+    if bound.row_cap().is_none() {
+        // Unpaged: the protocol forbids a continuation, so read to the end.
+        let mut pages = 0usize;
+        while let Some(token) = next.take() {
+            pages += 1;
+            if pages > 10_000_000 {
+                return Err(CqlError::ServerError(
+                    "result cursor: unpaged read did not terminate".into(),
+                ));
+            }
+            let (more, after) =
+                fetch_cursor_page(&q, &token, fingerprint, cap, owner.clone()).await?;
+            rows.extend(more);
+            next = after;
+        }
+    }
     Ok(SelectRawResult {
         column_names: q.col_names.to_vec(),
         column_types: q.col_types.to_vec(),
         rows,
         keyspace: q.ks.to_string(),
         table: q.s.table.clone(),
-        paging_state,
+        paging_state: next,
     })
 }
 
-/// Scan the table ONCE into a result cursor.
+/// Read the page `paging_state` names: here if this node owns the cursor,
+/// otherwise from its owner over internode.
+async fn fetch_cursor_page(
+    q: &CursorQuery<'_>,
+    paging_state: &[u8],
+    fingerprint: [u8; 16],
+    cap: usize,
+    owner: Option<String>,
+) -> Result<(Vec<Vec<Option<CqlValue>>>, Option<Vec<u8>>), CqlError> {
+    let registry = &q.state.result_cursors;
+    let token = crate::result_cursor::CursorToken::decode(paging_state)?;
+    if token.owner == registry.node() {
+        let (rows, next) = registry.serve_page(&token, &fingerprint, cap, owner)?;
+        return Ok((rows, next.map(|t| t.encode())));
+    }
+    crate::result_cursor::forward_page(
+        q.state.peer_manager.as_ref(),
+        &token,
+        paging_state,
+        fingerprint,
+        cap,
+    )
+    .await
+}
+
+/// Scan the table ONCE into a result cursor of FINAL result rows.
 ///
-/// - `ORDER BY`: filtered full rows go into a spilling external sort keyed by
-///   the order; each page projects its rows.
+/// - `ORDER BY`: each filtered row is projected and prefixed with its sort-key
+///   values, then pushed into a spilling external sort on that prefix. The
+///   stored rows need no statement context to be read, so the cursor can serve
+///   a page for any coordinator.
 /// - otherwise: rows are projected (and, for `DISTINCT`, de-duplicated) as
 ///   they arrive and spooled in arrival order; a `LIMIT` stops the scan once
 ///   it is met.
-/// - `ORDER BY` with `DISTINCT`: the sorted rows are projected and
-///   de-duplicated in sorted order (the first occurrence in sort order wins,
-///   as before) into a second, arrival-ordered spool.
+/// - `ORDER BY` with `DISTINCT`: the sorted rows are de-duplicated in sorted
+///   order (the first occurrence in sort order wins, as before) into a second,
+///   arrival-ordered spool.
 ///
 /// The de-duplication set lives only while the cursor is built: a parked
 /// cursor holds no `DISTINCT` state. The scan runs to completion here, so a
@@ -1987,21 +2024,26 @@ async fn build_result_cursor(
         })?;
     let threshold = ferrosa_storage::process_spill_threshold_bytes();
     let ordered = !q.s.order_by.is_empty();
-    let order = if ordered {
-        RowOrder::new(
-            q.s.order_by
-                .iter()
-                .filter_map(|(col_name, dir)| {
-                    let idx = q.rows.all_col_names.iter().position(|n| n == col_name)?;
-                    Some((idx, *dir == OrderDirection::Asc))
-                })
-                .collect(),
-        )
-    } else {
-        // No key: the sorter's stable runs and run-index tie-break keep
-        // arrival order, so it is a spill-backed FIFO.
-        RowOrder::new(Vec::new())
-    };
+    // Source column of each sort key, in ORDER BY order; key `i` is stored at
+    // column `i` of every row, ahead of the result columns.
+    let key_sources: Vec<(usize, bool)> =
+        q.s.order_by
+            .iter()
+            .filter_map(|(col_name, dir)| {
+                let idx = q.rows.all_col_names.iter().position(|n| n == col_name)?;
+                Some((idx, *dir == OrderDirection::Asc))
+            })
+            .collect();
+    let key_len = key_sources.len();
+    // With no key the sorter's stable runs and run-index tie-break keep
+    // arrival order, so it is a spill-backed FIFO.
+    let order = RowOrder::new(
+        key_sources
+            .iter()
+            .enumerate()
+            .map(|(i, (_, asc))| (i, *asc))
+            .collect(),
+    );
     let limit = literal_limit(q.s).map(|l| l as u64);
     let project = |batch: &[Vec<Option<CqlValue>>]| {
         project_select_rows(
@@ -2028,7 +2070,7 @@ async fn build_result_cursor(
     } else {
         None
     };
-    let mut first_time = |row: &Vec<Option<CqlValue>>| -> Result<bool, CqlError> {
+    let mut first_time = |row: &[Option<CqlValue>]| -> Result<bool, CqlError> {
         match dedup.as_mut() {
             None => Ok(true),
             Some(seen) => seen
@@ -2075,12 +2117,16 @@ async fn build_result_cursor(
             q.ks,
             q.state,
         )?;
+        let projected = project(&rows)?;
         if ordered {
-            for row in rows {
-                sorter.push(row).map_err(spill_err)?;
+            for (full, result) in rows.iter().zip(projected) {
+                let mut stored: Vec<Option<CqlValue>> = Vec::with_capacity(key_len + result.len());
+                stored.extend(key_sources.iter().map(|(idx, _)| full[*idx].clone()));
+                stored.extend(result);
+                sorter.push(stored).map_err(spill_err)?;
             }
         } else {
-            for row in project(&rows)? {
+            for row in projected {
                 if first_time(&row)? {
                     sorter.push(row).map_err(spill_err)?;
                     kept += 1;
@@ -2103,7 +2149,7 @@ async fn build_result_cursor(
 
     let spilled = sorter.spilled();
     let mut sorted = sorter.finish().map_err(spill_err)?;
-    let (rows, order, projected) = if ordered && q.s.distinct {
+    let (rows, order, key_len) = if ordered && q.s.distinct {
         let fifo_dir = spool.path().join("distinct-sorted");
         std::fs::create_dir(&fifo_dir).map_err(|e| {
             CqlError::ServerError(format!(
@@ -2113,29 +2159,21 @@ async fn build_result_cursor(
         })?;
         let fifo_order = RowOrder::new(Vec::new());
         let mut fifo = ExternalSorter::new(&fifo_dir, fifo_order.clone(), threshold);
-        const BATCH: usize = 4096;
-        'dedup: loop {
-            let mut batch = Vec::with_capacity(BATCH);
-            for row in sorted.by_ref().take(BATCH) {
-                batch.push(row.map_err(spill_err)?);
-            }
-            if batch.is_empty() {
-                break;
-            }
-            for row in project(&batch)? {
-                if first_time(&row)? {
-                    fifo.push(row).map_err(spill_err)?;
-                    kept += 1;
-                    if limit.is_some_and(|l| kept >= l) {
-                        break 'dedup;
-                    }
+        for row in sorted.by_ref() {
+            let mut row = row.map_err(spill_err)?;
+            row.drain(..key_len);
+            if first_time(&row)? {
+                fifo.push(row).map_err(spill_err)?;
+                kept += 1;
+                if limit.is_some_and(|l| kept >= l) {
+                    break;
                 }
             }
         }
         drop(sorted);
-        (fifo.finish().map_err(spill_err)?, fifo_order, true)
+        (fifo.finish().map_err(spill_err)?, fifo_order, 0)
     } else {
-        (sorted, order, !ordered)
+        (sorted, order, key_len)
     };
     drop(dedup);
     tracing::debug!(
@@ -2147,12 +2185,11 @@ async fn build_result_cursor(
     Ok(crate::result_cursor::ResultCursor::new(
         rows,
         order,
+        key_len,
         spool,
         permit,
         limit,
-        projected,
         fingerprint,
-        q.ctx.client_address.clone(),
     ))
 }
 

@@ -24,6 +24,8 @@ pub struct ResultRow {
 pub struct QueryResult {
     pub rows: Vec<ResultRow>,
     pub column_names: Vec<String>,
+    /// The continuation the server returned (`Has_more_pages`), if any.
+    pub paging_state: Option<Vec<u8>>,
 }
 
 /// Minimal CQL client.
@@ -251,6 +253,55 @@ impl CqlClient {
         self.query_with_cl(cql, 4).await // 4 = QUORUM
     }
 
+    /// Execute one page of a query at CL ONE: `page_size` rows at most,
+    /// continuing from `paging_state` when given. The result's
+    /// `paging_state` is the continuation for the next page, if any.
+    pub async fn query_page(
+        &mut self,
+        cql: &str,
+        page_size: i32,
+        paging_state: Option<&[u8]>,
+    ) -> Result<QueryResult, CqlError> {
+        let mut body = BytesMut::new();
+        body.put_i32(cql.len() as i32);
+        body.put_slice(cql.as_bytes());
+        body.put_u16(1); // ONE
+                         // v4 flags: 0x04 page_size, 0x08 with_paging_state.
+        body.put_u8(0x04 | if paging_state.is_some() { 0x08 } else { 0 });
+        body.put_i32(page_size);
+        if let Some(state) = paging_state {
+            body.put_i32(state.len() as i32);
+            body.put_slice(state);
+        }
+        self.send_query_body(body).await
+    }
+
+    /// Send a QUERY frame and parse its RESULT, or return its ERROR.
+    async fn send_query_body(&mut self, body: BytesMut) -> Result<QueryResult, CqlError> {
+        let stream_id = self.next_stream_id();
+        let frame = CqlFrame {
+            header: FrameHeader {
+                version: 0x04,
+                flags: 0,
+                stream_id,
+                opcode: Opcode::Query,
+                length: body.len() as u32,
+            },
+            body: body.freeze(),
+        };
+        self.framed.send(frame).await?;
+        let resp = self
+            .framed
+            .next()
+            .await
+            .ok_or_else(|| CqlError::Protocol("connection closed".into()))?
+            .map_err(|e| CqlError::Protocol(format!("query response error: {e}")))?;
+        if resp.header.opcode == Opcode::Error {
+            return Err(CqlError::ServerError(parse_error(&resp.body)?));
+        }
+        parse_result(&resp.body)
+    }
+
     /// Execute a query with an explicit consistency level (CQL wire u16).
     async fn query_with_cl(&mut self, cql: &str, cl: u16) -> Result<QueryResult, CqlError> {
         let stream_id = self.next_stream_id();
@@ -398,6 +449,7 @@ fn parse_result(body: &[u8]) -> Result<QueryResult, CqlError> {
         return Ok(QueryResult {
             rows: vec![],
             column_names: vec![],
+            paging_state: None,
         });
     }
     let mut cursor = body;
@@ -408,6 +460,7 @@ fn parse_result(body: &[u8]) -> Result<QueryResult, CqlError> {
         1 => Ok(QueryResult {
             rows: vec![],
             column_names: vec![],
+            paging_state: None,
         }),
         // ROWS
         2 => parse_rows(cursor),
@@ -415,6 +468,7 @@ fn parse_result(body: &[u8]) -> Result<QueryResult, CqlError> {
         _ => Ok(QueryResult {
             rows: vec![],
             column_names: vec![],
+            paging_state: None,
         }),
     }
 }
@@ -425,12 +479,38 @@ fn parse_rows(mut cursor: &[u8]) -> Result<QueryResult, CqlError> {
         return Ok(QueryResult {
             rows: vec![],
             column_names: vec![],
+            paging_state: None,
         });
     }
     let flags = cursor.get_i32();
     let col_count = cursor.get_i32() as usize;
 
     let has_global_table_spec = flags & 0x0001 != 0;
+    // Has_more_pages: the paging state comes right after the column count.
+    // Reading past it as a table spec would garble every column name.
+    let paging_state = if flags & 0x0002 != 0 {
+        if cursor.len() < 4 {
+            return Err(CqlError::Protocol(
+                "rows result: truncated paging state".into(),
+            ));
+        }
+        let len = cursor.get_i32();
+        if len < 0 {
+            None
+        } else {
+            let len = len as usize;
+            if cursor.len() < len {
+                return Err(CqlError::Protocol(
+                    "rows result: truncated paging state".into(),
+                ));
+            }
+            let state = cursor[..len].to_vec();
+            cursor.advance(len);
+            Some(state)
+        }
+    } else {
+        None
+    };
 
     // Skip global table spec if present.
     if has_global_table_spec {
@@ -458,6 +538,7 @@ fn parse_rows(mut cursor: &[u8]) -> Result<QueryResult, CqlError> {
         return Ok(QueryResult {
             rows: vec![],
             column_names,
+            paging_state,
         });
     }
     let row_count = cursor.get_i32() as usize;
@@ -485,7 +566,11 @@ fn parse_rows(mut cursor: &[u8]) -> Result<QueryResult, CqlError> {
         rows.push(ResultRow { columns });
     }
 
-    Ok(QueryResult { rows, column_names })
+    Ok(QueryResult {
+        rows,
+        column_names,
+        paging_state,
+    })
 }
 
 /// Read a CQL `[short] [bytes]` string from the cursor.
@@ -595,6 +680,7 @@ mod tests {
         let result = QueryResult {
             rows: vec![],
             column_names: vec!["id".to_string()],
+            paging_state: None,
         };
         assert!(result.rows.is_empty());
         assert_eq!(result.column_names.len(), 1);
@@ -870,6 +956,35 @@ mod tests {
         let result = parse_result(&body).unwrap();
         assert_eq!(result.column_names, vec!["id"]);
         assert!(result.rows.is_empty());
+    }
+
+    /// `Has_more_pages` puts the paging state between the column count and the
+    /// table spec. Skipping it garbled the column names; it must be returned.
+    #[test]
+    fn parse_result_rows_with_paging_state() {
+        let mut body = BytesMut::new();
+        body.put_i32(2); // ROWS kind
+        body.put_i32(0x0001 | 0x0002); // global table spec + has_more_pages
+        body.put_i32(1); // 1 column
+        body.put_i32(3);
+        body.put_slice(b"abc"); // paging state
+        for name in [&b"ks"[..], b"t", b"id"] {
+            body.put_u16(name.len() as u16);
+            body.put_slice(name);
+        }
+        body.put_u16(0x0009); // int type
+        body.put_i32(1); // 1 row
+        body.put_i32(4);
+        body.put_i32(42);
+
+        let result = parse_result(&body).unwrap();
+        assert_eq!(result.column_names, vec!["id"]);
+        assert_eq!(result.paging_state.as_deref(), Some(&b"abc"[..]));
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].columns[0].as_deref(),
+            Some(&42i32.to_be_bytes()[..])
+        );
     }
 
     #[test]

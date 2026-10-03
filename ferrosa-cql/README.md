@@ -87,14 +87,23 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   is never collected. A parked cursor holds files and a merge head only — no
   storage scan, scan-pool slot or thread — and is deleted with its spill
   directory when idle past `FERROSA_CQL_RESULT_CURSOR_TTL_SECS` (default 300),
-  when its connection closes, when its last page is read, or when the request
-  reading it is cancelled. A node holds at most `FERROSA_CQL_RESULT_CURSOR_MAX`
+  `FERROSA_CQL_RESULT_CURSOR_CLOSE_GRACE_SECS` (default 30) after its
+  connection closes unless a page is read meanwhile, when its last page is
+  read, or when the request reading it is cancelled. A node holds at most `FERROSA_CQL_RESULT_CURSOR_MAX`
   (default 256) open cursors and refuses more with `Overloaded` before
   scanning. A token for an expired/closed cursor, from another node or a
   restarted one, for another query or role, a stale page, or a pre-cursor
   (offset or scan-position) paging state is a clear `Invalid` error — never a
-  silent restart or a partial result. Cursors are node-local: a driver must
-  send a cursor query's next page to the node that served the previous one.
+  silent restart or a partial result. A cursor lives on the node that built
+  it; the token names that node, and any other coordinator forwards the page
+  request to it over internode (`MsgType::ResultCursorPage`,
+  `result_cursor::forward_page`, Data lane deadline) and relays the reply, so
+  a driver may send the next page anywhere (scylla-rust-driver retries the
+  remaining pages on another node after a broken connection). It forwards only
+  to a peer that advertised `CAP_RESULT_CURSOR_PAGE` in its handshake; an older
+  node, an unreachable owner, or an owner that restarted gets a named error.
+  The stored rows are final result rows prefixed by their sort key, so the
+  owner serves a page with no statement context.
   An UNPAGED request (no page size) still receives the whole result in one
   frame, as the protocol requires, so its heap is O(result).
   Results are bounded only by the query's own `LIMIT`, never a server-side row
@@ -189,8 +198,8 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 - **Pagination** (`paging.rs`) — opaque `paging_state` cursor (pk + ck +
   remaining-in-partition flag, HMAC-signed) for CQL v5 paging. Queries served
   from a result cursor carry a different token instead (`result_cursor::CursorToken`:
-  magic `FF 52 43`, version byte, node epoch, cursor id, page sequence, query
-  fingerprint; signed with the same key); each decoder refuses the other's
+  magic `FF 52 43`, version byte (2), owner host id, node epoch, cursor id,
+  page sequence, query fingerprint; signed with the same key); each decoder refuses the other's
   token by name. Paged full-table
   scans resume WITHIN a wide partition (t_a0f922a3): the router decodes the
   cursor into `ferrosa_cluster::write_path::ScanResume { key, clustering }` so
