@@ -3,7 +3,7 @@
 //! Correctness: Correct when (1) a portal is admitted to suspension only while
 //! both its connection and the node are under their limits, and the
 //! (limit+1)th is refused with SQLSTATE 53000; (2) the node count equals the
-//! live [`PortalSlot`]s, so every way a suspended portal ends (Execute to the
+//! live `PortalSlot`s, so every way a suspended portal ends (Execute to the
 //! end, Close, rebind, Sync, idle expiry, disconnect) gives its slot back; and
 //! (3) refusals are reported on their edges, not once per refusal.
 //! Last revised: 2026-10-03
