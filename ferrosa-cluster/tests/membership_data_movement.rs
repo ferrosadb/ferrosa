@@ -30,8 +30,12 @@ use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
 use async_trait::async_trait;
-use ferrosa_cluster::controller::data_movement::{decommission_verified, PartitionStreamer};
+use ferrosa_cluster::controller::data_movement::{
+    bootstrap_verified, decommission_verified, PartitionStreamer,
+};
 use ferrosa_cluster::raft::{uuid_to_node_id, NodeInfo, NodeState, RaftCommand, RaftOp};
+use ferrosa_cluster::repair::coordinator::promote_joining_members;
+use ferrosa_cluster::repair::{SessionExecutor, SessionStats};
 use ferrosa_cluster::ring::strategy::ReplicationStrategy;
 use ferrosa_cluster::ring::TokenRing;
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
@@ -307,5 +311,100 @@ async fn decommission_of_a_remote_host_is_refused() {
             .contains_key(&uuid_to_node_id(remote)),
         "nothing may be proposed for the remote node"
     );
+    cluster.shutdown().await;
+}
+
+struct Executor {
+    fail: bool,
+}
+
+#[async_trait]
+impl SessionExecutor for Executor {
+    async fn run_session(
+        &self,
+        _table: &TableId,
+        _range_start: i64,
+        _range_end: i64,
+        _peer: u64,
+    ) -> Result<SessionStats, String> {
+        if self.fail {
+            Err("peer connection reset mid-stream".into())
+        } else {
+            Ok(SessionStats {
+                partitions_streamed_in: 1,
+                ..Default::default()
+            })
+        }
+    }
+}
+
+/// P0-4, end to end through a real Raft group: a member committed `Joining`
+/// with no bootstrap record (a restart cut its stream off) is NOT promoted by
+/// the restart promote plan; a bootstrap rerun that fails leaves it `Joining`
+/// with no record; the rerun that verifies every range records completion and
+/// only then is it `Normal`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_mid_bootstrap_does_not_promote_until_the_rerun_records_completion() {
+    let (cluster, _, mut ring) = three_member_cluster().await;
+    let raft = cluster.leader_node().raft.clone();
+    let joiner_host = uuid::Uuid::from_u128(4);
+    let joiner = uuid_to_node_id(joiner_host);
+    let joining = NodeInfo {
+        state: NodeState::Joining,
+        ..member(joiner_host)
+    };
+    raft.client_write(RaftCommand {
+        op: RaftOp::JoinNode(joining.clone()),
+        schema_version: uuid::Uuid::new_v4(),
+    })
+    .await
+    .expect("Joining JoinNode commits");
+    ring.add_node(joiner, joining);
+    ring.assign_tokens(joiner, &[400]);
+    let tables = [(
+        TableId::new("ks", "t"),
+        ReplicationStrategy::Simple {
+            replication_factor: 2,
+        },
+    )];
+
+    // The restart: committed state has the joiner Joining and unrecorded.
+    let state = cluster.leader_node().state_snapshot().await;
+    let members = state.members.iter().map(|(id, m)| (*id, m.state)).collect();
+    let recorded = state.bootstrap_complete.keys().copied().collect();
+    assert!(
+        promote_joining_members(&members, &recorded).is_empty(),
+        "an unrecorded joiner must not be in the promote plan"
+    );
+
+    bootstrap_verified(
+        raft.as_ref(),
+        &ring,
+        joiner,
+        &tables,
+        &Executor { fail: true },
+    )
+    .await
+    .expect_err("a failed rerun must not complete the bootstrap");
+    let state = cluster.leader_node().state_snapshot().await;
+    assert_eq!(state.members[&joiner].state, NodeState::Joining);
+    assert!(!state.bootstrap_complete.contains_key(&joiner));
+
+    let evidence = bootstrap_verified(
+        raft.as_ref(),
+        &ring,
+        joiner,
+        &tables,
+        &Executor { fail: false },
+    )
+    .await
+    .expect("a verified rerun completes the bootstrap");
+    let state = cluster.leader_node().state_snapshot().await;
+    assert_eq!(
+        state.bootstrap_complete.get(&joiner),
+        Some(&evidence),
+        "the record must be committed"
+    );
+    assert_eq!(state.members[&joiner].state, NodeState::Normal);
     cluster.shutdown().await;
 }

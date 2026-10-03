@@ -15,6 +15,11 @@
 //!   or short apply aborts the whole transfer.
 //! - [`decommission_verified`]: `Leaving` → stream → `LeaveNode`. On any
 //!   failure `LeaveNode` is not proposed and the node stays `Leaving`.
+//! - [`bootstrap_verified`]: for a `Joining` node, a verified anti-entropy
+//!   pull of every range it will replicate, from every current replica, then
+//!   `RecordBootstrapComplete`, then `Normal`. On any failure nothing is
+//!   recorded and the node stays `Joining`. The restart promote pass only
+//!   promotes recorded joiners, and reruns this for an unrecorded local one.
 
 use std::collections::BTreeMap;
 
@@ -318,15 +323,15 @@ where
     Ok(evidence)
 }
 
-/// The keyspace/table list a decommission must move, each with its keyspace's
-/// replication strategy.
+/// The keyspace/table list a membership change must move (decommission and
+/// bootstrap alike), each with its keyspace's replication strategy.
 ///
 /// Includes `system_graph_<ks>` keyspaces (user data; the old code skipped
 /// every keyspace starting with "system" and so dropped them) and excludes the
 /// built-in system keyspaces, whose content is replicated through Raft. A
 /// keyspace with no metadata or an unparseable strategy is an error: guessing
 /// a replica set would stream to the wrong owners.
-pub fn decommission_tables(
+pub fn replicated_tables(
     snapshot: &ferrosa_schema::SchemaSnapshot,
 ) -> Result<Vec<(TableId, ReplicationStrategy)>> {
     let mut out = Vec::new();
@@ -426,6 +431,256 @@ impl PartitionStreamer for StreamSenderStreamer {
 /// Decommissions aborted because data movement was not verified. Exposed for
 /// metrics; a non-zero value means a node is parked in `Leaving`.
 pub static DECOMMISSION_ABORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Bootstrap (P0-4): Joining -> verified pull of every owned range -> record ->
+// Normal.
+// ---------------------------------------------------------------------------
+
+/// One verified pull: anti-entropy session between the joiner and `source`
+/// over `[start, end)` of `table`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapSession {
+    pub table: TableId,
+    pub start: i64,
+    pub end: i64,
+    pub source: u64,
+}
+
+/// The half-open `[start, end)` segments that make up the ring range ending
+/// at `ends[i]` (a token `t` belongs to the first ring token `>= t`).
+///
+/// The wrap range (after the last token, through `i64::MIN`, to the first
+/// token) is split in two. `[start, end)` cannot express `i64::MAX` itself,
+/// the same limit every repair session has; a partition at exactly that token
+/// is not covered.
+fn range_segments(ends: &[i64], i: usize) -> Vec<(i64, i64)> {
+    let end = ends[i].saturating_add(1);
+    if i > 0 {
+        return vec![(ends[i - 1].saturating_add(1), end)];
+    }
+    let mut segments = vec![(i64::MIN, end)];
+    let after_last = ends[ends.len() - 1].saturating_add(1);
+    if after_last < i64::MAX {
+        segments.push((after_last, i64::MAX));
+    }
+    segments
+}
+
+/// Every session a joining node must complete before it may be promoted: for
+/// each table, each ring range the joiner will replicate once `Normal`, from
+/// EVERY current replica of that range (writes taken at CL ONE may sit on any
+/// one of them).
+///
+/// Returns the sessions and the number of ranges covered.
+pub fn bootstrap_sessions(
+    ring: &TokenRing,
+    joiner: u64,
+    tables: &[(TableId, ReplicationStrategy)],
+) -> std::result::Result<(Vec<BootstrapSession>, u64), DataMovementError> {
+    let mut target = ring.clone();
+    target.set_node_state(joiner, NodeState::Normal);
+    let mut ends: Vec<i64> = ring
+        .node_ids()
+        .into_iter()
+        .flat_map(|n| ring.tokens_for_node(n))
+        .collect();
+    ends.sort_unstable();
+    ends.dedup();
+
+    let mut sessions = Vec::new();
+    let mut ranges = 0u64;
+    for (table, strategy) in tables {
+        for (i, &end_token) in ends.iter().enumerate() {
+            if !target
+                .replicas_for_strategy(end_token, strategy)
+                .contains(&joiner)
+            {
+                continue;
+            }
+            let sources: Vec<u64> = ring
+                .replicas_for_strategy(end_token, strategy)
+                .into_iter()
+                .filter(|&n| n != joiner)
+                .collect();
+            if sources.is_empty() {
+                return Err(DataMovementError::NoRemainingReplica {
+                    table: table.to_string(),
+                    token: end_token,
+                });
+            }
+            ranges += 1;
+            for (start, end) in range_segments(&ends, i) {
+                sessions.extend(sources.iter().map(|&source| BootstrapSession {
+                    table: table.clone(),
+                    start,
+                    end,
+                    source,
+                }));
+            }
+        }
+    }
+    Ok((sessions, ranges))
+}
+
+/// Run every bootstrap session. All-or-nothing: the first failed session is
+/// returned and nothing is recorded.
+///
+/// Each session is a Merkle anti-entropy exchange
+/// ([`crate::repair::SessionExecutor`]): both sides hash the range, and only
+/// leaves whose hashes differ are streamed. A session that returns `Ok` has
+/// compared the joiner's copy of the range against the source's, which is the
+/// per-range checksum verification.
+pub async fn verify_bootstrap(
+    sessions: &[BootstrapSession],
+    ranges: u64,
+    executor: &dyn crate::repair::SessionExecutor,
+) -> std::result::Result<DataMovementEvidence, DataMovementError> {
+    let mut evidence = DataMovementEvidence {
+        ranges,
+        ..Default::default()
+    };
+    for s in sessions {
+        let stats = executor
+            .run_session(&s.table, s.start, s.end, s.source)
+            .await
+            .map_err(|error| DataMovementError::Stream {
+                table: s.table.to_string(),
+                target: s.source,
+                error: format!("bootstrap session [{}, {}): {error}", s.start, s.end),
+            })?;
+        evidence.sessions += 1;
+        evidence.partitions += stats.partitions_streamed_in;
+    }
+    Ok(evidence)
+}
+
+/// Bootstrap `joiner`: verify every owned range, then commit
+/// `RecordBootstrapComplete`, then promote it to `Normal`.
+///
+/// This is both the first bootstrap and its resumption after a restart. A
+/// restart can cut a bootstrap off at any point; rerunning every session is
+/// safe because anti-entropy converges (ranges already in sync cost one Merkle
+/// comparison and move nothing). On any failure nothing is recorded and the
+/// node stays `Joining`, out of `replicas()`.
+pub async fn bootstrap_verified(
+    proposer: &dyn MembershipProposer,
+    ring: &TokenRing,
+    joiner: u64,
+    tables: &[(TableId, ReplicationStrategy)],
+    executor: &dyn crate::repair::SessionExecutor,
+) -> Result<DataMovementEvidence> {
+    let outcome = match bootstrap_sessions(ring, joiner, tables) {
+        Ok((sessions, ranges)) => verify_bootstrap(&sessions, ranges, executor).await,
+        Err(e) => Err(e),
+    };
+    let evidence = match outcome {
+        Ok(evidence) => evidence,
+        Err(e) => {
+            BOOTSTRAP_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                joiner,
+                error = %e,
+                "bootstrap NOT verified; nothing recorded, the node stays Joining (out of \
+                 replicas()) and is not promoted. It reruns on the next restart"
+            );
+            return Err(e.into());
+        }
+    };
+    proposer
+        .propose(RaftOp::RecordBootstrapComplete {
+            node_id: joiner,
+            evidence: evidence.clone(),
+        })
+        .await?;
+    proposer
+        .propose(RaftOp::SetNodeState {
+            node_id: joiner,
+            state: NodeState::Normal,
+        })
+        .await?;
+    tracing::info!(
+        joiner,
+        sessions = evidence.sessions,
+        ranges = evidence.ranges,
+        partitions = evidence.partitions,
+        "bootstrap verified and recorded; node promoted to Normal"
+    );
+    Ok(evidence)
+}
+
+/// Anti-entropy executor for a joiner's bootstrap: this node's storage as the
+/// local side, every other ring member reachable over the repair RPCs.
+pub fn bootstrap_executor(
+    storage: std::sync::Arc<ferrosa_storage::engine::StorageEngine>,
+    peer_manager: std::sync::Arc<ferrosa_net::peer::PeerManager>,
+    ring: &TokenRing,
+    local: u64,
+) -> crate::repair::LocalRepairExecutor {
+    let local_store: std::sync::Arc<dyn crate::repair::RepairStore> =
+        std::sync::Arc::new(crate::repair::StorageEngineRepairStore::new(storage));
+    let remotes = ring
+        .node_ids()
+        .into_iter()
+        .filter(|&id| id != local)
+        .filter_map(|id| {
+            ring.get_node(id).map(|info| {
+                let remote: std::sync::Arc<dyn crate::repair::RepairStore> =
+                    std::sync::Arc::new(crate::repair::RemoteRepairStore {
+                        host_id: info.host_id,
+                        peer_manager: peer_manager.clone(),
+                    });
+                (id, remote)
+            })
+        })
+        .collect();
+    crate::repair::LocalRepairExecutor {
+        local: local_store,
+        remotes,
+    }
+}
+
+/// Bootstraps that failed verification. A non-zero value means a node is
+/// parked in `Joining`.
+pub static BOOTSTRAP_ABORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`MembershipProposer`] that forwards to the Raft leader when this node is
+/// not the leader. A joining node is rarely the leader, and a bare
+/// `client_write` on a follower only returns a ForwardToLeader hint.
+pub struct ForwardingProposer {
+    pub raft: std::sync::Arc<crate::raft::FerrosRaft>,
+    pub peer_manager: std::sync::Arc<ferrosa_net::peer::PeerManager>,
+    pub ring: std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<TokenRing>>>>,
+}
+
+#[async_trait]
+impl MembershipProposer for ForwardingProposer {
+    async fn propose(&self, op: RaftOp) -> Result<()> {
+        let cmd = crate::raft::RaftCommand {
+            op,
+            schema_version: uuid::Uuid::new_v4(),
+        };
+        let outcome = match self.raft.client_write(cmd.clone()).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(crate::raft_forward::classify_client_write_error(&e)),
+        };
+        let ring = self.ring.clone();
+        let pm = self.peer_manager.clone();
+        crate::raft_forward::dispatch_propose_outcome(
+            outcome,
+            cmd,
+            move |leader| {
+                (**ring.load())
+                    .as_ref()
+                    .and_then(|r| r.get_node(leader).map(|n| n.host_id))
+            },
+            move |leader_uuid, cmd| async move {
+                crate::raft_forward::forward_raft_command_to_leader(&pm, leader_uuid, cmd).await
+            },
+        )
+        .await
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -717,5 +972,169 @@ mod tests {
 
         assert!(err.to_string().contains("no replica"), "{err}");
         assert!(!proposer.proposed_leave());
+    }
+
+    // ---- bootstrap (P0-4) ----------------------------------------------
+
+    /// Mock anti-entropy executor: records sessions, fails one source if asked.
+    #[derive(Default)]
+    struct RecordingExecutor {
+        calls: StdMutex<Vec<(i64, i64, u64)>>,
+        fail_source: Option<u64>,
+    }
+
+    #[async_trait]
+    impl crate::repair::SessionExecutor for RecordingExecutor {
+        async fn run_session(
+            &self,
+            _table: &TableId,
+            range_start: i64,
+            range_end: i64,
+            peer: u64,
+        ) -> std::result::Result<crate::repair::SessionStats, String> {
+            if self.fail_source == Some(peer) {
+                return Err("peer connection reset mid-stream".into());
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .push((range_start, range_end, peer));
+            Ok(crate::repair::SessionStats {
+                partitions_streamed_in: 5,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Nodes 1..=4 at tokens 100..=400, node 4 `Joining`. With RF=2 and node 4
+    /// counted, node 4 replicates the ranges ending at 300 ((200,300] ->
+    /// [3,4]) and 400 ((300,400] -> [4,1]).
+    fn ring_with_joiner() -> TokenRing {
+        let mut ring = TokenRing::new();
+        for id in 1..=4u64 {
+            ring.add_node(id, node(id));
+            ring.assign_tokens(id, &[id as i64 * 100]);
+        }
+        ring.set_node_state(4, NodeState::Joining);
+        ring
+    }
+
+    /// The plan covers every range the joiner will replicate, from every
+    /// current replica of that range, and nothing else.
+    #[test]
+    fn bootstrap_plan_pulls_every_owned_range_from_every_current_replica() {
+        let (sessions, ranges) =
+            bootstrap_sessions(&ring_with_joiner(), 4, &[(table(), rf2())]).unwrap();
+
+        let got: Vec<(i64, i64, u64)> = sessions
+            .iter()
+            .map(|s| (s.start, s.end, s.source))
+            .collect();
+        // (200,300]: current replicas [3,1]; (300,400]: current [1,2].
+        assert_eq!(
+            got,
+            vec![(201, 301, 3), (201, 301, 1), (301, 401, 1), (301, 401, 2)],
+        );
+        assert_eq!(ranges, 2);
+    }
+
+    /// P0-4: a bootstrap that a failure cuts off records nothing and promotes
+    /// nothing; the node stays `Joining`.
+    #[tokio::test]
+    async fn an_interrupted_bootstrap_records_nothing_and_does_not_promote() {
+        let proposer = RecordingProposer::default();
+        let executor = RecordingExecutor {
+            fail_source: Some(2),
+            ..Default::default()
+        };
+
+        let err = bootstrap_verified(
+            &proposer,
+            &ring_with_joiner(),
+            4,
+            &[(table(), rf2())],
+            &executor,
+        )
+        .await
+        .expect_err("a failed session must abort the bootstrap");
+
+        assert!(err.to_string().contains("connection reset"), "{err}");
+        assert!(
+            proposer.ops.lock().unwrap().is_empty(),
+            "nothing may be recorded or promoted: {:?}",
+            proposer.ops.lock().unwrap()
+        );
+    }
+
+    /// The verified path records completion BEFORE promoting, so a restart
+    /// between the two finds the record and the promote pass finishes it.
+    #[tokio::test]
+    async fn a_verified_bootstrap_records_then_promotes() {
+        let proposer = RecordingProposer::default();
+        let executor = RecordingExecutor::default();
+
+        let evidence = bootstrap_verified(
+            &proposer,
+            &ring_with_joiner(),
+            4,
+            &[(table(), rf2())],
+            &executor,
+        )
+        .await
+        .expect("all sessions succeed");
+
+        assert_eq!(evidence.sessions, 4);
+        assert_eq!(evidence.ranges, 2);
+        assert_eq!(evidence.partitions, 20);
+        let ops = proposer.ops.lock().unwrap();
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [
+                    RaftOp::RecordBootstrapComplete { node_id: 4, .. },
+                    RaftOp::SetNodeState {
+                        node_id: 4,
+                        state: NodeState::Normal
+                    }
+                ]
+            ),
+            "record first, then promote: {ops:?}"
+        );
+    }
+
+    /// A joiner that would own a range nobody else holds cannot be verified.
+    #[tokio::test]
+    async fn a_bootstrap_with_no_source_is_refused() {
+        let mut ring = TokenRing::new();
+        ring.add_node(4, node(4));
+        ring.assign_tokens(4, &[400]);
+        ring.set_node_state(4, NodeState::Joining);
+        let proposer = RecordingProposer::default();
+
+        let err = bootstrap_verified(
+            &proposer,
+            &ring,
+            4,
+            &[(table(), rf2())],
+            &RecordingExecutor::default(),
+        )
+        .await
+        .expect_err("no source replica must abort");
+        assert!(err.to_string().contains("no replica"), "{err}");
+        assert!(proposer.ops.lock().unwrap().is_empty());
+    }
+
+    /// The wrap range is covered on both sides of `i64::MIN`.
+    #[test]
+    fn the_wrap_range_is_split_into_two_segments() {
+        assert_eq!(
+            range_segments(&[100, 200], 0),
+            vec![(i64::MIN, 101), (201, i64::MAX)]
+        );
+        assert_eq!(range_segments(&[100, 200], 1), vec![(101, 201)]);
+        assert_eq!(
+            range_segments(&[100], 0),
+            vec![(i64::MIN, 101), (101, i64::MAX)]
+        );
     }
 }

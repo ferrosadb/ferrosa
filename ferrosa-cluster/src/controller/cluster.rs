@@ -302,6 +302,72 @@ pub(super) fn should_send_schema_snapshot(
 /// `CreateKeyspace` + `CreateTable` ops through Raft on Cluster-mode
 /// transition, which propagates them to every replica's state
 /// machine and storage engine.
+/// Rerun this node's bootstrap after a restart found it `Joining` with no
+/// verified bootstrap record (P0-4). Success records completion and promotes
+/// the node; failure leaves it `Joining` and is logged by
+/// [`super::data_movement::bootstrap_verified`]. Nothing here promotes on
+/// error.
+async fn rerun_local_bootstrap(
+    local_node_id: u64,
+    raft: Arc<crate::raft::FerrosRaft>,
+    peer_manager: Arc<ferrosa_net::peer::PeerManager>,
+    ring_holder: Arc<arc_swap::ArcSwap<Option<Arc<crate::ring::TokenRing>>>>,
+    storage: Arc<ferrosa_storage::engine::StorageEngine>,
+    schema: &ferrosa_schema::Schema,
+) {
+    let Some(ring) = ring_holder.load_full().as_ref().clone() else {
+        tracing::error!(
+            local = local_node_id,
+            "cannot rerun bootstrap: no token ring; the node stays Joining"
+        );
+        return;
+    };
+    let tables = match super::data_movement::replicated_tables(&schema.snapshot()) {
+        Ok(tables) => tables,
+        Err(e) => {
+            tracing::error!(
+                local = local_node_id,
+                %e,
+                "cannot rerun bootstrap: table replication unknown; the node stays Joining"
+            );
+            return;
+        }
+    };
+    tracing::warn!(
+        local = local_node_id,
+        tables = tables.len(),
+        "this node is Joining with no verified bootstrap record; rerunning its bootstrap"
+    );
+    let executor = super::data_movement::bootstrap_executor(
+        storage,
+        peer_manager.clone(),
+        &ring,
+        local_node_id,
+    );
+    let proposer = super::data_movement::ForwardingProposer {
+        raft,
+        peer_manager,
+        ring: ring_holder,
+    };
+    if let Err(e) = super::data_movement::bootstrap_verified(
+        &proposer,
+        &ring,
+        local_node_id,
+        &tables,
+        &executor,
+    )
+    .await
+    {
+        // Covers a failed proposal of the record or the promotion too, which
+        // `bootstrap_verified` returns without logging.
+        tracing::error!(
+            local = local_node_id,
+            %e,
+            "bootstrap rerun did not complete; the node stays Joining until the next restart"
+        );
+    }
+}
+
 pub(super) fn keyspace_needs_cluster_replay(name: &str) -> bool {
     !ferrosa_schema::is_system_keyspace(name)
 }
@@ -2905,6 +2971,22 @@ impl ModeController {
                                  bootstrap record; they are NOT promoted and stay out of \
                                  replicas() until their bootstrap reruns and records completion"
                             );
+                        }
+                        // A joiner reruns its own bootstrap: it pulls every
+                        // range it will own from the current replicas, records
+                        // completion through Raft, then promotes itself. Other
+                        // nodes only report it; the joiner holds the storage
+                        // the data must land in.
+                        if awaiting.contains(&local_node_id) {
+                            rerun_local_bootstrap(
+                                local_node_id,
+                                raft_arc.clone(),
+                                peer_manager_for_bootstrap.clone(),
+                                ring_for_bootstrap.clone(),
+                                storage_for_bootstrap.clone(),
+                                &schema_for_bootstrap,
+                            )
+                            .await;
                         }
                         if !promote_plan.is_empty() {
                             let stuck: Vec<(u64, NodeState)> = member_states
