@@ -56,6 +56,12 @@ Five-stage pipeline: **parse** (`spargebra`) → **plan**
 LIMIT/OFFSET) → **shape** (ASK boolean / CONSTRUCT+DESCRIBE graph assembly in
 `engine.rs`) → **serialize** (`results.rs`).
 
+Before parsing, `nesting::check_nesting` refuses query and update text whose
+`(`/`{`/`[` nesting exceeds `MAX_NESTING` (64), skipping literals, IRIs and
+comments as the lexer does. `spargebra` recurses per level with no limit, so
+unbounded nesting overflowed the worker stack and aborted the process
+(`tests/parser_depth.rs`).
+
 Each triple pattern is planned into the cheapest storage access it can prove:
 `SubjectLookup` (point read on the partition key) when the subject is bound,
 `PredicateScan`/`FullScan` (streaming range read) otherwise, `ObjectScan`

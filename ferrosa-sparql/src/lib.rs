@@ -10,6 +10,7 @@ pub mod executor;
 pub mod filter;
 pub mod http;
 pub mod namespace;
+pub mod nesting;
 pub mod planner;
 pub mod property_path;
 pub mod rdf_star;

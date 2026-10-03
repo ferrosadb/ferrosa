@@ -285,7 +285,9 @@ impl SparqlEngine {
         query_str: &str,
         keyspace: &str,
     ) -> Result<SparqlResult, SparqlError> {
-        // 1. Parse SPARQL → algebra.
+        // 1. Parse SPARQL → algebra. The parser recurses per nesting level
+        // without a limit, so the depth is bounded first.
+        crate::nesting::check_nesting(query_str)?;
         let query = spargebra::SparqlParser::new()
             .parse_query(query_str)
             .map_err(|e| SparqlError::Parse(format!("{e}")))?;
