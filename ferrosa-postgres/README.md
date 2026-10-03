@@ -179,7 +179,7 @@ soon as a batch arrives. A fetch waits only on the executor's inputs, never on
 the client, so a suspended portal or a client that stopped reading its socket
 holds no blocking thread. Below it, the storage range scan pauses after a
 10 ms grace and gives back its pool slot and thread too, keeping its exact
-position (ferrosa-storage ST-68). Before this, each suspended portal parked
+position (ferrosa-storage ST-73). Before this, each suspended portal parked
 two blocking threads, and about `cores` idle clients exhausted the listener
 runtime's bounded blocking pool (`tests/pg_suspended_portals_hold_no_thread.rs`:
 16 portals beside a 4-thread pool, every thread free, another session's
