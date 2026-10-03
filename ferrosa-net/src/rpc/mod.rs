@@ -1,5 +1,6 @@
 // ferrosa-net/src/rpc/mod.rs
 pub mod client;
+pub mod error_reply;
 pub mod handler;
 pub mod server;
 

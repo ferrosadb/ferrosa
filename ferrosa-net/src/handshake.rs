@@ -14,6 +14,16 @@ type HmacSha256 = Hmac<Sha256>;
 /// Current protocol version.
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Capability bit: the initiator understands error-reply frames
+/// ([`crate::codec::FLAG_RPC_ERROR`]). A server sends one only to an initiator
+/// that advertised this bit; an older initiator would misread the frame (an
+/// opaque body decodes as the request type) or, for an unknown message type,
+/// drop the whole connection.
+pub const CAP_RPC_ERROR_REPLY: u32 = 1 << 0;
+
+/// Every capability this build understands, advertised in its Handshake.
+pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY;
+
 /// Peer metadata learned from a completed handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakePeer {
@@ -24,6 +34,10 @@ pub struct HandshakePeer {
     /// The peer's advertised internode broadcast hostname (host:port), if any.
     /// When present, this is the re-resolvable target stored in `NodeInfo.addr`.
     pub internode_broadcast: Option<String>,
+    /// Capability bits the peer advertised (`CAP_*`). Known only on the
+    /// accepting side: the Handshake carries them, the HandshakeAck does not,
+    /// so the initiator records `0`.
+    pub capabilities: u32,
 }
 
 /// Compute PSK auth token: HMAC-SHA256(key=psk, data=cluster_name|host_id|nonce).
@@ -79,6 +93,7 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         auth_token,
         cql_broadcast: config.cql_broadcast.clone(),
         internode_broadcast: config.internode_broadcast.clone(),
+        capabilities: LOCAL_CAPABILITIES,
     };
     let mut body = BytesMut::new();
     handshake.encode(&mut body)?;
@@ -114,6 +129,7 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     host_id,
                     cql_broadcast,
                     internode_broadcast,
+                    capabilities: 0,
                 })
             } else {
                 Err(NetError::HandshakeFailed(reason))
@@ -146,6 +162,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
         peer_token,
         peer_cql_broadcast,
         peer_internode_broadcast,
+        peer_capabilities,
     ) = match hs {
         Message::Handshake {
             cluster_name,
@@ -154,6 +171,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             auth_token,
             cql_broadcast,
             internode_broadcast,
+            capabilities,
             ..
         } => (
             host_id,
@@ -162,6 +180,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             auth_token,
             cql_broadcast,
             internode_broadcast,
+            capabilities,
         ),
         _ => return Err(NetError::Protocol("expected Handshake".into())),
     };
@@ -246,6 +265,7 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
         host_id: peer_host_id,
         cql_broadcast: peer_cql_broadcast,
         internode_broadcast: peer_internode_broadcast,
+        capabilities: peer_capabilities,
     })
 }
 
@@ -499,6 +519,7 @@ mod tests {
             auth_token: vec![],
             cql_broadcast: None,
             internode_broadcast: None,
+            capabilities: 0,
         };
         use futures::SinkExt;
         let mut body = BytesMut::new();
