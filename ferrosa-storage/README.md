@@ -29,8 +29,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   are expanded at the writer boundary: every flush and compaction whose output
   is complex-framed runs `memtable::expand_collection_blobs_for_writer` (and
   widens the header minimums for the sentinel), so a simple-framed blob never
-  reaches a complex writer. `TableStore::write` refuses a whole value that does
-  not parse as its collection (FMEA ST-66).
+  reaches a complex writer. Every expansion is counted in
+  `ferrosa_storage_collection_blob_expansions_total{table}` and WARNs once per
+  (table, column). `TableStore::write` refuses a whole value that does not parse
+  as its collection or whose elements are not values of the element type
+  (FMEA ST-66).
 - **Commit log** (`commitlog/`) — segmented WAL with CAS-based lock-free
   allocation, forward-linked sync markers, crash-recovery replay, CDC reader,
   S3 archiver for PITR, and per-table checkpoints. Three sync strategies

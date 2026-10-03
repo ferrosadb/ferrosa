@@ -3482,8 +3482,9 @@ impl<F: FlushTarget> TableStore<F> {
             SSTableWriter::new(options, header.clone())
         };
         let phase_start = Instant::now();
+        let table_label = format!("{}.{}", schema.keyspace, schema.table);
         for p in &partitions {
-            let p = crate::memtable::expand_collection_blobs_for_writer(p, &header)?;
+            let p = crate::memtable::expand_collection_blobs_for_writer(p, &header, &table_label)?;
             writer.add_partition(&p)?;
         }
         let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
@@ -3928,6 +3929,7 @@ impl<F: FlushTarget> TableStore<F> {
             .map(|_| self.flush_target.file_output_staging_dir().map(Staging))
             .collect::<Result<_>>()?;
         let phase_start = Instant::now();
+        let table_label = format!("{}.{}", schema.keyspace, schema.table);
         let outputs: Vec<ShardOutput> = crate::flush_executor::pool()?.install(|| {
             shards
                 .par_iter()
@@ -3944,7 +3946,9 @@ impl<F: FlushTarget> TableStore<F> {
                     };
                     for partition in shard {
                         let partition = crate::memtable::expand_collection_blobs_for_writer(
-                            partition, &header,
+                            partition,
+                            &header,
+                            &table_label,
                         )?;
                         writer.add_partition(&partition)?;
                     }

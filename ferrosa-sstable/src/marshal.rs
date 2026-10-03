@@ -136,9 +136,28 @@ pub fn collection_value_type(type_name: &str) -> Option<&str> {
     }
 }
 
+/// For a multicell `map<K,V>` column, the key type `K` (each element cell's
+/// path). `None` for any other type.
+pub fn collection_key_type(type_name: &str) -> Option<&str> {
+    match simple_class_name(type_name) {
+        "MapType" => top_level_args(type_name)?.next(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_key_type_is_the_first_argument() {
+        assert_eq!(
+            collection_key_type(MAP_TEXT_INT),
+            Some("org.apache.cassandra.db.marshal.UTF8Type")
+        );
+        assert_eq!(collection_key_type(LIST_INT), None);
+        assert_eq!(collection_key_type(SET_TEXT), None);
+    }
 
     const LIST_INT: &str =
         "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.Int32Type)";

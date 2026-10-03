@@ -1481,6 +1481,7 @@ impl CompactionExecutor {
         // Counts and min/max token across all merged output partitions so the
         // emitted SSTableMetadata can be filled without a second scan.
         let mut tally = OutputTally::default();
+        let table_label = task.table_id.to_string();
         // First partition that purged down to nothing, kept (unpurged) in case
         // every partition does: an empty output cannot be swapped in.
         let mut held_back: Option<ferrosa_sstable::types::Partition> = None;
@@ -1600,7 +1601,13 @@ impl CompactionExecutor {
                     }
                 }
             }
-            emit_partition(&mut writer, &output_header, &merged, &mut tally)?;
+            emit_partition(
+                &mut writer,
+                &output_header,
+                &table_label,
+                &merged,
+                &mut tally,
+            )?;
         }
 
         if tally.partitions == 0 {
@@ -1616,7 +1623,7 @@ impl CompactionExecutor {
                 "compaction: every partition purged away; writing one unpurged partition \
                  so the output is not empty"
             );
-            emit_partition(&mut writer, &output_header, &kept, &mut tally)?;
+            emit_partition(&mut writer, &output_header, &table_label, &kept, &mut tally)?;
         }
         if purged_markers > 0 {
             crate::metrics::add_compaction_purged_markers(purged_markers);
@@ -1918,13 +1925,14 @@ impl Default for OutputTally {
 fn emit_partition(
     writer: &mut ferrosa_sstable::writer::SSTableWriter,
     header: &ferrosa_sstable::statistics::SerializationHeader,
+    table: &str,
     merged: &ferrosa_sstable::types::Partition,
     tally: &mut OutputTally,
 ) -> std::result::Result<(), String> {
     let write_start = Instant::now();
     // A legacy simple-framed input may carry whole-value collection cells that
     // a complex-framed output cannot hold as-is.
-    let merged = &*crate::memtable::expand_collection_blobs_for_writer(merged, header)
+    let merged = &*crate::memtable::expand_collection_blobs_for_writer(merged, header, table)
         .map_err(|e| format!("write partition: {e}"))?;
     validate_partition_writable(merged, header).map_err(|e| format!("write partition: {e}"))?;
     writer

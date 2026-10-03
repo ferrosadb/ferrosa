@@ -60,6 +60,39 @@ fn raw_collection_kind(type_name: &str) -> Option<RawCollectionKind> {
     }
 }
 
+/// A non-frozen collection column's declared type: its kind plus the full
+/// marshal type string, from which the element types are read so a blob's
+/// elements can be checked against them.
+#[derive(Clone, Copy)]
+struct CollectionType<'a> {
+    kind: RawCollectionKind,
+    type_name: &'a str,
+}
+
+fn collection_type(type_name: &str) -> Option<CollectionType<'_>> {
+    raw_collection_kind(type_name).map(|kind| CollectionType { kind, type_name })
+}
+
+/// Refuse an element whose bytes cannot be a value of `element_type`: a
+/// fixed-width type with the wrong length, or text that is not valid
+/// UTF-8/ASCII. This is what separates a genuine whole-value collection from
+/// stray bytes that only happen to frame as one (for example a path-dropped
+/// element cell). It cannot separate them when the element type is
+/// variable-width and unconstrained (blob, varint, decimal), or when the bytes
+/// are exactly `00 00 00 00`, the encoding of an EMPTY collection — those
+/// still expand, and the expansion is counted and logged.
+fn check_collection_element(element_type: &str, bytes: &[u8]) -> std::result::Result<(), String> {
+    ferrosa_common::schema::validate_cell_bytes(element_type, bytes)?;
+    let simple = element_type.rsplit('.').next().unwrap_or(element_type);
+    match simple {
+        "UTF8Type" => std::str::from_utf8(bytes)
+            .map(|_| ())
+            .map_err(|e| format!("{element_type} element is not UTF-8: {e}")),
+        "AsciiType" if !bytes.is_ascii() => Err(format!("{element_type} element is not ASCII")),
+        _ => Ok(()),
+    }
+}
+
 fn take_collection_value<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     let len_bytes = bytes
         .get(*pos..*pos + 4)
@@ -82,10 +115,35 @@ fn take_collection_value<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8
 /// [`validate_legacy_collection_blobs`], so the write-time check accepts
 /// exactly what a later flush can expand.
 fn walk_collection_blob<'a>(
-    kind: RawCollectionKind,
+    collection: CollectionType<'_>,
     bytes: &'a [u8],
     mut emit: impl FnMut(usize, &'a [u8], &'a [u8]),
 ) -> Result<usize> {
+    let kind = collection.kind;
+    // Element types: list/set element, or map key then value. A type string
+    // that does not name them is itself malformed.
+    let missing = || {
+        Error::InvalidData(format!(
+            "collection type {} does not name its element types",
+            collection.type_name
+        ))
+    };
+    let first_type = match kind {
+        RawCollectionKind::Map => {
+            ferrosa_sstable::marshal::collection_key_type(collection.type_name)
+        }
+        RawCollectionKind::List | RawCollectionKind::Set => {
+            ferrosa_sstable::marshal::collection_value_type(collection.type_name)
+        }
+    }
+    .ok_or_else(missing)?;
+    let second_type = match kind {
+        RawCollectionKind::Map => Some(
+            ferrosa_sstable::marshal::collection_value_type(collection.type_name)
+                .ok_or_else(missing)?,
+        ),
+        RawCollectionKind::List | RawCollectionKind::Set => None,
+    };
     let count_bytes = bytes
         .get(..4)
         .ok_or_else(|| Error::InvalidData("truncated collection element count".into()))?;
@@ -109,9 +167,16 @@ fn walk_collection_blob<'a>(
     let mut pos = 4;
     for seq in 0..count {
         let first = take_collection_value(bytes, &mut pos)?;
-        let second = match kind {
-            RawCollectionKind::Map => take_collection_value(bytes, &mut pos)?,
-            RawCollectionKind::List | RawCollectionKind::Set => &[],
+        check_collection_element(first_type, first)
+            .map_err(|e| Error::InvalidData(format!("collection element {seq}: {e}")))?;
+        let second = match second_type {
+            Some(value_type) => {
+                let value = take_collection_value(bytes, &mut pos)?;
+                check_collection_element(value_type, value)
+                    .map_err(|e| Error::InvalidData(format!("collection value {seq}: {e}")))?;
+                value
+            }
+            None => &[],
         };
         emit(seq, first, second);
     }
@@ -125,15 +190,16 @@ fn walk_collection_blob<'a>(
 }
 
 fn expand_legacy_collection_cell(
-    kind: RawCollectionKind,
+    collection: CollectionType<'_>,
     blob: &CellValue,
 ) -> Result<Vec<CellValue>> {
+    let kind = collection.kind;
     let bytes = blob
         .value
         .as_deref()
         .ok_or_else(|| Error::InvalidData("live collection blob has no value".into()))?;
     let mut elements = Vec::new();
-    walk_collection_blob(kind, bytes, |seq, first, second| {
+    walk_collection_blob(collection, bytes, |seq, first, second| {
         let (path, value) = match kind {
             RawCollectionKind::List => (
                 ferrosa_row_bridge::collection::list_cell_path(blob.timestamp, seq as u16),
@@ -178,11 +244,12 @@ pub(crate) fn validate_legacy_collection_blobs(row: &Row, schema: &TableSchema) 
         if cell.path.is_some() || cell.is_tombstone() {
             continue;
         }
-        let (Some(kind), Some(bytes)) = (collection_kind_at(schema, *idx), cell.value.as_deref())
+        let (Some(collection), Some(bytes)) =
+            (collection_type_at(schema, *idx), cell.value.as_deref())
         else {
             continue;
         };
-        if let Err(e) = walk_collection_blob(kind, bytes, |_, _, _| {}) {
+        if let Err(e) = walk_collection_blob(collection, bytes, |_, _, _| {}) {
             let column = schema
                 .column_at_ordinal(*idx)
                 .map_or("<unknown>", |c| c.name.as_str());
@@ -235,19 +302,28 @@ pub(crate) fn normalize_collection_rows_for_merge(
                         "collection cell column index {idx} is outside the table schema"
                     ))
                 })?;
-                let kind = raw_collection_kind(&column.type_name).ok_or_else(|| {
+                let collection = collection_type(&column.type_name).ok_or_else(|| {
                     Error::InvalidData(format!(
                         "path-bearing cell for non-collection column {}",
                         column.name
                     ))
                 })?;
-                replacements.insert(*idx, expand_legacy_collection_cell(kind, cell)?);
+                replacements.insert(*idx, expand_legacy_collection_cell(collection, cell)?);
             }
         }
         Ok(replacements)
     };
     let mut existing_replacements = plan(existing)?;
     let mut incoming_replacements = plan(incoming)?;
+    let expanded: Vec<u16> = existing_replacements
+        .keys()
+        .chain(incoming_replacements.keys())
+        .copied()
+        .collect();
+    record_blob_expansions(
+        &schema_table_label(schema),
+        schema_column_names(schema, &expanded),
+    );
 
     let apply =
         |row: &mut Row, replacements: &mut std::collections::HashMap<u16, Vec<CellValue>>| {
@@ -274,7 +350,7 @@ pub(crate) fn normalize_collection_rows_for_merge(
 /// Collection kind of the column at cell index `idx` (statics first, then
 /// regulars, per `TableSchema`'s contract), or `None` for a non-collection,
 /// frozen or out-of-range column.
-fn collection_kind_at(schema: &TableSchema, idx: u16) -> Option<RawCollectionKind> {
+fn collection_type_at(schema: &TableSchema, idx: u16) -> Option<CollectionType<'_>> {
     let idx = idx as usize;
     let static_count = schema.static_columns.len();
     let column = if idx < static_count {
@@ -282,7 +358,7 @@ fn collection_kind_at(schema: &TableSchema, idx: u16) -> Option<RawCollectionKin
     } else {
         schema.regular_columns.get(idx - static_count)
     }?;
-    raw_collection_kind(&column.type_name)
+    collection_type(&column.type_name)
 }
 
 /// Expand every legacy whole-value collection cell (live, `path == None`, on a
@@ -295,24 +371,32 @@ fn collection_kind_at(schema: &TableSchema, idx: u16) -> Option<RawCollectionKin
 /// or compaction unexpanded are handled by
 /// [`expand_collection_blobs_for_writer`].
 pub(crate) fn expand_legacy_collection_blobs(row: &mut Row, schema: &TableSchema) -> Result<()> {
-    expand_row_collection_blobs(row, |idx| collection_kind_at(schema, idx))
+    let expanded = expand_row_collection_blobs(row, |idx| collection_type_at(schema, idx))?;
+    record_blob_expansions(
+        &schema_table_label(schema),
+        schema_column_names(schema, &expanded),
+    );
+    Ok(())
 }
 
 /// The expansion behind [`expand_legacy_collection_blobs`] and
-/// [`expand_collection_blobs_for_writer`]; `kind_at` maps a cell's column
-/// index to its collection kind under the caller's indexing convention.
-fn expand_row_collection_blobs(
+/// [`expand_collection_blobs_for_writer`]; `type_at` maps a cell's column
+/// index to its collection type under the caller's indexing convention.
+/// Returns the column index of every cell it expanded, so callers can
+/// account for each rewrite.
+fn expand_row_collection_blobs<'s>(
     row: &mut Row,
-    kind_at: impl Fn(u16) -> Option<RawCollectionKind>,
-) -> Result<()> {
+    type_at: impl Fn(u16) -> Option<CollectionType<'s>>,
+) -> Result<Vec<u16>> {
     let is_blob = |cell: &CellValue| cell.path.is_none() && !cell.is_tombstone();
     if !row
         .cells
         .iter()
-        .any(|(idx, cell)| is_blob(cell) && kind_at(*idx).is_some())
+        .any(|(idx, cell)| is_blob(cell) && type_at(*idx).is_some())
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut expanded = Vec::new();
     // Move the cells rather than cloning them: `cell.clone()` copies row data
     // (P0 OOM audit, rule `clone-on-row-data`). Taking the vec is safe because
     // every caller owns the row it hands in and discards it on `Err`, so a
@@ -320,26 +404,29 @@ fn expand_row_collection_blobs(
     let original = std::mem::take(&mut row.cells);
     let mut cells = Vec::with_capacity(original.len() + 1);
     for (idx, cell) in original {
-        match kind_at(idx).filter(|_| is_blob(&cell)) {
-            Some(kind) => cells.extend(
-                expand_legacy_collection_cell(kind, &cell)?
-                    .into_iter()
-                    .map(|element| (idx, element)),
-            ),
+        match type_at(idx).filter(|_| is_blob(&cell)) {
+            Some(collection) => {
+                cells.extend(
+                    expand_legacy_collection_cell(collection, &cell)?
+                        .into_iter()
+                        .map(|element| (idx, element)),
+                );
+                expanded.push(idx);
+            }
             None => cells.push((idx, cell)),
         }
     }
     cells.sort_by(|(a_idx, a), (b_idx, b)| (a_idx, &a.path).cmp(&(b_idx, &b.path)));
     row.cells = cells;
-    Ok(())
+    Ok(expanded)
 }
 
-/// Collection kind of a writer header column (`(name, type)` pairs indexed
+/// Collection type of a writer header column (`(name, type)` pairs indexed
 /// from 0), or `None` for a non-collection, frozen or out-of-range column.
-fn header_collection_kind(columns: &[(Vec<u8>, String)], idx: u16) -> Option<RawCollectionKind> {
+fn header_collection_type(columns: &[(Vec<u8>, String)], idx: u16) -> Option<CollectionType<'_>> {
     columns
         .get(usize::from(idx))
-        .and_then(|(_, type_name)| raw_collection_kind(type_name))
+        .and_then(|(_, type_name)| collection_type(type_name))
 }
 
 /// True when `partition` holds a live path-less cell on a non-frozen
@@ -354,7 +441,7 @@ pub(crate) fn partition_has_collection_blob(
         row.cells.iter().any(|(idx, cell)| {
             cell.path.is_none()
                 && !cell.is_tombstone()
-                && header_collection_kind(columns, *idx).is_some()
+                && header_collection_type(columns, *idx).is_some()
         })
     };
     partition
@@ -398,12 +485,16 @@ pub(crate) fn widen_header_for_blob_sentinels(
 /// each from 0). A simple-framed header, or a partition with no such cell, is
 /// returned borrowed and untouched.
 ///
-/// This is the single fix for both writer refusals of 2026-10-03 (node2's
-/// `storage-flush`, node1's compaction). A blob that does not parse fails
-/// with an error naming the partition key.
+/// This rewrites stored data, so it is never silent: every expanded cell is
+/// counted in `ferrosa_storage_collection_blob_expansions_total{table}`, and
+/// the first expansion of each (table, column) in this process logs a WARN
+/// naming both. A blob that does not parse, or whose elements are not values
+/// of the declared element types, fails with an error naming the table and
+/// partition key instead of being expanded.
 pub(crate) fn expand_collection_blobs_for_writer<'a>(
     partition: &'a Partition,
     header: &ferrosa_sstable::statistics::SerializationHeader,
+    table: &str,
 ) -> Result<std::borrow::Cow<'a, Partition>> {
     use std::borrow::Cow;
     if !header.complex_collections {
@@ -414,29 +505,88 @@ pub(crate) fn expand_collection_blobs_for_writer<'a>(
     }
 
     let mut owned = partition.clone();
-    let expanded = owned
-        .static_row
-        .as_mut()
-        .map_or(Ok(()), |row| {
-            expand_row_collection_blobs(row, |idx| {
-                header_collection_kind(&header.static_columns, idx)
-            })
-        })
-        .and_then(|()| {
-            owned.rows.iter_mut().try_for_each(|row| {
-                expand_row_collection_blobs(row, |idx| {
-                    header_collection_kind(&header.regular_columns, idx)
-                })
-            })
-        });
-    expanded.map_err(|e| {
+    let result = (|| -> Result<(Vec<u16>, Vec<u16>)> {
+        let static_indices = match owned.static_row.as_mut() {
+            Some(row) => expand_row_collection_blobs(row, |idx| {
+                header_collection_type(&header.static_columns, idx)
+            })?,
+            None => Vec::new(),
+        };
+        let mut regular_indices = Vec::new();
+        for row in owned.rows.iter_mut() {
+            regular_indices.extend(expand_row_collection_blobs(row, |idx| {
+                header_collection_type(&header.regular_columns, idx)
+            })?);
+        }
+        Ok((static_indices, regular_indices))
+    })();
+    let (static_indices, regular_indices) = result.map_err(|e| {
         Error::InvalidData(format!(
-            "whole-value collection cell in partition key={:?} cannot be expanded for a \
-             complex-framed SSTable: {e}",
+            "{table}: whole-value collection cell in partition key={:?} cannot be expanded \
+             for a complex-framed SSTable: {e}",
             String::from_utf8_lossy(partition.key.key.as_bytes())
         ))
     })?;
+    record_blob_expansions(
+        table,
+        header_column_names(&header.static_columns, &static_indices).chain(header_column_names(
+            &header.regular_columns,
+            &regular_indices,
+        )),
+    );
     Ok(Cow::Owned(owned))
+}
+
+/// Count whole-value collection cells rewritten into elements and WARN on
+/// the first one per (table, column) in this process. Every expansion site
+/// (writer boundary, commit-log replay, memtable merge) reports here, so no
+/// rewrite of stored data is silent.
+fn record_blob_expansions(table: &str, column_names: impl Iterator<Item = String>) {
+    let mut count = 0u64;
+    for column in column_names {
+        count += 1;
+        if crate::metrics::first_collection_blob_expansion(table, &column) {
+            tracing::warn!(
+                table,
+                column = %column,
+                "storage: expanding whole-value collection cells into elements (legacy or \
+                 non-CQL write); further expansions for this column are counted in \
+                 ferrosa_storage_collection_blob_expansions_total only"
+            );
+        }
+    }
+    if count > 0 {
+        crate::metrics::add_collection_blob_expansions(table, count);
+    }
+}
+
+/// Column names, from a writer header's column list, for expanded indices.
+fn header_column_names<'c>(
+    columns: &'c [(Vec<u8>, String)],
+    indices: &'c [u16],
+) -> impl Iterator<Item = String> + 'c {
+    indices.iter().map(move |idx| {
+        columns.get(usize::from(*idx)).map_or_else(
+            || format!("<index {idx}>"),
+            |(name, _)| String::from_utf8_lossy(name).into_owned(),
+        )
+    })
+}
+
+/// Column names, from a table schema (statics first), for expanded indices.
+fn schema_column_names<'c>(
+    schema: &'c TableSchema,
+    indices: &'c [u16],
+) -> impl Iterator<Item = String> + 'c {
+    indices.iter().map(move |idx| {
+        schema
+            .column_at_ordinal(*idx)
+            .map_or_else(|| format!("<index {idx}>"), |c| c.name.clone())
+    })
+}
+
+fn schema_table_label(schema: &TableSchema) -> String {
+    format!("{}.{}", schema.keyspace, schema.table)
 }
 
 pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Result<()> {
