@@ -22,7 +22,15 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Memtable** — sharded write buffer behind the `Memtable` trait. Default build
   uses `SkipListMemtable` (crossbeam skiplist, feature `skiplist-memtable`);
   `ShardedBTreeMemtable` (64 `parking_lot::RwLock` shards) is the alternative.
-  Per-partition merge-on-write (cell-level LWW, tombstone merge). When a legacy
+  Per-partition merge-on-write (cell-level LWW, tombstone merge). Two
+  empty-clustering marker rows carry partition-level state through the row
+  write path (and so the commit log and `Mutation`): no cells + non-LIVE
+  deletion is the partition deletion, and cells on a clustered table is the
+  STATIC row (cells must be static ordinals), lifted into
+  `Partition::static_row`. `StorageEngine::apply_partition`
+  (`partition_apply.rs`) applies a whole partition received from another
+  replica — deletion, static row, rows — and `partition_to_rows` is the shared
+  conversion for senders that ship a `Mutation` (P0-3, ST-71). When a legacy
   whole-value collection and path-keyed collection elements meet during replay
   or a live update, the merge expands the whole value into a deletion sentinel
   plus sorted element cells. Whole values in DIFFERENT partitions or SSTables

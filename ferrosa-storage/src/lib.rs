@@ -37,6 +37,7 @@ pub mod memtable;
 pub mod merge;
 pub mod metrics;
 pub mod observer;
+pub mod partition_apply;
 pub mod pin_config;
 pub mod quantized_range_cache;
 pub mod quarantine;

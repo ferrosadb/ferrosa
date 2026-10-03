@@ -181,21 +181,15 @@ impl Memtable for ShardedBTreeMemtable {
             // into `Partition::deletion` instead of storing a phantom row, so a
             // subsequent read suppresses every clustered row at or below the
             // tombstone timestamp (see `super::is_partition_tombstone`).
-            let partition = if super::is_partition_tombstone(&row) {
-                Partition {
-                    key: key.clone(),
-                    deletion: row.deletion,
-                    static_row: None,
-                    rows: Vec::new(),
-                }
-            } else {
-                Partition {
-                    key: key.clone(),
-                    deletion: DeletionTime::LIVE,
-                    static_row: None,
-                    rows: vec![row],
-                }
+            // The same merge as an existing partition, so a static-row marker
+            // lands in `Partition::static_row` here too.
+            let mut partition = Partition {
+                key: key.clone(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: Vec::with_capacity(1),
             };
+            merge_row_into_partition(&mut partition, row, schema)?;
             let size = Self::estimate_partition_size(&partition);
             shard.insert(key.clone(), Arc::new(partition));
             self.count.fetch_add(1, Ordering::Relaxed);
@@ -327,7 +321,7 @@ impl Memtable for ShardedBTreeMemtable {
 /// Otherwise inserts the row at the correct sorted position.
 pub(crate) fn merge_row_into_partition(
     partition: &mut Partition,
-    mut new_row: Row,
+    new_row: Row,
     schema: &TableSchema,
 ) -> Result<()> {
     // A partition-tombstone marker is a partition-level DELETE: merge it into
@@ -341,59 +335,76 @@ pub(crate) fn merge_row_into_partition(
         return Ok(());
     }
 
+    // A static-row marker (empty clustering + cells on a clustered table) is
+    // the partition's static row: merge it into `Partition::static_row` with
+    // the same cell-level rules as a clustered row, never into `rows`.
+    if super::is_static_row_marker(&new_row, schema) {
+        match partition.static_row.as_mut() {
+            Some(existing) => merge_into_existing_row(existing, new_row, schema)?,
+            None => partition.static_row = Some(new_row),
+        }
+        return Ok(());
+    }
+
     // Binary search by clustering key
     let pos = partition
         .rows
         .binary_search_by(|existing| existing.clustering.cmp(&new_row.clustering));
 
     match pos {
-        Ok(idx) => {
-            // Row with same clustering key exists — merge cells
-            let existing_row = &mut partition.rows[idx];
-
-            super::normalize_collection_rows_for_merge(existing_row, &mut new_row, schema)?;
-
-            // Update row-level deletion: newer tombstone wins (LWW).
-            if new_row.deletion.marked_for_delete_at > existing_row.deletion.marked_for_delete_at {
-                existing_row.deletion = new_row.deletion;
-            }
-
-            // Update primary key liveness to the newer timestamp
-            if new_row.primary_key_liveness.timestamp > existing_row.primary_key_liveness.timestamp
-            {
-                existing_row.primary_key_liveness = new_row.primary_key_liveness;
-            }
-
-            // Merge cells, keyed by (column index, cell path). A simple column
-            // has one cell (path == None); a complex (collection) column has many
-            // cells sharing the column index, one per element, distinguished by
-            // path. Cells stay sorted by (col_idx, path) — for simple cells (all
-            // None) this is identical to the historical col_idx order, so existing
-            // data and searches are unaffected. Reconciliation uses the CRDT rule
-            // (higher timestamp wins; tombstone wins an equal-timestamp tie), which
-            // is what makes concurrent per-element appends converge.
-            for (col_idx, new_cell) in new_row.cells {
-                let key = (col_idx, &new_cell.path);
-                let cell_pos = existing_row
-                    .cells
-                    .binary_search_by(|(idx, cell)| (*idx, &cell.path).cmp(&key));
-
-                match cell_pos {
-                    Ok(ci) => {
-                        let existing_cell = &existing_row.cells[ci].1;
-                        existing_row.cells[ci].1 =
-                            ferrosa_common::reconcile(existing_cell, &new_cell);
-                    }
-                    Err(ci) => {
-                        // New (col_idx, path) — insert at sorted position.
-                        existing_row.cells.insert(ci, (col_idx, new_cell));
-                    }
-                }
-            }
-        }
+        // Row with same clustering key exists — merge cells
+        Ok(idx) => merge_into_existing_row(&mut partition.rows[idx], new_row, schema)?,
         Err(idx) => {
             // No row with this clustering key — insert at sorted position
             partition.rows.insert(idx, new_row);
+        }
+    }
+    Ok(())
+}
+
+/// Merge `new_row` into `existing_row` (same clustering, or both the static
+/// row) using row-level LWW for deletion and liveness and cell-level LWW for
+/// cells.
+fn merge_into_existing_row(
+    existing_row: &mut Row,
+    mut new_row: Row,
+    schema: &TableSchema,
+) -> Result<()> {
+    super::normalize_collection_rows_for_merge(existing_row, &mut new_row, schema)?;
+
+    // Update row-level deletion: newer tombstone wins (LWW).
+    if new_row.deletion.marked_for_delete_at > existing_row.deletion.marked_for_delete_at {
+        existing_row.deletion = new_row.deletion;
+    }
+
+    // Update primary key liveness to the newer timestamp
+    if new_row.primary_key_liveness.timestamp > existing_row.primary_key_liveness.timestamp {
+        existing_row.primary_key_liveness = new_row.primary_key_liveness;
+    }
+
+    // Merge cells, keyed by (column index, cell path). A simple column
+    // has one cell (path == None); a complex (collection) column has many
+    // cells sharing the column index, one per element, distinguished by
+    // path. Cells stay sorted by (col_idx, path) — for simple cells (all
+    // None) this is identical to the historical col_idx order, so existing
+    // data and searches are unaffected. Reconciliation uses the CRDT rule
+    // (higher timestamp wins; tombstone wins an equal-timestamp tie), which
+    // is what makes concurrent per-element appends converge.
+    for (col_idx, new_cell) in new_row.cells {
+        let key = (col_idx, &new_cell.path);
+        let cell_pos = existing_row
+            .cells
+            .binary_search_by(|(idx, cell)| (*idx, &cell.path).cmp(&key));
+
+        match cell_pos {
+            Ok(ci) => {
+                let existing_cell = &existing_row.cells[ci].1;
+                existing_row.cells[ci].1 = ferrosa_common::reconcile(existing_cell, &new_cell);
+            }
+            Err(ci) => {
+                // New (col_idx, path) — insert at sorted position.
+                existing_row.cells.insert(ci, (col_idx, new_cell));
+            }
         }
     }
     Ok(())
