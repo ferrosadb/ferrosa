@@ -23,6 +23,7 @@ pub mod jsonb_wire;
 pub mod messages;
 mod mvcc;
 pub mod pg_types;
+pub mod portal_limits;
 pub mod query;
 pub(crate) mod result_stream;
 pub mod scram;
@@ -43,6 +44,7 @@ pub use messages::{
     TransactionStatus,
 };
 pub use mvcc::{MvccManager, PgWrite};
+pub use portal_limits::{PortalLimits, SuspendedPortals};
 pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
 pub use server::{PgTls, QueryContext};
 

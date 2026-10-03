@@ -108,6 +108,20 @@ fn record_scan_park() {
     SCAN_PARKS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+static SCAN_RELEASES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Times a scan producer gave back its pool slot AND its thread because its
+/// consumer stopped reading ([`ScanSlot::park_or_release`]), to resume later
+/// from its own cursor. One per pause; a high rate against a low query rate
+/// means clients hold results open without reading them.
+pub fn scan_releases_total() -> u64 {
+    SCAN_RELEASES_TOTAL.load(Ordering::Relaxed)
+}
+
+fn record_scan_release() {
+    SCAN_RELEASES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 // Chunk-budget tripwire (B1 T1.3 / FMEA FM-2). A scan chunk is the work between
 // two `ScanSlot::tick`s; a chunk longer than the budget is a *yield-point gap* —
 // the producer held the pool slot too long without a chance to cede it, which
@@ -243,6 +257,14 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_sched_scan_parks_total {}\n",
         scan_parks_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_scan_releases_total Times a scan producer paused, giving back its pool slot and its thread, because its consumer stopped reading.\n\
+         # TYPE ferrosa_sched_scan_releases_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_scan_releases_total {}\n",
+        scan_releases_total()
     ));
     // Runtime-stall detector (Phase 3): async-runtime freeze visibility. Kept as
     // its own module (process-global counters, no dependence on the pool) so it
@@ -595,6 +617,7 @@ impl ScanSlot {
     /// (`load_full()` → owned `Arc`s), holding no guard; the
     /// `scan_cooperative_yield_guard` source test enforces it.
     pub fn tick(&mut self) {
+        assert!(!self.finished, "ScanSlot used after it was released");
         let elapsed = self.last_tick.elapsed();
         record_chunk(elapsed);
         // Accumulate the chunk's wall-time (CPU + any I/O wait) as service.
@@ -647,6 +670,43 @@ impl ScanSlot {
         // Time spent parked is not this scan's service.
         self.last_tick = Instant::now();
         out
+    }
+
+    /// [`park`](Self::park) for a wait that may be abandoned. `wait` runs with
+    /// the slot and I/O permit released; when it returns `Some`, both are
+    /// re-acquired as in `park`. When it returns `None` they are NOT: the slot
+    /// is finished, the call returns `None`, and the producer must return
+    /// without producing anything more on this slot — so it gives back its
+    /// thread as well. A producer uses this to pause a scan whose consumer
+    /// has stopped reading and resume it later from its own cursor.
+    ///
+    /// # Panics
+    ///
+    /// If the slot was already released or finished: work done on it would be
+    /// work the scheduler does not know about.
+    pub fn park_or_release<R>(&mut self, wait: impl FnOnce() -> Option<R>) -> Option<R> {
+        assert!(!self.finished, "ScanSlot used after it was released");
+        let suspended = self.admit.suspend(self.id);
+        drop(self._io_permit.take());
+        let Some(out) = wait() else {
+            // The slot is already free (suspend gave it back) and `suspended`
+            // is never re-queued; finishing marks the slot so Drop does not
+            // touch the scheduler again.
+            self.finished = true;
+            crate::record_scan_release();
+            return None;
+        };
+        if let Some(suspended) = suspended {
+            self.admit.resume(&self.handle, suspended);
+        }
+        let io_permits = self.io_permits.clone();
+        self._io_permit = Some(
+            self.handle
+                .block_on(async move { io_permits.acquire().await }),
+        );
+        crate::record_scan_park();
+        self.last_tick = Instant::now();
+        Some(out)
     }
 
     /// How many times this scan re-competed for its slot at a budget boundary.
@@ -960,6 +1020,59 @@ mod tests {
             io_capacity,
             "every I/O permit returned"
         );
+    }
+
+    /// A producer that abandons its wait gives back the slot and the permit
+    /// for good, returns, and never re-competes: its thread is free too. One
+    /// whose wait completes re-acquires both, as `park` does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_released_scan_returns_its_slot_permit_and_thread() {
+        let pool = SchedPool::new(Reservation::new(1, 0));
+        let releases = scan_releases_total();
+        let released =
+            pool.submit_scan(SchedClass::Bulk, 64, std::future::pending::<()>(), |slot| {
+                let kept = slot.park_or_release(|| Some(1u32));
+                assert_eq!(kept, Some(1), "a completed wait keeps the slot");
+                slot.tick();
+                slot.park_or_release(|| None::<u32>)
+            });
+        assert_eq!(ran(released.await.expect("scan joined")), None);
+        // Process-wide counter, and tests run in parallel: at least ours.
+        assert!(scan_releases_total() > releases, "the release is counted");
+        assert_eq!(pool.available_permits(), 1, "the slot came back");
+        assert_eq!(pool.io_permits.available(), 1, "the I/O permit came back");
+        // The only slot is free, so another scan is admitted at once.
+        let next = pool.submit_scan(
+            SchedClass::Bulk,
+            64,
+            std::future::pending::<()>(),
+            |_slot| 7u32,
+        );
+        let next = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .expect("a released slot admits the next scan");
+        assert_eq!(ran(next.expect("scan joined")), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "ScanSlot used after it was released")]
+    fn a_released_slot_refuses_further_work() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let pool = SchedPool::new(Reservation::new(1, 0));
+        let outcome = rt.block_on(async {
+            pool.submit_scan(SchedClass::Bulk, 64, std::future::pending::<()>(), |slot| {
+                assert_eq!(slot.park_or_release(|| None::<()>), None);
+                slot.tick();
+            })
+            .await
+        });
+        if let Err(join_error) = outcome {
+            std::panic::resume_unwind(join_error.into_panic());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

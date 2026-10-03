@@ -51,9 +51,9 @@ use ferrosa_index::DistanceMetric;
 use crate::flush::{self, FlushTarget};
 use crate::index::sidecar::{RowPositionRef, SidecarReader};
 use crate::memtable::index::MemtableIndex;
-#[cfg(not(feature = "skiplist-memtable"))]
+#[cfg(any(not(feature = "skiplist-memtable"), miri))]
 use crate::memtable::sharded::ShardedBTreeMemtable;
-#[cfg(feature = "skiplist-memtable")]
+#[cfg(all(feature = "skiplist-memtable", not(miri)))]
 use crate::memtable::skiplist::SkipListMemtable;
 use crate::memtable::vector_index::VectorMemtableIndex;
 use crate::memtable::Memtable;
@@ -1230,12 +1230,17 @@ impl<F: FlushTarget> FulltextSidecarBuild<F> {
     }
 }
 
+/// Under Miri the sharded BTree memtable is used whatever the features say:
+/// crossbeam-skiplist 0.1.3 / crossbeam-epoch 0.9.18 trip Miri's aliasing
+/// models inside their own code (upstream, crossbeam#545), which would stop
+/// Miri before it reaches ferrosa's own unsafe (`OwnedMerger`). Production
+/// builds never set `miri`.
 fn new_memtable() -> Arc<dyn Memtable> {
-    #[cfg(feature = "skiplist-memtable")]
+    #[cfg(all(feature = "skiplist-memtable", not(miri)))]
     {
         Arc::new(SkipListMemtable::new())
     }
-    #[cfg(not(feature = "skiplist-memtable"))]
+    #[cfg(any(not(feature = "skiplist-memtable"), miri))]
     {
         Arc::new(ShardedBTreeMemtable::with_default_shards())
     }
@@ -1824,6 +1829,369 @@ fn deliver_error(
     let message = error.to_string();
     if !deliver(slot, tx, Err(error)) {
         tracing::debug!(error = %message, "range scan failed after its consumer went away");
+    }
+}
+
+/// How long a whole-partition range scan waits for a consumer that stopped
+/// reading, its pool slot already given back, before it pauses and gives back
+/// its thread as well. A resume costs only a re-admission (the merger keeps
+/// its position), so this is short: it absorbs a consumer that is momentarily
+/// behind, and bounds how long a blocking thread is spent on one that is not.
+/// Many slow consumers each holding a thread through a long grace starve the
+/// bounded blocking pool the same way parked ones do.
+pub(crate) const RANGE_SCAN_PAUSE_GRACE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How one delivery attempt by a pausable producer ended.
+enum Delivery {
+    Sent,
+    /// The consumer dropped the stream.
+    Gone,
+    /// The consumer took nothing within the grace. The item comes back so the
+    /// scan can pause holding it.
+    Stalled(Result<Partition>),
+}
+
+/// Hand `item` to the consumer. When the channel is full, wait up to `grace`
+/// for room with the pool slot and I/O permit released; past the grace, give
+/// up the slot for good and return the item ([`Delivery::Stalled`]), so the
+/// producer can pause and return its thread.
+fn deliver_or_pause(
+    slot: &mut ferrosa_sched::ScanSlot,
+    tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+    item: Result<Partition>,
+    grace: std::time::Duration,
+) -> Delivery {
+    use tokio::sync::mpsc::error::TrySendError;
+    let item = match tx.try_send(item) {
+        Ok(()) => return Delivery::Sent,
+        Err(TrySendError::Closed(_)) => return Delivery::Gone,
+        Err(TrySendError::Full(item)) => item,
+    };
+    // A producer runs on a blocking thread inside the runtime, so it has a
+    // handle, and blocking on it here is allowed.
+    let handle = tokio::runtime::Handle::current();
+    let room = slot.park_or_release(|| {
+        handle
+            .block_on(tokio::time::timeout(grace, tx.reserve()))
+            .ok()
+    });
+    match room {
+        Some(Ok(permit)) => {
+            permit.send(item);
+            Delivery::Sent
+        }
+        Some(Err(_closed)) => Delivery::Gone,
+        None => Delivery::Stalled(item),
+    }
+}
+
+/// How one run of a pausable range-scan producer ended.
+enum ScanRun {
+    /// The scan ended: the range is exhausted, an error was delivered, or the
+    /// consumer went away.
+    Finished,
+    /// The consumer stopped reading. The item it would not take is handed to
+    /// the supervisor, which delivers it when there is room and then resumes.
+    Paused(Result<Partition>),
+}
+
+/// A [`crate::range_merger::RangeMerger`] that owns everything it borrows: the
+/// store view whose memtables it iterates, the open SSTable readers, the
+/// column mappings and the projection. A paused scan keeps one of these, so
+/// it resumes at its exact position, on any thread, at no cost — no re-open,
+/// no re-seek, no skip, and exactly the output of a scan that never paused.
+struct OwnedMerger<R: ReadAt + Send + Sync + 'static> {
+    // Declared FIRST so it is dropped first (fields drop in declaration
+    // order): it borrows from every field below.
+    merger: crate::range_merger::RangeMerger<'static, R>,
+    _mappings: Box<[ColumnOrdinalMapping]>,
+    _wanted: Option<Box<[u16]>>,
+    _readers: Box<[Arc<SSTableReader<R>>]>,
+    _view: Arc<StoreView>,
+}
+
+impl<R: ReadAt + Send + Sync + 'static> OwnedMerger<R> {
+    fn open(
+        view: Arc<StoreView>,
+        readers: Vec<Arc<SSTableReader<R>>>,
+        schema: &TableSchema,
+        wanted: Option<Vec<u16>>,
+        start: Option<DecoratedKey>,
+        end: Option<DecoratedKey>,
+    ) -> Result<Self> {
+        let readers: Box<[Arc<SSTableReader<R>>]> = readers.into_boxed_slice();
+        let mappings: Box<[ColumnOrdinalMapping]> =
+            sstable_column_mappings(schema, &readers).into_boxed_slice();
+        let wanted: Option<Box<[u16]>> = wanted.map(Vec::into_boxed_slice);
+        // SAFETY: each reference below points into a heap allocation — the
+        // `StoreView` behind an `Arc`, or a boxed slice — that this struct
+        // owns, never mutates, and frees only after `merger` is dropped
+        // (`merger` is the first field). Moving the struct moves the `Arc` and
+        // `Box` pointers, not the allocations, so the references stay valid
+        // for as long as `merger` can use them; nothing hands them out beyond
+        // the struct. This is the stable-allocation pattern the merger itself
+        // uses for its SSTable runs (`runs_arena`). On unwind the struct drops
+        // like any other value, merger first. Checked under Miri (Tree
+        // Borrows): `owned_merger_*` tests, which a projection freed early
+        // turns into a reported use-after-free.
+        let view_ref: &'static StoreView = unsafe { &*Arc::as_ptr(&view) };
+        let readers_ref: &'static [Arc<SSTableReader<R>>] =
+            unsafe { &*(&*readers as *const [Arc<SSTableReader<R>>]) };
+        let mappings_ref: &'static [ColumnOrdinalMapping] =
+            unsafe { &*(&*mappings as *const [ColumnOrdinalMapping]) };
+        let wanted_ref: Option<&'static [u16]> = wanted
+            .as_deref()
+            .map(|wanted| unsafe { &*(wanted as *const [u16]) });
+
+        let active_iter = view_ref.active.range_iter(start.as_ref(), end.as_ref());
+        // Every sealed memtable still being flushed is a source, as in the
+        // other range producers.
+        let flushing_iters: Vec<_> = view_ref
+            .flushing
+            .iter()
+            .map(|sealed| sealed.memtable.range_iter(start.as_ref(), end.as_ref()))
+            .collect();
+        let merger = match wanted_ref {
+            Some(wanted) => crate::range_merger::merger_for_projected_sources_with_mappings(
+                active_iter,
+                flushing_iters,
+                readers_ref,
+                mappings_ref,
+                wanted,
+                start,
+                end,
+            )?,
+            None => crate::range_merger::merger_for_sources_with_mappings(
+                active_iter,
+                flushing_iters,
+                readers_ref,
+                mappings_ref,
+                start,
+                end,
+            )?,
+        };
+        Ok(Self {
+            merger,
+            _mappings: mappings,
+            _wanted: wanted,
+            _readers: readers,
+            _view: view,
+        })
+    }
+}
+
+/// A whole-partition range scan that can stop mid-range and resume where it
+/// stopped. Between runs it holds its merger (see [`OwnedMerger`]) and costs
+/// no pool slot and no thread.
+///
+/// A resumed run continues the same merger, so the scan yields exactly what an
+/// unpaused scan would. A storage range scan is not a snapshot: a write made
+/// during the scan, ahead of its position, may or may not be seen, paused or
+/// not; a key is never yielded twice, and keys come out in order.
+struct RangeScan<F: FlushTarget> {
+    view: Arc<StoreView>,
+    schema: Arc<TableSchema>,
+    reader_pool: SharedReaderPool<F::Reader>,
+    pool_table_key: String,
+    flush_target: Arc<F>,
+    /// The cell ordinals to decode, for the projected variant.
+    wanted: Option<Vec<u16>>,
+    partition_limit: Option<usize>,
+    start: Option<DecoratedKey>,
+    end: Option<DecoratedKey>,
+    grace: std::time::Duration,
+    /// Opened by the first run, after admission (t_6d0553ee), and kept across
+    /// pauses: the scan's position, and its SSTable readers, so compaction
+    /// cannot pull an input out from under a paused scan.
+    merger: Option<OwnedMerger<F::Reader>>,
+    emitted: usize,
+}
+
+impl<F: FlushTarget> RangeScan<F>
+where
+    F: Send + Sync + 'static,
+{
+    /// Open the readers and the merger: on the first run only, now that a
+    /// slot is held.
+    fn open_merger(&self) -> Result<OwnedMerger<F::Reader>> {
+        let readers = open_pooled_readers(
+            &self.reader_pool,
+            &self.pool_table_key,
+            &*self.flush_target,
+            &self.view.sstables,
+            self.start.as_ref(),
+            self.end.as_ref(),
+        )?;
+        OwnedMerger::open(
+            Arc::clone(&self.view),
+            readers,
+            &self.schema,
+            self.wanted.clone(),
+            self.start.clone(),
+            self.end.clone(),
+        )
+    }
+
+    /// Produce until the range ends, the consumer goes away, or the consumer
+    /// stalls past the grace.
+    fn run(
+        &mut self,
+        slot: &mut ferrosa_sched::ScanSlot,
+        tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+    ) -> ScanRun {
+        if self.merger.is_none() {
+            match self.open_merger() {
+                Ok(merger) => self.merger = Some(merger),
+                Err(e) => return deliver_failure(slot, tx, e, self.grace),
+            }
+        }
+        let grace = self.grace;
+        let cap = self.partition_limit.unwrap_or(usize::MAX);
+        let Some(owned) = self.merger.as_mut() else {
+            unreachable!("the merger is opened above");
+        };
+        loop {
+            if self.emitted >= cap {
+                return ScanRun::Finished;
+            }
+            let partition = match owned.merger.next_merged_partition() {
+                Ok(Some(partition)) => partition,
+                Ok(None) => return ScanRun::Finished,
+                Err(e) => return deliver_failure(slot, tx, e, grace),
+            };
+            match deliver_or_pause(slot, tx, Ok(partition), grace) {
+                Delivery::Sent => {
+                    self.emitted += 1;
+                    // B1 T1.2: account the chunk and cooperatively yield the
+                    // pool slot every budget partitions.
+                    slot.tick();
+                }
+                Delivery::Gone => return ScanRun::Finished,
+                Delivery::Stalled(item) => {
+                    // Handed out by the supervisor once there is room.
+                    self.emitted += 1;
+                    return ScanRun::Paused(item);
+                }
+            }
+        }
+    }
+}
+
+/// Deliver a scan failure from a pausable producer. If the consumer is not
+/// reading, the error is held while paused and delivered by the supervisor,
+/// never dropped. A consumer that has gone has nobody to tell, so that case
+/// is logged (designed fallback, as in [`deliver_error`]).
+fn deliver_failure(
+    slot: &mut ferrosa_sched::ScanSlot,
+    tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+    error: ferrosa_common::Error,
+    grace: std::time::Duration,
+) -> ScanRun {
+    let message = error.to_string();
+    match deliver_or_pause(slot, tx, Err(error), grace) {
+        Delivery::Sent => ScanRun::Finished,
+        Delivery::Gone => {
+            tracing::debug!(error = %message, "range scan failed after its consumer went away");
+            ScanRun::Finished
+        }
+        Delivery::Stalled(item) => ScanRun::Paused(item),
+    }
+}
+
+static RANGE_SCAN_RESUMES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Times a paused range scan resumed after its consumer made room. Each costs
+/// one scheduler admission; the merger keeps its position.
+pub fn range_scan_resumes_total() -> u64 {
+    RANGE_SCAN_RESUMES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run a [`RangeScan`] through the bounded scheduler pool, pausing it while its
+/// consumer is not reading and resuming it when the consumer makes room.
+///
+/// The supervisor is an async task: while the scan is paused it waits for room
+/// in the channel and holds no pool slot and no thread. Each run is a fresh
+/// admission, so the same properties [`spawn_bounded_range_scan`] gives hold
+/// for every run: cancellation while queued (the consumer dropped the stream)
+/// and fail-loud overload. A producer panic is delivered as an error, never as
+/// a short stream.
+fn spawn_resumable_range_scan<F>(
+    tx: tokio::sync::mpsc::Sender<Result<Partition>>,
+    scan: RangeScan<F>,
+) where
+    F: FlushTarget + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let mut scan = scan;
+        loop {
+            let cancel_probe = tx.clone();
+            let producer_tx = tx.clone();
+            let handle = ferrosa_sched::global_pool().submit_scan(
+                ferrosa_sched::SchedClass::Bulk,
+                ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
+                async move { cancel_probe.closed().await },
+                move |slot| match scan.run(slot, &producer_tx) {
+                    ScanRun::Paused(pending) => Some((scan, pending)),
+                    // Release the readers and memtable views here, on the
+                    // producer's thread, as the scan ends — not whenever this
+                    // supervisor task is next polled.
+                    ScanRun::Finished => None,
+                },
+            );
+            let pending = match handle.await {
+                Ok(ferrosa_sched::ScanOutcome::Ran(Some((back, pending)))) => {
+                    scan = back;
+                    pending
+                }
+                Ok(ferrosa_sched::ScanOutcome::Ran(None))
+                | Ok(ferrosa_sched::ScanOutcome::Cancelled) => return,
+                Ok(ferrosa_sched::ScanOutcome::Overloaded) => {
+                    fail_range_scan(
+                        &tx,
+                        "overloaded: scan admission queue full — retry".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(join_error) => {
+                    fail_range_scan(&tx, format!("range scan producer failed: {join_error}")).await;
+                    return;
+                }
+            };
+            // Paused: no slot, no thread. Wait for room, hand over the item the
+            // consumer would not take, then resume after it.
+            let ends_scan = pending.is_err();
+            match tx.reserve().await {
+                Ok(permit) => permit.send(pending),
+                Err(_) => return, // the consumer dropped the stream
+            }
+            if ends_scan {
+                return;
+            }
+            // Resume once the consumer has drained half the channel, not at
+            // its first read, so a slow consumer costs one resume per several
+            // partitions rather than one per partition.
+            let room = (tx.max_capacity() / 2).max(1);
+            match tx.reserve_many(room).await {
+                Ok(permits) => drop(permits),
+                Err(_) => return,
+            }
+            RANGE_SCAN_RESUMES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// End a range scan's stream with an error, so its consumer sees a failure
+/// rather than a short result. A consumer that has gone is logged.
+async fn fail_range_scan(tx: &tokio::sync::mpsc::Sender<Result<Partition>>, message: String) {
+    tracing::warn!(error = %message, "range scan ended with an error");
+    if tx
+        .send(Err(ferrosa_common::Error::InvalidData(message)))
+        .await
+        .is_err()
+    {
+        tracing::debug!("range scan error had no consumer left to receive it");
     }
 }
 
@@ -5689,8 +6057,8 @@ impl<F: FlushTarget> TableStore<F> {
     /// alloc + the value-byte memcpy per skipped cell. Memtable
     /// partitions retain their full cells (already in memory).
     ///
-    /// Takes `wanted` by value so the spawned blocking task can
-    /// move it in; the returned stream has no borrow.
+    /// Takes `wanted` by value so the scan can own it; the returned stream
+    /// has no borrow.
     pub fn range_iter_projected(
         &self,
         wanted: Vec<u16>,
@@ -5701,114 +6069,63 @@ impl<F: FlushTarget> TableStore<F> {
     where
         F: Send + Sync + 'static,
     {
-        // Buffer is intentionally small. The producer runs on a
-        // spawn_blocking thread and per-partition body decode on cold
-        // cache is the dominant cost (wide rows + embedding cells +
-        // dedup across multiple SSTable runs sharing a key). A larger
-        // buffer turns a `LIMIT N` scan into a `LIMIT N + buffer`
-        // scan because the producer races ahead before the consumer
-        // can drop the stream; we measured ~32 s cold-cache walls on
-        // a 1.7 GB table for `LIMIT 5` with buffer=64. With buffer=4
-        // *and* `partition_limit` pushed into the producer loop, the
-        // producer stops cleanly after N emissions.
-        const STREAM_BUFFER: usize = 4;
+        self.whole_partition_range_scan(
+            Some(wanted),
+            partition_limit,
+            start,
+            end,
+            RANGE_SCAN_PAUSE_GRACE,
+        )
+    }
 
-        let view = self.view.load_full();
-        let schema = self.schema.load_full();
-        let start_owned = start.cloned();
-        let end_owned = end.cloned();
-        let wanted_owned = wanted;
+    /// The producer behind [`Self::range_iter`] and
+    /// [`Self::range_iter_projected`]: a [`RangeScan`] on the bounded pool
+    /// that pauses — no slot, no thread — while its consumer is not reading.
+    fn whole_partition_range_scan(
+        &self,
+        wanted: Option<Vec<u16>>,
+        partition_limit: Option<usize>,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        grace: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    where
+        F: Send + Sync + 'static,
+    {
+        // Buffer is intentionally small. Per-partition body decode on cold
+        // cache is the dominant cost (wide rows + embedding cells + dedup
+        // across multiple SSTable runs sharing a key). A larger buffer turns a
+        // `LIMIT N` scan into a `LIMIT N + buffer` scan because the producer
+        // races ahead before the consumer can drop the stream; we measured
+        // ~32 s cold-cache walls on a 1.7 GB table for `LIMIT 5` with
+        // buffer=64. With buffer=4 *and* `partition_limit` pushed into the
+        // producer loop, the producer stops cleanly after N emissions.
+        const STREAM_BUFFER: usize = 4;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
 
-        // Open the overlapping readers (pooled) up front and move the `Arc`s
-        // into the blocking task. The readers stay resident only while the
-        // stream runs; the pool cap (soft when in use) bounds total residency.
-        // Capture the pooled-reader inputs so the producer opens its SSTable
-        // readers AFTER admission (t_6d0553ee): a cancelled or overloaded scan
-        // then never opens readers. `flush_target` is Arc-wrapped so a cheap
-        // clone moves into the 'static closure.
-        let reader_pool = self.reader_pool.clone();
-        let pool_table_key = self.pool_table_key.clone();
-        let flush_target = self.flush_target.clone();
-
-        // t_88223ad0: route the scan producer through the bounded scheduler pool
-        // (cores - reserved) instead of the unbounded blocking pool, so a broad
-        // scan cannot oversubscribe the cores and starve raft heartbeats.
-        // Every scan through the bounded pool is an unbounded full-table range
-        // scan (`ScanPlan::FullScan`-class work) — see ScanPlan::sched_class. The
-        // fair scheduler weights it as Bulk so it cedes to any Foreground work
-        // sharing the pool (interactive scans today bypass; B3 folds in
-        // compaction/repair, which this weighting then arbitrates).
-        spawn_bounded_range_scan(tx.clone(), move |slot| {
-            // Open the overlapping SSTable readers now that a slot is held —
-            // gated by admission, not before it.
-            let sst_readers = match open_pooled_readers(
-                &reader_pool,
-                &pool_table_key,
-                &*flush_target,
-                &view.sstables,
-                start_owned.as_ref(),
-                end_owned.as_ref(),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    deliver_error(slot, &tx, e);
-                    return;
-                }
-            };
-            let column_mappings = sstable_column_mappings(&schema, &sst_readers);
-            let active_iter = view
-                .active
-                .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iters: Vec<_> = view
-                .flushing
-                .iter()
-                .map(|sealed| {
-                    sealed
-                        .memtable
-                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
-                })
-                .collect();
-            let sstables_slice = &sst_readers[..];
-
-            let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
-                active_iter,
-                flushing_iters,
-                sstables_slice,
-                &column_mappings,
-                &wanted_owned,
-                start_owned,
-                end_owned,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    deliver_error(slot, &tx, e);
-                    return;
-                }
-            };
-
-            let cap = partition_limit.unwrap_or(usize::MAX);
-            let mut emitted: usize = 0;
-            loop {
-                if emitted >= cap {
-                    return;
-                }
-                match merger.next_merged_partition() {
-                    Ok(Some(partition)) => {
-                        if !deliver(slot, &tx, Ok(partition)) {
-                            return;
-                        }
-                        emitted += 1;
-                        slot.tick(); // B1 T1.2 cooperative yield
-                    }
-                    Ok(None) => return,
-                    Err(e) => {
-                        deliver_error(slot, &tx, e);
-                        return;
-                    }
-                }
-            }
-        });
+        // The scan opens its SSTable readers only once admitted (t_6d0553ee):
+        // a cancelled or overloaded scan never opens readers. Everything it
+        // needs is an owned `Arc`/clone, so it can pause between runs.
+        //
+        // t_88223ad0: the producer runs on the bounded scheduler pool (cores -
+        // reserved), not the unbounded blocking pool, so a broad scan cannot
+        // oversubscribe the cores and starve raft heartbeats. Every such scan
+        // is `ScanPlan::FullScan`-class work, weighted Bulk.
+        let scan = RangeScan {
+            view: self.view.load_full(),
+            schema: self.schema.load_full(),
+            reader_pool: self.reader_pool.clone(),
+            pool_table_key: self.pool_table_key.clone(),
+            flush_target: self.flush_target.clone(),
+            wanted,
+            partition_limit,
+            start: start.cloned(),
+            end: end.cloned(),
+            grace,
+            merger: None,
+            emitted: 0,
+        };
+        spawn_resumable_range_scan(tx, scan);
 
         Box::pin(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -5833,111 +6150,7 @@ impl<F: FlushTarget> TableStore<F> {
     where
         F: Send + Sync + 'static,
     {
-        /// Per-stream channel buffer. Kept small because per-partition
-        /// decode on cold cache is expensive (wide rows + cell decode)
-        /// and a `LIMIT N` consumer should pay for ~N body decodes,
-        /// not N + buffer_capacity. See the matching constant in
-        /// `range_iter_projected` for the LIMIT-pushdown rationale.
-        const STREAM_BUFFER: usize = 4;
-
-        let view = self.view.load_full();
-        let schema = self.schema.load_full();
-        let start_owned = start.cloned();
-        let end_owned = end.cloned();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
-
-        // Open overlapping readers (pooled) and move the Arcs into the task.
-        // Capture the pooled-reader inputs so the producer opens its SSTable
-        // readers AFTER admission (t_6d0553ee): a cancelled or overloaded scan
-        // then never opens readers. `flush_target` is Arc-wrapped so a cheap
-        // clone moves into the 'static closure.
-        let reader_pool = self.reader_pool.clone();
-        let pool_table_key = self.pool_table_key.clone();
-        let flush_target = self.flush_target.clone();
-
-        // t_88223ad0: route the scan producer through the bounded scheduler pool
-        // (cores - reserved) instead of the unbounded blocking pool, so a broad
-        // scan cannot oversubscribe the cores and starve raft heartbeats.
-        // Every scan through the bounded pool is an unbounded full-table range
-        // scan (`ScanPlan::FullScan`-class work) — see ScanPlan::sched_class. The
-        // fair scheduler weights it as Bulk so it cedes to any Foreground work
-        // sharing the pool (interactive scans today bypass; B3 folds in
-        // compaction/repair, which this weighting then arbitrates).
-        spawn_bounded_range_scan(tx.clone(), move |slot| {
-            // Open the overlapping SSTable readers now that a slot is held —
-            // gated by admission, not before it.
-            let sst_readers = match open_pooled_readers(
-                &reader_pool,
-                &pool_table_key,
-                &*flush_target,
-                &view.sstables,
-                start_owned.as_ref(),
-                end_owned.as_ref(),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    deliver_error(slot, &tx, e);
-                    return;
-                }
-            };
-            let column_mappings = sstable_column_mappings(&schema, &sst_readers);
-            // Build source iterators — these borrow from `view`
-            // (memtable Arcs) and from the opened SSTable reader Arcs, both
-            // of which the closure owns for the task's full lifetime, so there
-            // is no self-referential lifetime problem.
-            let active_iter = view
-                .active
-                .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iters: Vec<_> = view
-                .flushing
-                .iter()
-                .map(|sealed| {
-                    sealed
-                        .memtable
-                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
-                })
-                .collect();
-            let sstables_slice = &sst_readers[..];
-
-            let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
-                active_iter,
-                flushing_iters,
-                sstables_slice,
-                &column_mappings,
-                start_owned,
-                end_owned,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    deliver_error(slot, &tx, e);
-                    return;
-                }
-            };
-
-            loop {
-                match merger.next_merged_partition() {
-                    Ok(Some(partition)) => {
-                        if !deliver(slot, &tx, Ok(partition)) {
-                            // Consumer dropped (cancelled stream).
-                            return;
-                        }
-                        // B1 T1.2: account the chunk and cooperatively yield the
-                        // pool slot every budget partitions so a concurrent scan
-                        // isn't starved for this scan's whole duration.
-                        slot.tick();
-                    }
-                    Ok(None) => return,
-                    Err(e) => {
-                        deliver_error(slot, &tx, e);
-                        return;
-                    }
-                }
-            }
-        });
-
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }))
+        self.whole_partition_range_scan(None, None, start, end, RANGE_SCAN_PAUSE_GRACE)
     }
 
     /// Intra-partition streaming variant of [`Self::range_iter`]. A single
@@ -18113,6 +18326,280 @@ mod tests {
              missing {missing:?}. An index in this list is declared and never \
              maintained: writes skip it and reads of it return nothing, with no \
              error on either path."
+        );
+    }
+
+    /// Drain `stream`, reading one item every `pace` so the producer keeps
+    /// finding its channel full. Returns the keys in arrival order, stopping
+    /// at `cap` so a scan that repeats itself fails its test instead of
+    /// running forever.
+    async fn drain_slowly(
+        mut stream: std::pin::Pin<
+            Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>,
+        >,
+        pace: std::time::Duration,
+        cap: usize,
+        mut between: impl FnMut(usize),
+    ) -> Vec<DecoratedKey> {
+        let mut keys = Vec::new();
+        while keys.len() < cap {
+            let Some(item) = futures::StreamExt::next(&mut stream).await else {
+                break;
+            };
+            keys.push(item.expect("the scan must not fail").key);
+            between(keys.len());
+            tokio::time::sleep(pace).await;
+        }
+        keys
+    }
+
+    /// A store whose partitions are spread over two SSTables and the active
+    /// memtable, so a resume re-opens a real k-way merge.
+    fn store_across_sources(partitions: usize) -> TableStore<InMemoryFlushTarget> {
+        let store = test_store();
+        for i in 0..partitions {
+            store
+                .write(&make_key(&format!("k{i:05}")), make_row(b"v", 1000))
+                .unwrap();
+            if i == partitions / 3 || i == 2 * partitions / 3 {
+                store.flush().unwrap();
+            }
+        }
+        store
+    }
+
+    /// An `OwnedMerger` over the whole of `store`.
+    fn owned_merger_over(
+        store: &TableStore<InMemoryFlushTarget>,
+    ) -> OwnedMerger<<InMemoryFlushTarget as FlushTarget>::Reader> {
+        let view = store.view.load_full();
+        let readers = open_pooled_readers(
+            &store.reader_pool,
+            &store.pool_table_key,
+            &*store.flush_target,
+            &view.sstables,
+            None,
+            None,
+        )
+        .unwrap();
+        let schema = store.schema.load_full();
+        OwnedMerger::open(view, readers, &schema, None, None, None).unwrap()
+    }
+
+    /// The `OwnedMerger` self-reference (unsafe) under the conditions it must
+    /// survive, with no async runtime so Miri can run it
+    /// (`cargo +nightly miri test -p ferrosa-storage --lib owned_merger`):
+    /// moved between threads mid-scan, outliving the store it came from, and
+    /// dropped, all yielding exactly what a plain merger yields.
+    #[test]
+    fn owned_merger_keeps_its_place_across_threads_and_outlives_its_store() {
+        let store = store_across_sources(24);
+        let reference: Vec<DecoratedKey> = {
+            let mut owned = owned_merger_over(&store);
+            std::iter::from_fn(|| owned.merger.next_merged_partition().unwrap())
+                .map(|p| p.key)
+                .collect()
+        };
+        assert_eq!(reference.len(), 24);
+
+        let mut owned = owned_merger_over(&store);
+        // The merger owns what it borrows: the store can go first.
+        drop(store);
+        let mut keys = Vec::new();
+        loop {
+            let (back, chunk, done) = std::thread::spawn(move || {
+                let mut chunk = Vec::new();
+                for _ in 0..5 {
+                    match owned.merger.next_merged_partition().unwrap() {
+                        Some(p) => chunk.push(p.key),
+                        None => return (owned, chunk, true),
+                    }
+                }
+                (owned, chunk, false)
+            })
+            .join()
+            .expect("puller thread");
+            owned = back;
+            keys.extend(chunk);
+            if done {
+                break;
+            }
+        }
+        drop(owned);
+        assert_eq!(keys, reference);
+    }
+
+    /// The projected variant: the merger reads the owned projection (`wanted`)
+    /// on every SSTable partition it decodes, so Miri sees each use of that
+    /// self-borrow after the struct has moved threads and the store is gone.
+    #[test]
+    fn owned_merger_reads_its_owned_projection_after_moving() {
+        let store = store_across_sources(18);
+        let view = store.view.load_full();
+        let readers = open_pooled_readers(
+            &store.reader_pool,
+            &store.pool_table_key,
+            &*store.flush_target,
+            &view.sstables,
+            None,
+            None,
+        )
+        .unwrap();
+        let schema = store.schema.load_full();
+        let mut owned =
+            OwnedMerger::open(view, readers, &schema, Some(vec![0]), None, None).unwrap();
+        drop(store);
+        let keys = std::thread::spawn(move || {
+            let mut keys = Vec::new();
+            while let Some(p) = owned.merger.next_merged_partition().unwrap() {
+                keys.push(p.key);
+            }
+            keys
+        })
+        .join()
+        .expect("puller thread");
+        assert_eq!(keys.len(), 18);
+    }
+
+    /// A panic mid-scan unwinds through the `OwnedMerger`: the merger is
+    /// dropped before the readers, mappings and view it borrows.
+    #[test]
+    fn owned_merger_unwinds_cleanly_from_a_panic_mid_scan() {
+        let store = store_across_sources(12);
+        let mut owned = owned_merger_over(&store);
+        drop(store);
+        let outcome = std::thread::spawn(move || {
+            owned
+                .merger
+                .next_merged_partition()
+                .unwrap()
+                .expect("a partition");
+            panic!("mid-scan");
+        })
+        .join();
+        assert!(outcome.is_err(), "the puller panicked and unwound");
+    }
+
+    /// A scan whose consumer keeps stalling pauses (no slot, no thread) and
+    /// resumes over and over, and still yields exactly the partitions, in
+    /// exactly the order, of an uninterrupted scan: no gap, no duplicate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_paused_range_scan_resumes_with_no_gap_or_duplicate() {
+        const N: usize = 300;
+        let store = store_across_sources(N);
+        let reference: Vec<DecoratedKey> = {
+            let mut stream = store.range_iter(None, None);
+            let mut keys = Vec::new();
+            while let Some(item) = futures::StreamExt::next(&mut stream).await {
+                keys.push(item.unwrap().key);
+            }
+            keys
+        };
+        assert_eq!(
+            reference.len(),
+            N,
+            "the reference scan sees every partition"
+        );
+
+        let releases = ferrosa_sched::scan_releases_total();
+        let resumes = range_scan_resumes_total();
+        // Grace zero: every time the 4-item channel fills, the producer pauses.
+        let paused =
+            store.whole_partition_range_scan(None, None, None, None, std::time::Duration::ZERO);
+        let keys = drain_slowly(
+            paused,
+            std::time::Duration::from_millis(1),
+            2 * reference.len(),
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(
+            keys, reference,
+            "a paused scan must yield exactly the reference"
+        );
+        let paused_runs = ferrosa_sched::scan_releases_total() - releases;
+        assert!(
+            paused_runs >= 10,
+            "the slow consumer should have paused the scan many times, saw {paused_runs}"
+        );
+        assert!(
+            range_scan_resumes_total() - resumes >= 10,
+            "every pause must be followed by a resume"
+        );
+    }
+
+    /// The projected variant pauses and resumes the same way, and its
+    /// partition limit counts what was handed out before each pause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_paused_projected_scan_honours_its_partition_limit() {
+        let store = store_across_sources(120);
+        let reference: Vec<DecoratedKey> = {
+            let mut stream = store.range_iter(None, None);
+            let mut keys = Vec::new();
+            while let Some(item) = futures::StreamExt::next(&mut stream).await {
+                keys.push(item.unwrap().key);
+            }
+            keys
+        };
+        let paused = store.whole_partition_range_scan(
+            Some(vec![0]),
+            Some(50),
+            None,
+            None,
+            std::time::Duration::ZERO,
+        );
+        let keys = drain_slowly(paused, std::time::Duration::from_millis(1), 100, |_| {}).await;
+        assert_eq!(keys, reference[..50].to_vec());
+    }
+
+    /// Writes made while a scan is paused: every partition that existed when
+    /// the scan began is yielded exactly once, nothing is yielded twice, and
+    /// keys stay in order. A key written during the scan, ahead of it, may or
+    /// may not appear — storage range scans are not snapshots, paused or not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_paused_scan_under_concurrent_writes_never_duplicates_or_drops() {
+        const N: usize = 200;
+        let store = std::sync::Arc::new(store_across_sources(N));
+        let original: std::collections::BTreeSet<DecoratedKey> =
+            (0..N).map(|i| make_key(&format!("k{i:05}"))).collect();
+        let writer = std::sync::Arc::clone(&store);
+        let paused =
+            store.whole_partition_range_scan(None, None, None, None, std::time::Duration::ZERO);
+        // Bounded well above every key that can exist (originals plus one new
+        // key per item read), so a scan that repeats itself stops and fails.
+        let keys = drain_slowly(
+            paused,
+            std::time::Duration::from_millis(1),
+            4 * N,
+            move |seen| {
+                // New partitions, overwrites of existing ones, and a flush, all
+                // while the scan is mid-range.
+                writer
+                    .write(&make_key(&format!("new{seen:05}")), make_row(b"n", 2000))
+                    .unwrap();
+                writer
+                    .write(
+                        &make_key(&format!("k{:05}", seen % N)),
+                        make_row(b"o", 3000),
+                    )
+                    .unwrap();
+                if seen % 50 == 0 {
+                    writer.flush().unwrap();
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "keys must be strictly increasing: no duplicate, no reordering"
+        );
+        let seen: std::collections::BTreeSet<DecoratedKey> = keys.iter().cloned().collect();
+        let missing: Vec<_> = original.difference(&seen).collect();
+        assert!(
+            missing.is_empty(),
+            "partitions dropped by the pauses: {missing:?}"
         );
     }
 }

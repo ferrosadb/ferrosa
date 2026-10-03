@@ -91,7 +91,7 @@ pub use memtable::Memtable;
 pub use merge::merge_partitions;
 pub use observer::{ObserverConfig, ObserverMode, WriteObserver};
 pub use spill_budget::{process_spill_threshold_bytes, spill_threshold_bytes};
-pub use store::{TableStore, VectorIndexMethod};
+pub use store::{range_scan_resumes_total, TableStore, VectorIndexMethod};
 pub use subscription_observer::{
     SubscriptionConfig, SubscriptionFilter, SubscriptionId, SubscriptionObserver,
 };

@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 use crate::authz;
 use crate::codec::{self, CodecError};
 use crate::connection::{ConnError, Connection, TlsPolicy};
-use crate::extended::{self, PreparedKind, Session};
+use crate::extended::{self, PortalRun, PreparedKind, Session};
 use crate::handshake::{HandshakeError, VerifierStore};
 use crate::messages::{BackendMessage, FrontendMessage};
 use crate::mvcc::{MvccCommitError, MvccManager};
@@ -55,6 +55,10 @@ pub struct QueryContext {
     /// every constructor must supply the resolved value. They gate INSERT and
     /// UPDATE input only; reads use the codec's fixed hard ceilings.
     pub jsonb_limits: ferrosa_jsonb::Limits,
+    /// Node-wide accounting and limits for portals suspended by `max_rows`:
+    /// per connection, per node, and an idle timeout. Shared by every
+    /// connection on this listener.
+    pub portals: Arc<crate::SuspendedPortals>,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -323,6 +327,7 @@ where
     St: AsyncRead + AsyncWrite + Unpin,
 {
     let mut session = Session::new(auth);
+    let idle_timeout = ctx.portals.limits().idle_timeout;
     loop {
         match codec::read_frontend(frames) {
             Ok(Some(msg)) => {
@@ -331,8 +336,23 @@ where
                 }
             }
             Ok(None) => {
-                // Need more bytes for a complete frame.
-                let n = stream.read(read_buf).await?;
+                // Need more bytes for a complete frame. A client that sends
+                // nothing must not keep its suspended portals forever, so the
+                // wait ends early when the longest-idle one expires.
+                let n = match session.next_expiry(idle_timeout) {
+                    None => stream.read(read_buf).await?,
+                    Some(deadline) => tokio::select! {
+                        // `read` is cancel-safe: no bytes are lost if the
+                        // deadline wins.
+                        read = stream.read(read_buf) => read?,
+                        () = tokio::time::sleep_until(deadline.into()) => {
+                            let closed =
+                                session.expire_idle(std::time::Instant::now(), idle_timeout);
+                            ctx.portals.record_expiries(closed);
+                            continue;
+                        }
+                    },
+                };
                 if n == 0 {
                     return Ok(()); // EOF: client closed
                 }
@@ -1283,15 +1303,33 @@ async fn execute_portal_body<O: ReplySink>(
     max_rows: i32,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
+    // PostgreSQL answers a portal already run to its end with its completion
+    // tag and nothing else. Re-running it would return a query's rows again,
+    // or apply a DML statement a second time.
+    if let Some(tag) = session.finished_tag(portal_name) {
+        return Ok(vec![BackendMessage::CommandComplete {
+            tag: tag.to_string(),
+        }]);
+    }
     let is_select = session
         .portal(portal_name)
         .and_then(|portal| session.statement(&portal.stmt_name))
         .is_some_and(|stmt| matches!(&stmt.parsed, PreparedKind::Select(_)));
     if is_select {
-        execute_select_portal(ctx, session, portal_name, max_rows, out).await
-    } else {
-        Ok(execute_portal_inner(ctx, session, portal_name).await)
+        return execute_select_portal(ctx, session, portal_name, max_rows, out).await;
     }
+    let messages = execute_portal_inner(ctx, session, portal_name).await;
+    let succeeded = !messages
+        .iter()
+        .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }));
+    let tag = messages.iter().rev().find_map(|m| match m {
+        BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+        _ => None,
+    });
+    if let (true, Some(tag)) = (succeeded, tag) {
+        session.finish(portal_name.to_string(), tag);
+    }
+    Ok(messages)
 }
 
 /// The `SELECT` a portal is bound to, with its bound parameters.
@@ -1347,12 +1385,39 @@ async fn execute_select_portal<O: ReplySink>(
     max_rows: i32,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
-    let mut stream = match session.take_stream(portal_name) {
-        Some(stream) => stream,
-        None => match open_portal_stream(ctx, session, portal_name).await {
-            Ok(stream) => stream,
-            Err(error) => return Ok(vec![session.fail(error)]),
-        },
+    let (mut stream, slot) = match session.take_run(portal_name) {
+        Some(PortalRun::Suspended(query)) => (query.stream, Some(query.slot)),
+        Some(PortalRun::Finished(tag)) => {
+            // Answered in `execute_portal_body`; kept for the exhaustive match.
+            session.finish(portal_name.to_string(), tag.clone());
+            return Ok(vec![BackendMessage::CommandComplete { tag }]);
+        }
+        Some(PortalRun::Closed(error)) => {
+            session.close_run(portal_name.to_string(), error.clone());
+            return Ok(vec![session.fail(error)]);
+        }
+        None => {
+            // A portal that may suspend (`max_rows` set) takes its place
+            // under the connection and node limits BEFORE it runs, so a
+            // refusal reaches the client before any `DataRow`, as PostgreSQL
+            // refuses a resource limit before output. If it completes
+            // without suspending, the place is given back.
+            let slot = if max_rows > 0 {
+                match session.admit_suspension(&ctx.portals) {
+                    Ok(slot) => Some(slot),
+                    Err(refusal) => {
+                        session.close_run(portal_name.to_string(), refusal.clone());
+                        return Ok(vec![session.fail(refusal)]);
+                    }
+                }
+            } else {
+                None
+            };
+            match open_portal_stream(ctx, session, portal_name).await {
+                Ok(stream) => (stream, slot),
+                Err(error) => return Ok(vec![session.fail(error)]),
+            }
+        }
     };
     let result_formats = session
         .portal(portal_name)
@@ -1367,10 +1432,23 @@ async fn execute_select_portal<O: ReplySink>(
     let limit = usize::try_from(max_rows).ok().filter(|n| *n > 0);
     let end = stream.pump(limit, &result_formats, out).await?;
     match &end {
-        PumpEnd::Suspended => session.park_stream(portal_name.to_string(), stream),
+        PumpEnd::Suspended => {
+            // Only an Execute with `max_rows` suspends, and every such
+            // Execute holds its place (taken above, or kept from before).
+            let Some(slot) = slot else {
+                unreachable!("a portal suspended without max_rows");
+            };
+            session.park(
+                portal_name.to_string(),
+                stream,
+                slot,
+                std::time::Instant::now(),
+            );
+        }
         // Skip the rest of the sequence until Sync (PostgreSQL semantics).
         PumpEnd::Failed(_) => session.mark_error(),
-        PumpEnd::Complete { .. } => {}
+        // A further Execute returns no rows: "SELECT 0".
+        PumpEnd::Complete { .. } => session.finish(portal_name.to_string(), "SELECT 0".into()),
     }
     Ok(end.into_messages())
 }
@@ -1723,6 +1801,7 @@ mod txn_atomicity_tests {
             accord: AccordAccess::disabled(),
             ddl: None,
             jsonb_limits: crate::jsonb_wire::test_limits(),
+            portals: Default::default(),
         }
     }
 
@@ -1755,6 +1834,117 @@ mod txn_atomicity_tests {
         msgs.iter()
             .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
             .count()
+    }
+
+    /// At the suspended-portal limit, a fresh portal executed with `max_rows`
+    /// is refused BEFORE any `DataRow`, as PostgreSQL refuses a resource limit
+    /// before output: the client never sees partial rows followed by 53000.
+    #[tokio::test]
+    async fn a_portal_over_the_suspension_limit_is_refused_before_any_row() {
+        let (_dir, mut ctx) = make_ctx().await;
+        ctx.portals = Arc::new(crate::SuspendedPortals::new(crate::PortalLimits {
+            per_connection: 1,
+            per_node: 100,
+            idle_timeout: Duration::from_secs(600),
+        }));
+        let mut writer = Session::new(superuser());
+        for k in ["a", "b", "c", "d"] {
+            execute_simple(
+                &ctx,
+                &mut writer,
+                &format!("INSERT INTO kv (k, v) VALUES ('{k}', 'v')"),
+            )
+            .await;
+        }
+        let mut s = Session::new(superuser());
+        execute_simple(&ctx, &mut s, "BEGIN").await;
+        s.on_parse("st".into(), "SELECT k FROM kv", vec![]);
+        for portal in ["p1", "p2"] {
+            s.on_bind(
+                portal.into(),
+                "st".into(),
+                &[],
+                &[],
+                vec![],
+                &crate::jsonb_wire::test_limits(),
+            );
+        }
+        async fn execute(ctx: &QueryContext, s: &mut Session, portal: &str) -> Vec<BackendMessage> {
+            let mut messages: Vec<BackendMessage> = Vec::new();
+            let tail = execute_portal_to(ctx, s, portal, 1, &mut messages)
+                .await
+                .expect("an in-memory sink cannot fail");
+            messages.extend(tail);
+            messages
+        }
+        let first = execute(&ctx, &mut s, "p1").await;
+        assert!(
+            matches!(first.last(), Some(BackendMessage::PortalSuspended)),
+            "the first portal suspends: {first:?}"
+        );
+        let second = execute(&ctx, &mut s, "p2").await;
+        assert!(is_error(&second, "53000"), "refused with 53000: {second:?}");
+        assert!(
+            !second
+                .iter()
+                .any(|m| matches!(m, BackendMessage::DataRow { .. })),
+            "a refused portal sent rows before its error: {second:?}"
+        );
+        assert_eq!(ctx.portals.suspended(), 1);
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// A DML portal that has run to completion is never applied twice: as in
+    /// PostgreSQL, a second `Execute` returns its completion tag and does not
+    /// re-run the statement. An INSERT here is an upsert, so the row count
+    /// alone cannot show a second apply (it would still silently overwrite a
+    /// concurrent writer); inside a transaction every apply is buffered, so
+    /// the write-set shows it.
+    #[tokio::test]
+    async fn a_completed_dml_portal_is_not_applied_twice() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut s = Session::new(superuser());
+        execute_simple(&ctx, &mut s, "BEGIN").await;
+        s.on_parse(
+            "ins".into(),
+            "INSERT INTO kv (k, v) VALUES ($1, 'v')",
+            vec![25],
+        );
+        s.on_bind(
+            "p".into(),
+            "ins".into(),
+            &[0],
+            &[Some(b"once".to_vec())],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
+        let first = execute_portal(&ctx, &mut s, "p").await;
+        let second = execute_portal(&ctx, &mut s, "p").await;
+        assert_eq!(
+            s.txn_writes().len(),
+            1,
+            "the second Execute applied the INSERT again"
+        );
+        execute_simple(&ctx, &mut s, "COMMIT").await;
+        assert_eq!(row_count(&ctx, "once").await, 1, "inserted exactly once");
+        let tag = |msgs: &[BackendMessage]| -> Option<String> {
+            msgs.iter().find_map(|m| match m {
+                BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+                _ => None,
+            })
+        };
+        assert!(
+            tag(&first).is_some(),
+            "the first Execute completes: {first:?}"
+        );
+        assert_eq!(
+            second,
+            vec![BackendMessage::CommandComplete {
+                tag: tag(&first).expect("a tag")
+            }],
+            "the second Execute only repeats the completion"
+        );
+        ctx.engine.shutdown().unwrap();
     }
 
     fn is_error(msgs: &[BackendMessage], code: &str) -> bool {
@@ -2521,6 +2711,16 @@ mod txn_atomicity_tests {
             "UPDATE kv SET v = 'after' WHERE k = 'extended-snapshot'",
         )
         .await;
+        // A portal run to its end returns no more rows (PostgreSQL), so read
+        // again through a fresh bind of the same statement.
+        reader.on_bind(
+            "portal".to_string(),
+            "read".to_string(),
+            &[],
+            &[],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
         let second = execute_portal(&ctx, &mut reader, "portal").await;
         assert_eq!(read_first_text_column(&second).as_deref(), Some("before"));
         execute_simple(&ctx, &mut reader, "ROLLBACK").await;

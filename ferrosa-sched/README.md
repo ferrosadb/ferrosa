@@ -42,8 +42,14 @@ a CheckQuorum leader step-down.
   with the CPU slot and I/O permit released, then re-competes for both
   (`FairAdmit::suspend`/`resume`; metric `ferrosa_sched_scan_parks_total`).
   Without it one idle client per slot — a suspended PG portal, a socket left
-  undrained — stalls every scan on the node. `submit`/`submit_blocking` are
-  the generic (Bulk-weight) entries.
+  undrained — stalls every scan on the node. `slot.park_or_release(wait)` is
+  the same wait for a producer that can pause: when `wait` gives up (`None`)
+  the slot and permit stay released, the slot is finished, and the producer
+  returns, so it gives back its blocking thread too and resumes later from its
+  own cursor (metric `scan_releases_total`; any further use of the slot
+  panics). `ferrosa-storage`'s whole-partition range scans use it, because a
+  parked thread per idle client still exhausts the runtime's bounded blocking
+  pool. `submit`/`submit_blocking` are the generic (Bulk-weight) entries.
 - `runqueue::{RunQueue, SchedEntity, weight_for_class}` +
   `scheduler::{advance_vruntime, should_switch}` — the pure vruntime primitives
   `FairAdmit` is built from: a pick-min run queue with a monotonic `min_vruntime`

@@ -211,6 +211,7 @@ async fn start_with(jsonb_limits: Limits) -> Fixture {
         accord: AccordAccess::disabled(),
         ddl: Some(Arc::new(ClusterDdl::new(path))),
         jsonb_limits,
+        portals: Default::default(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();

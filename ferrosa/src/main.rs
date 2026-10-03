@@ -456,6 +456,40 @@ fn resolve_flight_bind(file_config: &toml::Value) -> std::net::SocketAddr {
     parse_bind_addr("Arrow Flight", "FERROSA_FLIGHT_BIND", &flight_bind)
 }
 
+/// The PostgreSQL suspended-portal limits: `[postgres]
+/// max_suspended_portals_per_connection` / `max_suspended_portals` /
+/// `suspended_portal_idle_timeout_ms`, each overriding its
+/// `FERROSA_POSTGRES_*` variable (TOML wins). A malformed value is logged at
+/// ERROR and the defaults apply (`PortalLimits::resolve_or_default`).
+fn resolve_postgres_portal_limits(file_config: &toml::Value) -> ferrosa_postgres::PortalLimits {
+    use ferrosa_postgres::portal_limits::{
+        IDLE_TIMEOUT_MS_ENV, MAX_PER_CONNECTION_ENV, MAX_PER_NODE_ENV,
+    };
+    let per_connection = config_val_opt(
+        MAX_PER_CONNECTION_ENV,
+        file_config,
+        "postgres",
+        "max_suspended_portals_per_connection",
+    );
+    let per_node = config_val_opt(
+        MAX_PER_NODE_ENV,
+        file_config,
+        "postgres",
+        "max_suspended_portals",
+    );
+    let idle_ms = config_val_opt(
+        IDLE_TIMEOUT_MS_ENV,
+        file_config,
+        "postgres",
+        "suspended_portal_idle_timeout_ms",
+    );
+    ferrosa_postgres::PortalLimits::resolve_or_default(
+        per_connection.as_deref(),
+        per_node.as_deref(),
+        idle_ms.as_deref(),
+    )
+}
+
 fn resolve_postgres_bind(file_config: &toml::Value) -> std::net::SocketAddr {
     let postgres_bind = config_val(
         "FERROSA_POSTGRES_BIND",
@@ -3017,6 +3051,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // the compiled defaults, ceilings enforced). No default is applied
             // here: the PG front end gets exactly what startup resolved.
             jsonb_limits,
+            portals: {
+                let limits = resolve_postgres_portal_limits(&file_config);
+                tracing::info!(?limits, "PostgreSQL suspended-portal limits");
+                std::sync::Arc::new(ferrosa_postgres::SuspendedPortals::new(limits))
+            },
         });
         let pg_status = listener_status.clone();
         runtimes.background.spawn(async move {
