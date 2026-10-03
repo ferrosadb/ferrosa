@@ -66,7 +66,8 @@ use crate::range_merger::ColumnOrdinalMapping;
 /// flush (eager index builds, pin accounting) acts on "the SSTable this flush
 /// just wrote".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FlushOutcome {
+#[must_use = "a flush that published an SSTable needs the engine's post-flush bookkeeping"]
+pub enum FlushOutcome {
     /// No SSTable was written: the memtable was empty, or every row was
     /// quarantined.
     NothingToFlush,
@@ -484,8 +485,10 @@ struct StoreView {
     /// descriptor.
     sstable_ids: Arc<Vec<(String, std::path::PathBuf)>>,
     /// Per-index MemtableIndex companions for the active memtable, keyed by
-    /// index name. Swapped atomically alongside the active memtable during flush.
-    indexes: Arc<HashMap<String, Arc<MemtableIndex>>>,
+    /// index name, and the index catalog they were built from. Swapped
+    /// atomically alongside the active memtable during flush; the catalog
+    /// published here is the table's current one.
+    indexes: Arc<MemtableIndexes>,
     /// Per-SSTable sidecar index readers, parallel to `sstables`.
     /// Each entry maps index_name -> SidecarReader for that SSTable.
     sidecar_indexes: Arc<Vec<Arc<HashMap<String, SidecarReader>>>>,
@@ -599,43 +602,9 @@ pub struct TableStore<F: FlushTarget> {
     /// `Clone` nor `'static`-movable, but `Arc<F>` is.
     pub(crate) flush_target: Arc<F>,
     options: WriteOptions,
-    /// Secondary index declarations: `(index_name, column_position)` pairs.
-    /// Column position is the index into `Row.cells` by column ordinal
-    /// (matching the `u16` tag in each cell tuple).
-    indexed_columns: Vec<(String, usize)>,
-    /// Secondary indexes on CLUSTERING columns: `(index_name,
-    /// clustering_component)` pairs (t_430c4188). A clustering column's value
-    /// is not a cell — the write path extracts it from the row's composite
-    /// clustering-key bytes at the given component index.
-    indexed_clustering_columns: Vec<(String, usize)>,
-    /// Partition-key secondary index declarations:
-    /// `(index_name, partition_key_component)`.
-    ///
-    /// A partition-key value is encoded in the key, not stored as a cell, so
-    /// the cell-based `indexed_columns` path cannot see it — the same reason
-    /// `indexed_clustering_columns` exists for the other half of the primary
-    /// key.
-    indexed_partition_key_columns: Vec<(String, usize)>,
-    /// Per-index type, keyed by index name. Threaded from the schema so eager /
-    /// backfill / compaction index-build jobs carry the correct `IndexType`
-    /// instead of a hardcoded `BTree`. Missing entries default to `BTree`.
-    index_types: HashMap<String, IndexType>,
-    /// Partial-index predicates, keyed by index name. Present only for
-    /// [`IndexType::Filtered`] indexes. The memtable write path consults this so
-    /// a live write is added to the filtered memtable index ONLY when its
-    /// filter-column cell satisfies the predicate — matching exactly the rows
-    /// the SSTable sidecar build keeps, so memtable and sidecar agree.
-    index_filter_predicates: HashMap<String, FilterPredicate>,
-    /// Full-text index declarations: `(index_name, column_position)` pairs.
-    /// Built as FTI sidecar files during flush.
-    fulltext_indexes: Vec<(String, usize)>,
-    /// Vector index configurations. Immutable after registration.
-    /// At flush time each declared vector index is drained from the memtable
-    /// and persisted as a method-specific vector artifact.
-    vector_index_configs: Vec<VectorIndexConfig>,
-    /// Per-index persistent artifact/search method. Missing entries default to
-    /// the legacy HNSW sidecar for API compatibility with existing callers.
-    vector_index_methods: HashMap<String, VectorIndexMethod>,
+    /// Set once the table is dropped (see [`TableStore::retire`]): no flush
+    /// of this store writes anything after it is set.
+    retired: std::sync::atomic::AtomicBool,
     /// Monotonic generation counter for stable SSTable IDs.
     /// Incremented on each flush. Used by compaction swap to identify
     /// exactly which SSTables to remove.
@@ -668,6 +637,260 @@ pub struct TableStore<F: FlushTarget> {
     /// queries that all find the same SSTable uncovered builds its sidecar
     /// once instead of tokenizing it once per query at the same time.
     fulltext_sidecar_build_lock: Arc<Mutex<()>>,
+}
+
+/// The index declarations of one table, as one immutable value.
+///
+/// A [`TableStore`] publishes its catalog through an `ArcSwap`: the write
+/// and read paths `load()` a snapshot and never block, and DDL clones the
+/// current catalog, edits the clone and stores it. These fields used to be
+/// plain members mutated through `&mut TableStore`, which only worked
+/// because the engine-wide table map was a `RwLock` whose write guard made
+/// DDL exclusive. That lock is gone (t_d938e6ae): a reader parked holding it
+/// deadlocked a node.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct IndexCatalog {
+    /// Secondary index declarations: `(index_name, column_position)` pairs.
+    /// Column position is the index into `Row.cells` by column ordinal
+    /// (matching the `u16` tag in each cell tuple).
+    indexed_columns: Vec<(String, usize)>,
+    /// Secondary indexes on CLUSTERING columns: `(index_name,
+    /// clustering_component)` pairs (t_430c4188). A clustering column's value
+    /// is not a cell — the write path extracts it from the row's composite
+    /// clustering-key bytes at the given component index.
+    indexed_clustering_columns: Vec<(String, usize)>,
+    /// Partition-key secondary index declarations:
+    /// `(index_name, partition_key_component)`.
+    ///
+    /// A partition-key value is encoded in the key, not stored as a cell, so
+    /// the cell-based `indexed_columns` path cannot see it — the same reason
+    /// `indexed_clustering_columns` exists for the other half of the primary
+    /// key.
+    indexed_partition_key_columns: Vec<(String, usize)>,
+    /// Per-index type, keyed by index name. Threaded from the schema so eager /
+    /// backfill / compaction index-build jobs carry the correct `IndexType`
+    /// instead of a hardcoded `BTree`. Missing entries default to `BTree`.
+    index_types: HashMap<String, IndexType>,
+    /// Partial-index predicates, keyed by index name. Present only for
+    /// [`IndexType::Filtered`] indexes. The memtable write path consults this so
+    /// a live write is added to the filtered memtable index ONLY when its
+    /// filter-column cell satisfies the predicate — matching exactly the rows
+    /// the SSTable sidecar build keeps, so memtable and sidecar agree.
+    index_filter_predicates: HashMap<String, FilterPredicate>,
+    /// Full-text index declarations: `(index_name, column_position)` pairs.
+    /// Built as FTI sidecar files during flush.
+    fulltext_indexes: Vec<(String, usize)>,
+    /// Vector index configurations. At flush time each declared vector index
+    /// is drained from the memtable and persisted as a method-specific
+    /// vector artifact.
+    vector_index_configs: Vec<VectorIndexConfig>,
+    /// Per-index persistent artifact/search method. Missing entries default to
+    /// the legacy HNSW sidecar for API compatibility with existing callers.
+    vector_index_methods: HashMap<String, VectorIndexMethod>,
+}
+
+impl IndexCatalog {
+    /// A catalog declaring only the given cell-column indexes, each BTree.
+    fn with_indexed_columns(indexed_columns: Vec<(String, usize)>) -> Self {
+        Self {
+            index_types: default_index_types(&indexed_columns),
+            indexed_columns,
+            ..Self::default()
+        }
+    }
+
+    /// The declared type of `index_name`; BTree when undeclared.
+    fn index_type_for(&self, index_name: &str) -> IndexType {
+        self.index_types
+            .get(index_name)
+            .copied()
+            .unwrap_or(IndexType::BTree)
+    }
+
+    /// The artifact/search method of vector index `index_name`; HNSW when
+    /// undeclared or registered through the legacy path.
+    fn vector_index_method(&self, index_name: &str) -> VectorIndexMethod {
+        self.vector_index_methods
+            .get(index_name)
+            .copied()
+            .unwrap_or(VectorIndexMethod::Hnsw)
+    }
+
+    /// This catalog with every column ordinal remapped from `old_schema`'s
+    /// regular-column layout onto `new_schema`'s.
+    ///
+    /// Regular columns are ordered by Cassandra's column-name comparator, so
+    /// `ALTER TABLE ADD` of a column that sorts before an indexed column
+    /// shifts the indexed column's ordinal (the `u16` cell tag). Index
+    /// declarations store ordinals, not names — left stale, every subsequent
+    /// write extracts the indexed value from the WRONG cell, and a
+    /// backfilled-Current index then serves false empty results (memory-suite
+    /// regression `fixed_phonetic_match`). So every positional declaration is
+    /// remapped through the old schema's column name.
+    fn remapped_onto(&self, old_schema: &TableSchema, new_schema: &TableSchema) -> Self {
+        let mut catalog = self.clone();
+        let remap = |index_name: &str, pos: &mut usize| {
+            let Some(old_col) = old_schema.regular_columns.get(*pos) else {
+                tracing::error!(
+                    index = index_name,
+                    position = *pos,
+                    "index ordinal points past the pre-ALTER regular column \
+                     set — leaving it unchanged; index writes may be wrong"
+                );
+                return;
+            };
+            match new_schema
+                .regular_columns
+                .iter()
+                .position(|c| c.name == old_col.name)
+            {
+                Some(new_pos) => {
+                    if new_pos != *pos {
+                        tracing::info!(
+                            index = index_name,
+                            column = %old_col.name,
+                            old_position = *pos,
+                            new_position = new_pos,
+                            "remapped index column ordinal after schema update"
+                        );
+                        *pos = new_pos;
+                    }
+                }
+                None => tracing::error!(
+                    index = index_name,
+                    column = %old_col.name,
+                    "indexed column absent from post-ALTER schema — leaving \
+                     ordinal unchanged; index writes may be wrong"
+                ),
+            }
+        };
+        for (name, pos) in &mut catalog.indexed_columns {
+            remap(name, pos);
+        }
+        for (name, pos) in &mut catalog.fulltext_indexes {
+            remap(name, pos);
+        }
+        for cfg in &mut catalog.vector_index_configs {
+            remap(&cfg.index_name.clone(), &mut cfg.column_position);
+        }
+        for (name, pred) in &mut catalog.index_filter_predicates {
+            for clause in &mut pred.clauses {
+                remap(name, &mut clause.column_position);
+            }
+        }
+        catalog
+    }
+
+    /// Whether this catalog declares any index at all.
+    fn declares_any(&self) -> bool {
+        !(self.indexed_columns.is_empty()
+            && self.indexed_clustering_columns.is_empty()
+            && self.indexed_partition_key_columns.is_empty()
+            && self.fulltext_indexes.is_empty()
+            && self.vector_index_configs.is_empty())
+    }
+
+    /// Every scalar (memtable-indexed) index this catalog declares: cell,
+    /// clustering and partition-key indexes, by name.
+    fn scalar_index_names(&self) -> impl Iterator<Item = &String> {
+        self.indexed_columns
+            .iter()
+            .chain(self.indexed_clustering_columns.iter())
+            .chain(self.indexed_partition_key_columns.iter())
+            .map(|(name, _)| name)
+    }
+
+    /// Drop every declaration named `index_name`; whether there was one.
+    fn remove(&mut self, index_name: &str) -> bool {
+        let before = (
+            self.indexed_columns.len(),
+            self.indexed_clustering_columns.len(),
+            self.indexed_partition_key_columns.len(),
+            self.vector_index_configs.len(),
+        );
+        self.indexed_columns.retain(|(name, _)| name != index_name);
+        self.indexed_clustering_columns
+            .retain(|(name, _)| name != index_name);
+        self.indexed_partition_key_columns
+            .retain(|(name, _)| name != index_name);
+        // Full-text declarations are NOT dropped here: `remove_index` never
+        // has, and DROP INDEX of a full-text index is out of this change.
+        self.vector_index_configs
+            .retain(|cfg| cfg.index_name != index_name);
+        let after = (
+            self.indexed_columns.len(),
+            self.indexed_clustering_columns.len(),
+            self.indexed_partition_key_columns.len(),
+            self.vector_index_configs.len(),
+        );
+        let mut removed = before != after;
+        removed |= self.index_types.remove(index_name).is_some();
+        removed |= self.index_filter_predicates.remove(index_name).is_some();
+        removed |= self.vector_index_methods.remove(index_name).is_some();
+        removed
+    }
+
+    /// Everything that determines the postings scalar index `index_name`
+    /// holds: which key family it reads, the position there, its type and its
+    /// partial-index predicate. Two catalogs agreeing on this give the same
+    /// postings for the same rows.
+    fn scalar_definition(
+        &self,
+        index_name: &str,
+    ) -> Option<(u8, usize, IndexType, Option<&FilterPredicate>)> {
+        let find = |list: &[(String, usize)]| {
+            list.iter()
+                .find(|(name, _)| name == index_name)
+                .map(|(_, pos)| *pos)
+        };
+        let (family, position) = find(&self.indexed_columns)
+            .map(|pos| (0, pos))
+            .or_else(|| find(&self.indexed_clustering_columns).map(|pos| (1, pos)))
+            .or_else(|| find(&self.indexed_partition_key_columns).map(|pos| (2, pos)))?;
+        Some((
+            family,
+            position,
+            self.index_type_for(index_name),
+            self.index_filter_predicates.get(index_name),
+        ))
+    }
+
+    /// Whether this catalog declares an index named `index_name`, of any kind.
+    fn declares(&self, index_name: &str) -> bool {
+        let named = |list: &[(String, usize)]| list.iter().any(|(n, _)| n == index_name);
+        named(&self.indexed_columns)
+            || named(&self.indexed_clustering_columns)
+            || named(&self.indexed_partition_key_columns)
+            || named(&self.fulltext_indexes)
+            || self
+                .vector_index_configs
+                .iter()
+                .any(|cfg| cfg.index_name == index_name)
+    }
+}
+
+/// A read-only list out of one [`IndexCatalog`] snapshot.
+///
+/// Dereferences to a slice, so callers iterate it like the `&[T]` the
+/// accessors used to return; it keeps its snapshot alive, so a DDL that
+/// swaps the catalog meanwhile cannot change what the holder sees.
+pub struct CatalogSlice<T: 'static> {
+    catalog: Arc<IndexCatalog>,
+    project: fn(&IndexCatalog) -> &[T],
+}
+
+impl<T> std::ops::Deref for CatalogSlice<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        (self.project)(&self.catalog)
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for CatalogSlice<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
 }
 
 /// File name of generation `gen`'s FTI sidecar for `index_name`.
@@ -831,25 +1054,151 @@ fn new_memtable() -> Arc<dyn Memtable> {
     }
 }
 
-/// Build a fresh `HashMap` of empty `MemtableIndex` instances, one per
-/// declared secondary index. `clustering_indexed_columns` carries the
-/// clustering-column indexes (t_430c4188) so a flush swap does not drop them.
-fn new_indexes(
-    indexed_columns: &[(String, usize)],
-    clustering_indexed_columns: &[(String, usize)],
-    partition_key_indexed_columns: &[(String, usize)],
-) -> Arc<HashMap<String, Arc<MemtableIndex>>> {
+/// The memtable indexes of ONE active memtable, together with the catalog
+/// they were built from.
+///
+/// The pair is created when its memtable is, and replaced only when the
+/// memtable is (a flush swap), so the catalog a write posts under is always
+/// the catalog its memtable's flush writes sidecars for: index postings equal
+/// the flushed sidecar set by construction. Index DDL never edits a live
+/// memtable's indexes; it rotates the memtable (see
+/// [`TableStore::flush_applying_catalog_edit`]). Dereferences to the
+/// name→index map, which is what reads use.
+pub(crate) struct MemtableIndexes {
+    catalog: Arc<IndexCatalog>,
+    by_name: HashMap<String, Arc<MemtableIndex>>,
+}
+
+impl std::ops::Deref for MemtableIndexes {
+    type Target = HashMap<String, Arc<MemtableIndex>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_name
+    }
+}
+
+/// Post every row of `partitions` to `index_name`, as the write path would
+/// have had the index existed when they were written. Used only for a frozen
+/// memtable — immutable rows no write can reach — whose rotating DDL added
+/// the index (see `TableStore::flush_sidecar_indexes`).
+fn scalar_index_from_rows(
+    catalog: &IndexCatalog,
+    index_name: &str,
+    partitions: &[Partition],
+    key_component_counts: (usize, usize),
+) -> Arc<MemtableIndex> {
+    let (pk_total, ck_total) = key_component_counts;
+    let index = Arc::new(MemtableIndex::new());
+    let index_type = catalog.index_type_for(index_name);
+    let find = |list: &[(String, usize)]| {
+        list.iter()
+            .find(|(name, _)| name == index_name)
+            .map(|(_, pos)| *pos)
+    };
+    let post_key_component =
+        |value: &[u8], row_pos: RowPosition| match crate::index::scheduler::encode_index_key(
+            index_type, value,
+        ) {
+            Ok(Some(index_key)) => index.insert(index_key, row_pos),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                index_name,
+                %e,
+                "store: skipping key-component index entry built at flush; key encoding failed"
+            ),
+        };
+    for partition in partitions {
+        let pk_bytes = partition.key.key.as_bytes();
+        if let Some(position) = find(&catalog.indexed_columns) {
+            let predicate = catalog.index_filter_predicates.get(index_name);
+            for row in partition.static_row.iter().chain(partition.rows.iter()) {
+                insert_scalar_memtable_index_row(
+                    &index, index_name, position, index_type, predicate, pk_bytes, row,
+                );
+            }
+        } else if let Some(component) = find(&catalog.indexed_partition_key_columns) {
+            let components = ferrosa_row_bridge::decode_pk(&partition.key, pk_total);
+            if let Some(value) = components.get(component) {
+                post_key_component(
+                    value,
+                    RowPosition {
+                        partition_key: pk_bytes.to_vec(),
+                        clustering_key: Vec::new(),
+                    },
+                );
+            }
+        } else if let Some(component) = find(&catalog.indexed_clustering_columns) {
+            for row in partition
+                .rows
+                .iter()
+                .filter(|row| !row.clustering.is_empty())
+            {
+                let components = ferrosa_row_bridge::decode_clustering(&row.clustering, ck_total);
+                if let Some(value) = components.get(component) {
+                    post_key_component(
+                        value,
+                        RowPosition {
+                            partition_key: pk_bytes.to_vec(),
+                            clustering_key: row.clustering.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Build vector index `cfg` over the rows of `partitions` (see
+/// [`scalar_index_from_rows`] for when).
+fn vector_index_from_rows(
+    cfg: &VectorIndexConfig,
+    partitions: &[Partition],
+) -> Arc<VectorMemtableIndex> {
+    let vector_index = Arc::new(VectorMemtableIndex::new(
+        cfg.metric,
+        cfg.m,
+        cfg.ef_construction,
+    ));
+    for partition in partitions {
+        for row in partition.static_row.iter().chain(partition.rows.iter()) {
+            let Some(value) = row
+                .cells
+                .iter()
+                .find(|(idx, _)| *idx as usize == cfg.column_position)
+                .and_then(|(_, cell)| cell.value.as_ref())
+            else {
+                continue;
+            };
+            let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) else {
+                continue;
+            };
+            let position = ferrosa_index::vector::RowPosition::new(vector_index.len() as u64);
+            vector_index.insert_with_scope(
+                position,
+                vector,
+                Some(partition.key.key.as_bytes().to_vec()),
+            );
+        }
+    }
+    vector_index
+}
+
+/// Build a fresh empty `MemtableIndex` per secondary index `catalog`
+/// declares — cell, clustering (t_430c4188) and partition-key indexes alike.
+fn new_indexes(catalog: Arc<IndexCatalog>) -> Arc<MemtableIndexes> {
     // EVERY declared index must appear here. A flush installs this map
     // wholesale, so a family of indexes omitted from it exists in the
     // declaration and nowhere else: `guard.indexes.get(name)` then returns
     // None for the rest of the table's life and each write silently skips it.
-    let map: HashMap<String, Arc<MemtableIndex>> = indexed_columns
+    let by_name: HashMap<String, Arc<MemtableIndex>> = catalog
+        .indexed_columns
         .iter()
-        .chain(clustering_indexed_columns.iter())
-        .chain(partition_key_indexed_columns.iter())
+        .chain(catalog.indexed_clustering_columns.iter())
+        .chain(catalog.indexed_partition_key_columns.iter())
         .map(|(name, _)| (name.clone(), Arc::new(MemtableIndex::new())))
         .collect();
-    Arc::new(map)
+    Arc::new(MemtableIndexes { catalog, by_name })
 }
 
 /// Default per-index types for a freshly-declared set of secondary indexes.
@@ -1673,7 +2022,9 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns, &[], &[]);
+        let indexes = new_indexes(Arc::new(IndexCatalog::with_indexed_columns(
+            indexed_columns,
+        )));
         let initial_view = StoreView {
             active,
             flushing: None,
@@ -1691,15 +2042,8 @@ impl<F: FlushTarget> TableStore<F> {
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
-            index_types: default_index_types(&indexed_columns),
-            index_filter_predicates: HashMap::new(),
-            indexed_columns,
-            indexed_clustering_columns: Vec::new(),
-            indexed_partition_key_columns: Vec::new(),
-            fulltext_indexes: vec![],
-            vector_index_configs: vec![],
-            vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
+            retired: std::sync::atomic::AtomicBool::new(false),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -1837,7 +2181,9 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns, &[], &[]);
+        let indexes = new_indexes(Arc::new(IndexCatalog::with_indexed_columns(
+            indexed_columns,
+        )));
         let sidecar_count = initial_sstables.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -1896,15 +2242,8 @@ impl<F: FlushTarget> TableStore<F> {
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
-            index_types: default_index_types(&indexed_columns),
-            index_filter_predicates: HashMap::new(),
-            indexed_columns,
-            indexed_clustering_columns: Vec::new(),
-            indexed_partition_key_columns: Vec::new(),
-            fulltext_indexes: vec![],
-            vector_index_configs: vec![],
-            vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
+            retired: std::sync::atomic::AtomicBool::new(false),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -1938,7 +2277,9 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns, &[], &[]);
+        let indexes = new_indexes(Arc::new(IndexCatalog::with_indexed_columns(
+            indexed_columns,
+        )));
         let sstable_count = descriptors.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -1980,15 +2321,8 @@ impl<F: FlushTarget> TableStore<F> {
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
-            index_types: default_index_types(&indexed_columns),
-            index_filter_predicates: HashMap::new(),
-            indexed_columns,
-            indexed_clustering_columns: Vec::new(),
-            indexed_partition_key_columns: Vec::new(),
-            fulltext_indexes: vec![],
-            vector_index_configs: vec![],
-            vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
+            retired: std::sync::atomic::AtomicBool::new(false),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -2007,66 +2341,19 @@ impl<F: FlushTarget> TableStore<F> {
     /// `SerializationHeader` with up-to-date `num_columns`, avoiding the
     /// writer's out-of-range-col_idx panic
     /// (see bug-sstable-writer-produces-zero-byte-rows-db.md).
-    pub fn update_schema(&mut self, new_schema: TableSchema) {
-        // Regular columns are ordered by Cassandra's column-name comparator,
-        // so `ALTER TABLE ADD` of a column that sorts before an indexed
-        // column shifts the indexed column's ordinal (the `u16` cell tag).
-        // Index declarations store ordinals, not names — left stale, every
-        // subsequent write extracts the indexed value from the WRONG cell,
-        // and a backfilled-Current index then serves false empty results
-        // (memory-suite regression `fixed_phonetic_match`). Remap every
-        // positional declaration through the old schema's column name.
-        let old_schema = self.schema.load_full();
-        let remap = |index_name: &str, pos: &mut usize| {
-            let Some(old_col) = old_schema.regular_columns.get(*pos) else {
-                tracing::error!(
-                    index = index_name,
-                    position = *pos,
-                    "index ordinal points past the pre-ALTER regular column \
-                     set — leaving it unchanged; index writes may be wrong"
-                );
-                return;
-            };
-            match new_schema
-                .regular_columns
-                .iter()
-                .position(|c| c.name == old_col.name)
-            {
-                Some(new_pos) => {
-                    if new_pos != *pos {
-                        tracing::info!(
-                            index = index_name,
-                            column = %old_col.name,
-                            old_position = *pos,
-                            new_position = new_pos,
-                            "remapped index column ordinal after schema update"
-                        );
-                        *pos = new_pos;
-                    }
-                }
-                None => tracing::error!(
-                    index = index_name,
-                    column = %old_col.name,
-                    "indexed column absent from post-ALTER schema — leaving \
-                     ordinal unchanged; index writes may be wrong"
-                ),
-            }
-        };
-        for (name, pos) in &mut self.indexed_columns {
-            remap(name, pos);
-        }
-        for (name, pos) in &mut self.fulltext_indexes {
-            remap(name, pos);
-        }
-        for cfg in &mut self.vector_index_configs {
-            remap(&cfg.index_name.clone(), &mut cfg.column_position);
-        }
-        for (name, pred) in &mut self.index_filter_predicates {
-            for clause in &mut pred.clauses {
-                remap(name, &mut clause.column_position);
-            }
-        }
-        self.schema.store(Arc::new(new_schema));
+    ///
+    /// Rows already in the memtable were written under the old schema, so
+    /// this is a flush that publishes the new schema at its memtable swap:
+    /// see [`Self::flush_and_update_schema`].
+    pub fn update_schema(&self, new_schema: TableSchema) -> Result<()> {
+        self.flush_and_update_schema(new_schema, || {})
+            .map(|_outcome| ())
+    }
+
+    /// The table's current index catalog: the one the active memtable was
+    /// created with, and which every write to it posts under.
+    fn catalog(&self) -> Arc<IndexCatalog> {
+        Arc::clone(&self.view.load().indexes.catalog)
     }
 
     /// Return a guard over the current schema. Holding the guard keeps the
@@ -2074,6 +2361,12 @@ impl<F: FlushTarget> TableStore<F> {
     /// concurrently.
     pub fn schema(&self) -> arc_swap::Guard<Arc<TableSchema>> {
         self.schema.load()
+    }
+
+    /// The current schema as an owned `Arc`, for holders that outlive a
+    /// guard or cross threads.
+    pub fn schema_arc(&self) -> Arc<TableSchema> {
+        self.schema.load_full()
     }
 
     /// Directory under which this store's SSTable components and
@@ -2105,22 +2398,29 @@ impl<F: FlushTarget> TableStore<F> {
     /// Loads the current view atomically, then delegates to the memtable's
     /// `put`. After the memtable write, each declared secondary index is
     /// updated by extracting the indexed column value from the row cells.
-    /// No lock is taken on the read/write path; the ArcSwap guard provides
-    /// the necessary lifetime without blocking.
+    ///
+    /// The whole write — index postings and memtable put — runs inside the
+    /// shared write barrier against ONE loaded view, and posts under the
+    /// catalog bound to that view's memtable. The barrier is exclusive only
+    /// for a flush's memtable swap, so a write can never post into one
+    /// memtable's indexes and put its row into another, and never posts under
+    /// a catalog its memtable's flush will not write sidecars for.
     pub fn write(&self, key: &DecoratedKey, row: Row) -> Result<()> {
+        let _wb = self.write_barrier.read();
         let guard = self.view.load();
+        let catalog = Arc::clone(&guard.indexes.catalog);
 
         // Secondary index maintenance: extract indexed column values and insert
         // before the memtable put (which consumes the row reference via move).
-        if !self.indexed_columns.is_empty() {
-            for (index_name, col_pos) in &self.indexed_columns {
+        if !catalog.indexed_columns.is_empty() {
+            for (index_name, col_pos) in &catalog.indexed_columns {
                 if let Some(index) = guard.indexes.get(index_name) {
                     insert_scalar_memtable_index_row(
                         index,
                         index_name,
                         *col_pos,
-                        self.index_type_for(index_name),
-                        self.index_filter_predicates.get(index_name),
+                        catalog.index_type_for(index_name),
+                        catalog.index_filter_predicates.get(index_name),
                         key.key.as_bytes(),
                         &row,
                     );
@@ -2131,10 +2431,10 @@ impl<F: FlushTarget> TableStore<F> {
         // Partition-key index maintenance: a partition-key column's value is
         // not a cell either, so it is extracted from the row's composite
         // partition-key bytes at the declared component.
-        if !self.indexed_partition_key_columns.is_empty() {
+        if !catalog.indexed_partition_key_columns.is_empty() {
             let total = self.partition_key_column_count();
             let components = ferrosa_row_bridge::decode_pk(key, total);
-            for (index_name, component) in &self.indexed_partition_key_columns {
+            for (index_name, component) in &catalog.indexed_partition_key_columns {
                 let Some(value) = components.get(*component) else {
                     tracing::warn!(
                         index_name,
@@ -2144,7 +2444,7 @@ impl<F: FlushTarget> TableStore<F> {
                     );
                     continue;
                 };
-                let index_type = self.index_type_for(index_name);
+                let index_type = catalog.index_type_for(index_name);
                 match crate::index::scheduler::encode_index_key(index_type, value) {
                     Ok(Some(index_key)) => {
                         // One posting per PARTITION (t_c5bccc65): every row of
@@ -2184,10 +2484,10 @@ impl<F: FlushTarget> TableStore<F> {
         // Clustering-column index maintenance (t_430c4188): a clustering
         // column's value is not a cell, so it is extracted from the row's
         // composite clustering-key bytes at the declared component.
-        if !self.indexed_clustering_columns.is_empty() && !row.clustering.is_empty() {
+        if !catalog.indexed_clustering_columns.is_empty() && !row.clustering.is_empty() {
             let total = self.clustering_column_count();
             let components = ferrosa_row_bridge::decode_clustering(&row.clustering, total);
-            for (index_name, component) in &self.indexed_clustering_columns {
+            for (index_name, component) in &catalog.indexed_clustering_columns {
                 let Some(value) = components.get(*component) else {
                     tracing::warn!(
                         index_name,
@@ -2197,7 +2497,7 @@ impl<F: FlushTarget> TableStore<F> {
                     );
                     continue;
                 };
-                let index_type = self.index_type_for(index_name);
+                let index_type = catalog.index_type_for(index_name);
                 match crate::index::scheduler::encode_index_key(index_type, value) {
                     Ok(Some(index_key)) => {
                         let row_pos = RowPosition {
@@ -2235,8 +2535,8 @@ impl<F: FlushTarget> TableStore<F> {
         // placeholder. The drain→HNSW build at flush time re-inserts with
         // the final on-disk offset. For now, the memtable search is by position
         // within the memtable (ordering only), not absolute file offset.
-        if !self.vector_index_configs.is_empty() {
-            for cfg in &self.vector_index_configs {
+        if !catalog.vector_index_configs.is_empty() {
+            for cfg in &catalog.vector_index_configs {
                 if let Some(cell) = row
                     .cells
                     .iter()
@@ -2268,14 +2568,11 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // Hold the write barrier (shared) during the memtable put.
-        // This prevents the flush from swapping the active memtable while
-        // we're writing. Re-load the view INSIDE the barrier to ensure we
-        // write to the current active, not a stale one.
-        let _wb = self.write_barrier.read();
-        let current = self.view.load();
+        // The shared write barrier taken at the top is still held, so the
+        // flush cannot have swapped the active memtable since `guard` was
+        // loaded: the row lands in the memtable its postings were added for.
         let schema = self.schema.load();
-        current.active.put(key, row, &schema)
+        guard.active.put(key, row, &schema)
     }
 
     /// Read a partition by merging all sources: active memtable, flushing
@@ -3220,6 +3517,107 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         on_memtable_release: impl FnOnce(),
     ) -> Result<FlushOutcome> {
+        self.flush_rotating(None, |_| None, on_memtable_release)
+    }
+
+    /// Flush every row written under the current schema, then publish
+    /// `new_schema`, with no write admitted in between (`ALTER TABLE`).
+    ///
+    /// The memtable swap and the schema swap are one step: the frozen memtable
+    /// is serialized with the schema and catalog it was written under, and the
+    /// new memtable starts empty under the new ones. So every row in the
+    /// flushed SSTable carries the pre-ALTER layout its header describes, and
+    /// every later row enters a memtable that will flush under the new one.
+    /// This used to depend on the engine holding its table-map write lock
+    /// across `flush` and `update_schema`; that lock is gone (t_d938e6ae).
+    pub(crate) fn flush_and_update_schema(
+        &self,
+        new_schema: TableSchema,
+        on_memtable_release: impl FnOnce(),
+    ) -> Result<FlushOutcome> {
+        self.flush_rotating(Some(new_schema), |_| None, on_memtable_release)
+    }
+
+    /// Change the table's index catalog by rotating the memtable: `edit`
+    /// derives the new catalog from the current one (or returns `None` to
+    /// change nothing), the active memtable is frozen and flushed, and a new
+    /// empty one bound to the new catalog takes writes.
+    ///
+    /// This is how index DDL stays lock-free and exact. A live memtable's
+    /// indexes are never edited, so no write can post under a catalog its
+    /// memtable does not carry, and every index of a memtable is complete for
+    /// it — the new memtable starts empty, and the frozen one gets sidecars for
+    /// the NEW catalog built from its own postings, or from its now-immutable
+    /// rows for an index the edit added (see `flush_rotating`). `edit` runs at
+    /// the swap against the latest catalog, so concurrent DDLs, which the
+    /// flush already serializes, cannot lose one another's changes.
+    ///
+    /// Returns what the rotation's flush did. A published generation's
+    /// sidecars already cover every index of the new catalog (see
+    /// [`Self::indexes_written_by_last_flush`]), so it needs no backfill build
+    /// for an index the edit added. The caller owns the engine-side
+    /// bookkeeping every flush needs.
+    pub(crate) fn flush_applying_catalog_edit(
+        &self,
+        edit: impl FnOnce(&IndexCatalog) -> Option<IndexCatalog>,
+    ) -> Result<FlushOutcome> {
+        self.flush_rotating(None, edit, || {})
+    }
+
+    /// The memtable indexes a flush writes sidecars from: one per scalar index
+    /// the `target` catalog declares. An index the frozen memtable carried
+    /// gives its own postings, complete because every write to that memtable
+    /// posted to it; an index the rotating DDL added is posted now from the
+    /// frozen rows. An index the DDL dropped is left out.
+    fn flush_sidecar_indexes(
+        &self,
+        frozen: &MemtableIndexes,
+        target: &IndexCatalog,
+        partitions: &[Partition],
+    ) -> Vec<(String, Arc<MemtableIndex>)> {
+        let key_component_counts = (
+            self.partition_key_column_count(),
+            self.clustering_column_count(),
+        );
+        target
+            .scalar_index_names()
+            .map(|name| {
+                // The frozen postings serve only when they were built to the
+                // same definition: a re-declaration that changed the type,
+                // position or predicate needs its sidecar built from the rows.
+                let same_definition =
+                    frozen.catalog.scalar_definition(name) == target.scalar_definition(name);
+                let index = match frozen.get(name) {
+                    Some(index) if same_definition => Arc::clone(index),
+                    _ => scalar_index_from_rows(target, name, partitions, key_component_counts),
+                };
+                (name.clone(), index)
+            })
+            .collect()
+    }
+
+    /// Mark this store dropped: wait for a flush already writing to finish,
+    /// then make every later flush a no-op.
+    ///
+    /// DROP TABLE removes the table from the engine and deletes its directory
+    /// so a re-CREATE starts empty. Readers that still hold the table get
+    /// I/O errors for files that are gone, which is loud and correct for a
+    /// dropped table. A flush still running on it is different: it would
+    /// write an SSTable into the deleted directory for the re-created table
+    /// to load. The engine-wide table lock used to make DROP wait for it; this
+    /// waits only for the one in-progress flush of this table.
+    pub fn retire(&self) {
+        let _flush = self.flush_guard.lock();
+        self.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn flush_rotating(
+        &self,
+        new_schema: Option<TableSchema>,
+        edit_catalog: impl FnOnce(&IndexCatalog) -> Option<IndexCatalog>,
+        on_memtable_release: impl FnOnce(),
+    ) -> Result<FlushOutcome> {
         let total_start = Instant::now();
         let phase_start = Instant::now();
         let _guard = self.flush_guard.lock();
@@ -3227,6 +3625,13 @@ impl<F: FlushTarget> TableStore<F> {
             crate::metrics::FlushPhase::LockWait,
             phase_start.elapsed(),
         );
+        if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!(
+                dir = %self.flush_target.base_dir().display(),
+                "flush skipped: the table was dropped while this flush was pending"
+            );
+            return Ok(FlushOutcome::NothingToFlush);
+        }
 
         // Step 1: Swap in a fresh active memtable, move old to flushing.
         // Take the write barrier (exclusive) to ensure no writer is mid-put
@@ -3234,16 +3639,36 @@ impl<F: FlushTarget> TableStore<F> {
         // new writes go to the new active memtable, and the old memtable
         // contains a complete snapshot.
         let new_active: Arc<dyn Memtable> = new_memtable();
-        let fresh_indexes = new_indexes(
-            &self.indexed_columns,
-            &self.indexed_clustering_columns,
-            &self.indexed_partition_key_columns,
-        );
-        let fresh_vector_indexes = new_vector_indexes(&self.vector_index_configs);
         let phase_start = Instant::now();
-        let (old_active, old_view_flushing, old_indexes, old_vector_indexes) = {
+        let (
+            old_active,
+            old_view_flushing,
+            old_indexes,
+            old_vector_indexes,
+            flush_schema,
+            flush_catalog,
+            target_catalog,
+        ) = {
             let _wb = self.write_barrier.write(); // block all writers
             let old_view = self.view.load();
+            // The schema and index catalog the frozen memtable's rows were
+            // written under. The flush serializes them with these even if
+            // `new_schema` replaces them below: an ALTER remaps index
+            // ordinals, and the frozen rows still carry the old ones.
+            let flush_schema = self.schema.load_full();
+            let flush_catalog = Arc::clone(&old_view.indexes.catalog);
+            // The catalog the new memtable is bound to, and whose index set the
+            // frozen memtable's sidecars must cover.
+            let mut target_catalog = match edit_catalog(&flush_catalog) {
+                Some(edited) => Arc::new(edited),
+                None => Arc::clone(&flush_catalog),
+            };
+            if let Some(new_schema) = new_schema {
+                target_catalog = Arc::new(target_catalog.remapped_onto(&flush_schema, &new_schema));
+                self.schema.store(Arc::new(new_schema));
+            }
+            let fresh_indexes = new_indexes(Arc::clone(&target_catalog));
+            let fresh_vector_indexes = new_vector_indexes(&target_catalog.vector_index_configs);
             let old_active = Arc::clone(&old_view.active);
             let old_view_flushing = old_view.flushing.clone();
             let old_indexes = Arc::clone(&old_view.indexes);
@@ -3270,6 +3695,9 @@ impl<F: FlushTarget> TableStore<F> {
                 old_view_flushing,
                 old_indexes,
                 old_vector_indexes,
+                flush_schema,
+                flush_catalog,
+                target_catalog,
             )
         };
         crate::metrics::observe_flush_phase(
@@ -3358,10 +3786,10 @@ impl<F: FlushTarget> TableStore<F> {
             phase_start.elapsed(),
         );
 
-        // Step 5: Build the SSTable.
+        // Step 5: Build the SSTable, under the schema captured at the swap.
         let options = self.options.clone();
 
-        let schema = self.schema.load();
+        let schema = Arc::clone(&flush_schema);
 
         // Step 5a: Quarantine-on-flush guard (Layer 2 of the timeuuid-flush-
         // wedge fix). Filter every partition's rows through the per-cell
@@ -3447,11 +3875,9 @@ impl<F: FlushTarget> TableStore<F> {
         // floor. Indexed tables fall through to the single-SSTable path below
         // (per-shard index splitting is a later increment); their sidecar/
         // fulltext/vector steps stay exactly as-is.
-        let can_shard = self.indexed_columns.is_empty()
-            && self.indexed_clustering_columns.is_empty()
-            && self.indexed_partition_key_columns.is_empty()
-            && self.fulltext_indexes.is_empty()
-            && self.vector_index_configs.is_empty();
+        // Sidecars are written for the target catalog (see Step 5b), so a
+        // flush whose rotation added an index must take the indexed path.
+        let can_shard = !flush_catalog.declares_any() && !target_catalog.declares_any();
         let num_shards = flush::desired_flush_shards(
             partitions.len(),
             can_shard,
@@ -3459,7 +3885,14 @@ impl<F: FlushTarget> TableStore<F> {
         );
         if num_shards > 1 {
             return self
-                .flush_sharded(partitions, num_shards, total_rows, total_start, &old_active)
+                .flush_sharded(
+                    partitions,
+                    num_shards,
+                    total_rows,
+                    total_start,
+                    &old_active,
+                    flush_schema,
+                )
                 .map(|()| FlushOutcome::Published);
         }
 
@@ -3546,7 +3979,15 @@ impl<F: FlushTarget> TableStore<F> {
         // so the sidecar describes the rows this SSTable holds however long the
         // write itself takes. Pinning a persistent tree copies nothing: it is
         // one `Arc` per index.
-        let pinned_indexes: Vec<(&str, crate::memtable::index::IndexSnapshot)> = old_indexes
+        //
+        // The sidecar set is exactly the indexes the TARGET catalog declares —
+        // the one the next memtable is bound to. An index DDL rotated the
+        // memtable to get here: an index it dropped gets no sidecar, and an
+        // index it added is posted now from the frozen rows, which no write
+        // can reach any more.
+        let sidecar_indexes =
+            self.flush_sidecar_indexes(&old_indexes, &target_catalog, &partitions);
+        let pinned_indexes: Vec<(&str, crate::memtable::index::IndexSnapshot)> = sidecar_indexes
             .iter()
             .map(|(index_name, memtable_idx)| (index_name.as_str(), memtable_idx.pin()))
             .collect();
@@ -3610,8 +4051,15 @@ impl<F: FlushTarget> TableStore<F> {
             };
         drop(sidecar_sources);
 
-        // Step 5c: Build FTI sidecar files for any full-text indexes.
-        for (index_name, col_pos) in &self.fulltext_indexes {
+        // Step 5c: Build FTI sidecar files for the target catalog's full-text
+        // indexes, reading each column at the ordinal the frozen rows were
+        // written with (the frozen catalog's, when it declares the index).
+        for (index_name, target_pos) in &target_catalog.fulltext_indexes {
+            let col_pos = flush_catalog
+                .fulltext_indexes
+                .iter()
+                .find(|(name, _)| name == index_name)
+                .map_or(target_pos, |(_, frozen_pos)| frozen_pos);
             let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
             for partition in &partitions {
                 let pk_bytes = partition.key.key.as_bytes();
@@ -3666,8 +4114,18 @@ impl<F: FlushTarget> TableStore<F> {
         //   - If the persist call fails: ERROR log + panic in debug builds.
         //   - Never silently skip: a missing vector sidecar causes ANN queries
         //     to fall back to full scans without the caller knowing.
-        for cfg in &self.vector_index_configs {
-            if let Some(vi) = old_vector_indexes.get(&cfg.index_name) {
+        for cfg in &target_catalog.vector_index_configs {
+            // A vector index the rotating DDL added has no memtable index on
+            // the frozen memtable; build it from the frozen rows instead.
+            let built_from_rows;
+            let vi = match old_vector_indexes.get(&cfg.index_name) {
+                Some(vi) => Some(vi),
+                None => {
+                    built_from_rows = vector_index_from_rows(cfg, &partitions);
+                    Some(&built_from_rows)
+                }
+            };
+            if let Some(vi) = vi {
                 let drained_with_scopes = vi.drain_with_scopes();
                 if drained_with_scopes.is_empty() {
                     continue;
@@ -3678,7 +4136,7 @@ impl<F: FlushTarget> TableStore<F> {
                     .map(|(_, pos, vector)| (*pos, vector.clone()))
                     .collect();
 
-                match self.vector_index_method(&cfg.index_name) {
+                match target_catalog.vector_index_method(&cfg.index_name) {
                     VectorIndexMethod::Hnsw => {
                         // Build HNSW graph and serialize via the public API.
                         match ferrosa_index::vector::hnsw::build_and_serialize(
@@ -3885,11 +4343,12 @@ impl<F: FlushTarget> TableStore<F> {
         total_rows: usize,
         total_start: Instant,
         old_active: &Arc<dyn Memtable>,
+        schema: Arc<TableSchema>,
     ) -> Result<()> {
         let options = self.options.clone();
-        // Arc<TableSchema> (owned, Send+Sync) so the encode closures can share it
-        // across the rayon pool without borrowing a non-Sync arc_swap guard.
-        let schema = self.schema.load_full();
+        // `schema` is the one captured at the memtable swap (owned, Send+Sync),
+        // so the encode closures share it across the rayon pool and a
+        // concurrent ALTER cannot change the layout mid-flush.
         let shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
 
         // Stage directories before entering Rayon: the target need not be Sync.
@@ -6375,67 +6834,64 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(partitions)
     }
 
+    /// Run one index DDL: rotate the memtable onto the catalog `edit` derives
+    /// from the current one. See [`Self::flush_applying_catalog_edit`] for why
+    /// a rotation, and not an edit of the live memtable's indexes, is what
+    /// keeps index postings equal to the flushed sidecars without a lock.
+    ///
+    /// `edit` returns `false` to leave the catalog unchanged (an idempotent
+    /// re-declaration); the memtable still rotates, which is harmless.
+    /// Returns what the rotation's flush did (see
+    /// [`Self::flush_applying_catalog_edit`]).
+    fn rotate_catalog(&self, edit: impl FnOnce(&mut IndexCatalog) -> bool) -> Result<FlushOutcome> {
+        self.flush_applying_catalog_edit(|current| {
+            let mut next = current.clone();
+            edit(&mut next).then_some(next)
+        })
+    }
+
     /// Retrieve a named memtable-level secondary index.
     ///
-    /// Dynamically adds a secondary index. Existing live memtable rows are
-    /// backfilled before publication and future writes are indexed.
-    pub fn add_index(&mut self, index_name: String, column_position: usize, index_type: IndexType) {
-        self.add_index_with_predicate(index_name, column_position, index_type, None);
+    /// Dynamically adds a secondary index. Rows already written are flushed by
+    /// the memtable rotation that publishes it, and their sidecar for the new
+    /// index is built from those rows; future writes are indexed.
+    pub fn add_index(
+        &self,
+        index_name: String,
+        column_position: usize,
+        index_type: IndexType,
+    ) -> Result<FlushOutcome> {
+        self.add_index_with_predicate(index_name, column_position, index_type, None)
     }
 
     /// Dynamically adds a secondary index carrying an optional partial-index
-    /// [`FilterPredicate`]. Existing active/flushing memtable rows are streamed
-    /// into the new index before it is published, and future writes update it;
-    /// for a Filtered index the predicate gates both paths identically.
+    /// [`FilterPredicate`]. Rows already written are flushed by the rotation
+    /// that publishes the index, with a sidecar built from them under the same
+    /// predicate; future writes update it. Re-declaring an index with the same
+    /// definition changes nothing; a different definition replaces the old one
+    /// (the engine refuses that case before it gets here).
     pub fn add_index_with_predicate(
-        &mut self,
+        &self,
         index_name: String,
         column_position: usize,
         index_type: IndexType,
         filter_predicate: Option<FilterPredicate>,
-    ) {
-        self.indexed_columns
-            .push((index_name.clone(), column_position));
-        self.index_types.insert(index_name.clone(), index_type);
-        if let Some(ref pred) = filter_predicate {
-            self.index_filter_predicates
-                .insert(index_name.clone(), pred.clone());
-        }
-        let current = self.view.load();
-        let memtable_index = Arc::new(MemtableIndex::new());
-        let backfill = |memtable: &Arc<dyn Memtable>| {
-            for partition in memtable.range_iter(None, None) {
-                for row in partition.static_row.iter().chain(partition.rows.iter()) {
-                    insert_scalar_memtable_index_row(
-                        &memtable_index,
-                        &index_name,
-                        column_position,
-                        index_type,
-                        filter_predicate.as_ref(),
-                        partition.key.key.as_bytes(),
-                        row,
-                    );
-                }
+    ) -> Result<FlushOutcome> {
+        self.rotate_catalog(|catalog| {
+            let wanted = Some((0, column_position, index_type, filter_predicate.as_ref()));
+            if catalog.scalar_definition(&index_name) == wanted {
+                return false;
             }
-        };
-        backfill(&current.active);
-        if let Some(flushing) = current.flushing.as_ref() {
-            backfill(flushing);
-        }
-
-        let mut new_indexes = (*current.indexes).clone();
-        new_indexes.insert(index_name, memtable_index);
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::new(new_indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::clone(&current.vector_indexes),
-        };
-        new_view.check_invariants("update_indexes");
-        self.view.store(Arc::new(new_view));
+            catalog.remove(&index_name);
+            catalog
+                .indexed_columns
+                .push((index_name.clone(), column_position));
+            catalog.index_types.insert(index_name.clone(), index_type);
+            if let Some(pred) = filter_predicate {
+                catalog.index_filter_predicates.insert(index_name, pred);
+            }
+            true
+        })
     }
 
     /// Removes a declared secondary index from every live store layer.
@@ -6446,84 +6902,49 @@ impl<F: FlushTarget> TableStore<F> {
     /// sidecar state for the name, and vector-index metadata is unwired too.
     /// Persisted sidecar files/readers are left as inert orphan artifacts; the
     /// declaration metadata and read guards stop naming them immediately.
-    pub fn remove_index(&mut self, index_name: &str) -> bool {
-        let before_regular = self.indexed_columns.len();
-        self.indexed_columns.retain(|(name, _)| name != index_name);
-        let before_clustering = self.indexed_clustering_columns.len();
-        self.indexed_clustering_columns
-            .retain(|(name, _)| name != index_name);
-        let before_pk = self.indexed_partition_key_columns.len();
-        self.indexed_partition_key_columns
-            .retain(|(name, _)| name != index_name);
-        let mut removed = before_regular != self.indexed_columns.len()
-            || before_clustering != self.indexed_clustering_columns.len()
-            || before_pk != self.indexed_partition_key_columns.len();
-
-        removed |= self.index_types.remove(index_name).is_some();
-        removed |= self.index_filter_predicates.remove(index_name).is_some();
-        removed |= self.vector_index_methods.remove(index_name).is_some();
-        let before_vector_configs = self.vector_index_configs.len();
-        self.vector_index_configs
-            .retain(|cfg| cfg.index_name != index_name);
-        removed |= before_vector_configs != self.vector_index_configs.len();
+    /// Returns whether anything named `index_name` was declared, and what the
+    /// rotation's flush did.
+    pub fn remove_index(&self, index_name: &str) -> Result<(bool, FlushOutcome)> {
+        let mut removed = false;
+        let outcome = self.rotate_catalog(|catalog| {
+            removed = catalog.remove(index_name);
+            removed
+        })?;
         removed |= self.vector_index_scopes.lock().remove(index_name).is_some();
-
-        let current = self.view.load();
-        let mut new_indexes = (*current.indexes).clone();
-        removed |= new_indexes.remove(index_name).is_some();
-
-        let mut new_vector_indexes = (*current.vector_indexes).clone();
-        removed |= new_vector_indexes.remove(index_name).is_some();
-
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::new(new_indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::new(new_vector_indexes),
-        };
-        new_view.check_invariants("remove_index");
-        self.view.store(Arc::new(new_view));
-
-        removed
+        Ok((removed, outcome))
     }
 
     /// Dynamically adds a secondary index on a CLUSTERING column
     /// (t_430c4188). Future writes extract the indexed value from the row's
     /// composite clustering-key bytes at `clustering_component` — a
     /// clustering column's value is not a cell, so the cell-based
-    /// [`add_index`](Self::add_index) path cannot see it at all.
+    /// [`add_index`](Self::add_index) path cannot see it at all. Rows already
+    /// written are flushed by the rotation and indexed from their keys.
     pub fn add_clustering_index(
-        &mut self,
+        &self,
         index_name: String,
         clustering_component: usize,
         index_type: IndexType,
-    ) {
-        self.indexed_clustering_columns
-            .push((index_name.clone(), clustering_component));
-        self.index_types.insert(index_name.clone(), index_type);
-        let current = self.view.load();
-        let mut new_indexes = (*current.indexes).clone();
-        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::new(new_indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::clone(&current.vector_indexes),
-        };
-        new_view.check_invariants("update_indexes");
-        self.view.store(Arc::new(new_view));
+    ) -> Result<FlushOutcome> {
+        self.rotate_catalog(|catalog| {
+            if catalog.declares(&index_name) {
+                return false;
+            }
+            catalog
+                .indexed_clustering_columns
+                .push((index_name.clone(), clustering_component));
+            catalog.index_types.insert(index_name, index_type);
+            true
+        })
     }
 
     /// Clustering-column secondary index declarations:
     /// `(index_name, clustering_component)` pairs.
-    pub fn indexed_clustering_columns(&self) -> &[(String, usize)] {
-        &self.indexed_clustering_columns
+    pub fn indexed_clustering_columns(&self) -> CatalogSlice<(String, usize)> {
+        CatalogSlice {
+            catalog: self.catalog(),
+            project: |catalog| &catalog.indexed_clustering_columns,
+        }
     }
 
     /// Dynamically adds a secondary index on a PARTITION-KEY column.
@@ -6539,28 +6960,21 @@ impl<F: FlushTarget> TableStore<F> {
     /// built nothing, and every read through it returned no rows over a table
     /// full of data.
     pub fn add_partition_key_index(
-        &mut self,
+        &self,
         index_name: String,
         partition_key_component: usize,
         index_type: IndexType,
-    ) {
-        self.indexed_partition_key_columns
-            .push((index_name.clone(), partition_key_component));
-        self.index_types.insert(index_name.clone(), index_type);
-        let current = self.view.load();
-        let mut new_indexes = (*current.indexes).clone();
-        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::new(new_indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::clone(&current.vector_indexes),
-        };
-        new_view.check_invariants("add_partition_key_index");
-        self.view.store(Arc::new(new_view));
+    ) -> Result<FlushOutcome> {
+        self.rotate_catalog(|catalog| {
+            if catalog.declares(&index_name) {
+                return false;
+            }
+            catalog
+                .indexed_partition_key_columns
+                .push((index_name.clone(), partition_key_component));
+            catalog.index_types.insert(index_name, index_type);
+            true
+        })
     }
 
     /// Partition-key secondary index declarations:
@@ -6572,21 +6986,20 @@ impl<F: FlushTarget> TableStore<F> {
     /// rebuild needs, so it can refuse rather than build nothing and report
     /// success.
     pub fn partition_key_index_def(&self, index_name: &str) -> Option<(usize, IndexType)> {
-        let component = self
+        let catalog = self.catalog();
+        let component = catalog
             .indexed_partition_key_columns
             .iter()
             .find(|(n, _)| n == index_name)
             .map(|(_, c)| *c)?;
-        let index_type = self
-            .index_types
-            .get(index_name)
-            .copied()
-            .unwrap_or(IndexType::BTree);
-        Some((component, index_type))
+        Some((component, catalog.index_type_for(index_name)))
     }
 
-    pub fn indexed_partition_key_columns(&self) -> &[(String, usize)] {
-        &self.indexed_partition_key_columns
+    pub fn indexed_partition_key_columns(&self) -> CatalogSlice<(String, usize)> {
+        CatalogSlice {
+            catalog: self.catalog(),
+            project: |catalog| &catalog.indexed_partition_key_columns,
+        }
     }
 
     /// Number of partition-key columns in this table's schema — the component
@@ -6634,42 +7047,50 @@ impl<F: FlushTarget> TableStore<F> {
     /// Whether this table declares the secondary index `index_name`. A global
     /// read of an undeclared index is refused by [`Self::read_by_index_each`].
     pub fn secondary_index_declared(&self, index_name: &str) -> bool {
-        self.index_types.contains_key(index_name)
-            || self
+        let catalog = self.catalog();
+        catalog.index_types.contains_key(index_name)
+            || catalog
                 .indexed_columns
                 .iter()
                 .any(|(name, _)| name == index_name)
-            || self
+            || catalog
                 .indexed_clustering_columns
                 .iter()
                 .any(|(name, _)| name == index_name)
     }
 
-    /// Returns the current secondary index declarations.
-    pub fn indexed_columns(&self) -> &[(String, usize)] {
-        &self.indexed_columns
+    /// Returns the current secondary index declarations, as one snapshot.
+    pub fn indexed_columns(&self) -> CatalogSlice<(String, usize)> {
+        CatalogSlice {
+            catalog: self.catalog(),
+            project: |catalog| &catalog.indexed_columns,
+        }
     }
 
     /// The declared `IndexType` for a named secondary index, defaulting to
     /// `BTree` when unknown. Used by the eager / backfill / compaction index
     /// build paths so a job carries the index's real type.
     pub fn index_type_for(&self, index_name: &str) -> IndexType {
-        self.index_types
-            .get(index_name)
-            .copied()
-            .unwrap_or(IndexType::BTree)
+        self.catalog().index_type_for(index_name)
     }
 
     /// The partial-index [`FilterPredicate`] for a named index, if any. `Some`
     /// only for [`IndexType::Filtered`] indexes that were registered with a
-    /// predicate (and thus survives reload).
-    pub fn filter_predicate_for(&self, index_name: &str) -> Option<&FilterPredicate> {
-        self.index_filter_predicates.get(index_name)
+    /// predicate (and thus survives reload). Owned: the catalog it comes from
+    /// can be replaced by DDL at any time.
+    pub fn filter_predicate_for(&self, index_name: &str) -> Option<FilterPredicate> {
+        self.catalog()
+            .index_filter_predicates
+            .get(index_name)
+            .cloned()
     }
 
-    /// Returns the current full-text index declarations.
-    pub fn fulltext_indexes(&self) -> &[(String, usize)] {
-        &self.fulltext_indexes
+    /// Returns the current full-text index declarations, as one snapshot.
+    pub fn fulltext_indexes(&self) -> CatalogSlice<(String, usize)> {
+        CatalogSlice {
+            catalog: self.catalog(),
+            project: |catalog| &catalog.fulltext_indexes,
+        }
     }
 
     /// Search active/flushing memtables for a declared full-text index.
@@ -6694,7 +7115,8 @@ impl<F: FlushTarget> TableStore<F> {
         use ferrosa_index::fulltext::query::parse_fts_query;
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
 
-        let Some((_, col_pos)) = self
+        let catalog = self.catalog();
+        let Some((_, col_pos)) = catalog
             .fulltext_indexes
             .iter()
             .find(|(name, _)| name == index_name)
@@ -6804,7 +7226,8 @@ impl<F: FlushTarget> TableStore<F> {
         use ferrosa_index::fulltext::query::parse_fts_query;
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
 
-        let Some((_, col_pos)) = self
+        let catalog = self.catalog();
+        let Some((_, col_pos)) = catalog
             .fulltext_indexes
             .iter()
             .find(|(name, _)| name == index_name)
@@ -6917,7 +7340,8 @@ impl<F: FlushTarget> TableStore<F> {
         if !self.flush_target.persists_fti_sidecars() {
             return plan;
         }
-        let Some((_, column_position)) = self
+        let catalog = self.catalog();
+        let Some((_, column_position)) = catalog
             .fulltext_indexes
             .iter()
             .find(|(name, _)| name == index_name)
@@ -6973,6 +7397,7 @@ impl<F: FlushTarget> TableStore<F> {
             return plan;
         }
         plan.jobs = self
+            .catalog()
             .fulltext_indexes
             .iter()
             .map(|(index_name, column_position)| FulltextSidecarJob {
@@ -6995,29 +7420,43 @@ impl<F: FlushTarget> TableStore<F> {
         }
     }
 
-    /// Register a full-text index for this table.
-    pub fn add_fulltext_index(&mut self, index_name: String, column_position: usize) {
-        if !self.fulltext_indexes.iter().any(|(n, _)| n == &index_name) {
-            self.fulltext_indexes.push((index_name, column_position));
-        }
+    /// Register a full-text index for this table. Rows already written are
+    /// flushed by the memtable rotation that publishes it, with an FTI sidecar
+    /// built from them. Re-registering an existing name changes nothing.
+    pub fn add_fulltext_index(
+        &self,
+        index_name: String,
+        column_position: usize,
+    ) -> Result<FlushOutcome> {
+        self.rotate_catalog(|catalog| {
+            if catalog
+                .fulltext_indexes
+                .iter()
+                .any(|(n, _)| n == &index_name)
+            {
+                return false;
+            }
+            catalog.fulltext_indexes.push((index_name, column_position));
+            true
+        })
     }
 
     /// Register a vector index for this table.
     ///
-    /// Idempotent: calling twice with the same `index_name` is a no-op.
-    /// Updates both `vector_index_configs` and the live `StoreView` so that
-    /// subsequent writes begin populating the in-memory vector index
-    /// immediately.
-    pub fn add_vector_index(&mut self, config: VectorIndexConfig) {
-        self.add_vector_index_with_method(config, VectorIndexMethod::Hnsw);
+    /// Idempotent: calling twice with the same `index_name` changes nothing.
+    /// The memtable rotation that publishes it flushes the rows already
+    /// written, with a vector sidecar built from them, and every later write
+    /// populates the in-memory vector index.
+    pub fn add_vector_index(&self, config: VectorIndexConfig) -> Result<FlushOutcome> {
+        self.add_vector_index_with_method(config, VectorIndexMethod::Hnsw)
     }
 
     /// Register a quantized IVFFlat/C-SPANN vector index for this table.
     ///
     /// Keeps `add_vector_index` as the legacy HNSW path so existing callers and
     /// sidecar artifacts remain compatible.
-    pub fn add_quantized_vector_index(&mut self, config: VectorIndexConfig) {
-        self.add_vector_index_with_method(config, VectorIndexMethod::QuantizedIvf);
+    pub fn add_quantized_vector_index(&self, config: VectorIndexConfig) -> Result<FlushOutcome> {
+        self.add_vector_index_with_method(config, VectorIndexMethod::QuantizedIvf)
     }
 
     /// Report the artifact/search method registered for `index_name`.
@@ -7025,82 +7464,32 @@ impl<F: FlushTarget> TableStore<F> {
     /// Defaults to [`VectorIndexMethod::Hnsw`] when the index is unknown or was
     /// registered through the legacy path, matching `add_vector_index`.
     pub fn vector_index_method(&self, index_name: &str) -> VectorIndexMethod {
-        self.vector_index_methods
-            .get(index_name)
-            .copied()
-            .unwrap_or(VectorIndexMethod::Hnsw)
+        self.catalog().vector_index_method(index_name)
     }
 
     fn add_vector_index_with_method(
-        &mut self,
+        &self,
         config: VectorIndexConfig,
         method: VectorIndexMethod,
-    ) {
-        if self
-            .vector_index_configs
-            .iter()
-            .any(|c| c.index_name == config.index_name)
-        {
-            return; // already registered
-        }
-
-        // Build the index from every live memtable before publishing it. If an
-        // index is created after rows have already been written, publishing an
-        // empty index makes the planner select it and turns a correct brute-force
-        // ANN query into an empty result set. Include the flushing memtable too:
-        // it remains part of the read view until its SSTable and sidecars are
-        // installed.
-        let current = self.view.load();
-        let vector_index = Arc::new(VectorMemtableIndex::new(
-            config.metric,
-            config.m,
-            config.ef_construction,
-        ));
-        let backfill = |memtable: &Arc<dyn Memtable>| {
-            for partition in memtable.range_iter(None, None) {
-                for row in partition.static_row.iter().chain(partition.rows.iter()) {
-                    let Some(value) = row
-                        .cells
-                        .iter()
-                        .find(|(idx, _)| *idx as usize == config.column_position)
-                        .and_then(|(_, cell)| cell.value.as_ref())
-                    else {
-                        continue;
-                    };
-                    let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) else {
-                        continue;
-                    };
-                    let position =
-                        ferrosa_index::vector::RowPosition::new(vector_index.len() as u64);
-                    vector_index.insert_with_scope(
-                        position,
-                        vector,
-                        Some(partition.key.key.as_bytes().to_vec()),
-                    );
-                }
+    ) -> Result<FlushOutcome> {
+        // Publishing an empty index over existing rows would make the planner
+        // select it and turn a correct brute-force ANN query into an empty
+        // result. The rotation avoids that: the rows already written leave
+        // with the frozen memtable, whose flush builds their vector sidecar.
+        self.rotate_catalog(|catalog| {
+            if catalog
+                .vector_index_configs
+                .iter()
+                .any(|c| c.index_name == config.index_name)
+            {
+                return false; // already registered
             }
-        };
-        backfill(&current.active);
-        if let Some(flushing) = current.flushing.as_ref() {
-            backfill(flushing);
-        }
-
-        let mut new_vi = (*current.vector_indexes).clone();
-        new_vi.insert(config.index_name.clone(), vector_index);
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::clone(&current.indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::new(new_vi),
-        };
-        new_view.check_invariants("add_vector_index");
-        self.view.store(Arc::new(new_view));
-        self.vector_index_methods
-            .insert(config.index_name.clone(), method);
-        self.vector_index_configs.push(config);
+            catalog
+                .vector_index_methods
+                .insert(config.index_name.clone(), method);
+            catalog.vector_index_configs.push(config);
+            true
+        })
     }
 
     /// Perform an approximate nearest-neighbor search across memtable and
@@ -7619,18 +8008,17 @@ impl<F: FlushTarget> TableStore<F> {
     /// references drop. On-disk SSTable files remain until GC.
     pub fn truncate(&self) {
         let _guard = self.flush_guard.lock();
+        // Index DDL also holds `flush_guard`, so this catalog cannot change
+        // before the view below is published.
+        let catalog = self.catalog();
         let new_view = StoreView {
             active: new_memtable(),
             flushing: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
-            indexes: new_indexes(
-                &self.indexed_columns,
-                &self.indexed_clustering_columns,
-                &self.indexed_partition_key_columns,
-            ),
+            indexes: new_indexes(Arc::clone(&catalog)),
             sidecar_indexes: Arc::new(vec![]),
-            vector_indexes: new_vector_indexes(&self.vector_index_configs),
+            vector_indexes: new_vector_indexes(&catalog.vector_index_configs),
         };
         new_view.check_invariants("truncate");
         self.view.store(Arc::new(new_view));
@@ -8215,14 +8603,18 @@ mod tests {
     /// instead of a hardcoded `BTree`. Unknown indexes default to `BTree`.
     #[test]
     fn add_index_threads_declared_index_type() {
-        let mut store = test_store();
+        let store = test_store();
         assert_eq!(
             store.index_type_for("missing"),
             IndexType::BTree,
             "unknown index defaults to BTree"
         );
-        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
-        store.add_index("emb_idx".to_string(), 1, IndexType::Vector);
+        let _rotation: FlushOutcome = store
+            .add_index("name_idx".to_string(), 0, IndexType::Phonetic)
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_index("emb_idx".to_string(), 1, IndexType::Vector)
+            .unwrap();
         assert_eq!(store.index_type_for("name_idx"), IndexType::Phonetic);
         assert_eq!(
             store.index_type_for("emb_idx"),
@@ -8236,12 +8628,14 @@ mod tests {
     /// until those rows are flushed and rebuilt into a sidecar.
     #[test]
     fn add_index_backfills_existing_active_memtable_rows() {
-        let mut store = test_store();
+        let store = test_store();
         store
             .write(&make_key("before-index"), make_row(b"match", 1000))
             .unwrap();
 
-        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_index("val_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
         let rows = collect_index_results(&store, "val_idx", &IndexKey(b"match".to_vec())).unwrap();
         assert_eq!(rows.len(), 1, "pre-existing memtable row must be indexed");
@@ -8249,8 +8643,10 @@ mod tests {
 
     #[test]
     fn remove_index_unwires_future_index_reads() {
-        let mut store = test_store();
-        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        let store = test_store();
+        let _rotation: FlushOutcome = store
+            .add_index("val_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
         store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
 
         let before_drop =
@@ -8258,7 +8654,7 @@ mod tests {
         assert_eq!(before_drop.len(), 1);
 
         assert!(
-            store.remove_index("val_idx"),
+            store.remove_index("val_idx").unwrap().0,
             "declared index state should be removed"
         );
         assert!(store.indexed_columns().is_empty());
@@ -8272,7 +8668,7 @@ mod tests {
             "the refusal must name the index: {after_drop}"
         );
         assert!(
-            !store.remove_index("val_idx"),
+            !store.remove_index("val_idx").unwrap().0,
             "second removal is idempotent and reports no state removed"
         );
     }
@@ -8433,7 +8829,7 @@ mod tests {
 
     #[test]
     fn remove_index_unwires_flushed_sidecar_reads() {
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             test_schema(),
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -8453,29 +8849,33 @@ mod tests {
             "sanity check: flushed sidecar serves the declared index"
         );
 
-        assert!(store.remove_index("val_idx"));
+        assert!(store.remove_index("val_idx").unwrap().0);
         assert!(
             collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec())).is_err(),
             "dropped index must not consult stale sidecar readers, and must not \
              report its absence as zero rows"
         );
         assert!(
-            !store.remove_index("val_idx"),
+            !store.remove_index("val_idx").unwrap().0,
             "orphan sidecar readers must not make removal non-idempotent"
         );
     }
 
     #[test]
     fn remove_index_unwires_clustering_and_vector_metadata() {
-        let mut store = test_store();
-        store.add_clustering_index("ck_idx".to_string(), 0, IndexType::BTree);
-        store.add_quantized_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            m: 8,
-            ef_construction: 16,
-            metric: DistanceMetric::L2,
-        });
+        let store = test_store();
+        let _rotation: FlushOutcome = store
+            .add_clustering_index("ck_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_quantized_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                m: 8,
+                ef_construction: 16,
+                metric: DistanceMetric::L2,
+            })
+            .unwrap();
 
         assert_eq!(store.indexed_clustering_columns().len(), 1);
         assert_eq!(
@@ -8483,10 +8883,10 @@ mod tests {
             VectorIndexMethod::QuantizedIvf
         );
 
-        assert!(store.remove_index("ck_idx"));
+        assert!(store.remove_index("ck_idx").unwrap().0);
         assert!(store.indexed_clustering_columns().is_empty());
 
-        assert!(store.remove_index("vec_idx"));
+        assert!(store.remove_index("vec_idx").unwrap().0);
         assert_eq!(
             store.vector_index_method("vec_idx"),
             VectorIndexMethod::Hnsw,
@@ -10276,8 +10676,8 @@ mod tests {
 
     #[test]
     fn fulltext_sidecarless_scan_fails_loud_on_unopenable_sstable() {
-        let mut store = store_with_unopenable_sstable(&["a"], &["c"]);
-        store.add_fulltext_index("fts_idx".to_string(), 0);
+        let store = store_with_unopenable_sstable(&["a"], &["c"]);
+        let _rotation: FlushOutcome = store.add_fulltext_index("fts_idx".to_string(), 0).unwrap();
         let err = store
             .fulltext_sstable_scan_missing_sidecar(
                 "fts_idx",
@@ -10303,8 +10703,8 @@ mod tests {
 
     #[test]
     fn fulltext_scan_does_not_skip_quarantined_sstables() {
-        let mut store = store_with_unopenable_sstable(&["a"], &["c"]);
-        store.add_fulltext_index("fts_idx".to_string(), 0);
+        let store = store_with_unopenable_sstable(&["a"], &["c"]);
+        let _rotation: FlushOutcome = store.add_fulltext_index("fts_idx".to_string(), 0).unwrap();
         let covered = std::collections::HashSet::new();
         store
             .fulltext_sstable_scan_missing_sidecar("fts_idx", "x", &covered, None)
@@ -10402,8 +10802,10 @@ mod tests {
 
     #[test]
     fn index_read_with_quarantined_generation_fails_typed_not_empty() {
-        let mut store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
-        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let _rotation: FlushOutcome = store
+            .add_index("val_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
         quarantine_via_point_read(&store);
         let err = collect_index_results(&store, "val_idx", &IndexKey(b"missing".to_vec()))
             .expect_err("an index read over a table with a quarantined generation must not be Ok");
@@ -10420,8 +10822,10 @@ mod tests {
 
     #[test]
     fn reads_recover_once_the_quarantined_generation_leaves_the_view() {
-        let mut store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
-        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let _rotation: FlushOutcome = store
+            .add_index("val_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
         quarantine_via_point_read(&store);
         remove_generation_from_view(&store, "missing-gen");
         store
@@ -11624,7 +12028,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -11633,7 +12037,9 @@ mod tests {
             },
             vec![],
         );
-        store.add_index("loc_geo".to_string(), 0, IndexType::Geo);
+        let _rotation: FlushOutcome = store
+            .add_index("loc_geo".to_string(), 0, IndexType::Geo)
+            .unwrap();
         store
     }
 
@@ -11992,7 +12398,7 @@ mod tests {
             extensions: Default::default(),
         };
 
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -12001,7 +12407,9 @@ mod tests {
             },
             vec![("name_idx".to_string(), 0_usize)],
         );
-        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+        let _rotation: FlushOutcome = store
+            .add_index("name_idx".to_string(), 0, IndexType::Phonetic)
+            .unwrap();
 
         store
             .write(
@@ -12056,7 +12464,7 @@ mod tests {
             extensions: Default::default(),
         };
 
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             make_schema(&["name"]),
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -12065,11 +12473,15 @@ mod tests {
             },
             vec![("name_idx".to_string(), 0_usize)],
         );
-        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+        let _rotation: FlushOutcome = store
+            .add_index("name_idx".to_string(), 0, IndexType::Phonetic)
+            .unwrap();
 
         // ALTER TABLE ADD aaa_before — sorts before "name", shifting the
         // indexed column's ordinal from 0 to 1.
-        store.update_schema(make_schema(&["aaa_before", "name"]));
+        store
+            .update_schema(make_schema(&["aaa_before", "name"]))
+            .unwrap();
 
         store
             .write(
@@ -12117,7 +12529,7 @@ mod tests {
             extensions: Default::default(),
         };
 
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             make_schema(&["name"]),
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -12139,7 +12551,9 @@ mod tests {
         store.flush().unwrap();
 
         // Adding a lexically earlier column moves `name` from ordinal 0 to 1.
-        store.update_schema(make_schema(&["aaa_before", "name"]));
+        store
+            .update_schema(make_schema(&["aaa_before", "name"]))
+            .unwrap();
 
         let partition = store
             .read(&make_key("user1"))
@@ -12176,7 +12590,7 @@ mod tests {
             extensions: Default::default(),
         };
 
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -12185,7 +12599,9 @@ mod tests {
             },
             vec![("name_idx".to_string(), 0_usize)],
         );
-        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+        let _rotation: FlushOutcome = store
+            .add_index("name_idx".to_string(), 0, IndexType::Phonetic)
+            .unwrap();
 
         store
             .write(
@@ -12646,7 +13062,7 @@ mod tests {
     #[test]
     fn quantized_ann_dispatch_uses_qvec_artifact_without_legacy_sidecar() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -12654,13 +13070,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_quantized_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_quantized_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         store
             .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
@@ -12740,7 +13158,14 @@ mod tests {
             .collect();
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
         let error = store
-            .flush_sharded(partitions, 2, 4, Instant::now(), &new_memtable())
+            .flush_sharded(
+                partitions,
+                2,
+                4,
+                Instant::now(),
+                &new_memtable(),
+                store.schema.load_full(),
+            )
             .unwrap_err();
         assert!(
             error.to_string().contains("No space") || error.to_string().contains("ENOSPC"),
@@ -12791,7 +13216,14 @@ mod tests {
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
         // Call the actual shard path with two shards even on a one-core runner.
         store
-            .flush_sharded(partitions, 2, 20, Instant::now(), &new_memtable())
+            .flush_sharded(
+                partitions,
+                2,
+                20,
+                Instant::now(),
+                &new_memtable(),
+                store.schema.load_full(),
+            )
             .unwrap();
         assert_eq!(store.sstable_count(), 2);
         assert!(
@@ -12891,7 +13323,7 @@ mod tests {
     #[test]
     fn quantized_ann_search_merges_active_memtable_with_flushed_qvec_even_when_offsets_overlap() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -12899,13 +13331,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_quantized_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_quantized_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         store
             .write(
@@ -12947,7 +13381,7 @@ mod tests {
     fn vector_sidecar_roundtrip_ann_search_returns_ordered_results() {
         // Create a store with a vector index on column 0.
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -12955,13 +13389,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         // Write three vectors: k0 is closest to the query [1,0,0], k2 is farthest.
         //   k0 = [1.0, 0.0, 0.0]   distance 0.0
@@ -13028,7 +13464,7 @@ mod tests {
     #[test]
     fn ann_search_partitions_returns_nearest_rows_with_pk_in_score_order() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13036,13 +13472,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         // k0 is the exact match for the query, k1 close, k2 far.
         store
@@ -13079,7 +13517,7 @@ mod tests {
     fn vector_index_created_after_writes_backfills_live_rows() {
         for method in [VectorIndexMethod::Hnsw, VectorIndexMethod::QuantizedIvf] {
             let flush_target = InMemoryFlushTarget::new();
-            let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            let store: TableStore<InMemoryFlushTarget> = TableStore::new(
                 vector_schema(),
                 flush_target,
                 WriteOptions {
@@ -13102,7 +13540,8 @@ mod tests {
                 m: 8,
                 ef_construction: 50,
             };
-            store.add_vector_index_with_method(config, method);
+            let _rotation: FlushOutcome =
+                store.add_vector_index_with_method(config, method).unwrap();
 
             let partitions = store
                 .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
@@ -13119,7 +13558,7 @@ mod tests {
     #[test]
     fn ann_search_partitions_recovers_rows_after_flush() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13127,13 +13566,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         store
             .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
@@ -13157,7 +13598,7 @@ mod tests {
     #[test]
     fn ann_same_offset_results_from_different_sstable_generations_both_survive_merge() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13165,13 +13606,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         store
             .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
@@ -13200,7 +13643,7 @@ mod tests {
     #[test]
     fn partition_scoped_ann_search_excludes_other_prefixes() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13208,13 +13651,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         let scope_a = make_key("tenant-a|session-1");
         let scope_b = make_key("tenant-b|session-1");
@@ -13257,7 +13702,7 @@ mod tests {
     #[test]
     fn vector_prefix_scope_reads_smaller_scoped_sidecar_than_unscoped_search() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13265,13 +13710,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         let scope_a = make_key("tenant-a|session-1");
         let scope_b = make_key("tenant-b|session-1");
@@ -13315,7 +13762,7 @@ mod tests {
     #[test]
     fn sparse_vector_update_on_existing_row_becomes_visible_to_readback_and_ann() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             TableSchema {
                 keyspace: "agent_memory".to_string(),
                 table: "entity_store".to_string(),
@@ -13344,13 +13791,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "entity_embedding_ann".to_string(),
-            column_position: 1,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "entity_embedding_ann".to_string(),
+                column_position: 1,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         let key = make_key("tenant-session");
         let clustering = 7i32.to_be_bytes().to_vec();
@@ -14358,7 +14807,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -14368,7 +14817,9 @@ mod tests {
         );
 
         // Component 0 of the partition key is the tenant.
-        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
         // Two tenants, several sessions each: the rows land in different
         // partitions under the same tenant, which is the shape that matters.
@@ -14437,7 +14888,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -14445,7 +14896,9 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree)
+            .unwrap();
         store
     }
 
@@ -14612,7 +15065,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -14620,7 +15073,9 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
         let mut mine = 0usize;
         for i in 0..6 {
@@ -14714,7 +15169,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -14722,7 +15177,9 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
         // Comfortably past 2 * MIN_PARTITIONS_PER_FLUSH_SHARD (512).
         let rows = 1200usize;
@@ -14795,7 +15252,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -14805,17 +15262,17 @@ mod tests {
         );
 
         // One index of each family that exists today.
-        store.add_index("idx_regular".to_string(), 0, IndexType::BTree);
-        store.add_clustering_index("idx_clustering".to_string(), 0, IndexType::BTree);
-        store.add_partition_key_index("idx_partition_key".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_index("idx_regular".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_clustering_index("idx_clustering".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_partition_key".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
-        let declared: Vec<String> = store
-            .indexed_columns
-            .iter()
-            .chain(store.indexed_clustering_columns.iter())
-            .chain(store.indexed_partition_key_columns.iter())
-            .map(|(name, _)| name.clone())
-            .collect();
+        let declared: Vec<String> = store.catalog().scalar_index_names().cloned().collect();
         assert_eq!(
             declared.len(),
             3,
