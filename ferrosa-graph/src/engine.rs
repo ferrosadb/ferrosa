@@ -26,7 +26,9 @@ use ferrosa_storage::StorageEngine;
 use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::observer::AdjacencyIndexObserver;
-use crate::adjacency::reconcile::{reconcile_once, record_heal, spawn_reconciliation};
+use crate::adjacency::reconcile::{
+    reconcile_once_with, record_heal, spawn_reconciliation, ReconcileMode,
+};
 use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, is_aggregate_function};
@@ -610,6 +612,13 @@ impl GraphEngine {
         self.ensure_adjacency_storage_for_keyspace(keyspace).await
     }
 
+    /// Test-visible alias for the first-use heal gate, so a test can run the
+    /// heal on a cluster write path without the rest of a query's pipeline.
+    #[doc(hidden)]
+    pub async fn ensure_adjacency_ready_for_test(&self, keyspace: &str) -> Result<()> {
+        self.ensure_adjacency_ready(keyspace).await
+    }
+
     async fn ensure_adjacency_storage_for_keyspace(&self, keyspace: &str) -> Result<bool> {
         let snap = self.schema.snapshot();
         let has_edge_table = snap.tables.iter().any(|((ks, _), meta)| {
@@ -766,12 +775,15 @@ impl GraphEngine {
         created.expect("rcu runs its closure at least once")
     }
 
-    /// One complete reconcile of `keyspace` before it serves traversals.
+    /// One complete reconcile of `keyspace` before it serves traversals, in
+    /// [`ReconcileMode::Rewrite`]: every entry is written to every replica,
+    /// because another replica's damage is invisible to this node's reads.
     async fn heal_adjacency(&self, keyspace: &str) -> Result<()> {
         self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
         let started = std::time::Instant::now();
         let wp = self.write_path.load_full();
-        let metrics = reconcile_once(&self.schema, &wp, keyspace).await;
+        let metrics =
+            reconcile_once_with(&self.schema, &wp, keyspace, ReconcileMode::Rewrite).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         record_heal(metrics.is_complete());
         if !metrics.is_complete() {
@@ -797,6 +809,7 @@ impl GraphEngine {
                 entries_checked = metrics.entries_checked,
                 entries_repaired = metrics.entries_repaired,
                 entries_removed = metrics.orphans_removed,
+                entries_rewritten = metrics.entries_rewritten,
                 elapsed_ms,
                 "graph engine: adjacency heal repaired the index before serving traversals"
             );
@@ -804,8 +817,10 @@ impl GraphEngine {
             tracing::info!(
                 keyspace,
                 entries_checked = metrics.entries_checked,
+                entries_rewritten = metrics.entries_rewritten,
                 elapsed_ms,
-                "graph engine: adjacency index consistent; serving traversals"
+                "graph engine: adjacency index consistent here; rewrote it to every replica; \
+                 serving traversals"
             );
         }
         Ok(())

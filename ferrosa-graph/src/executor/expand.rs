@@ -58,7 +58,7 @@ struct MatchedTableRow {
     json: serde_json::Value,
 }
 
-fn graph_replication_strategy(
+pub(crate) fn graph_replication_strategy(
     schema: Option<&Schema>,
     keyspace: &str,
 ) -> Result<ReplicationStrategy> {

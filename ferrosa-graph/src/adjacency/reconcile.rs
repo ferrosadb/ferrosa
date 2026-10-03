@@ -33,6 +33,10 @@ pub struct ReconcileMetrics {
     /// an edge that is deleted (the pre-fix observer derived LIVE entries from
     /// an edge tombstone).
     pub orphans_removed: usize,
+    /// Entries already right where this node read them, written again anyway
+    /// ([`ReconcileMode::Rewrite`] only): another replica may still hold them
+    /// wrong.
+    pub entries_rewritten: usize,
     /// Reads, scans and writes that failed. A pass with errors is INCOMPLETE:
     /// the index may still be missing entries, so a caller that gates queries
     /// on the pass must not treat it as healed.
@@ -46,12 +50,28 @@ impl ReconcileMetrics {
     }
 }
 
+/// What a pass writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileMode {
+    /// Write only the entries this node reads as wrong. The periodic
+    /// background pass, which runs on local storage (`WritePath::direct`).
+    Repair,
+    /// Write EVERY entry the edges imply, to every replica: the first-use
+    /// heal. A replica's row tombstone is invisible to a read coordinated
+    /// elsewhere (replica reads do not ship row tombstones), and each node's
+    /// pre-fix background pass damaged its own copy at its own time, so an
+    /// entry this node reads as live can still be tombstoned on another
+    /// replica. Only rewriting it repairs that copy.
+    Rewrite,
+}
+
 /// Process-wide reconcile counters for `/metrics`. The repair counters are the
 /// observable side of the deploy heal: a node starting on a build after
 /// 330a0c29 over an index the pre-fix reconcile damaged reports the entries
 /// it wrote back here (and in a WARN line).
 static ENTRIES_REPAIRED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ENTRIES_REMOVED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static ENTRIES_REWRITTEN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PASSES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static HEALS_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +81,7 @@ fn record_pass(metrics: &ReconcileMetrics) {
     PASSES_TOTAL.fetch_add(1, Ordering::Relaxed);
     ENTRIES_REPAIRED_TOTAL.fetch_add(metrics.entries_repaired as u64, Ordering::Relaxed);
     ENTRIES_REMOVED_TOTAL.fetch_add(metrics.orphans_removed as u64, Ordering::Relaxed);
+    ENTRIES_REWRITTEN_TOTAL.fetch_add(metrics.entries_rewritten as u64, Ordering::Relaxed);
     ERRORS_TOTAL.fetch_add(metrics.errors as u64, Ordering::Relaxed);
 }
 
@@ -88,6 +109,11 @@ pub fn render_prometheus(out: &mut String) {
             "ferrosa_graph_adjacency_entries_removed_total",
             "Live adjacency entries of deleted or missing edges tombstoned by reconcile.",
             &ENTRIES_REMOVED_TOTAL,
+        ),
+        (
+            "ferrosa_graph_adjacency_entries_rewritten_total",
+            "Adjacency entries the first-use heal rewrote although this node read them as right.",
+            &ENTRIES_REWRITTEN_TOTAL,
         ),
         (
             "ferrosa_graph_adjacency_reconcile_errors_total",
@@ -152,12 +178,25 @@ fn edge_keyed_by_source_and_target(meta: &ferrosa_schema::metadata::table::Table
         && &meta.clustering_key[0].0 == target
 }
 
-/// Run one reconciliation pass for a keyspace.
+/// Run one reconciliation pass for a keyspace ([`ReconcileMode::Repair`]).
 pub async fn reconcile_once(
     schema: &Schema,
     write_path: &WritePath,
     keyspace: &str,
 ) -> ReconcileMetrics {
+    reconcile_once_with(schema, write_path, keyspace, ReconcileMode::Repair).await
+}
+
+/// Run one reconciliation pass for a keyspace in `mode`.
+pub async fn reconcile_once_with(
+    schema: &Schema,
+    write_path: &WritePath,
+    keyspace: &str,
+    mode: ReconcileMode,
+) -> ReconcileMetrics {
+    // Every repair this pass writes is stamped at or after this instant (see
+    // `entry_repair`).
+    let pass_started_at = now_micros();
     let snap = schema.snapshot();
     let mut metrics = ReconcileMetrics::default();
 
@@ -172,7 +211,35 @@ pub async fn reconcile_once(
         .collect();
 
     let adj_ks = adjacency_keyspace_name(keyspace);
-    let adj_table_id = TableId::new(&adj_ks, "adjacency");
+    // Scans run at CL ONE under each keyspace's own replication: when that
+    // replication spans the ring (the memory cluster's RF 3 on 3 nodes) the
+    // local replica holds everything and the scan stays local.
+    let strategies = crate::executor::expand::graph_replication_strategy(Some(schema), &adj_ks)
+        .and_then(|adj| {
+            crate::executor::expand::graph_replication_strategy(Some(schema), keyspace)
+                .map(|edges| (adj, edges))
+        });
+    let (index, edge_strategy) = match strategies {
+        Ok((strategy, edge_strategy)) => (
+            AdjacencyIndex {
+                table_id: TableId::new(&adj_ks, "adjacency"),
+                strategy,
+            },
+            edge_strategy,
+        ),
+        Err(e) => {
+            metrics.errors += 1;
+            tracing::warn!(
+                keyspace = %adj_ks,
+                error = %e,
+                "adjacency reconcile: cannot resolve the adjacency keyspace's replication; \
+                 skipping this pass"
+            );
+            record_pass(&metrics);
+            return metrics;
+        }
+    };
+    let adj_table_id = index.table_id.clone();
     let point_checkable_edge_tables: std::collections::HashSet<String> = edge_tables
         .iter()
         .filter(|(_, meta)| edge_keyed_by_source_and_target(meta))
@@ -196,7 +263,10 @@ pub async fn reconcile_once(
         // the yielding bought latency without bounding memory: a background
         // safety-net scan could hold a tenant-sized table resident and OOM the
         // node. Nothing here needs more than the partition in hand.
-        let mut partitions = match write_path.range_read_stream_all(edge_tid, 0).await {
+        let mut partitions = match write_path
+            .range_read_stream_all_with(edge_tid, 0, SCAN_CONSISTENCY, &edge_strategy)
+            .await
+        {
             Ok(stream) => stream,
             Err(e) => {
                 // Best-effort by design (this is a periodic safety net, not a
@@ -236,9 +306,13 @@ pub async fn reconcile_once(
             for (_, entry) in expected {
                 reconcile_entry(
                     write_path,
-                    &adj_table_id,
+                    &index,
                     &edge_table_fqn,
                     entry,
+                    Pass {
+                        started_at: pass_started_at,
+                        mode,
+                    },
                     &mut metrics,
                 )
                 .await;
@@ -267,7 +341,10 @@ pub async fn reconcile_once(
     // `unwrap_or_default()` also swallowed the scan error whole — an
     // unreachable adjacency table looked exactly like an empty one, i.e. like
     // "no orphans to remove".
-    let adj_partitions = match write_path.range_read_stream_all(&adj_table_id, 0).await {
+    let adj_partitions = match write_path
+        .range_read_stream_all_with(&adj_table_id, 0, SCAN_CONSISTENCY, &index.strategy)
+        .await
+    {
         Ok(stream) => Some(stream),
         Err(e) => {
             metrics.errors += 1;
@@ -384,7 +461,7 @@ pub async fn reconcile_once(
                     // Write a tombstone to remove this orphan adjacency entry.
                     match write_tombstone(
                         write_path,
-                        &adj_table_id,
+                        &index,
                         &partition.key,
                         &row.clustering,
                         &edge_label,
@@ -522,15 +599,47 @@ enum EntryState {
     Deleted(i64),
 }
 
+/// The adjacency table and how reconcile reaches it.
+///
+/// Reads and writes go to EVERY replica of the adjacency keyspace (its own
+/// replication strategy, at `ALL`). Each replica can hold its own damage —
+/// the pre-fix background reconcile tombstoned every node's local copy — and a
+/// node answers `CL ONE` traversals from its local copy. Reading at `ALL`
+/// sees the newest tombstone on any replica, so the repair outranks it
+/// everywhere; writing at `ALL` puts the repair on every replica, or fails
+/// (and the pass is incomplete) when one is down. `Direct` mode (single node,
+/// and the background loop's `WritePath::direct`) ignores both and uses local
+/// storage.
+struct AdjacencyIndex {
+    table_id: TableId,
+    strategy: ferrosa_cluster::ring::strategy::ReplicationStrategy,
+}
+
+const INDEX_CONSISTENCY: ferrosa_cluster::consistency::ConsistencyLevel =
+    ferrosa_cluster::consistency::ConsistencyLevel::All;
+
+/// Consistency of the full-table scans (edge tables, and the adjacency table
+/// in the orphan phase).
+const SCAN_CONSISTENCY: ferrosa_cluster::consistency::ConsistencyLevel =
+    ferrosa_cluster::consistency::ConsistencyLevel::One;
+
 /// Read one entry's state. `Err` is a failed read: the caller counts it and
 /// leaves the entry alone (the pass is then incomplete).
 async fn read_entry_state(
     write_path: &WritePath,
-    adj_table_id: &TableId,
+    index: &AdjacencyIndex,
     vertex_key: &DecoratedKey,
     clustering: &[u8],
 ) -> ferrosa_common::Result<EntryState> {
-    let Some(partition) = write_path.read(adj_table_id, vertex_key).await? else {
+    let Some(partition) = write_path
+        .pk_read(
+            &index.table_id,
+            vertex_key,
+            INDEX_CONSISTENCY,
+            &index.strategy,
+        )
+        .await?
+    else {
         return Ok(EntryState::Absent);
     };
     let Some(row) = partition
@@ -551,27 +660,37 @@ async fn read_entry_state(
 
 /// The write that brings one entry in line with the edges behind it, if any.
 ///
-/// Timestamps are chosen so a concurrent client write still wins:
-/// - an entry of a live edge is written at the edge's own write time, or one
-///   microsecond past a tombstone that shadows it (the pre-fix reconcile's,
-///   or a deleted sibling's) — never at "now", which would outrank a delete
-///   of the edge that lands while the pass runs;
-/// - a live entry of a deleted edge is tombstoned at the later of the edge's
-///   deletion and the entry's own write, so a re-create that lands while the
-///   pass runs (written after the pass read the entry) still wins.
+/// Repairs are timestamped at the PASS START (`pass_started_at`), or later
+/// when the data itself is newer:
+/// - Past every stale write. The pre-fix reconcile's tombstones, and the live
+///   entries it re-created for deleted edges, all predate the pass, on EVERY
+///   replica — including replicas whose newer tombstones a read here cannot
+///   see (replica reads do not ship row tombstones), so a timestamp derived
+///   from the local tombstone would lose to them.
+/// - Before every concurrent client write. A delete or re-create issued
+///   while the pass runs is stamped after the pass started, so it still
+///   wins. A tombstone that is itself newer than the pass start is such a
+///   concurrent delete: the entry is left for the next pass.
+///
+/// In [`ReconcileMode::Rewrite`] an entry this node reads as right is written
+/// anyway (outcome `Rewritten`); only the concurrent-write skips apply.
 fn entry_repair(
     entry: &ExpectedEntry,
     state: &EntryState,
-) -> Option<(ferrosa_sstable::types::Row, i64, bool)> {
+    pass: Pass,
+) -> Option<(ferrosa_sstable::types::Row, i64, Outcome)> {
     use ferrosa_common::cell::CellValue;
     use ferrosa_sstable::types::{LivenessInfo, Row};
 
+    let rewrite = pass.mode == ReconcileMode::Rewrite;
     if let Some(live_at) = entry.live_at {
-        let at = match *state {
-            EntryState::Live(_) => return None,
-            EntryState::Absent => live_at,
-            EntryState::Deleted(deleted_at) => live_at.max(deleted_at.saturating_add(1)),
+        let outcome = match *state {
+            EntryState::Deleted(deleted_at) if deleted_at >= pass.started_at => return None,
+            EntryState::Live(_) if !rewrite => return None,
+            EntryState::Live(_) => Outcome::Rewritten,
+            EntryState::Absent | EntryState::Deleted(_) => Outcome::Repaired,
         };
+        let at = live_at.max(pass.started_at);
         let cells = entry
             .edge_table_cell
             .clone()
@@ -583,62 +702,84 @@ fn entry_repair(
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(at),
         };
-        return Some((row, at, true));
+        return Some((row, at, outcome));
     }
-    let (EntryState::Live(written_at), Some(deleted_at)) = (state, entry.deleted_at) else {
-        return None;
+    let deleted_at = entry.deleted_at?;
+    let outcome = match *state {
+        // Re-created while the pass ran: leave it for the next pass.
+        EntryState::Live(written_at) if written_at >= pass.started_at => return None,
+        EntryState::Live(_) => Outcome::Removed,
+        EntryState::Absent | EntryState::Deleted(_) if rewrite => Outcome::Rewritten,
+        EntryState::Absent | EntryState::Deleted(_) => return None,
     };
-    let at = deleted_at.max(*written_at);
+    let at = deleted_at.max(pass.started_at);
     let row = Row {
         clustering: entry.clustering.clone(),
         cells: vec![],
         deletion: DeletionTime::new(at, (at / 1_000_000).clamp(0, i64::from(u32::MAX)) as u32),
         primary_key_liveness: LivenessInfo::NONE,
     };
-    Some((row, at, false))
+    Some((row, at, outcome))
+}
+
+/// The pass an entry is reconciled in.
+#[derive(Debug, Clone, Copy)]
+struct Pass {
+    /// Every write is stamped at or after this (see `entry_repair`).
+    started_at: i64,
+    mode: ReconcileMode,
+}
+
+/// What a write did to an entry, as this node read it.
+#[derive(Debug, Clone, Copy)]
+enum Outcome {
+    /// A live edge's entry was missing or tombstoned.
+    Repaired,
+    /// A deleted edge's entry was live.
+    Removed,
+    /// Already right here; rewritten for other replicas.
+    Rewritten,
 }
 
 /// Check one expected entry against the index and repair it.
 async fn reconcile_entry(
     write_path: &WritePath,
-    adj_table_id: &TableId,
+    index: &AdjacencyIndex,
     edge_table_fqn: &str,
     entry: ExpectedEntry,
+    pass: Pass,
     metrics: &mut ReconcileMetrics,
 ) {
-    let state = match read_entry_state(
-        write_path,
-        adj_table_id,
-        &entry.vertex_key,
-        &entry.clustering,
-    )
-    .await
-    {
-        Ok(state) => state,
-        Err(e) => {
-            metrics.errors += 1;
-            tracing::warn!(
-                table = %edge_table_fqn,
-                error = %e,
-                "adjacency reconcile: could not read an adjacency partition; \
-                 skipping its repair for this pass"
-            );
-            return;
-        }
-    };
-    let Some((row, at, live)) = entry_repair(&entry, &state) else {
+    let state =
+        match read_entry_state(write_path, index, &entry.vertex_key, &entry.clustering).await {
+            Ok(state) => state,
+            Err(e) => {
+                metrics.errors += 1;
+                tracing::warn!(
+                    table = %edge_table_fqn,
+                    error = %e,
+                    "adjacency reconcile: could not read an adjacency partition; \
+                     skipping its repair for this pass"
+                );
+                return;
+            }
+        };
+    let Some((row, at, outcome)) = entry_repair(&entry, &state, pass) else {
         return;
     };
     let repair = Mutation::new(
-        adj_table_id.keyspace.clone(),
-        adj_table_id.table.clone(),
+        index.table_id.keyspace.clone(),
+        index.table_id.table.clone(),
         entry.vertex_key,
         vec![row],
         at,
     );
-    match write_mutation(write_path, repair).await {
-        Ok(()) if live => metrics.entries_repaired += 1,
-        Ok(()) => metrics.orphans_removed += 1,
+    match write_mutation(write_path, index, repair).await {
+        Ok(()) => match outcome {
+            Outcome::Repaired => metrics.entries_repaired += 1,
+            Outcome::Removed => metrics.orphans_removed += 1,
+            Outcome::Rewritten => metrics.entries_rewritten += 1,
+        },
         Err(e) => {
             metrics.errors += 1;
             tracing::warn!(
@@ -682,7 +823,11 @@ fn extract_edge_label(clustering: &[u8]) -> Option<String> {
 /// `row.clone()` per row). The mutation is owned by the caller and dropped right
 /// after, so consuming it removes one heap clone per repaired row on the
 /// reconcile hot path with no change to which rows are written or their order.
-async fn write_mutation(write_path: &WritePath, mutation: Mutation) -> ferrosa_common::Result<()> {
+async fn write_mutation(
+    write_path: &WritePath,
+    index: &AdjacencyIndex,
+    mutation: Mutation,
+) -> ferrosa_common::Result<()> {
     let table_id = TableId::new(&mutation.keyspace, &mutation.table);
     for row in mutation.rows {
         write_path
@@ -691,10 +836,8 @@ async fn write_mutation(write_path: &WritePath, mutation: Mutation) -> ferrosa_c
                 &mutation.key,
                 row,
                 mutation.timestamp,
-                ferrosa_cluster::consistency::ConsistencyLevel::One,
-                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                    replication_factor: 1,
-                },
+                INDEX_CONSISTENCY,
+                &index.strategy,
             )
             .await?;
     }
@@ -704,7 +847,7 @@ async fn write_mutation(write_path: &WritePath, mutation: Mutation) -> ferrosa_c
 /// Write a tombstone row for an orphan adjacency entry.
 async fn write_tombstone(
     write_path: &WritePath,
-    adj_table_id: &TableId,
+    index: &AdjacencyIndex,
     vertex_key: &DecoratedKey,
     clustering: &[u8],
     _edge_label: &str,
@@ -723,14 +866,12 @@ async fn write_tombstone(
 
     write_path
         .write(
-            adj_table_id,
+            &index.table_id,
             vertex_key,
             tombstone_row,
             now_us,
-            ferrosa_cluster::consistency::ConsistencyLevel::One,
-            &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
-                replication_factor: 1,
-            },
+            INDEX_CONSISTENCY,
+            &index.strategy,
         )
         .await
 }

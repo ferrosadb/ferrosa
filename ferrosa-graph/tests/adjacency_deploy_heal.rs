@@ -56,7 +56,9 @@ fn storage_config(dir: &TempDir) -> StorageEngineConfig {
         commit_log: CommitLogConfig {
             segment_size: 4 * 1024 * 1024,
             max_segment_age: std::time::Duration::from_secs(60),
-            sync_strategy: SyncStrategyConfig::Batch,
+            // The production default (periodic fsync), so timings match a
+            // node's, not a per-write-fsync configuration's.
+            sync_strategy: SyncStrategyConfig::default(),
             batch: Default::default(),
             log_dir: dir.path().join("commitlog"),
             checkpoint_dir: dir.path().join("commitlog"),
@@ -138,7 +140,7 @@ fn table(
 /// agent_memory's `entity_store` and `typed_edges`, keyed as
 /// ferrosa-memory's `ddl/017_typed_edges.cql` keys them, with the graph
 /// extensions its `ALTER TABLE` sets.
-fn create_agent_memory_schema(schema: &Schema) {
+fn create_agent_memory_schema(schema: &Schema, replication_factor: usize) {
     use ColumnKind::{Clustering, PartitionKey as Pk, Regular};
     schema
         .create_keyspace_internal(KeyspaceMetadata {
@@ -146,7 +148,10 @@ fn create_agent_memory_schema(schema: &Schema) {
             durable_writes: true,
             replication: ReplicationParams {
                 strategy: "SimpleStrategy".to_string(),
-                options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+                options: HashMap::from([(
+                    "replication_factor".to_string(),
+                    replication_factor.to_string(),
+                )]),
             },
         })
         .unwrap();
@@ -215,6 +220,10 @@ struct Node {
 
 impl Node {
     fn new() -> Self {
+        Self::with_replication_factor(1)
+    }
+
+    fn with_replication_factor(replication_factor: usize) -> Self {
         let dir = TempDir::new().unwrap();
         let storage = Arc::new(StorageEngine::new(storage_config(&dir), None).unwrap());
         let schema = Arc::new(
@@ -229,7 +238,7 @@ impl Node {
             })
             .unwrap(),
         );
-        create_agent_memory_schema(&schema);
+        create_agent_memory_schema(&schema, replication_factor);
         register_storage_tables(&storage);
         Self {
             schema,
@@ -829,15 +838,20 @@ mod old_build {
     }
 }
 
-/// How many OUT/IN adjacency entries of `edges` are live in storage.
+/// How many OUT/IN adjacency entries of `edges` are live in `node`'s storage.
 fn live_entries_of(node: &Node, edges: &BTreeSet<Edge>) -> usize {
+    live_entries_in(&node.storage, edges)
+}
+
+/// How many OUT/IN adjacency entries of `edges` are live in `storage`.
+fn live_entries_in(storage: &StorageEngine, edges: &BTreeSet<Edge>) -> usize {
     let adj = TableId::new(ADJACENCY_KEYSPACE, "adjacency");
     let mut live = 0;
     for e in edges {
         for (vertex, direction, neighbor) in [(e.src, 0u8, e.dst), (e.dst, 1u8, e.src)] {
             let key = DecoratedKey::new(PartitionKey::new(vertex.as_bytes().to_vec()));
             let clustering = adjacency_clustering(direction, "TYPED_EDGE", neighbor.as_bytes());
-            let partition = node.storage.read(&adj, &key).unwrap();
+            let partition = storage.read(&adj, &key).unwrap();
             live += partition.map_or(0, |p| {
                 p.rows
                     .iter()
@@ -865,7 +879,15 @@ async fn damaged_node(
     sessions: usize,
     per_session: usize,
 ) -> (Node, Vec<Edge>, BTreeSet<Edge>) {
-    let node = Node::new();
+    damage(Node::new(), tenants, sessions, per_session).await
+}
+
+async fn damage(
+    node: Node,
+    tenants: usize,
+    sessions: usize,
+    per_session: usize,
+) -> (Node, Vec<Edge>, BTreeSet<Edge>) {
     let all = generate_edges(tenants, sessions, per_session);
     let (before, after): (Vec<_>, Vec<_>) = all.iter().enumerate().partition(|(i, _)| i % 10 != 9);
     let mut live: BTreeSet<Edge> = BTreeSet::new();
@@ -1038,6 +1060,176 @@ async fn deleting_one_edge_type_keeps_its_sibling_traversable() {
     );
 }
 
+/// Cluster mode, replication factor 2: the heal on one node repairs EVERY
+/// replica, not only the token's primary.
+///
+/// The live memory cluster is RF 3 on 3 nodes: every node is a replica and
+/// answers `CL ONE` traversals from its own copy, and each node's pre-fix
+/// background reconcile tombstoned its own copy. The remote replica here was
+/// damaged later than the local one (its tombstones are newer), so a repair
+/// timestamped past only the LOCAL tombstone would lose to it.
+mod cluster {
+    use super::*;
+    use ferrosa_cluster::consistency::ConsistencyLevel;
+    use ferrosa_cluster::coordinator::{ClusterCoordinator, MutationForwardHandler};
+    use ferrosa_cluster::raft::handlers::ReadRequestHandler;
+    use ferrosa_cluster::raft::{NodeInfo, NodeState};
+    use ferrosa_cluster::ring::TokenRing;
+    use ferrosa_net::codec::MsgType;
+    use ferrosa_net::config::NetConfig;
+    use ferrosa_net::peer::{PeerEventListener, PeerManager};
+    use ferrosa_net::rpc::handler::PeerId;
+    use ferrosa_net::rpc::server::RpcServer;
+    use ferrosa_net::rpc::HandlerRegistry;
+
+    #[derive(Debug)]
+    struct NoopPeers;
+
+    impl PeerEventListener for NoopPeers {
+        fn on_peer_connected(&self, _peer: PeerId) {}
+        fn on_peer_disconnected(&self, _peer: PeerId) {}
+        fn on_peer_suspected(&self, _peer: PeerId) {}
+        fn on_peer_recovered(&self, _peer_id: Uuid) {}
+        fn on_peer_failed(&self, _peer_id: Uuid) {}
+    }
+
+    fn node_info(addr: &str, host_id: Uuid) -> NodeInfo {
+        NodeInfo {
+            host_id,
+            addr: addr.to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        }
+    }
+
+    /// A remote replica: its own storage, served by the production write and
+    /// read handlers.
+    async fn start_replica(storage: Arc<StorageEngine>) -> (Arc<RpcServer>, String, Uuid) {
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(
+            MsgType::MutationForward,
+            Arc::new(MutationForwardHandler::new(Arc::clone(&storage))),
+        );
+        // As `controller::cluster` registers it in production.
+        let read_handler = Arc::new(ReadRequestHandler::new(Arc::clone(&storage)));
+        registry.register(MsgType::ReadRequest, read_handler.clone());
+        registry.register(MsgType::PartitionSuffixReadRequest, read_handler);
+        let host_id = Uuid::new_v4();
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server = Arc::new(RpcServer::new(config, host_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+        (server, addr.to_string(), host_id)
+    }
+
+    /// Tombstone `edges`' OUT and IN entries in `storage`, as a node's own
+    /// pre-fix background pass did to its local copy.
+    fn tombstone_entries(storage: &StorageEngine, edges: &BTreeSet<Edge>, ts: i64) {
+        let adj = TableId::new(ADJACENCY_KEYSPACE, "adjacency");
+        for e in edges {
+            for (vertex, direction, neighbor) in [(e.src, 0u8, e.dst), (e.dst, 1u8, e.src)] {
+                storage
+                    .write(
+                        &adj,
+                        &DecoratedKey::new(PartitionKey::new(vertex.as_bytes().to_vec())),
+                        Row {
+                            clustering: adjacency_clustering(
+                                direction,
+                                "TYPED_EDGE",
+                                neighbor.as_bytes(),
+                            ),
+                            cells: vec![],
+                            deletion: DeletionTime::new(ts, (ts / 1_000_000) as u32),
+                            primary_key_liveness: LivenessInfo::NONE,
+                        },
+                        ts,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heal_repairs_every_replica_past_its_newest_tombstone() {
+        let (node, all, live) = damage(Node::with_replication_factor(2), 1, 1, 24).await;
+        let reference = Reference::new(&all, &live);
+
+        let remote_dir = TempDir::new().unwrap();
+        let remote = Arc::new(StorageEngine::new(storage_config(&remote_dir), None).unwrap());
+        register_storage_tables(&remote);
+        remote
+            .register_table(
+                ferrosa_graph::adjacency::adjacency_table_metadata(KEYSPACE).to_storage_schema(),
+            )
+            .unwrap();
+        tombstone_entries(&remote, &live, now_micros());
+        let (server, remote_addr, remote_host) = start_replica(Arc::clone(&remote)).await;
+
+        let local_host = Uuid::new_v4();
+        let mut ring = TokenRing::new();
+        ring.add_node(1, node_info("127.0.0.1:7000", local_host));
+        ring.add_node(2, node_info(&remote_addr, remote_host));
+        ring.assign_tokens(1, &[0]);
+        ring.assign_tokens(2, &[i64::MIN / 2]);
+        let coordinator = Arc::new(ClusterCoordinator::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                Arc::new(NetConfig::default()),
+                local_host,
+                Arc::new(NoopPeers),
+            )),
+            1,
+            Arc::clone(&node.storage),
+            2,
+            ConsistencyLevel::One,
+        ));
+        let fresh = GraphEngine::new(
+            Arc::clone(&node.schema),
+            Arc::clone(&node.storage),
+            Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::cluster(
+                coordinator,
+            ))),
+            GraphEngineConfig::default(),
+            std::time::Duration::from_secs(300),
+        );
+
+        // The heal, through the cluster write path. (The rest of a query's
+        // pipeline needs more of the RPC surface than this two-node harness
+        // serves; the heal is what is under test.)
+        assert_eq!(
+            live_entries_in(&remote, &live),
+            0,
+            "the remote replica starts damaged"
+        );
+        fresh
+            .ensure_adjacency_ready_for_test(KEYSPACE)
+            .await
+            .expect("the heal completes against both replicas");
+        // Each node answers CL ONE traversals from its own replica: the local
+        // one, read directly.
+        assert_clean(
+            "traversals answered from the local replica",
+            &check_all(&node.start_engine(), &reference).await,
+        );
+        let want = 2 * live.len();
+        assert_eq!(
+            live_entries_of(&node, &live),
+            want,
+            "every live edge's entries are live on the local replica"
+        );
+        assert_eq!(
+            live_entries_in(&remote, &live),
+            want,
+            "every live edge's entries are live on the remote replica"
+        );
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// `count(r)` (ferrosa-memory's `stats`) does not count a deleted edge whose
 /// partition still holds live ones: typed_edges keeps a whole session's edges
 /// in one partition, so a row tombstone, not a dead partition, is the norm.
@@ -1067,4 +1259,192 @@ async fn edge_count_skips_a_deleted_edge_in_a_live_partition() {
 
     let rows = run_ok(&engine, &count_query(t)).await;
     assert_eq!(rows[0][0].as_u64(), Some(4), "five edges, one deleted");
+}
+
+/// The deploy heal at the live memory cluster's size. Run it with
+/// `cargo test --release -p ferrosa-graph --features slow-tests --test
+/// adjacency_deploy_heal -- ::slow:: --nocapture` for timings worth quoting.
+#[cfg(feature = "slow-tests")]
+mod slow {
+    use super::*;
+
+    /// The memory cluster on 2026-09-29: 102,853 entities; typed_edges ~21k.
+    const ENTITIES: usize = 102_853;
+    const TYPED_EDGES: usize = 21_000;
+    const TENANTS: usize = 3;
+    const SESSIONS_PER_TENANT: usize = 30;
+    const EDGE_TYPES: [&str; 3] = ["related_to", "depends_on", "part_of"];
+
+    fn write_entity(node: &Node, t: usize, s: usize, i: usize) {
+        let probe = Edge {
+            tenant: tenant_id(t),
+            session: session_id(t, s),
+            src: entity(t, s, i),
+            edge_type: "",
+            dst: entity(t, s, i),
+        };
+        let (key, _) = typed_edge_key(&probe);
+        let row = Row {
+            clustering: entity(t, s, i).as_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(format!("entity-{i}").into_bytes(), 1))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1),
+        };
+        node.storage
+            .write(&TableId::new(KEYSPACE, "entity_store"), &key, row, 1)
+            .unwrap();
+    }
+
+    /// An edge row written as a typed_edges INSERT lands; the adjacency
+    /// observer (registered by the engine) derives its entries.
+    fn write_edge(node: &Node, e: &Edge, ts: i64) {
+        let (key, clustering) = typed_edge_key(e);
+        let row = Row {
+            clustering,
+            cells: vec![],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        node.storage
+            .write(&TableId::new(KEYSPACE, "typed_edges"), &key, row, ts)
+            .unwrap();
+    }
+
+    fn production_shaped_edges() -> Vec<Edge> {
+        let sessions = TENANTS * SESSIONS_PER_TENANT;
+        let per_session = ENTITIES / sessions;
+        let mut edges = BTreeSet::new();
+        let mut k = 0usize;
+        while edges.len() < TYPED_EDGES {
+            let session = k % sessions;
+            let (t, s) = (session / SESSIONS_PER_TENANT, session % SESSIONS_PER_TENANT);
+            let i = (k / sessions) % per_session;
+            let j = (i * 7 + 3 + k / (sessions * per_session)) % per_session;
+            edges.insert(Edge {
+                tenant: tenant_id(t),
+                session: session_id(t, s),
+                src: entity(t, s, i),
+                edge_type: EDGE_TYPES[k % EDGE_TYPES.len()],
+                dst: entity(t, s, j),
+            });
+            k += 1;
+        }
+        edges.into_iter().collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deploy_heal_at_memory_cluster_scale() {
+        let node = Node::new();
+        let sessions = TENANTS * SESSIONS_PER_TENANT;
+        let per_session = ENTITIES / sessions;
+        let mut entities = 0;
+        for session in 0..sessions {
+            for i in 0..per_session {
+                write_entity(
+                    &node,
+                    session / SESSIONS_PER_TENANT,
+                    session % SESSIONS_PER_TENANT,
+                    i,
+                );
+                entities += 1;
+            }
+        }
+
+        // Register the observer the way the old build's first query did.
+        let old = node.start_engine();
+        let all = production_shaped_edges();
+        run_ok(
+            &old,
+            &related_query(all[0].tenant, all[0].session, all[0].src),
+        )
+        .await;
+        let mut live: BTreeSet<Edge> = BTreeSet::new();
+        let seed_ts = now_micros();
+        for e in &all {
+            write_edge(&node, e, seed_ts);
+            live.insert(*e);
+        }
+        for (i, e) in all.iter().enumerate() {
+            if i % 40 == 7 {
+                run_ok(&old, &delete_query(e)).await;
+                live.remove(e);
+            }
+        }
+        eprintln!("SCALE seeded {entities} entities, {} edges", all.len());
+        let started = std::time::Instant::now();
+        let damage = old_build::reconcile_once(&node.schema, &node.write_path(), KEYSPACE).await;
+        let damage_ms = started.elapsed().as_millis();
+        assert_eq!(live_entries_of(&node, &live), 0, "{damage:?}");
+        for (i, e) in all.iter().enumerate() {
+            if i % 50 == 11 && live.contains(e) {
+                delete_as_prefix_build(&node, e);
+                live.remove(e);
+            }
+        }
+        drop(old);
+
+        // First start of the fixed build: the first query carries the heal.
+        let fresh = node.start_engine();
+        let some = *live.iter().next().unwrap();
+        let started = std::time::Instant::now();
+        let first = run_ok(&fresh, &related_query(some.tenant, some.session, some.src)).await;
+        let first_query_ms = started.elapsed().as_millis();
+        assert!(
+            !first.is_empty(),
+            "the first query answers from the healed index"
+        );
+
+        // Steady state: a second pass finds nothing to do.
+        let started = std::time::Instant::now();
+        let second = ferrosa_graph::adjacency::reconcile::reconcile_once(
+            &node.schema,
+            &node.write_path(),
+            KEYSPACE,
+        )
+        .await;
+        let second_ms = started.elapsed().as_millis();
+        assert!(second.is_complete(), "{second:?}");
+        assert_eq!(
+            (second.entries_repaired, second.orphans_removed),
+            (0, 0),
+            "the heal left nothing for the next pass: {second:?}"
+        );
+
+        eprintln!(
+            "SCALE entities={entities} typed_edges={} live={} \
+             prefix_reconcile_ms={damage_ms} prefix_damage={damage:?} \
+             first_query_with_heal_ms={first_query_ms} \
+             second_pass_ms={second_ms} second_pass={second:?}",
+            all.len(),
+            live.len(),
+        );
+
+        // Answers: every vertex of one session, and every tenant's count.
+        // One session, not more: an IN hop without edge_type scans the whole
+        // edge table per neighbour (t_9049eab1), so the check, not the heal,
+        // dominates the run.
+        let sampled = (some.tenant, some.session);
+        let sample: Vec<Edge> = all
+            .iter()
+            .filter(|e| (e.tenant, e.session) == sampled)
+            .copied()
+            .collect();
+        let sample_live: BTreeSet<Edge> = sample
+            .iter()
+            .filter(|e| live.contains(e))
+            .copied()
+            .collect();
+        let reference = Reference::new(&sample, &sample_live);
+        assert_clean(
+            "sampled traversals at scale",
+            &check_all(&fresh, &reference).await,
+        );
+        let full = Reference::new(&all, &live);
+        assert_clean("counts at scale", &check_counts(&fresh, &full).await);
+        eprintln!(
+            "SCALE answers checked: {} vertices of one session, {} tenant counts",
+            reference.vertices.len(),
+            full.count_by_tenant.len()
+        );
+    }
 }

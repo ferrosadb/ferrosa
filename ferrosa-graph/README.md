@@ -130,11 +130,15 @@ resolved port.
 ## How it works
 
 A query flows: **parse → bind params → validate + authorize → logical plan →
-physical plan → execute**. On the first query in a keyspace that touches edges,
-`ensure_adjacency_storage_for_keyspace` lazily creates
-`system_graph_<ks>.adjacency`, registers the `AdjacencyIndexObserver`, runs one
-synchronous reconcile pass, and (if configured) starts the background
-reconciliation loop.
+physical plan → execute**. Every query in a keyspace that touches edges first
+awaits `GraphEngine::ensure_adjacency_ready`: once per process and keyspace it
+lazily creates `system_graph_<ks>.adjacency`, registers the
+`AdjacencyIndexObserver`, (if configured) starts the background reconciliation
+loop, and runs one complete synchronous reconcile pass — the **heal** — before
+any traversal reads the index. Concurrent first queries wait on the same heal
+(a `tokio::sync::OnceCell` per keyspace). A heal with any failed read, scan or
+write is not marked done: the query fails with the retryable
+`GraphError::Unavailable` (HTTP 503) and the next query heals again.
 
 The **adjacency-consistency invariant** is the heart of the crate: every edge
 write must produce the matching OUT and IN adjacency entries. This is enforced
@@ -152,10 +156,75 @@ return row tombstones, so every traversal goes through
 `traversable_neighbor_id`, which skips a deleted entry
 (`adjacency::schema::row_is_deleted`) and the entries of the other direction.
 The reconciler derives expected entries with the observer's column
-extraction, never repairs a deleted edge, and removes orphans only from edge
-tables keyed exactly (`graph.source`) / (`graph.target`). For any other layout
-(agent_memory's `typed_edges`) an entry does not name the edge's key, so it
-cannot be point-checked.
+extraction, and judges each entry on every edge row of the partition that
+derives it: several edges can share one entry (typed_edges keeps one row per
+`edge_type` between a pair), so the entry stays live while any of them is.
+It writes a missing or tombstoned entry of a live edge back at the edge's own
+write time, or one microsecond past the tombstone shadowing it — never at
+"now", so a delete that lands during the pass still wins — and tombstones a
+live entry whose edges are all deleted. `DELETE r` likewise writes back the
+entries a surviving sibling in the same partition still derives. Orphans
+with no edge row at all are removed only from edge tables keyed exactly
+(`graph.source`) / (`graph.target`); for any other layout (agent_memory's
+`typed_edges`) an entry does not name the edge's key, so it cannot be
+point-checked. Edge and vertex row readers skip row tombstones
+(`row_is_deleted`), so `count(r)` and edge binding never see a deleted row in
+a partition that still holds live ones.
+
+### Deploy notes: first start after the traversal fix (330a0c29)
+
+Builds before 330a0c29 ran a reconcile that tombstoned **every** adjacency
+entry of `agent_memory.typed_edges` on every pass (its orphan check read the
+edge at the raw-key position, which a composite-key table does not use), and
+left live entries behind for edges they deleted. Those builds ignored
+tombstones, so the damage was invisible. From 330a0c29 on, traversals honour
+tombstones, so on a node carrying that damage every typed edge would vanish
+from traversals until the entries were rebuilt.
+
+What happens on the first start of this build:
+
+1. Nothing at boot. The heal runs on the first graph query that needs the
+   adjacency index in `agent_memory` (ferrosa-memory's first `TYPED_EDGE`
+   lookup), on each node independently, once per process.
+2. That query, and every adjacency query arriving while it runs, waits for
+   one complete reconcile of every `agent_memory` edge table. Queries that
+   need no adjacency (plain `RETURN`, vertex lookups) are not held.
+3. The pass writes back every tombstoned entry of a live edge, tombstones the
+   live entries of deleted edges, and logs one WARN line:
+   `graph engine: adjacency heal repaired the index before serving
+   traversals` with `entries_repaired`, `entries_removed` and `elapsed_ms`.
+4. If any read or write failed, the query gets HTTP 503 / Bolt
+   `Neo.TransientError.General.DatabaseUnavailable` with "being repaired;
+   retry", the WARN line says `adjacency heal incomplete`, and the next query
+   heals again. No partial answer is returned as complete.
+
+**Time at production scale.** HEAL_TIMING_PLACEHOLDER
+
+**Verify on one node** before rolling the others:
+
+```bash
+# 1. Restart the node on the new build, then send one traversal:
+curl -s -u "$FERROSA_USER:$FERROSA_PASS" http://127.0.0.1:7474/graph/query \
+  -H 'content-type: application/json' \
+  -d '{"keyspace":"agent_memory","query":"MATCH (a:Entity)-[r:TYPED_EDGE]->(b:Entity) RETURN count(r)"}'
+# 2. The heal's WARN line names what it repaired:
+#    (the node's log: StandardErrorPath in its launchd plist)
+grep 'adjacency heal' "$NODE_LOG"
+# 3. Metrics: repaired > 0 once, heals_completed 1, heals_failed 0, errors 0.
+curl -s http://127.0.0.1:9090/metrics | grep ferrosa_graph_adjacency_
+# 4. Answers: ferrosa-memory's related-entity lookup for a known entity
+#    returns its typed neighbours again (empty before the heal finished).
+```
+
+`ferrosa_graph_adjacency_heals_failed_total` above 0 means a heal hit errors
+and queries were refused until a later one completed; check the WARN line's
+`errors` count and the storage logs. Roll the remaining nodes one at a time;
+each heals its own index on its own first query.
+
+Not repaired, and harmless to traversals: the pre-fix reconcile's phase 1 also
+wrote junk `typed_edges` entries keyed by raw composite key bytes, which no
+vertex id matches. The current reconcile cannot point-check that layout, so
+they stay until removed separately.
 
 ### Edge-table endpoint-label contract
 
