@@ -410,10 +410,7 @@ impl PartitionStreamer for StreamSenderStreamer {
             .iter()
             .map(|p| partition_to_streamed_mutation(table, p))
             .collect::<std::result::Result<Vec<_>, String>>()?;
-        // Random session id: every source used to number its sessions from 1,
-        // and the receiver keys sessions by id alone, so two sources streaming
-        // to one target overwrote each other's sessions.
-        let session_id = uuid::Uuid::new_v4().as_u64_pair().0;
+        let session_id = crate::streaming::new_session_id();
         crate::streaming::StreamSender::send_stream(
             mutations,
             &self.peer_manager,

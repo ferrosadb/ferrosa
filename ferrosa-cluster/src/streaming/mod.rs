@@ -33,6 +33,17 @@ pub struct StreamedMutation {
     pub timestamp: i64,
 }
 
+/// A fresh session id for an outbound stream.
+///
+/// The receiver keys in-flight sessions by id alone. Every source used to
+/// number its sessions from 1, so two sources streaming to one target at once
+/// overwrote each other's session: one stream's data was applied under the
+/// other's `StreamEnd` and the other was rejected as unknown. A random 64-bit
+/// id makes a collision negligible.
+pub fn new_session_id() -> u64 {
+    uuid::Uuid::new_v4().as_u64_pair().0
+}
+
 /// Payload carried in a `StreamStart` message.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct StreamStartPayload {

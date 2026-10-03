@@ -321,6 +321,68 @@ mod tests {
         bincode::deserialize(bytes).expect("StreamEnd reply must carry a StreamEndAck verdict")
     }
 
+    /// Two sources stream to one receiver at once: both `StreamStart`s arrive
+    /// before either `StreamEnd`. Returns each source's verdict.
+    async fn interleave_two_sources(id_a: u64, id_b: u64) -> (StreamEndOutcome, StreamEndOutcome) {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = StreamHandler::new(test_storage(dir.path()));
+        let empty_checksum = crc32fast::Hasher::new().finalize();
+        let send = |msg: Message| {
+            let handler = &handler;
+            async move { handler.handle(peer(), msg).await.expect("reply") }
+        };
+        let start_of = |session_id, source_node| {
+            Message::StreamStart(Bytes::from(
+                bincode::serialize(&StreamStartPayload {
+                    session_id,
+                    source_node,
+                    token_range_start: i64::MIN,
+                    token_range_end: i64::MAX,
+                    estimated_bytes: 0,
+                })
+                .unwrap(),
+            ))
+        };
+        let end_of = |session_id| {
+            Message::StreamEnd(Bytes::from(
+                bincode::serialize(&StreamEndPayload {
+                    session_id,
+                    total_mutations: 0,
+                    checksum: empty_checksum,
+                })
+                .unwrap(),
+            ))
+        };
+        send(start_of(id_a, 1)).await;
+        send(start_of(id_b, 2)).await;
+        let a = decode_ack(&send(end_of(id_a)).await).outcome;
+        let b = decode_ack(&send(end_of(id_b)).await).outcome;
+        (a, b)
+    }
+
+    /// Concurrent streams from two sources to one receiver both apply when
+    /// their ids come from `new_session_id`. Every source used to number its
+    /// sessions from 1; the second case pins what that did: the second source's
+    /// `StreamStart` replaced the first's session, and one stream was rejected
+    /// as unknown, which a membership change now treats as a failed transfer.
+    #[tokio::test]
+    async fn concurrent_sources_do_not_collide_on_session_ids() {
+        let (id_a, id_b) = (
+            crate::streaming::new_session_id(),
+            crate::streaming::new_session_id(),
+        );
+        assert_ne!(id_a, id_b);
+        let (a, b) = interleave_two_sources(id_a, id_b).await;
+        assert_eq!(a, StreamEndOutcome::Applied { applied: 0 });
+        assert_eq!(b, StreamEndOutcome::Applied { applied: 0 });
+
+        let (a, b) = interleave_two_sources(1, 1).await;
+        assert!(
+            matches!(b, StreamEndOutcome::Rejected { .. }),
+            "two sources both using session 1 collide (first {a:?}, second {b:?})"
+        );
+    }
+
     /// P0-2: a session whose checksum does not match must be reported as
     /// REJECTED to the sender. The reply used to be `b"ok"` regardless, so a
     /// decommission counted a discarded stream as moved data.
