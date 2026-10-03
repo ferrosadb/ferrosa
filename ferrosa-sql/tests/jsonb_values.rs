@@ -77,6 +77,43 @@ fn distinct_treats_scale_variants_inside_documents_as_equal() {
     }
 }
 
+/// Grouping, DISTINCT and the hash join key on `canonical_cmp`; it must call two
+/// jsonb values Equal exactly when `Value`'s `Eq` does, or a sort-based GROUP BY
+/// merges distinct documents or splits equal ones.
+#[test]
+fn canonical_order_agrees_with_eq_for_jsonb() {
+    use ferrosa_sql::spill::canonical_cmp;
+    let values: Vec<Value> = [
+        "1",
+        "1.0",
+        "1.5",
+        "[]",
+        "{}",
+        "null",
+        r#""1""#,
+        r#"{"a":1}"#,
+        r#"{"a":1.00}"#,
+        "[1,2]",
+        "[2,1]",
+        "[[]]",
+        "[null]",
+    ]
+    .iter()
+    .map(|t| jv(t))
+    .chain([Value::Int(1), Value::Text("1".into()), Value::Null])
+    .collect();
+    for a in &values {
+        for b in &values {
+            assert_eq!(
+                canonical_cmp(a, b) == Ordering::Equal,
+                a == b,
+                "canonical_cmp disagrees with Eq for {a:?} vs {b:?}"
+            );
+            assert_eq!(canonical_cmp(a, b), canonical_cmp(b, a).reverse());
+        }
+    }
+}
+
 #[test]
 fn hash_join_matches_jsonb_keys_by_value() {
     let dir = tempfile::tempdir().unwrap();
@@ -89,8 +126,11 @@ fn hash_join_matches_jsonb_keys_by_value() {
 
 /// PostgreSQL jsonb order, ascending: null < string < number < boolean <
 /// array < object; arrays by length then element-wise; objects by pair count.
+/// The one exception: a top-level empty array sorts below every scalar
+/// (checked against postgres:16; `ferrosa-jsonb/tests/order.rs`).
 fn pg_ordered_corpus() -> Vec<&'static str> {
     vec![
+        "[]",
         "null",
         r#""a""#,
         r#""b""#,
@@ -99,7 +139,6 @@ fn pg_ordered_corpus() -> Vec<&'static str> {
         "2.5",
         "false",
         "true",
-        "[]",
         "[1]",
         "[1,2]",
         "[2,1]",

@@ -577,6 +577,11 @@ fn anchor_scan_peaks(n: usize) -> Peaks {
         1,
         "exactly one vertex carries the needle name; a memory fix must not change the ANSWER"
     );
+    assert_eq!(
+        result.rows[0],
+        vec![serde_json::json!(NEEDLE)],
+        "the one row returned must be the needle vertex"
+    );
     Peaks {
         materialize,
         operation,
@@ -619,6 +624,11 @@ fn edge_anchored_peaks(n: usize) -> Peaks {
         1,
         "exactly one edge carries the needle tag; a memory fix must not change the ANSWER"
     );
+    assert_eq!(
+        result.rows[0],
+        vec![serde_json::json!(NEEDLE)],
+        "the one row returned must be the needle edge"
+    );
     Peaks {
         materialize,
         operation,
@@ -639,6 +649,15 @@ fn edge_anchored_scan_memory_is_independent_of_edge_table_size() {
 
 // --- 3. variable-length path seed (executor/varpath.rs) -------------------
 
+/// The `name` property of a returned node.
+fn node_name(value: &serde_json::Value) -> String {
+    value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("returned node has no name: {value}"))
+        .to_string()
+}
+
 fn varpath_peaks(n: usize) -> Peaks {
     let fx = fixture(n, true);
     let rt = current_thread_rt();
@@ -656,7 +675,19 @@ fn varpath_peaks(n: usize) -> Peaks {
             &auth,
         ))
     });
-    result.expect("var-length path query must succeed");
+    let result = result.expect("var-length path query must succeed");
+    // The needle is p(n/2); KNOWS runs p(i) -> p(i+1), so one and two hops
+    // reach exactly the next two vertices.
+    let mut reached: Vec<String> = result.rows.iter().map(|row| node_name(&row[0])).collect();
+    reached.sort();
+    assert_eq!(
+        reached,
+        vec![
+            format!("person-{:06}", (n / 2 + 1) % n),
+            format!("person-{:06}", (n / 2 + 2) % n)
+        ],
+        "a memory fix must not change the ANSWER: 1..2 hops from the needle"
+    );
     Peaks {
         materialize,
         operation,
@@ -695,18 +726,30 @@ fn reconcile_peaks(n: usize) -> Peaks {
     let warm = rt.block_on(ferrosa_graph::adjacency::reconcile::reconcile_once(
         &schema, &wp, KEYSPACE,
     ));
-    assert!(
-        warm.entries_checked > 0,
-        "warm-up reconcile must walk the seeded edges, got {warm:?}"
+    // One KNOWS edge per person, each missing its OUT and IN adjacency entries.
+    assert_eq!(
+        (
+            warm.entries_checked,
+            warm.entries_repaired,
+            warm.orphans_removed
+        ),
+        (n, 2 * n, 0),
+        "warm-up reconcile must walk every seeded edge and repair both directions, got {warm:?}"
     );
     let (metrics, operation) = measure_peak(|| {
         rt.block_on(ferrosa_graph::adjacency::reconcile::reconcile_once(
             &schema, &wp, KEYSPACE,
         ))
     });
-    assert!(
-        metrics.entries_checked > 0,
-        "reconcile must actually walk the seeded edges, got {metrics:?}"
+    assert_eq!(
+        (
+            metrics.entries_checked,
+            metrics.entries_repaired,
+            metrics.orphans_removed
+        ),
+        (n, 0, 0),
+        "the steady-state pass must walk every edge and find nothing left to repair, \
+         got {metrics:?}"
     );
     Peaks {
         materialize,
@@ -754,6 +797,31 @@ fn streaming_anchor_scan_still_returns_every_row() {
         LARGE_VERTICES,
         "streaming must bound MEMORY, never the result set: an unfiltered MATCH over \
          {LARGE_VERTICES} vertices must return all {LARGE_VERTICES} rows"
+    );
+    let mut names: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| {
+            row[0]
+                .as_str()
+                .unwrap_or_else(|| panic!("p.name must be a string, got {}", row[0]))
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    let mut expected: Vec<String> = (0..LARGE_VERTICES)
+        .map(|i| {
+            if i == LARGE_VERTICES / 2 {
+                NEEDLE.to_string()
+            } else {
+                format!("person-{i:06}")
+            }
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        names, expected,
+        "every vertex exactly once, none duplicated"
     );
     // Keep the storage engine alive until after the assertion.
     drop(fx.storage);

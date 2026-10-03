@@ -1139,7 +1139,15 @@ async fn i1_i2_compaction_over_evicted_inputs_keeps_the_bound_and_every_row() {
             .await_compaction_result(std::time::Duration::from_secs(30)),
         "compaction over evicted inputs produced no result"
     );
-    h.engine().poll_compactions().await;
+    // Settle EVERY table's compaction, not only the first to finish. Each
+    // compaction rehydrates its evicted inputs to read them, and an input of
+    // a compaction still running is local and listed until its swap, which
+    // the cache bound below then counts against the cap.
+    for model in &h.models {
+        h.engine()
+            .drive_compactions_until_idle(&model.tid, std::time::Duration::from_secs(30))
+            .await;
+    }
     h.sync().await;
     let acct = h.assert_cache_bound("after compaction").await;
     assert_data_dwarfs_cache(&acct, params.cache_cap);

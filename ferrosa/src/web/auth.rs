@@ -257,6 +257,7 @@ mod tests {
             auth_disabled,
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
+            supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
         };
 
         let router = Router::new()
@@ -435,6 +436,7 @@ mod tests {
             auth_disabled,
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
+            supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
         }
     }
 

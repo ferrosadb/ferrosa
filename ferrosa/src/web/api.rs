@@ -77,6 +77,7 @@ pub fn routes() -> Router<WebAppState> {
 pub async fn get_metrics(
     State(registry): State<Arc<VirtualTableRegistry>>,
     State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
+    State(supervision): State<Arc<crate::supervisor::SupervisionStatus>>,
 ) -> (
     StatusCode,
     [(axum::http::header::HeaderName, &'static str); 1],
@@ -96,6 +97,11 @@ pub async fn get_metrics(
     // `_fallbacks_total` MUST stay 0 when FERROSA_SSTABLE_DIRECT_IO=1 — non-zero
     // means the fs rejected O_DIRECT and Data.db is page-cached (mitigation inert).
     ferrosa_sstable::direct::render_prometheus(&mut body);
+    // Graph adjacency reconcile + first-use heal (ferrosa_graph_adjacency_*).
+    // `_entries_repaired_total` > 0 after a deploy is the heal of an index the
+    // pre-330a0c29 reconcile damaged; `_heals_failed_total` > 0 means graph
+    // traversals were refused retryably until a heal completed.
+    ferrosa_graph::adjacency::reconcile::render_prometheus(&mut body);
     // Background client listeners (Postgres, SPARQL, graph HTTP, Bolt): 0 means the
     // listener failed to bind or exited, and `/readyz` reports not ready.
     listeners.render_prometheus(&mut body);
@@ -103,6 +109,9 @@ pub async fn get_metrics(
     // refused at the per-connection/per-node limit (SQLSTATE 53000), and
     // closed by the idle timeout.
     ferrosa_postgres::portal_limits::render_prometheus(&mut body);
+    // Supervised background tasks (flusher, maintenance loop): `_up` 0 means the
+    // task is failing, stalled or restarting, and `/readyz` reports not ready.
+    supervision.render_prometheus(&mut body);
     // Client request rate, outcome and latency (ferrosa_cql_requests_total,
     // ferrosa_cql_request_duration_seconds, ferrosa_cql_requests_in_flight).
     ferrosa_cql::request_metrics::render_prometheus(&mut body);
@@ -133,6 +142,14 @@ pub fn cluster_routes() -> Router<WebAppState> {
         .route("/ring", get(ring_handler))
         .route("/rebalance", post(rebalance_handler))
         .route("/repair", post(repair_handler))
+}
+
+/// Query parameters for `POST /api/cluster/downgrade-to-pair`.
+#[derive(serde::Deserialize)]
+struct DowngradeToPairParams {
+    /// Host id of the peer to pair with. Required: the controller refuses
+    /// without it.
+    peer: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -422,8 +439,22 @@ async fn cluster_promote(State(mc): State<Arc<ModeController>>) -> (StatusCode, 
 /// POST with an explicit path rather than anything a health check can trigger.
 async fn cluster_downgrade_to_pair(
     State(mc): State<Arc<ModeController>>,
+    axum::extract::Query(params): axum::extract::Query<DowngradeToPairParams>,
 ) -> (StatusCode, Json<Value>) {
-    match mc.downgrade_to_pair() {
+    // The peer is named by the operator, never picked from whatever connected
+    // first (P0-5). A malformed id is a 400; a missing one is refused by the
+    // controller with a message saying a named peer is required.
+    let named_peer = match params.peer.as_deref().map(str::parse::<uuid::Uuid>) {
+        None => None,
+        Some(Ok(id)) => Some(id),
+        Some(Err(e)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid peer host id: {e}") })),
+            )
+        }
+    };
+    match mc.downgrade_to_pair(named_peer) {
         Ok(peer_host_id) => (
             StatusCode::OK,
             Json(json!({
@@ -974,6 +1005,7 @@ mod tests {
             auth_disabled: true,
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
+            supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
         }
     }
 
@@ -1817,7 +1849,11 @@ mod tests {
         let state = make_state();
         let mc = state.mode_controller.clone();
         let net_config = Arc::new(ferrosa_net::config::NetConfig::default());
-        let pm = Arc::new(PeerManager::new(net_config, mc.host_id(), mc.clone()));
+        let pm = Arc::new(PeerManager::with_weak_listener(
+            net_config,
+            mc.host_id(),
+            mc.as_peer_listener(),
+        ));
         mc.set_peer_manager(pm);
         mc.set_mode_for_test(ferrosa_common::deployment_mode::DeploymentMode::Cluster);
         // Drive the REAL production path rather than reaching into controller
@@ -1858,11 +1894,12 @@ mod tests {
             ferrosa_common::deployment_mode::DeploymentMode::Cluster,
             "precondition: the node starts as a committed cluster member"
         );
+        let peer = uuid::Uuid::from_u128(mc.host_id().as_u128() - 1);
 
         let router = crate::web::build_router(state);
         let req = Request::builder()
             .method("POST")
-            .uri("/api/cluster/downgrade-to-pair")
+            .uri(format!("/api/cluster/downgrade-to-pair?peer={peer}"))
             .body(Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
@@ -1925,7 +1962,10 @@ mod tests {
         let router = crate::web::build_router(state);
         let req = Request::builder()
             .method("POST")
-            .uri("/api/cluster/downgrade-to-pair")
+            .uri(format!(
+                "/api/cluster/downgrade-to-pair?peer={}",
+                uuid::Uuid::new_v4()
+            ))
             .body(Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
@@ -1946,6 +1986,37 @@ mod tests {
         assert!(
             error.contains("connected peer"),
             "the error must name the missing peer, got: {error}"
+        );
+    }
+
+    /// P0-5: the endpoint refuses a downgrade that names no peer, even when a
+    /// peer is connected. The old endpoint took no argument and paired with
+    /// whichever peer connected first.
+    #[tokio::test]
+    async fn api_downgrade_to_pair_returns_409_without_a_named_peer() {
+        let state = make_state_in_cluster_with_peer();
+        let mc = state.mode_controller.clone();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/downgrade-to-pair")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("named peer"),
+            "the error must say a named peer is required, got: {error}"
+        );
+        assert_eq!(
+            mc.mode(),
+            ferrosa_common::deployment_mode::DeploymentMode::Cluster,
+            "a refused downgrade must leave the node untouched"
         );
     }
 
@@ -2263,9 +2334,15 @@ mod tests {
 
         let state = Arc::new(registry);
         let listeners = Arc::new(crate::listener_status::ListenerStatus::default());
-        let (status, headers, body) = get_metrics(State(state), State(listeners)).await;
+        let supervision = Arc::new(crate::supervisor::SupervisionStatus::default());
+        let (status, headers, body) =
+            get_metrics(State(state), State(listeners), State(supervision)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers[0].1, "text/plain; charset=utf-8");
+        assert!(
+            body.contains("ferrosa_supervised_task_up{task=\"storage_flush\"} 1\n"),
+            "supervised background tasks are exported: {body}"
+        );
         assert!(body.contains("ferrosa_test_table_count"));
         assert!(body.contains("host=\"node1\""));
         assert!(body.contains("5"));

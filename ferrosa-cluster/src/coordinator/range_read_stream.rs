@@ -49,6 +49,51 @@ use crate::write_path::ScanResume;
 /// 30 s the peer is genuinely stuck and aborting is correct.
 const STREAMING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default longest a remote stream may go without a DATA frame (chunk or Done)
+/// before the coordinator fails it, however many heartbeats arrive meanwhile.
+///
+/// Heartbeats reset the idle watchdog, and a replica built before heartbeats
+/// were progress-gated sends one every 3 s even while its walk is stuck. That
+/// kept a remote stream "alive" forever, and the index merge above it held the
+/// coordinator's own local walker parked inside `tables.read()`. This deadline
+/// is the backstop heartbeats cannot reset.
+///
+/// Budget: 10x the idle timeout (5 min). A current replica heartbeats only on
+/// progress, so its stuck walk is caught by the 30 s idle timeout; this bound
+/// only has to catch the old ones, and it must not fail a legitimately slow
+/// walk. The slowest legitimate gap is a walk rehydrating evicted SSTables
+/// before its next hit: one 16 MiB ranged part per request at the default
+/// `FERROSA_S3_MAX_REQUESTS_PER_SECOND=20` throttle is about 320 MiB/s, so 5
+/// minutes covers a gap of tens of GiB of downloads between two rows.
+/// Override with `FERROSA_STREAM_NO_DATA_DEADLINE_SECS` (read once).
+const DEFAULT_STREAM_NO_DATA_DEADLINE: Duration =
+    Duration::from_secs(STREAMING_IDLE_TIMEOUT.as_secs() * 10);
+
+/// The no-data deadline in force: [`DEFAULT_STREAM_NO_DATA_DEADLINE`] unless
+/// `FERROSA_STREAM_NO_DATA_DEADLINE_SECS` names a positive number of seconds.
+/// An unparsable or zero value is refused loudly at first use and the default
+/// applies.
+fn stream_no_data_deadline() -> Duration {
+    static DEADLINE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *DEADLINE.get_or_init(
+        || match std::env::var("FERROSA_STREAM_NO_DATA_DEADLINE_SECS") {
+            Err(_) => DEFAULT_STREAM_NO_DATA_DEADLINE,
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) if secs > 0 => Duration::from_secs(secs),
+                _ => {
+                    tracing::error!(
+                        value = raw,
+                        default_secs = DEFAULT_STREAM_NO_DATA_DEADLINE.as_secs(),
+                        "FERROSA_STREAM_NO_DATA_DEADLINE_SECS must be a positive integer; \
+                     using the default"
+                    );
+                    DEFAULT_STREAM_NO_DATA_DEADLINE
+                }
+            },
+        },
+    )
+}
+
 /// Default idle budget for one merge source to produce its next fragment.
 ///
 /// The N-way merge picks the next token by walking its cursors **in order** and
@@ -484,6 +529,23 @@ fn next_remote_error(err: StreamConsumeError) -> crate::error::Result<Partition>
                 data_present: false,
             }
         }
+        StreamConsumeError::NoData {
+            request_id,
+            no_data_deadline,
+        } => {
+            tracing::warn!(
+                request_id,
+                ?no_data_deadline,
+                "streaming range read: replica sent heartbeats but no data within the no-data \
+                 deadline — returning retryable ReadTimeout"
+            );
+            ClusterError::ReadTimeout {
+                consistency: "ONE".to_string(),
+                received: 0,
+                required: 1,
+                data_present: false,
+            }
+        }
         // Decode / unexpected-frame faults are genuine protocol bugs — keep them
         // loud (non-retryable) so they surface for diagnosis.
         other => ClusterError::Internal(format!("streaming range read: {other:?}")),
@@ -546,6 +608,10 @@ async fn forward_remote_range_stream_inner(
     let mut watchdog = IdleTimeoutWatchdog::new(receiver, STREAMING_IDLE_TIMEOUT);
     let mut delivered_done = 0usize;
     let mut resume: Option<StreamResumePositionWire> = None;
+    // Heartbeats reset the watchdog but not this: see
+    // [`DEFAULT_STREAM_NO_DATA_DEADLINE`].
+    let no_data_deadline = stream_no_data_deadline();
+    let mut data_deadline = tokio::time::Instant::now() + no_data_deadline;
 
     loop {
         if delivered_done >= expected_done {
@@ -559,6 +625,12 @@ async fn forward_remote_range_stream_inner(
         let next = tokio::select! {
             biased;
             _ = tx.closed() => return Ok(ForwardOutcome::Abandoned),
+            _ = tokio::time::sleep_until(data_deadline) => {
+                return Err(StreamConsumeError::NoData {
+                    request_id,
+                    no_data_deadline,
+                });
+            }
             next = watchdog.next() => next,
         };
         let next = next.map_err(|elapsed| StreamConsumeError::IdleTimeout {
@@ -591,6 +663,9 @@ async fn forward_remote_range_stream_inner(
                         return Ok(ForwardOutcome::Abandoned);
                     }
                 }
+                // Re-armed AFTER the hand-off: time spent waiting on a slow
+                // consumer is not the replica's silence.
+                data_deadline = tokio::time::Instant::now() + no_data_deadline;
             }
             Message::RangeReadStreamHeartbeat(bytes) => {
                 let _heartbeat = bincode::deserialize::<RangeReadStreamHeartbeatPayload>(&bytes)
@@ -618,6 +693,7 @@ async fn forward_remote_range_stream_inner(
                 }
                 resume = done.resume;
                 delivered_done += 1;
+                data_deadline = tokio::time::Instant::now() + no_data_deadline;
             }
             other => {
                 return Err(StreamConsumeError::UnexpectedFrame {
@@ -2010,10 +2086,13 @@ impl ClusterCoordinator {
             clustering: Some(cursor.clustering_key.clone()),
         });
         let mut sources: Vec<ClusterPartitionStream> = Vec::with_capacity(remotes.len() + 1);
-        sources.push(Box::pin(
-            self.storage
-                .read_by_index_stream_after(table_id, index_name, index_key, after.cloned())
-                .map(|item| item.map_err(ClusterError::Storage)),
+        sources.push(bounded_local_index_source(
+            Box::pin(
+                self.storage
+                    .read_by_index_stream_after(table_id, index_name, index_key, after.cloned())
+                    .map(|item| item.map_err(ClusterError::Storage)),
+            ),
+            merge_source_fragment_timeout(),
         ));
 
         let index_key_bytes = index_key.0.as_slice();
@@ -2097,13 +2176,30 @@ impl ClusterCoordinator {
                     fanout.last_error.as_deref().unwrap_or("no replica tried")
                 )));
             }
+            // Refused, not warned about, for the same reason as the paged path
+            // (`paged_multi_replica_stream`): merging fewer sources than the CL
+            // needs is a silent read below the requested consistency level.
             if fanout.streams.len() < expected_done {
                 tracing::warn!(
                     failed = fanout.fire_failures,
                     succeeded = fanout.streams.len(),
                     needed = expected_done,
-                    "streaming range read: partial fan-out — some replicas could not be reached"
+                    "streaming range read: partial fan-out — refusing to serve below \
+                     the requested consistency level"
                 );
+                return Err(ClusterError::Internal(format!(
+                    "streaming range read: partial fan-out — reached {} of {} required \
+                     replicas ({} failed); refusing to serve a read below the requested \
+                     consistency level{}",
+                    fanout.streams.len(),
+                    expected_done,
+                    fanout.fire_failures,
+                    fanout
+                        .last_error
+                        .as_deref()
+                        .map(|e| format!(": {e}"))
+                        .unwrap_or_default()
+                )));
             }
 
             // N-way merge -> merge_rx.
@@ -2343,6 +2439,44 @@ fn index_hit_position(partition: &Partition) -> (&[u8], &[u8]) {
 /// the previous row, so no set of rows seen is kept: memory is one head per
 /// node plus the previous row's key. A node's error ends the merged stream
 /// with that error — its undelivered rows are never passed off as absent.
+/// Bound each row pull from the LOCAL engine index walk by the merge-source
+/// budget ([`merge_source_fragment_timeout`], 30 s).
+///
+/// `merge_index_streams_in_row_order` awaits its sources in order. Remote
+/// sources carry the idle watchdog and the no-data deadline; the local walk
+/// carried nothing, so a walk blocked behind its own node's tables lock parked
+/// the merge and every remote route behind it. A source that produces no row
+/// within the budget now yields one loud error and ends.
+///
+/// Only the local source is wrapped: a remote whose walk is slow but
+/// progressing (an R2 rehydrate) keeps its stream open through progress-gated
+/// heartbeats, and a per-row bound on it would undo that.
+fn bounded_local_index_source(
+    source: ClusterPartitionStream,
+    budget: Duration,
+) -> ClusterPartitionStream {
+    Box::pin(futures::stream::unfold(
+        Some(source),
+        move |state| async move {
+            let mut source = state?;
+            match tokio::time::timeout(budget, source.next()).await {
+                Ok(Some(item)) => Some((item, Some(source))),
+                Ok(None) => None,
+                // Dropping `source` here releases the walker behind it.
+                Err(_elapsed) => Some((
+                    Err(ClusterError::Internal(format!(
+                        "streaming index read: the local index walk produced no row within \
+                         {}ms; failing loudly rather than waiting forever (a silent local \
+                         source must not stall the merge or the remote routes behind it)",
+                        budget.as_millis()
+                    ))),
+                    None,
+                )),
+            }
+        },
+    ))
+}
+
 pub(crate) fn merge_index_streams_in_row_order(
     sources: Vec<ClusterPartitionStream>,
 ) -> ClusterPartitionStream {
@@ -2426,6 +2560,277 @@ mod tests {
 
     fn replica(hits: Vec<crate::error::Result<Partition>>) -> ClusterPartitionStream {
         Box::pin(futures::stream::iter(hits))
+    }
+
+    fn heartbeat_frame(request_id: u32, seq: u32) -> Message {
+        let hb = RangeReadStreamHeartbeatPayload { request_id, seq };
+        Message::RangeReadStreamHeartbeat(Bytes::from(bincode::serialize(&hb).unwrap()))
+    }
+
+    /// INVARIANT: heartbeats alone never keep a remote stream open past the
+    /// no-data deadline. A replica built before the progress-gated heartbeat
+    /// still heartbeats every 3 s while its walk is stuck; each one resets the
+    /// 30 s idle watchdog, so without a deadline heartbeats cannot reset, the
+    /// forwarder waited forever and the merge above it kept the coordinator's
+    /// local walker parked inside `tables.read()`.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeats_without_data_fail_the_stream_at_the_no_data_deadline() {
+        const REQ: u32 = 9;
+        let (frame_tx, frame_rx) = mpsc::channel::<Message>(STREAM_RECEIVER_BUFFER);
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let forwarder = tokio::spawn(forward_remote_range_stream(frame_rx, REQ, 1, out_tx));
+        let heartbeats = tokio::spawn(async move {
+            let mut seq = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if frame_tx.send(heartbeat_frame(REQ, seq)).await.is_err() {
+                    return;
+                }
+                seq += 1;
+            }
+        });
+
+        let deadline = stream_no_data_deadline();
+        let first = tokio::time::timeout(deadline + Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("heartbeats alone kept the stream open past the no-data deadline");
+        heartbeats.abort();
+        let err = first
+            .expect("the forwarder must deliver its failure")
+            .expect_err("a heartbeat-only stream must fail");
+        assert!(
+            matches!(err, ClusterError::ReadTimeout { .. }),
+            "a no-data stall is a retryable read timeout, got {err:?}"
+        );
+        assert!(matches!(forwarder.await.unwrap(), ForwardOutcome::Failed));
+    }
+
+    /// Regression for the node2 wedge (2026-10-03), end to end on one node:
+    /// the REAL engine index walker as the local source, the REAL forwarder as
+    /// a remote that sends only heartbeats (a replica whose walk is stuck,
+    /// built before heartbeats were progress-gated). The merge waits on that
+    /// remote while the local walker sits parked in `blocking_send` inside
+    /// `tables.read()`; DDL (`tables.write()`) then blocks, and every later
+    /// reader behind it. The stream must fail within the no-data deadline so
+    /// the merge drops and the walker's guard is released.
+    ///
+    /// Paused time, driven with `advance`: the walker runs on a real blocking
+    /// thread, which inhibits the paused clock's auto-advance.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_only_remote_releases_the_local_index_walker() {
+        use ferrosa_common::cell::CellValue;
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        use ferrosa_storage::{StorageEngine, StorageEngineConfig};
+
+        const INDEX: &str = "hb_val_idx";
+        fn schema(table: &str) -> TableSchema {
+            TableSchema {
+                keyspace: "hb_ks".to_string(),
+                table: table.to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![ColumnDefinition {
+                    name: "ck".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                }],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "val".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                }],
+                extensions: Default::default(),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap(),
+        );
+        engine
+            .register_table_with_indexes(schema("hits"), vec![(INDEX.to_string(), 0_usize)])
+            .unwrap();
+        let tid = TableId::new("hb_ks", "hits");
+        for n in 0..32_i32 {
+            let key = DecoratedKey::new(PartitionKey::new(format!("pk{n}").into_bytes()));
+            let row = Row {
+                clustering: n.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(b"hot".to_vec(), 1))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1),
+            };
+            engine.write(&tid, &key, row, 1).unwrap();
+        }
+
+        let local: ClusterPartitionStream = Box::pin(
+            engine
+                .read_by_index_stream(&tid, INDEX, &ferrosa_index::IndexKey(b"hot".to_vec()))
+                .map(|item| item.map_err(ClusterError::Storage)),
+        );
+        const REQ: u32 = 7;
+        let (frame_tx, frame_rx) = mpsc::channel::<Message>(STREAM_RECEIVER_BUFFER);
+        let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        tokio::spawn(forward_remote_range_stream(frame_rx, REQ, 1, remote_tx));
+        let remote: ClusterPartitionStream = Box::pin(clean_end_guarded_stream(
+            remote_rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            uuid::Uuid::from_u128(2),
+        ));
+        let heartbeats = tokio::spawn(async move {
+            let mut seq = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if frame_tx.send(heartbeat_frame(REQ, seq)).await.is_err() {
+                    return;
+                }
+                seq += 1;
+            }
+        });
+
+        let mut merged = merge_index_streams_in_row_order(vec![local, remote]);
+        let consumer = tokio::spawn(async move {
+            // As the CQL page collector does: an error ends the read and
+            // drops the merge, and with it the local walker.
+            let first = merged.next().await;
+            drop(merged);
+            first.map(|r| r.is_err())
+        });
+
+        // Let the walker fill its channel and park, then run the clock past
+        // the no-data deadline one heartbeat at a time.
+        std::thread::sleep(Duration::from_millis(100));
+        let horizon = stream_no_data_deadline() + Duration::from_secs(30);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < horizon && !consumer.is_finished() {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            elapsed += Duration::from_secs(1);
+        }
+        heartbeats.abort();
+        let finished = consumer.is_finished();
+        if !finished {
+            // Drop the merge so the parked walker unparks and the runtime can
+            // shut down after the assertion fails, instead of hanging on it.
+            consumer.abort();
+        }
+        assert!(
+            finished,
+            "the merge was still waiting on a heartbeat-only remote after {}s",
+            horizon.as_secs()
+        );
+        assert_eq!(
+            consumer.await.unwrap(),
+            Some(true),
+            "the heartbeat-only remote must surface as an error"
+        );
+
+        let ddl_engine = Arc::clone(&engine);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            ddl_engine
+                .register_table(schema("created_during_read"))
+                .unwrap();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "DDL still blocked: the local index walker kept tables.read() after the merge failed"
+        );
+    }
+
+    /// INVARIANT: a silent LOCAL index source cannot wedge the index merge.
+    /// The merge awaits sources in order and the local engine walk has no idle
+    /// watchdog of its own (remotes have the watchdog and the no-data
+    /// deadline), so a walk blocked on its own node's tables lock parked the
+    /// merge -- and every remote route behind it -- forever. The same hazard
+    /// 1cfedfb2 closed for `FragmentCursor`.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_local_index_source_fails_the_merge_loudly() {
+        let silent_local: ClusterPartitionStream = bounded_local_index_source(
+            Box::pin(futures::stream::pending()),
+            DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT,
+        );
+        let ready_remote = replica(vec![index_hit(b"a", b"1"), index_hit(b"b", b"1")]);
+        let mut merged = merge_index_streams_in_row_order(vec![silent_local, ready_remote]);
+
+        let first = tokio::time::timeout(
+            DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT + Duration::from_secs(5),
+            merged.next(),
+        )
+        .await
+        .expect("a silent local source wedged the index merge");
+        let err = first
+            .expect("the merge must report the stall")
+            .expect_err("a silent local source must be an error, not a short result");
+        assert!(
+            err.to_string().contains("produced no row"),
+            "the error must name the condition: {err}"
+        );
+    }
+
+    /// Control: a slow but live local source is not killed by the bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_local_index_source_is_not_killed() {
+        let slow = futures::stream::unfold(0u8, |n| async move {
+            if n == 3 {
+                return None;
+            }
+            tokio::time::sleep(DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT / 2).await;
+            Some((index_hit(&[b'a' + n], b"1"), n + 1))
+        });
+        // Explicit budget: the process-wide test override is shared with
+        // concurrently running tests.
+        let local =
+            bounded_local_index_source(Box::pin(slow), DEFAULT_MERGE_SOURCE_FRAGMENT_TIMEOUT);
+        let mut merged = merge_index_streams_in_row_order(vec![local, replica(vec![])]);
+        let mut rows = 0;
+        while let Some(item) = merged.next().await {
+            item.expect("a slow but live source must not be errored");
+            rows += 1;
+        }
+        assert_eq!(rows, 3);
+    }
+
+    /// Control: a stream that delivers data keeps going past the no-data
+    /// deadline. The deadline measures time since the last DATA frame, not
+    /// since the stream began.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_delivering_data_outlives_the_no_data_deadline() {
+        const REQ: u32 = 10;
+        let (frame_tx, frame_rx) = mpsc::channel::<Message>(STREAM_RECEIVER_BUFFER);
+        let (out_tx, mut out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        let forwarder = tokio::spawn(forward_remote_range_stream(frame_rx, REQ, 1, out_tx));
+        let deadline = stream_no_data_deadline();
+        let steps = (deadline.as_secs() / 10) * 3;
+        let feeder = tokio::spawn(async move {
+            for seq in 0..steps as u32 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let chunk = crate::raft::handlers::RangeReadStreamChunkPayload {
+                    request_id: REQ,
+                    seq,
+                    partitions: vec![crate::raft::handlers::partition_to_wire(partition(
+                        &seq.to_be_bytes(),
+                    ))],
+                };
+                let bytes = Bytes::from(bincode::serialize(&chunk).unwrap());
+                if frame_tx
+                    .send(Message::RangeReadStreamChunk(bytes))
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
+            }
+            Some(frame_tx)
+        });
+        let mut received = 0u64;
+        while received < steps {
+            let item = out_rx.recv().await.expect("stream ended early");
+            item.expect("a stream delivering data must not be failed");
+            received += 1;
+        }
+        drop(feeder.await.unwrap());
+        forwarder.abort();
     }
 
     /// One partition holding a single row, keyed by `pk`.
@@ -3446,7 +3851,7 @@ mod tests {
         ) -> Vec<Partition> {
             let mut merger = ferrosa_storage::range_merger::merger_for_sources(
                 Box::new(std::iter::empty()),
-                None,
+                Vec::new(),
                 readers,
                 start,
                 None,

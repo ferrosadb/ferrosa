@@ -332,6 +332,31 @@ async fn parts_download_concurrently_up_to_the_configured_limit() {
     assert_eq!(store.total_requests(), 7, "part 0 + six ranged parts");
 }
 
+/// Downloads advance the node's I/O progress counter as bytes land, on both
+/// the ranged and the single-GET path. Streaming responders read it to tell a
+/// walk waiting on a rehydrate (progressing) from a stuck one. The counter is
+/// process-wide, so concurrent tests may add to it: the bound is `>=`.
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads_advance_the_io_progress_counter() {
+    for size in [5 * 1024 + 123, 700] {
+        let body = pattern(size);
+        let store = ScriptedStore::with_object(&body).await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("7-Data.db");
+        let before = crate::metrics::object_store_download_progress();
+
+        download_component(&store, &key(), &local, &cfg(1024, 3))
+            .await
+            .unwrap();
+
+        let advanced = crate::metrics::object_store_download_progress() - before;
+        assert!(
+            advanced >= size as u64,
+            "a {size}-byte download advanced I/O progress by only {advanced}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_small_object_is_one_get() {
     let body = pattern(700);

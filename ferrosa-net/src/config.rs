@@ -59,6 +59,10 @@ pub struct NetConfig {
     /// hostname (not a startup-frozen IP) in `NodeInfo.addr` and re-resolve it on
     /// every reconnect — handling container IP churn without stale membership.
     pub internode_broadcast: Option<String>,
+    /// Capability bits advertised in the handshake (`handshake::CAP_*`).
+    /// Defaults to [`crate::handshake::LOCAL_CAPABILITIES`]; a test lowers it
+    /// to stand in for a node built before a capability existed.
+    pub advertised_capabilities: u32,
 }
 
 impl Default for NetConfig {
@@ -89,6 +93,7 @@ impl Default for NetConfig {
             require_tls: false,
             cql_broadcast: None,
             internode_broadcast: None,
+            advertised_capabilities: crate::handshake::LOCAL_CAPABILITIES,
         }
     }
 }

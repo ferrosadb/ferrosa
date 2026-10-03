@@ -5,10 +5,10 @@
 //! the missing condition otherwise.
 //! A failed consensus runtime overrides every deployment-mode shortcut and
 //! returns 503 without awaiting a Raft handle.
-//! Last revised: 2026-09-26
-//! Last changed: A node that declared `FERROSA_EXPECTED_CLUSTER_SIZE` is not ready
-//!   until that topology is met (a booting Standalone pod and a cluster that fell
-//!   back to Pair used to answer 200 while CQL refused connections).
+//! Last revised: 2026-10-03
+//! Last changed: An impaired supervised background task (flusher, maintenance
+//!   loop) holds readiness (t_7681b32b); node2 answered 200 for a day with no
+//!   flusher.
 //!
 //! ## Readiness criteria
 //!
@@ -24,6 +24,11 @@
 //! | Forming    | Ready only once a Raft leader is elected    |
 //! | Cluster    | Ready only once a Raft leader is elected    |
 //! | Degraded*  | Mode rules apply unless consensus failed    |
+//!
+//! Independent of mode, a supervised background task that is failing, stalled
+//! or restarting (`storage_flush`, `maintenance_loop`; see `crate::supervisor`)
+//! answers `503 {"waiting_for":"background_tasks"}` naming each task and its last
+//! failure, until it recovers.
 //!
 //! Independent of mode, a node that holds set-aside commit-log mutations (rows
 //! startup replay could not bind to a schema, durable but invisible to reads)
@@ -94,6 +99,7 @@ pub async fn readyz_handler(
     State(mc): State<Arc<ModeController>>,
     State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
     State(storage): State<Arc<ferrosa_storage::StorageEngine>>,
+    State(supervision): State<Arc<crate::supervisor::SupervisionStatus>>,
 ) -> (StatusCode, Json<Value>) {
     if !mc.consensus_is_healthy() {
         return (
@@ -102,6 +108,26 @@ pub async fn readyz_handler(
                 "ready": false,
                 "waiting_for": "consensus_runtime",
                 "detail": "consensus runtime failed; retry another node"
+            })),
+        );
+    }
+    // A supervised background task (the flusher, the maintenance loop) that is
+    // failing, stalled or restarting. A node that cannot flush keeps taking
+    // writes into memtables it cannot persist, so it must not look healthy.
+    let impaired = supervision.impaired();
+    if !impaired.is_empty() {
+        let impaired: Vec<Value> = impaired
+            .into_iter()
+            .map(|(task, reason)| json!({"task": task, "reason": reason}))
+            .collect();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ready": false,
+                "waiting_for": "background_tasks",
+                "impaired": impaired,
+                "detail": "a supervised background task is failing or restarting; see the \
+                    reasons and the ferrosa_supervised_task_up metric"
             })),
         );
     }
@@ -336,6 +362,7 @@ mod tests {
             auth_disabled: true,
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
+            supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
         }
     }
 
@@ -693,6 +720,39 @@ what made this failure invisible"
             body["failed"].as_array().unwrap().len(),
             1,
             "only the failed one"
+        );
+    }
+
+    /// 2026-10-02, node2: the flush thread panicked and the node answered `/readyz`
+    /// 200 while nothing flushed (t_7681b32b). An impaired supervised task now
+    /// holds readiness, naming the task and its last failure.
+    #[tokio::test]
+    async fn readyz_is_not_ready_while_a_supervised_task_is_impaired() {
+        use crate::supervisor::{Child, FailureKind};
+        let state = make_state();
+        state.supervision.record_failure(
+            Child::StorageFlush,
+            FailureKind::Panic,
+            "storage-flush panicked: complex col_idx 8",
+        );
+        let (status, body) = probe(state.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["waiting_for"], "background_tasks");
+        assert_eq!(body["impaired"][0]["task"], "storage_flush");
+        assert!(
+            body["impaired"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("complex col_idx 8"),
+            "{body}"
+        );
+
+        state.supervision.record_recovery(Child::StorageFlush);
+        assert_eq!(
+            probe(state).await.0,
+            StatusCode::OK,
+            "a recovered task is ready"
         );
     }
 

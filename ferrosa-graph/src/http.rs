@@ -191,6 +191,8 @@ fn error_to_response(err: &GraphError) -> Response {
         // URS-QEC-D02: a constraint violation is a client error; the message is
         // the safe Neo4j-style guidance, not internal detail, so expose it.
         GraphError::ConstraintViolation(msg) => (StatusCode::CONFLICT, msg.clone()),
+        // Retryable: the message says what is pending, not internal detail.
+        GraphError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
         // T8: Internal errors are never exposed to the client.
         GraphError::Storage(_) | GraphError::Schema(_) | GraphError::Internal(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -84,7 +84,10 @@ Memory model (t_ee98faa0 layer 2 — the replica-side `fts_match` OOM):
   through a bounded heap; `MultiTerm`/`Phrase` drive the smallest posting
   list against borrowed key maps; compound shapes (`And`/`Or`/`Not`/`Prefix`)
   reuse the exact evaluator with borrowed (pointer-sized) keys and clone only
-  the k winners. Matching semantics are identical to `search`; `k` is always
+  the k winners. The streaming paths have no score map, so they rely on
+  `FullTextIndexBuilder::build` holding each key at most once per term (a
+  key added twice is folded, as `merge_fti` folds two sidecars;
+  `tests/fulltext_topk_semantics.rs`). Matching semantics are identical to `search`; `k` is always
   query-derived — never a server cap.
 - `reader.search(query)` (no LIMIT) returns the complete match set; its
   evaluation maps borrow doc keys from the index (no per-doc key clones).

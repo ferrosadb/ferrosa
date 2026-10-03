@@ -31,6 +31,7 @@ pub(crate) mod flush_executor;
 pub mod fulltext_observability;
 pub(crate) mod generation_guard;
 pub mod index;
+pub(crate) mod lockfree;
 pub mod manifest;
 pub mod memtable;
 pub mod merge;

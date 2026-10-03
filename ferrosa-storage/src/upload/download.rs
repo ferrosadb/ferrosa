@@ -338,6 +338,7 @@ async fn write_whole(
             .write_all(&chunk)
             .await
             .map_err(|e| local("write SSTable download temp file", e))?;
+        crate::metrics::add_object_store_download_progress(chunk.len() as u64);
     }
     writer
         .flush()
@@ -498,9 +499,12 @@ where
 
 async fn write_at(file: &Arc<std::fs::File>, offset: u64, data: Bytes) -> Result<(), Fail> {
     let file = Arc::clone(file);
+    let len = data.len() as u64;
     run_blocking(move || file.write_all_at(&data, offset))
         .await
-        .map_err(|e| Fail::Fatal(format!("failed to write SSTable download at {offset}: {e}")))
+        .map_err(|e| Fail::Fatal(format!("failed to write SSTable download at {offset}: {e}")))?;
+    crate::metrics::add_object_store_download_progress(len);
+    Ok(())
 }
 
 /// Part 0 rides the request that revealed the object's size. Any failure

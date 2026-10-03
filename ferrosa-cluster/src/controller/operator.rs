@@ -48,27 +48,78 @@ impl ModeController {
     /// [`Self::force_promote`] -- and like that one it is reachable only through
     /// this deliberate call, never from a timeout or a peer event.
     ///
-    /// Refused, leaving the node untouched, when:
+    /// Refused, leaving the node untouched, when (P0-5):
     ///
-    /// - `peer` is not a currently connected peer: a pair needs somewhere to
-    ///   replicate, and a mode change alone would be a lie. The message names
-    ///   the connected peers so the operator can see what was actually available.
+    /// - no peer is named. The old action paired with `connected_peers.first()`,
+    ///   so the replication target was whichever peer connected first.
+    /// - any Raft group is still running on this node. While Raft runs the node
+    ///   is a voter and a replica; installing the pair write path on top commits
+    ///   writes a quorum never saw while the cluster still counts this node.
+    ///   That is split brain. There is no supported way to stop Raft and shrink
+    ///   membership to the named peer yet, so in a live cluster this refuses
+    ///   outright (fail loud, never fake).
+    /// - the token ring still holds a member other than this node and the named
+    ///   peer: that member is still a replica of ranges this node would write
+    ///   without it.
+    /// - the named peer is not currently connected: a pair needs somewhere to
+    ///   replicate. The message names the connected peers.
     /// - the T-300 jsonb guard refuses leaving standalone (checked inside the
     ///   pair transition, so it cannot be bypassed by going through here).
-    /// - no peer manager is installed.
     ///
     /// On success the real pair machinery is installed (coordinator, DDL path,
     /// write path, pair state), not merely the mode -- so the node genuinely
     /// behaves as a pair afterwards rather than reporting pair mode while still
     /// writing through the cluster path.
-    pub fn downgrade_to_pair(&self) -> Result<Uuid> {
-        let peers = self.connected_peers.lock().clone();
-        let Some((peer_host_id, peer_addr)) = peers.first().copied() else {
+    pub fn downgrade_to_pair(&self, named_peer: Option<Uuid>) -> Result<Uuid> {
+        let Some(named_peer) = named_peer else {
             return Err(ClusterError::ModeTransitionRejected(
-                "downgrade to pair requires a connected peer to replicate to; none is \
-                 connected — is the intended peer running and reachable?"
+                "downgrade to pair requires a named peer to replicate to; pass the \
+                 peer's host id"
                     .into(),
             ));
+        };
+        let running_groups = self.raft_groups.load().len();
+        if running_groups > 0 {
+            return Err(ClusterError::ModeTransitionRejected(format!(
+                "downgrade to pair refused: Raft is running ({running_groups} group(s)); \
+                 this node is still a voter and a replica, so committing point-to-point \
+                 would split the cluster. Decommission the other members first; an \
+                 in-place Raft shutdown is not supported yet"
+            )));
+        }
+        if let Some(ring) = self.token_ring() {
+            let allowed = [
+                crate::raft::uuid_to_node_id(self.local_host_id),
+                crate::raft::uuid_to_node_id(named_peer),
+            ];
+            let others: Vec<String> = ring
+                .node_ids()
+                .into_iter()
+                .filter(|id| !allowed.contains(id))
+                .map(|id| {
+                    ring.get_node(id)
+                        .map(|n| n.host_id.to_string())
+                        .unwrap_or_else(|| format!("node_id {id}"))
+                })
+                .collect();
+            if !others.is_empty() {
+                return Err(ClusterError::ModeTransitionRejected(format!(
+                    "downgrade to pair refused: the token ring still holds members other \
+                     than this node and {named_peer}: {others:?}. They are still replicas; \
+                     decommission them first"
+                )));
+            }
+        }
+        let peers = self.connected_peers.lock().clone();
+        let Some((peer_host_id, peer_addr)) =
+            peers.iter().copied().find(|(id, _)| *id == named_peer)
+        else {
+            let connected: Vec<String> = peers.iter().map(|(id, _)| id.to_string()).collect();
+            return Err(ClusterError::ModeTransitionRejected(format!(
+                "downgrade to pair requires the named peer {named_peer} to be a connected \
+                 peer to replicate to; connected peers: {connected:?} — is the intended \
+                 peer running and reachable?"
+            )));
         };
         {
             // Hold `transition_guard` across the transition so the mode cannot
@@ -105,14 +156,24 @@ impl ModeController {
     /// Initiate switchover: swap primary/secondary roles.
     ///
     /// Must be called on the current primary. Both nodes must be connected.
+    ///
+    /// Refused unless the peer is caught up: no data catch-up replay may be
+    /// running or have failed, and the peer must confirm it converged to this
+    /// node's schema (pushed here, so a missed ALTER is applied first).
+    /// Promoting a peer that is behind makes it serve wrong answers -- a
+    /// written value read back as null.
     pub async fn switchover(&self) -> Result<()> {
-        let (role_arc, peer_host_id) = {
+        let (role_arc, peer_host_id, catch_up) = {
             let ctx = self.pair_context.lock();
             let ctx = ctx.as_ref().ok_or(ClusterError::ModeTransitionRejected(
                 "switchover requires pair mode; current node is standalone".into(),
             ))?;
-            (ctx.role.clone(), ctx.peer_host_id)
+            (ctx.role.clone(), ctx.peer_host_id, ctx.catch_up.clone())
         };
+        if **role_arc.load() != crate::pair::PairRole::Primary {
+            return Err(ClusterError::NotPrimary);
+        }
+        catch_up.ready()?;
 
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
@@ -122,6 +183,9 @@ impl ModeController {
                 ));
             }
         };
+
+        crate::pair::switchover::push_schema_and_confirm(&peer_manager, peer_host_id, &self.schema)
+            .await?;
 
         crate::pair::switchover::initiate_switchover(
             &peer_manager,

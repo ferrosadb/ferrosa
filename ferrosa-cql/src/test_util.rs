@@ -29,6 +29,64 @@ use crate::virtual_tables::{FullScanTracker, IndexUsageTracker};
 /// rooted at `data_dir`. Auth is disabled; DML/DDL execute against a real local
 /// `StorageEngine`. The caller owns `data_dir` (e.g. a `tempfile::TempDir`).
 pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
+    standalone_for_test_with_flush_threshold(data_dir, 4096)
+}
+
+/// [`standalone_for_test`] with an explicit memtable flush threshold.
+///
+/// The default fixture flushes every 4 KiB, so a few thousand padded rows
+/// become hundreds of SSTables, and a range scan's per-source buffers then
+/// grow with the table. A memory-bound test that compares two table sizes
+/// needs the scan's own footprint held constant, so it keeps the data in the
+/// memtable with a large threshold.
+pub fn standalone_for_test_with_flush_threshold(
+    data_dir: &Path,
+    flush_threshold_bytes: u64,
+) -> Arc<SharedState> {
+    standalone_for_test_with(
+        data_dir,
+        StandaloneOptions {
+            flush_threshold_bytes,
+            ..StandaloneOptions::default()
+        },
+    )
+}
+
+/// Knobs for [`standalone_for_test_with`].
+pub struct StandaloneOptions {
+    /// Memtable flush threshold (see [`standalone_for_test_with_flush_threshold`]).
+    pub flush_threshold_bytes: u64,
+    /// The node's host id; random when `None`.
+    pub host_id: Option<uuid::Uuid>,
+    /// An internode peer manager, so the node can reach other test nodes
+    /// (e.g. to forward a result-cursor page request).
+    pub peer_manager: Option<Arc<ferrosa_net::peer::PeerManager>>,
+    /// Result-cursor tunables (TTL, cap, close grace).
+    pub cursor_config: crate::result_cursor::ResultCursorConfig,
+}
+
+impl Default for StandaloneOptions {
+    fn default() -> Self {
+        Self {
+            flush_threshold_bytes: 4096,
+            host_id: None,
+            peer_manager: None,
+            cursor_config: crate::result_cursor::ResultCursorConfig::default(),
+        }
+    }
+}
+
+/// [`standalone_for_test`] with explicit [`StandaloneOptions`]: a standalone
+/// node that can still be given an identity and internode peers, which is what
+/// a multi-coordinator test of result-cursor forwarding needs.
+pub fn standalone_for_test_with(data_dir: &Path, options: StandaloneOptions) -> Arc<SharedState> {
+    let StandaloneOptions {
+        flush_threshold_bytes,
+        host_id,
+        peer_manager,
+        cursor_config,
+    } = options;
+    let host_id = host_id.unwrap_or_else(uuid::Uuid::new_v4);
     let commit_log = CommitLogConfig {
         log_dir: data_dir.join("commitlog"),
         checkpoint_dir: data_dir.join("commitlog"),
@@ -41,7 +99,7 @@ pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
         object_store: None,
         local_cache_max_bytes: 1024 * 1024,
         local_disk_free_reserve_bytes: 0,
-        flush_threshold_bytes: 4096,
+        flush_threshold_bytes,
         memtable_backpressure_bytes: u64::MAX,
         flush_max_age_secs: 5,
         data_dir: data_dir.to_path_buf(),
@@ -72,7 +130,7 @@ pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
         data_center: "dc1".into(),
         rack: "rack1".into(),
         rpc_port: 9042,
-        host_id: uuid::Uuid::new_v4(),
+        host_id,
         listen_address: "127.0.0.1".parse().unwrap(),
         listen_port: 7000,
         broadcast_address: "127.0.0.1".parse().unwrap(),
@@ -104,7 +162,7 @@ pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
             udf_executor,
             mode_controller,
             auth_warn: false,
-            peer_manager: None,
+            peer_manager,
             accord_clock: None,
             accord_state: ferrosa_cluster::accord::empty_accord_state_slot(),
         }),
@@ -120,6 +178,10 @@ pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
         topology_policy: ClientTopologyPolicy::default(),
         txn_registry: std::sync::Arc::new(parking_lot::Mutex::new(
             crate::txn_registry::TransactionRegistry::default(),
+        )),
+        result_cursors: Arc::new(crate::result_cursor::ResultCursorRegistry::new(
+            cursor_config,
+            host_id,
         )),
     })
 }

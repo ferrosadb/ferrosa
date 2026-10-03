@@ -448,6 +448,19 @@ async fn digest_read_attempt(
     }
 }
 
+/// Why a full re-fetch from a newer replica produced no partition. Kept apart
+/// from `Ok(None)` (the replica answered "not found") so a reply that cannot
+/// be decoded is never read as an absent partition.
+#[derive(Debug)]
+pub(crate) enum RefetchError {
+    /// The replica could not be reached or did not answer.
+    Unreachable(ClusterError),
+    /// The replica answered with something that is not a usable ReadResponse
+    /// (undecodable bytes, e.g. an incompatible wire format, or the wrong
+    /// message type).
+    Malformed(String),
+}
+
 /// Decode a [`ReadResponsePayload`] from raw bytes, or return `None`.
 fn decode_read_response(bytes: &[u8]) -> Option<ReadResponsePayload> {
     bincode::deserialize(bytes)
@@ -541,6 +554,9 @@ impl ClusterCoordinator {
             .await
     }
 
+    /// Fetch the full partition from `host_id`. `Ok(None)` means the replica
+    /// answered and does not hold the partition; every failure to get a usable
+    /// answer is an `Err` so it can never be mistaken for an absent partition.
     async fn full_refetch_limited_rows(
         &self,
         table_id: &TableId,
@@ -549,7 +565,7 @@ impl ClusterCoordinator {
         row_limit: usize,
         clustering: Option<&[u8]>,
         start_clustering: Option<&[u8]>,
-    ) -> Option<Partition> {
+    ) -> Result<Option<Partition>, RefetchError> {
         let addr = {
             let ring = self.ring.load();
             ring.node_ids()
@@ -557,7 +573,12 @@ impl ClusterCoordinator {
                 .filter_map(|node_id| ring.get_node(node_id))
                 .find(|node| node.host_id == host_id)
                 .map(|node| node.addr.clone())
-        }?;
+        }
+        .ok_or_else(|| {
+            RefetchError::Unreachable(ClusterError::Internal(format!(
+                "full re-fetch: replica {host_id} is not in the ring"
+            )))
+        })?;
         let payload = ReadRequestPayload {
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
@@ -572,11 +593,25 @@ impl ClusterCoordinator {
             .send_remote_with_reconnect(host_id, &addr, message, Lane::Data)
             .await
         {
-            Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
-                Some(resp) if resp.found => resp.partition.map(partition_from_wire),
-                _ => None,
-            },
-            _ => None,
+            Ok(Message::ReadResponse(b)) => {
+                let resp: ReadResponsePayload = bincode::deserialize(&b).map_err(|e| {
+                    RefetchError::Malformed(format!(
+                        "full re-fetch of {table_id} from {host_id}: ReadResponse ({} bytes) \
+                         does not decode: {e}",
+                        b.len()
+                    ))
+                })?;
+                Ok(if resp.found {
+                    resp.partition.map(partition_from_wire)
+                } else {
+                    None
+                })
+            }
+            Ok(other) => Err(RefetchError::Malformed(format!(
+                "full re-fetch of {table_id} from {host_id}: expected ReadResponse, got {:?}",
+                other.msg_type()
+            ))),
+            Err(e) => Err(RefetchError::Unreachable(e)),
         }
     }
 
@@ -586,7 +621,7 @@ impl ClusterCoordinator {
         table_id: &TableId,
         key: &DecoratedKey,
         host_id: uuid::Uuid,
-    ) -> Option<Partition> {
+    ) -> Result<Option<Partition>, RefetchError> {
         self.full_refetch_limited_rows(table_id, key, host_id, 0, None, None)
             .await
     }
@@ -988,7 +1023,7 @@ impl ClusterCoordinator {
             );
 
             if let Some(hid) = newest_remote_host_id {
-                if let Some(newer_partition) = self
+                let refetched = self
                     .full_refetch_limited_rows(
                         table_id,
                         key,
@@ -997,8 +1032,23 @@ impl ClusterCoordinator {
                         clustering.as_deref(),
                         start_clustering.as_deref(),
                     )
-                    .await
-                {
+                    .await;
+                let refetched = match refetched {
+                    Ok(partition) => partition,
+                    // A reply that does not decode is not a timeout and not an
+                    // absent partition: surface it as what it is.
+                    Err(RefetchError::Malformed(reason)) => {
+                        tracing::error!(table = %table_id, replica = %hid, %reason,
+                            "full re-fetch from newer replica returned a malformed reply");
+                        return Err(ClusterError::Internal(reason));
+                    }
+                    Err(RefetchError::Unreachable(e)) => {
+                        tracing::warn!(table = %table_id, replica = %hid, %e,
+                            "full re-fetch from newer replica could not reach it");
+                        None
+                    }
+                };
+                if let Some(newer_partition) = refetched {
                     // The full-read replica (and any other mismatched digests
                     // except the one we just fetched from) are stale.
                     let mut stale: Vec<uuid::Uuid> = digest_responses
@@ -1189,8 +1239,29 @@ impl ClusterCoordinator {
                 {
                     Ok(Some(rows)) if !rows.is_empty() => return Ok(Some(rows)),
                     Ok(_) => {
-                        received_response = true;
-                        continue; // no data on this replica, try next
+                        // A NEGATIVE ANSWER FROM THE LOCAL REPLICA ENDS THE READ.
+                        //
+                        // The local node is one of the replicas, and at CL=ONE /
+                        // LOCAL_ONE this read asks ONE replica. Its "not here" is
+                        // an answer, not an invitation to ask somebody else --
+                        // continuing here turned a one-replica read into a
+                        // fan-out over every replica in the ring, which is CL=ALL
+                        // behaviour wearing a CL=ONE label.
+                        //
+                        // The cost was the live outage: each remote probe is
+                        // bounded only by the Data-lane timeout (10s), so an
+                        // absent key at CL=ONE took 10s per unreachable remote
+                        // while a PRESENT key returned in 1ms (only the present
+                        // case returned early). The session replay probes cursors
+                        // that do not exist yet, so every session paid that
+                        // timeout, blew its 30s deadline, and was closed as a
+                        // protocol violation: no blueprints, no workers, no
+                        // sessions, reconnect every ~30s.
+                        //
+                        // Only a local STORAGE ERROR may advance to the next
+                        // candidate, and that case is handled below -- a negative
+                        // answer is not an error.
+                        return Ok(None);
                     }
                     Err(ClusterError::Storage(ref e)) if e.corrupt_sstable_range().is_some() => {
                         // Genuine local SSTable corruption (storage already
@@ -2463,6 +2534,42 @@ mod tests {
         }
     }
 
+    /// A remote replica that is REACHABLE but slow, and answers "absent".
+    ///
+    /// It counts the read requests it received, so a test can prove the
+    /// coordinator never probed it. A "reachable but slow" peer (rather than a
+    /// dead address) makes the timing deterministic: an absent CL=ONE read that
+    /// still fans out waits for this handler's `delay`.
+    struct SlowAbsentReadHandler {
+        delay: std::time::Duration,
+        probed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for SlowAbsentReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::ReadRequest(body) = msg else {
+                return None;
+            };
+            let _req: ReadRequestPayload = bincode::deserialize(&body).ok()?;
+            // Count BEFORE the sleep so a probe is visible immediately.
+            self.probed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            let payload = ReadResponsePayload {
+                found: false,
+                partition: None,
+                timestamp: i64::MIN,
+                digest: None,
+                has_more: false,
+                next_page_state: Vec::new(),
+            };
+            Some(Message::ReadResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
     struct StaticDigestReadHandler {
         partition: Partition,
     }
@@ -2957,6 +3064,105 @@ mod tests {
         // With CL=ONE the coordinator must succeed using only the local replica.
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
         assert!(result.is_some(), "CL=ONE should return local data");
+    }
+
+    /// An ABSENT key at CL=ONE must be answered by the LOCAL replica alone.
+    ///
+    /// The local replica is authoritative for "this row is not here", so its
+    /// negative answer must END the read. Instead the coordinator treats it as
+    /// "no data on THIS replica, try the next" and fans out to every remote
+    /// replica, where each unreachable peer costs a full Data-lane timeout
+    /// (`PAUSED_RPC_DEADLINE`, 10s). That is the live symptom: a CL=ONE point
+    /// lookup for an absent row took 10.004s on a cluster whose node2 was down,
+    /// while the same lookup for a PRESENT row returned in 0.001s -- because only
+    /// the present case returns early.
+    ///
+    /// The cost is not academic. The memory listener's session replay probes for
+    /// cursors that do not exist yet, so every session paid a lane timeout per
+    /// absent probe, blew its 30s deadline, and was closed as a protocol
+    /// violation: no blueprints, no workers, no sessions, reconnect every ~30s.
+    ///
+    /// Two properties, and the second is the one that catches a regression that
+    /// is merely FAST rather than correct:
+    ///   1. an absent CL=ONE read completes well inside a small bound, and
+    ///   2. it never sends a read to a remote replica at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinate_read_absent_key_at_one_does_not_fan_out_to_remote_replicas() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+
+        // A reachable, SLOW remote that always answers "not found". Every probe
+        // it receives is counted, so the fan-out is observable rather than
+        // inferred from elapsed time.
+        let probed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::ReadRequest,
+            Arc::new(SlowAbsentReadHandler {
+                delay: std::time::Duration::from_secs(4),
+                probed: Arc::clone(&probed),
+            }),
+        )
+        .await;
+        let _server = server; // kept alive for the read
+
+        // Point the remote replicas at that server so a fan-out is a REAL send
+        // that the handler counts, rather than a call into an empty pool.
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        for (id, port) in [(2u64, 100), (3u64, 200)] {
+            let mut n = make_node(&addr.to_string());
+            n.host_id = remote_host_id;
+            ring.add_node(id, n);
+            ring.assign_tokens(id, &[port]);
+        }
+        ring.assign_tokens(local_node_id, &[50]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm,
+            local_node_id,
+            storage.clone(),
+            3, // RF=3
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        // Deliberately NO write: the key is absent on the local replica, which is
+        // authoritative for that answer.
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            coordinator.coordinate_read(&table_id, &key),
+        )
+        .await
+        .expect("an absent CL=ONE read must not stall on remote replicas")
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(result.is_none(), "an absent key has no rows to return");
+        assert_eq!(
+            probed.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an absent key must be answered by the local replica and never probed \
+             on a remote; each remote probe costs a full Data-lane timeout"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "an absent CL=ONE read took {elapsed:?}; the local replica is \
+             authoritative and no timeout should be reachable"
+        );
     }
 
     /// Two replicas with different timestamps: coordinator returns newest (LWW).
@@ -3972,9 +4178,70 @@ mod tests {
             .full_refetch(&table_id, &key, Uuid::new_v4())
             .await;
         assert!(
-            result.is_none(),
-            "full_refetch should return None when replica is unreachable"
+            matches!(result, Err(RefetchError::Unreachable(_))),
+            "an unreachable replica is a failed refetch, not an absent partition: {result:?}"
         );
+    }
+
+    /// Replies with bytes that do not decode as a `ReadResponsePayload`, as a
+    /// replica on an incompatible wire format would.
+    struct UndecodableReadHandler;
+
+    #[async_trait::async_trait]
+    impl RpcHandler for UndecodableReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            matches!(
+                msg,
+                Message::ReadRequest(_) | Message::PartitionSuffixReadRequest(_)
+            )
+            .then(|| Message::ReadResponse(Bytes::from_static(&[2, 0xff, 0xff])))
+        }
+    }
+
+    /// A ReadResponse that does not decode is a malformed reply, NEVER
+    /// "partition not found": the refetch only runs because a digest said this
+    /// replica holds newer data. It used to return `None`, the same value as an
+    /// absent partition, with only a WARN from the decoder.
+    #[tokio::test]
+    async fn full_refetch_reports_an_undecodable_response_as_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+        let (_server, addr, remote_host_id) =
+            start_rpc_server(MsgType::ReadRequest, Arc::new(UndecodableReadHandler)).await;
+
+        let local_node_id = 1u64;
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage,
+            2,
+            ConsistencyLevel::One,
+        );
+
+        let result = coordinator
+            .full_refetch(
+                &TableId::new("test_ks", "test_tbl"),
+                &test_key(),
+                remote_host_id,
+            )
+            .await;
+        match result {
+            Err(RefetchError::Malformed(reason)) => {
+                assert!(reason.contains("decode"), "reason must say why: {reason}")
+            }
+            other => panic!("an undecodable reply must be Malformed, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

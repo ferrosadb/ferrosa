@@ -1,8 +1,9 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::codec::Lane;
+use crate::codec::{Lane, MsgType};
 use crate::rpc::client::orphan_response_count;
+use crate::rpc::error_reply::RemoteFailureKind;
 
 const LANES: [Lane; 3] = [Lane::Raft, Lane::Data, Lane::Bulk];
 const DEFAULT_DATA_LANE_MAX_IN_FLIGHT: usize = 256;
@@ -51,6 +52,64 @@ static DATA_LANE_CAP_BLOCKED: AtomicU64 = AtomicU64::new(0);
 static DATA_LANE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static DATA_LANE_ACTIVE_MAX: AtomicUsize = AtomicUsize::new(0);
 static DATA_LANE_MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(DEFAULT_DATA_LANE_MAX_IN_FLIGHT);
+/// Inbound RPC handler panics, indexed by the request's `MsgType` wire byte.
+static RPC_HANDLER_PANICS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+
+/// Inbound RPC requests that got no response, by `RemoteFailureKind` code
+/// (index 0 is unused; unknown codes never originate locally).
+static RPC_HANDLER_FAILURES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+const LOCAL_FAILURE_KINDS: [RemoteFailureKind; 4] = [
+    RemoteFailureKind::HandlerPanicked,
+    RemoteFailureKind::ResponseEncodeFailed,
+    RemoteFailureKind::RequestDecodeFailed,
+    RemoteFailureKind::ResponseTooLarge,
+];
+
+/// Handler panics recorded for `msg_type` since process start.
+pub fn rpc_handler_panics(msg_type: MsgType) -> u64 {
+    RPC_HANDLER_PANICS[msg_type as usize].load(Ordering::Relaxed)
+}
+
+pub fn record_rpc_handler_panic(msg_type: MsgType) {
+    RPC_HANDLER_PANICS[msg_type as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count an inbound request that will get no response.
+pub fn record_rpc_handler_failure(kind: RemoteFailureKind) {
+    match RPC_HANDLER_FAILURES.get(usize::from(kind.code())) {
+        Some(counter) => {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        None => tracing::error!(%kind, "handler failure kind has no metric slot"),
+    }
+}
+
+fn render_rpc_handler_failures(output: &mut String) {
+    output.push_str("# HELP ferrosa_net_rpc_handler_panics_total Inbound internode RPC handlers that panicked, by request type.\n");
+    output.push_str("# TYPE ferrosa_net_rpc_handler_panics_total counter\n");
+    for (code, counter) in RPC_HANDLER_PANICS.iter().enumerate() {
+        let count = counter.load(Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        let label = u8::try_from(code)
+            .ok()
+            .and_then(|byte| MsgType::try_from(byte).ok())
+            .map_or_else(|| format!("0x{code:02x}"), |t| format!("{t:?}"));
+        output.push_str(&format!(
+            "ferrosa_net_rpc_handler_panics_total{{msg_type=\"{label}\"}} {count}\n"
+        ));
+    }
+    output.push_str("# HELP ferrosa_net_rpc_handler_failures_total Inbound internode RPC requests that got no response, by cause.\n");
+    output.push_str("# TYPE ferrosa_net_rpc_handler_failures_total counter\n");
+    for kind in LOCAL_FAILURE_KINDS {
+        output.push_str(&format!(
+            "ferrosa_net_rpc_handler_failures_total{{kind=\"{}\"}} {}\n",
+            kind.as_str(),
+            RPC_HANDLER_FAILURES[usize::from(kind.code())].load(Ordering::Relaxed)
+        ));
+    }
+}
 
 fn update_max_u64(target: &AtomicU64, value: u64) {
     let mut current = target.load(Ordering::Relaxed);
@@ -297,6 +356,7 @@ pub fn render_prometheus() -> String {
         "ferrosa_net_rpc_orphan_responses_total {}\n",
         orphan_response_count()
     ));
+    render_rpc_handler_failures(&mut output);
 
     output
 }

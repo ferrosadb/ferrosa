@@ -278,6 +278,12 @@ early acknowledgement.
   `CLUSTER_REJOIN_ATTEMPTS_TOTAL` / `_FAILURES_TOTAL`.
 - `pair/` — two-node primary/secondary coordination (deterministic host-ID
   ordering, independent of which TCP direction wins), switchover, catch-up.
+  Schema catch-up (`PairSchemaSyncHandler`) is applied only by a receiver: a
+  primary refuses a peer's snapshot. A receiver converges to the primary's
+  keyspaces and tables (inserting, replacing a stale definition, dropping what
+  the primary dropped), verifies, adopts the primary's schema version and acks
+  with it (CL-33). Switchover refuses until the peer confirms that version and
+  no rejoin data replay is running or failed (`CatchUpGate`, CL-34).
   `ModeController::choose_pair_role` gives `Primary` to the **lowest** host_id
   (`local_host_id <= peer_host_id`). A node with no `FERROSA_HOST_ID` generates
   a random UUID on first boot, so any deployment that needs a predictable
@@ -287,6 +293,13 @@ early acknowledgement.
   reporting healthy on `/readyz`, so an unpinned stack can hand you a node that
   looks up but serves nothing.
 - `rebalance.rs` — token-skew rebalancing with data streaming.
+- `raft/handlers.rs` `RowWire`/`CellValueWire` — the bincode row format of
+  coordinator reads, anti-entropy repair, range-read streaming, digests and
+  bootstrap/decommission/rebalance streaming. A complex (non-frozen collection)
+  cell carries its path behind leading tag `2`; simple cells keep the legacy
+  bytes. A node older than this format refuses a complex cell with a decode
+  error rather than flattening it, and the row-stream receiver fails a session
+  whose payload does not decode (FMEA CL-32).
 - `controller/jsonb_gate.rs` (T-300, D24) — while any table holds jsonb, a
   standalone node may not move to Pair, Forming or Cluster: the transition entry
   points and `try_transition_mode` refuse, naming the tables and the D15a
@@ -315,11 +328,33 @@ early acknowledgement.
   make that degraded state reportable; `GET /api/cluster/ring` returns
   `ring_healthy`, `non_normal_members` and `data_scatter_risk` (CL-29).
 - `repair/coordinator.rs::promote_joining_members` — pure Promote-phase planner:
-  one `SetNodeState{Normal}` per `Joining` member, and nothing for
+  one `SetNodeState{Normal}` per `Joining` member WHOSE BOOTSTRAP IS RECORDED
+  (`RaftOp::RecordBootstrapComplete`, CL-41), and nothing for
   `Leaving` / `Decommissioned` / `Learner` (operator intent and the ADR-014
-  learner state are never reversed). The controller runs it on the
-  recovered-topology path, which previously skipped promotion outright and so
-  left a mid-join node stuck `Joining` across every restart (CL-29).
+  learner state are never reversed). `joiners_awaiting_bootstrap` names the
+  unrecorded joiners, which stay `Joining`. The controller runs it on the
+  recovered-topology path (CL-29); a joiner found unrecorded there reruns its
+  own bootstrap.
+- `controller/data_movement.rs` — no replica-ownership change without verified
+  data movement (CL-40, CL-41):
+  - `decommission_verified`: `Leaving` → stream every partition of every range
+    the leaving node REPLICATES (per keyspace strategy, `DecommissionPlan`) to
+    each new owner, each batch verified by the receiver → only then
+    `LeaveNode`. Any read error, stream rejection, short apply or range left
+    with no replica aborts; the node stays `Leaving` with its data
+    (`DECOMMISSION_ABORTS`). `ModeController::initiate_decommission` runs it and
+    only for the local node.
+  - `bootstrap_verified`: one Merkle anti-entropy session per (table, range the
+    joiner will replicate, current replica), all must succeed, then
+    `RecordBootstrapComplete`, then `Normal` (`BOOTSTRAP_ABORTS`).
+  - The row-stream `StreamEnd` reply carries a `StreamEndAck` verdict
+    (`Applied { applied }` / `Rejected { reason }`); `StreamSender::send_stream`
+    returns the verified applied count and fails on a rejection or a pre-upgrade
+    peer's bare `ok`.
+- `ModeController::downgrade_to_pair(Some(peer))` — operator downgrade. Refuses
+  without a named peer, while any Raft group runs on the node, or while the
+  ring holds any other member (CL-42). With no in-place Raft shutdown it is
+  refused in every live cluster.
 
 ### Accord transactions (`accord/`)
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
@@ -348,6 +383,15 @@ early acknowledgement.
   this, two transactions whose PreAccepts crossed each waited on the other until
   the 5 s dependency wait failed both, with every replica live (FMEA CL-28). A
   dependency cycle among parked transactions is refused loudly, never dropped.
+  A PreAccept for a transaction the replica already knows is decided is
+  refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)
+  and registers nothing; otherwise a PreAccept queued behind a no-write
+  finalize, or delayed past `prune_applied`, would register a conflict nothing
+  ever clears (FMEA CL-36). The record is `finalized.rs`'s `FinalizedTxns`:
+  exact tombstones plus a monotone floor, bounded by a 60 s retention horizon
+  (advanced by `prune_applied` from the shared HLC), a 250 000-id cap that
+  evicts into the floor, and a restart floor set when the HLC is wired, since
+  the replica does not replay its Accord log.
   `accord/quorum_availability.rs` drives real replicas through the real committer
   to pin the criterion: a live quorum commits while one replica is paused, and a
   lost quorum fails promptly naming the quorum.

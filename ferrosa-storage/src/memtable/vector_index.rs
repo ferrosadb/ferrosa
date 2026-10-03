@@ -208,6 +208,21 @@ impl VectorMemtableIndex {
         positions.into_iter().zip(vectors).collect()
     }
 
+    /// Every vector with its optional prefix scope, leaving the index intact:
+    /// a flush reads a frozen memtable's index this way so ANN reads can keep
+    /// using it until the flushed sidecar is installed.
+    pub fn entries_with_scopes(&self) -> Vec<(Option<Vec<u8>>, RowPosition, Vec<f32>)> {
+        let inner = self.inner.read();
+        inner
+            .scopes
+            .iter()
+            .cloned()
+            .zip(inner.positions.iter().cloned())
+            .zip(inner.vectors.iter().cloned())
+            .map(|((scope, position), vector)| (scope, position, vector))
+            .collect()
+    }
+
     /// Drain all vectors from the index with their optional prefix scopes.
     pub fn drain_with_scopes(&self) -> Vec<(Option<Vec<u8>>, RowPosition, Vec<f32>)> {
         let mut inner = self.inner.write();

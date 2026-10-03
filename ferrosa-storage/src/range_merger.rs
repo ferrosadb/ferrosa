@@ -39,22 +39,25 @@ pub const DEFAULT_ROWS_PER_FRAGMENT: usize = 4_096;
 
 /// Resolved fragment row cap `K`.
 ///
-/// `None` means "not resolved yet": the value is read from the environment on
-/// first use and cached, rather than calling `std::env::var` on every fragment
+/// The value is read from the environment on first use and cached, rather than calling `std::env::var` on every fragment
 /// flush. Both this crate's merger and `ferrosa_cluster`'s wire-frame chunker
 /// must agree on `K` (a frame must be able to carry one full fragment), so this
 /// is the ONE resolver; the cluster-side helper delegates here rather than
 /// re-reading the variable.
 ///
-/// `ArcSwap` rather than a plain atomic because the override is a set-once
-/// configuration action, and a scan in flight must observe a consistent value
-/// for its lifetime: it loads the current cap once per flush and keeps using
-/// it, which is exactly `ArcSwap`'s read-mostly shape. It also removes the
-/// process-global mutation the tests previously had to serialize with a
-/// `static Mutex` — a lock that cannot work at all under nextest, which runs
-/// one process per test.
+/// `ArcSwap` keeps the read side lock-free: a scan loads the cap once per
+/// fragment flush. Only an override (tests) ever stores to it, and an
+/// override holds [`OVERRIDE_EXCLUSIVE`] for its whole lifetime — see
+/// [`RowsPerFragmentOverride`].
 static ROWS_PER_FRAGMENT: std::sync::OnceLock<arc_swap::ArcSwap<usize>> =
     std::sync::OnceLock::new();
+
+/// Serializes overrides of `K`. `cargo test` runs a crate's tests on parallel
+/// threads in ONE process, so without this a second test's override (or its
+/// reset) changed `K` under a first test mid-scan — a test asserting
+/// fragments of `<= 16` rows then saw 37- or 4096-row fragments. Never taken
+/// on a production path: nothing outside tests overrides `K`.
+static OVERRIDE_EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn slot() -> &'static arc_swap::ArcSwap<usize> {
     ROWS_PER_FRAGMENT
@@ -80,28 +83,45 @@ pub fn rows_per_fragment() -> usize {
     **slot().load()
 }
 
-/// Override the fragment row cap for this process.
+/// Override the fragment row cap for this process until the returned guard
+/// drops.
 ///
-/// The supported way to change `K`. Tests call this instead of mutating the
-/// process environment, so they no longer depend on cross-test mutual
-/// exclusion to be correct — and a test that sets a cap cannot corrupt a scan
-/// running in another test. A value of `0` is refused (it would loop forever);
-/// pass the default explicitly if that is what you want.
+/// The supported way to change `K` (tests). The guard holds exclusive
+/// ownership of `K`: a concurrent override blocks until this one drops, so a
+/// test's scan cannot have `K` changed underneath it. Dropping the guard puts
+/// `K` back to the environment-derived value, including on panic unwind. A
+/// value of `0` is refused (it would loop forever).
 ///
 /// Process-global by nature: `K` bounds a wire frame, so every scan in the
 /// process must agree. Making it per-scan would require threading it through
 /// the coordinator, the storage engine and the stream handlers — a much wider
 /// change for no additional safety.
-pub fn set_rows_per_fragment(cap: usize) {
+pub fn set_rows_per_fragment(cap: usize) -> RowsPerFragmentOverride {
     assert!(cap >= 1, "a fragment row cap of 0 would loop forever");
+    // A poisoned lock means an earlier holder panicked; its guard's `Drop`
+    // already restored `K` during unwind, so the protected state is sound.
+    let exclusive = OVERRIDE_EXCLUSIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     slot().store(std::sync::Arc::new(cap));
+    RowsPerFragmentOverride {
+        _exclusive: exclusive,
+    }
 }
 
-/// Put the cap back to whatever the environment says (or the default).
-///
-/// For tests that must not leak their override into a later test.
-pub fn reset_rows_per_fragment() {
-    slot().store(std::sync::Arc::new(resolve_rows_per_fragment_from_env()));
+/// Exclusive override of `K`, from [`set_rows_per_fragment`]. Restores the
+/// configured value on drop, before releasing exclusivity.
+#[must_use = "the override lasts only while this guard is alive"]
+pub struct RowsPerFragmentOverride {
+    _exclusive: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for RowsPerFragmentOverride {
+    fn drop(&mut self) {
+        // Runs before the `_exclusive` field drops, so the next override
+        // cannot observe this one's value.
+        slot().store(std::sync::Arc::new(resolve_rows_per_fragment_from_env()));
+    }
 }
 
 /// One bounded slice of a merged partition emitted by [`RangeMerger`].
@@ -1002,19 +1022,20 @@ pub fn group_disjoint_runs(bounds: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<usize>> {
 }
 
 /// Convenience constructor: build a merger from explicit source
-/// inputs. `active_iter` and `flushing_iter` are memtable iterators;
+/// inputs. `active_iter` and `flushing_iters` (one per sealed memtable)
+/// are memtable iterators;
 /// `sstables` are the per-SSTable Arcs whose `partitions_iter()`
 /// will be consumed.
 pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
     build_merger_with_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         RunMode::Full,
         start,
@@ -1026,18 +1047,18 @@ pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
 /// from one or more SSTable SerializationHeaders.
 pub fn merger_for_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mappings: &'a [ColumnOrdinalMapping],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
     if mappings.iter().all(ColumnOrdinalMapping::is_identity) {
-        return merger_for_sources(active_iter, flushing_iter, sstables, start, end);
+        return merger_for_sources(active_iter, flushing_iters, sstables, start, end);
     }
     build_merger_without_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         Some(mappings),
         RunMode::Full,
@@ -1055,7 +1076,7 @@ pub fn merger_for_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
 /// path.
 pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     wanted: &'a [u16],
     start: Option<DecoratedKey>,
@@ -1063,7 +1084,7 @@ pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
 ) -> Result<RangeMerger<'a, R>> {
     build_merger_with_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         RunMode::Projected(wanted),
         start,
@@ -1074,7 +1095,7 @@ pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
 /// Compatibility projection variant for mixed current/SSTable column order.
 pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mappings: &'a [ColumnOrdinalMapping],
     wanted: &'a [u16],
@@ -1084,7 +1105,7 @@ pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 
     if mappings.iter().all(ColumnOrdinalMapping::is_identity) {
         return merger_for_projected_sources(
             active_iter,
-            flushing_iter,
+            flushing_iters,
             sstables,
             wanted,
             start,
@@ -1093,7 +1114,7 @@ pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 
     }
     build_merger_without_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         Some(mappings),
         RunMode::Projected(wanted),
@@ -1111,14 +1132,14 @@ pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 
 /// output). Used by the COUNT(*) fast path.
 pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
     build_merger_with_runs(
         active_iter,
-        flushing_iter,
+        flushing_iters,
         sstables,
         RunMode::Metadata,
         start,
@@ -1128,19 +1149,19 @@ pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
 
 fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mappings: Option<&'a [ColumnOrdinalMapping]>,
     mode: RunMode<'a>,
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
 ) -> Result<RangeMerger<'a, R>> {
-    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + sstables.len());
+    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(1 + sstables.len());
     sources.push(MergeSource::Memtable {
         iter: active_iter,
         peeked: None,
     });
-    if let Some(it) = flushing_iter {
+    for it in flushing_iters {
         sources.push(MergeSource::Memtable {
             iter: it,
             peeked: None,
@@ -1183,7 +1204,7 @@ fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
 /// SSTables on a single table.
 fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
     active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iter: Option<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mode: RunMode<'a>,
     start: Option<DecoratedKey>,
@@ -1212,12 +1233,12 @@ fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
     // leaking the slab to the merger's lifetime. We allocate it
     // into a `Box<[Vec<Arc<...>>]>` and stash on the merger so it
     // lives as long as the iterators borrowing from it.
-    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(2 + runs.len());
+    let mut sources: Vec<MergeSource<'a, R>> = Vec::with_capacity(1 + runs.len());
     sources.push(MergeSource::Memtable {
         iter: active_iter,
         peeked: None,
     });
-    if let Some(it) = flushing_iter {
+    for it in flushing_iters {
         sources.push(MergeSource::Memtable {
             iter: it,
             peeked: None,
@@ -1847,8 +1868,8 @@ mod tests {
 
     use super::{
         group_disjoint_runs, group_disjoint_runs_by_key, merger_for_projected_sources,
-        merger_for_sources, reset_rows_per_fragment, resolve_rows_per_fragment_from_env,
-        rows_per_fragment, set_rows_per_fragment, DEFAULT_ROWS_PER_FRAGMENT,
+        merger_for_sources, resolve_rows_per_fragment_from_env, rows_per_fragment,
+        set_rows_per_fragment, DEFAULT_ROWS_PER_FRAGMENT,
     };
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
     use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
@@ -1978,7 +1999,8 @@ mod tests {
         k: usize,
     ) -> (Vec<Partition>, usize) {
         let empty_active: Box<dyn Iterator<Item = Partition> + Send> = Box::new(std::iter::empty());
-        let mut merger = merger_for_sources(empty_active, None, sstables, None, None).unwrap();
+        let mut merger =
+            merger_for_sources(empty_active, Vec::new(), sstables, None, None).unwrap();
 
         let mut out: Vec<Partition> = Vec::new();
         let mut cur: Option<Partition> = None;
@@ -2038,7 +2060,8 @@ mod tests {
     /// must reproduce.
     fn drain_whole(sstables: &[Arc<SSTableReader<Vec<u8>>>]) -> Vec<Partition> {
         let empty_active: Box<dyn Iterator<Item = Partition> + Send> = Box::new(std::iter::empty());
-        let mut merger = merger_for_sources(empty_active, None, sstables, None, None).unwrap();
+        let mut merger =
+            merger_for_sources(empty_active, Vec::new(), sstables, None, None).unwrap();
         let mut out = Vec::new();
         while let Some(p) = merger.next_merged_partition().unwrap() {
             out.push(p);
@@ -2072,8 +2095,14 @@ mod tests {
         let readers = vec![a, b];
 
         // Truth: whole-partition merge is monotonic 0..=9.
-        let mut mm =
-            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut mm = merger_for_sources(
+            Box::new(std::iter::empty()),
+            Vec::new(),
+            &readers,
+            None,
+            None,
+        )
+        .unwrap();
         let merged = mm.next_merged_partition().unwrap().unwrap();
         let merged_cks: Vec<i32> = merged
             .rows
@@ -2083,8 +2112,14 @@ mod tests {
         assert_eq!(merged_cks, (0..=9).collect::<Vec<_>>());
 
         // Fragment path must match, in monotonic order, across the two runs.
-        let mut m =
-            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut m = merger_for_sources(
+            Box::new(std::iter::empty()),
+            Vec::new(),
+            &readers,
+            None,
+            None,
+        )
+        .unwrap();
         let mut cks: Vec<i32> = Vec::new();
         while let Some(frag) = m.next_fragment(2).unwrap() {
             for r in &frag.rows {
@@ -2120,8 +2155,14 @@ mod tests {
         };
         let a = std::sync::Arc::new(reader_from_partitions(&[p]));
         let readers = vec![a];
-        let mut m =
-            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut m = merger_for_sources(
+            Box::new(std::iter::empty()),
+            Vec::new(),
+            &readers,
+            None,
+            None,
+        )
+        .unwrap();
         let mut err = None;
         loop {
             match m.next_fragment(2) {
@@ -2550,8 +2591,14 @@ mod tests {
         let good_reader = reader_from_partitions(std::slice::from_ref(&first));
         let corrupt_reader = reader_with_truncated_tail(&[first, second]);
         let sstables = vec![Arc::new(good_reader), Arc::new(corrupt_reader)];
-        let mut merger =
-            merger_for_sources(Box::new(std::iter::empty()), None, &sstables, None, None).unwrap();
+        let mut merger = merger_for_sources(
+            Box::new(std::iter::empty()),
+            Vec::new(),
+            &sstables,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(
             merger.next_merged_partition().unwrap().is_some(),
@@ -2585,7 +2632,7 @@ mod tests {
 
         let mut merger = merger_for_projected_sources(
             Box::new(std::iter::empty()),
-            None,
+            Vec::new(),
             &sstables,
             &wanted,
             None,
@@ -2612,17 +2659,51 @@ mod tests {
     /// The override is honoured, and it is what `rows_per_fragment` returns.
     ///
     /// This replaces mutating `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` via
-    /// `env::set_var`. The env route is process-global mutable state that a scan
-    /// in flight reads on every fragment flush, so tests using it had to be
-    /// mutually excluded -- which a `static Mutex` cannot do under nextest (one
-    /// process per test). The explicit setter has no such coupling.
+    /// `env::set_var`, which a scan in flight read on every fragment flush.
     #[test]
     fn set_rows_per_fragment_overrides_the_value_in_force() {
-        set_rows_per_fragment(1);
-        assert_eq!(rows_per_fragment(), 1);
-        set_rows_per_fragment(37);
+        {
+            let _k = set_rows_per_fragment(1);
+            assert_eq!(rows_per_fragment(), 1);
+        }
+        let _k = set_rows_per_fragment(37);
         assert_eq!(rows_per_fragment(), 37);
-        reset_rows_per_fragment();
+    }
+
+    /// An override is isolated from a concurrent test's override.
+    ///
+    /// `cargo test` runs a crate's tests on parallel threads in ONE process,
+    /// so a second test overriding K while the first is mid-scan must not
+    /// change the K the first observes: the second override waits for the
+    /// first to drop. Before the guard, the other thread's store landed at
+    /// once and this test saw K = 1.
+    #[test]
+    fn an_override_is_not_changed_by_a_concurrent_override() {
+        let first = set_rows_per_fragment(16);
+        let (took_tx, took_rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let _k = set_rows_per_fragment(1);
+            took_tx.send(rows_per_fragment()).expect("report");
+        });
+        // Give the other override every chance to land; it must not.
+        let raced = took_rx.recv_timeout(std::time::Duration::from_millis(200));
+        assert!(
+            raced.is_err(),
+            "a concurrent override ran while this one was held (saw K = {raced:?})"
+        );
+        assert_eq!(
+            rows_per_fragment(),
+            16,
+            "another test's override leaked into this one"
+        );
+        drop(first);
+        other.join().expect("other test thread");
+        assert_eq!(
+            took_rx
+                .recv()
+                .expect("the other override runs once this one drops"),
+            1
+        );
     }
 
     /// A cap of zero is refused rather than accepted.
@@ -2633,21 +2714,39 @@ mod tests {
     #[test]
     #[should_panic(expected = "loop forever")]
     fn a_zero_cap_is_refused() {
-        set_rows_per_fragment(0);
+        let _k = set_rows_per_fragment(0);
     }
 
-    /// `reset` restores the environment-derived value, not the override.
+    /// Dropping the override restores the environment-derived value.
     #[test]
-    fn reset_returns_to_the_configured_value() {
-        set_rows_per_fragment(1);
+    fn dropping_the_override_returns_to_the_configured_value() {
+        let k = set_rows_per_fragment(1);
         assert_eq!(rows_per_fragment(), 1);
-        reset_rows_per_fragment();
-        let expected = resolve_rows_per_fragment_from_env();
+        drop(k);
+        // Every override holds the exclusion, so while WE hold it none is
+        // active and K must be the configured value.
+        let _none_active = super::OVERRIDE_EXCLUSIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             rows_per_fragment(),
-            expected,
-            "reset must fall back to the environment, not leave the override in place"
+            resolve_rows_per_fragment_from_env(),
+            "dropping must fall back to the environment, not leave the override in place"
         );
+    }
+
+    /// A test that panics while holding the override still restores K and
+    /// does not wedge every later override behind a poisoned lock.
+    #[test]
+    fn a_panicking_holder_restores_k_and_releases_the_override() {
+        let joined = std::thread::spawn(|| {
+            let _k = set_rows_per_fragment(3);
+            panic!("simulated test failure while holding the override");
+        })
+        .join();
+        assert!(joined.is_err(), "the holder thread must have panicked");
+        let _k = set_rows_per_fragment(5);
+        assert_eq!(rows_per_fragment(), 5);
     }
 
     /// The env-derived resolver always produces a terminating cap.

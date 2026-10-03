@@ -33,6 +33,17 @@ pub struct StreamedMutation {
     pub timestamp: i64,
 }
 
+/// A fresh session id for an outbound stream.
+///
+/// The receiver keys in-flight sessions by id alone. Every source used to
+/// number its sessions from 1, so two sources streaming to one target at once
+/// overwrote each other's session: one stream's data was applied under the
+/// other's `StreamEnd` and the other was rejected as unknown. A random 64-bit
+/// id makes a collision negligible.
+pub fn new_session_id() -> u64 {
+    uuid::Uuid::new_v4().as_u64_pair().0
+}
+
 /// Payload carried in a `StreamStart` message.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct StreamStartPayload {
@@ -63,6 +74,34 @@ pub struct StreamEndPayload {
     pub total_mutations: u64,
     /// CRC32 checksum computed over all serialised `StreamedMutation` bytes in order.
     pub checksum: u32,
+}
+
+/// What the receiver did with a row stream, carried in the `StreamEnd` reply.
+///
+/// The reply used to be a bare `b"ok"` sent whether the session applied, failed
+/// its checksum, or was never found, so a sender could not tell a delivered
+/// stream from a discarded one. Membership changes gate on this verdict (P0-2).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum StreamEndOutcome {
+    /// Count and checksum matched and every mutation was applied.
+    Applied {
+        /// Mutations applied to the receiver's storage.
+        applied: u64,
+    },
+    /// The session was not applied. Nothing from it should be counted as moved.
+    Rejected {
+        /// Why, as the receiver logged it.
+        reason: String,
+    },
+}
+
+/// Payload of the `StreamEnd` reply.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StreamEndAck {
+    /// Session the verdict is for.
+    pub session_id: u64,
+    /// The receiver's verdict.
+    pub outcome: StreamEndOutcome,
 }
 
 // ---------------------------------------------------------------------------

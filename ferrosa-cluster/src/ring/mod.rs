@@ -20,6 +20,11 @@ pub struct TokenRing {
     ring: BTreeMap<Token, u64>,
     /// Node metadata.
     nodes: BTreeMap<u64, NodeInfo>,
+    /// Members with a committed `RecordBootstrapComplete` (P0-4), copied from
+    /// `RaftState::bootstrap_complete` by the state machine's ring sync so the
+    /// promote pass can gate on it. Not serialized: it is derived state.
+    #[serde(skip)]
+    bootstrap_complete: std::collections::BTreeSet<u64>,
 }
 
 impl TokenRing {
@@ -150,6 +155,16 @@ impl TokenRing {
         }
 
         candidates.iter().take(count).map(|n| n.host_id).collect()
+    }
+
+    /// Replace the set of members whose bootstrap completed and was verified.
+    pub fn set_bootstrap_complete(&mut self, nodes: std::collections::BTreeSet<u64>) {
+        self.bootstrap_complete = nodes;
+    }
+
+    /// Whether `node_id` has a committed, verified bootstrap record (P0-4).
+    pub fn bootstrap_complete(&self, node_id: u64) -> bool {
+        self.bootstrap_complete.contains(&node_id)
     }
 
     /// Update the lifecycle state of a node.

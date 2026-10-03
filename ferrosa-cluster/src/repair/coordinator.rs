@@ -368,24 +368,50 @@ pub fn ring_data_scatter_risk(ring: &TokenRing) -> Vec<u64> {
 }
 
 /// Plan the Promote phase: one `SetNodeState { Normal }` per member still in
-/// `Joining`, in node_id order.
+/// `Joining` WHOSE BOOTSTRAP IS RECORDED COMPLETE, in node_id order.
 ///
 /// `Joining` is the only state the Promote phase moves forward. `Leaving` and
 /// `Decommissioned` are deliberate operator intent and MUST NOT be promoted
 /// back, and learners are a distinct state machine (ADR-014), not joiners.
 ///
-/// INVARIANT: `plan` contains exactly one op per `Joining` member, and is
-/// empty when no member is `Joining` (no needless Raft churn).
+/// P0-4: a `Joining` member is promoted only when `bootstrap_complete` holds
+/// its committed `RecordBootstrapComplete`. Without it the member might be a
+/// join whose stream a restart cut off; promoting it would make it a replica
+/// without its data. Such members are reported by
+/// [`joiners_awaiting_bootstrap`] and stay `Joining` until their bootstrap
+/// reruns. Members already `Normal` are grandfathered and need no record.
+///
+/// INVARIANT: `plan` contains exactly one op per recorded `Joining` member,
+/// and is empty when there is none (no needless Raft churn).
 pub fn promote_joining_members(
     members: &std::collections::BTreeMap<u64, crate::raft::NodeState>,
+    bootstrap_complete: &std::collections::BTreeSet<u64>,
 ) -> Vec<crate::raft::RaftOp> {
     members
         .iter()
-        .filter(|(_, st)| matches!(st, crate::raft::NodeState::Joining))
+        .filter(|(id, st)| {
+            matches!(st, crate::raft::NodeState::Joining) && bootstrap_complete.contains(id)
+        })
         .map(|(&node_id, _)| crate::raft::RaftOp::SetNodeState {
             node_id,
             state: crate::raft::NodeState::Normal,
         })
+        .collect()
+}
+
+/// `Joining` members with no bootstrap-complete record: their data has not
+/// been verified, so the promote pass must NOT move them to `Normal`. They
+/// stay `Joining` until their bootstrap reruns and records completion.
+pub fn joiners_awaiting_bootstrap(
+    members: &std::collections::BTreeMap<u64, crate::raft::NodeState>,
+    bootstrap_complete: &std::collections::BTreeSet<u64>,
+) -> Vec<u64> {
+    members
+        .iter()
+        .filter(|(id, st)| {
+            matches!(st, crate::raft::NodeState::Joining) && !bootstrap_complete.contains(id)
+        })
+        .map(|(&id, _)| id)
         .collect()
 }
 

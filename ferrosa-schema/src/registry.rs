@@ -524,6 +524,24 @@ impl Schema {
         Ok(())
     }
 
+    /// Create or REPLACE a table definition without auth checks.
+    ///
+    /// Pair catch-up uses this when the primary's snapshot carries a table the
+    /// receiver already holds under a different definition: an ALTER (or a
+    /// DROP + CREATE) it missed while offline. `create_table_internal` and
+    /// `apply_snapshot` both keep the existing entry, which is exactly how the
+    /// missed ALTER was lost.
+    pub fn replace_table_internal(&self, table: TableMetadata) -> crate::Result<()> {
+        crate::validation::validate_table(&table)?;
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        self.check_table_jsonb(&table, &snap.types)?;
+        snap.tables
+            .insert((table.keyspace.clone(), table.name.clone()), table);
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
     /// Drop a keyspace without auth checks. Idempotent — succeeds silently
     /// if keyspace doesn't exist.
     pub fn drop_keyspace_internal(&self, name: &str) -> crate::Result<()> {

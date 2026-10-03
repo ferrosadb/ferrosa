@@ -194,6 +194,23 @@ pub fn build_serialization_header(
     }
 }
 
+/// [`build_serialization_header`] for a memtable flush. When the output is
+/// complex-framed and some partition still holds a whole-value collection
+/// cell, the header is widened to cover the deletion sentinel that
+/// `crate::memtable::expand_collection_blobs_in_place` will mint for it.
+/// Every flush writer must feed its partitions through that function.
+pub fn header_for_flush(schema: &TableSchema, partitions: &[Partition]) -> SerializationHeader {
+    let mut header = build_serialization_header(schema, partitions);
+    if header.complex_collections
+        && partitions
+            .iter()
+            .any(|p| crate::memtable::partition_has_collection_blob(p, &header))
+    {
+        crate::memtable::widen_header_for_blob_sentinels(&mut header);
+    }
+    header
+}
+
 /// Split token-sorted `partitions` into at most `num_shards` contiguous slices
 /// so each shard can be encoded into its own SSTable in parallel (parallel flush
 /// slice #3 — the encode phase is ~98% of flush time and single-threaded per
@@ -479,13 +496,14 @@ pub trait FlushTarget {
     /// Read back a vector sidecar that was written by `write_vector_sidecar`.
     ///
     /// Returns `None` if no sidecar was written for this `(generation,
-    /// index_name)` pair, or if the target does not persist sidecars
-    /// (e.g. `FileFlushTarget` — the store loads those from disk instead).
+    /// index_name)` pair, or if the target does not persist sidecars.
     ///
-    /// Used in integration tests to verify the sidecar round-trip without
-    /// touching the filesystem.
-    fn read_vector_sidecar(&self, _generation: u64, _index_name: &str) -> Option<Vec<u8>> {
-        None
+    /// # Errors
+    ///
+    /// A sidecar that exists but cannot be read: the ANN query must fail
+    /// rather than answer without that SSTable's rows.
+    fn read_vector_sidecar(&self, _generation: u64, _index_name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
     }
 
     /// Write a quantized vector artifact (`{gen}-QVEC-{index_name}.qvec`).
@@ -676,7 +694,7 @@ impl FlushTarget for InMemoryFlushTarget {
         Ok(())
     }
 
-    fn read_vector_sidecar(&self, generation: u64, index_name: &str) -> Option<Vec<u8>> {
+    fn read_vector_sidecar(&self, generation: u64, index_name: &str) -> Result<Option<Vec<u8>>> {
         let map = self
             .vector_sidecars
             .lock()
@@ -686,7 +704,7 @@ impl FlushTarget for InMemoryFlushTarget {
             self.vector_sidecar_bytes_read
                 .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        bytes
+        Ok(bytes)
     }
 
     fn write_quantized_vector_sidecar(
@@ -2496,6 +2514,25 @@ impl FlushTarget for FileFlushTarget {
             .join(format!("{generation}-VEC-{index_name}.db"));
         std::fs::write(&path, vec_bytes)?;
         Ok(())
+    }
+
+    /// The HNSW sidecar `write_vector_sidecar` wrote, read back from disk.
+    ///
+    /// This target used to inherit the default `None`, so every HNSW sidecar
+    /// it wrote was write-only: ANN over a flushed SSTable found nothing, and
+    /// an ANN query returned only the rows still in the memtable.
+    fn read_vector_sidecar(&self, generation: u64, index_name: &str) -> Result<Option<Vec<u8>>> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-VEC-{index_name}.db"));
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ferrosa_common::Error::InvalidData(format!(
+                "vector sidecar {} is unreadable: {e}",
+                path.display()
+            ))),
+        }
     }
 
     fn write_quantized_vector_sidecar(

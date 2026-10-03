@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 arc-swap = "1.7"
+async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 dashmap = "6"
@@ -37,6 +38,8 @@ rand = "0.10"
 parking_lot = "0.12"
 phf = { version = "0.13", features = ["macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
@@ -59,6 +62,9 @@ test-util = []
 slow-tests = []
 
 [dev-dependencies]
+# Self dev-dependency: turns on `test-util` in this crate's own integration
+# tests (tests/result_streaming_memory_bound.rs builds a standalone node).
+ferrosa-cql = { path = ".", features = ["test-util"] }
 # Builds `CqlValue::Jsonb` cells for the T-150 refusal / D6a wire tests.
 ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 criterion = "0.5"

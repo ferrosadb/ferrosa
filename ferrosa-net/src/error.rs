@@ -35,6 +35,15 @@ pub enum NetError {
     /// delivered to the caller because the receiver was dropped before the
     /// listener bound). Carries a human-readable cause for the operator.
     StartupFailed(String),
+    /// The peer received the request but answered with an error-reply frame:
+    /// its handler panicked, or the request or response could not be
+    /// encoded/decoded. The request was not served; whether it had side
+    /// effects before failing is unknown, as with a timeout.
+    RemoteHandlerFailed {
+        msg_type: crate::codec::MsgType,
+        kind: crate::rpc::error_reply::RemoteFailureKind,
+        detail: String,
+    },
 }
 
 impl fmt::Display for NetError {
@@ -56,6 +65,11 @@ impl fmt::Display for NetError {
                 write!(f, "lane actor shut down (connection replaced or closed)")
             }
             Self::StartupFailed(msg) => write!(f, "startup failed: {msg}"),
+            Self::RemoteHandlerFailed {
+                msg_type,
+                kind,
+                detail,
+            } => write!(f, "peer failed to handle {msg_type:?}: {kind}: {detail}"),
         }
     }
 }

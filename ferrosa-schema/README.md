@@ -40,7 +40,10 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
   dropped table's `SchemaSnapshot.indexes` entries (t_ae06e925).
   `apply_snapshot` bulk-loads a snapshot (skips system keyspaces) and
   refuses the whole snapshot, before applying any of it, when a table breaks
-  the jsonb placement rules.
+  the jsonb placement rules. It only INSERTS what is missing; an existing
+  table is kept as is. `replace_table_internal` overwrites a table definition
+  (same validation and jsonb checks as create), which pair catch-up uses to
+  apply an ALTER the receiver missed (ferrosa-cluster CL-33).
 - **jsonb placement rules** ([`jsonb_rules.rs`](src/jsonb_rules.rs), T-154a,
   D3/D21) — jsonb is refused in partition and clustering keys (through
   frozen collections, tuples and UDTs) and as a set element, map key or

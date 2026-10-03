@@ -37,6 +37,7 @@ pub mod prepared;
 pub mod prometheus;
 pub mod request_metrics;
 pub mod result;
+pub mod result_cursor;
 pub mod router;
 pub mod server;
 pub mod session;

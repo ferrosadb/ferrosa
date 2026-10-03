@@ -1833,6 +1833,17 @@ impl SSTableWriter {
 
     /// Serialize a single partition to the data buffer.
     fn serialize_partition(&mut self, partition: &Partition, data_pos: u64) -> Result<Option<u64>> {
+        // Validate every row's cell layout BEFORE writing a byte of this
+        // partition, so a refusal leaves no half-written partition behind.
+        if let Some(static_row) = &partition.static_row {
+            validate_row_cells(&self.header, static_row, true)
+                .map_err(|msg| refused_partition(partition, static_row, true, &msg))?;
+        }
+        for row in &partition.rows {
+            validate_row_cells(&self.header, row, false)
+                .map_err(|msg| refused_partition(partition, row, false, &msg))?;
+        }
+
         let row_index_start = self.row_trie.sink_mut().len();
         let build_row_index = !self.header.clustering_types.is_empty()
             && partition.rows.len() >= row_index_min_rows();
@@ -1923,60 +1934,17 @@ impl SSTableWriter {
         };
         let num_columns = column_defs.len();
 
-        // P0 correctness: every cell's col_idx must be in range, and cells must
-        // be grouped/sorted by col_idx. A *simple* column has exactly one cell;
-        // a *complex* (non-frozen collection) column has one cell PER ELEMENT,
-        // all sharing that col_idx and each carrying a distinct cell-path — that
-        // is Cassandra's complex-column layout. If these invariants are violated
-        // the present-column bitmap (distinct indices) would under-count the
-        // body bytes and the reader's parse position would drift, silently
-        // corrupting every row after the first drift.
-        let mut prev_idx: Option<u16> = None;
-        // A complex column may carry one `path == None` tombstone — the
-        // collection-level deletion sentinel. Any such cell sets the row-level
+        // The cell layout was validated by `validate_row_cells` before this
+        // partition's first byte (see `serialize_partition`), so every col_idx
+        // is in range and sorted, and every complex column's path-less cell is
+        // the collection-deletion sentinel. Such a sentinel sets the row-level
         // HAS_COMPLEX_DELETION flag (all-or-nothing: every complex column then
         // writes a DeletionTime, LIVE for those without a sentinel).
-        let mut has_complex_deletion = false;
-        for (idx, cell) in &row.cells {
-            assert!(
-                (*idx as usize) < num_columns,
-                "SSTable writer: cell col_idx {} is out of range (num_columns={}). \
-                 Serializing would produce a silently corrupt SSTable.",
-                idx,
-                num_columns
-            );
-            let is_complex = self.header.complex_collections
-                && crate::marshal::is_multicell(&column_defs[*idx as usize].1);
-            match prev_idx {
-                Some(p) if *idx < p => panic!(
-                    "SSTable writer: row.cells must be sorted by col_idx (found {idx} after {p})"
-                ),
-                Some(p) if *idx == p => assert!(
-                    is_complex,
-                    "SSTable writer: duplicate col_idx {idx} for a non-complex column — \
-                     only complex (collection) columns may have multiple cells per row"
-                ),
-                _ => {}
-            }
-            if is_complex {
-                // Element cell (path present) or collection-deletion sentinel
-                // (path absent, must be a tombstone).
-                if cell.path.is_none() {
-                    assert!(
-                        cell.is_tombstone(),
-                        "SSTable writer: complex col_idx {idx} path=None cell must be a \
-                         collection-deletion tombstone"
-                    );
-                    has_complex_deletion = true;
-                }
-            } else {
-                assert!(
-                    cell.path.is_none(),
-                    "SSTable writer: simple col_idx {idx} must not carry a cell path"
-                );
-            }
-            prev_idx = Some(*idx);
-        }
+        debug_assert!(validate_row_cells(&self.header, row, is_static).is_ok());
+        let has_complex_deletion = self.header.complex_collections
+            && row.cells.iter().any(|(idx, cell)| {
+                cell.path.is_none() && crate::marshal::is_multicell(&column_defs[*idx as usize].1)
+            });
 
         // Distinct present columns (cells are grouped by col_idx, so dedup runs).
         // Reused across rows instead of allocating a fresh `Vec` each time.
@@ -2783,6 +2751,91 @@ fn split_u16_prefixed(bytes: &[u8], expected: usize) -> SplitU16Prefixed<'_> {
     }
 }
 
+/// Check a row's cell layout against the header (P0 correctness). Every
+/// col_idx must be in range and cells grouped/sorted by col_idx. A *simple*
+/// column has exactly one cell, without a path; a *complex* (non-frozen
+/// collection) column has one cell PER ELEMENT, sharing the col_idx and each
+/// carrying a path, plus at most the path-less collection-deletion TOMBSTONE.
+/// Violating this would make the present-column bitmap under-count the body
+/// and the reader's parse position drift, silently corrupting every following
+/// row — so it is refused, never written.
+///
+/// Returns the reason as `Err`. These were `assert!`s until 2026-10-03, when a
+/// live path-less cell on a complex column killed a node's `storage-flush`
+/// thread for good (and two compaction executors on another node): the
+/// invariant was right, the thread-killing enforcement was not.
+fn validate_row_cells(
+    header: &SerializationHeader,
+    row: &crate::types::Row,
+    is_static: bool,
+) -> std::result::Result<(), String> {
+    let column_defs = if is_static {
+        &header.static_columns
+    } else {
+        &header.regular_columns
+    };
+    let column_name = |idx: u16| String::from_utf8_lossy(&column_defs[idx as usize].0).into_owned();
+    let mut prev_idx: Option<u16> = None;
+    for (idx, cell) in &row.cells {
+        if (*idx as usize) >= column_defs.len() {
+            return Err(format!(
+                "cell col_idx {idx} is out of range (num_columns={})",
+                column_defs.len()
+            ));
+        }
+        let is_complex = header.complex_collections
+            && crate::marshal::is_multicell(&column_defs[*idx as usize].1);
+        match prev_idx {
+            Some(p) if *idx < p => {
+                return Err(format!(
+                    "row.cells must be sorted by col_idx (found {idx} after {p})"
+                ))
+            }
+            Some(p) if *idx == p && !is_complex => {
+                return Err(format!(
+                    "duplicate col_idx {idx} (column \"{}\") for a non-complex column; only \
+                     complex (collection) columns may have multiple cells per row",
+                    column_name(*idx)
+                ))
+            }
+            _ => {}
+        }
+        if is_complex && cell.path.is_none() && !cell.is_tombstone() {
+            return Err(format!(
+                "complex col_idx {idx} (column \"{}\") has a LIVE path=None cell (ts={}); only \
+                 the collection-deletion tombstone may lack a path. A whole-collection blob or \
+                 an element whose path was dropped upstream reached the writer",
+                column_name(*idx),
+                cell.timestamp
+            ));
+        }
+        if !is_complex && cell.path.is_some() {
+            return Err(format!(
+                "simple col_idx {idx} (column \"{}\") must not carry a cell path",
+                column_name(*idx)
+            ));
+        }
+        prev_idx = Some(*idx);
+    }
+    Ok(())
+}
+
+/// The typed error for a partition [`validate_row_cells`] refused, naming the
+/// partition key and row so the caller's log points at the data.
+fn refused_partition(
+    partition: &Partition,
+    row: &crate::types::Row,
+    is_static: bool,
+    reason: &str,
+) -> ferrosa_common::Error {
+    ferrosa_common::Error::InvalidData(format!(
+        "ferrosa-sstable/writer: refusing partition key={:?} {} clustering={:02x?}: {reason}",
+        String::from_utf8_lossy(partition.key.key.as_bytes()),
+        if is_static { "static row" } else { "row" },
+        row.clustering,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3026,6 +3079,70 @@ mod tests {
                 "org.apache.cassandra.db.marshal.UTF8Type".into(),
             )],
         }
+    }
+
+    /// A complex-framed header: `val` text (col 0) and `tags` list<text> (col 1).
+    fn complex_list_header() -> SerializationHeader {
+        let mut header = test_header();
+        header.complex_collections = true;
+        header.regular_columns.push((
+            b"tags".to_vec(),
+            "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.UTF8Type)"
+                .into(),
+        ));
+        header
+    }
+
+    fn write_one(header: SerializationHeader, partition: &Partition) -> Result<()> {
+        let mut writer = SSTableWriter::new(WriteOptions::default(), header);
+        writer.add_partition(partition)
+    }
+
+    /// A LIVE path-less cell on a complex column (a whole-collection blob, or
+    /// an element whose path a lossy wire dropped) cannot be framed. It used
+    /// to `assert!`, which killed node2's `storage-flush` thread for good and
+    /// two compaction executors on node1 (2026-10-03). It must come back as an
+    /// error that names the column and partition (the caller adds the table),
+    /// so flush/compaction fail loudly and keep running.
+    #[test]
+    fn live_pathless_cell_on_complex_column_is_an_error_not_a_panic() {
+        let mut partition = make_partition(b"pk-blob", &1i32.to_be_bytes(), b"v", 1_000_001);
+        partition.rows[0]
+            .cells
+            .push((1, CellValue::live(b"whole-list-blob".to_vec(), 1_000_001)));
+
+        let err = write_one(complex_list_header(), &partition)
+            .expect_err("a live path-less cell on a complex column must be refused");
+        let msg = err.to_string();
+        for needle in ["tags", "col_idx 1", "pk-blob", "path=None"] {
+            assert!(msg.contains(needle), "error must name {needle:?}: {msg}");
+        }
+    }
+
+    /// The invariant stays: a path on a SIMPLE column is refused too, as an
+    /// error.
+    #[test]
+    fn path_on_simple_column_is_an_error_not_a_panic() {
+        let mut partition = make_partition(b"pk-simple", &1i32.to_be_bytes(), b"v", 1_000_001);
+        partition.rows[0].cells[0].1.path = Some(b"p".to_vec());
+        let err = write_one(complex_list_header(), &partition)
+            .expect_err("a path on a simple column must be refused");
+        assert!(err.to_string().contains("val"), "got: {err}");
+    }
+
+    /// What the writer must accept on a complex column: the sentinel plus
+    /// element cells.
+    #[test]
+    fn sentinel_and_elements_on_complex_column_are_written() {
+        let mut partition = make_partition(b"pk-ok", &1i32.to_be_bytes(), b"v", 1_000_001);
+        partition.rows[0].cells.extend([
+            (1, CellValue::tombstone(1_000_000, 1_700_000_000)),
+            (
+                1,
+                CellValue::live(b"a".to_vec(), 1_000_001).with_path(vec![1; 16]),
+            ),
+        ]);
+        write_one(complex_list_header(), &partition).unwrap();
     }
 
     /// Build a simple partition with one row and one cell.

@@ -27,7 +27,7 @@ pub use exec::{
     dedup, fallible, filter, hash_aggregate, hash_join, limit_offset, project, seq_scan, sort,
     try_filter, try_project, AggFunc, CmpOp, Predicate, RowStream, SortDir, SortKey, TryRowStream,
 };
-pub use parser::{parse, parse_statement, ParseError};
+pub use parser::{parse, parse_statement, ParseError, MAX_EXPR_DEPTH};
 pub use plan::{
     describe, execute, execute_streaming, execute_with, infer_param_types, open_cursor, ExecError,
     QueryResult, RowCursor, RowSink,

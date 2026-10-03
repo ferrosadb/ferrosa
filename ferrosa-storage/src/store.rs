@@ -1,8 +1,9 @@
 //! Module: Compose lock-free memtable, flush, SSTable read, and metadata views.
 //! Correctness: Correct when every ArcSwap view is internally aligned and read
 //! and compaction planning preserve key bounds without resident-reader fanout.
-//! Last revised: 2026-09-26
-//! Last changed: Opened staged Data.db directly for streaming flush output.
+//! Last revised: 2026-10-03
+//! Last changed: Removed the per-table locks (write gate, view CAS, rotation
+//! queue, ArcSwap sets), t_d938e6ae.
 //!
 //! Lock-free composition of memtable, flush, and SSTable reads.
 //!
@@ -16,7 +17,8 @@
 //!
 //! The read path is lock-free: it uses `ArcSwap::load()` to atomically
 //! snapshot the current view without blocking any writer or flusher.
-//! Flush serialization is enforced by a `parking_lot::Mutex`.
+//! Memtable rotations (flush, index DDL, ALTER, TRUNCATE) run one at a time
+//! through a lock-free queue (`TableStore::rotate`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,7 +34,6 @@ static LAST_READ_FANOUT_ERROR_UNIX_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
@@ -66,7 +67,8 @@ use crate::range_merger::ColumnOrdinalMapping;
 /// flush (eager index builds, pin accounting) acts on "the SSTable this flush
 /// just wrote".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FlushOutcome {
+#[must_use = "a flush that published an SSTable needs the engine's post-flush bookkeeping"]
+pub enum FlushOutcome {
     /// No SSTable was written: the memtable was empty, or every row was
     /// quarantined.
     NothingToFlush,
@@ -460,6 +462,43 @@ impl std::fmt::Display for CorruptSstableId {
     }
 }
 
+/// A memtable swapped out of the active slot, with everything a reader and
+/// its flush need: the catalog and schema its rows were written under, and
+/// the index postings and vector indexes readers consult until its SSTable
+/// and sidecars are installed.
+pub(crate) struct SealedMemtable {
+    memtable: Arc<dyn Memtable>,
+    /// The catalog, schema, scalar postings and (sealed) write gate the
+    /// memtable was bound to while it took writes.
+    bound: Arc<MemtableIndexes>,
+    /// The memtable's own vector indexes.
+    vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>>,
+    /// The scalar postings readers consult: the memtable's own at first,
+    /// then, once its flush has built them, the postings for the catalog the
+    /// flush writes sidecars for (an index a rotating DDL added included).
+    postings: ArcSwap<HashMap<String, Arc<MemtableIndex>>>,
+    /// The vector indexes readers consult, published the same way.
+    vectors: ArcSwap<HashMap<String, Arc<VectorMemtableIndex>>>,
+}
+
+impl SealedMemtable {
+    fn new(
+        memtable: Arc<dyn Memtable>,
+        bound: Arc<MemtableIndexes>,
+        vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>>,
+    ) -> Arc<Self> {
+        let postings = ArcSwap::from_pointee(bound.by_name.clone());
+        let vectors = ArcSwap::new(Arc::clone(&vector_indexes));
+        Arc::new(Self {
+            memtable,
+            bound,
+            vector_indexes,
+            postings,
+            vectors,
+        })
+    }
+}
+
 /// Atomic snapshot of the storage engine's current state.
 ///
 /// Held inside an [`ArcSwap`] so any thread can load a consistent view
@@ -468,9 +507,13 @@ impl std::fmt::Display for CorruptSstableId {
 struct StoreView {
     /// The active memtable: accepts all current writes.
     active: Arc<dyn Memtable>,
-    /// A memtable that has been swapped out and is being flushed.
-    /// Readable during the flush; `None` when no flush is in progress.
-    flushing: Option<Arc<dyn Memtable>>,
+    /// Memtables swapped out of `active` and not yet flushed, newest first.
+    /// Each stays readable (rows and index postings) until the flush that
+    /// writes it installs its SSTable. A flush that fails or panics leaves
+    /// its memtable here; the next rotation flushes it to its own SSTable,
+    /// exactly once (t_7681b32b). Overlapping SSTables are normal in the LSM;
+    /// reads merge them and compaction folds them together.
+    flushing: Arc<Vec<Arc<SealedMemtable>>>,
     /// Completed SSTables, newest first. Lightweight descriptors only — the
     /// readers are opened on demand through the engine-wide reader pool so
     /// resident memory is `O(reader_cap)` rather than `O(sstable_count)`.
@@ -484,8 +527,10 @@ struct StoreView {
     /// descriptor.
     sstable_ids: Arc<Vec<(String, std::path::PathBuf)>>,
     /// Per-index MemtableIndex companions for the active memtable, keyed by
-    /// index name. Swapped atomically alongside the active memtable during flush.
-    indexes: Arc<HashMap<String, Arc<MemtableIndex>>>,
+    /// index name, and the index catalog they were built from. Swapped
+    /// atomically alongside the active memtable during flush; the catalog
+    /// published here is the table's current one.
+    indexes: Arc<MemtableIndexes>,
     /// Per-SSTable sidecar index readers, parallel to `sstables`.
     /// Each entry maps index_name -> SidecarReader for that SSTable.
     sidecar_indexes: Arc<Vec<Arc<HashMap<String, SidecarReader>>>>,
@@ -577,18 +622,25 @@ pub struct TableStore<F: FlushTarget> {
     /// Stable identifier for this table, used as the high-order half of the
     /// pool key so generations from different tables never collide.
     pool_table_key: String,
-    /// Serializes concurrent flushes. The read/write paths never touch this.
-    flush_guard: Mutex<()>,
+    /// Memtable rotations (flushes, index DDL, ALTER, TRUNCATE, retire)
+    /// waiting to run; see [`TableStore::rotate`].
+    rotation_tx: crossbeam_channel::Sender<RotationRequest>,
+    rotation_rx: crossbeam_channel::Receiver<RotationRequest>,
+    /// Set while one thread runs queued rotations for everyone (the
+    /// combiner). Claimed by compare-and-swap; nothing ever waits on it.
+    rotating: std::sync::atomic::AtomicBool,
+    /// Memtable swaps performed, for coalescing checks and diagnostics.
+    rotations_started: std::sync::atomic::AtomicU64,
     /// The indexes the most recent flush wrote a sidecar for, published for
     /// the engine's post-flush bookkeeping. Shared by pointer, so reading it
     /// copies no names: the engine only asks whether a name is in the set.
     last_flush_indexes: ArcSwap<Vec<String>>,
-    /// Write barrier: writes hold shared (read), flush holds exclusive (write)
-    /// during the memtable swap. This ensures no writer is mid-put when the
-    /// active memtable is swapped, preventing writes to a stale memtable.
-    write_barrier: parking_lot::RwLock<()>,
     /// Counter of SSTable read errors during get_partition.
     pub sstable_read_errors: std::sync::atomic::AtomicU64,
+    /// Partitions a flush found changed in its frozen memtable after the
+    /// snapshot. The sealed write gate makes this impossible; non-zero means
+    /// admission is broken (see `TableStore::write`).
+    late_writes_after_seal: std::sync::atomic::AtomicU64,
     /// Counter of reads that exhausted the store-view retry bound while an
     /// SSTable was still failing to open. Non-zero in steady state means a
     /// genuinely corrupt/missing file (not a transient compaction swap) and a
@@ -599,6 +651,55 @@ pub struct TableStore<F: FlushTarget> {
     /// `Clone` nor `'static`-movable, but `Arc<F>` is.
     pub(crate) flush_target: Arc<F>,
     options: WriteOptions,
+    /// Set once the table is dropped (see [`TableStore::retire`]): no flush
+    /// of this store writes anything after it is set.
+    retired: std::sync::atomic::AtomicBool,
+    /// Monotonic generation counter for stable SSTable IDs.
+    /// Incremented on each flush. Used by compaction swap to identify
+    /// exactly which SSTables to remove.
+    next_gen: std::sync::atomic::AtomicU64,
+    /// Partition-key scopes observed per vector index, accumulated at flush.
+    ///
+    /// Persisted vector sidecars store only a placeholder `RowPosition::offset`
+    /// and do **not** record the partition key, so a flushed global-sidecar
+    /// `IndexResult` cannot be mapped back to a base-table row on its own. The
+    /// scoped per-prefix sidecars written at flush time *are* keyed by scope,
+    /// so remembering which scopes were flushed lets the index-consult path in
+    /// [`ann_search_partitions`] enumerate those scoped sidecars and recover the
+    /// actual partition keys without a full table scan.
+    vector_index_scopes: ArcSwap<VectorIndexScopes>,
+    /// SSTable generations the read path has quarantined because a read
+    /// exhausted the view-retry bound against them (genuine corruption, not a
+    /// transient compaction window). Subsequent reads SKIP these generations so
+    /// they neither re-fail nor re-incur the full retry storm, and anti-entropy
+    /// repair targets their covered token range to refill from a healthy
+    /// replica. Keyed by `gen`; the covered range is recovered from the live
+    /// descriptor (still in the view until repair swaps it out).
+    quarantined_sstables: crate::lockfree::SharedSet,
+    /// Generations whose secondary-index sidecars could not all be opened.
+    /// Their data is intact and still read; only index consults refuse them.
+    index_unavailable_sstables: crate::lockfree::SharedSet,
+    /// Generations whose object recently failed to open: they fail fast for a
+    /// short TTL instead of costing a reopen per retry per read.
+    missing_sstables: MissingSstableCache,
+    /// `gen/index` keys of the FTI sidecars being built for this table, so a
+    /// burst of concurrent queries that all find the same SSTable uncovered
+    /// builds its sidecar once instead of tokenizing it once per query at the
+    /// same time. A query that finds a build in flight does not wait for it.
+    fulltext_sidecars_in_flight: Arc<crate::lockfree::SharedSet>,
+}
+
+/// The index declarations of one table, as one immutable value.
+///
+/// A [`TableStore`] publishes its catalog through an `ArcSwap`: the write
+/// and read paths `load()` a snapshot and never block, and DDL clones the
+/// current catalog, edits the clone and stores it. These fields used to be
+/// plain members mutated through `&mut TableStore`, which only worked
+/// because the engine-wide table map was a `RwLock` whose write guard made
+/// DDL exclusive. That lock is gone (t_d938e6ae): a reader parked holding it
+/// deadlocked a node.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct IndexCatalog {
     /// Secondary index declarations: `(index_name, column_position)` pairs.
     /// Column position is the index into `Row.cells` by column ordinal
     /// (matching the `u16` tag in each cell tuple).
@@ -629,45 +730,217 @@ pub struct TableStore<F: FlushTarget> {
     /// Full-text index declarations: `(index_name, column_position)` pairs.
     /// Built as FTI sidecar files during flush.
     fulltext_indexes: Vec<(String, usize)>,
-    /// Vector index configurations. Immutable after registration.
-    /// At flush time each declared vector index is drained from the memtable
-    /// and persisted as a method-specific vector artifact.
+    /// Vector index configurations. At flush time each declared vector index
+    /// is drained from the memtable and persisted as a method-specific
+    /// vector artifact.
     vector_index_configs: Vec<VectorIndexConfig>,
     /// Per-index persistent artifact/search method. Missing entries default to
     /// the legacy HNSW sidecar for API compatibility with existing callers.
     vector_index_methods: HashMap<String, VectorIndexMethod>,
-    /// Monotonic generation counter for stable SSTable IDs.
-    /// Incremented on each flush. Used by compaction swap to identify
-    /// exactly which SSTables to remove.
-    next_gen: std::sync::atomic::AtomicU64,
-    /// Partition-key scopes observed per vector index, accumulated at flush.
+}
+
+impl IndexCatalog {
+    /// A catalog declaring only the given cell-column indexes, each BTree.
+    fn with_indexed_columns(indexed_columns: Vec<(String, usize)>) -> Self {
+        Self {
+            index_types: default_index_types(&indexed_columns),
+            indexed_columns,
+            ..Self::default()
+        }
+    }
+
+    /// The declared type of `index_name`; BTree when undeclared.
+    fn index_type_for(&self, index_name: &str) -> IndexType {
+        self.index_types
+            .get(index_name)
+            .copied()
+            .unwrap_or(IndexType::BTree)
+    }
+
+    /// The artifact/search method of vector index `index_name`; HNSW when
+    /// undeclared or registered through the legacy path.
+    fn vector_index_method(&self, index_name: &str) -> VectorIndexMethod {
+        self.vector_index_methods
+            .get(index_name)
+            .copied()
+            .unwrap_or(VectorIndexMethod::Hnsw)
+    }
+
+    /// This catalog with every column ordinal remapped from `old_schema`'s
+    /// regular-column layout onto `new_schema`'s.
     ///
-    /// Persisted vector sidecars store only a placeholder `RowPosition::offset`
-    /// and do **not** record the partition key, so a flushed global-sidecar
-    /// `IndexResult` cannot be mapped back to a base-table row on its own. The
-    /// scoped per-prefix sidecars written at flush time *are* keyed by scope,
-    /// so remembering which scopes were flushed lets the index-consult path in
-    /// [`ann_search_partitions`] enumerate those scoped sidecars and recover the
-    /// actual partition keys without a full table scan.
-    vector_index_scopes: parking_lot::Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
-    /// SSTable generations the read path has quarantined because a read
-    /// exhausted the view-retry bound against them (genuine corruption, not a
-    /// transient compaction window). Subsequent reads SKIP these generations so
-    /// they neither re-fail nor re-incur the full retry storm, and anti-entropy
-    /// repair targets their covered token range to refill from a healthy
-    /// replica. Keyed by `gen`; the covered range is recovered from the live
-    /// descriptor (still in the view until repair swaps it out).
-    quarantined_sstables: parking_lot::RwLock<std::collections::HashSet<String>>,
-    /// Generations whose secondary-index sidecars could not all be opened.
-    /// Their data is intact and still read; only index consults refuse them.
-    index_unavailable_sstables: parking_lot::RwLock<std::collections::HashSet<String>>,
-    /// Generations whose object recently failed to open: they fail fast for a
-    /// short TTL instead of costing a reopen per retry per read.
-    missing_sstables: MissingSstableCache,
-    /// Serializes FTI sidecar builds for this table, so a burst of concurrent
-    /// queries that all find the same SSTable uncovered builds its sidecar
-    /// once instead of tokenizing it once per query at the same time.
-    fulltext_sidecar_build_lock: Arc<Mutex<()>>,
+    /// Regular columns are ordered by Cassandra's column-name comparator, so
+    /// `ALTER TABLE ADD` of a column that sorts before an indexed column
+    /// shifts the indexed column's ordinal (the `u16` cell tag). Index
+    /// declarations store ordinals, not names — left stale, every subsequent
+    /// write extracts the indexed value from the WRONG cell, and a
+    /// backfilled-Current index then serves false empty results (memory-suite
+    /// regression `fixed_phonetic_match`). So every positional declaration is
+    /// remapped through the old schema's column name.
+    fn remapped_onto(&self, old_schema: &TableSchema, new_schema: &TableSchema) -> Self {
+        let mut catalog = self.clone();
+        let remap = |index_name: &str, pos: &mut usize| {
+            let Some(old_col) = old_schema.regular_columns.get(*pos) else {
+                tracing::error!(
+                    index = index_name,
+                    position = *pos,
+                    "index ordinal points past the pre-ALTER regular column \
+                     set — leaving it unchanged; index writes may be wrong"
+                );
+                return;
+            };
+            match new_schema
+                .regular_columns
+                .iter()
+                .position(|c| c.name == old_col.name)
+            {
+                Some(new_pos) => {
+                    if new_pos != *pos {
+                        tracing::info!(
+                            index = index_name,
+                            column = %old_col.name,
+                            old_position = *pos,
+                            new_position = new_pos,
+                            "remapped index column ordinal after schema update"
+                        );
+                        *pos = new_pos;
+                    }
+                }
+                None => tracing::error!(
+                    index = index_name,
+                    column = %old_col.name,
+                    "indexed column absent from post-ALTER schema — leaving \
+                     ordinal unchanged; index writes may be wrong"
+                ),
+            }
+        };
+        for (name, pos) in &mut catalog.indexed_columns {
+            remap(name, pos);
+        }
+        for (name, pos) in &mut catalog.fulltext_indexes {
+            remap(name, pos);
+        }
+        for cfg in &mut catalog.vector_index_configs {
+            remap(&cfg.index_name.clone(), &mut cfg.column_position);
+        }
+        for (name, pred) in &mut catalog.index_filter_predicates {
+            for clause in &mut pred.clauses {
+                remap(name, &mut clause.column_position);
+            }
+        }
+        catalog
+    }
+
+    /// Whether this catalog declares any index at all.
+    fn declares_any(&self) -> bool {
+        !(self.indexed_columns.is_empty()
+            && self.indexed_clustering_columns.is_empty()
+            && self.indexed_partition_key_columns.is_empty()
+            && self.fulltext_indexes.is_empty()
+            && self.vector_index_configs.is_empty())
+    }
+
+    /// Every scalar (memtable-indexed) index this catalog declares: cell,
+    /// clustering and partition-key indexes, by name.
+    fn scalar_index_names(&self) -> impl Iterator<Item = &String> {
+        self.indexed_columns
+            .iter()
+            .chain(self.indexed_clustering_columns.iter())
+            .chain(self.indexed_partition_key_columns.iter())
+            .map(|(name, _)| name)
+    }
+
+    /// Drop every declaration named `index_name`; whether there was one.
+    fn remove(&mut self, index_name: &str) -> bool {
+        let before = (
+            self.indexed_columns.len(),
+            self.indexed_clustering_columns.len(),
+            self.indexed_partition_key_columns.len(),
+            self.vector_index_configs.len(),
+        );
+        self.indexed_columns.retain(|(name, _)| name != index_name);
+        self.indexed_clustering_columns
+            .retain(|(name, _)| name != index_name);
+        self.indexed_partition_key_columns
+            .retain(|(name, _)| name != index_name);
+        // Full-text declarations are NOT dropped here: `remove_index` never
+        // has, and DROP INDEX of a full-text index is out of this change.
+        self.vector_index_configs
+            .retain(|cfg| cfg.index_name != index_name);
+        let after = (
+            self.indexed_columns.len(),
+            self.indexed_clustering_columns.len(),
+            self.indexed_partition_key_columns.len(),
+            self.vector_index_configs.len(),
+        );
+        let mut removed = before != after;
+        removed |= self.index_types.remove(index_name).is_some();
+        removed |= self.index_filter_predicates.remove(index_name).is_some();
+        removed |= self.vector_index_methods.remove(index_name).is_some();
+        removed
+    }
+
+    /// Everything that determines the postings scalar index `index_name`
+    /// holds: which key family it reads, the position there, its type and its
+    /// partial-index predicate. Two catalogs agreeing on this give the same
+    /// postings for the same rows.
+    fn scalar_definition(
+        &self,
+        index_name: &str,
+    ) -> Option<(u8, usize, IndexType, Option<&FilterPredicate>)> {
+        let find = |list: &[(String, usize)]| {
+            list.iter()
+                .find(|(name, _)| name == index_name)
+                .map(|(_, pos)| *pos)
+        };
+        let (family, position) = find(&self.indexed_columns)
+            .map(|pos| (0, pos))
+            .or_else(|| find(&self.indexed_clustering_columns).map(|pos| (1, pos)))
+            .or_else(|| find(&self.indexed_partition_key_columns).map(|pos| (2, pos)))?;
+        Some((
+            family,
+            position,
+            self.index_type_for(index_name),
+            self.index_filter_predicates.get(index_name),
+        ))
+    }
+
+    /// Whether this catalog declares an index named `index_name`, of any kind.
+    fn declares(&self, index_name: &str) -> bool {
+        let named = |list: &[(String, usize)]| list.iter().any(|(n, _)| n == index_name);
+        named(&self.indexed_columns)
+            || named(&self.indexed_clustering_columns)
+            || named(&self.indexed_partition_key_columns)
+            || named(&self.fulltext_indexes)
+            || self
+                .vector_index_configs
+                .iter()
+                .any(|cfg| cfg.index_name == index_name)
+    }
+}
+
+/// A read-only list out of one `IndexCatalog` snapshot.
+///
+/// Dereferences to a slice, so callers iterate it like the `&[T]` the
+/// accessors used to return; it keeps its snapshot alive, so a DDL that
+/// swaps the catalog meanwhile cannot change what the holder sees.
+pub struct CatalogSlice<T: 'static> {
+    catalog: Arc<IndexCatalog>,
+    project: fn(&IndexCatalog) -> &[T],
+}
+
+impl<T> std::ops::Deref for CatalogSlice<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        (self.project)(&self.catalog)
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for CatalogSlice<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
 }
 
 /// File name of generation `gen`'s FTI sidecar for `index_name`.
@@ -737,22 +1010,72 @@ pub struct FulltextSidecarOutcome {
     /// Sidecars a concurrent build had already written by the time this one
     /// reached them.
     pub already_present: usize,
+    /// Sidecars another build was writing when this one reached them. This
+    /// build did not wait for it: the query that ran it scans those SSTables
+    /// in full this once instead.
+    pub in_flight_elsewhere: usize,
     /// Sidecars that could not be built or written. Each is logged at ERROR;
     /// queries keep scanning that SSTable in full until one is built.
     pub failed: usize,
 }
 
-/// FTI sidecars planned under the engine's table lock and built without it.
+/// FTI sidecars planned from one view of a table and built outside it.
 ///
 /// Holds only shared handles (flush target, schema snapshot, readers, the
-/// table's single-flight lock), so tokenizing a large SSTable never holds the lock
-/// every read, write and DDL statement on the node goes through.
+/// table's set of sidecars being built), so tokenizing a large SSTable holds
+/// nothing any read, write or DDL statement waits on.
 #[must_use = "a planned sidecar build does nothing until it is run"]
 pub struct FulltextSidecarBuild<F: FlushTarget> {
     flush_target: Arc<F>,
     schema: Arc<TableSchema>,
-    single_flight: Arc<Mutex<()>>,
+    /// `gen/index` keys of the sidecars being built right now, by any build
+    /// of this table: single-flight per sidecar, with no lock to wait on.
+    in_flight: Arc<crate::lockfree::SharedSet>,
     jobs: Vec<FulltextSidecarJob<F::Reader>>,
+}
+
+/// One sidecar build's claim on its `gen/index` key in the table's in-flight
+/// set; dropping it releases the claim, whether the build succeeded, failed
+/// or panicked.
+struct SidecarClaim<'a> {
+    in_flight: &'a crate::lockfree::SharedSet,
+    key: String,
+}
+
+impl<'a> SidecarClaim<'a> {
+    /// Claim `key`, or `None` if another build holds it. A claim that cannot
+    /// be recorded is refused too, loudly: building without it could
+    /// tokenize the same SSTable twice at once.
+    fn take(in_flight: &'a crate::lockfree::SharedSet, key: String) -> Option<Self> {
+        match in_flight.insert(&key) {
+            Ok(true) => Some(Self { in_flight, key }),
+            Ok(false) => None,
+            Err(e) => {
+                tracing::error!(%e, sidecar = %key, "fts: could not claim a sidecar build; skipped");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for SidecarClaim<'_> {
+    fn drop(&mut self) {
+        match self.in_flight.remove(&self.key) {
+            Ok(true) => {}
+            Ok(false) => tracing::error!(
+                sidecar = %self.key,
+                "fts: a sidecar build claim was already released; the in-flight set is inconsistent"
+            ),
+            // Left claimed, this sidecar is never built again by this
+            // process; every query keeps scanning its SSTable in full.
+            Err(e) => tracing::error!(
+                %e,
+                sidecar = %self.key,
+                "fts: a sidecar build claim could not be released; this sidecar will not be built \
+                 again until restart"
+            ),
+        }
+    }
 }
 
 impl<F: FlushTarget> FulltextSidecarBuild<F> {
@@ -767,8 +1090,15 @@ impl<F: FlushTarget> FulltextSidecarBuild<F> {
         if self.jobs.is_empty() {
             return outcome;
         }
-        let _single_flight = self.single_flight.lock();
         for job in &self.jobs {
+            let Some(_claim) =
+                SidecarClaim::take(&self.in_flight, format!("{}/{}", job.gen, job.index_name))
+            else {
+                outcome.in_flight_elsewhere += 1;
+                continue;
+            };
+            // Checked under the claim: a build that finished between this
+            // plan and the claim has left its file.
             if job
                 .dir
                 .join(fti_sidecar_file_name(&job.gen, &job.index_name))
@@ -836,25 +1166,272 @@ fn new_memtable() -> Arc<dyn Memtable> {
     }
 }
 
-/// Build a fresh `HashMap` of empty `MemtableIndex` instances, one per
-/// declared secondary index. `clustering_indexed_columns` carries the
-/// clustering-column indexes (t_430c4188) so a flush swap does not drop them.
-fn new_indexes(
-    indexed_columns: &[(String, usize)],
-    clustering_indexed_columns: &[(String, usize)],
-    partition_key_indexed_columns: &[(String, usize)],
-) -> Arc<HashMap<String, Arc<MemtableIndex>>> {
+/// Partition-key scopes flushed per vector index (see
+/// `TableStore::vector_index_scopes`). Each index's set is its own `Arc`, so
+/// recording scopes for one index copies only that index's set.
+type VectorIndexScopes = HashMap<String, Arc<std::collections::HashSet<Vec<u8>>>>;
+
+/// An index DDL's change to a catalog: the next catalog, or `None` for none.
+type CatalogEdit = Box<dyn FnOnce(&IndexCatalog) -> Option<IndexCatalog> + Send>;
+
+/// What [`TableStore::swap_compacted_sstables`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an output that was not swapped in must be deleted by the caller"]
+pub enum CompactionSwap {
+    /// The output replaced its inputs in the view.
+    Swapped,
+    /// At least one input had already left the view (a TRUNCATE, or another
+    /// compaction): installing the output would bring back rows the view no
+    /// longer holds, so nothing changed and the output must be discarded.
+    InputsGone,
+}
+
+/// What one queued memtable rotation asks for (see `TableStore::rotate`).
+enum RotationKind {
+    /// Flush the active memtable; `on_release` runs right after the swap.
+    Flush {
+        on_release: Box<dyn FnOnce() + Send>,
+    },
+    /// Rotate onto a catalog derived from the current one (index DDL);
+    /// `None` from the edit leaves the catalog as it is.
+    Edit(CatalogEdit),
+    /// Rotate onto a new schema (`ALTER TABLE`).
+    Schema {
+        schema: TableSchema,
+        on_release: Box<dyn FnOnce() + Send>,
+    },
+    /// Discard every row and SSTable (`TRUNCATE`).
+    Truncate,
+    /// Change nothing; answered once every rotation queued before it is done.
+    Barrier,
+}
+
+/// A catalog or schema change one rotation applies, in queue order.
+enum RotationChange {
+    Edit(CatalogEdit),
+    Schema(TableSchema),
+}
+
+/// The catalog and schema a rotation's new memtable is bound to: `changes`
+/// applied in queue order to the frozen memtable's. A schema change remaps
+/// the catalog's column ordinals onto the new layout.
+fn apply_rotation_changes(
+    changes: Vec<RotationChange>,
+    catalog: &Arc<IndexCatalog>,
+    schema: &Arc<TableSchema>,
+) -> (Arc<IndexCatalog>, Arc<TableSchema>) {
+    changes.into_iter().fold(
+        (Arc::clone(catalog), Arc::clone(schema)),
+        |(catalog, schema), change| match change {
+            RotationChange::Edit(edit) => match edit(&catalog) {
+                Some(edited) => (Arc::new(edited), schema),
+                None => (catalog, schema),
+            },
+            RotationChange::Schema(next) => {
+                let remapped = catalog.remapped_onto(&schema, &next);
+                (Arc::new(remapped), Arc::new(next))
+            }
+        },
+    )
+}
+
+/// One queued rotation and where to send its result.
+struct RotationRequest {
+    kind: RotationKind,
+    enqueued_at: Instant,
+    reply: crossbeam_channel::Sender<Result<FlushOutcome>>,
+}
+
+/// How often a thread waiting for its rotation re-checks whether it should
+/// run the queue itself (the combiner may have stopped between rounds).
+const ROTATION_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long a thread waits for its rotation before failing loud. A rotation
+/// is a flush, so this is far beyond any healthy one.
+const ROTATION_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How many queue drains one combiner runs before handing the queue back,
+/// so a busy table cannot keep one caller combining for everyone forever.
+const MAX_COMBINE_ROUNDS: usize = 8;
+
+/// Clears `TableStore::rotating` when the combiner stops, panics included.
+struct CombinerSlot<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for CombinerSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// How many sealed memtables one write may meet before it is refused. A
+/// flush publishes the next memtable before sealing the old one, so a retry
+/// normally finds an open gate at once; this many in a row means rotations
+/// are not completing.
+const MAX_SEALED_MEMTABLE_RETRIES: usize = 10_000;
+
+/// How long a flush waits for the writers inside a memtable it sealed. Those
+/// writes are in-memory puts; still inside after this, one is stuck and the
+/// flush fails loud rather than snapshot an incomplete memtable.
+const MEMTABLE_SEAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The memtable indexes of ONE active memtable, together with the catalog
+/// they were built from.
+///
+/// The pair is created when its memtable is, and replaced only when the
+/// memtable is (a flush swap), so the catalog a write posts under is always
+/// the catalog its memtable's flush writes sidecars for: index postings equal
+/// the flushed sidecar set by construction. Index DDL never edits a live
+/// memtable's indexes; it rotates the memtable (see
+/// [`TableStore::flush_applying_catalog_edit`]). Dereferences to the
+/// name→index map, which is what reads use.
+pub(crate) struct MemtableIndexes {
+    catalog: Arc<IndexCatalog>,
+    /// The schema the memtable's rows are put under: the one current when
+    /// the memtable was created, so an `ALTER` publishing a new schema at a
+    /// rotation never reaches a write still inside the old memtable.
+    schema: Arc<TableSchema>,
+    by_name: HashMap<String, Arc<MemtableIndex>>,
+    /// Admission to the memtable. The flush that freezes it seals the gate
+    /// and waits for the writers inside, so its snapshot holds every row
+    /// written to it and no later write lands in it (see `TableStore::write`).
+    gate: crate::lockfree::WriteGate,
+}
+
+impl std::ops::Deref for MemtableIndexes {
+    type Target = HashMap<String, Arc<MemtableIndex>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_name
+    }
+}
+
+/// Post every row of `partitions` to `index_name`, as the write path would
+/// have had the index existed when they were written. Used only for a frozen
+/// memtable — immutable rows no write can reach — whose rotating DDL added
+/// the index (see `TableStore::flush_sidecar_indexes`).
+fn scalar_index_from_rows(
+    catalog: &IndexCatalog,
+    index_name: &str,
+    partitions: &[Partition],
+    key_component_counts: (usize, usize),
+) -> Arc<MemtableIndex> {
+    let (pk_total, ck_total) = key_component_counts;
+    let index = Arc::new(MemtableIndex::new());
+    let index_type = catalog.index_type_for(index_name);
+    let find = |list: &[(String, usize)]| {
+        list.iter()
+            .find(|(name, _)| name == index_name)
+            .map(|(_, pos)| *pos)
+    };
+    let post_key_component =
+        |value: &[u8], row_pos: RowPosition| match crate::index::scheduler::encode_index_key(
+            index_type, value,
+        ) {
+            Ok(Some(index_key)) => index.insert(index_key, row_pos),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                index_name,
+                %e,
+                "store: skipping key-component index entry built at flush; key encoding failed"
+            ),
+        };
+    for partition in partitions {
+        let pk_bytes = partition.key.key.as_bytes();
+        if let Some(position) = find(&catalog.indexed_columns) {
+            let predicate = catalog.index_filter_predicates.get(index_name);
+            for row in partition.static_row.iter().chain(partition.rows.iter()) {
+                insert_scalar_memtable_index_row(
+                    &index, index_name, position, index_type, predicate, pk_bytes, row,
+                );
+            }
+        } else if let Some(component) = find(&catalog.indexed_partition_key_columns) {
+            let components = ferrosa_row_bridge::decode_pk(&partition.key, pk_total);
+            if let Some(value) = components.get(component) {
+                post_key_component(
+                    value,
+                    RowPosition {
+                        partition_key: pk_bytes.to_vec(),
+                        clustering_key: Vec::new(),
+                    },
+                );
+            }
+        } else if let Some(component) = find(&catalog.indexed_clustering_columns) {
+            for row in partition
+                .rows
+                .iter()
+                .filter(|row| !row.clustering.is_empty())
+            {
+                let components = ferrosa_row_bridge::decode_clustering(&row.clustering, ck_total);
+                if let Some(value) = components.get(component) {
+                    post_key_component(
+                        value,
+                        RowPosition {
+                            partition_key: pk_bytes.to_vec(),
+                            clustering_key: row.clustering.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Build vector index `cfg` over the rows of `partitions` (see
+/// [`scalar_index_from_rows`] for when).
+fn vector_index_from_rows(
+    cfg: &VectorIndexConfig,
+    partitions: &[Partition],
+) -> Arc<VectorMemtableIndex> {
+    let vector_index = Arc::new(VectorMemtableIndex::new(
+        cfg.metric,
+        cfg.m,
+        cfg.ef_construction,
+    ));
+    for partition in partitions {
+        for row in partition.static_row.iter().chain(partition.rows.iter()) {
+            let Some(value) = row
+                .cells
+                .iter()
+                .find(|(idx, _)| *idx as usize == cfg.column_position)
+                .and_then(|(_, cell)| cell.value.as_ref())
+            else {
+                continue;
+            };
+            let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) else {
+                continue;
+            };
+            let position = ferrosa_index::vector::RowPosition::new(vector_index.len() as u64);
+            vector_index.insert_with_scope(
+                position,
+                vector,
+                Some(partition.key.key.as_bytes().to_vec()),
+            );
+        }
+    }
+    vector_index
+}
+
+/// Build a fresh empty `MemtableIndex` per secondary index `catalog`
+/// declares — cell, clustering (t_430c4188) and partition-key indexes alike.
+fn new_indexes(catalog: Arc<IndexCatalog>, schema: Arc<TableSchema>) -> Arc<MemtableIndexes> {
     // EVERY declared index must appear here. A flush installs this map
     // wholesale, so a family of indexes omitted from it exists in the
     // declaration and nowhere else: `guard.indexes.get(name)` then returns
     // None for the rest of the table's life and each write silently skips it.
-    let map: HashMap<String, Arc<MemtableIndex>> = indexed_columns
+    let by_name: HashMap<String, Arc<MemtableIndex>> = catalog
+        .indexed_columns
         .iter()
-        .chain(clustering_indexed_columns.iter())
-        .chain(partition_key_indexed_columns.iter())
+        .chain(catalog.indexed_clustering_columns.iter())
+        .chain(catalog.indexed_partition_key_columns.iter())
         .map(|(name, _)| (name.clone(), Arc::new(MemtableIndex::new())))
         .collect();
-    Arc::new(map)
+    Arc::new(MemtableIndexes {
+        catalog,
+        schema,
+        by_name,
+        gate: crate::lockfree::WriteGate::default(),
+    })
 }
 
 /// Default per-index types for a freshly-declared set of secondary indexes.
@@ -932,11 +1509,29 @@ where
         move |slot| producer(slot),
     );
     tokio::spawn(async move {
-        if let Ok(ferrosa_sched::ScanOutcome::Overloaded) = handle.await {
-            let _ = tx.try_send(Err(ferrosa_common::Error::InvalidData(
+        let failure = match handle.await {
+            Ok(ferrosa_sched::ScanOutcome::Ran(())) | Ok(ferrosa_sched::ScanOutcome::Cancelled) => {
+                return;
+            }
+            Ok(ferrosa_sched::ScanOutcome::Overloaded) => ferrosa_common::Error::InvalidData(
                 "overloaded: scan admission queue full — retry".to_string(),
-            )));
-        }
+            ),
+            // The producer panicked (or its task was torn down). Its sender
+            // dropped during unwind, so without this error the consumer would
+            // read the partitions delivered so far followed by a normal close:
+            // a truncated scan reported as complete.
+            Err(join) => {
+                tracing::error!(error = %join, "range scan producer panicked; failing the scan");
+                ferrosa_common::Error::InvalidData(format!(
+                    "range scan producer panicked; the scan is incomplete: {join}"
+                ))
+            }
+        };
+        // `send().await`, not `try_send`: the error queues behind partitions
+        // already buffered (it must not be lost to a full channel, which would
+        // end the stream cleanly), and this sender keeps the channel open until
+        // it lands. It fails only when the consumer is already gone.
+        let _ = tx.send(Err(failure)).await;
     });
 }
 
@@ -1087,14 +1682,17 @@ impl<R: ReadAt + Send + Sync + 'static> OwnedMerger<R> {
             .map(|wanted| unsafe { &*(wanted as *const [u16]) });
 
         let active_iter = view_ref.active.range_iter(start.as_ref(), end.as_ref());
-        let flushing_iter = view_ref
+        // Every sealed memtable still being flushed is a source, as in the
+        // other range producers.
+        let flushing_iters: Vec<_> = view_ref
             .flushing
-            .as_ref()
-            .map(|f| f.range_iter(start.as_ref(), end.as_ref()));
+            .iter()
+            .map(|sealed| sealed.memtable.range_iter(start.as_ref(), end.as_ref()))
+            .collect();
         let merger = match wanted_ref {
             Some(wanted) => crate::range_merger::merger_for_projected_sources_with_mappings(
                 active_iter,
-                flushing_iter,
+                flushing_iters,
                 readers_ref,
                 mappings_ref,
                 wanted,
@@ -1103,7 +1701,7 @@ impl<R: ReadAt + Send + Sync + 'static> OwnedMerger<R> {
             )?,
             None => crate::range_merger::merger_for_sources_with_mappings(
                 active_iter,
-                flushing_iter,
+                flushing_iters,
                 readers_ref,
                 mappings_ref,
                 start,
@@ -1846,6 +2444,40 @@ pub fn filter_tombstoned_sidecar_entries(
 /// interpose a full compaction (view swap + input-file deletion) before the read
 /// opens its SSTables — reproducing the stale-view condition every time instead
 /// of relying on timing.
+/// Test-only fault injection for [`TableStore::flush_with_swap_callback`]:
+/// a panic armed on the calling thread fires at a named point of the flush,
+/// so a test can reproduce "the flush thread died mid-flush" (2026-10-02,
+/// node2: `writer.rs:1965` panicked after the memtable swap, t_7681b32b)
+/// without depending on a particular encoder bug still existing.
+#[cfg(test)]
+pub(crate) mod flush_fault_test_hook {
+    use std::cell::Cell;
+
+    /// Where in the flush an armed panic fires.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum FlushFault {
+        /// After the active memtable moved to `flushing`, before encoding.
+        AfterSwap,
+    }
+
+    thread_local! {
+        static ARMED: Cell<Option<FlushFault>> = const { Cell::new(None) };
+    }
+
+    /// Arm one panic at `at` for the next flush on this thread.
+    pub(crate) fn arm(at: FlushFault) {
+        ARMED.with(|armed| armed.set(Some(at)));
+    }
+
+    /// Fire (and disarm) the panic if one is armed for `at` on this thread.
+    pub(crate) fn fire(at: FlushFault) {
+        if ARMED.with(|armed| armed.get()) == Some(at) {
+            ARMED.with(|armed| armed.set(None));
+            panic!("injected flush panic at {at:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod read_race_test_hook {
     use std::sync::{Arc, Condvar, Mutex};
@@ -1928,17 +2560,19 @@ pub const UNSELECTIVE_INDEX_SHARE_DENOMINATOR: u64 = 10;
 pub const UNSELECTIVE_INDEX_MIN_MATCHES: usize = 50;
 
 /// The row-ordered posting sources for one index key, each positioned at
-/// `from` (inclusive): the active memtable's pinned list, then every SSTable
-/// sidecar that holds the index.
+/// `from` (inclusive): the memtables' posting lists (see
+/// [`memtable_posting_lists`]), then every SSTable sidecar that holds the
+/// index.
 fn index_posting_sources<'a>(
     view: &'a StoreView,
-    memtable: Option<&'a crate::memtable::index::PostingList>,
+    memtables: &'a [crate::memtable::index::PostingList],
     index_name: &str,
     key: &'a IndexKey,
     from: Option<&RowPosition>,
 ) -> Vec<PostingSource<'a>> {
-    let mut sources: Vec<PostingSource<'a>> = Vec::with_capacity(view.sidecar_indexes.len() + 1);
-    if let Some(list) = memtable {
+    let mut sources: Vec<PostingSource<'a>> =
+        Vec::with_capacity(view.sidecar_indexes.len() + memtables.len());
+    for list in memtables {
         let postings = list.as_slice();
         let start = postings.partition_point(|p| from.is_some_and(|start| p < start));
         sources.push(Box::new(postings[start..].iter().map(RowPositionRef::from)));
@@ -1949,6 +2583,63 @@ fn index_posting_sources<'a>(
         }
     }
     sources
+}
+
+/// The posting lists for `key` in `index_name` of the active memtable and of
+/// every sealed memtable not yet flushed (T1): until a sealed memtable's
+/// sidecar is installed, its postings are the only record of its rows.
+fn memtable_posting_lists(
+    view: &StoreView,
+    index_name: &str,
+    key: &IndexKey,
+) -> Vec<crate::memtable::index::PostingList> {
+    memtable_indexes_named(view, index_name)
+        .iter()
+        .filter_map(|index| index.posting_list(key))
+        .collect()
+}
+
+/// `flushing` without the sealed memtable holding `memtable`.
+fn without_sealed(
+    flushing: &[Arc<SealedMemtable>],
+    memtable: &Arc<dyn Memtable>,
+) -> Arc<Vec<Arc<SealedMemtable>>> {
+    let target = Arc::as_ptr(memtable).cast::<()>();
+    Arc::new(
+        flushing
+            .iter()
+            .filter(|sealed| Arc::as_ptr(&sealed.memtable).cast::<()>() != target)
+            .cloned()
+            .collect(),
+    )
+}
+
+/// The generation `ann_search` files a sealed memtable's results under: one
+/// per sealed memtable counting down from here, so placeholder positions
+/// cannot collide with the active memtable's or a real SSTable's (flush
+/// generations never reach this range).
+const FLUSHING_MEMTABLE_GENERATION: u64 = u64::MAX;
+
+/// Every sealed memtable's vector index named `index_name`, newest first.
+fn flushing_vector_indexes(view: &StoreView, index_name: &str) -> Vec<Arc<VectorMemtableIndex>> {
+    view.flushing
+        .iter()
+        .filter_map(|sealed| sealed.vectors.load().get(index_name).cloned())
+        .collect()
+}
+
+/// The active memtable's index named `index_name` and every sealed one's.
+fn memtable_indexes_named(view: &StoreView, index_name: &str) -> Vec<Arc<MemtableIndex>> {
+    view.indexes
+        .get(index_name)
+        .cloned()
+        .into_iter()
+        .chain(
+            view.flushing
+                .iter()
+                .filter_map(|sealed| sealed.postings.load().get(index_name).cloned()),
+        )
+        .collect()
 }
 
 /// K-way merge of whole sidecars in `(key, row)` order, yielding each entry
@@ -2073,10 +2764,15 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns, &[], &[]);
+        let schema = Arc::new(schema);
+        let (rotation_tx, rotation_rx) = crossbeam_channel::unbounded();
+        let indexes = new_indexes(
+            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
+            Arc::clone(&schema),
+        );
         let initial_view = StoreView {
             active,
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
             indexes,
@@ -2085,28 +2781,28 @@ impl<F: FlushTarget> TableStore<F> {
         };
         initial_view.check_invariants("new:empty");
         Self {
-            schema: ArcSwap::from_pointee(schema),
+            schema: ArcSwap::new(schema),
             view: ArcSwap::from_pointee(initial_view),
-            flush_guard: Mutex::new(()),
+            rotation_tx,
+            rotation_rx,
+            rotating: std::sync::atomic::AtomicBool::new(false),
+            rotations_started: std::sync::atomic::AtomicU64::new(0),
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
-            index_types: default_index_types(&indexed_columns),
-            index_filter_predicates: HashMap::new(),
-            indexed_columns,
-            indexed_clustering_columns: Vec::new(),
-            indexed_partition_key_columns: Vec::new(),
-            fulltext_indexes: vec![],
-            vector_index_configs: vec![],
-            vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
-            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
-            quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            vector_index_scopes: ArcSwap::from_pointee(VectorIndexScopes::new()),
+            quarantined_sstables: crate::lockfree::SharedSet::new("quarantined SSTables"),
+            index_unavailable_sstables: crate::lockfree::SharedSet::new(
+                "index-unavailable SSTables",
+            ),
             missing_sstables: MissingSstableCache::default(),
-            fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
-            write_barrier: parking_lot::RwLock::new(()),
+            fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
+                "FTI sidecar builds in flight",
+            )),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            late_writes_after_seal: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
             reader_pool: Arc::new(crate::reader_pool::ReaderPool::new(
                 crate::reader_pool::configured_reader_cache_cap(),
@@ -2237,7 +2933,12 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns, &[], &[]);
+        let schema = Arc::new(schema);
+        let (rotation_tx, rotation_rx) = crossbeam_channel::unbounded();
+        let indexes = new_indexes(
+            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
+            Arc::clone(&schema),
+        );
         let sidecar_count = initial_sstables.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -2281,7 +2982,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let initial_view = StoreView {
             active,
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(descriptors),
             sstable_ids: Arc::new(initial_ids),
             indexes,
@@ -2290,28 +2991,28 @@ impl<F: FlushTarget> TableStore<F> {
         };
         initial_view.check_invariants("new_with_sstables");
         Self {
-            schema: ArcSwap::from_pointee(schema),
+            schema: ArcSwap::new(schema),
             view: ArcSwap::from_pointee(initial_view),
-            flush_guard: Mutex::new(()),
+            rotation_tx,
+            rotation_rx,
+            rotating: std::sync::atomic::AtomicBool::new(false),
+            rotations_started: std::sync::atomic::AtomicU64::new(0),
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
-            index_types: default_index_types(&indexed_columns),
-            index_filter_predicates: HashMap::new(),
-            indexed_columns,
-            indexed_clustering_columns: Vec::new(),
-            indexed_partition_key_columns: Vec::new(),
-            fulltext_indexes: vec![],
-            vector_index_configs: vec![],
-            vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
-            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
-            quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            vector_index_scopes: ArcSwap::from_pointee(VectorIndexScopes::new()),
+            quarantined_sstables: crate::lockfree::SharedSet::new("quarantined SSTables"),
+            index_unavailable_sstables: crate::lockfree::SharedSet::new(
+                "index-unavailable SSTables",
+            ),
             missing_sstables: MissingSstableCache::default(),
-            fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
-            write_barrier: parking_lot::RwLock::new(()),
+            fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
+                "FTI sidecar builds in flight",
+            )),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            late_writes_after_seal: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
             pool_table_key,
@@ -2338,7 +3039,12 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns, &[], &[]);
+        let schema = Arc::new(schema);
+        let (rotation_tx, rotation_rx) = crossbeam_channel::unbounded();
+        let indexes = new_indexes(
+            Arc::new(IndexCatalog::with_indexed_columns(indexed_columns)),
+            Arc::clone(&schema),
+        );
         let sstable_count = descriptors.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -2365,7 +3071,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let initial_view = StoreView {
             active,
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(descriptors),
             sstable_ids: Arc::new(initial_ids),
             indexes,
@@ -2374,28 +3080,28 @@ impl<F: FlushTarget> TableStore<F> {
         };
         initial_view.check_invariants("new_with_descriptors");
         Self {
-            schema: ArcSwap::from_pointee(schema),
+            schema: ArcSwap::new(schema),
             view: ArcSwap::from_pointee(initial_view),
-            flush_guard: Mutex::new(()),
+            rotation_tx,
+            rotation_rx,
+            rotating: std::sync::atomic::AtomicBool::new(false),
+            rotations_started: std::sync::atomic::AtomicU64::new(0),
             last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
-            index_types: default_index_types(&indexed_columns),
-            index_filter_predicates: HashMap::new(),
-            indexed_columns,
-            indexed_clustering_columns: Vec::new(),
-            indexed_partition_key_columns: Vec::new(),
-            fulltext_indexes: vec![],
-            vector_index_configs: vec![],
-            vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
-            vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
-            quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            index_unavailable_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            vector_index_scopes: ArcSwap::from_pointee(VectorIndexScopes::new()),
+            quarantined_sstables: crate::lockfree::SharedSet::new("quarantined SSTables"),
+            index_unavailable_sstables: crate::lockfree::SharedSet::new(
+                "index-unavailable SSTables",
+            ),
             missing_sstables: MissingSstableCache::default(),
-            fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
-            write_barrier: parking_lot::RwLock::new(()),
+            fulltext_sidecars_in_flight: Arc::new(crate::lockfree::SharedSet::new(
+                "FTI sidecar builds in flight",
+            )),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
+            late_writes_after_seal: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
             reader_pool,
             pool_table_key: String::new(),
@@ -2407,66 +3113,19 @@ impl<F: FlushTarget> TableStore<F> {
     /// `SerializationHeader` with up-to-date `num_columns`, avoiding the
     /// writer's out-of-range-col_idx panic
     /// (see bug-sstable-writer-produces-zero-byte-rows-db.md).
-    pub fn update_schema(&mut self, new_schema: TableSchema) {
-        // Regular columns are ordered by Cassandra's column-name comparator,
-        // so `ALTER TABLE ADD` of a column that sorts before an indexed
-        // column shifts the indexed column's ordinal (the `u16` cell tag).
-        // Index declarations store ordinals, not names — left stale, every
-        // subsequent write extracts the indexed value from the WRONG cell,
-        // and a backfilled-Current index then serves false empty results
-        // (memory-suite regression `fixed_phonetic_match`). Remap every
-        // positional declaration through the old schema's column name.
-        let old_schema = self.schema.load_full();
-        let remap = |index_name: &str, pos: &mut usize| {
-            let Some(old_col) = old_schema.regular_columns.get(*pos) else {
-                tracing::error!(
-                    index = index_name,
-                    position = *pos,
-                    "index ordinal points past the pre-ALTER regular column \
-                     set — leaving it unchanged; index writes may be wrong"
-                );
-                return;
-            };
-            match new_schema
-                .regular_columns
-                .iter()
-                .position(|c| c.name == old_col.name)
-            {
-                Some(new_pos) => {
-                    if new_pos != *pos {
-                        tracing::info!(
-                            index = index_name,
-                            column = %old_col.name,
-                            old_position = *pos,
-                            new_position = new_pos,
-                            "remapped index column ordinal after schema update"
-                        );
-                        *pos = new_pos;
-                    }
-                }
-                None => tracing::error!(
-                    index = index_name,
-                    column = %old_col.name,
-                    "indexed column absent from post-ALTER schema — leaving \
-                     ordinal unchanged; index writes may be wrong"
-                ),
-            }
-        };
-        for (name, pos) in &mut self.indexed_columns {
-            remap(name, pos);
-        }
-        for (name, pos) in &mut self.fulltext_indexes {
-            remap(name, pos);
-        }
-        for cfg in &mut self.vector_index_configs {
-            remap(&cfg.index_name.clone(), &mut cfg.column_position);
-        }
-        for (name, pred) in &mut self.index_filter_predicates {
-            for clause in &mut pred.clauses {
-                remap(name, &mut clause.column_position);
-            }
-        }
-        self.schema.store(Arc::new(new_schema));
+    ///
+    /// Rows already in the memtable were written under the old schema, so
+    /// this is a flush that publishes the new schema at its memtable swap:
+    /// see `TableStore::flush_and_update_schema`.
+    pub fn update_schema(&self, new_schema: TableSchema) -> Result<()> {
+        self.flush_and_update_schema(new_schema, || {})
+            .map(|_outcome| ())
+    }
+
+    /// The table's current index catalog: the one the active memtable was
+    /// created with, and which every write to it posts under.
+    fn catalog(&self) -> Arc<IndexCatalog> {
+        Arc::clone(&self.view.load().indexes.catalog)
     }
 
     /// Return a guard over the current schema. Holding the guard keeps the
@@ -2474,6 +3133,12 @@ impl<F: FlushTarget> TableStore<F> {
     /// concurrently.
     pub fn schema(&self) -> arc_swap::Guard<Arc<TableSchema>> {
         self.schema.load()
+    }
+
+    /// The current schema as an owned `Arc`, for holders that outlive a
+    /// guard or cross threads.
+    pub fn schema_arc(&self) -> Arc<TableSchema> {
+        self.schema.load_full()
     }
 
     /// Directory under which this store's SSTable components and
@@ -2505,22 +3170,61 @@ impl<F: FlushTarget> TableStore<F> {
     /// Loads the current view atomically, then delegates to the memtable's
     /// `put`. After the memtable write, each declared secondary index is
     /// updated by extracting the indexed column value from the row cells.
-    /// No lock is taken on the read/write path; the ArcSwap guard provides
-    /// the necessary lifetime without blocking.
+    ///
+    /// The whole write — index postings and memtable put — runs against ONE
+    /// loaded view, admitted through that view's memtable gate, and posts
+    /// under the catalog and schema bound to that memtable. A flush publishes
+    /// the next memtable before it seals this one, and waits for the writers
+    /// inside before it snapshots, so a write never posts into one memtable's
+    /// indexes and puts its row into another, never lands in a frozen
+    /// memtable after its snapshot, and never posts under a catalog its
+    /// memtable's flush will not write sidecars for. A writer that meets a
+    /// sealed gate reloads the view and writes to the new memtable; no writer
+    /// ever waits for a flush.
     pub fn write(&self, key: &DecoratedKey, row: Row) -> Result<()> {
-        let guard = self.view.load();
+        for _ in 0..MAX_SEALED_MEMTABLE_RETRIES {
+            let guard = self.view.load();
+            if let Some(_admitted) = guard.indexes.gate.try_enter() {
+                return self.write_admitted(&guard, key, row);
+            }
+            // Sealed: a flush already published the next memtable.
+            std::thread::yield_now();
+        }
+        tracing::error!(
+            attempts = MAX_SEALED_MEMTABLE_RETRIES,
+            "store: every memtable this write loaded was already sealed; the write is refused"
+        );
+        Err(ferrosa_common::Error::InvalidData(format!(
+            "write refused: met a sealed memtable {MAX_SEALED_MEMTABLE_RETRIES} times in a row"
+        )))
+    }
+
+    /// [`Self::write`] once it holds an admission to `guard`'s memtable.
+    ///
+    /// A whole-value (path-less, live) cell on a non-frozen collection column
+    /// must parse as a collection, or the write is refused before anything
+    /// sees it: a complex-framed flush or compaction later expands that cell
+    /// into elements, and a value that cannot be expanded would fail every
+    /// flush of the table. Every write producer (CQL, mixed-version forwards,
+    /// hints, batchlog, graph writes, commit-log replay) passes through here.
+    /// It is checked against the schema bound to the admitted memtable, the
+    /// same schema its flush writes under, so a racing `ALTER` cannot pass a
+    /// cell under one schema and flush it under another.
+    fn write_admitted(&self, guard: &StoreView, key: &DecoratedKey, row: Row) -> Result<()> {
+        crate::memtable::validate_legacy_collection_blobs(&row, &guard.indexes.schema)?;
+        let catalog = Arc::clone(&guard.indexes.catalog);
 
         // Secondary index maintenance: extract indexed column values and insert
         // before the memtable put (which consumes the row reference via move).
-        if !self.indexed_columns.is_empty() {
-            for (index_name, col_pos) in &self.indexed_columns {
+        if !catalog.indexed_columns.is_empty() {
+            for (index_name, col_pos) in &catalog.indexed_columns {
                 if let Some(index) = guard.indexes.get(index_name) {
                     insert_scalar_memtable_index_row(
                         index,
                         index_name,
                         *col_pos,
-                        self.index_type_for(index_name),
-                        self.index_filter_predicates.get(index_name),
+                        catalog.index_type_for(index_name),
+                        catalog.index_filter_predicates.get(index_name),
                         key.key.as_bytes(),
                         &row,
                     );
@@ -2531,10 +3235,10 @@ impl<F: FlushTarget> TableStore<F> {
         // Partition-key index maintenance: a partition-key column's value is
         // not a cell either, so it is extracted from the row's composite
         // partition-key bytes at the declared component.
-        if !self.indexed_partition_key_columns.is_empty() {
+        if !catalog.indexed_partition_key_columns.is_empty() {
             let total = self.partition_key_column_count();
             let components = ferrosa_row_bridge::decode_pk(key, total);
-            for (index_name, component) in &self.indexed_partition_key_columns {
+            for (index_name, component) in &catalog.indexed_partition_key_columns {
                 let Some(value) = components.get(*component) else {
                     tracing::warn!(
                         index_name,
@@ -2544,7 +3248,7 @@ impl<F: FlushTarget> TableStore<F> {
                     );
                     continue;
                 };
-                let index_type = self.index_type_for(index_name);
+                let index_type = catalog.index_type_for(index_name);
                 match crate::index::scheduler::encode_index_key(index_type, value) {
                     Ok(Some(index_key)) => {
                         // One posting per PARTITION (t_c5bccc65): every row of
@@ -2584,10 +3288,10 @@ impl<F: FlushTarget> TableStore<F> {
         // Clustering-column index maintenance (t_430c4188): a clustering
         // column's value is not a cell, so it is extracted from the row's
         // composite clustering-key bytes at the declared component.
-        if !self.indexed_clustering_columns.is_empty() && !row.clustering.is_empty() {
+        if !catalog.indexed_clustering_columns.is_empty() && !row.clustering.is_empty() {
             let total = self.clustering_column_count();
             let components = ferrosa_row_bridge::decode_clustering(&row.clustering, total);
-            for (index_name, component) in &self.indexed_clustering_columns {
+            for (index_name, component) in &catalog.indexed_clustering_columns {
                 let Some(value) = components.get(*component) else {
                     tracing::warn!(
                         index_name,
@@ -2597,7 +3301,7 @@ impl<F: FlushTarget> TableStore<F> {
                     );
                     continue;
                 };
-                let index_type = self.index_type_for(index_name);
+                let index_type = catalog.index_type_for(index_name);
                 match crate::index::scheduler::encode_index_key(index_type, value) {
                     Ok(Some(index_key)) => {
                         let row_pos = RowPosition {
@@ -2635,8 +3339,8 @@ impl<F: FlushTarget> TableStore<F> {
         // placeholder. The drain→HNSW build at flush time re-inserts with
         // the final on-disk offset. For now, the memtable search is by position
         // within the memtable (ordering only), not absolute file offset.
-        if !self.vector_index_configs.is_empty() {
-            for cfg in &self.vector_index_configs {
+        if !catalog.vector_index_configs.is_empty() {
+            for cfg in &catalog.vector_index_configs {
                 if let Some(cell) = row
                     .cells
                     .iter()
@@ -2668,14 +3372,10 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // Hold the write barrier (shared) during the memtable put.
-        // This prevents the flush from swapping the active memtable while
-        // we're writing. Re-load the view INSIDE the barrier to ensure we
-        // write to the current active, not a stale one.
-        let _wb = self.write_barrier.read();
-        let current = self.view.load();
-        let schema = self.schema.load();
-        current.active.put(key, row, &schema)
+        // The caller holds an admission to this memtable's gate, so the flush
+        // that freezes it has not snapshotted it yet: the row lands in the
+        // memtable its postings were added for, under that memtable's schema.
+        guard.active.put(key, row, &guard.indexes.schema)
     }
 
     /// Read a partition by merging all sources: active memtable, flushing
@@ -2949,10 +3649,15 @@ impl<F: FlushTarget> TableStore<F> {
     /// generation leaves the view (FMEA ST-56). What it buys is that those
     /// reads fail fast instead of re-opening the file on each attempt.
     fn quarantine_sstable(&self, corrupt: &CorruptSstableId) -> bool {
-        let inserted = self
-            .quarantined_sstables
-            .write()
-            .insert(corrupt.gen.clone());
+        let inserted = match self.quarantined_sstables.insert(&corrupt.gen) {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                // The read that found it still fails with the typed error;
+                // only the fast-fail on later reads is lost.
+                tracing::error!(corrupt = %corrupt, %e, "could not record an SSTable quarantine");
+                false
+            }
+        };
         if inserted {
             tracing::warn!(
                 corrupt = %corrupt,
@@ -2968,11 +3673,19 @@ impl<F: FlushTarget> TableStore<F> {
     /// consults over a view holding it fail with the typed corrupt-SSTable
     /// error; data reads are unaffected (FMEA ST-59).
     pub(crate) fn mark_index_unavailable(&self, gen: &str) {
-        if self
-            .index_unavailable_sstables
-            .write()
-            .insert(gen.to_string())
-        {
+        let inserted = match self.index_unavailable_sstables.insert(gen) {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                tracing::error!(
+                    gen,
+                    %e,
+                    "could not record that this SSTable's index sidecars are unavailable; \
+                     index consults over it are NOT refused"
+                );
+                false
+            }
+        };
+        if inserted {
             tracing::error!(
                 gen,
                 "secondary-index sidecars of this SSTable could not be opened; index consults \
@@ -2986,7 +3699,13 @@ impl<F: FlushTarget> TableStore<F> {
     /// probes it for real. Returns whether it was quarantined.
     pub fn resolve_sstable_quarantine(&self, gen: &str) -> bool {
         self.missing_sstables.forget(gen);
-        self.quarantined_sstables.write().remove(gen)
+        match self.quarantined_sstables.remove(gen) {
+            Ok(removed) => removed,
+            Err(e) => {
+                tracing::error!(gen, %e, "could not clear an SSTable quarantine; it stays quarantined");
+                false
+            }
+        }
     }
 
     /// Open attempts that failed for real (reached storage), not fast-failed.
@@ -3007,14 +3726,14 @@ impl<F: FlushTarget> TableStore<F> {
     /// Whether `gen` is currently quarantined (reads overlapping it fail fast).
     /// Used by the repair path to target the SSTable's range and by tests.
     pub fn is_sstable_quarantined(&self, gen: &str) -> bool {
-        self.quarantined_sstables.read().contains(gen)
+        self.quarantined_sstables.contains(gen)
     }
 
     /// Snapshot of all currently-quarantined SSTable generations. The
     /// anti-entropy repair scheduler drains this to learn which ranges to
     /// refill from a healthy replica.
     pub fn quarantined_sstable_gens(&self) -> Vec<String> {
-        self.quarantined_sstables.read().iter().cloned().collect()
+        self.quarantined_sstables.to_vec()
     }
 
     /// Refuse an index consult while a generation overlapping it is
@@ -3033,14 +3752,12 @@ impl<F: FlushTarget> TableStore<F> {
         token: Option<i64>,
         op: &'static str,
     ) -> Result<()> {
-        if self.quarantined_sstables.read().is_empty()
-            && self.index_unavailable_sstables.read().is_empty()
-        {
+        if self.quarantined_sstables.is_empty() && self.index_unavailable_sstables.is_empty() {
             return Ok(());
         }
         let overlapping = view.sstables.iter().find(|desc| {
             (self.is_sstable_quarantined(&desc.gen)
-                || self.index_unavailable_sstables.read().contains(&desc.gen))
+                || self.index_unavailable_sstables.contains(&desc.gen))
                 && token.is_none_or(|t| t >= desc.min_token && t <= desc.max_token)
         });
         let Some(desc) = overlapping else {
@@ -3122,7 +3839,7 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // Flushing memtable
-        if let Some(ref flushing) = guard.flushing {
+        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
             if let Some(p) = flushing.get(key)? {
                 flushing_hits += 1;
                 sources.push(clone_partition_limited(&p, start_clustering, row_limit));
@@ -3297,7 +4014,7 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        if let Some(ref flushing) = guard.flushing {
+        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
             if let Some(p) = flushing.get(key)? {
                 if let Some(filtered) = partition_with_matching_clustering(&p, clustering) {
                     sources.push(filtered);
@@ -3446,7 +4163,7 @@ impl<F: FlushTarget> TableStore<F> {
             rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
             mem_row_iters.push(rows.into_iter());
         }
-        if let Some(flushing) = guard.flushing.as_ref() {
+        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
             if let Some(partition) = flushing.get(key)? {
                 if partition.deletion.marked_for_delete_at
                     > partition_delete_at.marked_for_delete_at
@@ -3595,7 +4312,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// Flush the active memtable to an SSTable.
     ///
     /// The flush sequence:
-    /// 1. Lock the flush mutex (serializes concurrent flush calls).
+    /// 1. Queue the rotation; one thread runs the queue (see `TableStore::rotate`).
     /// 2. Install a fresh active memtable; move the old one to `flushing`.
     /// 3. Snapshot the flushing memtable.
     /// 4. If the snapshot is empty, clear `flushing` and return (no-op).
@@ -3618,105 +4335,460 @@ impl<F: FlushTarget> TableStore<F> {
     /// caller must not treat that generation as freshly written.
     pub(crate) fn flush_with_swap_callback(
         &self,
+        on_memtable_release: impl FnOnce() + Send + 'static,
+    ) -> Result<FlushOutcome> {
+        self.rotate(RotationKind::Flush {
+            on_release: Box::new(on_memtable_release),
+        })
+    }
+
+    /// Flush every row written under the current schema, then publish
+    /// `new_schema`, with no write admitted in between (`ALTER TABLE`).
+    ///
+    /// The memtable swap and the schema swap are one step: the frozen memtable
+    /// is serialized with the schema and catalog it was written under, and the
+    /// new memtable starts empty under the new ones. So every row in the
+    /// flushed SSTable carries the pre-ALTER layout its header describes, and
+    /// every later row enters a memtable that will flush under the new one.
+    /// This used to depend on the engine holding its table-map write lock
+    /// across `flush` and `update_schema`; that lock is gone (t_d938e6ae).
+    pub(crate) fn flush_and_update_schema(
+        &self,
+        new_schema: TableSchema,
+        on_memtable_release: impl FnOnce() + Send + 'static,
+    ) -> Result<FlushOutcome> {
+        self.rotate(RotationKind::Schema {
+            schema: new_schema,
+            on_release: Box::new(on_memtable_release),
+        })
+    }
+
+    /// Change the table's index catalog by rotating the memtable: `edit`
+    /// derives the new catalog from the current one (or returns `None` to
+    /// change nothing), the active memtable is frozen and flushed, and a new
+    /// empty one bound to the new catalog takes writes.
+    ///
+    /// This is how index DDL stays lock-free and exact. A live memtable's
+    /// indexes are never edited, so no write can post under a catalog its
+    /// memtable does not carry, and every index of a memtable is complete for
+    /// it — the new memtable starts empty, and the frozen one gets sidecars for
+    /// the NEW catalog built from its own postings, or from its now-immutable
+    /// rows for an index the edit added (see `flush_rotating`). `edit` runs at
+    /// the swap against the latest catalog, and rotations run one at a time
+    /// in queue order, so concurrent DDLs cannot lose one another's changes.
+    ///
+    /// Returns what the rotation's flush did. A published generation's
+    /// sidecars already cover every index of the new catalog (see
+    /// [`Self::indexes_written_by_last_flush`]), so it needs no backfill build
+    /// for an index the edit added. The caller owns the engine-side
+    /// bookkeeping every flush needs.
+    pub(crate) fn flush_applying_catalog_edit(
+        &self,
+        edit: impl FnOnce(&IndexCatalog) -> Option<IndexCatalog> + Send + 'static,
+    ) -> Result<FlushOutcome> {
+        self.rotate(RotationKind::Edit(Box::new(edit)))
+    }
+
+    /// Run one memtable rotation, with no lock (t_d938e6ae).
+    ///
+    /// Rotations of one table must happen one at a time: each swaps the
+    /// active memtable, and a catalog edit derives from the catalog the
+    /// previous rotation left. That used to be a per-table `Mutex` every
+    /// flush, DDL and truncate queued on. Now the request goes onto a queue,
+    /// and whichever caller claims the `rotating` flag by compare-and-swap
+    /// runs everything queued, in order, for everyone (flat combining):
+    /// flushes, edits and schema changes queued together are ONE rotation.
+    /// The others wait for their own answer, never for a lock, and take over
+    /// the queue if the combiner stops.
+    ///
+    /// # Errors
+    ///
+    /// The rotation's own error, or a loud error if no answer arrives within
+    /// [`ROTATION_WAIT_LIMIT`].
+    fn rotate(&self, kind: RotationKind) -> Result<FlushOutcome> {
+        let (reply, answer) = crossbeam_channel::bounded(1);
+        let request = RotationRequest {
+            kind,
+            enqueued_at: Instant::now(),
+            reply,
+        };
+        if self.rotation_tx.send(request).is_err() {
+            // The store holds the receiver, so this cannot happen while
+            // `self` is alive.
+            return Err(ferrosa_common::Error::InvalidData(
+                "rotation queue closed".to_string(),
+            ));
+        }
+        let start = Instant::now();
+        while start.elapsed() < ROTATION_WAIT_LIMIT {
+            self.combine_rotations();
+            match answer.recv_timeout(ROTATION_POLL) {
+                Ok(result) => return result,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    tracing::error!("store: a rotation was dropped without an answer");
+                    return Err(ferrosa_common::Error::InvalidData(
+                        "the rotation was dropped without an answer (its combiner panicked)"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        tracing::error!(
+            waited_s = start.elapsed().as_secs(),
+            "store: no answer for a queued rotation; it may still run later"
+        );
+        Err(ferrosa_common::Error::InvalidData(format!(
+            "no answer for a queued memtable rotation after {ROTATION_WAIT_LIMIT:?}"
+        )))
+    }
+
+    /// If no other thread is running the rotation queue, run it.
+    fn combine_rotations(&self) {
+        for _ in 0..MAX_COMBINE_ROUNDS {
+            if self
+                .rotating
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return;
+            }
+            let slot = CombinerSlot(&self.rotating);
+            let batch: Vec<RotationRequest> = self.rotation_rx.try_iter().collect();
+            self.run_rotation_batch(batch);
+            drop(slot);
+            // A request queued after the drain but before the flag cleared
+            // found the flag set; pick it up rather than strand it.
+            if self.rotation_rx.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Run one drained batch in queue order: consecutive flushes, edits and
+    /// schema changes as one rotation; a truncate or barrier on its own.
+    fn run_rotation_batch(&self, batch: Vec<RotationRequest>) {
+        let mut group = Vec::new();
+        for request in batch {
+            match request.kind {
+                RotationKind::Truncate | RotationKind::Barrier => {
+                    if !group.is_empty() {
+                        self.run_rotation_group(std::mem::take(&mut group));
+                    }
+                    let result = match request.kind {
+                        RotationKind::Truncate => self.truncate_now(),
+                        _ => Ok(FlushOutcome::NothingToFlush),
+                    };
+                    Self::answer(&request.reply, result);
+                }
+                _ => group.push(request),
+            }
+        }
+        if !group.is_empty() {
+            self.run_rotation_group(group);
+        }
+    }
+
+    /// Send `result` to one waiting caller. The caller may have given up
+    /// (see [`ROTATION_WAIT_LIMIT`]); its answer is then only logged.
+    fn answer(
+        reply: &crossbeam_channel::Sender<Result<FlushOutcome>>,
+        result: Result<FlushOutcome>,
+    ) {
+        if let Err(unsent) = reply.send(result) {
+            tracing::warn!(
+                result = ?unsent.0,
+                "store: a rotation finished after its caller stopped waiting"
+            );
+        }
+    }
+
+    /// Run queued flushes, edits and schema changes as ONE memtable rotation.
+    fn run_rotation_group(&self, group: Vec<RotationRequest>) {
+        let oldest = group
+            .iter()
+            .map(|request| request.enqueued_at)
+            .min()
+            .unwrap_or_else(Instant::now);
+        crate::metrics::observe_flush_phase(crate::metrics::FlushPhase::LockWait, oldest.elapsed());
+        let mut replies = Vec::with_capacity(group.len());
+        let mut changes = Vec::with_capacity(group.len());
+        let mut releases: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        for request in group {
+            replies.push(request.reply);
+            match request.kind {
+                RotationKind::Flush { on_release } => releases.push(on_release),
+                RotationKind::Edit(edit) => changes.push(RotationChange::Edit(edit)),
+                RotationKind::Schema { schema, on_release } => {
+                    changes.push(RotationChange::Schema(schema));
+                    releases.push(on_release);
+                }
+                RotationKind::Truncate | RotationKind::Barrier => {
+                    unreachable!("run_rotation_batch never groups a truncate or barrier")
+                }
+            }
+        }
+        let result = if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!(
+                dir = %self.flush_target.base_dir().display(),
+                "flush skipped: the table was dropped while this flush was pending"
+            );
+            Ok(FlushOutcome::NothingToFlush)
+        } else {
+            self.flush_rotating(
+                |catalog, schema| apply_rotation_changes(changes, catalog, schema),
+                || releases.into_iter().for_each(|release| release()),
+            )
+        };
+        match result {
+            Ok(outcome) => replies
+                .iter()
+                .for_each(|reply| Self::answer(reply, Ok(outcome))),
+            Err(e) => {
+                // The first caller gets the error itself; the rest its text.
+                let message = e.to_string();
+                let mut replies = replies.iter();
+                if let Some(first) = replies.next() {
+                    Self::answer(first, Err(e));
+                }
+                replies.for_each(|reply| {
+                    Self::answer(
+                        reply,
+                        Err(ferrosa_common::Error::InvalidData(format!(
+                            "the memtable rotation this request joined failed: {message}"
+                        ))),
+                    );
+                });
+            }
+        }
+    }
+
+    /// The memtable indexes a flush writes sidecars from: one per scalar index
+    /// the `target` catalog declares. An index the frozen memtable carried
+    /// gives its own postings, complete because every write to that memtable
+    /// posted to it; an index the rotating DDL added is posted now from the
+    /// frozen rows. An index the DDL dropped is left out.
+    fn flush_sidecar_indexes(
+        &self,
+        frozen: &MemtableIndexes,
+        target: &IndexCatalog,
+        partitions: &[Partition],
+    ) -> Vec<(String, Arc<MemtableIndex>)> {
+        let key_component_counts = (
+            self.partition_key_column_count(),
+            self.clustering_column_count(),
+        );
+        target
+            .scalar_index_names()
+            .map(|name| {
+                // The frozen postings serve only when they were built to the
+                // same definition: a re-declaration that changed the type,
+                // position or predicate needs its sidecar built from the rows.
+                let same_definition =
+                    frozen.catalog.scalar_definition(name) == target.scalar_definition(name);
+                let index = match frozen.get(name) {
+                    Some(index) if same_definition => Arc::clone(index),
+                    _ => scalar_index_from_rows(target, name, partitions, key_component_counts),
+                };
+                (name.clone(), index)
+            })
+            .collect()
+    }
+
+    /// Mark this store dropped: wait for a rotation already running to
+    /// finish, then make every later one a no-op.
+    ///
+    /// DROP TABLE removes the table from the engine and deletes its directory
+    /// so a re-CREATE starts empty. Readers that still hold the table get
+    /// I/O errors for files that are gone, which is loud and correct for a
+    /// dropped table. A flush still running on it is different: it would
+    /// write an SSTable into the deleted directory for the re-created table
+    /// to load. So the flag is set first, and then a barrier goes through the
+    /// rotation queue: it is answered only after every rotation queued before
+    /// it has finished, and every rotation after it sees the flag.
+    pub fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Err(e) = self.rotate(RotationKind::Barrier) {
+            tracing::error!(
+                %e,
+                dir = %self.flush_target.base_dir().display(),
+                "retire: could not confirm that no flush of the dropped table is still writing"
+            );
+        }
+    }
+
+    /// The partition for `key` in SSTable generation `gen` alone.
+    #[cfg(test)]
+    pub(crate) fn read_from_generation_for_test(
+        &self,
+        gen: &str,
+        key: &DecoratedKey,
+    ) -> Result<Option<Partition>> {
+        let view = self.view.load();
+        let desc = view
+            .sstables
+            .iter()
+            .find(|desc| desc.gen == gen)
+            .ok_or_else(|| ferrosa_common::Error::InvalidData(format!("no generation {gen}")))?;
+        self.open_reader(desc)?.get_partition_limited_rows(key, 0)
+    }
+
+    /// Sealed memtables not yet flushed.
+    #[cfg(test)]
+    pub(crate) fn sealed_memtable_count_for_test(&self) -> usize {
+        self.view.load().flushing.len()
+    }
+
+    /// Memtable swaps this store has performed (see [`Self::rotate`]).
+    #[cfg(test)]
+    pub(crate) fn rotations_started(&self) -> u64 {
+        self.rotations_started
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// One memtable rotation and the flush of the frozen memtable. Runs only
+    /// on the rotation combiner (see [`Self::rotate`]), so never twice at once
+    /// for one table. `plan` gives the catalog and schema the new memtable is
+    /// bound to, from the frozen memtable's.
+    fn flush_rotating(
+        &self,
+        plan: impl FnOnce(
+            &Arc<IndexCatalog>,
+            &Arc<TableSchema>,
+        ) -> (Arc<IndexCatalog>, Arc<TableSchema>),
         on_memtable_release: impl FnOnce(),
     ) -> Result<FlushOutcome> {
         let total_start = Instant::now();
-        let phase_start = Instant::now();
-        let _guard = self.flush_guard.lock();
-        crate::metrics::observe_flush_phase(
-            crate::metrics::FlushPhase::LockWait,
-            phase_start.elapsed(),
-        );
+        self.rotations_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Step 1: Swap in a fresh active memtable, move old to flushing.
-        // Take the write barrier (exclusive) to ensure no writer is mid-put
-        // during the swap. This is the critical section: after the swap, all
-        // new writes go to the new active memtable, and the old memtable
-        // contains a complete snapshot.
+        // Step 1: Swap in a fresh active memtable and seal the old one: push it
+        // onto the front of `flushing`, then seal its write gate and wait for
+        // the writers already inside. After that every new write goes to the
+        // new active memtable and the sealed one holds a complete, final
+        // snapshot. Writers never wait here: one that meets the sealed gate
+        // reloads the view.
         let new_active: Arc<dyn Memtable> = new_memtable();
-        let fresh_indexes = new_indexes(
-            &self.indexed_columns,
-            &self.indexed_clustering_columns,
-            &self.indexed_partition_key_columns,
-        );
-        let fresh_vector_indexes = new_vector_indexes(&self.vector_index_configs);
         let phase_start = Instant::now();
-        let (old_active, old_view_flushing, old_indexes, old_vector_indexes) = {
-            let _wb = self.write_barrier.write(); // block all writers
-            let old_view = self.view.load();
-            let old_active = Arc::clone(&old_view.active);
-            let old_view_flushing = old_view.flushing.clone();
+        let target_catalog = {
+            let old_view = self.view.load_full();
+            let flush_schema = Arc::clone(&old_view.indexes.schema);
+            let flush_catalog = Arc::clone(&old_view.indexes.catalog);
+            // The catalog and schema the new memtable is bound to; every
+            // sealed memtable this rotation flushes gets sidecars for this
+            // catalog.
+            let (target_catalog, target_schema) = plan(&flush_catalog, &flush_schema);
+            if !Arc::ptr_eq(&target_schema, &flush_schema) {
+                self.schema.store(Arc::clone(&target_schema));
+            }
+            let fresh_indexes = new_indexes(Arc::clone(&target_catalog), target_schema);
+            let fresh_vector_indexes = new_vector_indexes(&target_catalog.vector_index_configs);
+            let frozen_active = Arc::clone(&old_view.active);
             let old_indexes = Arc::clone(&old_view.indexes);
-            let old_vector_indexes = Arc::clone(&old_view.vector_indexes);
-            let current_sstables = Arc::clone(&old_view.sstables);
-            let current_ids = Arc::clone(&old_view.sstable_ids);
-            let current_sidecars = Arc::clone(&old_view.sidecar_indexes);
+            debug_assert!(
+                !old_indexes.gate.is_sealed(),
+                "the active memtable's gate is sealed before its flush"
+            );
+            let sealed = SealedMemtable::new(
+                Arc::clone(&frozen_active),
+                Arc::clone(&old_indexes),
+                Arc::clone(&old_view.vector_indexes),
+            );
             drop(old_view);
 
-            let new_view = StoreView {
-                active: new_active,
-                flushing: Some(Arc::clone(&old_active)),
-                sstables: Arc::clone(&current_sstables),
-                sstable_ids: Arc::clone(&current_ids),
-                indexes: fresh_indexes,
-                sidecar_indexes: Arc::clone(&current_sidecars),
-                vector_indexes: fresh_vector_indexes,
-            };
-            new_view.check_invariants("flush:swap_active");
-            self.view.store(Arc::new(new_view));
-            // Write barrier released here — writers resume with the new active.
-            (
-                old_active,
-                old_view_flushing,
-                old_indexes,
-                old_vector_indexes,
-            )
+            // Only a rotation replaces the active memtable, and rotations run
+            // one at a time, so the view this derives from still holds
+            // `frozen_active`; compaction swaps and sidecar installs that
+            // landed since are kept. A memtable a failed flush left in
+            // `flushing` stays there, behind this one (t_7681b32b).
+            let swapped = self.update_view("flush:swap_active", |current| {
+                if !Arc::ptr_eq(&current.active, &frozen_active) {
+                    return (None, false);
+                }
+                let mut flushing = Vec::with_capacity(current.flushing.len() + 1);
+                flushing.push(Arc::clone(&sealed));
+                flushing.extend(current.flushing.iter().cloned());
+                let next = StoreView {
+                    active: Arc::clone(&new_active),
+                    flushing: Arc::new(flushing),
+                    sstables: Arc::clone(&current.sstables),
+                    sstable_ids: Arc::clone(&current.sstable_ids),
+                    indexes: Arc::clone(&fresh_indexes),
+                    sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+                    vector_indexes: Arc::clone(&fresh_vector_indexes),
+                };
+                (Some(next), true)
+            })?;
+            if !swapped {
+                tracing::error!("flush: the active memtable changed under a rotation");
+                return Err(ferrosa_common::Error::InvalidData(
+                    "flush: the active memtable was replaced while this rotation held it"
+                        .to_string(),
+                ));
+            }
+            // Writers that load the view from here on write to the new
+            // memtable; seal the old one and wait out the writes inside it.
+            old_indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE)?;
+            target_catalog
         };
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::SwapMemtable,
             phase_start.elapsed(),
         );
         on_memtable_release();
+        #[cfg(test)]
+        flush_fault_test_hook::fire(flush_fault_test_hook::FlushFault::AfterSwap);
 
-        // Step 2: Snapshot the flushing memtable.
-        // Also capture any late writes from the PREVIOUS flushing memtable
-        // (kept alive since the last flush). These are writes that landed
-        // between the previous snapshot and the view swap.
-        let prev_flushing_present = old_view_flushing.is_some();
-        let phase_start = Instant::now();
-        let mut partitions = old_active.snapshot();
-        if let Some(ref prev_flushing) = old_view_flushing {
-            let prev_parts = prev_flushing.snapshot();
-            // Merge previous flushing data with current snapshot.
-            // When the same partition key exists in both, MERGE the rows
-            // (different clustering keys = different rows that must all
-            // be included). The old code skipped the entire partition
-            // from prev_flushing if the key existed in the current
-            // snapshot, silently dropping rows with different clustering
-            // keys — this was the P0 data loss bug.
-            let mut existing_map: std::collections::BTreeMap<
-                ferrosa_common::key::DecoratedKey,
-                usize,
-            > = partitions
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (p.key.clone(), i))
-                .collect();
-            for p in prev_parts {
-                if let Some(&idx) = existing_map.get(&p.key) {
-                    // Same partition key: merge rows from both sources using
-                    // the normal read-path semantics. A raw append preserves
-                    // data but can leave clustering rows out of order
-                    // (current flush rows followed by previous flushing rows),
-                    // which corrupts wide-row row-index construction.
-                    partitions[idx] = merge::merge_partitions(vec![partitions[idx].clone(), p]);
-                } else {
-                    let idx = partitions.len();
-                    existing_map.insert(p.key.clone(), idx);
-                    partitions.push(p);
-                }
+        // Step 2: Flush every sealed memtable, oldest first, each to its own
+        // SSTable. More than one means earlier flushes failed after their
+        // swap; each memtable leaves `flushing` only in the same view change
+        // that installs its SSTable, so it is flushed exactly once. A failure
+        // stops here and leaves the rest for the next rotation.
+        let sealed: Vec<Arc<SealedMemtable>> =
+            self.view.load().flushing.iter().rev().cloned().collect();
+        if sealed.len() > 1 {
+            tracing::warn!(
+                sealed = sealed.len(),
+                "flush: writing memtables left by earlier failed flushes, one SSTable each"
+            );
+        }
+        let mut outcome = FlushOutcome::NothingToFlush;
+        for memtable in &sealed {
+            if self.flush_sealed(memtable, &target_catalog, total_start)? == FlushOutcome::Published
+            {
+                outcome = FlushOutcome::Published;
             }
         }
+        Ok(outcome)
+    }
+
+    /// Flush one sealed memtable to its own SSTable, with sidecars for
+    /// `target_catalog`, and take it out of `flushing` in the view change
+    /// that installs that SSTable.
+    fn flush_sealed(
+        &self,
+        sealed: &Arc<SealedMemtable>,
+        target_catalog: &Arc<IndexCatalog>,
+        total_start: Instant,
+    ) -> Result<FlushOutcome> {
+        let old_active = Arc::clone(&sealed.memtable);
+        let old_indexes = Arc::clone(&sealed.bound);
+        let old_vector_indexes = Arc::clone(&sealed.vector_indexes);
+        // The schema and catalog the memtable's rows were written under. The
+        // flush serializes with these even if an ALTER has replaced them: the
+        // rows still carry the old ordinals.
+        let flush_schema = Arc::clone(&sealed.bound.schema);
+        let flush_catalog = Arc::clone(&sealed.bound.catalog);
+
+        // Snapshot the sealed memtable.
+        let phase_start = Instant::now();
+        let mut partitions = old_active.snapshot();
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::SnapshotMemtable,
             phase_start.elapsed(),
@@ -3726,27 +4798,25 @@ impl<F: FlushTarget> TableStore<F> {
         tracing::debug!(
             partitions = partitions.len(),
             total_rows,
-            prev_flushing = prev_flushing_present,
             "flush: memtable snapshot captured"
         );
 
         // Step 3: No-op if the memtable was empty.
         if partitions.is_empty() {
-            // Re-load the live view to get current sstables (not the stale
-            // capture from the top of flush) — defensive against future
-            // changes to locking discipline.
-            let live = self.view.load();
-            let new_view = StoreView {
-                active: Arc::clone(&live.active),
-                flushing: None,
-                sstables: Arc::clone(&live.sstables),
-                sstable_ids: Arc::clone(&live.sstable_ids),
-                indexes: Arc::clone(&live.indexes),
-                sidecar_indexes: Arc::clone(&live.sidecar_indexes),
-                vector_indexes: Arc::clone(&live.vector_indexes),
-            };
-            new_view.check_invariants("flush:clear_flushing");
-            self.view.store(Arc::new(new_view));
+            // Derived from the live view, so a compaction swap or sidecar
+            // install since the swap above is kept.
+            self.update_view("flush:clear_flushing", |live| {
+                let next = StoreView {
+                    active: Arc::clone(&live.active),
+                    flushing: without_sealed(&live.flushing, &old_active),
+                    sstables: Arc::clone(&live.sstables),
+                    sstable_ids: Arc::clone(&live.sstable_ids),
+                    indexes: Arc::clone(&live.indexes),
+                    sidecar_indexes: Arc::clone(&live.sidecar_indexes),
+                    vector_indexes: Arc::clone(&live.vector_indexes),
+                };
+                (Some(next), ())
+            })?;
             return Ok(FlushOutcome::NothingToFlush);
         }
 
@@ -3758,10 +4828,10 @@ impl<F: FlushTarget> TableStore<F> {
             phase_start.elapsed(),
         );
 
-        // Step 5: Build the SSTable.
+        // Step 5: Build the SSTable, under the schema captured at the swap.
         let options = self.options.clone();
 
-        let schema = self.schema.load();
+        let schema = Arc::clone(&flush_schema);
 
         // Step 5a: Quarantine-on-flush guard (Layer 2 of the timeuuid-flush-
         // wedge fix). Filter every partition's rows through the per-cell
@@ -3825,18 +4895,18 @@ impl<F: FlushTarget> TableStore<F> {
                 quarantined_rows = total_quarantined,
                 "flush: all rows were quarantined; skipping empty SSTable publish"
             );
-            let live = self.view.load();
-            let new_view = StoreView {
-                active: Arc::clone(&live.active),
-                flushing: None,
-                sstables: Arc::clone(&live.sstables),
-                sstable_ids: Arc::clone(&live.sstable_ids),
-                indexes: Arc::clone(&live.indexes),
-                sidecar_indexes: Arc::clone(&live.sidecar_indexes),
-                vector_indexes: Arc::clone(&live.vector_indexes),
-            };
-            new_view.check_invariants("flush:clear_all_quarantined");
-            self.view.store(Arc::new(new_view));
+            self.update_view("flush:clear_all_quarantined", |live| {
+                let next = StoreView {
+                    active: Arc::clone(&live.active),
+                    flushing: without_sealed(&live.flushing, &old_active),
+                    sstables: Arc::clone(&live.sstables),
+                    sstable_ids: Arc::clone(&live.sstable_ids),
+                    indexes: Arc::clone(&live.indexes),
+                    sidecar_indexes: Arc::clone(&live.sidecar_indexes),
+                    vector_indexes: Arc::clone(&live.vector_indexes),
+                };
+                (Some(next), ())
+            })?;
             return Ok(FlushOutcome::NothingToFlush);
         }
 
@@ -3847,11 +4917,9 @@ impl<F: FlushTarget> TableStore<F> {
         // floor. Indexed tables fall through to the single-SSTable path below
         // (per-shard index splitting is a later increment); their sidecar/
         // fulltext/vector steps stay exactly as-is.
-        let can_shard = self.indexed_columns.is_empty()
-            && self.indexed_clustering_columns.is_empty()
-            && self.indexed_partition_key_columns.is_empty()
-            && self.fulltext_indexes.is_empty()
-            && self.vector_index_configs.is_empty();
+        // Sidecars are written for the target catalog (see Step 5b), so a
+        // flush whose rotation added an index must take the indexed path.
+        let can_shard = !flush_catalog.declares_any() && !target_catalog.declares_any();
         let num_shards = flush::desired_flush_shards(
             partitions.len(),
             can_shard,
@@ -3859,19 +4927,112 @@ impl<F: FlushTarget> TableStore<F> {
         );
         if num_shards > 1 {
             return self
-                .flush_sharded(partitions, num_shards, total_rows, total_start, &old_active)
+                .flush_sharded(
+                    partitions,
+                    num_shards,
+                    total_rows,
+                    total_start,
+                    &old_active,
+                    flush_schema,
+                )
                 .map(|()| FlushOutcome::Published);
         }
 
-        let header = flush::build_serialization_header(&schema, &partitions);
+        // Everything a sidecar is built from the rows is built HERE, before
+        // the rows are encoded: encoding expands legacy whole-value collection
+        // cells in place, and the sidecars must describe the rows as the
+        // memtable held and indexed them, the same as the memtable postings.
+        //
+        // The sidecar set is exactly the indexes the TARGET catalog declares —
+        // the one the next memtable is bound to. An index DDL rotated the
+        // memtable to get here: an index it dropped gets no sidecar, and an
+        // index it added is posted now from the frozen rows, which no write
+        // can reach any more.
+        let sidecar_indexes = self.flush_sidecar_indexes(&old_indexes, target_catalog, &partitions);
+        // Serve exactly these postings for the flushing memtable until the
+        // sidecar is installed: an index the rotating DDL added now reads the
+        // frozen rows too, and one it dropped no longer answers from them.
+        let published: Arc<HashMap<String, Arc<MemtableIndex>>> =
+            Arc::new(sidecar_indexes.iter().cloned().collect());
+        // The vector indexes the target catalog declares, for the frozen rows:
+        // its own index, or one built from the rows for an index the rotating
+        // DDL added. The same map feeds the vector sidecars below.
+        let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
+            target_catalog
+                .vector_index_configs
+                .iter()
+                .map(|cfg| {
+                    let index = match old_vector_indexes.get(&cfg.index_name) {
+                        Some(index) => Arc::clone(index),
+                        None => vector_index_from_rows(cfg, &partitions),
+                    };
+                    (cfg.index_name.clone(), index)
+                })
+                .collect(),
+        );
+        sealed.postings.store(Arc::clone(&published));
+        sealed.vectors.store(Arc::clone(&flush_vector_indexes));
+        // FTI documents for the target catalog's full-text indexes, read at the
+        // ordinal the frozen rows were written with (the frozen catalog's,
+        // when it declares the index). Built before encoding, from the rows as
+        // the memtable holds them; written once the generation is known.
+        let mut fti_sidecars: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
+        for (index_name, target_pos) in &target_catalog.fulltext_indexes {
+            let col_pos = flush_catalog
+                .fulltext_indexes
+                .iter()
+                .find(|(name, _)| name == index_name)
+                .map_or(target_pos, |(_, frozen_pos)| frozen_pos);
+            let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
+            for partition in &partitions {
+                let pk_bytes = partition.key.key.as_bytes();
+                // Index ONE document PER ROW, keyed by the full primary key
+                // (partition + clustering). Indexing per-partition with the text
+                // of all rows concatenated made a hit identify only the partition,
+                // leaking non-matching clustering rows (t_da51e20c).
+                for row in &partition.rows {
+                    let mut text = String::new();
+                    for (col_idx, cell) in &row.cells {
+                        if *col_idx as usize == *col_pos {
+                            if let Some(ref val) = cell.value {
+                                if let Ok(s) = std::str::from_utf8(val) {
+                                    text.push_str(s);
+                                    text.push(' ');
+                                }
+                            }
+                        }
+                    }
+                    if !text.is_empty() {
+                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
+                            pk_bytes,
+                            &row.clustering,
+                        );
+                        fti_builder.add_document(doc_key, text.trim());
+                    }
+                }
+            }
+            fti_sidecars.push((
+                index_name.clone(),
+                fti_builder.finish().map_err(|e| e.to_string()),
+            ));
+        }
+
+        let header = flush::header_for_flush(&schema, &partitions);
         let staged_output = self.flush_target.file_output_staging_dir()?;
         let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db"))?
+            SSTableWriter::new_file_backed(options, header.clone(), staging_dir.join("Data.db"))?
         } else {
-            SSTableWriter::new(options, header)
+            SSTableWriter::new(options, header.clone())
         };
         let phase_start = Instant::now();
-        for p in &partitions {
+        let table_label = format!("{}.{}", schema.keyspace, schema.table);
+        // The partitions are owned, so a legacy whole-value collection cell is
+        // expanded in place. The late-writer check below knows which ones.
+        let mut expanded_keys = std::collections::BTreeSet::new();
+        for p in partitions.iter_mut() {
+            if crate::memtable::expand_collection_blobs_in_place(p, &header, &table_label)? {
+                expanded_keys.insert(p.key.clone());
+            }
             writer.add_partition(p)?;
         }
         let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
@@ -3946,7 +5107,13 @@ impl<F: FlushTarget> TableStore<F> {
         // so the sidecar describes the rows this SSTable holds however long the
         // write itself takes. Pinning a persistent tree copies nothing: it is
         // one `Arc` per index.
-        let pinned_indexes: Vec<(&str, crate::memtable::index::IndexSnapshot)> = old_indexes
+        //
+        // The sidecar set is exactly the indexes the TARGET catalog declares —
+        // the one the next memtable is bound to. An index DDL rotated the
+        // memtable to get here: an index it dropped gets no sidecar, and an
+        // index it added is posted now from the frozen rows, which no write
+        // can reach any more.
+        let pinned_indexes: Vec<(&str, crate::memtable::index::IndexSnapshot)> = sidecar_indexes
             .iter()
             .map(|(index_name, memtable_idx)| (index_name.as_str(), memtable_idx.pin()))
             .collect();
@@ -4010,41 +5177,13 @@ impl<F: FlushTarget> TableStore<F> {
             };
         drop(sidecar_sources);
 
-        // Step 5c: Build FTI sidecar files for any full-text indexes.
-        for (index_name, col_pos) in &self.fulltext_indexes {
-            let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
-            for partition in &partitions {
-                let pk_bytes = partition.key.key.as_bytes();
-                // Index ONE document PER ROW, keyed by the full primary key
-                // (partition + clustering). Indexing per-partition with the text
-                // of all rows concatenated made a hit identify only the partition,
-                // leaking non-matching clustering rows (t_da51e20c).
-                for row in &partition.rows {
-                    let mut text = String::new();
-                    for (col_idx, cell) in &row.cells {
-                        if *col_idx as usize == *col_pos {
-                            if let Some(ref val) = cell.value {
-                                if let Ok(s) = std::str::from_utf8(val) {
-                                    text.push_str(s);
-                                    text.push(' ');
-                                }
-                            }
-                        }
-                    }
-                    if !text.is_empty() {
-                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
-                            pk_bytes,
-                            &row.clustering,
-                        );
-                        fti_builder.add_document(doc_key, text.trim());
-                    }
-                }
-            }
-            match fti_builder.finish() {
+        // Step 5c: Write the FTI sidecars built before the rows were encoded.
+        for (index_name, built) in fti_sidecars {
+            match built {
                 Ok(fti_bytes) => {
-                    if let Err(e) = self
-                        .flush_target
-                        .write_fti_sidecar(gen, index_name, &fti_bytes)
+                    if let Err(e) =
+                        self.flush_target
+                            .write_fti_sidecar(gen, &index_name, &fti_bytes)
                     {
                         tracing::error!(%e, %index_name, gen, "store: FTI sidecar write failed");
                     }
@@ -4066,9 +5205,11 @@ impl<F: FlushTarget> TableStore<F> {
         //   - If the persist call fails: ERROR log + panic in debug builds.
         //   - Never silently skip: a missing vector sidecar causes ANN queries
         //     to fall back to full scans without the caller knowing.
-        for cfg in &self.vector_index_configs {
-            if let Some(vi) = old_vector_indexes.get(&cfg.index_name) {
-                let drained_with_scopes = vi.drain_with_scopes();
+        for cfg in &target_catalog.vector_index_configs {
+            // Read, not drained: readers keep searching this index through
+            // `flushing_vector_indexes` until the sidecar is installed.
+            if let Some(vi) = flush_vector_indexes.get(&cfg.index_name) {
+                let drained_with_scopes = vi.entries_with_scopes();
                 if drained_with_scopes.is_empty() {
                     continue;
                 }
@@ -4078,7 +5219,7 @@ impl<F: FlushTarget> TableStore<F> {
                     .map(|(_, pos, vector)| (*pos, vector.clone()))
                     .collect();
 
-                match self.vector_index_method(&cfg.index_name) {
+                match target_catalog.vector_index_method(&cfg.index_name) {
                     VectorIndexMethod::Hnsw => {
                         // Build HNSW graph and serialize via the public API.
                         match ferrosa_index::vector::hnsw::build_and_serialize(
@@ -4147,15 +5288,11 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                 }
 
+                // Remember these scopes so `ann_search_partitions` can later
+                // enumerate the scoped sidecars and recover partition keys
+                // (the global sidecar drops the scope on write).
+                self.record_vector_scopes(&cfg.index_name, by_scope.keys());
                 for (scope, scoped_entries) in by_scope {
-                    // Remember this scope so `ann_search_partitions` can later
-                    // enumerate the scoped sidecar and recover partition keys
-                    // (the global sidecar drops the scope on write).
-                    self.vector_index_scopes
-                        .lock()
-                        .entry(cfg.index_name.clone())
-                        .or_default()
-                        .insert(scope.clone());
                     let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, &scope);
                     match ferrosa_index::vector::hnsw::build_and_serialize(
                         cfg.m,
@@ -4197,11 +5334,18 @@ impl<F: FlushTarget> TableStore<F> {
             let flushed_by_key: std::collections::BTreeMap<_, _> =
                 partitions.iter().map(|p| (p.key.clone(), p)).collect();
             for p in &late_partitions {
-                if late_partition_needs_replay(&flushed_by_key, p) {
-                    // Late write into either a brand-new partition or an existing
-                    // partition that changed after the flush snapshot. Replay the
-                    // current partition image into the new active memtable so the
-                    // post-swap view retains those rows.
+                if late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
+                    // The sealed gate makes this impossible: a write after the
+                    // snapshot means admission is broken. Keep the rows (replay
+                    // them into the new memtable), and say so loudly — their
+                    // index postings are NOT carried over.
+                    self.late_writes_after_seal
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        partition = ?p.key,
+                        "flush: a row reached a sealed memtable after its snapshot; replaying \
+                         it without its index postings"
+                    );
                     for row in &p.rows {
                         if let Err(e) = current_view.active.put(&p.key, row.clone(), &schema) {
                             tracing::error!(%e, "flush: late-writer replay put failed");
@@ -4218,8 +5362,6 @@ impl<F: FlushTarget> TableStore<F> {
             prior_sstable_count = self.sstable_count(),
             "flush: SSTable written, updating view"
         );
-        let current_view = self.view.load();
-
         // Use the actual base directory from the flush target, not empty PathBuf.
         // An empty path causes ID collisions with compaction output:
         // swap_compacted_sstables matches by ID only, so a flush SSTable with
@@ -4232,33 +5374,32 @@ impl<F: FlushTarget> TableStore<F> {
         let new_desc =
             SstableDescriptor::from_reader(format!("{gen}"), flush_dir.clone(), &new_reader);
         self.seed_reader(&new_desc, new_reader);
-        let mut new_sstables = vec![new_desc];
-        new_sstables.extend(current_view.sstables.iter().cloned());
-
-        let mut new_ids = vec![(format!("{gen}"), flush_dir)];
-        new_ids.extend(current_view.sstable_ids.iter().cloned());
-
-        let mut new_sidecars = vec![Arc::new(sidecar_map)];
-        new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
+        let new_sidecar_map = Arc::new(sidecar_map);
 
         // Once the SSTable reader is installed, the flushed memtable must leave
-        // the live view. Writers cannot be racing against `old_active`: Store::write
-        // takes `write_barrier.read()` and loads the active view inside that guard,
-        // while the flush swap above takes `write_barrier.write()`. Keeping
+        // the live view. Writers cannot be racing against `old_active`: its
+        // gate was sealed and drained before the snapshot. Keeping
         // `old_active` in `flushing` after a successful flush makes subsequent
         // flushes re-ingest already-flushed rows and can cascade wide-partition
         // snapshots under aggressive concurrent flush loops.
-        let new_view = StoreView {
-            active: Arc::clone(&current_view.active),
-            flushing: None,
-            sstables: Arc::new(new_sstables),
-            sstable_ids: Arc::new(new_ids),
-            indexes: Arc::clone(&current_view.indexes),
-            sidecar_indexes: Arc::new(new_sidecars),
-            vector_indexes: Arc::clone(&current_view.vector_indexes),
-        };
-        new_view.check_invariants("flush:install_new_sstable");
-        self.view.store(Arc::new(new_view));
+        self.update_view("flush:install_new_sstable", |current_view| {
+            let mut new_sstables = vec![new_desc.clone()];
+            new_sstables.extend(current_view.sstables.iter().cloned());
+            let mut new_ids = vec![(format!("{gen}"), flush_dir.clone())];
+            new_ids.extend(current_view.sstable_ids.iter().cloned());
+            let mut new_sidecars = vec![Arc::clone(&new_sidecar_map)];
+            new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
+            let next = StoreView {
+                active: Arc::clone(&current_view.active),
+                flushing: without_sealed(&current_view.flushing, &old_active),
+                sstables: Arc::new(new_sstables),
+                sstable_ids: Arc::new(new_ids),
+                indexes: Arc::clone(&current_view.indexes),
+                sidecar_indexes: Arc::new(new_sidecars),
+                vector_indexes: Arc::clone(&current_view.vector_indexes),
+            };
+            (Some(next), ())
+        })?;
 
         Ok(FlushOutcome::Published)
     }
@@ -4285,12 +5426,13 @@ impl<F: FlushTarget> TableStore<F> {
         total_rows: usize,
         total_start: Instant,
         old_active: &Arc<dyn Memtable>,
+        schema: Arc<TableSchema>,
     ) -> Result<()> {
         let options = self.options.clone();
-        // Arc<TableSchema> (owned, Send+Sync) so the encode closures can share it
-        // across the rayon pool without borrowing a non-Sync arc_swap guard.
-        let schema = self.schema.load_full();
-        let shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
+        // `schema` is the one captured at the memtable swap (owned, Send+Sync),
+        // so the encode closures share it across the rayon pool and a
+        // concurrent ALTER cannot change the layout mid-flush.
+        let mut shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
 
         // Stage directories before entering Rayon: the target need not be Sync.
         // Guards outlive all parallel writers and remove incomplete or unpublished
@@ -4316,32 +5458,52 @@ impl<F: FlushTarget> TableStore<F> {
             .map(|_| self.flush_target.file_output_staging_dir().map(Staging))
             .collect::<Result<_>>()?;
         let phase_start = Instant::now();
-        let outputs: Vec<ShardOutput> = crate::flush_executor::pool()?.install(|| {
-            shards
-                .par_iter()
-                .zip(staging.par_iter())
-                .map(|(shard, stage)| {
-                    let header = flush::build_serialization_header(&schema, shard);
-                    let mut writer = match &stage.0 {
-                        Some(dir) => SSTableWriter::new_file_backed(
-                            options.clone(),
-                            header,
-                            dir.join("Data.db"),
-                        )?,
-                        None => SSTableWriter::new(options.clone(), header),
-                    };
-                    for partition in shard {
-                        writer.add_partition(partition)?;
-                    }
-                    match &stage.0 {
-                        Some(dir) => writer
-                            .finish_to_directory_deferred_sync(dir)
-                            .map(ShardOutput::Files),
-                        None => writer.finish().map(ShardOutput::Memory),
-                    }
-                })
-                .collect::<Result<_>>()
-        })?;
+        let table_label = format!("{}.{}", schema.keyspace, schema.table);
+        // Each shard is owned, so a legacy whole-value collection cell is
+        // expanded in place; the keys that were expanded go to the late-writer
+        // check below.
+        let encoded: Vec<(ShardOutput, Vec<DecoratedKey>)> = crate::flush_executor::pool()?
+            .install(|| {
+                shards
+                    .par_iter_mut()
+                    .zip(staging.par_iter())
+                    .map(|(shard, stage)| {
+                        let header = flush::header_for_flush(&schema, shard);
+                        let mut writer = match &stage.0 {
+                            Some(dir) => SSTableWriter::new_file_backed(
+                                options.clone(),
+                                header.clone(),
+                                dir.join("Data.db"),
+                            )?,
+                            None => SSTableWriter::new(options.clone(), header.clone()),
+                        };
+                        let mut expanded = Vec::new();
+                        for partition in shard.iter_mut() {
+                            if crate::memtable::expand_collection_blobs_in_place(
+                                partition,
+                                &header,
+                                &table_label,
+                            )? {
+                                expanded.push(partition.key.clone());
+                            }
+                            writer.add_partition(partition)?;
+                        }
+                        let output = match &stage.0 {
+                            Some(dir) => writer
+                                .finish_to_directory_deferred_sync(dir)
+                                .map(ShardOutput::Files),
+                            None => writer.finish().map(ShardOutput::Memory),
+                        }?;
+                        Ok((output, expanded))
+                    })
+                    .collect::<Result<_>>()
+            })?;
+        let mut expanded_keys = std::collections::BTreeSet::new();
+        let mut outputs: Vec<ShardOutput> = Vec::with_capacity(encoded.len());
+        for (output, expanded) in encoded {
+            outputs.push(output);
+            expanded_keys.extend(expanded);
+        }
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::EncodeSstable,
             phase_start.elapsed(),
@@ -4409,7 +5571,14 @@ impl<F: FlushTarget> TableStore<F> {
         if !late_partitions.is_empty() {
             let current_view = self.view.load();
             for p in &late_partitions {
-                if late_partition_needs_replay(&flushed_by_key, p) {
+                if late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
+                    // Impossible behind the sealed gate; see the unsharded path.
+                    self.late_writes_after_seal
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        partition = ?p.key,
+                        "flush: a row reached a sealed memtable after its snapshot; replaying it"
+                    );
                     for row in &p.rows {
                         if let Err(e) = current_view.active.put(&p.key, row.clone(), &schema) {
                             tracing::error!(%e, "flush(sharded): late-writer replay put failed");
@@ -4423,34 +5592,35 @@ impl<F: FlushTarget> TableStore<F> {
         // Step 6 (publish) — prepend ALL shard SSTables to the view, clear
         // flushing. Each shard carries an empty sidecar map (no secondary
         // indexes on a shardable table).
-        let current_view = self.view.load();
-        let mut new_sstables = Vec::with_capacity(published.len() + current_view.sstables.len());
-        let mut new_ids = Vec::with_capacity(published.len() + current_view.sstable_ids.len());
-        let mut new_sidecars =
-            Vec::with_capacity(published.len() + current_view.sidecar_indexes.len());
+        let mut shard_sstables = Vec::with_capacity(published.len());
+        let mut shard_ids = Vec::with_capacity(published.len());
         for (gen, reader) in &published {
             let desc = SstableDescriptor::from_reader(format!("{gen}"), flush_dir.clone(), reader);
             self.seed_reader(&desc, Arc::clone(reader));
-            new_sstables.push(desc);
-            new_ids.push((format!("{gen}"), flush_dir.clone()));
-            new_sidecars.push(Arc::new(HashMap::<String, SidecarReader>::new()));
+            shard_sstables.push(desc);
+            shard_ids.push((format!("{gen}"), flush_dir.clone()));
         }
-        new_sstables.extend(current_view.sstables.iter().cloned());
-        new_ids.extend(current_view.sstable_ids.iter().cloned());
-        new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
-
-        let new_view = StoreView {
-            active: Arc::clone(&current_view.active),
-            flushing: None,
-            sstables: Arc::new(new_sstables),
-            sstable_ids: Arc::new(new_ids),
-            indexes: Arc::clone(&current_view.indexes),
-            sidecar_indexes: Arc::new(new_sidecars),
-            vector_indexes: Arc::clone(&current_view.vector_indexes),
-        };
-        new_view.check_invariants("flush:install_sharded_sstables");
-        self.view.store(Arc::new(new_view));
-        Ok(())
+        // Derived from the live view, so a compaction swap or sidecar install
+        // since the memtable swap is kept.
+        self.update_view("flush:install_sharded_sstables", |current_view| {
+            let mut new_sstables = shard_sstables.clone();
+            new_sstables.extend(current_view.sstables.iter().cloned());
+            let mut new_ids = shard_ids.clone();
+            new_ids.extend(current_view.sstable_ids.iter().cloned());
+            let mut new_sidecars: Vec<Arc<HashMap<String, SidecarReader>>> =
+                shard_ids.iter().map(|_| Arc::new(HashMap::new())).collect();
+            new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
+            let next = StoreView {
+                active: Arc::clone(&current_view.active),
+                flushing: without_sealed(&current_view.flushing, old_active),
+                sstables: Arc::new(new_sstables),
+                sstable_ids: Arc::new(new_ids),
+                indexes: Arc::clone(&current_view.indexes),
+                sidecar_indexes: Arc::new(new_sidecars),
+                vector_indexes: Arc::clone(&current_view.vector_indexes),
+            };
+            (Some(next), ())
+        })
     }
 
     /// Reads partitions from the memtable in token order with an optional
@@ -4515,10 +5685,15 @@ impl<F: FlushTarget> TableStore<F> {
         let active_iter = view
             .active
             .range_iter(start_owned.as_ref(), end_owned.as_ref());
-        let flushing_iter = view
+        let flushing_iters: Vec<_> = view
             .flushing
-            .as_ref()
-            .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+            .iter()
+            .map(|sealed| {
+                sealed
+                    .memtable
+                    .range_iter(start_owned.as_ref(), end_owned.as_ref())
+            })
+            .collect();
         // Open readers for descriptors overlapping the key window (pooled).
         // Held for the merger's lifetime so they cannot be evicted mid-merge.
         let sst_readers = self.open_readers_for_key_range(
@@ -4530,7 +5705,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let mut merger = crate::range_merger::merger_for_metadata_sources(
             active_iter,
-            flushing_iter,
+            flushing_iters,
             sstables_slice,
             start_owned,
             end_owned,
@@ -4725,15 +5900,20 @@ impl<F: FlushTarget> TableStore<F> {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
+            let flushing_iters: Vec<_> = view
                 .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                .iter()
+                .map(|sealed| {
+                    sealed
+                        .memtable
+                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
+                })
+                .collect();
             let sstables_slice = &sst_readers[..];
 
             let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
                 active_iter,
-                flushing_iter,
+                flushing_iters,
                 sstables_slice,
                 &column_mappings,
                 start_owned,
@@ -4827,15 +6007,20 @@ impl<F: FlushTarget> TableStore<F> {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
+            let flushing_iters: Vec<_> = view
                 .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                .iter()
+                .map(|sealed| {
+                    sealed
+                        .memtable
+                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
+                })
+                .collect();
             let sstables_slice = &sst_readers[..];
 
             let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
                 active_iter,
-                flushing_iter,
+                flushing_iters,
                 sstables_slice,
                 &column_mappings,
                 &wanted_owned,
@@ -4932,7 +6117,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Flushing memtable (if any).
         if matched.len() < limit {
-            if let Some(ref flushing) = guard.flushing {
+            for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
                 for p in flushing.range_iter(None, None) {
                     if matched.len() >= limit {
                         break;
@@ -5126,15 +6311,16 @@ impl<F: FlushTarget> TableStore<F> {
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
-        let mut mem_flushing: Vec<Partition> = match guard.flushing {
-            Some(ref f) => f
+        // One source per sealed memtable: two of them can hold the same key.
+        for sealed in guard.flushing.iter() {
+            let mut mem_flushing: Vec<Partition> = sealed
+                .memtable
                 .range_iter(None, None)
                 .filter(|p: &Partition| in_range(p.key.token.0))
-                .collect(),
-            None => Vec::new(),
-        };
-        mem_flushing.sort_by(|a, b| a.key.cmp(&b.key));
-        vec_sources.push(PartitionSource::new(mem_flushing));
+                .collect();
+            mem_flushing.sort_by(|a, b| a.key.cmp(&b.key));
+            vec_sources.push(PartitionSource::new(mem_flushing));
+        }
 
         // Open one streaming reader per overlapping SSTable. Hold the opened
         // `Arc`s for the lifetime of the borrowed iterators so the pool cannot
@@ -5570,15 +6756,16 @@ impl<F: FlushTarget> TableStore<F> {
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
-        let mut mem_flushing_vec: Vec<Partition> = match guard.flushing {
-            Some(ref f) => f
+        // One source per sealed memtable: two of them can hold the same key.
+        for sealed in guard.flushing.iter() {
+            let mut mem_flushing_vec: Vec<Partition> = sealed
+                .memtable
                 .range_iter(None, None)
                 .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
-                .collect(),
-            None => Vec::new(),
-        };
-        mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
-        vec_sources.push(PartitionSource::new(mem_flushing_vec));
+                .collect();
+            mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
+            vec_sources.push(PartitionSource::new(mem_flushing_vec));
+        }
 
         // Acquire the overlapping SSTable inputs through the BOUNDED multi-pass
         // merge: at most `merge_reader_budget()` readers are ever open at once.
@@ -5914,15 +7101,16 @@ impl<F: FlushTarget> TableStore<F> {
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
-        let mut mem_flushing_vec: Vec<Partition> = match guard.flushing {
-            Some(ref f) => f
+        // One source per sealed memtable: two of them can hold the same key.
+        for sealed in guard.flushing.iter() {
+            let mut mem_flushing_vec: Vec<Partition> = sealed
+                .memtable
                 .range_iter(None, None)
                 .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
-                .collect(),
-            None => Vec::new(),
-        };
-        mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
-        vec_sources.push(PartitionSource::new(mem_flushing_vec));
+                .collect();
+            mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
+            vec_sources.push(PartitionSource::new(mem_flushing_vec));
+        }
 
         // Acquire the overlapping SSTable inputs through the BOUNDED multi-pass
         // merge (see `bounded_overlap_readers`): at most `merge_reader_budget()`
@@ -6086,7 +7274,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Flushing memtable
         if all_partitions.len() < limit {
-            if let Some(ref flushing) = guard.flushing {
+            for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
                 let remaining = limit.saturating_sub(all_partitions.len());
                 let mut flushing_parts = flushing.snapshot_range_limited(start, end, remaining);
                 trim_rows(&mut flushing_parts);
@@ -6213,10 +7401,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let guard = self.view.load();
         self.refuse_index_read_over_quarantine(&guard, None, "read_by_index_each_after")?;
-        let memtable = guard
-            .indexes
-            .get(index_name)
-            .and_then(|index| index.posting_list(&lookup_key));
+        let memtables = memtable_posting_lists(&guard, index_name, &lookup_key);
         // Seek to the cursor's PARTITION, inclusive: a partition posting
         // (pk, []) sorts before every row of pk, and a page that stopped
         // inside pk must reopen it. Rows at or before the cursor are dropped
@@ -6225,13 +7410,8 @@ impl<F: FlushTarget> TableStore<F> {
             partition_key: cursor.partition_key.clone(),
             clustering_key: Vec::new(),
         });
-        let sources = index_posting_sources(
-            &guard,
-            memtable.as_ref(),
-            index_name,
-            &lookup_key,
-            from.as_ref(),
-        );
+        let sources =
+            index_posting_sources(&guard, &memtables, index_name, &lookup_key, from.as_ref());
 
         // The partition last streamed whole: a row posting for it (a sidecar
         // written before partition postings) names a row already delivered.
@@ -6286,18 +7466,15 @@ impl<F: FlushTarget> TableStore<F> {
             .saturating_add(
                 guard
                     .flushing
-                    .as_ref()
-                    .map_or(0, |memtable| memtable.partition_count() as u64),
+                    .iter()
+                    .map(|sealed| sealed.memtable.partition_count() as u64)
+                    .sum::<u64>(),
             );
         let threshold = usize::try_from(partitions / UNSELECTIVE_INDEX_SHARE_DENOMINATOR)
             .unwrap_or(usize::MAX)
             .max(UNSELECTIVE_INDEX_MIN_MATCHES);
-        let memtable = guard
-            .indexes
-            .get(index_name)
-            .and_then(|index| index.posting_list(&lookup_key));
-        let sources =
-            index_posting_sources(&guard, memtable.as_ref(), index_name, &lookup_key, None);
+        let memtables = memtable_posting_lists(&guard, index_name, &lookup_key);
+        let sources = index_posting_sources(&guard, &memtables, index_name, &lookup_key, None);
         Ok(OrderedPostings::new(sources).take(threshold).count() >= threshold)
     }
 
@@ -6478,8 +7655,8 @@ impl<F: FlushTarget> TableStore<F> {
             Ok(())
         };
 
-        // 1. Memtable index.
-        if let Some(idx) = guard.indexes.get(index_name) {
+        // 1. Memtable indexes: the active memtable's and the flushing one's.
+        for idx in memtable_indexes_named(&guard, index_name) {
             append_in_partition(idx.lookup(key))?;
         }
 
@@ -6575,8 +7752,8 @@ impl<F: FlushTarget> TableStore<F> {
             })
             .collect();
 
-        // 1. Memtable index: ordered range scan per range.
-        if let Some(idx) = guard.indexes.get(index_name) {
+        // 1. Memtable indexes (active and flushing): ordered range scan per range.
+        for idx in memtable_indexes_named(&guard, index_name) {
             for (start_key, end_key) in &key_ranges {
                 append_positions(idx.range(start_key, end_key))?;
             }
@@ -6630,67 +7807,135 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(partitions)
     }
 
+    /// Replace the view with one derived from the current view, by
+    /// compare-and-swap: if another writer (a flush, a compaction swap, a
+    /// sidecar install) replaced the view meanwhile, `derive` runs again on
+    /// the newer one, so no change is lost. `derive` must be a pure function
+    /// of the view it is given; it returns the next view (or `None` to leave
+    /// the view alone) and a result for the caller.
+    fn update_view<R>(
+        &self,
+        what: &'static str,
+        mut derive: impl FnMut(&StoreView) -> (Option<StoreView>, R),
+    ) -> Result<R> {
+        crate::lockfree::update(&self.view, what, |current| {
+            let (next, result) = derive(current);
+            if let Some(next) = next.as_ref() {
+                next.check_invariants(what);
+            }
+            (next, result)
+        })
+    }
+
+    /// Add `scopes` to the scopes recorded for vector index `index_name`.
+    ///
+    /// A failure is logged, not returned: the flush that calls this has
+    /// written its sidecars, and a scope left unrecorded makes
+    /// `ann_search_partitions` miss that scope's sidecar until the next
+    /// flush records it again.
+    fn record_vector_scopes<'a>(
+        &self,
+        index_name: &str,
+        scopes: impl Iterator<Item = &'a Vec<u8>>,
+    ) {
+        let scopes: Vec<&Vec<u8>> = scopes.collect();
+        let recorded =
+            crate::lockfree::update(&self.vector_index_scopes, "vector index scopes", |map| {
+                let known = map.get(index_name);
+                if scopes
+                    .iter()
+                    .all(|scope| known.is_some_and(|set| set.contains(*scope)))
+                {
+                    return (None, ());
+                }
+                let mut set = known.map(|set| (**set).clone()).unwrap_or_default();
+                set.extend(scopes.iter().map(|scope| (*scope).clone()));
+                let mut next = map.clone();
+                next.insert(index_name.to_string(), Arc::new(set));
+                (Some(next), ())
+            });
+        if let Err(e) = recorded {
+            tracing::error!(
+                index_name,
+                %e,
+                "vector index scopes not recorded; scoped ANN reads miss them until the next flush"
+            );
+        }
+    }
+
+    /// Forget every scope recorded for `index_name`; whether there were any.
+    fn forget_vector_scopes(&self, index_name: &str) -> Result<bool> {
+        crate::lockfree::update(&self.vector_index_scopes, "vector index scopes", |map| {
+            if !map.contains_key(index_name) {
+                return (None, false);
+            }
+            let mut next = map.clone();
+            next.remove(index_name);
+            (Some(next), true)
+        })
+    }
+
+    /// Run one index DDL: rotate the memtable onto the catalog `edit` derives
+    /// from the current one. See [`Self::flush_applying_catalog_edit`] for why
+    /// a rotation, and not an edit of the live memtable's indexes, is what
+    /// keeps index postings equal to the flushed sidecars without a lock.
+    ///
+    /// `edit` returns `false` to leave the catalog unchanged (an idempotent
+    /// re-declaration); the memtable still rotates, which is harmless.
+    /// Returns what the rotation's flush did (see
+    /// [`Self::flush_applying_catalog_edit`]).
+    fn rotate_catalog(
+        &self,
+        edit: impl FnOnce(&mut IndexCatalog) -> bool + Send + 'static,
+    ) -> Result<FlushOutcome> {
+        self.flush_applying_catalog_edit(|current| {
+            let mut next = current.clone();
+            edit(&mut next).then_some(next)
+        })
+    }
+
     /// Retrieve a named memtable-level secondary index.
     ///
-    /// Dynamically adds a secondary index. Existing live memtable rows are
-    /// backfilled before publication and future writes are indexed.
-    pub fn add_index(&mut self, index_name: String, column_position: usize, index_type: IndexType) {
-        self.add_index_with_predicate(index_name, column_position, index_type, None);
+    /// Dynamically adds a secondary index. Rows already written are flushed by
+    /// the memtable rotation that publishes it, and their sidecar for the new
+    /// index is built from those rows; future writes are indexed.
+    pub fn add_index(
+        &self,
+        index_name: String,
+        column_position: usize,
+        index_type: IndexType,
+    ) -> Result<FlushOutcome> {
+        self.add_index_with_predicate(index_name, column_position, index_type, None)
     }
 
     /// Dynamically adds a secondary index carrying an optional partial-index
-    /// [`FilterPredicate`]. Existing active/flushing memtable rows are streamed
-    /// into the new index before it is published, and future writes update it;
-    /// for a Filtered index the predicate gates both paths identically.
+    /// [`FilterPredicate`]. Rows already written are flushed by the rotation
+    /// that publishes the index, with a sidecar built from them under the same
+    /// predicate; future writes update it. Re-declaring an index with the same
+    /// definition changes nothing; a different definition replaces the old one
+    /// (the engine refuses that case before it gets here).
     pub fn add_index_with_predicate(
-        &mut self,
+        &self,
         index_name: String,
         column_position: usize,
         index_type: IndexType,
         filter_predicate: Option<FilterPredicate>,
-    ) {
-        self.indexed_columns
-            .push((index_name.clone(), column_position));
-        self.index_types.insert(index_name.clone(), index_type);
-        if let Some(ref pred) = filter_predicate {
-            self.index_filter_predicates
-                .insert(index_name.clone(), pred.clone());
-        }
-        let current = self.view.load();
-        let memtable_index = Arc::new(MemtableIndex::new());
-        let backfill = |memtable: &Arc<dyn Memtable>| {
-            for partition in memtable.range_iter(None, None) {
-                for row in partition.static_row.iter().chain(partition.rows.iter()) {
-                    insert_scalar_memtable_index_row(
-                        &memtable_index,
-                        &index_name,
-                        column_position,
-                        index_type,
-                        filter_predicate.as_ref(),
-                        partition.key.key.as_bytes(),
-                        row,
-                    );
-                }
+    ) -> Result<FlushOutcome> {
+        self.rotate_catalog(move |catalog| {
+            let wanted = Some((0, column_position, index_type, filter_predicate.as_ref()));
+            if catalog.scalar_definition(&index_name) == wanted {
+                return false;
             }
-        };
-        backfill(&current.active);
-        if let Some(flushing) = current.flushing.as_ref() {
-            backfill(flushing);
-        }
-
-        let mut new_indexes = (*current.indexes).clone();
-        new_indexes.insert(index_name, memtable_index);
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::new(new_indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::clone(&current.vector_indexes),
-        };
-        new_view.check_invariants("update_indexes");
-        self.view.store(Arc::new(new_view));
+            catalog.remove(&index_name);
+            catalog
+                .indexed_columns
+                .push((index_name.clone(), column_position));
+            catalog.index_types.insert(index_name.clone(), index_type);
+            if let Some(pred) = filter_predicate {
+                catalog.index_filter_predicates.insert(index_name, pred);
+            }
+            true
+        })
     }
 
     /// Removes a declared secondary index from every live store layer.
@@ -6701,84 +7946,53 @@ impl<F: FlushTarget> TableStore<F> {
     /// sidecar state for the name, and vector-index metadata is unwired too.
     /// Persisted sidecar files/readers are left as inert orphan artifacts; the
     /// declaration metadata and read guards stop naming them immediately.
-    pub fn remove_index(&mut self, index_name: &str) -> bool {
-        let before_regular = self.indexed_columns.len();
-        self.indexed_columns.retain(|(name, _)| name != index_name);
-        let before_clustering = self.indexed_clustering_columns.len();
-        self.indexed_clustering_columns
-            .retain(|(name, _)| name != index_name);
-        let before_pk = self.indexed_partition_key_columns.len();
-        self.indexed_partition_key_columns
-            .retain(|(name, _)| name != index_name);
-        let mut removed = before_regular != self.indexed_columns.len()
-            || before_clustering != self.indexed_clustering_columns.len()
-            || before_pk != self.indexed_partition_key_columns.len();
-
-        removed |= self.index_types.remove(index_name).is_some();
-        removed |= self.index_filter_predicates.remove(index_name).is_some();
-        removed |= self.vector_index_methods.remove(index_name).is_some();
-        let before_vector_configs = self.vector_index_configs.len();
-        self.vector_index_configs
-            .retain(|cfg| cfg.index_name != index_name);
-        removed |= before_vector_configs != self.vector_index_configs.len();
-        removed |= self.vector_index_scopes.lock().remove(index_name).is_some();
-
-        let current = self.view.load();
-        let mut new_indexes = (*current.indexes).clone();
-        removed |= new_indexes.remove(index_name).is_some();
-
-        let mut new_vector_indexes = (*current.vector_indexes).clone();
-        removed |= new_vector_indexes.remove(index_name).is_some();
-
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::new(new_indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::new(new_vector_indexes),
-        };
-        new_view.check_invariants("remove_index");
-        self.view.store(Arc::new(new_view));
-
-        removed
+    /// Returns whether anything named `index_name` was declared, and what the
+    /// rotation's flush did.
+    pub fn remove_index(&self, index_name: &str) -> Result<(bool, FlushOutcome)> {
+        let declared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let found = Arc::clone(&declared);
+        let name = index_name.to_string();
+        let outcome = self.rotate_catalog(move |catalog| {
+            let removed = catalog.remove(&name);
+            found.store(removed, std::sync::atomic::Ordering::Release);
+            removed
+        })?;
+        let mut removed = declared.load(std::sync::atomic::Ordering::Acquire);
+        removed |= self.forget_vector_scopes(index_name)?;
+        Ok((removed, outcome))
     }
 
     /// Dynamically adds a secondary index on a CLUSTERING column
     /// (t_430c4188). Future writes extract the indexed value from the row's
     /// composite clustering-key bytes at `clustering_component` — a
     /// clustering column's value is not a cell, so the cell-based
-    /// [`add_index`](Self::add_index) path cannot see it at all.
+    /// [`add_index`](Self::add_index) path cannot see it at all. Rows already
+    /// written are flushed by the rotation and indexed from their keys.
     pub fn add_clustering_index(
-        &mut self,
+        &self,
         index_name: String,
         clustering_component: usize,
         index_type: IndexType,
-    ) {
-        self.indexed_clustering_columns
-            .push((index_name.clone(), clustering_component));
-        self.index_types.insert(index_name.clone(), index_type);
-        let current = self.view.load();
-        let mut new_indexes = (*current.indexes).clone();
-        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::new(new_indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::clone(&current.vector_indexes),
-        };
-        new_view.check_invariants("update_indexes");
-        self.view.store(Arc::new(new_view));
+    ) -> Result<FlushOutcome> {
+        self.rotate_catalog(move |catalog| {
+            if catalog.declares(&index_name) {
+                return false;
+            }
+            catalog
+                .indexed_clustering_columns
+                .push((index_name.clone(), clustering_component));
+            catalog.index_types.insert(index_name, index_type);
+            true
+        })
     }
 
     /// Clustering-column secondary index declarations:
     /// `(index_name, clustering_component)` pairs.
-    pub fn indexed_clustering_columns(&self) -> &[(String, usize)] {
-        &self.indexed_clustering_columns
+    pub fn indexed_clustering_columns(&self) -> CatalogSlice<(String, usize)> {
+        CatalogSlice {
+            catalog: self.catalog(),
+            project: |catalog| &catalog.indexed_clustering_columns,
+        }
     }
 
     /// Dynamically adds a secondary index on a PARTITION-KEY column.
@@ -6794,28 +8008,21 @@ impl<F: FlushTarget> TableStore<F> {
     /// built nothing, and every read through it returned no rows over a table
     /// full of data.
     pub fn add_partition_key_index(
-        &mut self,
+        &self,
         index_name: String,
         partition_key_component: usize,
         index_type: IndexType,
-    ) {
-        self.indexed_partition_key_columns
-            .push((index_name.clone(), partition_key_component));
-        self.index_types.insert(index_name.clone(), index_type);
-        let current = self.view.load();
-        let mut new_indexes = (*current.indexes).clone();
-        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::new(new_indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::clone(&current.vector_indexes),
-        };
-        new_view.check_invariants("add_partition_key_index");
-        self.view.store(Arc::new(new_view));
+    ) -> Result<FlushOutcome> {
+        self.rotate_catalog(move |catalog| {
+            if catalog.declares(&index_name) {
+                return false;
+            }
+            catalog
+                .indexed_partition_key_columns
+                .push((index_name.clone(), partition_key_component));
+            catalog.index_types.insert(index_name, index_type);
+            true
+        })
     }
 
     /// Partition-key secondary index declarations:
@@ -6827,21 +8034,20 @@ impl<F: FlushTarget> TableStore<F> {
     /// rebuild needs, so it can refuse rather than build nothing and report
     /// success.
     pub fn partition_key_index_def(&self, index_name: &str) -> Option<(usize, IndexType)> {
-        let component = self
+        let catalog = self.catalog();
+        let component = catalog
             .indexed_partition_key_columns
             .iter()
             .find(|(n, _)| n == index_name)
             .map(|(_, c)| *c)?;
-        let index_type = self
-            .index_types
-            .get(index_name)
-            .copied()
-            .unwrap_or(IndexType::BTree);
-        Some((component, index_type))
+        Some((component, catalog.index_type_for(index_name)))
     }
 
-    pub fn indexed_partition_key_columns(&self) -> &[(String, usize)] {
-        &self.indexed_partition_key_columns
+    pub fn indexed_partition_key_columns(&self) -> CatalogSlice<(String, usize)> {
+        CatalogSlice {
+            catalog: self.catalog(),
+            project: |catalog| &catalog.indexed_partition_key_columns,
+        }
     }
 
     /// Number of partition-key columns in this table's schema — the component
@@ -6889,42 +8095,50 @@ impl<F: FlushTarget> TableStore<F> {
     /// Whether this table declares the secondary index `index_name`. A global
     /// read of an undeclared index is refused by [`Self::read_by_index_each`].
     pub fn secondary_index_declared(&self, index_name: &str) -> bool {
-        self.index_types.contains_key(index_name)
-            || self
+        let catalog = self.catalog();
+        catalog.index_types.contains_key(index_name)
+            || catalog
                 .indexed_columns
                 .iter()
                 .any(|(name, _)| name == index_name)
-            || self
+            || catalog
                 .indexed_clustering_columns
                 .iter()
                 .any(|(name, _)| name == index_name)
     }
 
-    /// Returns the current secondary index declarations.
-    pub fn indexed_columns(&self) -> &[(String, usize)] {
-        &self.indexed_columns
+    /// Returns the current secondary index declarations, as one snapshot.
+    pub fn indexed_columns(&self) -> CatalogSlice<(String, usize)> {
+        CatalogSlice {
+            catalog: self.catalog(),
+            project: |catalog| &catalog.indexed_columns,
+        }
     }
 
     /// The declared `IndexType` for a named secondary index, defaulting to
     /// `BTree` when unknown. Used by the eager / backfill / compaction index
     /// build paths so a job carries the index's real type.
     pub fn index_type_for(&self, index_name: &str) -> IndexType {
-        self.index_types
-            .get(index_name)
-            .copied()
-            .unwrap_or(IndexType::BTree)
+        self.catalog().index_type_for(index_name)
     }
 
     /// The partial-index [`FilterPredicate`] for a named index, if any. `Some`
     /// only for [`IndexType::Filtered`] indexes that were registered with a
-    /// predicate (and thus survives reload).
-    pub fn filter_predicate_for(&self, index_name: &str) -> Option<&FilterPredicate> {
-        self.index_filter_predicates.get(index_name)
+    /// predicate (and thus survives reload). Owned: the catalog it comes from
+    /// can be replaced by DDL at any time.
+    pub fn filter_predicate_for(&self, index_name: &str) -> Option<FilterPredicate> {
+        self.catalog()
+            .index_filter_predicates
+            .get(index_name)
+            .cloned()
     }
 
-    /// Returns the current full-text index declarations.
-    pub fn fulltext_indexes(&self) -> &[(String, usize)] {
-        &self.fulltext_indexes
+    /// Returns the current full-text index declarations, as one snapshot.
+    pub fn fulltext_indexes(&self) -> CatalogSlice<(String, usize)> {
+        CatalogSlice {
+            catalog: self.catalog(),
+            project: |catalog| &catalog.fulltext_indexes,
+        }
     }
 
     /// Search active/flushing memtables for a declared full-text index.
@@ -6949,7 +8163,8 @@ impl<F: FlushTarget> TableStore<F> {
         use ferrosa_index::fulltext::query::parse_fts_query;
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
 
-        let Some((_, col_pos)) = self
+        let catalog = self.catalog();
+        let Some((_, col_pos)) = catalog
             .fulltext_indexes
             .iter()
             .find(|(name, _)| name == index_name)
@@ -6990,7 +8205,7 @@ impl<F: FlushTarget> TableStore<F> {
             }
         };
         add_partitions(guard.active.snapshot());
-        if let Some(ref flushing) = guard.flushing {
+        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
             add_partitions(flushing.snapshot());
         }
         drop(guard);
@@ -7059,7 +8274,8 @@ impl<F: FlushTarget> TableStore<F> {
         use ferrosa_index::fulltext::query::parse_fts_query;
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
 
-        let Some((_, col_pos)) = self
+        let catalog = self.catalog();
+        let Some((_, col_pos)) = catalog
             .fulltext_indexes
             .iter()
             .find(|(name, _)| name == index_name)
@@ -7172,7 +8388,8 @@ impl<F: FlushTarget> TableStore<F> {
         if !self.flush_target.persists_fti_sidecars() {
             return plan;
         }
-        let Some((_, column_position)) = self
+        let catalog = self.catalog();
+        let Some((_, column_position)) = catalog
             .fulltext_indexes
             .iter()
             .find(|(name, _)| name == index_name)
@@ -7228,6 +8445,7 @@ impl<F: FlushTarget> TableStore<F> {
             return plan;
         }
         plan.jobs = self
+            .catalog()
             .fulltext_indexes
             .iter()
             .map(|(index_name, column_position)| FulltextSidecarJob {
@@ -7245,34 +8463,48 @@ impl<F: FlushTarget> TableStore<F> {
         FulltextSidecarBuild {
             flush_target: Arc::clone(&self.flush_target),
             schema: self.schema.load_full(),
-            single_flight: Arc::clone(&self.fulltext_sidecar_build_lock),
+            in_flight: Arc::clone(&self.fulltext_sidecars_in_flight),
             jobs: Vec::new(),
         }
     }
 
-    /// Register a full-text index for this table.
-    pub fn add_fulltext_index(&mut self, index_name: String, column_position: usize) {
-        if !self.fulltext_indexes.iter().any(|(n, _)| n == &index_name) {
-            self.fulltext_indexes.push((index_name, column_position));
-        }
+    /// Register a full-text index for this table. Rows already written are
+    /// flushed by the memtable rotation that publishes it, with an FTI sidecar
+    /// built from them. Re-registering an existing name changes nothing.
+    pub fn add_fulltext_index(
+        &self,
+        index_name: String,
+        column_position: usize,
+    ) -> Result<FlushOutcome> {
+        self.rotate_catalog(move |catalog| {
+            if catalog
+                .fulltext_indexes
+                .iter()
+                .any(|(n, _)| n == &index_name)
+            {
+                return false;
+            }
+            catalog.fulltext_indexes.push((index_name, column_position));
+            true
+        })
     }
 
     /// Register a vector index for this table.
     ///
-    /// Idempotent: calling twice with the same `index_name` is a no-op.
-    /// Updates both `vector_index_configs` and the live `StoreView` so that
-    /// subsequent writes begin populating the in-memory vector index
-    /// immediately.
-    pub fn add_vector_index(&mut self, config: VectorIndexConfig) {
-        self.add_vector_index_with_method(config, VectorIndexMethod::Hnsw);
+    /// Idempotent: calling twice with the same `index_name` changes nothing.
+    /// The memtable rotation that publishes it flushes the rows already
+    /// written, with a vector sidecar built from them, and every later write
+    /// populates the in-memory vector index.
+    pub fn add_vector_index(&self, config: VectorIndexConfig) -> Result<FlushOutcome> {
+        self.add_vector_index_with_method(config, VectorIndexMethod::Hnsw)
     }
 
     /// Register a quantized IVFFlat/C-SPANN vector index for this table.
     ///
     /// Keeps `add_vector_index` as the legacy HNSW path so existing callers and
     /// sidecar artifacts remain compatible.
-    pub fn add_quantized_vector_index(&mut self, config: VectorIndexConfig) {
-        self.add_vector_index_with_method(config, VectorIndexMethod::QuantizedIvf);
+    pub fn add_quantized_vector_index(&self, config: VectorIndexConfig) -> Result<FlushOutcome> {
+        self.add_vector_index_with_method(config, VectorIndexMethod::QuantizedIvf)
     }
 
     /// Report the artifact/search method registered for `index_name`.
@@ -7280,82 +8512,32 @@ impl<F: FlushTarget> TableStore<F> {
     /// Defaults to [`VectorIndexMethod::Hnsw`] when the index is unknown or was
     /// registered through the legacy path, matching `add_vector_index`.
     pub fn vector_index_method(&self, index_name: &str) -> VectorIndexMethod {
-        self.vector_index_methods
-            .get(index_name)
-            .copied()
-            .unwrap_or(VectorIndexMethod::Hnsw)
+        self.catalog().vector_index_method(index_name)
     }
 
     fn add_vector_index_with_method(
-        &mut self,
+        &self,
         config: VectorIndexConfig,
         method: VectorIndexMethod,
-    ) {
-        if self
-            .vector_index_configs
-            .iter()
-            .any(|c| c.index_name == config.index_name)
-        {
-            return; // already registered
-        }
-
-        // Build the index from every live memtable before publishing it. If an
-        // index is created after rows have already been written, publishing an
-        // empty index makes the planner select it and turns a correct brute-force
-        // ANN query into an empty result set. Include the flushing memtable too:
-        // it remains part of the read view until its SSTable and sidecars are
-        // installed.
-        let current = self.view.load();
-        let vector_index = Arc::new(VectorMemtableIndex::new(
-            config.metric,
-            config.m,
-            config.ef_construction,
-        ));
-        let backfill = |memtable: &Arc<dyn Memtable>| {
-            for partition in memtable.range_iter(None, None) {
-                for row in partition.static_row.iter().chain(partition.rows.iter()) {
-                    let Some(value) = row
-                        .cells
-                        .iter()
-                        .find(|(idx, _)| *idx as usize == config.column_position)
-                        .and_then(|(_, cell)| cell.value.as_ref())
-                    else {
-                        continue;
-                    };
-                    let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) else {
-                        continue;
-                    };
-                    let position =
-                        ferrosa_index::vector::RowPosition::new(vector_index.len() as u64);
-                    vector_index.insert_with_scope(
-                        position,
-                        vector,
-                        Some(partition.key.key.as_bytes().to_vec()),
-                    );
-                }
+    ) -> Result<FlushOutcome> {
+        // Publishing an empty index over existing rows would make the planner
+        // select it and turn a correct brute-force ANN query into an empty
+        // result. The rotation avoids that: the rows already written leave
+        // with the frozen memtable, whose flush builds their vector sidecar.
+        self.rotate_catalog(move |catalog| {
+            if catalog
+                .vector_index_configs
+                .iter()
+                .any(|c| c.index_name == config.index_name)
+            {
+                return false; // already registered
             }
-        };
-        backfill(&current.active);
-        if let Some(flushing) = current.flushing.as_ref() {
-            backfill(flushing);
-        }
-
-        let mut new_vi = (*current.vector_indexes).clone();
-        new_vi.insert(config.index_name.clone(), vector_index);
-        let new_view = StoreView {
-            active: Arc::clone(&current.active),
-            flushing: current.flushing.clone(),
-            sstables: Arc::clone(&current.sstables),
-            sstable_ids: Arc::clone(&current.sstable_ids),
-            indexes: Arc::clone(&current.indexes),
-            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-            vector_indexes: Arc::new(new_vi),
-        };
-        new_view.check_invariants("add_vector_index");
-        self.view.store(Arc::new(new_view));
-        self.vector_index_methods
-            .insert(config.index_name.clone(), method);
-        self.vector_index_configs.push(config);
+            catalog
+                .vector_index_methods
+                .insert(config.index_name.clone(), method);
+            catalog.vector_index_configs.push(config);
+            true
+        })
     }
 
     /// Perform an approximate nearest-neighbor search across memtable and
@@ -7390,13 +8572,32 @@ impl<F: FlushTarget> TableStore<F> {
                 merged.insert(VectorRowRef::memtable(result.position), result);
             }
         }
+        for (nth, vi) in flushing_vector_indexes(&guard, index_name)
+            .iter()
+            .enumerate()
+        {
+            let results = vi.search(query, k, ef_search).map_err(|e| {
+                ferrosa_common::Error::InvalidData(format!(
+                    "ann_search flushing memtable failed: {e}"
+                ))
+            })?;
+            for result in results {
+                merged.insert(
+                    VectorRowRef::sstable(
+                        FLUSHING_MEMTABLE_GENERATION - nth as u64,
+                        result.position,
+                    ),
+                    result,
+                );
+            }
+        }
 
         for (gen_str, _dir) in guard.sstable_ids.iter() {
             if let Ok(gen) = gen_str.parse::<u64>() {
                 match method {
                     VectorIndexMethod::Hnsw => {
                         if let Some(vec_bytes) =
-                            self.flush_target.read_vector_sidecar(gen, index_name)
+                            self.flush_target.read_vector_sidecar(gen, index_name)?
                         {
                             match ferrosa_index::vector::hnsw::search_from_bytes(
                                 &vec_bytes, query, k, ef_search,
@@ -7487,13 +8688,34 @@ impl<F: FlushTarget> TableStore<F> {
                 merged.insert(VectorRowRef::memtable(result.position), result);
             }
         }
+        for (nth, vi) in flushing_vector_indexes(&guard, index_name)
+            .iter()
+            .enumerate()
+        {
+            let results = vi
+                .search_with_scope(query, k, ef_search, partition_scope)
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidData(format!(
+                        "ann_search scoped flushing memtable failed: {e}"
+                    ))
+                })?;
+            for result in results {
+                merged.insert(
+                    VectorRowRef::sstable(
+                        FLUSHING_MEMTABLE_GENERATION - nth as u64,
+                        result.position,
+                    ),
+                    result,
+                );
+            }
+        }
 
         let scoped_index_name = scoped_vector_sidecar_name(index_name, partition_scope);
         for (gen_str, _dir) in guard.sstable_ids.iter() {
             if let Ok(gen) = gen_str.parse::<u64>() {
                 if let Some(vec_bytes) = self
                     .flush_target
-                    .read_vector_sidecar(gen, &scoped_index_name)
+                    .read_vector_sidecar(gen, &scoped_index_name)?
                 {
                     match ferrosa_index::vector::hnsw::search_from_bytes(
                         &vec_bytes, query, k, ef_search,
@@ -7577,7 +8799,13 @@ impl<F: FlushTarget> TableStore<F> {
         // Source (a): active memtable — scope carried inline.
         let guard = self.view.load();
         let mut scopeless_memtable_hits = 0usize;
-        if let Some(vi) = guard.vector_indexes.get(index_name) {
+        let memtable_vector_indexes = guard
+            .vector_indexes
+            .get(index_name)
+            .cloned()
+            .into_iter()
+            .chain(flushing_vector_indexes(&guard, index_name));
+        for vi in memtable_vector_indexes {
             let results = vi.search_with_scopes(query, k, ef_search).map_err(|e| {
                 ferrosa_common::Error::InvalidData(format!(
                     "ann_search_partitions memtable failed: {e}"
@@ -7603,7 +8831,7 @@ impl<F: FlushTarget> TableStore<F> {
         // Source (b): flushed scoped sidecars — probe each remembered scope.
         let scopes: Vec<Vec<u8>> = self
             .vector_index_scopes
-            .lock()
+            .load()
             .get(index_name)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default();
@@ -7843,8 +9071,10 @@ impl<F: FlushTarget> TableStore<F> {
         let view = self.view.load();
         let flushing = view
             .flushing
-            .as_ref()
-            .map_or(i64::MAX, |m| m.min_timestamp());
+            .iter()
+            .map(|sealed| sealed.memtable.min_timestamp())
+            .min()
+            .unwrap_or(i64::MAX);
         view.active.min_timestamp().min(flushing)
     }
 
@@ -7872,23 +9102,35 @@ impl<F: FlushTarget> TableStore<F> {
     /// Existing readers holding `Arc` references to the old memtable or
     /// SSTables will complete normally; the data is freed once those
     /// references drop. On-disk SSTable files remain until GC.
-    pub fn truncate(&self) {
-        let _guard = self.flush_guard.lock();
+    ///
+    /// Runs as a rotation (see `TableStore::rotate`), so it never interleaves
+    /// with a flush or an index DDL of this table.
+    pub fn truncate(&self) -> Result<()> {
+        self.rotate(RotationKind::Truncate).map(|_outcome| ())
+    }
+
+    /// [`Self::truncate`], on the rotation combiner.
+    fn truncate_now(&self) -> Result<FlushOutcome> {
+        // Rotations run one at a time, so this catalog cannot change before
+        // the view below is published.
+        let catalog = self.catalog();
         let new_view = StoreView {
             active: new_memtable(),
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
-            indexes: new_indexes(
-                &self.indexed_columns,
-                &self.indexed_clustering_columns,
-                &self.indexed_partition_key_columns,
-            ),
+            indexes: new_indexes(Arc::clone(&catalog), self.schema.load_full()),
             sidecar_indexes: Arc::new(vec![]),
-            vector_indexes: new_vector_indexes(&self.vector_index_configs),
+            vector_indexes: new_vector_indexes(&catalog.vector_index_configs),
         };
         new_view.check_invariants("truncate");
-        self.view.store(Arc::new(new_view));
+        let old_view = self.view.swap(Arc::new(new_view));
+        // A writer that loaded the old view must not land in the discarded
+        // memtable after this returns: seal it, so such a writer reloads.
+        if let Err(e) = old_view.indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE) {
+            tracing::error!(%e, "truncate: writes still inside the discarded memtable");
+        }
+        Ok(FlushOutcome::NothingToFlush)
     }
 
     /// Atomically replace input SSTables with a compacted output SSTable.
@@ -7961,18 +9203,72 @@ impl<F: FlushTarget> TableStore<F> {
         output_path: std::path::PathBuf,
         add: Arc<SSTableReader<F::Reader>>,
         output_sidecars: HashMap<String, SidecarReader>,
-    ) -> Result<()> {
-        let _guard = self.flush_guard.lock();
-        let current = self.view.load();
+    ) -> Result<CompactionSwap> {
+        // Build the descriptor for the compacted output and seed its reader
+        // into the pool once; the view swap below may derive more than once.
+        let out_desc = SstableDescriptor::from_reader(output_id.clone(), output_path.clone(), &add);
+        self.seed_reader(&out_desc, add);
+        let output_sidecars = Arc::new(output_sidecars);
+        let input_id_set: std::collections::HashSet<&str> =
+            input_ids.iter().map(|(id, _)| id.as_str()).collect();
 
+        // Derived from the live view by compare-and-swap: a flush installing
+        // its SSTable meanwhile is kept, never overwritten (this used to be
+        // excluded by the table's flush lock).
+        let removed = self.update_view("swap_compacted", |current| {
+            Self::view_with_compaction_output(
+                current,
+                &input_id_set,
+                &out_desc,
+                (&output_id, &output_path),
+                &output_sidecars,
+            )
+        })?;
+        let Some(removed) = removed else {
+            // An input already left the view (a TRUNCATE or another
+            // compaction got there first). The output holds rows the view no
+            // longer has; installing it would resurrect them.
+            self.reader_pool.remove(&self.pool_key(&out_desc));
+            tracing::warn!(
+                output = %output_id,
+                inputs = ?input_id_set,
+                "compaction swap refused: an input is no longer in the view; the output must be discarded"
+            );
+            return Ok(CompactionSwap::InputsGone);
+        };
+
+        // Evict every removed input generation from the pool so a stale reader
+        // can never be served or reopened after its files are deleted (FMEA #4).
+        for desc in &removed {
+            self.reader_pool.remove(&self.pool_key(desc));
+        }
+        Ok(CompactionSwap::Swapped)
+    }
+
+    /// `current` with the compaction inputs removed and the output prepended,
+    /// plus the input descriptors it removed; `(None, None)` when an input is
+    /// no longer in `current`.
+    fn view_with_compaction_output(
+        current: &StoreView,
+        input_id_set: &std::collections::HashSet<&str>,
+        out_desc: &SstableDescriptor,
+        (output_id, output_path): (&String, &std::path::PathBuf),
+        output_sidecars: &Arc<HashMap<String, SidecarReader>>,
+    ) -> (Option<StoreView>, Option<Vec<SstableDescriptor>>) {
+        let all_present = input_id_set.iter().all(|input| {
+            current
+                .sstable_ids
+                .iter()
+                .any(|(id, _)| id.as_str() == *input)
+        });
+        if !all_present {
+            return (None, None);
+        }
         // Keep SSTables whose ID is NOT in the compaction input set.
         // Match on ID only — the path in the view may be empty (from flush)
         // while the compaction task resolves it to the table directory. Matching
         // on (id, path) caused inputs to never be removed, leaving stale
         // references to deleted files that silently lost data on reads.
-        let input_id_set: std::collections::HashSet<&str> =
-            input_ids.iter().map(|(id, _)| id.as_str()).collect();
-
         let mut new_sstables = Vec::with_capacity(current.sstables.len());
         let mut new_ids = Vec::with_capacity(current.sstable_ids.len());
         let mut new_sidecars = Vec::with_capacity(current.sidecar_indexes.len());
@@ -7989,23 +9285,19 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // Evict every removed input generation from the pool so a stale reader
-        // can never be served or reopened after its files are deleted (FMEA #4).
-        for desc in current.sstables.iter() {
-            if input_id_set.contains(desc.gen.as_str()) {
-                self.reader_pool.remove(&self.pool_key(desc));
-            }
-        }
+        let removed: Vec<SstableDescriptor> = current
+            .sstables
+            .iter()
+            .filter(|desc| input_id_set.contains(desc.gen.as_str()))
+            .cloned()
+            .collect();
 
-        // Build the descriptor for the compacted output, seed its reader into
-        // the pool, then prepend it.
-        let out_desc = SstableDescriptor::from_reader(output_id.clone(), output_path.clone(), &add);
-        self.seed_reader(&out_desc, add);
-        new_sstables.insert(0, out_desc);
-        new_ids.insert(0, (output_id, output_path));
-        new_sidecars.insert(0, Arc::new(output_sidecars));
+        // Prepend the compacted output.
+        new_sstables.insert(0, out_desc.clone());
+        new_ids.insert(0, (output_id.clone(), output_path.clone()));
+        new_sidecars.insert(0, Arc::clone(output_sidecars));
 
-        let new_view = StoreView {
+        let next = StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
             sstables: Arc::new(new_sstables),
@@ -8014,9 +9306,7 @@ impl<F: FlushTarget> TableStore<F> {
             sidecar_indexes: Arc::new(new_sidecars),
             vector_indexes: Arc::clone(&current.vector_indexes),
         };
-        new_view.check_invariants("swap_compacted");
-        self.view.store(Arc::new(new_view));
-        Ok(())
+        (Some(next), Some(removed))
     }
 
     /// Collects sidecar entries from SSTables matching the given `(id, path)` pairs for merging.
@@ -8061,39 +9351,52 @@ impl<F: FlushTarget> TableStore<F> {
         index_name: &str,
         reader: crate::index::sidecar::SidecarReader,
     ) -> bool {
-        let guard = self.view.load();
-        let Some(position) = guard
-            .sstable_ids
-            .iter()
-            .position(|(gen, _)| gen == generation_id)
-        else {
-            return false;
-        };
-
-        let mut sidecars: Vec<Arc<HashMap<String, SidecarReader>>> =
-            Vec::with_capacity(guard.sidecar_indexes.len());
-        for (i, existing) in guard.sidecar_indexes.iter().enumerate() {
-            if i == position {
-                let mut map: HashMap<String, SidecarReader> = existing.as_ref().clone();
-                map.insert(index_name.to_string(), reader.clone());
-                sidecars.push(Arc::new(map));
-            } else {
-                sidecars.push(Arc::clone(existing));
+        // By compare-and-swap: this used to load and store the view with no
+        // exclusion at all, so a flush or compaction swap landing in between
+        // was overwritten — an SSTable dropped from the view, or this
+        // sidecar lost.
+        let installed = self.update_view("install_sidecar", |guard| {
+            let Some(position) = guard
+                .sstable_ids
+                .iter()
+                .position(|(gen, _)| gen == generation_id)
+            else {
+                return (None, false);
+            };
+            let mut sidecars: Vec<Arc<HashMap<String, SidecarReader>>> =
+                Vec::with_capacity(guard.sidecar_indexes.len());
+            for (i, existing) in guard.sidecar_indexes.iter().enumerate() {
+                if i == position {
+                    let mut map: HashMap<String, SidecarReader> = existing.as_ref().clone();
+                    map.insert(index_name.to_string(), reader.clone());
+                    sidecars.push(Arc::new(map));
+                } else {
+                    sidecars.push(Arc::clone(existing));
+                }
+            }
+            let next = StoreView {
+                active: Arc::clone(&guard.active),
+                flushing: guard.flushing.clone(),
+                sstables: Arc::clone(&guard.sstables),
+                sstable_ids: Arc::clone(&guard.sstable_ids),
+                indexes: Arc::clone(&guard.indexes),
+                sidecar_indexes: Arc::new(sidecars),
+                vector_indexes: Arc::clone(&guard.vector_indexes),
+            };
+            (Some(next), true)
+        });
+        match installed {
+            Ok(installed) => installed,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    generation_id,
+                    index_name,
+                    "install_sidecar: the view stayed contended; sidecar NOT installed"
+                );
+                false
             }
         }
-
-        let new_view = StoreView {
-            active: Arc::clone(&guard.active),
-            flushing: guard.flushing.clone(),
-            sstables: Arc::clone(&guard.sstables),
-            sstable_ids: Arc::clone(&guard.sstable_ids),
-            indexes: Arc::clone(&guard.indexes),
-            sidecar_indexes: Arc::new(sidecars),
-            vector_indexes: Arc::clone(&guard.vector_indexes),
-        };
-        new_view.check_invariants("install_sidecar");
-        self.view.store(Arc::new(new_view));
-        true
     }
 
     /// Collect metadata for all current SSTables.
@@ -8254,12 +9557,43 @@ fn time_series_row_timestamp(
 
 fn late_partition_needs_replay(
     flushed_by_key: &std::collections::BTreeMap<ferrosa_common::key::DecoratedKey, &Partition>,
+    expanded: &std::collections::BTreeSet<ferrosa_common::key::DecoratedKey>,
     late_partition: &Partition,
 ) -> bool {
     match flushed_by_key.get(&late_partition.key) {
         None => true,
+        // The flush expanded this partition's whole-value collection cells in
+        // place, so its cells differ from the memtable's by design. A late
+        // write would still add a row or a newer timestamp: compare those.
+        Some(flushed_partition) if expanded.contains(&late_partition.key) => {
+            !same_rows_and_timestamps(flushed_partition, late_partition)
+        }
         Some(flushed_partition) => *flushed_partition != late_partition,
     }
+}
+
+/// Whether two images of one partition hold the same rows with the same
+/// deletions and newest timestamps, whatever their collection cells' layout.
+/// Expanding a whole-value collection keeps each row's clustering, deletion,
+/// liveness and newest cell timestamp (the sentinel it adds is one older).
+fn same_rows_and_timestamps(a: &Partition, b: &Partition) -> bool {
+    fn newest(row: &Row) -> Option<i64> {
+        row.cells.iter().map(|(_, cell)| cell.timestamp).max()
+    }
+    fn same_row(a: &Row, b: &Row) -> bool {
+        a.clustering == b.clustering
+            && a.deletion == b.deletion
+            && a.primary_key_liveness == b.primary_key_liveness
+            && newest(a) == newest(b)
+    }
+    a.deletion == b.deletion
+        && a.rows.len() == b.rows.len()
+        && a.rows.iter().zip(&b.rows).all(|(x, y)| same_row(x, y))
+        && match (&a.static_row, &b.static_row) {
+            (Some(x), Some(y)) => same_row(x, y),
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 #[cfg(test)]
@@ -8470,14 +9804,18 @@ mod tests {
     /// instead of a hardcoded `BTree`. Unknown indexes default to `BTree`.
     #[test]
     fn add_index_threads_declared_index_type() {
-        let mut store = test_store();
+        let store = test_store();
         assert_eq!(
             store.index_type_for("missing"),
             IndexType::BTree,
             "unknown index defaults to BTree"
         );
-        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
-        store.add_index("emb_idx".to_string(), 1, IndexType::Vector);
+        let _rotation: FlushOutcome = store
+            .add_index("name_idx".to_string(), 0, IndexType::Phonetic)
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_index("emb_idx".to_string(), 1, IndexType::Vector)
+            .unwrap();
         assert_eq!(store.index_type_for("name_idx"), IndexType::Phonetic);
         assert_eq!(
             store.index_type_for("emb_idx"),
@@ -8491,21 +9829,369 @@ mod tests {
     /// until those rows are flushed and rebuilt into a sidecar.
     #[test]
     fn add_index_backfills_existing_active_memtable_rows() {
-        let mut store = test_store();
+        let store = test_store();
         store
             .write(&make_key("before-index"), make_row(b"match", 1000))
             .unwrap();
 
-        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_index("val_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
         let rows = collect_index_results(&store, "val_idx", &IndexKey(b"match".to_vec())).unwrap();
         assert_eq!(rows.len(), 1, "pre-existing memtable row must be indexed");
     }
 
+    /// Index DDL is lock-free (t_d938e6ae): it rotates the memtable instead of
+    /// editing the live one's indexes under a table-map write lock. The
+    /// invariant that rotation must keep is "a memtable's postings are exactly
+    /// the flushed sidecars of the catalog it is bound to". So race writers,
+    /// index DDL and flushes, then check every SSTable: each sidecar holds one
+    /// posting per row of its SSTable (none lost, none from another
+    /// memtable), and no SSTable flushed after an index was dropped has a
+    /// sidecar for it.
+    #[test]
+    fn index_postings_equal_flushed_sidecars_under_racing_ddl_and_flush() {
+        const WRITERS: usize = 2;
+        const ROWS_PER_WRITER: usize = 400;
+        const DDL_ROUNDS: usize = 25;
+
+        let store = Arc::new(test_store());
+        let _rotation: FlushOutcome = store
+            .add_index("idx_main".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let writers_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let store = Arc::clone(&store);
+                let done = Arc::clone(&writers_done);
+                std::thread::spawn(move || {
+                    for i in 0..ROWS_PER_WRITER {
+                        store
+                            .write(&make_key(&format!("w{w}-{i:04}")), make_row(b"v", 1000))
+                            .unwrap();
+                    }
+                    done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+            .collect();
+        let ddl = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                for _ in 0..DDL_ROUNDS {
+                    let _added: FlushOutcome = store
+                        .add_index("idx_tmp".to_string(), 0, IndexType::BTree)
+                        .unwrap();
+                    let (removed, _flushed) = store.remove_index("idx_tmp").unwrap();
+                    assert!(removed, "idx_tmp was declared and must be removed");
+                }
+                let _added: FlushOutcome = store
+                    .add_index("idx_tmp".to_string(), 0, IndexType::BTree)
+                    .unwrap();
+                let _added: FlushOutcome = store
+                    .add_index("idx_gone".to_string(), 0, IndexType::BTree)
+                    .unwrap();
+                let (removed, _flushed) = store.remove_index("idx_gone").unwrap();
+                assert!(removed, "idx_gone was declared and must be removed");
+            })
+        };
+        let flusher = {
+            let store = Arc::clone(&store);
+            let done = Arc::clone(&writers_done);
+            std::thread::spawn(move || {
+                // Bounded by the writers finishing; each round is one flush.
+                for _ in 0..100_000 {
+                    if done.load(std::sync::atomic::Ordering::SeqCst) == WRITERS {
+                        return;
+                    }
+                    store.flush().unwrap();
+                }
+                panic!("writers did not finish within 100,000 flushes");
+            })
+        };
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        ddl.join().unwrap();
+        flusher.join().unwrap();
+        // One more row, so the final flush publishes an SSTable whose memtable
+        // was created after every DDL above.
+        store
+            .write(&make_key("zz-last"), make_row(b"v", 1000))
+            .unwrap();
+        store.flush().unwrap();
+
+        let total = WRITERS * ROWS_PER_WRITER + 1;
+        let main = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec())).unwrap();
+        assert_eq!(main.len(), total, "a posting of idx_main was lost");
+
+        let view = store.view.load();
+        assert_eq!(view.sstables.len(), view.sidecar_indexes.len());
+        for (sstable, sidecars) in view.sstables.iter().zip(view.sidecar_indexes.iter()) {
+            assert!(
+                sidecars.contains_key("idx_main"),
+                "generation {} has no idx_main sidecar",
+                sstable.gen
+            );
+            for (name, reader) in sidecars.iter() {
+                assert!(
+                    ["idx_main", "idx_tmp", "idx_gone"].contains(&name.as_str()),
+                    "generation {} has a sidecar for unknown index {name}",
+                    sstable.gen
+                );
+                assert_eq!(
+                    reader.entries_in_order().count() as u64,
+                    sstable.partition_count,
+                    "generation {}'s {name} sidecar must hold one posting per row",
+                    sstable.gen
+                );
+            }
+        }
+        // The view lists the newest SSTable first.
+        let last = view
+            .sidecar_indexes
+            .first()
+            .expect("the final flush published");
+        let mut last_names: Vec<&str> = last.keys().map(String::as_str).collect();
+        last_names.sort_unstable();
+        assert_eq!(
+            last_names,
+            ["idx_main", "idx_tmp"],
+            "the last flush's sidecars must be exactly the declared indexes"
+        );
+        let mut live: Vec<&str> = view.indexes.keys().map(String::as_str).collect();
+        live.sort_unstable();
+        assert_eq!(live, ["idx_main", "idx_tmp"]);
+    }
+
+    /// `write_barrier` (an `RwLock` every write took shared and every flush
+    /// took exclusive) is gone: a flush seals the frozen memtable's gate
+    /// instead, and writers that meet it move to the new memtable. The
+    /// invariant the barrier protected: no write lands in a memtable after
+    /// its flush snapshot. Race writers against back-to-back flushes; the
+    /// flush counts any partition that changed after its snapshot, and every
+    /// row must be readable through the index afterwards (t_d938e6ae).
+    #[test]
+    fn no_write_lands_in_a_sealed_memtable() {
+        const WRITERS: usize = 4;
+        const ROWS_PER_WRITER: usize = 1_500;
+        let store = Arc::new(test_store());
+        let _rotation: FlushOutcome = store
+            .add_index("idx_main".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let writers_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let store = Arc::clone(&store);
+                let done = Arc::clone(&writers_done);
+                std::thread::spawn(move || {
+                    (0..ROWS_PER_WRITER).for_each(|i| {
+                        store
+                            .write(&make_key(&format!("w{w}-{i:05}")), make_row(b"v", 1000))
+                            .unwrap();
+                    });
+                    done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+            .collect();
+        let flushes = {
+            let store = Arc::clone(&store);
+            let done = Arc::clone(&writers_done);
+            std::thread::spawn(move || {
+                let mut flushes = 0_usize;
+                while done.load(std::sync::atomic::Ordering::SeqCst) < WRITERS {
+                    store.flush().unwrap();
+                    flushes += 1;
+                    assert!(flushes < 1_000_000, "writers never finished");
+                }
+                flushes
+            })
+        };
+        writers
+            .into_iter()
+            .for_each(|writer| writer.join().unwrap());
+        let flushes = flushes.join().unwrap();
+        store.flush().unwrap();
+
+        assert!(
+            flushes > 1,
+            "the test must race flushes against the writers"
+        );
+        assert_eq!(
+            store
+                .late_writes_after_seal
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a write landed in a memtable after its flush snapshot"
+        );
+        let rows = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec())).unwrap();
+        assert_eq!(rows.len(), WRITERS * ROWS_PER_WRITER, "a write was lost");
+    }
+
+    /// `flush_guard` (a per-table `Mutex` every flush, DDL and truncate
+    /// queued on) is gone: rotations go onto a queue that one caller runs
+    /// for everyone (t_d938e6ae). Two flushes requested while a third is
+    /// running must become ONE rotation, not two more, and lose no row.
+    #[test]
+    fn flushes_queued_behind_a_running_flush_coalesce_into_one_rotation() {
+        let store = Arc::new(test_store());
+        store.write(&make_key("a"), make_row(b"v", 1000)).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.flush_with_swap_callback(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        // The first flush is inside its rotation, holding the combiner.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(store.rotations_started(), 1);
+
+        store.write(&make_key("b"), make_row(b"v", 1000)).unwrap();
+        store.write(&make_key("c"), make_row(b"v", 1000)).unwrap();
+        let queued: Vec<_> = (0..2)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || store.flush())
+            })
+            .collect();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while store.rotation_rx.len() < 2 {
+            assert!(Instant::now() < deadline, "the two flushes never queued");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        release_tx.send(()).unwrap();
+
+        assert_eq!(first.join().unwrap().unwrap(), FlushOutcome::Published);
+        queued
+            .into_iter()
+            .for_each(|flush| flush.join().unwrap().unwrap());
+        assert_eq!(
+            store.rotations_started(),
+            2,
+            "the two queued flushes must run as one rotation"
+        );
+        assert_eq!(store.sstable_count(), 2);
+        assert_eq!(store.memtable_size(), 0);
+        ["a", "b", "c"].iter().for_each(|key| {
+            assert!(
+                store.read(&make_key(key)).unwrap().is_some(),
+                "row {key} was lost"
+            );
+        });
+    }
+
+    /// Every view change is a compare-and-swap derived from the current view
+    /// (t_d938e6ae). `install_sidecar` used to load and store the view with
+    /// no exclusion, so a flush installing its SSTable in between was
+    /// overwritten (the SSTable vanished from reads) or overwrote the
+    /// sidecar. Race the two and check neither loses the other's change.
+    #[test]
+    fn sidecar_installs_and_flushes_lose_no_view_change() {
+        const ROUNDS: usize = 200;
+        let store = Arc::new(test_store());
+        let _rotation: FlushOutcome = store
+            .add_index("idx_main".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        store
+            .write(&make_key("first"), make_row(b"v", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let first_gen = store.view.load().sstable_ids[0].0.clone();
+        let reader = store.view.load().sidecar_indexes[0]["idx_main"].clone();
+
+        let flusher = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                (0..ROUNDS).for_each(|i| {
+                    store
+                        .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000))
+                        .unwrap();
+                    store.flush().unwrap();
+                });
+            })
+        };
+        let installer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                (0..ROUNDS).for_each(|i| {
+                    assert!(store.install_sidecar(
+                        &first_gen,
+                        &format!("extra_{i}"),
+                        reader.clone()
+                    ));
+                });
+            })
+        };
+        flusher.join().unwrap();
+        installer.join().unwrap();
+
+        let view = store.view.load();
+        assert_eq!(
+            view.sstables.len(),
+            ROUNDS + 1,
+            "an SSTable a flush installed was dropped from the view"
+        );
+        let first = view
+            .sidecar_indexes
+            .last()
+            .expect("the first flush's SSTable is the oldest");
+        (0..ROUNDS).for_each(|i| {
+            assert!(
+                first.contains_key(&format!("extra_{i}")),
+                "sidecar extra_{i} was installed and then lost"
+            );
+        });
+    }
+
+    /// `vector_index_scopes` was a `Mutex<HashMap>`; recording scopes from
+    /// concurrent callers must lose none of them, and forgetting an index
+    /// must drop only that index's scopes (t_d938e6ae).
+    #[test]
+    fn concurrent_vector_scope_records_lose_none() {
+        const THREADS: usize = 8;
+        const SCOPES: usize = 50;
+        let store = Arc::new(test_store());
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    let index = format!("vec_{}", t % 2);
+                    (0..SCOPES).for_each(|i| {
+                        let scope = format!("{t}-{i}").into_bytes();
+                        store.record_vector_scopes(&index, std::iter::once(&scope));
+                    });
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .for_each(|handle| handle.join().unwrap());
+        let scopes = store.vector_index_scopes.load();
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes["vec_0"].len(), THREADS / 2 * SCOPES);
+        assert_eq!(scopes["vec_1"].len(), THREADS / 2 * SCOPES);
+        assert!(store.forget_vector_scopes("vec_0").unwrap());
+        assert!(!store.forget_vector_scopes("vec_0").unwrap());
+        assert_eq!(
+            store.vector_index_scopes.load()["vec_1"].len(),
+            THREADS / 2 * SCOPES
+        );
+    }
+
     #[test]
     fn remove_index_unwires_future_index_reads() {
-        let mut store = test_store();
-        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        let store = test_store();
+        let _rotation: FlushOutcome = store
+            .add_index("val_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
         store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
 
         let before_drop =
@@ -8513,7 +10199,7 @@ mod tests {
         assert_eq!(before_drop.len(), 1);
 
         assert!(
-            store.remove_index("val_idx"),
+            store.remove_index("val_idx").unwrap().0,
             "declared index state should be removed"
         );
         assert!(store.indexed_columns().is_empty());
@@ -8527,7 +10213,7 @@ mod tests {
             "the refusal must name the index: {after_drop}"
         );
         assert!(
-            !store.remove_index("val_idx"),
+            !store.remove_index("val_idx").unwrap().0,
             "second removal is idempotent and reports no state removed"
         );
     }
@@ -8688,7 +10374,7 @@ mod tests {
 
     #[test]
     fn remove_index_unwires_flushed_sidecar_reads() {
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             test_schema(),
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -8708,29 +10394,33 @@ mod tests {
             "sanity check: flushed sidecar serves the declared index"
         );
 
-        assert!(store.remove_index("val_idx"));
+        assert!(store.remove_index("val_idx").unwrap().0);
         assert!(
             collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec())).is_err(),
             "dropped index must not consult stale sidecar readers, and must not \
              report its absence as zero rows"
         );
         assert!(
-            !store.remove_index("val_idx"),
+            !store.remove_index("val_idx").unwrap().0,
             "orphan sidecar readers must not make removal non-idempotent"
         );
     }
 
     #[test]
     fn remove_index_unwires_clustering_and_vector_metadata() {
-        let mut store = test_store();
-        store.add_clustering_index("ck_idx".to_string(), 0, IndexType::BTree);
-        store.add_quantized_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            m: 8,
-            ef_construction: 16,
-            metric: DistanceMetric::L2,
-        });
+        let store = test_store();
+        let _rotation: FlushOutcome = store
+            .add_clustering_index("ck_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_quantized_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                m: 8,
+                ef_construction: 16,
+                metric: DistanceMetric::L2,
+            })
+            .unwrap();
 
         assert_eq!(store.indexed_clustering_columns().len(), 1);
         assert_eq!(
@@ -8738,10 +10428,10 @@ mod tests {
             VectorIndexMethod::QuantizedIvf
         );
 
-        assert!(store.remove_index("ck_idx"));
+        assert!(store.remove_index("ck_idx").unwrap().0);
         assert!(store.indexed_clustering_columns().is_empty());
 
-        assert!(store.remove_index("vec_idx"));
+        assert!(store.remove_index("vec_idx").unwrap().0);
         assert_eq!(
             store.vector_index_method("vec_idx"),
             VectorIndexMethod::Hnsw,
@@ -8798,7 +10488,7 @@ mod tests {
         let current = store.view.load();
         let replacement = StoreView {
             active: Arc::new(SnapshotMemtable { partitions }),
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::clone(&current.sstables),
             sstable_ids: Arc::clone(&current.sstable_ids),
             indexes: Arc::clone(&current.indexes),
@@ -9160,7 +10850,7 @@ mod tests {
     /// This is the storage-level OOM-bound + equivalence oracle.
     #[tokio::test]
     async fn range_iter_fragmented_flattens_to_range_iter_across_sources() {
-        crate::range_merger::set_rows_per_fragment(16);
+        let _k = crate::range_merger::set_rows_per_fragment(16);
         let store = test_store();
 
         // One wide partition "hot": half its rows flushed to an SSTable, half
@@ -9224,7 +10914,50 @@ mod tests {
         // The hot partition must have fragmented (40 distinct cks > K=16).
         let hot = whole.iter().find(|p| p.key == make_key("hot")).unwrap();
         assert!(hot.rows.len() > 16, "fixture must produce a wide partition");
-        crate::range_merger::reset_rows_per_fragment();
+    }
+
+    /// A scan producer that panics must end its stream with an ERROR, never a
+    /// clean end-of-stream. The producer's sender drops during unwind, so
+    /// without one the consumer sees the partitions delivered so far followed
+    /// by a normal close: a truncated scan that reads as complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_scan_producer_ends_the_stream_with_an_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Partition>>(4);
+        let producer_tx = tx.clone();
+        drop(tx);
+        // Fill the channel to capacity before panicking, so the error has to
+        // wait behind buffered partitions rather than find a free slot.
+        super::spawn_bounded_range_scan(producer_tx.clone(), move |_slot| {
+            for i in 0..4 {
+                producer_tx
+                    .blocking_send(Ok(make_partition(&format!("before-panic-{i}"), b"v", 1)))
+                    .expect("consumer is alive");
+            }
+            panic!("simulated producer bug mid-scan");
+        });
+        // Let the panic land while the buffer is still full.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for _ in 0..4 {
+            let item = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("buffered item within 10 s")
+                .expect("a partition sent before the panic");
+            assert!(item.is_ok(), "partitions sent before the panic arrive");
+        }
+        let last = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the stream must not hang after a producer panic");
+        match last {
+            Some(Err(e)) => assert!(
+                e.to_string().contains("panicked"),
+                "the error must say the scan producer panicked, got: {e}"
+            ),
+            Some(Ok(p)) => panic!("unexpected partition after the panic: {:?}", p.key),
+            None => panic!(
+                "the scan ended cleanly after its producer panicked: a truncated \
+                 result would be reported as complete"
+            ),
+        }
     }
 
     #[test]
@@ -9506,7 +11239,7 @@ mod tests {
                 .unwrap();
             let mut merger = crate::range_merger::merger_for_sources(
                 Box::new(std::iter::empty()),
-                None,
+                Vec::new(),
                 &sst_readers[..],
                 None,
                 None,
@@ -9593,7 +11326,7 @@ mod tests {
             let mut merger = if label == "row-scan" {
                 crate::range_merger::merger_for_sources(
                     Box::new(std::iter::empty()),
-                    None,
+                    Vec::new(),
                     &readers[..],
                     None,
                     None,
@@ -9602,7 +11335,7 @@ mod tests {
             } else {
                 crate::range_merger::merger_for_metadata_sources(
                     Box::new(std::iter::empty()),
-                    None,
+                    Vec::new(),
                     &readers[..],
                     None,
                     None,
@@ -9712,7 +11445,7 @@ mod tests {
         let scanned: u64 = {
             let mut merger = crate::range_merger::merger_for_sources(
                 Box::new(std::iter::empty()),
-                None,
+                Vec::new(),
                 &readers[..],
                 None,
                 None,
@@ -9736,7 +11469,7 @@ mod tests {
         let counted: u64 = {
             let mut merger = crate::range_merger::merger_for_metadata_sources(
                 Box::new(std::iter::empty()),
-                None,
+                Vec::new(),
                 &readers[..],
                 None,
                 None,
@@ -9786,7 +11519,7 @@ mod tests {
         store.seed_reader(&corrupt_desc, corrupt);
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![good_desc, corrupt_desc]),
             sstable_ids: Arc::new(vec![
                 ("good".to_string(), std::path::PathBuf::new()),
@@ -9849,7 +11582,7 @@ mod tests {
         store.seed_reader(&desc, truncated);
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![("truncated".to_string(), std::path::PathBuf::new())]),
             indexes: Arc::clone(&current.indexes),
@@ -9907,7 +11640,7 @@ mod tests {
         store.seed_reader(&desc, truncated);
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![("corrupt-gen".to_string(), std::path::PathBuf::new())]),
             indexes: Arc::clone(&current.indexes),
@@ -9972,7 +11705,7 @@ mod tests {
         store.seed_reader(&desc, truncated);
         store.view.store(Arc::new(StoreView {
             active: Arc::clone(&current.active),
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![(
                 "corrupt-gen-2".to_string(),
@@ -10060,7 +11793,7 @@ mod tests {
         let sidecars = descs.iter().map(|_| Arc::new(HashMap::new())).collect();
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
-            flushing: None,
+            flushing: Arc::new(Vec::new()),
             sstables: Arc::new(descs),
             sstable_ids: Arc::new(ids),
             indexes: Arc::clone(&current.indexes),
@@ -10531,8 +12264,8 @@ mod tests {
 
     #[test]
     fn fulltext_sidecarless_scan_fails_loud_on_unopenable_sstable() {
-        let mut store = store_with_unopenable_sstable(&["a"], &["c"]);
-        store.add_fulltext_index("fts_idx".to_string(), 0);
+        let store = store_with_unopenable_sstable(&["a"], &["c"]);
+        let _rotation: FlushOutcome = store.add_fulltext_index("fts_idx".to_string(), 0).unwrap();
         let err = store
             .fulltext_sstable_scan_missing_sidecar(
                 "fts_idx",
@@ -10558,8 +12291,8 @@ mod tests {
 
     #[test]
     fn fulltext_scan_does_not_skip_quarantined_sstables() {
-        let mut store = store_with_unopenable_sstable(&["a"], &["c"]);
-        store.add_fulltext_index("fts_idx".to_string(), 0);
+        let store = store_with_unopenable_sstable(&["a"], &["c"]);
+        let _rotation: FlushOutcome = store.add_fulltext_index("fts_idx".to_string(), 0).unwrap();
         let covered = std::collections::HashSet::new();
         store
             .fulltext_sstable_scan_missing_sidecar("fts_idx", "x", &covered, None)
@@ -10657,8 +12390,10 @@ mod tests {
 
     #[test]
     fn index_read_with_quarantined_generation_fails_typed_not_empty() {
-        let mut store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
-        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let _rotation: FlushOutcome = store
+            .add_index("val_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
         quarantine_via_point_read(&store);
         let err = collect_index_results(&store, "val_idx", &IndexKey(b"missing".to_vec()))
             .expect_err("an index read over a table with a quarantined generation must not be Ok");
@@ -10675,8 +12410,10 @@ mod tests {
 
     #[test]
     fn reads_recover_once_the_quarantined_generation_leaves_the_view() {
-        let mut store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
-        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        let store = store_with_unopenable_sstable(&["a", "b"], &["c"]);
+        let _rotation: FlushOutcome = store
+            .add_index("val_idx".to_string(), 0, IndexType::BTree)
+            .unwrap();
         quarantine_via_point_read(&store);
         remove_generation_from_view(&store, "missing-gen");
         store
@@ -10877,7 +12614,7 @@ mod tests {
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
 
         assert!(
-            late_partition_needs_replay(&flushed_by_key, &late_same_key),
+            late_partition_needs_replay(&flushed_by_key, &Default::default(), &late_same_key),
             "late writes that add rows to an existing partition must be replayed"
         );
     }
@@ -10894,7 +12631,7 @@ mod tests {
         let flushed_by_key = std::collections::BTreeMap::from([(key.clone(), &flushed)]);
 
         assert!(
-            !late_partition_needs_replay(&flushed_by_key, &flushed),
+            !late_partition_needs_replay(&flushed_by_key, &Default::default(), &flushed),
             "unchanged partitions should not be replayed into the new active memtable"
         );
     }
@@ -10987,7 +12724,7 @@ mod tests {
 
         let view = store.view.load();
         assert!(
-            view.flushing.is_none(),
+            view.flushing.is_empty(),
             "completed flush must clear the flushing memtable so future flushes do not re-ingest the already-flushed snapshot"
         );
     }
@@ -11332,7 +13069,7 @@ mod tests {
         let input_id_paths: Vec<(String, std::path::PathBuf)> =
             current_id_paths.iter().rev().take(2).cloned().collect();
 
-        store
+        let swap = store
             .swap_compacted_sstables(
                 &input_id_paths,
                 "compacted".to_string(),
@@ -11341,6 +13078,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
+        assert_eq!(swap, CompactionSwap::Swapped);
         assert_eq!(store.sstable_count(), 3); // 4 - 2 + 1 = 3
 
         // Verify output is present and inputs are gone.
@@ -11358,6 +13096,97 @@ mod tests {
                 "input {id} should be removed"
             );
         }
+    }
+
+    /// An index read during a flush must find every row written before the
+    /// memtable rotated (T1). After the swap the view's memtable indexes are
+    /// the NEW memtable's; the frozen memtable's postings must stay readable
+    /// until its sidecar is installed. The flush is held between the swap and
+    /// the sidecar install by its own swap callback, so no sleep is involved.
+    #[test]
+    fn an_index_read_during_a_flush_finds_rows_written_before_the_rotation() {
+        let store = Arc::new(test_store());
+        let _rotation: FlushOutcome = store
+            .add_index("idx_main".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        store
+            .write(&make_key("before"), make_row(b"v", 1000))
+            .unwrap();
+
+        let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let flush = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.flush_with_swap_callback(move || {
+                    rotated_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        rotated_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // The memtable has rotated; no sidecar for its rows exists yet.
+        let during = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec()));
+        release_tx.send(()).unwrap();
+        assert_eq!(flush.join().unwrap().unwrap(), FlushOutcome::Published);
+
+        let during = during.unwrap();
+        assert_eq!(
+            during.len(),
+            1,
+            "a row written before the rotation was missing from an index read during the flush"
+        );
+        let after = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec())).unwrap();
+        assert_eq!(after.len(), 1);
+    }
+
+    /// A compaction swap must not install its output once its inputs have left
+    /// the view (T2). Compaction merges inputs A and B; TRUNCATE commits while
+    /// it runs; then the swap arrives. Installing the merged output would bring
+    /// the truncated rows back. The swap must refuse, and change nothing.
+    #[test]
+    fn a_compaction_swap_after_truncate_does_not_resurrect_rows() {
+        let store = test_store();
+        store.write(&make_key("a"), make_row(b"va", 1000)).unwrap();
+        store.flush().unwrap();
+        store.write(&make_key("b"), make_row(b"vb", 2000)).unwrap();
+        store.flush().unwrap();
+        let inputs: Vec<(String, std::path::PathBuf)> =
+            store.view.load().sstable_ids.iter().cloned().collect();
+        // Stand in for the merged output: an SSTable holding both rows.
+        let merged = sstable_reader_from_partitions(
+            &test_schema(),
+            &[
+                make_partition("a", b"va", 1000),
+                make_partition("b", b"vb", 2000),
+            ],
+            None,
+        );
+
+        store.truncate().unwrap();
+        let swapped = store.swap_compacted_sstables(
+            &inputs,
+            "merged".to_string(),
+            std::path::PathBuf::new(),
+            Arc::new(merged),
+            HashMap::new(),
+        );
+
+        assert!(
+            matches!(swapped, Ok(CompactionSwap::InputsGone)),
+            "the swap must refuse an output whose inputs were truncated: {swapped:?}"
+        );
+        assert_eq!(store.sstable_count(), 0);
+        assert!(
+            store.read(&make_key("a")).unwrap().is_none(),
+            "truncated row a resurrected"
+        );
+        assert!(
+            store.read(&make_key("b")).unwrap().is_none(),
+            "truncated row b resurrected"
+        );
     }
 
     /// P0 data loss: two flushes to same partition key, different clustering
@@ -11606,7 +13435,7 @@ mod tests {
 
         // Swap: this MUST remove the 2 inputs even though their paths
         // don't match the view's empty PathBuf.
-        store
+        let swap = store
             .swap_compacted_sstables(
                 &input_ids_with_real_path,
                 "output".to_string(),
@@ -11615,6 +13444,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
+        assert_eq!(swap, CompactionSwap::Swapped);
 
         // Before the fix, this was 4 (2 inputs kept + output + merged).
         // After the fix, inputs are removed: 3 - 2 + 1 = 2.
@@ -11879,7 +13709,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -11888,7 +13718,9 @@ mod tests {
             },
             vec![],
         );
-        store.add_index("loc_geo".to_string(), 0, IndexType::Geo);
+        let _rotation: FlushOutcome = store
+            .add_index("loc_geo".to_string(), 0, IndexType::Geo)
+            .unwrap();
         store
     }
 
@@ -12247,7 +14079,7 @@ mod tests {
             extensions: Default::default(),
         };
 
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -12256,7 +14088,9 @@ mod tests {
             },
             vec![("name_idx".to_string(), 0_usize)],
         );
-        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+        let _rotation: FlushOutcome = store
+            .add_index("name_idx".to_string(), 0, IndexType::Phonetic)
+            .unwrap();
 
         store
             .write(
@@ -12311,7 +14145,7 @@ mod tests {
             extensions: Default::default(),
         };
 
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             make_schema(&["name"]),
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -12320,11 +14154,15 @@ mod tests {
             },
             vec![("name_idx".to_string(), 0_usize)],
         );
-        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+        let _rotation: FlushOutcome = store
+            .add_index("name_idx".to_string(), 0, IndexType::Phonetic)
+            .unwrap();
 
         // ALTER TABLE ADD aaa_before — sorts before "name", shifting the
         // indexed column's ordinal from 0 to 1.
-        store.update_schema(make_schema(&["aaa_before", "name"]));
+        store
+            .update_schema(make_schema(&["aaa_before", "name"]))
+            .unwrap();
 
         store
             .write(
@@ -12372,7 +14210,7 @@ mod tests {
             extensions: Default::default(),
         };
 
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             make_schema(&["name"]),
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -12394,7 +14232,9 @@ mod tests {
         store.flush().unwrap();
 
         // Adding a lexically earlier column moves `name` from ordinal 0 to 1.
-        store.update_schema(make_schema(&["aaa_before", "name"]));
+        store
+            .update_schema(make_schema(&["aaa_before", "name"]))
+            .unwrap();
 
         let partition = store
             .read(&make_key("user1"))
@@ -12431,7 +14271,7 @@ mod tests {
             extensions: Default::default(),
         };
 
-        let mut store = TableStore::new_with_indexes(
+        let store = TableStore::new_with_indexes(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -12440,7 +14280,9 @@ mod tests {
             },
             vec![("name_idx".to_string(), 0_usize)],
         );
-        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+        let _rotation: FlushOutcome = store
+            .add_index("name_idx".to_string(), 0, IndexType::Phonetic)
+            .unwrap();
 
         store
             .write(
@@ -12901,7 +14743,7 @@ mod tests {
     #[test]
     fn quantized_ann_dispatch_uses_qvec_artifact_without_legacy_sidecar() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -12909,13 +14751,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_quantized_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_quantized_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         store
             .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
@@ -12933,6 +14777,7 @@ mod tests {
             store
                 .flush_target
                 .read_vector_sidecar(gen, "vec_idx")
+                .unwrap()
                 .is_none(),
             "quantized method must not write the legacy HNSW/VEC sidecar"
         );
@@ -12995,7 +14840,14 @@ mod tests {
             .collect();
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
         let error = store
-            .flush_sharded(partitions, 2, 4, Instant::now(), &new_memtable())
+            .flush_sharded(
+                partitions,
+                2,
+                4,
+                Instant::now(),
+                &new_memtable(),
+                store.schema.load_full(),
+            )
             .unwrap_err();
         assert!(
             error.to_string().contains("No space") || error.to_string().contains("ENOSPC"),
@@ -13046,7 +14898,14 @@ mod tests {
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
         // Call the actual shard path with two shards even on a one-core runner.
         store
-            .flush_sharded(partitions, 2, 20, Instant::now(), &new_memtable())
+            .flush_sharded(
+                partitions,
+                2,
+                20,
+                Instant::now(),
+                &new_memtable(),
+                store.schema.load_full(),
+            )
             .unwrap();
         assert_eq!(store.sstable_count(), 2);
         assert!(
@@ -13146,7 +15005,7 @@ mod tests {
     #[test]
     fn quantized_ann_search_merges_active_memtable_with_flushed_qvec_even_when_offsets_overlap() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13154,13 +15013,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_quantized_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_quantized_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         store
             .write(
@@ -13202,7 +15063,7 @@ mod tests {
     fn vector_sidecar_roundtrip_ann_search_returns_ordered_results() {
         // Create a store with a vector index on column 0.
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13210,13 +15071,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         // Write three vectors: k0 is closest to the query [1,0,0], k2 is farthest.
         //   k0 = [1.0, 0.0, 0.0]   distance 0.0
@@ -13247,6 +15110,7 @@ mod tests {
         let sidecar_bytes = store
             .flush_target
             .read_vector_sidecar(gen, "vec_idx")
+            .unwrap()
             .expect("vector sidecar must be present after flush");
         assert!(
             !sidecar_bytes.is_empty(),
@@ -13280,10 +15144,112 @@ mod tests {
         );
     }
 
+    /// ANN during a flush must find rows written before the memtable rotated:
+    /// the vector-index form of T1. The flush is held between the swap and
+    /// the sidecar install by its swap callback.
+    #[test]
+    fn ann_during_a_flush_finds_rows_written_before_the_rotation() {
+        let store = Arc::new(TableStore::new(
+            vector_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        ));
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+
+        let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let flush = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.flush_with_swap_callback(move || {
+                    rotated_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        rotated_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let during = store.ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20);
+        let raw = store.ann_search("vec_idx", &[1.0, 0.0, 0.0], 1, 20);
+        release_tx.send(()).unwrap();
+        assert_eq!(flush.join().unwrap().unwrap(), FlushOutcome::Published);
+
+        assert_eq!(
+            during.unwrap().len(),
+            1,
+            "ANN during the flush missed the frozen row"
+        );
+        assert_eq!(
+            raw.unwrap().len(),
+            1,
+            "raw ANN during the flush missed the frozen row"
+        );
+        let after = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+            .unwrap();
+        assert_eq!(after.len(), 1);
+    }
+
+    /// A vector index declared AFTER rows were written must answer for those
+    /// rows. Its DDL rotates the memtable, so the rows leave with the frozen
+    /// memtable; the rotation's flush must give them a vector sidecar that ANN
+    /// reads find (regression: `vector_index_registered_and_ann_orders_correctly`).
+    #[test]
+    fn a_vector_index_added_after_rows_answers_ann_for_them() {
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
+
+        let partitions = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+            .unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "ANN found no row written before the index"
+        );
+        assert_eq!(partitions[0].key.key.as_bytes(), b"k0");
+    }
+
     #[test]
     fn ann_search_partitions_returns_nearest_rows_with_pk_in_score_order() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13291,13 +15257,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         // k0 is the exact match for the query, k1 close, k2 far.
         store
@@ -13334,7 +15302,7 @@ mod tests {
     fn vector_index_created_after_writes_backfills_live_rows() {
         for method in [VectorIndexMethod::Hnsw, VectorIndexMethod::QuantizedIvf] {
             let flush_target = InMemoryFlushTarget::new();
-            let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            let store: TableStore<InMemoryFlushTarget> = TableStore::new(
                 vector_schema(),
                 flush_target,
                 WriteOptions {
@@ -13357,7 +15325,8 @@ mod tests {
                 m: 8,
                 ef_construction: 50,
             };
-            store.add_vector_index_with_method(config, method);
+            let _rotation: FlushOutcome =
+                store.add_vector_index_with_method(config, method).unwrap();
 
             let partitions = store
                 .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
@@ -13374,7 +15343,7 @@ mod tests {
     #[test]
     fn ann_search_partitions_recovers_rows_after_flush() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13382,13 +15351,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         store
             .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
@@ -13412,7 +15383,7 @@ mod tests {
     #[test]
     fn ann_same_offset_results_from_different_sstable_generations_both_survive_merge() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13420,13 +15391,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         store
             .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
@@ -13455,7 +15428,7 @@ mod tests {
     #[test]
     fn partition_scoped_ann_search_excludes_other_prefixes() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13463,13 +15436,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         let scope_a = make_key("tenant-a|session-1");
         let scope_b = make_key("tenant-b|session-1");
@@ -13512,7 +15487,7 @@ mod tests {
     #[test]
     fn vector_prefix_scope_reads_smaller_scoped_sidecar_than_unscoped_search() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             vector_schema(),
             flush_target,
             WriteOptions {
@@ -13520,13 +15495,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "vec_idx".to_string(),
-            column_position: 0,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         let scope_a = make_key("tenant-a|session-1");
         let scope_b = make_key("tenant-b|session-1");
@@ -13570,7 +15547,7 @@ mod tests {
     #[test]
     fn sparse_vector_update_on_existing_row_becomes_visible_to_readback_and_ann() {
         let flush_target = InMemoryFlushTarget::new();
-        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
             TableSchema {
                 keyspace: "agent_memory".to_string(),
                 table: "entity_store".to_string(),
@@ -13599,13 +15576,15 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_vector_index(VectorIndexConfig {
-            index_name: "entity_embedding_ann".to_string(),
-            column_position: 1,
-            metric: ferrosa_index::DistanceMetric::L2,
-            m: 8,
-            ef_construction: 50,
-        });
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "entity_embedding_ann".to_string(),
+                column_position: 1,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
 
         let key = make_key("tenant-session");
         let clustering = 7i32.to_be_bytes().to_vec();
@@ -14451,7 +16430,7 @@ mod tests {
         // lives in the high-bit synthetic space — no collision with inputs).
         let out_gen = "compacted".to_string();
 
-        store
+        let swap = store
             .swap_compacted_sstables(
                 &input_id_paths,
                 out_gen.clone(),
@@ -14460,6 +16439,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
+        assert_eq!(swap, CompactionSwap::Swapped);
         // 3 inputs removed, 1 compacted output inserted → exactly 1 remaining.
         assert_eq!(store.sstable_count(), 1, "3 inputs - 3 + 1 output = 1");
 
@@ -14613,7 +16593,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -14623,7 +16603,9 @@ mod tests {
         );
 
         // Component 0 of the partition key is the tenant.
-        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
         // Two tenants, several sessions each: the rows land in different
         // partitions under the same tenant, which is the shape that matters.
@@ -14692,7 +16674,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -14700,7 +16682,9 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree)
+            .unwrap();
         store
     }
 
@@ -14867,7 +16851,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -14875,7 +16859,9 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
         let mut mine = 0usize;
         for i in 0..6 {
@@ -14969,7 +16955,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -14977,7 +16963,9 @@ mod tests {
                 ..WriteOptions::default()
             },
         );
-        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
         // Comfortably past 2 * MIN_PARTITIONS_PER_FLUSH_SHARD (512).
         let rows = 1200usize;
@@ -15050,7 +17038,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema,
             InMemoryFlushTarget::new(),
             WriteOptions {
@@ -15060,17 +17048,17 @@ mod tests {
         );
 
         // One index of each family that exists today.
-        store.add_index("idx_regular".to_string(), 0, IndexType::BTree);
-        store.add_clustering_index("idx_clustering".to_string(), 0, IndexType::BTree);
-        store.add_partition_key_index("idx_partition_key".to_string(), 0, IndexType::BTree);
+        let _rotation: FlushOutcome = store
+            .add_index("idx_regular".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_clustering_index("idx_clustering".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_partition_key_index("idx_partition_key".to_string(), 0, IndexType::BTree)
+            .unwrap();
 
-        let declared: Vec<String> = store
-            .indexed_columns
-            .iter()
-            .chain(store.indexed_clustering_columns.iter())
-            .chain(store.indexed_partition_key_columns.iter())
-            .map(|(name, _)| name.clone())
-            .collect();
+        let declared: Vec<String> = store.catalog().scalar_index_names().cloned().collect();
         assert_eq!(
             declared.len(),
             3,

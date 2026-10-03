@@ -302,6 +302,72 @@ pub(super) fn should_send_schema_snapshot(
 /// `CreateKeyspace` + `CreateTable` ops through Raft on Cluster-mode
 /// transition, which propagates them to every replica's state
 /// machine and storage engine.
+/// Rerun this node's bootstrap after a restart found it `Joining` with no
+/// verified bootstrap record (P0-4). Success records completion and promotes
+/// the node; failure leaves it `Joining` and is logged by
+/// [`super::data_movement::bootstrap_verified`]. Nothing here promotes on
+/// error.
+async fn rerun_local_bootstrap(
+    local_node_id: u64,
+    raft: Arc<crate::raft::FerrosRaft>,
+    peer_manager: Arc<ferrosa_net::peer::PeerManager>,
+    ring_holder: Arc<arc_swap::ArcSwap<Option<Arc<crate::ring::TokenRing>>>>,
+    storage: Arc<ferrosa_storage::engine::StorageEngine>,
+    schema: &ferrosa_schema::Schema,
+) {
+    let Some(ring) = ring_holder.load_full().as_ref().clone() else {
+        tracing::error!(
+            local = local_node_id,
+            "cannot rerun bootstrap: no token ring; the node stays Joining"
+        );
+        return;
+    };
+    let tables = match super::data_movement::replicated_tables(&schema.snapshot()) {
+        Ok(tables) => tables,
+        Err(e) => {
+            tracing::error!(
+                local = local_node_id,
+                %e,
+                "cannot rerun bootstrap: table replication unknown; the node stays Joining"
+            );
+            return;
+        }
+    };
+    tracing::warn!(
+        local = local_node_id,
+        tables = tables.len(),
+        "this node is Joining with no verified bootstrap record; rerunning its bootstrap"
+    );
+    let executor = super::data_movement::bootstrap_executor(
+        storage,
+        peer_manager.clone(),
+        &ring,
+        local_node_id,
+    );
+    let proposer = super::data_movement::ForwardingProposer {
+        raft,
+        peer_manager,
+        ring: ring_holder,
+    };
+    if let Err(e) = super::data_movement::bootstrap_verified(
+        &proposer,
+        &ring,
+        local_node_id,
+        &tables,
+        &executor,
+    )
+    .await
+    {
+        // Covers a failed proposal of the record or the promotion too, which
+        // `bootstrap_verified` returns without logging.
+        tracing::error!(
+            local = local_node_id,
+            %e,
+            "bootstrap rerun did not complete; the node stays Joining until the next restart"
+        );
+    }
+}
+
 pub(super) fn keyspace_needs_cluster_replay(name: &str) -> bool {
     !ferrosa_schema::is_system_keyspace(name)
 }
@@ -2806,6 +2872,31 @@ impl ModeController {
                                 "proceeding to promote joining nodes"
                             );
                             for &nid in &all_node_ids_for_bootstrap {
+                                // P0-4: a member still `Joining` without a
+                                // verified bootstrap record must not be
+                                // promoted here either. Formation peers are
+                                // committed `Normal`, so this only bites a
+                                // joiner that arrived through another path.
+                                let unverified_joiner = ring_for_bootstrap
+                                    .load()
+                                    .as_ref()
+                                    .as_ref()
+                                    .and_then(|ring| {
+                                        ring.get_node(nid).map(|info| {
+                                            info.state == NodeState::Joining
+                                                && !ring.bootstrap_complete(nid)
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                if unverified_joiner {
+                                    tracing::error!(
+                                        node_id = nid,
+                                        "not promoting a Joining member with no verified \
+                                         bootstrap record; it stays Joining until its \
+                                         bootstrap completes"
+                                    );
+                                    continue;
+                                }
                                 if nid != local_node_id {
                                     let cmd = crate::raft::RaftCommand {
                                         op: crate::raft::RaftOp::SetNodeState {
@@ -2836,10 +2927,16 @@ impl ModeController {
                         // skips non-Normal members, so that node's tokens were
                         // silently served by other nodes (repair run from it
                         // saw zero owned ranges, and its own full scans missed
-                        // a partition). The recovered topology is COMMITTED, so
-                        // a `Joining` member in it is a join whose promotion the
-                        // restart lost — not a node still streaming data.
-                        // Finish that promotion instead of leaving it stuck.
+                        // a partition).
+                        //
+                        // P0-4: a `Joining` member is EITHER a join whose
+                        // promotion the restart lost OR a join whose bootstrap
+                        // stream the restart cut off. Only the committed
+                        // `RecordBootstrapComplete` tells them apart, so only
+                        // recorded joiners are promoted here. The others stay
+                        // `Joining` (out of `replicas()`) and must rerun their
+                        // bootstrap; promoting them would make a replica with
+                        // no data.
                         let member_states: std::collections::BTreeMap<u64, NodeState> =
                             match ring_for_bootstrap.load().as_ref().as_ref() {
                                 Some(ring) => ring
@@ -2849,9 +2946,48 @@ impl ModeController {
                                     .collect(),
                                 None => std::collections::BTreeMap::new(),
                             };
+                        let recorded: std::collections::BTreeSet<u64> =
+                            match ring_for_bootstrap.load().as_ref().as_ref() {
+                                Some(ring) => member_states
+                                    .keys()
+                                    .copied()
+                                    .filter(|id| ring.bootstrap_complete(*id))
+                                    .collect(),
+                                None => std::collections::BTreeSet::new(),
+                            };
                         let promote_plan = crate::repair::coordinator::promote_joining_members(
                             &member_states,
+                            &recorded,
                         );
+                        let awaiting = crate::repair::coordinator::joiners_awaiting_bootstrap(
+                            &member_states,
+                            &recorded,
+                        );
+                        if !awaiting.is_empty() {
+                            tracing::error!(
+                                ?awaiting,
+                                local = local_node_id,
+                                "recovered topology has Joining members with no verified \
+                                 bootstrap record; they are NOT promoted and stay out of \
+                                 replicas() until their bootstrap reruns and records completion"
+                            );
+                        }
+                        // A joiner reruns its own bootstrap: it pulls every
+                        // range it will own from the current replicas, records
+                        // completion through Raft, then promotes itself. Other
+                        // nodes only report it; the joiner holds the storage
+                        // the data must land in.
+                        if awaiting.contains(&local_node_id) {
+                            rerun_local_bootstrap(
+                                local_node_id,
+                                raft_arc.clone(),
+                                peer_manager_for_bootstrap.clone(),
+                                ring_for_bootstrap.clone(),
+                                storage_for_bootstrap.clone(),
+                                &schema_for_bootstrap,
+                            )
+                            .await;
+                        }
                         if !promote_plan.is_empty() {
                             let stuck: Vec<(u64, NodeState)> = member_states
                                 .iter()
@@ -3008,9 +3144,12 @@ impl ModeController {
                     // otherwise have nowhere to receive a schema snapshot.
                     registry.register(
                         MsgType::PairSchemaSync,
-                        Arc::new(PairSchemaSyncHandler::new(
+                        Arc::new(PairSchemaSyncHandler::for_cluster(
                             schema_for_replay.clone(),
                             storage_for_bootstrap.clone(),
+                            // A returning member only ever RECEIVES the
+                            // cluster's schema here, so it is a receiver.
+                            Arc::new(ArcSwap::from_pointee(crate::pair::PairRole::Secondary)),
                         )),
                     );
 

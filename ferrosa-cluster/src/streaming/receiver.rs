@@ -43,7 +43,7 @@ impl Default for StreamSessionLimits {
 }
 
 use ferrosa_common::key::DecoratedKey;
-use ferrosa_common::{PartitionKey, Token};
+use ferrosa_common::PartitionKey;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
@@ -189,6 +189,11 @@ impl StreamSession {
         }
 
         let mut applied = 0u64;
+        // Mutations whose partition had no clustered rows. The senders stream
+        // `partition.rows` only, so such a partition's static row and
+        // partition-level deletion do not travel; counted so the session log
+        // shows it rather than reporting the mutation as applied data.
+        let mut empty_row_payloads = 0u64;
         let mut staged = std::fs::File::open(&self.staging_path).map_err(|e| {
             ClusterError::Internal(format!(
                 "stream: failed to open staged mutations {}: {e}",
@@ -216,45 +221,28 @@ impl StreamSession {
             let mutation: StreamedMutation = bincode::deserialize(&encoded).map_err(|e| {
                 ClusterError::Internal(format!("stream: failed to decode staged mutation: {e}"))
             })?;
+            // Decode BEFORE writing anything for this partition, so an
+            // undecodable row set fails the session instead of being stored.
+            let rows = decode_partition_rows(&mutation)?;
             let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-            // Reconstruct a minimal DecoratedKey from the raw key bytes.
-            // We use Token(0) as a placeholder — the storage engine uses the
-            // key bytes for lookup, not the token, so this is safe for
-            // mutation application during bootstrap streaming.
-            let key = DecoratedKey {
-                token: Token(0),
-                key: PartitionKey::new(mutation.key.clone()),
-            };
+            // Decorate with the key's real Murmur3 token. `DecoratedKey`
+            // orders by token first, so a placeholder token files the
+            // partition where no read at its real token will look.
+            let key = DecoratedKey::new(PartitionKey::new(mutation.key));
 
-            // Decode the row bytes. The sender serializes rows as
-            // Vec<RowWire> via bincode. Fall back to a single-cell
-            // placeholder if decoding fails (backwards compat with
-            // pre-RowWire streams).
-            use crate::raft::handlers::RowWire;
-            use ferrosa_common::CellValue;
-            use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
-
-            let rows: Vec<Row> = match bincode::deserialize::<Vec<RowWire>>(&mutation.row) {
-                Ok(wire_rows) if !wire_rows.is_empty() => {
-                    wire_rows.into_iter().map(Row::from).collect()
-                }
-                _ => {
-                    // Fallback: treat raw bytes as a single cell value.
-                    vec![Row {
-                        clustering: vec![],
-                        cells: vec![(0, CellValue::live(mutation.row.clone(), mutation.timestamp))],
-                        deletion: DeletionTime::LIVE,
-                        primary_key_liveness: LivenessInfo::with_timestamp(mutation.timestamp),
-                    }]
-                }
-            };
-
+            let mut wrote_any = false;
             for row in rows {
+                wrote_any = true;
                 storage
                     .write(&table_id, &key, row, mutation.timestamp)
                     .map_err(|e| {
                         ClusterError::Internal(format!("stream: storage write failed: {e}"))
                     })?;
+            }
+            // An empty row list writes nothing; count it so the session log
+            // shows it rather than reporting the mutation as applied data.
+            if !wrote_any {
+                empty_row_payloads += 1;
             }
             applied += 1;
         }
@@ -262,6 +250,7 @@ impl StreamSession {
         tracing::info!(
             session_id = self.start.session_id,
             applied,
+            empty_row_payloads,
             "stream: session applied to storage"
         );
 
@@ -270,6 +259,35 @@ impl StreamSession {
             applied,
         })
     }
+}
+
+/// Decode a streamed partition's rows (`Vec<RowWire>`, bincode).
+///
+/// Every sender encodes `Vec<RowWire>`. Bytes that do not decode are refused:
+/// this used to store the raw bytes as a single live cell in column 0
+/// ("backwards compat with pre-RowWire streams"), so a corrupt or truncated
+/// payload -- or a sender's `unwrap_or_default()` empty encoding -- became a
+/// plausible-looking row. An empty row list writes nothing; it used to take
+/// the same fallback and store the encoded empty vector as a cell.
+///
+/// The payload is ONE partition's rows, already bounded by the session byte
+/// limit when it was staged; the decoded rows are yielded one at a time
+/// rather than converted into a second `Vec`.
+fn decode_partition_rows(
+    mutation: &StreamedMutation,
+) -> Result<impl Iterator<Item = ferrosa_sstable::types::Row>> {
+    use crate::raft::handlers::RowWire;
+    let wire_rows: Vec<RowWire> = bincode::deserialize(&mutation.row).map_err(|e| {
+        ClusterError::Internal(format!(
+            "stream: rows for {}.{} partition {:02x?} do not decode as RowWire ({} bytes): {e}; \
+             refusing to store them",
+            mutation.keyspace,
+            mutation.table,
+            &mutation.key[..mutation.key.len().min(16)],
+            mutation.row.len()
+        ))
+    })?;
+    Ok(wire_rows.into_iter().map(ferrosa_sstable::types::Row::from))
 }
 
 impl Drop for StreamSession {
@@ -746,14 +764,161 @@ mod tests {
     use super::*;
     use crate::streaming::{compute_checksum, StreamChunkPayload, StreamConfig, StreamedMutation};
 
+    /// A streamed mutation in the format every sender emits: `Vec<RowWire>`.
     fn make_mutation(i: usize) -> StreamedMutation {
+        use crate::raft::handlers::RowWire;
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(
+                0,
+                CellValue::live(format!("row_{i}").into_bytes(), i as i64),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(i as i64),
+        };
         StreamedMutation {
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key: (i as u64).to_be_bytes().to_vec(),
-            row: format!("row_{i}").into_bytes(),
+            row: bincode::serialize(&vec![RowWire::from(row)]).unwrap(),
             timestamp: i as i64,
         }
+    }
+
+    /// Run one single-mutation session through `receive_and_apply`.
+    /// `session_id` must be unique per test: the staging file is keyed by
+    /// (pid, source node, session), so parallel tests would share one.
+    async fn apply_one(
+        storage: &Arc<StorageEngine>,
+        session_id: u64,
+        mutation: StreamedMutation,
+    ) -> Result<StreamResult> {
+        let checksum = compute_checksum(std::slice::from_ref(&mutation));
+        let start = StreamStartPayload {
+            session_id,
+            source_node: 1,
+            token_range_start: 0,
+            token_range_end: 100,
+            estimated_bytes: 0,
+        };
+        let chunks = vec![StreamChunkPayload {
+            session_id,
+            mutations: vec![mutation],
+        }];
+        let end = StreamEndPayload {
+            session_id,
+            total_mutations: 1,
+            checksum,
+        };
+        StreamReceiver::receive_and_apply(storage, start, chunks, end).await
+    }
+
+    /// Row bytes that do not decode as `Vec<RowWire>` must fail the session,
+    /// not be stored as a single live cell holding the raw bytes.
+    #[tokio::test]
+    async fn undecodable_streamed_rows_are_refused_not_stored() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_table(&storage, "ks", "tbl");
+
+        let mut mutation = make_mutation(1);
+        mutation.row = b"\xff\xff\xff\xff\xff\xff\xff\xffnot rowwire".to_vec();
+        let checksum = compute_checksum(std::slice::from_ref(&mutation));
+        let start = StreamStartPayload {
+            session_id: 43,
+            source_node: 10,
+            token_range_start: i64::MIN,
+            token_range_end: i64::MAX,
+            estimated_bytes: 0,
+        };
+        let chunks = vec![StreamChunkPayload {
+            session_id: 43,
+            mutations: vec![mutation.clone()],
+        }];
+        let end = StreamEndPayload {
+            session_id: 43,
+            total_mutations: 1,
+            checksum,
+        };
+        let err = StreamReceiver::receive_and_apply(&storage, start, chunks, end)
+            .await
+            .expect_err("undecodable rows must fail the session");
+        assert!(err.to_string().contains("RowWire"), "{err}");
+        let stored = storage
+            .read(
+                &TableId::new("ks", "tbl"),
+                &DecoratedKey::new(PartitionKey::new(mutation.key)),
+            )
+            .unwrap();
+        assert!(stored.is_none(), "nothing may be stored: {stored:?}");
+    }
+
+    /// Bootstrap/decommission/rebalance streaming must deliver a non-frozen
+    /// collection's element cells with their paths intact.
+    #[tokio::test]
+    async fn receive_preserves_complex_cell_paths() {
+        use crate::raft::handlers::RowWire;
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        storage
+            .register_table(TableSchema {
+                keyspace: "ks".to_string(),
+                table: "lists".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "l".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.ListType(\
+                                org.apache.cassandra.db.marshal.UTF8Type)"
+                        .to_string(),
+                }],
+                extensions: Default::default(),
+            })
+            .unwrap();
+
+        let cells = vec![
+            (0, CellValue::tombstone(99, 1_700_000_000)),
+            (
+                0,
+                CellValue::live(b"a".to_vec(), 100).with_path(b"p1".to_vec()),
+            ),
+            (
+                0,
+                CellValue::live(b"b".to_vec(), 100).with_path(b"p2".to_vec()),
+            ),
+        ];
+        let row = Row {
+            clustering: vec![],
+            cells: cells.clone(),
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(100),
+        };
+        let mutation = StreamedMutation {
+            keyspace: "ks".to_string(),
+            table: "lists".to_string(),
+            key: b"k".to_vec(),
+            row: bincode::serialize(&vec![RowWire::from(row)]).unwrap(),
+            timestamp: 100,
+        };
+        apply_one(&storage, 772, mutation).await.unwrap();
+
+        // Stored under the key's real Murmur3 token (see receive_and_apply).
+        let key = ferrosa_common::key::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"k".to_vec(),
+        ));
+        let stored = storage
+            .read(&ferrosa_storage::TableId::new("ks", "lists"), &key)
+            .unwrap()
+            .expect("partition stored");
+        assert_eq!(stored.rows[0].cells, cells);
     }
 
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
@@ -836,6 +1001,66 @@ mod tests {
 
         assert_eq!(result.applied, 5);
         assert_eq!(result.session_id, 1);
+    }
+
+    /// A streamed row must be readable afterwards by its partition key. The
+    /// receiver decorated every key with `Token(0)` ("the storage engine uses
+    /// the key bytes for lookup, not the token"), but `DecoratedKey` orders by
+    /// token first, so the partition landed at token 0 and a read at the
+    /// key's real Murmur3 token did not find it.
+    #[tokio::test]
+    async fn a_streamed_row_is_readable_by_its_partition_key() {
+        use crate::raft::handlers::RowWire;
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_table(&storage, "ks", "tbl");
+
+        let key = b"streamed-partition".to_vec();
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"v".to_vec(), 7))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(7),
+        };
+        let mutation = StreamedMutation {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key: key.clone(),
+            row: bincode::serialize(&vec![RowWire::from(row)]).unwrap(),
+            timestamp: 7,
+        };
+        let checksum = compute_checksum(std::slice::from_ref(&mutation));
+        let start = StreamStartPayload {
+            session_id: 41,
+            source_node: 10,
+            token_range_start: i64::MIN,
+            token_range_end: i64::MAX,
+            estimated_bytes: 0,
+        };
+        let chunks = vec![StreamChunkPayload {
+            session_id: 41,
+            mutations: vec![mutation],
+        }];
+        let end = StreamEndPayload {
+            session_id: 41,
+            total_mutations: 1,
+            checksum,
+        };
+        StreamReceiver::receive_and_apply(&storage, start, chunks, end)
+            .await
+            .unwrap();
+
+        let table_id = TableId::new("ks", "tbl");
+        let read = storage
+            .read(&table_id, &DecoratedKey::new(PartitionKey::new(key)))
+            .unwrap();
+        assert!(
+            read.is_some_and(|p| !p.rows.is_empty()),
+            "a bootstrap-streamed partition must be readable at its real token"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1196,10 +1421,11 @@ mod tests {
 
         // Read back from storage and verify the full row was applied.
         let table_id = ferrosa_storage::TableId::new("ks", "tbl");
-        let key = ferrosa_common::key::DecoratedKey {
-            token: ferrosa_common::Token(0),
-            key: ferrosa_common::PartitionKey::new(42u64.to_be_bytes().to_vec()),
-        };
+        // At the key's REAL token: this test used to read back at `Token(0)`,
+        // which pinned the placeholder-token bug instead of catching it.
+        let key = ferrosa_common::key::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            42u64.to_be_bytes().to_vec(),
+        ));
         let partition = storage.read(&table_id, &key).unwrap();
         assert!(partition.is_some(), "should find stored partition");
         let partition = partition.unwrap();

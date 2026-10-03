@@ -85,6 +85,10 @@ jobs:
           # mirror ci.yml's heavy/live-infra exclusions (they would never finish
           # at 50000 cases) and exclude the file-IO-heavy repair fuzz
           # (`fuzz-fileio`), which gets its own bounded step below.
+          # `--skip accord::perf` (matches accord::perf_regression too) keeps the
+          # absolute wall-clock bounds out of this debug-profile fuzz session,
+          # as ci.yml does; they ran here and failed at 56.7 ms on 2026-09-30.
+          # The `perf-regression` job below enforces them unchanged.
           # Crate excludes + skip list mirror ci.yml's proven --all-features run
           # (jepsen/loadgen excluded; live-infra + heavy tests skipped by name);
           # the file-IO repair fuzz is skipped here and run in the step below.
@@ -124,6 +128,7 @@ jobs:
                  --skip rust_driver_connects_to_cluster \
                  --skip ssh_execute_command \
                  --skip ssh_upload_file \
+                 --skip accord::perf \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           if [ "$status" = "124" ] || [ "$status" = "137" ]; then

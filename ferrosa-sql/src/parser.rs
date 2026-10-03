@@ -36,7 +36,16 @@ pub enum ParseError {
     MissingPrimaryKey,
     /// The primary key names a column the table does not define.
     UnknownPrimaryKeyColumn(String),
+    /// An expression nests (parentheses, `NOT`) deeper than
+    /// [`MAX_EXPR_DEPTH`]. The parser recurses per level, so without this
+    /// bound a client-chosen depth overflows the parsing thread's stack and
+    /// aborts the process.
+    TooDeep,
 }
+
+/// Deepest expression nesting the parser accepts: far beyond any real
+/// predicate, far below what a 2 MiB worker stack can recurse.
+pub const MAX_EXPR_DEPTH: usize = 256;
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -56,6 +65,9 @@ impl fmt::Display for ParseError {
             ParseError::UnknownPrimaryKeyColumn(c) => {
                 write!(f, "primary key column `{c}` is not defined")
             }
+            ParseError::TooDeep => {
+                write!(f, "expression nests deeper than {MAX_EXPR_DEPTH} levels")
+            }
         }
     }
 }
@@ -66,7 +78,7 @@ impl std::error::Error for ParseError {}
 pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let toks = lex(trimmed)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser::new(toks);
 
     p.expect(&Tok::Select, "SELECT")?;
     let distinct = if matches!(p.peek(), Some(Tok::Distinct)) {
@@ -154,7 +166,7 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
 pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let toks = lex_statement(trimmed)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser::new(toks);
     match p.peek() {
         Some(Tok::Select) => {
             if p.is_expr_select() {
@@ -475,9 +487,33 @@ fn aggregate_func(word: &str) -> Option<AggFunc> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Current expression nesting (see [`ParseError::TooDeep`]).
+    depth: usize,
 }
 
 impl Parser {
+    fn new(toks: Vec<Tok>) -> Self {
+        Self {
+            toks,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Run `f` one nesting level deeper, refusing past [`MAX_EXPR_DEPTH`].
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.depth >= MAX_EXPR_DEPTH {
+            return Err(ParseError::TooDeep);
+        }
+        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
     }
@@ -1038,7 +1074,7 @@ impl Parser {
     fn parse_not(&mut self) -> Result<Expr, ParseError> {
         if matches!(self.peek(), Some(Tok::Not)) {
             self.next();
-            let inner = self.parse_not()?;
+            let inner = self.nested(Self::parse_not)?;
             Ok(Expr::Not(Box::new(inner)))
         } else {
             self.parse_primary()
@@ -1048,7 +1084,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         if matches!(self.peek(), Some(Tok::LParen)) {
             self.next();
-            let inner = self.parse_or()?;
+            let inner = self.nested(Self::parse_or)?;
             self.expect(&Tok::RParen, ")")?;
             Ok(inner)
         } else {

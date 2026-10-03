@@ -25,16 +25,34 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   Per-partition merge-on-write (cell-level LWW, tombstone merge). When a legacy
   whole-value collection and path-keyed collection elements meet during replay
   or a live update, the merge expands the whole value into a deletion sentinel
-  plus sorted element cells. Flush therefore sees one collection
-  representation and cannot panic on a live pathless complex cell.
+  plus sorted element cells. Whole values in DIFFERENT partitions or SSTables
+  are expanded at the writer boundary: every flush and compaction whose output
+  is complex-framed runs `memtable::expand_collection_blobs_for_writer` (and
+  widens the header minimums for the sentinel), so a simple-framed blob never
+  reaches a complex writer. Every expansion is counted in
+  `ferrosa_storage_collection_blob_expansions_total{table}` and WARNs once per
+  (table, column). `TableStore::write` refuses a whole value that does not parse
+  as its collection or whose elements are not values of the element type
+  (FMEA ST-66).
 - **Commit log** (`commitlog/`) — segmented WAL with CAS-based lock-free
   allocation, forward-linked sync markers, crash-recovery replay, CDC reader,
   S3 archiver for PITR, and per-table checkpoints. Three sync strategies
   (`Batch`, `Periodic`, `Group`); **default is `Periodic`** → a bounded
-  durability window (see FMEA).
+  durability window (see FMEA). Open-time replay re-logs every mutation it
+  keeps only in memory into the new log generation (`ReplayRelog`) and fsyncs
+  it before deleting the old segment, so a second crash before the table
+  flushes loses nothing (FMEA ST-72).
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
-  memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`. Flush is
-  serialized by a per-table `Mutex`; reads/writes are never blocked. Optional
+  memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`, and
+  every view change is a compare-and-swap derived from the current view.
+  Memtable rotations (flush, index DDL, ALTER, TRUNCATE) run one at a time
+  through a lock-free queue that one caller runs for everyone; reads and
+  writes are never blocked. A flush that fails or panics after its swap
+  leaves its memtable in `flushing`, a list of sealed memtables (newest
+  first) that reads consult row by row and posting by posting; the next
+  rotation writes each one to its own SSTable, and a memtable leaves the list
+  only in the view change that installs its SSTable, so it is flushed exactly
+  once. Overlapping SSTables are merged by reads and compaction. Optional
   `write_verify` self-readback after every flush. The durability barrier
   (`fsync_components`) fsyncs a generation's component files **concurrently** on
   a shared, bounded flush pool (`flush_executor`, a rayon `ThreadPool` whose
@@ -44,6 +62,46 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   component fsync failure fails loud without the directory fsync. The pool caps
   concurrency across *all* concurrent flushes, so flush parallelism is a
   capacity-aware knob rather than a per-flush thread count.
+
+  **The table registry and index DDL take no lock (t_d938e6ae).** The engine's
+  table map is `Arc<ArcSwap<HashMap<TableId, Arc<TableState>>>>`: readers
+  `load()` it and clone a table's `Arc` out before any callback, blocking send
+  or long scan; registration and DROP install a new map with a bounded
+  compare-and-swap (`lockfree::update`, which fails loud after 1,000 lost
+  races instead of spinning). It used to be a `parking_lot::RwLock`; on
+  2026-10-03 an index-stream producer parked in `blocking_send` holding the read
+  guard, a raft `register_table` queued for the write guard, writer preference
+  parked every later reader, and node2 deadlocked. A table's index declarations
+  are one immutable `IndexCatalog` bound to the memtable it was created with.
+  Index DDL (`add_index*`, `remove_index`, `add_*_index`) and `ALTER`
+  (`update_schema`) take `&self` and **rotate the memtable**: the frozen one is
+  flushed with sidecars for the new catalog (its own postings, or postings built
+  from its now-immutable rows for an index the DDL added), and the new one
+  starts empty under the new catalog and schema. So a memtable's postings are
+  exactly its flushed sidecars by construction
+  (`index_postings_equal_flushed_sidecars_under_racing_ddl_and_flush`). Every
+  store flush, rotations included, runs the engine's post-flush bookkeeping
+  (`StorageEngine::finish_flush`: index tracker, pin cap, commit-log checkpoint).
+  A table's NVMe pin is one `ArcSwap<PinState>`. DROP TABLE no longer waits for
+  the table's readers; a reader racing it finishes or fails loud, and
+  `TableStore::retire` stops any later flush of the dropped store from writing
+  into the deleted directory.
+
+  **No per-table lock either.** Writers enter a memtable through its
+  `WriteGate` (one atomic word: sealed bit + writers inside); a flush publishes
+  the next memtable, seals the old gate and waits only for writes already
+  inside, and a writer that meets a sealed gate writes to the new memtable
+  instead of waiting. Every `StoreView` change (flush install, compaction
+  swap, sidecar install) is a compare-and-swap (`TableStore::update_view`), so
+  a compaction swap never waits on a flush and none overwrites another; the
+  sidecar install used to be a blind store that could drop a just-flushed
+  SSTable from the view. Rotations go through `TableStore::rotate`: requests
+  queue on a channel, whichever caller wins a compare-and-swap flag runs the
+  queue in order, and requests queued together are one rotation. The
+  quarantine sets, vector-index scopes and FTI build claims are `ArcSwap`
+  values changed by compare-and-swap (`lockfree::SharedSet`); an FTI build is
+  single-flight per sidecar, and a query that finds one in flight scans that
+  SSTable instead of waiting.
 
   **Publication safety — verify before promote (`publication-safety.md` M2):**
   `FileFlushTarget::flush_files` (used by both flush and compaction promotion)
@@ -662,7 +720,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `ferrosa-ctl commitlog set-aside <data-dir> [--apply]`
   (`StorageEngine::reingest_set_aside_offline`). Replay also
   expands legacy whole-value collection cells into element cells so the SSTable
-  writer's mixed-cell assertion cannot fire at the next flush.
+  writer's mixed-cell check cannot refuse the next flush.
   Mutations for tables absent while a schema exists are held in memory up to
   `FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS` (default 10000; invalid values fail
   `open` naming the variable) and the overflow goes to the same set-aside file,
@@ -735,6 +793,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   bounded k-way merge (`SortedRows`, `RowOrder`). Peak working set is
   `O(MERGE_FANIN)` — independent of the row count. Spill/merge I/O errors fail
   loud; runs live under the `TempSortTableReservation` dir (cleaned up on drop).
+  `SortedRows::into_disk_backed` moves an un-spilled (in-memory) remainder to a
+  run file so a CQL result cursor can be parked between pages holding only a
+  merge head, not up to a spill threshold of rows. With an empty `RowOrder` the
+  sorter is a spill-backed FIFO (stable runs, run-index tie-break).
 - **Range merger run grouping** (`range_merger.rs`) — to keep the merge heap
   small, token-disjoint SSTables are grouped into concatenated "runs"
   (`partition_into_disjoint_runs`), one heap source per run instead of one per
