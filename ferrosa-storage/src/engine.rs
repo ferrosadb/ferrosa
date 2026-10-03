@@ -1069,6 +1069,75 @@ fn flush_index_action(
     FlushIndexAction::NeedsBuild
 }
 
+/// Partitions an index stream buffers ahead of its consumer.
+const INDEX_STREAM_BUFFER: usize = 4;
+
+/// Run an index walk on a blocking worker and hand its partitions to the
+/// returned stream through a bounded channel.
+///
+/// `walk` gets a visitor that forwards each partition and stops the walk when
+/// the consumer is gone. The walk's error ends the stream as an error item,
+/// delivered even when the channel is full (it waits behind the buffered
+/// partitions). `label` names the stream in logs.
+fn spawn_index_stream(
+    label: String,
+    walk: impl FnOnce(&mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>) -> ferrosa_common::Result<()>
+        + Send
+        + 'static,
+) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>>
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(INDEX_STREAM_BUFFER);
+    let producer_tx = tx.clone();
+    let producer_label = label.clone();
+    let producer = tokio::task::spawn_blocking(move || {
+        let result = walk(
+            &mut |partition| match producer_tx.blocking_send(Ok(partition)) {
+                Ok(()) => std::ops::ControlFlow::Continue(()),
+                Err(_) => std::ops::ControlFlow::Break(()),
+            },
+        );
+        if let Err(error) = result {
+            if let Err(undelivered) = producer_tx.blocking_send(Err(error)) {
+                // The consumer dropped the stream, so nobody is left to
+                // return this to; say so rather than lose it.
+                tracing::warn!(
+                    stream = %producer_label,
+                    error = ?undelivered.0,
+                    "index stream failed after its consumer went away"
+                );
+            }
+        }
+    });
+    supervise_index_stream(label, producer, tx);
+    Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
+/// Watch an index stream's producer. If it panics, its sender drops during
+/// unwind and the consumer would read the partitions delivered so far and
+/// then a normal end of stream: a truncated index read reported as complete.
+/// So a panic becomes an error item, sent with `send().await` (it waits
+/// behind buffered partitions and keeps the channel open until it lands).
+fn supervise_index_stream(
+    label: String,
+    producer: tokio::task::JoinHandle<()>,
+    tx: tokio::sync::mpsc::Sender<ferrosa_common::Result<Partition>>,
+) {
+    tokio::spawn(async move {
+        let Err(join) = producer.await else {
+            return;
+        };
+        tracing::error!(stream = %label, error = %join, "index stream producer panicked; failing the read");
+        let failure = ferrosa_common::Error::InvalidData(format!(
+            "index stream producer for {label} panicked; the read is incomplete: {join}"
+        ));
+        if tx.send(Err(failure)).await.is_err() {
+            tracing::warn!(stream = %label, "index stream producer panicked after its consumer went away");
+        }
+    });
+}
+
 fn build_index_scheduler(
     config: &StorageEngineConfig,
     tables: &SharedTables,
@@ -9270,41 +9339,14 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
-        const STREAM_BUFFER: usize = 4;
         let table_id = table_id.clone();
         let index_name = index_name.to_string();
         let key = key.clone();
         let engine = Arc::clone(self);
-        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BUFFER);
-
-        tokio::task::spawn_blocking(move || {
-            let result = engine.read_by_index_each_after(
-                &table_id,
-                &index_name,
-                &key,
-                after.as_ref(),
-                &mut |partition| match tx.blocking_send(Ok(partition)) {
-                    Ok(()) => std::ops::ControlFlow::Continue(()),
-                    Err(_) => std::ops::ControlFlow::Break(()),
-                },
-            );
-            if let Err(error) = result {
-                if let Err(undelivered) = tx.blocking_send(Err(error)) {
-                    // The consumer dropped the stream, so nobody is left to
-                    // return this to; say so rather than lose it.
-                    tracing::warn!(
-                        table = %table_id,
-                        index = %index_name,
-                        error = ?undelivered.0,
-                        "index stream failed after its consumer went away"
-                    );
-                }
-            }
-        });
-
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }))
+        let label = format!("{table_id} index {index_name}");
+        spawn_index_stream(label, move |visit| {
+            engine.read_by_index_each_after(&table_id, &index_name, &key, after.as_ref(), visit)
+        })
     }
 
     /// Whether `key` names so large a share of `table_id` that a scan is
@@ -23009,6 +23051,50 @@ mod tests {
         );
         runtime.shutdown_timeout(std::time::Duration::from_secs(5));
         engine.shutdown().unwrap();
+    }
+
+    /// An index stream whose producer panics must end with an ERROR, never a
+    /// clean end of stream: the producer's sender drops during unwind, so the
+    /// consumer would read the rows delivered so far and then a normal close —
+    /// a truncated index read reported as complete. The producer fills the
+    /// channel first, so the error has to wait behind buffered rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_index_stream_producer_ends_the_stream_with_an_error() {
+        use futures::StreamExt;
+
+        let mut stream = super::spawn_index_stream("test stream".to_string(), |visit| {
+            (0..super::INDEX_STREAM_BUFFER).for_each(|i| {
+                let partition = Partition {
+                    key: make_key(&format!("before-panic-{i}")),
+                    deletion: DeletionTime::LIVE,
+                    static_row: None,
+                    rows: vec![make_row(b"v", 1)],
+                };
+                assert!(visit(partition).is_continue());
+            });
+            panic!("simulated index walk bug mid-stream");
+        });
+        // Let the panic land while the buffer is still full.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut delivered = 0;
+        let last = loop {
+            let item = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("the stream must not hang after a producer panic");
+            match item {
+                Some(Ok(_)) => delivered += 1,
+                other => break other,
+            }
+        };
+        assert_eq!(delivered, super::INDEX_STREAM_BUFFER);
+        match last {
+            Some(Err(e)) => assert!(e.to_string().contains("panicked"), "got: {e}"),
+            Some(Ok(_)) => unreachable!("Ok items are counted above"),
+            None => panic!(
+                "the index stream ended cleanly after its producer panicked: a truncated \
+                 read would be reported as complete"
+            ),
+        }
     }
 
     /// DROP TABLE no longer waits for the table's readers: it used to, by
