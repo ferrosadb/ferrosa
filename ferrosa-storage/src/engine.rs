@@ -987,7 +987,7 @@ pub(crate) struct PendingIndexUpload {
 /// The scheduler's sidecar installer: map the sidecar it just wrote and put it
 /// into the owning table's live view (t_7ac6b0e3).
 fn sidecar_installer(
-    tables: &Arc<RwLock<HashMap<TableId, TableState>>>,
+    tables: &SharedTables,
     pending_uploads: &Arc<parking_lot::Mutex<Vec<PendingIndexUpload>>>,
 ) -> crate::index::scheduler::SidecarInstaller {
     let tables = Arc::clone(tables);
@@ -996,7 +996,7 @@ fn sidecar_installer(
         let reader = crate::index::sidecar::SidecarReader::open(path)
             .map_err(|e| format!("map {}: {e}", path.display()))?;
         let table_id = TableId::new(&job.table.0, &job.table.1);
-        let tables = tables.read();
+        let tables = tables.load();
         let state = tables
             .get(&table_id)
             .ok_or_else(|| format!("table {table_id} is not registered"))?;
@@ -1071,7 +1071,7 @@ fn flush_index_action(
 
 fn build_index_scheduler(
     config: &StorageEngineConfig,
-    tables: &Arc<RwLock<HashMap<TableId, TableState>>>,
+    tables: &SharedTables,
     pending_uploads: &Arc<parking_lot::Mutex<Vec<PendingIndexUpload>>>,
 ) -> (
     Option<crate::index::IndexBuildScheduler>,
@@ -1273,7 +1273,7 @@ pub struct StorageEngine {
     runtime_tuning: crate::runtime_tuning::StorageRuntimeTuning,
     write_admission: WriteAdmissionSettings,
     /// Shared with the index scheduler's sidecar installer (t_7ac6b0e3).
-    tables: Arc<RwLock<HashMap<TableId, TableState>>>,
+    tables: SharedTables,
     /// Sidecars the scheduler built and installed, whose generation may
     /// already be in S3 — the next S3 sync uploads them (t_7ac6b0e3).
     pending_index_uploads: Arc<parking_lot::Mutex<Vec<PendingIndexUpload>>>,
@@ -1380,16 +1380,97 @@ pub struct StorageEngine {
     reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
 }
 
-/// Per-table state: schema + store + optional NVMe pin config.
-struct TableState {
-    schema: TableSchema,
-    store: TableStore<FileFlushTarget>,
+/// The engine's registered tables, as one immutable map.
+///
+/// Published through an `ArcSwap` ([`SharedTables`]): every reader `load()`s
+/// the current map and never waits, and registration/drop install a new map
+/// with a compare-and-swap ([`crate::lockfree::update`]). Each table's state
+/// is an `Arc`, so a reader that needs a table across a blocking step clones
+/// the `Arc` out and holds nothing engine-wide.
+///
+/// This was an `RwLock<HashMap<TableId, TableState>>`. On 2026-10-03 an
+/// index-stream producer parked in `blocking_send` while holding its read
+/// guard, a raft `register_table` queued for the write guard, and because the
+/// lock prefers writers every later reader — the stream's own consumer, CQL
+/// handlers, internode handlers — parked behind it until no runtime worker
+/// was left to drain the stream. The node never recovered (t_d938e6ae).
+type TableMap = HashMap<TableId, Arc<TableState>>;
+
+/// The shared, lock-free handle to the [`TableMap`]; the index scheduler's
+/// sidecar installer holds a clone (t_7ac6b0e3).
+type SharedTables = Arc<ArcSwap<TableMap>>;
+
+/// Register `state` as `table_id` unless a table of that id already is;
+/// whether this call registered it.
+///
+/// The absence check and the install are one compare-and-swap, so two
+/// concurrent registrations of the same table install exactly one state —
+/// the loser keeps its own (unpublished) store and must not replace the
+/// winner's live memtable.
+fn install_table_if_absent(
+    tables: &ArcSwap<TableMap>,
+    table_id: &TableId,
+    state: &Arc<TableState>,
+) -> ferrosa_common::Result<bool> {
+    crate::lockfree::update(tables, "table registry", |current| {
+        if current.contains_key(table_id) {
+            return (None, false);
+        }
+        let mut next = current.clone();
+        next.insert(table_id.clone(), Arc::clone(state));
+        (Some(next), true)
+    })
+}
+
+/// Unregister `table_id`, returning the state it had if it was registered.
+/// Readers that already hold the state's `Arc` keep using it; nothing about
+/// it is torn down here.
+fn remove_table(
+    tables: &ArcSwap<TableMap>,
+    table_id: &TableId,
+) -> ferrosa_common::Result<Option<Arc<TableState>>> {
+    crate::lockfree::update(tables, "table registry", |current| {
+        match current.get(table_id) {
+            None => (None, None),
+            Some(state) => {
+                let removed = Arc::clone(state);
+                let mut next = current.clone();
+                next.remove(table_id);
+                (Some(next), Some(removed))
+            }
+        }
+    })
+}
+
+/// A table's NVMe pin: its configuration and the SSTables it keeps local.
+///
+/// Published as one value in [`TableState::pin`], so the cap decision ("over
+/// `max_bytes`? evict the oldest") is taken on one consistent snapshot and
+/// applied with a compare-and-swap, never on two halves read apart.
+#[derive(Clone, Debug, Default)]
+struct PinState {
     /// When `Some`, this table is pinned to NVMe. S3 upload is skipped for
-    /// new flushes, and `pinned_sstables` tracks size for max_bytes enforcement.
-    pin_config: Option<PinConfig>,
+    /// new flushes, and `sstables` tracks size for max_bytes enforcement.
+    config: Option<PinConfig>,
     /// SSTable IDs that are currently pinned on NVMe, in oldest-first order.
     /// Each entry is `(sstable_id, size_bytes)`.
-    pinned_sstables: Vec<(String, u64)>,
+    sstables: Vec<(String, u64)>,
+}
+
+impl PinState {
+    fn total_bytes(&self) -> u64 {
+        self.sstables.iter().map(|(_, bytes)| *bytes).sum()
+    }
+}
+
+/// Per-table state: store (which owns the schema) + optional NVMe pin.
+///
+/// Shared as `Arc<TableState>` and never mutated through `&mut`: every field
+/// that changes after registration is atomic or `ArcSwap`-published.
+struct TableState {
+    store: TableStore<FileFlushTarget>,
+    /// The table's NVMe pin, if any; see [`PinState`].
+    pin: ArcSwap<PinState>,
     /// Nanoseconds since [`REFERENCE_INSTANT`] of the first write to the
     /// current (unflushed) memtable. `0` means "memtable is clean". Used by
     /// `flush_if_needed` to trigger time-based flushes for small, infrequently-
@@ -1514,7 +1595,7 @@ mod write_admission_config_tests {
     }
 }
 
-struct StorageSchemaView<'a>(&'a HashMap<TableId, TableState>);
+struct StorageSchemaView<'a>(&'a TableMap);
 
 impl Serialize for StorageSchemaView<'_> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -1523,7 +1604,7 @@ impl Serialize for StorageSchemaView<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
         for state in self.0.values() {
-            sequence.serialize_element(&state.schema)?;
+            sequence.serialize_element(&*state.schema())?;
         }
         sequence.end()
     }
@@ -1552,6 +1633,19 @@ impl IntoIterator for LocalTableSchemas {
 }
 
 impl TableState {
+    /// The table's current schema. The store owns it (an `ALTER` publishes
+    /// the new one at a memtable rotation; see
+    /// `TableStore::flush_and_update_schema`), so this is never a second copy
+    /// that could disagree with what the flush writes.
+    fn schema(&self) -> Arc<TableSchema> {
+        self.store.schema_arc()
+    }
+
+    /// Whether the table is pinned to NVMe.
+    fn is_pinned(&self) -> bool {
+        self.pin.load().config.is_some()
+    }
+
     /// Records a foreground read of this table (see
     /// `last_foreground_read_unix_ms`).
     fn note_foreground_read(&self) {
@@ -1576,7 +1670,7 @@ impl TableState {
     }
 
     fn time_series_timestamp_unit(&self) -> TimeSeriesTimestampUnit {
-        self.schema
+        self.schema()
             .clustering_columns
             .first()
             .map(|column| TimeSeriesTimestampUnit::from_storage_type(&column.type_name))
@@ -2715,10 +2809,7 @@ impl StorageEngine {
             return Ok(());
         }
         let notifier = {
-            let tables = self.tables.read();
-            let state = tables.get(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-            })?;
+            let state = self.require_table(table_id)?;
             Arc::clone(&state.write_pressure_notify)
         };
         let mut notified = std::pin::pin!(notifier.notified_owned());
@@ -2728,16 +2819,13 @@ impl StorageEngine {
 
         let hard_limit = self.config.memtable_backpressure_bytes.max(1);
         let (pressure, memtable_pressure, memtable_size) = {
-            let tables = self.tables.read();
-            let state = tables.get(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-            })?;
+            let state = self.require_table(table_id)?;
             let memtable_size = state.store.memtable_size() as u64;
             let memtable_pressure = (memtable_size as f64 / hard_limit as f64).min(1.0);
             let pressure = memtable_pressure
                 .max(self.sample_write_pump_blocked_rate())
                 .clamp(0.0, 1.0);
-            self.update_write_pressure(state, table_id, pressure);
+            self.update_write_pressure(&state, table_id, pressure);
             (pressure, memtable_pressure, memtable_size)
         };
 
@@ -2775,16 +2863,13 @@ impl StorageEngine {
         // One bounded re-check after the wake/deadline. Do not sleep or poll;
         // continued soft pressure is admitted after this single grace period.
         let (pressure, memtable_pressure, memtable_size) = {
-            let tables = self.tables.read();
-            let state = tables.get(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-            })?;
+            let state = self.require_table(table_id)?;
             let memtable_size = state.store.memtable_size() as u64;
             let memtable_pressure = (memtable_size as f64 / hard_limit as f64).min(1.0);
             let pressure = memtable_pressure
                 .max(self.sample_write_pump_blocked_rate())
                 .clamp(0.0, 1.0);
-            self.update_write_pressure(state, table_id, pressure);
+            self.update_write_pressure(&state, table_id, pressure);
             (pressure, memtable_pressure, memtable_size)
         };
         if pressure >= 1.0 {
@@ -2935,7 +3020,7 @@ impl StorageEngine {
             durable_local,
         );
 
-        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let tables: SharedTables = Arc::new(ArcSwap::from_pointee(TableMap::new()));
         let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
@@ -3172,7 +3257,7 @@ impl StorageEngine {
             _ => None,
         };
 
-        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let tables: SharedTables = Arc::new(ArcSwap::from_pointee(TableMap::new()));
         let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
@@ -3309,7 +3394,7 @@ impl StorageEngine {
             durable_local,
         );
 
-        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let tables: SharedTables = Arc::new(ArcSwap::from_pointee(TableMap::new()));
         let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
@@ -3328,14 +3413,18 @@ impl StorageEngine {
                 let table_id = TableId::new(&schema.keyspace, &schema.table);
                 match Self::build_table_state(&config, schema, vec![], Arc::clone(&reader_pool)) {
                     Ok(state) => {
-                        for (index_name, _col_pos) in state.store.indexed_columns() {
+                        for (index_name, _col_pos) in state.store.indexed_columns().iter() {
                             index_tracker.register_index(
                                 table_id.keyspace(),
                                 table_id.table(),
                                 index_name,
                             );
                         }
-                        tables.write().insert(table_id, state);
+                        if !install_table_if_absent(&tables, &table_id, &Arc::new(state))? {
+                            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                                "local schema lists table {table_id} twice; refusing to pick one"
+                            )));
+                        }
                     }
                     Err(e) => {
                         return Err(ferrosa_common::Error::InvalidFormat(format!(
@@ -3366,7 +3455,7 @@ impl StorageEngine {
                     return Ok(());
                 }
 
-                if tables.read().is_empty() {
+                if tables.load().is_empty() {
                     if pending_mutations.len() >= max_pending_without_schema {
                         return set_aside.lock().append(&mutation);
                     }
@@ -3506,9 +3595,9 @@ impl StorageEngine {
                     | crate::compaction::intent::CompactionIntentPhase::S3Uploaded
             )
         };
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         for (table_id, state) in tables.iter() {
-            if state.pin_config.is_some() {
+            if state.is_pinned() {
                 continue;
             }
             let table_dir = self.table_sstable_dir(table_id);
@@ -3587,14 +3676,9 @@ impl StorageEngine {
         let no_object_store = self.object_store.is_none();
         let tables = self
             .tables
-            .read()
+            .load()
             .iter()
-            .map(|(table_id, state)| {
-                (
-                    table_id.clone(),
-                    no_object_store || state.pin_config.is_some(),
-                )
-            })
+            .map(|(table_id, state)| (table_id.clone(), no_object_store || state.is_pinned()))
             .collect::<Vec<_>>();
         for (table_id, local_only) in tables {
             if !local_only {
@@ -3783,9 +3867,9 @@ impl StorageEngine {
         };
         let tables = self
             .tables
-            .read()
+            .load()
             .iter()
-            .map(|(table_id, state)| (table_id.clone(), state.pin_config.is_some()))
+            .map(|(table_id, state)| (table_id.clone(), state.is_pinned()))
             .collect::<Vec<_>>();
         for (table_id, pinned) in tables {
             if pinned {
@@ -4081,10 +4165,7 @@ impl StorageEngine {
     /// A row that fails to apply is logged per row at ERROR by the strict
     /// path, and the commit-log segment still carries the mutation, so replay
     /// does not abort. Returns whether the table was registered.
-    fn apply_replay_mutation_to_tables(
-        tables: &RwLock<HashMap<TableId, TableState>>,
-        mutation: &Mutation,
-    ) -> bool {
+    fn apply_replay_mutation_to_tables(tables: &ArcSwap<TableMap>, mutation: &Mutation) -> bool {
         match Self::apply_replay_mutation_strict(tables, mutation) {
             Ok(registered) => registered,
             Err(e) => {
@@ -4105,11 +4186,11 @@ impl StorageEngine {
     /// has been attempted), so a caller that is about to discard its only copy
     /// of the mutation can refuse to.
     fn apply_replay_mutation_strict(
-        tables: &RwLock<HashMap<TableId, TableState>>,
+        tables: &ArcSwap<TableMap>,
         mutation: &Mutation,
     ) -> ferrosa_common::Result<bool> {
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-        let tables = tables.read();
+        let tables = tables.load();
         let Some(state) = tables.get(&table_id) else {
             return Ok(false);
         };
@@ -4225,7 +4306,7 @@ impl StorageEngine {
     /// Estimate local SSTable bytes that a full scan of `keyspace.table` would touch.
     pub fn estimated_table_scan_bytes(&self, keyspace: &str, table: &str) -> Option<u64> {
         let table_id = TableId::new(keyspace, table);
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         tables
             .get(&table_id)
             .map(|state| state.store.estimated_disk_scan_bytes())
@@ -4314,6 +4395,51 @@ impl StorageEngine {
         self.register_table_inner(schema, vec![])
     }
 
+    /// The state of `table_id`, cloned out of the registry. Holding it pins
+    /// nothing engine-wide: use this, not a held `tables.load()` guard, for any
+    /// work that blocks, calls back, or runs long.
+    fn table_state(&self, table_id: &TableId) -> Option<Arc<TableState>> {
+        self.tables.load().get(table_id).cloned()
+    }
+
+    /// [`Self::table_state`], failing loudly for an unregistered table.
+    fn require_table(&self, table_id: &TableId) -> ferrosa_common::Result<Arc<TableState>> {
+        self.table_state(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })
+    }
+
+    /// Run one index DDL `ddl` on `state`'s store, which rotates its memtable
+    /// (see `TableStore::flush_applying_catalog_edit`), then do the engine's
+    /// post-flush bookkeeping for that rotation's flush like any other flush.
+    fn rotate_for_index_ddl<T>(
+        &self,
+        table_id: &TableId,
+        state: &Arc<TableState>,
+        ddl: impl FnOnce(&TableStore<FileFlushTarget>) -> ferrosa_common::Result<(T, FlushOutcome)>,
+    ) -> ferrosa_common::Result<T> {
+        // Read before the rotation: the checkpoint may cover only mutations
+        // already in the memtable the rotation flushes.
+        let cl_position = **state.last_commit_log_position.load();
+        let (result, outcome) = ddl(&state.store)?;
+        // A rotation of an empty memtable flushed nothing, so there is nothing
+        // to account for; `flush` itself is what persists the local schema
+        // file on every call, and a DDL is not a flush request.
+        if outcome == FlushOutcome::Published {
+            self.finish_flush(table_id, state, cl_position, outcome)?;
+        }
+        Ok(result)
+    }
+
+    /// Whether the index tracker already records `index_name` as built for
+    /// generation `sstable_id` — true of a generation an index DDL's own
+    /// rotation flushed, whose sidecars were written for the new catalog.
+    fn tracker_has_indexed(&self, table_id: &TableId, index_name: &str, sstable_id: &str) -> bool {
+        self.index_tracker
+            .get_state(table_id.keyspace(), table_id.table(), index_name)
+            .is_some_and(|state| state.indexed_sstables.contains(sstable_id))
+    }
+
     /// Registers a table schema with NVMe pin configuration.
     ///
     /// The table is registered normally but S3 uploads are skipped for new
@@ -4330,12 +4456,14 @@ impl StorageEngine {
         // Register via the inner path first.
         self.register_table_inner(schema, vec![])?;
         // Apply pin config and update metrics.
-        let mut tables = self.tables.write();
-        if let Some(state) = tables.get_mut(&table_id) {
-            state.pin_config = Some(pin_config);
+        if let Some(state) = self.table_state(&table_id) {
+            crate::lockfree::update(&state.pin, "table pin", |pin| {
+                let mut next = pin.clone();
+                next.config = Some(pin_config.clone());
+                (Some(next), ())
+            })?;
             self.pin_metrics.inc_pinned_tables();
         }
-        drop(tables);
         self.prune_local_only_compaction_intents();
         Ok(())
     }
@@ -4354,35 +4482,27 @@ impl StorageEngine {
         table_id: &TableId,
         new_config: Option<PinConfig>,
     ) -> ferrosa_common::Result<()> {
-        // Collect state needed before releasing the lock.
-        let (old_was_pinned, pinned_ids) = {
-            let tables = self.tables.read();
-            let state = tables.get(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-            })?;
-            let was_pinned = state.pin_config.is_some();
-            let ids: Vec<String> = state
-                .pinned_sstables
-                .iter()
-                .map(|(id, _)| id.clone())
-                .collect();
-            (was_pinned, ids)
-        };
-
+        let state = self.require_table(table_id)?;
         let now_pinned = new_config.is_some();
-
-        // Apply the new config.
-        {
-            let mut tables = self.tables.write();
-            let state = tables.get_mut(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        // Read the old pin and apply the new one as one compare-and-swap, so
+        // an SSTable pinned concurrently is either in `pinned_ids` (and gets
+        // uploaded below) or lands after the switch (and is uploaded by its
+        // own flush) — never dropped between a read and a separate write.
+        let (old_was_pinned, pinned_ids) =
+            crate::lockfree::update(&state.pin, "table pin", |pin| {
+                let was_pinned = pin.config.is_some();
+                let ids: Vec<String> = pin.sstables.iter().map(|(id, _)| id.clone()).collect();
+                let next = PinState {
+                    config: new_config.clone(),
+                    // Unpinned: clear the tracked list; bytes gauge is zeroed below.
+                    sstables: if now_pinned {
+                        pin.sstables.clone()
+                    } else {
+                        Vec::new()
+                    },
+                };
+                (Some(next), (was_pinned, ids))
             })?;
-            state.pin_config = new_config;
-            if !now_pinned {
-                // Unpinned: clear the tracked list; bytes gauge will be zeroed below.
-                state.pinned_sstables.clear();
-            }
-        }
 
         // Update pinned_tables gauge.
         match (old_was_pinned, now_pinned) {
@@ -4492,10 +4612,8 @@ impl StorageEngine {
         }
 
         Ok(TableState {
-            schema,
             store,
-            pin_config: None,
-            pinned_sstables: Vec::new(),
+            pin: ArcSwap::from_pointee(PinState::default()),
             first_unflushed_write_at_nanos: std::sync::atomic::AtomicI64::new(0),
             last_commit_log_position: ArcSwap::from_pointee(None),
             write_pressure_notify: Arc::new(tokio::sync::Notify::new()),
@@ -4516,7 +4634,7 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<()> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
         {
-            let tables = self.tables.read();
+            let tables = self.tables.load();
             if tables.contains_key(&table_id) {
                 drop(tables);
                 self.merge_index_declarations_for_registered_table(&table_id, &indexed_columns)?;
@@ -4538,7 +4656,7 @@ impl StorageEngine {
         // the declarations so the losing replay can still merge anything the
         // winning store did not have, without replacing its live memtable.
         let late_indexed_columns = state.store.indexed_columns().to_vec();
-        if !self.install_table_state_if_absent(table_id.clone(), state) {
+        if !self.install_table_state_if_absent(&table_id, state)? {
             self.merge_index_declarations_for_registered_table(&table_id, &late_indexed_columns)?;
             self.replay_deferred_mutations_for_table(&table_id);
             return Ok(());
@@ -4557,11 +4675,8 @@ impl StorageEngine {
         // of tiny SSTables that never get compacted (each one holds an
         // in-memory reader, bloating RSS). With 2,462 SSTables of 2KB each
         // for a single table, reader overhead alone exceeded 1GB.
-        {
-            let tables = self.tables.read();
-            if let Some(state) = tables.get(&table_id) {
-                self.maybe_compact(&table_id, state);
-            }
+        if let Some(state) = self.table_state(&table_id) {
+            self.maybe_compact(&table_id, &state);
         }
 
         self.replay_deferred_mutations_for_table(&table_id);
@@ -4576,25 +4691,21 @@ impl StorageEngine {
     /// Install a freshly built table state only when no concurrent schema
     /// replay has already installed a live state for the same table.
     ///
-    /// A registration performs filesystem discovery before it can take the
-    /// table map write lock. Rechecking under that lock prevents the late
-    /// builder from replacing the winner's active memtable and unflushed index
-    /// postings.
-    fn install_table_state_if_absent(&self, table_id: TableId, state: TableState) -> bool {
-        use std::collections::hash_map::Entry;
-
-        let mut tables = self.tables.write();
-        match tables.entry(table_id) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(slot) => {
-                let metric_label = slot.key().to_string();
-                let metric_gauge = Arc::clone(&state.write_pressure_percent);
-                slot.insert(state);
-                drop(tables);
-                crate::metrics::register_write_admission_pressure(metric_label, &metric_gauge);
-                true
-            }
+    /// A registration performs filesystem discovery before it can publish.
+    /// The absence check is repeated inside the compare-and-swap that
+    /// publishes, so a late builder never replaces the winner's active
+    /// memtable and unflushed index postings.
+    fn install_table_state_if_absent(
+        &self,
+        table_id: &TableId,
+        state: TableState,
+    ) -> ferrosa_common::Result<bool> {
+        let metric_gauge = Arc::clone(&state.write_pressure_percent);
+        if !install_table_if_absent(&self.tables, table_id, &Arc::new(state))? {
+            return Ok(false);
         }
+        crate::metrics::register_write_admission_pressure(table_id.to_string(), &metric_gauge);
+        Ok(true)
     }
 
     fn merge_index_declarations_for_registered_table(
@@ -4605,31 +4716,41 @@ impl StorageEngine {
         if indexed_columns.is_empty() {
             return Ok(());
         }
-
-        let mut tables = self.tables.write();
-        let Some(state) = tables.get_mut(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok(());
         };
 
         for (index_name, column_position) in indexed_columns {
-            match state
+            let existing = state
                 .store
                 .indexed_columns()
                 .iter()
                 .find(|(name, _)| name == index_name)
-                .map(|(_, pos)| *pos)
-            {
+                .map(|(_, pos)| *pos);
+            match existing {
                 Some(existing_position) if existing_position == *column_position => {}
                 Some(existing_position) => {
                     return Err(ferrosa_common::Error::InvalidFormat(format!(
                         "index {index_name} already registered on {table_id} at column {existing_position}, not {column_position}"
                     )));
                 }
-                None => state.store.add_index(
-                    index_name.clone(),
-                    *column_position,
-                    ferrosa_index::IndexType::BTree,
-                ),
+                None => {
+                    // Registered before the rotation, so the rotation's flush
+                    // records its generation as built for this index.
+                    self.index_tracker.register_index(
+                        table_id.keyspace(),
+                        table_id.table(),
+                        index_name,
+                    );
+                    self.rotate_for_index_ddl(table_id, &state, |store| {
+                        let outcome = store.add_index(
+                            index_name.clone(),
+                            *column_position,
+                            ferrosa_index::IndexType::BTree,
+                        )?;
+                        Ok(((), outcome))
+                    })?;
+                }
             }
 
             self.index_tracker
@@ -4659,60 +4780,26 @@ impl StorageEngine {
         new_schema: TableSchema,
     ) -> ferrosa_common::Result<()> {
         let time_series_handle = self.build_time_series_consolidator(table_id, &new_schema)?;
-        let cl_position = {
-            let mut tables = self.tables.write();
-            let state = tables.get_mut(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-            })?;
-
-            // Hold the table-map write lock across the old-schema flush and
-            // schema swap. The write path takes the table-map read lock for
-            // memtable admission and the `last_commit_log_position` store, so
-            // this hold excludes any new row from entering the memtable (or
-            // advancing the tracked position) between the flush barrier and
-            // the schema swap.
-            //
-            // Residual window (t_237efb08): the write path appends to the
-            // commit log BEFORE taking the read lock (see `write`, step 1 vs
-            // step 2), so a writer that has already appended an old-ordinal
-            // row and then blocks on this write lock will insert that row
-            // into the new-schema memtable after the swap — and its commit-log
-            // position postdates the `cl_position` captured here, so it also
-            // replays mis-tagged after a crash. Closing it needs schema-epoch
-            // validation at memtable admission, moving the append under this
-            // guard, or name-keyed cells.
-            let cl_position = **state.last_commit_log_position.load();
-            if state.store.memtable_size() > 0 {
-                let pressure_notify = Arc::clone(&state.write_pressure_notify);
-                state
-                    .store
-                    .flush_with_swap_callback(|| pressure_notify.notify_waiters())?;
-                let active_size = state.store.memtable_size() as u64;
-                let pressure = ((active_size as f64
-                    / self.config.memtable_backpressure_bytes.max(1) as f64)
-                    .max(self.sample_write_pump_blocked_rate()))
-                .clamp(0.0, 1.0);
-                self.update_write_pressure(state, table_id, pressure);
-                // Schema changes can flush the active memtable too; notify at
-                // both release and completion, in case a waiter re-checks early.
-                state.write_pressure_notify.notify_waiters();
-                state
-                    .first_unflushed_write_at_nanos
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                self.maybe_compact(table_id, state);
-            }
-
-            state.schema = new_schema.clone();
-            state.store.update_schema(new_schema);
-            cl_position
-        };
-
-        if let Some(pos) = cl_position {
-            if let Err(e) = self.commit_log.discard_completed(table_id, pos) {
-                tracing::warn!(%e, "commit log discard_completed failed for {}", table_id);
-            }
-        }
-        self.persist_storage_schema_locally()?;
+        let state = self.require_table(table_id)?;
+        // The old-schema flush and the schema swap are ONE memtable rotation
+        // in the store (`flush_and_update_schema`): the frozen memtable is
+        // serialized under the schema its rows were written with, and the new
+        // memtable starts empty under the new one. That used to be enforced by
+        // holding the table-map write lock across a flush and a separate
+        // `update_schema`; the store now does it without one.
+        //
+        // The commit-log position is read before the rotation, so every row
+        // whose position it covers is already in the frozen memtable (the
+        // write path stores its position after its memtable put). Residual
+        // window (t_237efb08), unchanged by this: the write path appends to
+        // the commit log BEFORE its memtable put, so a row appended under the
+        // old ordinals can still be put after the swap.
+        let cl_position = **state.last_commit_log_position.load();
+        let pressure_notify = Arc::clone(&state.write_pressure_notify);
+        let outcome = state
+            .store
+            .flush_and_update_schema(new_schema, move || pressure_notify.notify_waiters())?;
+        self.finish_flush(table_id, &state, cl_position, outcome)?;
         self.remove_time_series_consolidator(table_id);
         self.install_time_series_consolidator(table_id.clone(), time_series_handle);
         Ok(())
@@ -4757,7 +4844,7 @@ impl StorageEngine {
         // without the record, set-aside frames of this table would later be
         // applied to a re-created table of the same name. Only a registered
         // table is a drop; a replayed DROP of an absent table records nothing.
-        if self.tables.read().contains_key(table_id) {
+        if self.tables.load().contains_key(table_id) {
             crate::table_drops::record_drop(
                 &self.config.data_dir,
                 table_id.keyspace(),
@@ -4766,11 +4853,14 @@ impl StorageEngine {
             )?;
         }
         self.clear_compaction_retry_state(table_id);
-        if let Some(state) = self.tables.write().remove(table_id) {
+        if let Some(state) = remove_table(&self.tables, table_id)? {
             if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
                 self.soft_pressure_table_count
                     .fetch_sub(1, Ordering::Relaxed);
             }
+            // No flush of the dropped store may write into the directory
+            // deleted below; see `TableStore::retire`.
+            state.store.retire();
         }
         self.remove_time_series_consolidator(table_id);
 
@@ -4836,7 +4926,7 @@ impl StorageEngine {
     /// Persists storage-private table registrations separately from the
     /// registry-owned `schema.json`.
     fn persist_storage_schema_locally(&self) -> ferrosa_common::Result<()> {
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         crate::schema_snapshot::persist_bounded_json(
             &self.config.data_dir,
             "storage-schema.json",
@@ -4930,7 +5020,7 @@ impl StorageEngine {
         partition_keys: &PartitionKeyColumns,
     ) -> ferrosa_common::Result<IndexReloadOutcome> {
         let indexes_tid = TableId::new("system_schema", "indexes");
-        if !self.tables.read().contains_key(&indexes_tid) {
+        if !self.tables.load().contains_key(&indexes_tid) {
             // Table not registered (no dogfooded schema yet) — nothing to do.
             return Ok(IndexReloadOutcome::default());
         }
@@ -5002,7 +5092,7 @@ impl StorageEngine {
     /// skipped. Returns an empty vector when the table is not registered.
     pub fn read_persisted_indexes(&self) -> ferrosa_common::Result<Vec<PersistedIndexRow>> {
         let indexes_tid = TableId::new("system_schema", "indexes");
-        if !self.tables.read().contains_key(&indexes_tid) {
+        if !self.tables.load().contains_key(&indexes_tid) {
             return Ok(Vec::new());
         }
 
@@ -5030,7 +5120,7 @@ impl StorageEngine {
     /// when the table is not registered.
     pub fn read_persisted_types(&self) -> ferrosa_common::Result<Vec<PersistedTypeRow>> {
         let types_tid = TableId::new("system_schema", "types");
-        if !self.tables.read().contains_key(&types_tid) {
+        if !self.tables.load().contains_key(&types_tid) {
             return Ok(Vec::new());
         }
 
@@ -5058,7 +5148,7 @@ impl StorageEngine {
     /// skipped. Returns an empty vector when the table is not registered.
     pub fn read_persisted_functions(&self) -> ferrosa_common::Result<Vec<PersistedFunctionRow>> {
         let functions_tid = TableId::new("system_schema", "functions");
-        if !self.tables.read().contains_key(&functions_tid) {
+        if !self.tables.load().contains_key(&functions_tid) {
             return Ok(Vec::new());
         }
 
@@ -5377,7 +5467,7 @@ impl StorageEngine {
             // table arrives. Failing the DDL would escalate a normal race, and
             // waiting for a restart's reload would make a restart load-bearing
             // for correctness.
-            if defer_until_table_exists && !self.tables.read().contains_key(table_id) {
+            if defer_until_table_exists && !self.tables.load().contains_key(table_id) {
                 self.defer_index_build(
                     table_id,
                     DeferredIndexBuild {
@@ -5462,7 +5552,7 @@ impl StorageEngine {
         if matches!(index_type, ferrosa_index::IndexType::FullText) {
             self.add_fulltext_index(table_id, index_name, column_position)?;
             if let Some(ref scheduler) = self.index_scheduler {
-                let tables = self.tables.read();
+                let tables = self.tables.load();
                 if let Some(state) = tables.get(table_id) {
                     for sstable_id in state.store.sstable_generation_ids() {
                         let job = crate::index::IndexBuildJob {
@@ -5610,8 +5700,7 @@ impl StorageEngine {
     /// A vector's dimension is part of its type, so the only way to rebuild the
     /// artifact is to read the type back out of the registered schema.
     fn column_type_name(&self, table_id: &TableId, column_name: &str) -> Option<String> {
-        let tables = self.tables.read();
-        let schema = &tables.get(table_id)?.schema;
+        let schema = self.table_state(table_id)?.schema();
         schema
             .static_columns
             .iter()
@@ -5622,8 +5711,7 @@ impl StorageEngine {
     }
 
     fn storage_cell_position(&self, table_id: &TableId, column_name: &str) -> Option<usize> {
-        let tables = self.tables.read();
-        let schema = &tables.get(table_id)?.schema;
+        let schema = self.table_state(table_id)?.schema();
         if let Some(position) = schema
             .static_columns
             .iter()
@@ -5642,10 +5730,8 @@ impl StorageEngine {
     /// columns (the clustering-key component index), for clustering-column
     /// secondary indexes (t_430c4188).
     fn clustering_column_position(&self, table_id: &TableId, column_name: &str) -> Option<usize> {
-        let tables = self.tables.read();
-        let state = tables.get(table_id)?;
-        state
-            .schema
+        self.table_state(table_id)?
+            .schema()
             .clustering_columns
             .iter()
             .position(|c| c.name == column_name)
@@ -5677,10 +5763,12 @@ impl StorageEngine {
     /// this engine process, tracker cleanup still runs and the operation is a
     /// no-op for table-local state.
     pub fn drop_index(&self, table_id: &TableId, index_name: &str) -> ferrosa_common::Result<bool> {
-        let mut tables = self.tables.write();
-        let removed_store_state = tables
-            .get_mut(table_id)
-            .is_some_and(|state| state.store.remove_index(index_name));
+        let removed_store_state = match self.table_state(table_id) {
+            Some(state) => {
+                self.rotate_for_index_ddl(table_id, &state, |store| store.remove_index(index_name))?
+            }
+            None => false,
+        };
         let removed_tracker_state =
             self.index_tracker
                 .remove_index(table_id.keyspace(), table_id.table(), index_name);
@@ -5704,10 +5792,7 @@ impl StorageEngine {
         index_type: ferrosa_index::IndexType,
         filter_predicate: Option<ferrosa_index::FilterPredicate>,
     ) -> ferrosa_common::Result<()> {
-        let mut tables = self.tables.write();
-        let state = tables.get_mut(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
 
         // Schema events can be replayed after a reconnect. Replacing an
         // already-live MemtableIndex would throw away every unflushed posting,
@@ -5734,7 +5819,6 @@ impl StorageEngine {
                      {existing_type:?}, not {index_type:?}"
                 )));
             }
-            drop(tables);
             self.index_tracker
                 .register_index(table_id.keyspace(), table_id.table(), index_name);
             return Ok(());
@@ -5743,18 +5827,24 @@ impl StorageEngine {
         // Register with the tracker only after accepting the declaration.
         self.index_tracker
             .register_index(table_id.keyspace(), table_id.table(), index_name);
-        state.store.add_index_with_predicate(
-            index_name.to_string(),
-            column_position,
-            index_type,
-            filter_predicate.clone(),
-        );
+        self.rotate_for_index_ddl(table_id, &state, |store| {
+            let outcome = store.add_index_with_predicate(
+                index_name.to_string(),
+                column_position,
+                index_type,
+                filter_predicate.clone(),
+            )?;
+            Ok(((), outcome))
+        })?;
 
         // Submit rebuild jobs for all existing SSTables. Mark them pending
         // before enqueueing so query planning can distinguish a complete empty
         // index from an asynchronously backfilled one.
         let sstable_ids = state.store.sstable_generation_ids();
         for sst_id in sstable_ids {
+            if self.tracker_has_indexed(table_id, index_name, &sst_id) {
+                continue;
+            }
             // Fail closed: an unreadable header FAILS the CREATE INDEX DDL
             // (`?`) so the operator retries against readable files — never a
             // guessed layout. A column genuinely absent from (or an SSTable
@@ -5830,13 +5920,15 @@ impl StorageEngine {
         self.index_tracker
             .register_index(table_id.keyspace(), table_id.table(), index_name);
 
-        let mut tables = self.tables.write();
-        let state = tables.get_mut(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        let state = self.require_table(table_id)?;
+        self.rotate_for_index_ddl(table_id, &state, |store| {
+            let outcome = store.add_clustering_index(
+                index_name.to_string(),
+                clustering_component,
+                index_type,
+            )?;
+            Ok(((), outcome))
         })?;
-        state
-            .store
-            .add_clustering_index(index_name.to_string(), clustering_component, index_type);
 
         // Submit rebuild jobs for all existing SSTables so pre-existing data
         // is backfilled from its clustering-key components. Mark them pending
@@ -5844,6 +5936,9 @@ impl StorageEngine {
         let ck_total = state.store.clustering_column_count();
         let sstable_ids = state.store.sstable_generation_ids();
         for sst_id in sstable_ids {
+            if self.tracker_has_indexed(table_id, index_name, &sst_id) {
+                continue;
+            }
             self.index_tracker.mark_pending(
                 table_id.keyspace(),
                 table_id.table(),
@@ -5906,15 +6001,15 @@ impl StorageEngine {
         self.index_tracker
             .register_index(table_id.keyspace(), table_id.table(), index_name);
 
-        let mut tables = self.tables.write();
-        let state = tables.get_mut(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        let state = self.require_table(table_id)?;
+        self.rotate_for_index_ddl(table_id, &state, |store| {
+            let outcome = store.add_partition_key_index(
+                index_name.to_string(),
+                partition_key_component,
+                index_type,
+            )?;
+            Ok(((), outcome))
         })?;
-        state.store.add_partition_key_index(
-            index_name.to_string(),
-            partition_key_component,
-            index_type,
-        );
 
         // Backfill every SSTable that already exists, so an index created on a
         // table that already holds data covers that data.
@@ -5929,7 +6024,7 @@ impl StorageEngine {
         // Mark each SSTable pending BEFORE submitting, so a consult that finds
         // the index empty can only trust it once the backfill has completed.
         let coverage = self.backfill_partition_key_index(
-            state,
+            &state,
             table_id,
             index_name,
             partition_key_component,
@@ -5953,7 +6048,7 @@ impl StorageEngine {
     /// be restored, is failed and leaves the index stale.
     fn backfill_partition_key_index(
         &self,
-        state: &mut TableState,
+        state: &TableState,
         table_id: &TableId,
         index_name: &str,
         partition_key_component: usize,
@@ -6173,10 +6268,7 @@ impl StorageEngine {
         table_id: &TableId,
         index_name: &str,
     ) -> ferrosa_common::Result<RebuildOutcome> {
-        let mut tables = self.tables.write();
-        let state = tables.get_mut(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
 
         // Distinguish "there is no such index" from "that index exists and this
         // rebuild cannot do it yet". Reporting the second as the first sends an
@@ -6204,7 +6296,7 @@ impl StorageEngine {
         );
 
         let coverage =
-            self.backfill_partition_key_index(state, table_id, index_name, component, index_type);
+            self.backfill_partition_key_index(&state, table_id, index_name, component, index_type);
         let sstables_rebuilt = coverage.built;
 
         // Report the shortfall rather than only the success count: a rebuild
@@ -6243,14 +6335,11 @@ impl StorageEngine {
         index_name: &str,
         column_position: usize,
     ) -> ferrosa_common::Result<()> {
-        let mut tables = self.tables.write();
-        let state = tables.get_mut(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
-        state
-            .store
-            .add_fulltext_index(index_name.to_string(), column_position);
-        Ok(())
+        let state = self.require_table(table_id)?;
+        self.rotate_for_index_ddl(table_id, &state, |store| {
+            let outcome = store.add_fulltext_index(index_name.to_string(), column_position)?;
+            Ok(((), outcome))
+        })
     }
 
     /// Register a vector ANN index on a table.
@@ -6288,10 +6377,7 @@ impl StorageEngine {
         _dimension: usize,
         method: VectorIndexMethod,
     ) -> ferrosa_common::Result<()> {
-        let mut tables = self.tables.write();
-        let state = tables.get_mut(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         let config = VectorIndexConfig {
             index_name: index_name.to_string(),
             column_position,
@@ -6299,11 +6385,13 @@ impl StorageEngine {
             ef_construction: 64,
             m: 16,
         };
-        match method {
-            VectorIndexMethod::Hnsw => state.store.add_vector_index(config),
-            VectorIndexMethod::QuantizedIvf => state.store.add_quantized_vector_index(config),
-        }
-        Ok(())
+        self.rotate_for_index_ddl(table_id, &state, |store| {
+            let outcome = match method {
+                VectorIndexMethod::Hnsw => store.add_vector_index(config)?,
+                VectorIndexMethod::QuantizedIvf => store.add_quantized_vector_index(config)?,
+            };
+            Ok(((), outcome))
+        })
     }
 
     /// Report the artifact/search method registered for a table's vector index.
@@ -6312,10 +6400,7 @@ impl StorageEngine {
         table_id: &TableId,
         index_name: &str,
     ) -> ferrosa_common::Result<VectorIndexMethod> {
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         Ok(state.store.vector_index_method(index_name))
     }
 
@@ -6328,10 +6413,7 @@ impl StorageEngine {
         k: usize,
         ef_search: usize,
     ) -> ferrosa_common::Result<Vec<ferrosa_index::vector::IndexResult>> {
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         state.store.ann_search(index_name, query, k, ef_search)
     }
 
@@ -6350,10 +6432,7 @@ impl StorageEngine {
         k: usize,
         ef_search: usize,
     ) -> ferrosa_common::Result<Vec<Partition>> {
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         state
             .store
             .ann_search_partitions(index_name, query, k, ef_search)
@@ -6369,10 +6448,7 @@ impl StorageEngine {
         k: usize,
         ef_search: usize,
     ) -> ferrosa_common::Result<Vec<ferrosa_index::vector::IndexResult>> {
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         state
             .store
             .ann_search_in_partition_scope(index_name, partition_scope, query, k, ef_search)
@@ -7392,8 +7468,7 @@ impl StorageEngine {
     where
         Cb: FnMut(&Row) -> ferrosa_common::Result<()>,
     {
-        let tables = self.tables.read();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok(0);
         };
         state.store.visit_time_series_window_rows(
@@ -7844,18 +7919,18 @@ impl StorageEngine {
 
         let (task_tx, task_rx) = std::sync::mpsc::sync_channel(config.channel_capacity);
         let target_table_id = TableId::new(&schema.keyspace, &config.target_table);
-        let target_tables = self.tables.read();
-        let target_state = target_tables.get(&target_table_id);
+        let target_state = self.table_state(&target_table_id);
         let target_timestamp_unit = target_state
+            .as_deref()
             .map(TableState::time_series_timestamp_unit)
             .unwrap_or(source_timestamp_unit);
-        let target_result_column_indices = if let Some(target_state) = target_state {
+        let target_schema = target_state.as_ref().map(|state| state.schema());
+        let target_result_column_indices = if let Some(target_schema) = target_schema.as_deref() {
             let mut target_indices_by_name = HashMap::new();
-            for (idx, column) in target_state
-                .schema
+            for (idx, column) in target_schema
                 .static_columns
                 .iter()
-                .chain(target_state.schema.regular_columns.iter())
+                .chain(target_schema.regular_columns.iter())
                 .enumerate()
             {
                 target_indices_by_name.insert(column.name.as_str(), idx as u16);
@@ -7884,7 +7959,6 @@ impl StorageEngine {
                 .map(|idx| idx as u16)
                 .collect()
         };
-        drop(target_tables);
         let target = MaterializationTarget {
             source_table: table_id.clone(),
             target_table: target_table_id,
@@ -8028,7 +8102,7 @@ impl StorageEngine {
             return;
         }
         let dtid = TableId::new(&dm.keyspace, &dm.table);
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         if let Some(state) = tables.get(&dtid) {
             for row in &dm.rows {
                 if let Err(e) = state.store.write(&dm.key, row.clone()) {
@@ -8075,7 +8149,7 @@ impl StorageEngine {
                         continue;
                     }
                     let dtid = TableId::new(&dm.keyspace, &dm.table);
-                    let tables = self.tables.read();
+                    let tables = self.tables.load();
                     if let Some(state) = tables.get(&dtid) {
                         for row in &dm.rows {
                             let _ = state.store.write(&dm.key, row.clone());
@@ -8137,7 +8211,7 @@ impl StorageEngine {
 
     /// Number of tables currently registered.
     pub fn table_count(&self) -> usize {
-        self.tables.read().len()
+        self.tables.load().len()
     }
 
     /// The schema currently registered for `table_id`, if the table is known.
@@ -8148,13 +8222,16 @@ impl StorageEngine {
     /// that divergence is invisible until a cross-node row transfer decodes
     /// against the wrong ordinals.
     pub fn table_schema(&self, table_id: &TableId) -> Option<TableSchema> {
-        self.tables.read().get(table_id).map(|s| s.schema.clone())
+        self.tables
+            .load()
+            .get(table_id)
+            .map(|s| TableSchema::clone(&s.schema()))
     }
 
     /// The `TableId`s currently registered with this engine. Used by the
     /// self-heal controller to enumerate scan targets.
     pub fn registered_table_ids(&self) -> Vec<TableId> {
-        self.tables.read().keys().cloned().collect()
+        self.tables.load().keys().cloned().collect()
     }
 
     /// Filesystem directory holding a table's SSTables:
@@ -8308,7 +8385,7 @@ impl StorageEngine {
         _timestamp: i64,
     ) -> ferrosa_common::Result<()> {
         // Skip commit log for observability (best-effort, not durable).
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidData(format!("observability table not found: {table_id}"))
         })?;
@@ -8354,7 +8431,7 @@ impl StorageEngine {
 
         let phase_start = Instant::now();
         {
-            let tables = self.tables.read();
+            let tables = self.tables.load();
             let state = match tables.get(table_id) {
                 Some(state) => state,
                 None => {
@@ -8435,7 +8512,7 @@ impl StorageEngine {
         // 2. Write to the table's memtable and track commit log position.
         let phase_start = Instant::now();
         {
-            let tables = self.tables.read();
+            let tables = self.tables.load();
             let state = match tables.get(table_id) {
                 Some(state) => state,
                 None => {
@@ -8529,7 +8606,7 @@ impl StorageEngine {
         for (key, row, timestamp) in mutations {
             self.check_write_admission()?;
             {
-                let tables = self.tables.read();
+                let tables = self.tables.load();
                 let state = tables.get(table_id).ok_or_else(|| {
                     ferrosa_common::Error::InvalidFormat(format!(
                         "table not registered: {table_id}"
@@ -8551,7 +8628,7 @@ impl StorageEngine {
 
             // Write to memtable and track commit log position (scoped read lock).
             {
-                let tables = self.tables.read();
+                let tables = self.tables.load();
                 let state = tables.get(table_id).ok_or_else(|| {
                     ferrosa_common::Error::InvalidFormat(format!(
                         "table not registered: {table_id}"
@@ -8609,7 +8686,7 @@ impl StorageEngine {
         // front, so Phase 1 cannot fail *partway* and leave an already-appended
         // (and therefore replay-durable) prefix of the batch on disk.
         {
-            let tables = self.tables.read();
+            let tables = self.tables.load();
             let max_entry = self.commit_log.max_entry_size();
             let mut checked = HashSet::new();
             for m in &mutations {
@@ -8661,7 +8738,7 @@ impl StorageEngine {
         self.commit_log.force_sync()?;
 
         // Phase 2: Apply to memtables and update commit log positions.
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         for m in &mutations {
             let table_id = TableId::new(&m.keyspace, &m.table);
             let state = tables.get(&table_id).ok_or_else(|| {
@@ -8768,8 +8845,7 @@ impl StorageEngine {
             table = %table_id,
         )
         .entered();
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.read_limited_rows(key, row_limit)
@@ -8783,14 +8859,14 @@ impl StorageEngine {
     /// signal; repair, compaction and self-heal reads never set it.
     pub fn table_last_foreground_read(&self, table_id: &TableId) -> Option<std::time::SystemTime> {
         self.tables
-            .read()
+            .load()
             .get(table_id)
             .and_then(|state| state.last_foreground_read())
     }
 
     #[cfg(test)]
     fn clear_last_foreground_read_for_test(&self, table_id: &TableId) {
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         let state = tables.get(table_id).expect("table registered");
         state
             .last_foreground_read_unix_ms
@@ -8811,8 +8887,7 @@ impl StorageEngine {
         start_clustering: &[u8],
         row_limit: usize,
     ) -> ferrosa_common::Result<Option<Partition>> {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -8829,8 +8904,7 @@ impl StorageEngine {
     /// signal that anti-entropy repair must refill those generations' token
     /// ranges from a healthy replica. Empty (or an unknown table) yields `[]`.
     pub fn table_quarantined_sstable_gens(&self, table_id: &TableId) -> Vec<String> {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => state.store.quarantined_sstable_gens(),
             None => Vec::new(),
         }
@@ -8849,8 +8923,7 @@ impl StorageEngine {
             table = %table_id,
         )
         .entered();
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.read_clustering_row(key, clustering)
@@ -8892,8 +8965,7 @@ impl StorageEngine {
         if start_token >= end_token || limit == 0 {
             return Ok(Vec::new());
         }
-        let tables = self.tables.read();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok(Vec::new());
         };
         state.store.read_token_range(start_token, end_token, limit)
@@ -8915,8 +8987,7 @@ impl StorageEngine {
         if start_token >= end_token || max_partitions == 0 {
             return Ok((Vec::new(), None));
         }
-        let tables = self.tables.read();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok((Vec::new(), None));
         };
         state
@@ -8953,8 +9024,7 @@ impl StorageEngine {
         if start_token >= end_token {
             return Ok(());
         }
-        let tables = self.tables.read();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok(());
         };
         state
@@ -8981,8 +9051,7 @@ impl StorageEngine {
         if start_token >= end_token {
             return Ok(());
         }
-        let tables = self.tables.read();
-        let Some(state) = tables.get(table_id) else {
+        let Some(state) = self.table_state(table_id) else {
             return Ok(());
         };
         state.store.walk_token_range(start_token, end_token, cb)
@@ -8997,8 +9066,7 @@ impl StorageEngine {
         limit: usize,
         row_limit: usize,
     ) -> ferrosa_common::Result<Vec<Partition>> {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -9032,8 +9100,7 @@ impl StorageEngine {
         end: Option<&DecoratedKey>,
         matches: &dyn Fn(&DecoratedKey) -> bool,
     ) -> ferrosa_common::Result<u64> {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.count_range_matching(start, end, matches)
@@ -9057,8 +9124,7 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -9086,8 +9152,7 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.range_iter(start, end)
@@ -9109,8 +9174,7 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.range_iter_fragmented(start, end)
@@ -9130,8 +9194,7 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -9174,10 +9237,7 @@ impl StorageEngine {
                  incomplete results while index backfill is pending or failed"
             )));
         }
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         state.note_foreground_read();
         state
             .store
@@ -9229,7 +9289,16 @@ impl StorageEngine {
                 },
             );
             if let Err(error) = result {
-                let _ = tx.blocking_send(Err(error));
+                if let Err(undelivered) = tx.blocking_send(Err(error)) {
+                    // The consumer dropped the stream, so nobody is left to
+                    // return this to; say so rather than lose it.
+                    tracing::warn!(
+                        table = %table_id,
+                        index = %index_name,
+                        error = ?undelivered.0,
+                        "index stream failed after its consumer went away"
+                    );
+                }
             }
         });
 
@@ -9248,8 +9317,7 @@ impl StorageEngine {
         index_name: &str,
         key: &ferrosa_index::IndexKey,
     ) -> ferrosa_common::Result<bool> {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => state.store.index_key_is_unselective(index_name, key),
             None => Ok(false),
         }
@@ -9271,8 +9339,7 @@ impl StorageEngine {
         key: &ferrosa_index::IndexKey,
         partition_key: &[u8],
     ) -> ferrosa_common::Result<Vec<Partition>> {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state
@@ -9298,8 +9365,7 @@ impl StorageEngine {
         index_name: &str,
         ranges: &[(u64, u64)],
     ) -> ferrosa_common::Result<Vec<Partition>> {
-        let tables = self.tables.read();
-        match tables.get(table_id) {
+        match self.table_state(table_id) {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.read_by_index_cell_ranges(index_name, ranges)
@@ -9374,8 +9440,7 @@ impl StorageEngine {
         };
 
         {
-            let tables = self.tables.read();
-            let Some(state) = tables.get(table_id) else {
+            let Some(state) = self.table_state(table_id) else {
                 return Ok(vec![]);
             };
             state.note_foreground_read();
@@ -9489,7 +9554,7 @@ impl StorageEngine {
         // (the transient compaction / async-rebuild window) so a stable row is
         // never dropped from full-text search (BUG-F-007 / t_0455c0a1).
         {
-            let tables = self.tables.read();
+            let tables = self.tables.load();
             if let Some(state) = tables.get(table_id) {
                 merge_hits(
                     &mut score_map,
@@ -9516,9 +9581,10 @@ impl StorageEngine {
     ///
     /// First builds a sidecar for any live SSTable that has none, so a query
     /// tokenizes such an SSTable at most once instead of on every call. The
-    /// build runs with the table lock released and is single-flight per table;
-    /// a failure is logged by the build and leaves that SSTable to the
-    /// full-scan fallback, which still returns its rows.
+    /// build holds nothing engine-wide and is single-flight per sidecar; a
+    /// sidecar another query is building, or whose build failed (logged by
+    /// the build), is left to the full-scan fallback, which still returns its
+    /// rows.
     fn fulltext_sidecars_for_query(
         &self,
         table_id: &TableId,
@@ -9526,7 +9592,7 @@ impl StorageEngine {
     ) -> Option<(Vec<std::path::PathBuf>, std::collections::HashSet<String>)> {
         let build = self
             .tables
-            .read()
+            .load()
             .get(table_id)?
             .store
             .plan_missing_fulltext_sidecars(index_name);
@@ -9536,7 +9602,7 @@ impl StorageEngine {
         }
         let live = self
             .tables
-            .read()
+            .load()
             .get(table_id)?
             .store
             .fulltext_live_sidecars(index_name);
@@ -9610,7 +9676,7 @@ impl StorageEngine {
             None => return Ok(()),
         };
 
-        match self.tables.read().get(table_id) {
+        match self.tables.load().get(table_id) {
             Some(state) => state.note_foreground_read(),
             None => return Ok(()),
         }
@@ -9649,8 +9715,7 @@ impl StorageEngine {
 
         // Memtable overlay — collect under the lock, forward after release.
         let memtable_hits = {
-            let tables = self.tables.read();
-            let Some(state) = tables.get(table_id) else {
+            let Some(state) = self.table_state(table_id) else {
                 return Ok(());
             };
             state
@@ -9733,8 +9798,7 @@ impl StorageEngine {
         // Missing-sidecar fallback (transient rebuild window) — collect under
         // the lock, forward after release.
         let fallback_hits = {
-            let tables = self.tables.read();
-            match tables.get(table_id) {
+            match self.table_state(table_id) {
                 Some(state) => state.store.fulltext_sstable_scan_missing_sidecar(
                     index_name,
                     query,
@@ -9795,13 +9859,9 @@ impl StorageEngine {
     }
 
     fn truncate_local(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
+        let state = self.require_table(table_id)?;
         // Clear in-memory state (memtable + SSTable references).
-        state.store.truncate();
-        drop(tables);
+        state.store.truncate()?;
 
         // Delete local SSTable files so data doesn't reappear on restart.
         let table_dir = self
@@ -10170,7 +10230,7 @@ impl StorageEngine {
         prefix: &str,
     ) -> ferrosa_common::Result<crate::snapshot::metadata::SnapshotMetadata> {
         // Step 1: Flush all tables.
-        let table_ids: Vec<_> = self.tables.read().keys().cloned().collect();
+        let table_ids: Vec<_> = self.tables.load().keys().cloned().collect();
         for table_id in &table_ids {
             self.flush(table_id)?;
         }
@@ -10243,166 +10303,82 @@ impl StorageEngine {
             table = %table_id,
         )
         .entered();
-        // Flush + index submit under read lock, then release before write lock.
-        let (gen, is_pinned, cl_position, flush_outcome) = {
-            let tables = self.tables.read();
-            let state = tables.get(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-            })?;
+        let state = self.require_table(table_id)?;
 
-            // Snapshot the commit log position before flushing. All mutations
-            // up to this position are in the memtable we're about to flush.
-            let cl_position = **state.last_commit_log_position.load();
+        // Snapshot the commit log position before flushing. All mutations
+        // up to this position are in the memtable we're about to flush.
+        let cl_position = **state.last_commit_log_position.load();
 
-            // DURABILITY BARRIER (do not reorder): `store.flush()` only returns
-            // Ok after the SSTable's component files AND their directory entries
-            // are fsynced (see flush.rs `fsync_components`). This is the barrier
-            // that makes the later `commit_log.discard_completed(cl_position)`
-            // safe: we must NOT advance the WAL checkpoint / delete segments
-            // until the SSTable copy of those mutations is durable on disk. If
-            // flush() fails, we return here and the WAL is left intact so replay
-            // can rebuild the memtable. Removing the fsync from flush(), or
-            // moving discard_completed before this line, reintroduces the P0
-            // "kill mid-flush loses both the torn SSTable and the WAL copy" bug.
-            let pressure_notify = Arc::clone(&state.write_pressure_notify);
-            let flush_outcome = state
-                .store
-                .flush_with_swap_callback(|| pressure_notify.notify_waiters())?;
-            let active_size = state.store.memtable_size() as u64;
-            let pressure = ((active_size as f64
-                / self.config.memtable_backpressure_bytes.max(1) as f64)
-                .max(self.sample_write_pump_blocked_rate()))
-            .clamp(0.0, 1.0);
-            self.update_write_pressure(state, table_id, pressure);
-            // Completion is a second useful edge: the active memtable was
-            // already released at swap, while durability is now established.
-            state.write_pressure_notify.notify_waiters();
+        // DURABILITY BARRIER (do not reorder): `store.flush()` only returns
+        // Ok after the SSTable's component files AND their directory entries
+        // are fsynced (see flush.rs `fsync_components`). This is the barrier
+        // that makes the later `commit_log.discard_completed(cl_position)`
+        // safe: we must NOT advance the WAL checkpoint / delete segments
+        // until the SSTable copy of those mutations is durable on disk. If
+        // flush() fails, we return here and the WAL is left intact so replay
+        // can rebuild the memtable. Removing the fsync from flush(), or
+        // moving discard_completed before this line, reintroduces the P0
+        // "kill mid-flush loses both the torn SSTable and the WAL copy" bug.
+        let pressure_notify = Arc::clone(&state.write_pressure_notify);
+        let flush_outcome = state
+            .store
+            .flush_with_swap_callback(move || pressure_notify.notify_waiters())?;
+        self.finish_flush(table_id, &state, cl_position, flush_outcome)
+    }
 
-            // Reset the unflushed-write timestamp so the next write starts a
-            // fresh age window. This must happen after flush() succeeds.
-            state
-                .first_unflushed_write_at_nanos
-                .store(0, std::sync::atomic::Ordering::Relaxed);
+    /// Everything the engine does after a store flush returns: write
+    /// pressure, the index tracker for the new generation, compaction, the
+    /// commit-log checkpoint, NVMe pin tracking and the local schema file.
+    ///
+    /// Every store flush goes through here, including the memtable rotations
+    /// that index DDL and `ALTER TABLE` perform. A flush that skipped it would
+    /// publish a generation the index tracker never heard of, and an SSTable
+    /// of a pinned table that the pin cap never counts.
+    ///
+    /// `cl_position` must have been read BEFORE the store flush started: the
+    /// checkpoint may only cover mutations that are in the flushed SSTable.
+    fn finish_flush(
+        &self,
+        table_id: &TableId,
+        state: &Arc<TableState>,
+        cl_position: Option<CommitLogPosition>,
+        flush_outcome: FlushOutcome,
+    ) -> ferrosa_common::Result<()> {
+        let active_size = state.store.memtable_size() as u64;
+        let pressure = ((active_size as f64
+            / self.config.memtable_backpressure_bytes.max(1) as f64)
+            .max(self.sample_write_pump_blocked_rate()))
+        .clamp(0.0, 1.0);
+        self.update_write_pressure(state, table_id, pressure);
+        // Completion is a second useful edge: the active memtable was
+        // already released at swap, while durability is now established.
+        state.write_pressure_notify.notify_waiters();
 
-            // Eager index build: submit high-priority index rebuild for the newly
-            // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
-            // 0-1 entries in steady state by ensuring sidecar indexes are current.
-            //
-            // Only when this flush actually published an SSTable. A flush with
-            // nothing to write leaves `last_flush_generation()` naming an
-            // earlier SSTable (0 if this process never flushed the table, e.g.
-            // after its SSTables were evicted): building against that id
-            // queued a phantom pending SSTable per index and logged a false
-            // "cannot resolve ordinal layout" error for each (ST-43).
-            if let (Some(scheduler), FlushOutcome::Published) =
-                (self.index_scheduler.as_ref(), flush_outcome)
-            {
-                let gen = state.store.last_flush_generation();
-                let ck_total = state.store.clustering_column_count();
-                let pk_total = state.store.partition_key_column_count();
-                let index_sources = state
-                    .store
-                    .indexed_columns()
-                    .iter()
-                    .map(|(name, pos)| (name.clone(), *pos, None, None))
-                    .chain(state.store.indexed_clustering_columns().iter().map(
-                        |(name, component)| {
-                            (
-                                name.clone(),
-                                *component,
-                                Some(crate::index::ClusteringComponentRef {
-                                    component: *component,
-                                    total: ck_total,
-                                }),
-                                None,
-                            )
-                        },
-                    ))
-                    .chain(state.store.indexed_partition_key_columns().iter().map(
-                        |(name, component)| {
-                            (
-                                name.clone(),
-                                *component,
-                                None,
-                                Some(crate::index::PartitionKeyComponentRef {
-                                    component: *component,
-                                    total: pk_total,
-                                }),
-                            )
-                        },
-                    ))
-                    .collect::<Vec<_>>();
-                let written_by_flush = state.store.indexes_written_by_last_flush();
-                for (index_name, col_pos, clustering_source, partition_key_source) in index_sources
-                {
-                    let tracker_state = self.index_tracker.get_state(
-                        table_id.keyspace(),
-                        table_id.table(),
-                        &index_name,
-                    );
-                    // Only submit if the index needs building (not already current).
-                    if let Some(idx_state) = tracker_state {
-                        let sstable_id = format!("{gen}");
-                        match flush_index_action(
-                            &written_by_flush,
-                            &index_name,
-                            &idx_state.indexed_sstables,
-                            &sstable_id,
-                        ) {
-                            FlushIndexAction::Nothing => {}
-                            FlushIndexAction::AlreadyWritten => {
-                                // The flush wrote this index's sidecar for this
-                                // generation from the memtable index that made
-                                // the SSTable. Record it as indexed rather than
-                                // queueing a rebuild, so no reader sees a
-                                // complete index reported as pending.
-                                self.index_tracker.mark_indexed(
-                                    table_id.keyspace(),
-                                    table_id.table(),
-                                    &index_name,
-                                    &sstable_id,
-                                );
-                            }
-                            FlushIndexAction::NeedsBuild => {
-                                self.index_tracker.mark_pending(
-                                    table_id.keyspace(),
-                                    table_id.table(),
-                                    &index_name,
-                                    &sstable_id,
-                                    0,
-                                );
-                                match eager_index_build_job(
-                                    &state.store,
-                                    table_id,
-                                    sstable_id,
-                                    &index_name,
-                                    col_pos,
-                                    clustering_source,
-                                    partition_key_source,
-                                ) {
-                                    Ok(job) => {
-                                        if let Err(e) = scheduler.submit(job) {
-                                            tracing::error!(%e, %index_name, "flush: failed to submit eager index build");
-                                        }
-                                    }
-                                    Err(e) => tracing::error!(
-                                        %e, %index_name,
-                                        "flush: cannot resolve ordinal layout; SSTable left tracker-pending (unindexed)"
-                                    ),
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // Reset the unflushed-write timestamp so the next write starts a
+        // fresh age window. This must happen after flush() succeeds.
+        state
+            .first_unflushed_write_at_nanos
+            .store(0, std::sync::atomic::Ordering::Relaxed);
 
-            // Check for compaction after flush.
-            self.maybe_compact(table_id, state);
+        // Eager index build: submit high-priority index rebuild for the newly
+        // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
+        // 0-1 entries in steady state by ensuring sidecar indexes are current.
+        //
+        // Only when this flush actually published an SSTable. A flush with
+        // nothing to write leaves `last_flush_generation()` naming an
+        // earlier SSTable (0 if this process never flushed the table, e.g.
+        // after its SSTables were evicted): building against that id
+        // queued a phantom pending SSTable per index and logged a false
+        // "cannot resolve ordinal layout" error for each (ST-43).
+        if flush_outcome == FlushOutcome::Published {
+            self.track_flushed_generation_indexes(table_id, state);
+        }
 
-            let flushed_gen = state.store.last_flush_generation();
-            let pinned = state.pin_config.is_some();
-            (flushed_gen, pinned, cl_position, flush_outcome)
-        };
+        // Check for compaction after flush.
+        self.maybe_compact(table_id, state);
+
+        let gen = state.store.last_flush_generation();
+        let is_pinned = state.is_pinned();
 
         // Advance commit log checkpoint: tell the commit log that this table's
         // mutations are now durable in SSTables up to cl_position. This allows
@@ -10415,7 +10391,6 @@ impl StorageEngine {
         }
 
         // For pinned tables: record the new SSTable and enforce max_bytes.
-        // We do this outside the read lock so we can take a write lock.
         if is_pinned && flush_outcome == FlushOutcome::Published {
             let table_dir = self
                 .config
@@ -10423,24 +10398,7 @@ impl StorageEngine {
                 .join("sstables")
                 .join(table_id.to_string());
             let size = Self::sstable_disk_size(&table_dir, gen);
-            let sstable_id = gen.to_string();
-
-            {
-                let mut tables = self.tables.write();
-                if let Some(state) = tables.get_mut(table_id) {
-                    // Only append if this gen isn't already tracked (idempotent).
-                    if !state
-                        .pinned_sstables
-                        .iter()
-                        .any(|(id, _)| *id == sstable_id)
-                    {
-                        state.pinned_sstables.push((sstable_id.clone(), size));
-                    }
-                }
-            }
-
-            self.pin_metrics.add_pinned_bytes(size as i64);
-            self.enforce_pin_max_bytes(table_id);
+            self.track_pinned_sstable(table_id, state, gen.to_string(), size)?;
         }
 
         // Persist registered table schemas so the next restart can recover without
@@ -10450,9 +10408,143 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Record SSTable `sstable_id` of `size` bytes as pinned on NVMe, then
+    /// enforce the table's pin cap.
+    fn track_pinned_sstable(
+        &self,
+        table_id: &TableId,
+        state: &TableState,
+        sstable_id: String,
+        size: u64,
+    ) -> ferrosa_common::Result<()> {
+        // Only append if this gen isn't already tracked (idempotent).
+        let added = crate::lockfree::update(&state.pin, "table pin", |pin| {
+            if pin.sstables.iter().any(|(id, _)| *id == sstable_id) {
+                return (None, false);
+            }
+            let mut next = pin.clone();
+            next.sstables.push((sstable_id.clone(), size));
+            (Some(next), true)
+        })?;
+        if added {
+            self.pin_metrics.add_pinned_bytes(size as i64);
+        }
+        self.enforce_pin_max_bytes(table_id);
+        Ok(())
+    }
+
+    /// Tell the index tracker about the generation `state`'s last flush
+    /// published: indexes the flush wrote sidecars for are indexed there, and
+    /// any other declared index is queued for an eager build of it.
+    fn track_flushed_generation_indexes(&self, table_id: &TableId, state: &TableState) {
+        let Some(scheduler) = self.index_scheduler.as_ref() else {
+            return;
+        };
+        let gen = state.store.last_flush_generation();
+        let ck_total = state.store.clustering_column_count();
+        let pk_total = state.store.partition_key_column_count();
+        let index_sources =
+            state
+                .store
+                .indexed_columns()
+                .iter()
+                .map(|(name, pos)| (name.clone(), *pos, None, None))
+                .chain(
+                    state
+                        .store
+                        .indexed_clustering_columns()
+                        .iter()
+                        .map(|(name, component)| {
+                            (
+                                name.clone(),
+                                *component,
+                                Some(crate::index::ClusteringComponentRef {
+                                    component: *component,
+                                    total: ck_total,
+                                }),
+                                None,
+                            )
+                        }),
+                )
+                .chain(state.store.indexed_partition_key_columns().iter().map(
+                    |(name, component)| {
+                        (
+                            name.clone(),
+                            *component,
+                            None,
+                            Some(crate::index::PartitionKeyComponentRef {
+                                component: *component,
+                                total: pk_total,
+                            }),
+                        )
+                    },
+                ))
+                .collect::<Vec<_>>();
+        let written_by_flush = state.store.indexes_written_by_last_flush();
+        for (index_name, col_pos, clustering_source, partition_key_source) in index_sources {
+            // Only submit if the index needs building (not already current).
+            let Some(idx_state) =
+                self.index_tracker
+                    .get_state(table_id.keyspace(), table_id.table(), &index_name)
+            else {
+                continue;
+            };
+            let sstable_id = format!("{gen}");
+            match flush_index_action(
+                &written_by_flush,
+                &index_name,
+                &idx_state.indexed_sstables,
+                &sstable_id,
+            ) {
+                FlushIndexAction::Nothing => {}
+                FlushIndexAction::AlreadyWritten => {
+                    // The flush wrote this index's sidecar for this
+                    // generation from the memtable index that made
+                    // the SSTable. Record it as indexed rather than
+                    // queueing a rebuild, so no reader sees a
+                    // complete index reported as pending.
+                    self.index_tracker.mark_indexed(
+                        table_id.keyspace(),
+                        table_id.table(),
+                        &index_name,
+                        &sstable_id,
+                    );
+                }
+                FlushIndexAction::NeedsBuild => {
+                    self.index_tracker.mark_pending(
+                        table_id.keyspace(),
+                        table_id.table(),
+                        &index_name,
+                        &sstable_id,
+                        0,
+                    );
+                    match eager_index_build_job(
+                        &state.store,
+                        table_id,
+                        sstable_id,
+                        &index_name,
+                        col_pos,
+                        clustering_source,
+                        partition_key_source,
+                    ) {
+                        Ok(job) => {
+                            if let Err(e) = scheduler.submit(job) {
+                                tracing::error!(%e, %index_name, "flush: failed to submit eager index build");
+                            }
+                        }
+                        Err(e) => tracing::error!(
+                            %e, %index_name,
+                            "flush: cannot resolve ordinal layout; SSTable left tracker-pending (unindexed)"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_table_registered_for_test(&self, table_id: &TableId) -> bool {
-        self.tables.read().contains_key(table_id)
+        self.tables.load().contains_key(table_id)
     }
 
     /// Test accessor for the engine's own [`CompactionExecutor`] (T-021 CS4):
@@ -10600,7 +10692,7 @@ impl StorageEngine {
         if file.error.is_some() {
             return false;
         }
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         file.tables.keys().any(|key| {
             tables
                 .keys()
@@ -10658,7 +10750,7 @@ impl StorageEngine {
         table_id: &TableId,
         index_name: &str,
     ) -> Option<ferrosa_index::IndexType> {
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         let state = tables.get(table_id)?;
         if state
             .store
@@ -10680,9 +10772,9 @@ impl StorageEngine {
         table_id: &TableId,
         index_name: &str,
     ) -> Option<ferrosa_index::FilterPredicate> {
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         let state = tables.get(table_id)?;
-        state.store.filter_predicate_for(index_name).cloned()
+        state.store.filter_predicate_for(index_name)
     }
 
     /// Flushes tables that exceed the size threshold, have both sufficient
@@ -10701,7 +10793,7 @@ impl StorageEngine {
             .config
             .flush_threshold_bytes
             .clamp(1, self.runtime_tuning.max_age_flush_floor_bytes);
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         let to_flush: Vec<TableId> = tables
             .iter()
             .filter(|(table_id, state)| {
@@ -10732,7 +10824,7 @@ impl StorageEngine {
     /// Used before S3 schema persistence to ensure data and metadata
     /// stay in sync.  Equivalent to Cassandra's SNAPSHOT flush reason.
     pub fn flush_all(&self) -> ferrosa_common::Result<()> {
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         let to_flush: Vec<TableId> = tables
             .iter()
             .filter(|(_, state)| state.store.memtable_size() > 0)
@@ -10771,7 +10863,7 @@ impl StorageEngine {
         table_id: Option<&TableId>,
     ) -> ferrosa_common::Result<crate::compaction::CompactionStopReport> {
         if let Some(table_id) = table_id {
-            let tables = self.tables.read();
+            let tables = self.tables.load();
             if !tables.contains_key(table_id) {
                 return Err(ferrosa_common::Error::InvalidFormat(format!(
                     "table not registered: {table_id}"
@@ -10787,7 +10879,7 @@ impl StorageEngine {
 
     fn handle_compaction_failures(&self, failures: Vec<CompactionFailure>) {
         for failure in failures {
-            if !self.tables.read().contains_key(&failure.table_id) {
+            if !self.tables.load().contains_key(&failure.table_id) {
                 continue;
             }
             if self
@@ -11079,7 +11171,7 @@ impl StorageEngine {
             // each replica's search to 7–13 s against the 3 s Bulk-lane budget.
             // A failure is logged by the build; the output is still swapped in
             // and queries fall back to scanning it until a sidecar exists.
-            let fulltext_build = self.tables.read().get(table_id).map(|state| {
+            let fulltext_build = self.tables.load().get(table_id).map(|state| {
                 state
                     .store
                     .plan_fulltext_sidecars_for_output(gen, dir, &reader)
@@ -11104,7 +11196,7 @@ impl StorageEngine {
             // Advance the flush target past this gen to prevent future collisions,
             // and use the store's unique ID allocator for the tracking ID.
             {
-                let tables = self.tables.read();
+                let tables = self.tables.load();
                 if let Some(state) = tables.get(table_id) {
                     let output_id = gen.clone();
                     // Advance the store's flush target past the compaction gen
@@ -11172,7 +11264,7 @@ impl StorageEngine {
                     // Eager index build: submit high-priority rebuild for compacted output.
                     // Same as flush — keeps MemtableIndex bounded in steady state.
                     if let Some(ref scheduler) = self.index_scheduler {
-                        for (index_name, col_pos) in state.store.indexed_columns() {
+                        for (index_name, col_pos) in state.store.indexed_columns().iter() {
                             match eager_index_build_job(
                                 &state.store,
                                 table_id,
@@ -11198,7 +11290,9 @@ impl StorageEngine {
                         // components, or the index would silently lose all
                         // entries for compacted data.
                         let ck_total = state.store.clustering_column_count();
-                        for (index_name, component) in state.store.indexed_clustering_columns() {
+                        for (index_name, component) in
+                            state.store.indexed_clustering_columns().iter()
+                        {
                             match eager_index_build_job(
                                 &state.store,
                                 table_id,
@@ -11227,7 +11321,9 @@ impl StorageEngine {
                         // partition keys, or the index loses every entry
                         // belonging to the data that was just compacted.
                         let pk_total = state.store.partition_key_column_count();
-                        for (index_name, component) in state.store.indexed_partition_key_columns() {
+                        for (index_name, component) in
+                            state.store.indexed_partition_key_columns().iter()
+                        {
                             match eager_index_build_job(
                                 &state.store,
                                 table_id,
@@ -11285,27 +11381,16 @@ impl StorageEngine {
             //
             // Pinned tables keep SSTables on local NVMe only. Track the
             // compacted output the same way flush does.
-            let is_compaction_pinned = {
-                let tables = self.tables.read();
-                tables.get(table_id).is_some_and(|s| s.pin_config.is_some())
-            };
-            if is_compaction_pinned {
-                let size = output.size_bytes;
-                let sstable_id = output.id.clone();
-                {
-                    let mut tables = self.tables.write();
-                    if let Some(state) = tables.get_mut(table_id) {
-                        if !state
-                            .pinned_sstables
-                            .iter()
-                            .any(|(id, _)| *id == sstable_id)
-                        {
-                            state.pinned_sstables.push((sstable_id, size));
-                        }
-                    }
+            let pinned_state = self.table_state(table_id).filter(|state| state.is_pinned());
+            if let Some(pinned_state) = pinned_state {
+                if let Err(e) = self.track_pinned_sstable(
+                    table_id,
+                    &pinned_state,
+                    output.id.clone(),
+                    output.size_bytes,
+                ) {
+                    tracing::error!(%e, %table_id, sstable = %output.id, "compaction: pinned output not tracked; the pin cap will not count it");
                 }
-                self.pin_metrics.add_pinned_bytes(size as i64);
-                self.enforce_pin_max_bytes(table_id);
                 if !cleanup_inputs(&mut intent) {
                     continue;
                 }
@@ -11789,7 +11874,7 @@ impl StorageEngine {
     /// Returns the number of SSTables for a table.
     pub fn sstable_count(&self, table_id: &TableId) -> usize {
         self.tables
-            .read()
+            .load()
             .get(table_id)
             .map(|s| s.store.sstable_count())
             .unwrap_or(0)
@@ -11844,7 +11929,7 @@ impl StorageEngine {
     /// Returns the count of SSTable read errors for a table.
     pub fn sstable_read_errors(&self, table_id: &TableId) -> u64 {
         self.tables
-            .read()
+            .load()
             .get(table_id)
             .map(|s| {
                 s.store
@@ -11857,7 +11942,7 @@ impl StorageEngine {
     /// Returns the memtable size in bytes for a table.
     pub fn memtable_size(&self, table_id: &TableId) -> usize {
         self.tables
-            .read()
+            .load()
             .get(table_id)
             .map(|s| s.store.memtable_size())
             .unwrap_or(0)
@@ -11869,7 +11954,7 @@ impl StorageEngine {
     /// shuts down the upload manager, and stops the commit log.
     pub fn shutdown(&self) -> ferrosa_common::Result<()> {
         // Flush all tables.
-        let table_ids: Vec<TableId> = self.tables.read().keys().cloned().collect();
+        let table_ids: Vec<TableId> = self.tables.load().keys().cloned().collect();
         for table_id in &table_ids {
             // Best-effort flush; log but don't fail on individual table errors.
             if let Err(e) = self.flush(table_id) {
@@ -11943,7 +12028,7 @@ impl StorageEngine {
 
     /// bucketing or min_threshold.
     pub fn force_compact_all(&self) {
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         for (table_id, state) in tables.iter() {
             let Some(ticket) = self.compaction_executor.submission_ticket(table_id) else {
                 tracing::warn!(%table_id, "force-compact: table not admitting compactions (paused or shut down); skipped");
@@ -11956,7 +12041,7 @@ impl StorageEngine {
                 let task = crate::compaction::metadata::CompactionTask {
                     inputs: metadata,
                     output_dir: self.config.compaction.output_dir.join(table_id.to_string()),
-                    schema: state.schema.clone(),
+                    schema: TableSchema::clone(&state.schema()),
                     table_id: table_id.clone(),
                     purge,
                 };
@@ -12004,8 +12089,7 @@ impl StorageEngine {
             });
         };
         let (available_sstables, inputs, schema, purge) = {
-            let tables = self.tables.read();
-            let Some(state) = tables.get(table_id) else {
+            let Some(state) = self.table_state(table_id) else {
                 return Ok(IncrementalCompactionSchedule::TableNotFound);
             };
             let table_dir = self
@@ -12018,8 +12102,13 @@ impl StorageEngine {
                 max_sstables,
                 max_input_bytes,
             );
-            let purge = self.purge_policy_for(table_id, state, &inputs);
-            (available_sstables, inputs, state.schema.clone(), purge)
+            let purge = self.purge_policy_for(table_id, &state, &inputs);
+            (
+                available_sstables,
+                inputs,
+                TableSchema::clone(&state.schema()),
+                purge,
+            )
         };
 
         if inputs.len() < 2 {
@@ -12118,7 +12207,7 @@ impl StorageEngine {
             let task = crate::compaction::metadata::CompactionTask {
                 inputs,
                 output_dir: self.config.compaction.output_dir.join(table_id.to_string()),
-                schema: state.schema.clone(),
+                schema: TableSchema::clone(&state.schema()),
                 table_id: table_id.clone(),
                 purge,
             };
@@ -12147,7 +12236,7 @@ impl StorageEngine {
 
         let metadata = self.collect_sstable_metadata(table_id, state);
         let strategy = self.strategy_for_table(state);
-        let mut tasks = strategy.select(&metadata, &state.schema, table_id);
+        let mut tasks = strategy.select(&metadata, &state.schema(), table_id);
         // Independent of the size-tier strategy: legacy-format SSTables (bounds
         // not byte-comparable) store rows in an order the streaming read path
         // mis-handles and are never picked by size bucketing, so they linger and
@@ -12168,7 +12257,7 @@ impl StorageEngine {
             .collect();
         let rewrites = crate::compaction::strategy::legacy_rewrite_tasks(
             &uncovered_legacy,
-            &state.schema,
+            &state.schema(),
             table_id,
             &self.config.compaction.output_dir,
             max_inputs,
@@ -12209,7 +12298,7 @@ impl StorageEngine {
             self.config.compaction.max_threshold,
             self.runtime_tuning.max_compaction_inputs_per_task,
         );
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         let mut accepted = 0_usize;
         for (table_id, state) in tables.iter() {
             if state.store.sstable_count() < min_inputs {
@@ -12229,7 +12318,7 @@ impl StorageEngine {
     /// Tables with `compaction.class` containing "Unified" or "UCS" use the
     /// Unified Compaction Strategy. All others default to STCS.
     fn strategy_for_table(&self, state: &TableState) -> Box<dyn CompactionStrategy> {
-        let extensions = &state.schema.extensions;
+        let extensions = &state.schema().extensions;
         let class = extensions.get("compaction.class").map(|s| s.as_str());
         match class {
             Some(c) if c.contains("Unified") || c.contains("UCS") => {
@@ -12274,7 +12363,7 @@ impl StorageEngine {
         if !compaction_purge_enabled() {
             return None;
         }
-        let gc_grace = match state.schema.gc_grace_seconds() {
+        let gc_grace = match state.schema().gc_grace_seconds() {
             Ok(Some(seconds)) => seconds,
             Ok(None) => return None,
             Err(reason) => {
@@ -12321,10 +12410,10 @@ impl StorageEngine {
 
     /// Returns the total pinned bytes for a table from its tracked list.
     fn compute_pinned_bytes(&self, table_id: &TableId) -> i64 {
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         tables
             .get(table_id)
-            .map(|s| s.pinned_sstables.iter().map(|(_, b)| *b as i64).sum())
+            .map(|s| s.pin.load().total_bytes() as i64)
             .unwrap_or(0)
     }
 
@@ -12555,47 +12644,33 @@ impl StorageEngine {
             .join("sstables")
             .join(table_id.to_string());
 
+        let Some(state) = self.table_state(table_id) else {
+            return 0;
+        };
+        // Each eviction takes exactly one SSTable off the tracked list, so the
+        // list's length bounds the loop.
+        let bound = state.pin.load().sstables.len();
         let mut evictions = 0usize;
-        loop {
-            // Re-check under write lock each iteration.
-            let evict_id = {
-                let tables = self.tables.read();
-                let state = match tables.get(table_id) {
-                    Some(s) => s,
-                    None => break,
+        for _ in 0..bound {
+            // Decide and apply on one snapshot: over the cap, take the oldest
+            // (front of the list) off it. A concurrent pin change makes the
+            // compare-and-swap retry against the newer list.
+            let evicted = crate::lockfree::update(&state.pin, "table pin", |pin| {
+                let Some(max) = pin.config.as_ref().and_then(|c| c.max_bytes) else {
+                    return (None, None); // No cap — nothing to enforce.
                 };
-                let max = match state.pin_config.as_ref().and_then(|c| c.max_bytes) {
-                    Some(m) => m,
-                    None => break, // No cap — nothing to enforce.
-                };
-                let total: u64 = state.pinned_sstables.iter().map(|(_, b)| *b).sum();
-                if total <= max {
-                    break;
+                if pin.total_bytes() <= max || pin.sstables.is_empty() {
+                    return (None, None);
                 }
-                // Evict oldest (front of Vec).
-                state.pinned_sstables.first().map(|(id, _)| id.clone())
-            };
-
-            let evict_id = match evict_id {
-                Some(id) => id,
-                None => break,
-            };
-
-            // Remove from tracking and accumulate bytes delta.
-            let evicted_bytes = {
-                let mut tables = self.tables.write();
-                let state = match tables.get_mut(table_id) {
-                    Some(s) => s,
-                    None => break,
-                };
-                if let Some(pos) = state
-                    .pinned_sstables
-                    .iter()
-                    .position(|(id, _)| *id == evict_id)
-                {
-                    let (_, bytes) = state.pinned_sstables.remove(pos);
-                    bytes
-                } else {
+                let mut next = pin.clone();
+                let oldest = next.sstables.remove(0);
+                (Some(next), Some(oldest))
+            });
+            let (evict_id, evicted_bytes) = match evicted {
+                Ok(Some(oldest)) => oldest,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, "pin cap not enforced: the pin list stayed contended");
                     break;
                 }
             };
@@ -12685,7 +12760,7 @@ impl StorageEngine {
     /// checks this first instead of mistaking the refusal for a miss.
     pub fn declares_index(&self, table_id: &TableId, index_name: &str) -> bool {
         self.tables
-            .read()
+            .load()
             .get(table_id)
             .is_some_and(|state| state.store.secondary_index_declared(index_name))
     }
@@ -12700,7 +12775,7 @@ impl StorageEngine {
         index_name: &str,
     ) -> Vec<bool> {
         self.tables
-            .read()
+            .load()
             .get(table_id)
             .map(|state| state.store.sidecar_backings_for_test(index_name))
             .unwrap_or_default()
@@ -12866,7 +12941,7 @@ impl StorageEngine {
     /// table key (`TableId::to_string`). Tables never read are absent.
     fn last_foreground_reads(&self) -> HashMap<String, std::time::SystemTime> {
         self.tables
-            .read()
+            .load()
             .iter()
             .filter_map(|(id, state)| Some((id.to_string(), state.last_foreground_read()?)))
             .collect()
@@ -13142,10 +13217,10 @@ impl StorageEngine {
         // Pinned tables are excluded: their SSTables must not be uploaded
         // until the pin is removed via update_table_pin_config().
         let table_dirs: Vec<(String, std::path::PathBuf)> = {
-            let tables = self.tables.read();
+            let tables = self.tables.load();
             tables
                 .iter()
-                .filter(|(_, state)| state.pin_config.is_none())
+                .filter(|(_, state)| !state.is_pinned())
                 .map(|(id, _)| {
                     let dir = self.config.data_dir.join("sstables").join(id.to_string());
                     (id.to_string(), dir)
@@ -14308,7 +14383,7 @@ impl StorageEngine {
 
         // Binding from here: a flush of this table that starts after this
         // point is guaranteed a generation past `promoted_gen`.
-        if let Some(state) = self.tables.read().get(table_id) {
+        if let Some(state) = self.tables.load().get(table_id) {
             state.store.advance_gen_past(promoted_gen);
         }
 
@@ -14790,7 +14865,7 @@ impl StorageEngine {
             durable_local,
         );
 
-        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let tables: SharedTables = Arc::new(ArcSwap::from_pointee(TableMap::new()));
         let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
@@ -14880,7 +14955,7 @@ impl StorageEngine {
 
         // Collect table info under the lock, then drop it before async work.
         let table_dirs: Vec<(String, std::path::PathBuf)> = {
-            let tables = self.tables.read();
+            let tables = self.tables.load();
             tables
                 .keys()
                 .map(|tid| {
@@ -14969,9 +15044,8 @@ impl StorageEngine {
 
         // Schema snapshot — collect under lock, drop before await.
         let schema_json = {
-            let tables = self.tables.read();
-            let schemas: Vec<&TableSchema> = tables.values().map(|s| &s.schema).collect();
-            serde_json::to_vec_pretty(&schemas).unwrap_or_default()
+            let tables = self.tables.load();
+            serde_json::to_vec_pretty(&StorageSchemaView(&tables)).unwrap()
         };
         crate::manifest::save_schema_snapshot(store.as_ref(), prefix, &schema_json)
             .await
@@ -14985,7 +15059,7 @@ impl StorageEngine {
 
 impl crate::virtual_tables::StorageStatsProvider for StorageEngine {
     fn collect_stats(&self) -> Vec<crate::virtual_tables::StorageStats> {
-        let tables = self.tables.read();
+        let tables = self.tables.load();
         tables
             .iter()
             .map(|(table_id, state)| {
@@ -15647,7 +15721,7 @@ mod tests {
     ) -> Option<usize> {
         engine
             .tables
-            .read()
+            .load()
             .get(table_id)?
             .store
             .indexed_columns()
@@ -19383,9 +19457,9 @@ mod tests {
         engine
             .write(&tid, &make_key("soft"), make_row(b"data", 1000), 1000)
             .unwrap();
-        let current_size = engine.tables.read()[&tid].store.memtable_size() as u64;
+        let current_size = engine.tables.load()[&tid].store.memtable_size() as u64;
         engine.config.memtable_backpressure_bytes = current_size.saturating_mul(2).max(2);
-        engine.tables.read()[&tid]
+        engine.tables.load()[&tid]
             .in_write_soft_zone
             .store(true, Ordering::Relaxed);
         engine.soft_pressure_table_count.store(1, Ordering::Relaxed);
@@ -19415,9 +19489,9 @@ mod tests {
         engine
             .write(&tid, &make_key("soft"), make_row(b"data", 1000), 1000)
             .unwrap();
-        let current_size = engine.tables.read()[&tid].store.memtable_size() as u64;
+        let current_size = engine.tables.load()[&tid].store.memtable_size() as u64;
         engine.config.memtable_backpressure_bytes = current_size.saturating_mul(2).max(2);
-        engine.tables.read()[&tid]
+        engine.tables.load()[&tid]
             .in_write_soft_zone
             .store(true, Ordering::Relaxed);
         engine.soft_pressure_table_count.store(1, Ordering::Relaxed);
@@ -20652,7 +20726,7 @@ mod tests {
         // is PRODUCED — but not yet swapped in (poll_compactions applies the swap
         // and deletes the inputs; we control exactly when that happens).
         {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -20775,7 +20849,7 @@ mod tests {
 
         // Submit a compaction merging gen1+gen2; control when the swap applies.
         {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -20874,7 +20948,7 @@ mod tests {
         // Submit a compaction merging gen1+gen2; control exactly when the swap
         // (view -> merged, input files deleted) is applied via poll_compactions.
         {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -21082,7 +21156,7 @@ mod tests {
 
         // Submit a compaction merging gen1+gen2; control when the swap applies.
         {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -22858,6 +22932,182 @@ mod tests {
         engine.shutdown().unwrap();
     }
 
+    /// A secondary-index stream whose consumer stops pulling must not stall
+    /// schema changes.
+    ///
+    /// `read_by_index_stream_after` walks the index on a blocking worker and
+    /// hands partitions through a bounded channel. The walk ran under the
+    /// engine-wide `tables` read guard, so once the consumer paused, the
+    /// producer slept in `blocking_send` holding it. The next raft
+    /// `register_table` queued for the write lock, and because `parking_lot`
+    /// prefers writers, every later reader queued behind it, including
+    /// the consumer's own schema lookups. On 2026-10-03 that wedged node2 of the
+    /// memory cluster: 24 threads parked on the lock, raft apply stopped, and
+    /// node1 answered every CQL request with `request backpressure`
+    /// (t_d938e6ae).
+    #[test]
+    fn a_paused_index_stream_does_not_block_table_registration() {
+        use ferrosa_index::IndexKey;
+        use futures::StreamExt;
+
+        const ROWS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine
+            .register_table_with_indexes(test_schema(), vec![("val_idx".to_string(), 0_usize)])
+            .unwrap();
+        let tid = table_id();
+        for i in 0..ROWS {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("user{i}")),
+                    make_row(b"alice", 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        // Take one row and keep the stream open: the producer fills the
+        // bounded channel and parks, as it does behind a paused CQL page.
+        let mut stream = runtime.block_on(async {
+            engine.read_by_index_stream(&tid, "val_idx", &IndexKey(b"alice".to_vec()))
+        });
+        let first = runtime.block_on(stream.next());
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "the stream yields its first row: {first:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let ddl_engine = Arc::clone(&engine);
+        let ddl = std::thread::spawn(move || {
+            let mut other = test_schema();
+            other.table = "other_table".to_string();
+            let result = ddl_engine.register_table(other);
+            done_tx.send(result.is_ok()).unwrap();
+        });
+        let registered = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+
+        // Release the producer before asserting, so a failure reports
+        // instead of leaving the DDL thread parked forever.
+        drop(stream);
+        ddl.join().unwrap();
+        assert_eq!(
+            registered,
+            Ok(true),
+            "register_table must not wait on a paused index stream: the stream's \
+             producer may not hold the engine-wide tables guard across a blocking send"
+        );
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        engine.shutdown().unwrap();
+    }
+
+    /// DROP TABLE no longer waits for the table's readers: it used to, by
+    /// taking the table-map write lock, which is the wait that wedged node2
+    /// (t_d938e6ae). A reader still holding the dropped table therefore
+    /// races the directory delete. It may finish or fail, loudly — never
+    /// return a short answer as `Ok`. And nothing it does may put files back
+    /// into the directory a re-created table of the same name now owns.
+    #[test]
+    fn a_reader_of_a_dropped_table_fails_loud_and_resurrects_nothing() {
+        use ferrosa_index::IndexKey;
+        use futures::StreamExt;
+
+        const ROWS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        let indexes = vec![("val_idx".to_string(), 0_usize)];
+        engine
+            .register_table_with_indexes(test_schema(), indexes.clone())
+            .unwrap();
+        let tid = table_id();
+        for i in 0..ROWS {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("user{i}")),
+                    make_row(b"alice", 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = runtime.block_on(async {
+            engine.read_by_index_stream(&tid, "val_idx", &IndexKey(b"alice".to_vec()))
+        });
+        let first = runtime.block_on(stream.next());
+        assert!(matches!(first, Some(Ok(_))), "first row: {first:?}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let ddl_engine = Arc::clone(&engine);
+        let ddl_tid = tid.clone();
+        let drop_thread = std::thread::spawn(move || {
+            done_tx
+                .send(
+                    ddl_engine
+                        .unregister_table(&ddl_tid)
+                        .map_err(|e| e.to_string()),
+                )
+                .unwrap();
+        });
+        let dropped = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let drained = if dropped.is_ok() {
+            engine
+                .register_table_with_indexes(test_schema(), indexes)
+                .unwrap();
+            runtime.block_on(async {
+                let mut items = Vec::new();
+                while let Some(item) = stream.next().await {
+                    items.push(item.map(|_| ()).map_err(|e| e.to_string()));
+                }
+                items
+            })
+        } else {
+            drop(stream);
+            Vec::new()
+        };
+        drop_thread.join().unwrap();
+        assert_eq!(
+            dropped,
+            Ok(Ok(())),
+            "DROP TABLE must not wait for a paused reader of the table"
+        );
+
+        let delivered = 1 + drained.iter().filter(|item| item.is_ok()).count();
+        let failed = drained.iter().any(Result::is_err);
+        assert!(
+            failed || delivered == ROWS,
+            "a reader racing DROP TABLE returned {delivered} of {ROWS} rows and no error: \
+             a short answer reported as complete ({drained:?})"
+        );
+        let recreated = engine.read_range(&tid, None, None, 1_000).unwrap();
+        assert!(
+            recreated.is_empty(),
+            "the re-created table must start empty, found {} partitions",
+            recreated.len()
+        );
+        assert_eq!(engine.sstable_count(&tid), 0);
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        engine.shutdown().unwrap();
+    }
+
     #[test]
     fn sidecar_survives_table_reregistration() {
         use ferrosa_index::IndexKey;
@@ -23380,7 +23630,7 @@ mod tests {
             .unwrap();
         let gens = engine
             .tables
-            .read()
+            .load()
             .get(&tid)
             .unwrap()
             .store
@@ -23458,7 +23708,7 @@ mod tests {
         }
         let gens = engine
             .tables
-            .read()
+            .load()
             .get(&tid)
             .unwrap()
             .store
@@ -23922,7 +24172,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(engine.sstable_count(&tid), 1, "compaction must swap in");
-        let tables = engine.tables.read();
+        let tables = engine.tables.load();
         let state = tables.get(&tid).unwrap();
         engine.collect_sstable_metadata(&tid, state)[0].partition_count
     }
@@ -24099,7 +24349,7 @@ mod tests {
         );
 
         {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -25062,7 +25312,7 @@ mod tests {
         // Manually submit a compaction task.
         {
             let compaction_output_dir = dir.path().join("compaction").join(tid.to_string());
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -25363,7 +25613,7 @@ mod tests {
         let tid_str = tid.to_string();
 
         let input_metadata = {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             engine.collect_sstable_metadata(&tid, state)
         };
@@ -25505,7 +25755,7 @@ mod tests {
 
         // Submit a compaction task manually.
         {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -25584,7 +25834,7 @@ mod tests {
 
         let tid_str = tid.to_string();
         let input_ids: Vec<String> = {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             engine
                 .collect_sstable_metadata(&tid, state)
@@ -26031,7 +26281,7 @@ mod tests {
         let pre_generations = StorageEngine::scan_generations(&sstable_dir);
 
         let input_component_paths: Vec<std::path::PathBuf> = {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let inputs = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -26181,7 +26431,7 @@ mod tests {
         let engine = Arc::new(engine);
         let ticket = engine.compaction_executor.submission_ticket(&tid).unwrap();
         let stale = {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             crate::compaction::metadata::CompactionTask {
                 inputs: engine.collect_sstable_metadata(&tid, state),
@@ -26444,7 +26694,7 @@ mod tests {
         let pre_generations = StorageEngine::scan_generations(&sstable_dir);
 
         let input_component_paths: Vec<std::path::PathBuf> = {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let inputs = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -26699,7 +26949,7 @@ mod tests {
         engine.flush(&tid).unwrap();
 
         let (input_a, input_b) = {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let mut metadata = engine.collect_sstable_metadata(&tid, state);
             metadata.sort_by_key(|m| m.id.parse::<u64>().unwrap());
@@ -26709,7 +26959,7 @@ mod tests {
         // B first: the crash seam below retires whichever input is first.
         let inputs = vec![input_b.clone(), input_a.clone()];
         let purge = {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             engine.purge_policy_for(&tid, state, &inputs)
         };
@@ -27203,7 +27453,7 @@ mod tests {
 
         // ── Step 2: compact and upload to MinIO ──
         {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -27541,11 +27791,11 @@ mod tests {
         }
 
         {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             let strategy = engine.strategy_for_table(state);
-            let selected = strategy.select(&metadata, &state.schema, &tid);
+            let selected = strategy.select(&metadata, &state.schema(), &tid);
             assert_eq!(
                 selected.len(),
                 1,
@@ -28549,7 +28799,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !engine.install_table_state_if_absent(table_id.clone(), late_state),
+            !engine
+                .install_table_state_if_absent(&table_id, late_state)
+                .unwrap(),
             "a late registration must not replace an already-live table"
         );
 
@@ -29161,14 +29413,16 @@ mod tests {
         std::fs::create_dir_all(&table_dir).unwrap();
 
         let schema = test_schema();
-        let mut store = TableStore::new(
+        let store = TableStore::new(
             schema.clone(),
             FileFlushTarget::new_starting_at(table_dir).unwrap(),
             write_options_for_schema(&schema, true).unwrap(),
         );
         // Register a non-BTree (Phonetic) index on column 0, exactly as the DDL
         // path does, so the store can report its real type.
-        store.add_index("val_phonetic_idx".to_string(), 0, IndexType::Phonetic);
+        let _rotation: FlushOutcome = store
+            .add_index("val_phonetic_idx".to_string(), 0, IndexType::Phonetic)
+            .unwrap();
 
         // The eager helper now RESOLVES the target SSTable's header (fail-closed
         // ordinal contract), so the job must reference a real, readable SSTable
@@ -33369,6 +33623,74 @@ mod tests {
         );
     }
 
+    /// A burst of queries that all find the same SSTables without a sidecar
+    /// builds each sidecar ONCE. This was a per-table `Mutex` that made every
+    /// query wait for every build; it is now a per-sidecar claim, and a query
+    /// that finds a build in flight scans instead of waiting (t_d938e6ae).
+    #[test]
+    fn concurrent_fts_sidecar_builds_build_each_sidecar_once() {
+        const SSTABLES: usize = 4;
+        const ROWS: usize = 400;
+        const QUERIES: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+        (0..SSTABLES).for_each(|s| {
+            (0..ROWS).for_each(|r| {
+                let body = format!("alpha beta gamma delta row{s}x{r} epsilon zeta eta theta");
+                engine
+                    .write(
+                        &tid,
+                        &make_key(&format!("doc{s}-{r:04}")),
+                        make_row(body.as_bytes(), 1),
+                        1,
+                    )
+                    .unwrap();
+            });
+            engine.flush(&tid).unwrap();
+        });
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let sidecars = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.to_string_lossy().ends_with("-FTI-idx_body.db"))
+                .collect()
+        };
+        sidecars(&table_dir)
+            .into_iter()
+            .for_each(|path| std::fs::remove_file(path).unwrap());
+
+        let state = engine.require_table(&tid).unwrap();
+        let start = std::sync::Barrier::new(QUERIES);
+        let outcomes: Vec<crate::store::FulltextSidecarOutcome> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..QUERIES)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let build = state.store.plan_missing_fulltext_sidecars("idx_body");
+                        start.wait();
+                        build.run()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let built: usize = outcomes.iter().map(|o| o.built).sum();
+        let failed: usize = outcomes.iter().map(|o| o.failed).sum();
+        assert_eq!(failed, 0, "{outcomes:?}");
+        assert_eq!(
+            built, SSTABLES,
+            "each uncovered SSTable's sidecar must be built exactly once: {outcomes:?}"
+        );
+        assert_eq!(sidecars(&table_dir).len(), SSTABLES);
+        engine.shutdown().unwrap();
+    }
+
     /// Concurrent writes + flushes + compaction — reproduces the loadgen data loss.
     #[tokio::test]
     async fn concurrent_write_flush_compact_no_data_loss() {
@@ -33973,7 +34295,7 @@ mod tests {
         // Submit a compaction merging the two flush SSTables.
         {
             let compaction_output_dir = dir.path().join("compaction");
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);
@@ -34033,7 +34355,7 @@ mod tests {
 
         let compaction_output_dir = dir.path().join("compaction");
         {
-            let tables = engine.tables.read();
+            let tables = engine.tables.load();
             let state = tables.get(&tid).unwrap();
             let metadata = engine.collect_sstable_metadata(&tid, state);
             drop(tables);

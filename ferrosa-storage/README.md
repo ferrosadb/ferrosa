@@ -33,8 +33,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   (`Batch`, `Periodic`, `Group`); **default is `Periodic`** → a bounded
   durability window (see FMEA).
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
-  memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`. Flush is
-  serialized by a per-table `Mutex`; reads/writes are never blocked. Optional
+  memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`, and
+  every view change is a compare-and-swap derived from the current view.
+  Memtable rotations (flush, index DDL, ALTER, TRUNCATE) run one at a time
+  through a lock-free queue that one caller runs for everyone; reads and
+  writes are never blocked. Optional
   `write_verify` self-readback after every flush. The durability barrier
   (`fsync_components`) fsyncs a generation's component files **concurrently** on
   a shared, bounded flush pool (`flush_executor`, a rayon `ThreadPool` whose
@@ -44,6 +47,46 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   component fsync failure fails loud without the directory fsync. The pool caps
   concurrency across *all* concurrent flushes, so flush parallelism is a
   capacity-aware knob rather than a per-flush thread count.
+
+  **The table registry and index DDL take no lock (t_d938e6ae).** The engine's
+  table map is `Arc<ArcSwap<HashMap<TableId, Arc<TableState>>>>`: readers
+  `load()` it and clone a table's `Arc` out before any callback, blocking send
+  or long scan; registration and DROP install a new map with a bounded
+  compare-and-swap (`lockfree::update`, which fails loud after 1,000 lost
+  races instead of spinning). It used to be a `parking_lot::RwLock`; on
+  2026-10-03 an index-stream producer parked in `blocking_send` holding the read
+  guard, a raft `register_table` queued for the write guard, writer preference
+  parked every later reader, and node2 deadlocked. A table's index declarations
+  are one immutable `IndexCatalog` bound to the memtable it was created with.
+  Index DDL (`add_index*`, `remove_index`, `add_*_index`) and `ALTER`
+  (`update_schema`) take `&self` and **rotate the memtable**: the frozen one is
+  flushed with sidecars for the new catalog (its own postings, or postings built
+  from its now-immutable rows for an index the DDL added), and the new one
+  starts empty under the new catalog and schema. So a memtable's postings are
+  exactly its flushed sidecars by construction
+  (`index_postings_equal_flushed_sidecars_under_racing_ddl_and_flush`). Every
+  store flush, rotations included, runs the engine's post-flush bookkeeping
+  (`StorageEngine::finish_flush`: index tracker, pin cap, commit-log checkpoint).
+  A table's NVMe pin is one `ArcSwap<PinState>`. DROP TABLE no longer waits for
+  the table's readers; a reader racing it finishes or fails loud, and
+  `TableStore::retire` stops any later flush of the dropped store from writing
+  into the deleted directory.
+
+  **No per-table lock either.** Writers enter a memtable through its
+  `WriteGate` (one atomic word: sealed bit + writers inside); a flush publishes
+  the next memtable, seals the old gate and waits only for writes already
+  inside, and a writer that meets a sealed gate writes to the new memtable
+  instead of waiting. Every `StoreView` change (flush install, compaction
+  swap, sidecar install) is a compare-and-swap (`TableStore::update_view`), so
+  a compaction swap never waits on a flush and none overwrites another; the
+  sidecar install used to be a blind store that could drop a just-flushed
+  SSTable from the view. Rotations go through `TableStore::rotate`: requests
+  queue on a channel, whichever caller wins a compare-and-swap flag runs the
+  queue in order, and requests queued together are one rotation. The
+  quarantine sets, vector-index scopes and FTI build claims are `ArcSwap`
+  values changed by compare-and-swap (`lockfree::SharedSet`); an FTI build is
+  single-flight per sidecar, and a query that finds one in flight scans that
+  SSTable instead of waiting.
 
   **Publication safety — verify before promote (`publication-safety.md` M2):**
   `FileFlushTarget::flush_files` (used by both flush and compaction promotion)
