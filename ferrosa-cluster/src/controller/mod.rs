@@ -956,6 +956,15 @@ impl ModeController {
         self.hint_store.clone()
     }
 
+    /// Replace the set of connected peers without a network handshake.
+    ///
+    /// **Test helper**, like [`Self::set_mode_for_test`]: lets external-crate
+    /// tests state which members are up for checks that read it (the operator
+    /// downgrade). Production code must never call this.
+    pub fn set_connected_peers_for_test(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        *self.connected_peers.lock() = peers;
+    }
+
     /// Override the deployment mode without performing a real cluster transition.
     ///
     /// This is a **test helper**: it directly replaces the stored mode so that

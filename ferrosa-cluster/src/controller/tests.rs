@@ -4340,135 +4340,14 @@ fn cluster_mode_controller(dir: &std::path::Path) -> Arc<ModeController> {
     controller
 }
 
-/// Refused when there is no peer to replicate to.
-///
-/// This is the refusal that keeps the command honest. Pair mode replicates to
-/// exactly one peer; declaring it with nothing connected would leave a node that
-/// reports "pair" and has nowhere to send a write, which is worse than refusing.
-#[test]
-fn downgrade_to_pair_is_refused_with_no_connected_peer() {
-    let dir = tempfile::tempdir().unwrap();
-    let controller = cluster_mode_controller(dir.path());
-    assert!(controller.connected_peers.lock().is_empty());
-
-    let err = controller
-        .downgrade_to_pair(Some(Uuid::new_v4()))
-        .expect_err("no connected peer must be refused");
-
-    let msg = err.to_string();
-    assert!(
-        msg.contains("connected peer"),
-        "the refusal must name the missing peer, got: {msg}"
-    );
-    assert_eq!(
-        controller.mode(),
-        DeploymentMode::Cluster,
-        "a refused downgrade must leave the node untouched"
-    );
-}
-
-/// Succeeds for a committed cluster with a connected peer, and it is the MODE
-/// that moves -- not merely the reported string.
-///
-/// The automatic state machine forbids `Cluster -> Pair`, which is exactly why
-/// this needs an operator override: without lifting that one check the action
-/// could not exist at all. Asserting the mode after the call is what separates
-/// "the operator authorised it" from "the override silently did nothing".
-/// Async: the pair transition installs handlers and spawns its reverse-pool
-/// task, so it needs a reactor -- the same reason the neighbouring
-/// `on_peer_connected` tests are `#[tokio::test]`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn downgrade_to_pair_moves_a_cluster_member_when_a_peer_is_connected() {
-    let dir = tempfile::tempdir().unwrap();
-    let controller = cluster_mode_controller(dir.path());
-    let peer = Uuid::new_v4();
-    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.connected_peers.lock().push((peer, addr));
-
-    let peer_host_id = controller
-        .downgrade_to_pair(Some(peer))
-        .expect("a cluster with a connected peer must accept an operator downgrade");
-
-    assert_eq!(
-        peer_host_id, peer,
-        "the returned peer is the replication target"
-    );
-    assert_eq!(
-        controller.mode(),
-        DeploymentMode::Pair,
-        "the operator override must actually move the mode"
-    );
-}
-
-/// Refused without a NAMED peer (P0-5).
-///
-/// The old action paired with `connected_peers.first()`: whichever peer
-/// happened to connect first became the sole replication target. An operator
-/// must name the peer; "any connected peer" is not a decision.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn downgrade_to_pair_is_refused_without_a_named_peer() {
-    let dir = tempfile::tempdir().unwrap();
-    let controller = cluster_mode_controller(dir.path());
-    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller
-        .connected_peers
-        .lock()
-        .push((Uuid::new_v4(), addr));
-
-    let err = controller
-        .downgrade_to_pair(None)
-        .expect_err("a downgrade that names no peer must be refused");
-
-    assert!(
-        err.to_string().contains("named peer"),
-        "the refusal must say a named peer is required, got: {err}"
-    );
-    assert_eq!(controller.mode(), DeploymentMode::Cluster);
-}
-
-/// Refused when the named peer is not the one connected (P0-5).
-///
-/// Before the fix the first connected peer was used regardless of what the
-/// operator meant, so naming B while only A was connected paired with A.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn downgrade_to_pair_is_refused_when_the_named_peer_is_not_connected() {
-    let dir = tempfile::tempdir().unwrap();
-    let controller = cluster_mode_controller(dir.path());
-    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller
-        .connected_peers
-        .lock()
-        .push((Uuid::new_v4(), addr));
-
-    let named = Uuid::new_v4();
-    let err = controller
-        .downgrade_to_pair(Some(named))
-        .expect_err("a named peer that is not connected must be refused");
-
-    assert!(
-        err.to_string().contains(&named.to_string()),
-        "the refusal must name the requested peer, got: {err}"
-    );
-    assert_eq!(controller.mode(), DeploymentMode::Cluster);
-}
-
-/// Refused while the token ring still holds members other than this node and
-/// the named peer (P0-5).
-///
-/// A pair replicates to exactly one peer. If a third node still owns tokens,
-/// it is still a replica serving ranges this node would now write without it:
-/// that is the split brain the review found.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn downgrade_to_pair_is_refused_while_the_ring_has_other_members() {
-    let dir = tempfile::tempdir().unwrap();
-    let controller = cluster_mode_controller(dir.path());
-    let peer = Uuid::new_v4();
-    let third = Uuid::new_v4();
-    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.connected_peers.lock().push((peer, addr));
-
+/// Install a committed ring holding this node, `peer`, and `others`, one token
+/// each. Whether a member is up is decided by `connected_peers`, not the ring.
+fn install_downgrade_ring(controller: &ModeController, peer: Uuid, others: &[Uuid]) {
     let mut ring = crate::ring::TokenRing::new();
-    for (host_id, token) in [(controller.host_id(), 10), (peer, 20), (third, 30)] {
+    let members = [controller.host_id(), peer]
+        .into_iter()
+        .chain(others.iter().copied());
+    for (i, host_id) in members.enumerate() {
         let node_id = crate::raft::uuid_to_node_id(host_id);
         ring.add_node(
             node_id,
@@ -4481,18 +4360,163 @@ async fn downgrade_to_pair_is_refused_while_the_ring_has_other_members() {
                 cql_broadcast: None,
             },
         );
-        ring.assign_tokens(node_id, &[token]);
+        ring.assign_tokens(node_id, &[(i as i64 + 1) * 10]);
     }
     controller.set_token_ring(Arc::new(ring));
+}
+
+fn connect(controller: &ModeController, peer: Uuid) {
+    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    controller.connected_peers.lock().push((peer, addr));
+}
+
+// Ben's rule (t_ad872ac7): "to become a pair an operator needs to bring one
+// node down then do a downgrade — friction is the point." The allowed path is
+// exactly: a member is DOWN, every other member except the named peer is DOWN,
+// the named peer is connected, and the operator runs the downgrade naming it.
+// Each test below is one shortcut that must be refused, plus the allowed path.
+
+/// Allowed path: a third member is down, the named peer is connected, the
+/// operator downgrades naming it. The MODE moves and the pair machinery is in
+/// place. Async: the pair transition spawns its reverse-pool task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_succeeds_after_a_node_is_brought_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let peer = Uuid::new_v4();
+    let down = Uuid::new_v4();
+    install_downgrade_ring(&controller, peer, &[down]);
+    connect(&controller, peer);
+
+    let paired_with = controller
+        .downgrade_to_pair(Some(peer))
+        .await
+        .expect("node down + explicit named downgrade must be accepted");
+
+    assert_eq!(
+        paired_with, peer,
+        "the named peer is the replication target"
+    );
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "the operator downgrade must actually move the mode"
+    );
+}
+
+/// Shortcut: no peer named. The old action paired with
+/// `connected_peers.first()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_without_a_named_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let peer = Uuid::new_v4();
+    install_downgrade_ring(&controller, peer, &[Uuid::new_v4()]);
+    connect(&controller, peer);
+
+    let err = controller
+        .downgrade_to_pair(None)
+        .await
+        .expect_err("a downgrade that names no peer must be refused");
+
+    assert!(err.to_string().contains("named peer"), "{err}");
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+}
+
+/// Shortcut: the named peer is not connected (no peer to replicate to).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_with_no_connected_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let peer = Uuid::new_v4();
+    install_downgrade_ring(&controller, peer, &[Uuid::new_v4()]);
 
     let err = controller
         .downgrade_to_pair(Some(peer))
-        .expect_err("a ring with a third member must be refused");
+        .await
+        .expect_err("no connected peer must be refused");
+
+    assert!(err.to_string().contains("connected peer"), "{err}");
+    assert!(err.to_string().contains(&peer.to_string()), "{err}");
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+}
+
+/// Shortcut: no node has been brought down. Every member is still up, so a
+/// one-step cluster->pair would leave a live replica the pair writes past.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_while_no_node_is_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let peer = Uuid::new_v4();
+    let third = Uuid::new_v4();
+    install_downgrade_ring(&controller, peer, &[third]);
+    connect(&controller, peer);
+    connect(&controller, third);
+
+    let err = controller
+        .downgrade_to_pair(Some(peer))
+        .await
+        .expect_err("a downgrade with every member up must be refused");
 
     assert!(
-        err.to_string().contains(&third.to_string()),
-        "the refusal must name the member still in the ring, got: {err}"
+        err.to_string().contains("still up") && err.to_string().contains(&third.to_string()),
+        "the refusal must name the member that is still up, got: {err}"
     );
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+}
+
+/// Shortcut: the ring is just this node and the peer, so no node was brought
+/// down at all. Friction is the point: the operator takes a node down first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_when_no_member_was_taken_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let peer = Uuid::new_v4();
+    install_downgrade_ring(&controller, peer, &[]);
+    connect(&controller, peer);
+
+    let err = controller
+        .downgrade_to_pair(Some(peer))
+        .await
+        .expect_err("a downgrade with no member down must be refused");
+
+    assert!(err.to_string().contains("bring one node down"), "{err}");
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+}
+
+/// Shortcut: a downgrade with no committed cluster membership to check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_without_cluster_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let peer = Uuid::new_v4();
+    connect(&controller, peer);
+
+    let err = controller
+        .downgrade_to_pair(Some(peer))
+        .await
+        .expect_err("no committed ring must be refused");
+
+    assert!(err.to_string().contains("token ring"), "{err}");
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+}
+
+/// Shortcut: the named peer is not a cluster member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_when_the_named_peer_is_not_a_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let member = Uuid::new_v4();
+    install_downgrade_ring(&controller, member, &[Uuid::new_v4()]);
+    let stranger = Uuid::new_v4();
+    connect(&controller, stranger);
+
+    let err = controller
+        .downgrade_to_pair(Some(stranger))
+        .await
+        .expect_err("a peer outside the ring must be refused");
+
+    assert!(err.to_string().contains("not a cluster member"), "{err}");
     assert_eq!(controller.mode(), DeploymentMode::Cluster);
 }
 

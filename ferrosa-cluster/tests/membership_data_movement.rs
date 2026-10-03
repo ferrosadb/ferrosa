@@ -99,39 +99,113 @@ fn build_controller(dir: &std::path::Path, local_id: uuid::Uuid) -> Arc<ModeCont
     controller
 }
 
-/// P0-5: an operator downgrade is refused while this node still runs Raft.
-///
-/// While Raft runs the node is a voter and a replica. Installing the pair
-/// write path on top lets it commit point-to-point writes a quorum never saw,
-/// while the rest of the cluster still counts it: split brain. There is no
-/// supported way to stop Raft and shrink membership to the named peer yet, so
-/// the action must refuse rather than pretend.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn downgrade_to_pair_is_refused_while_raft_is_running() {
+/// A controller in cluster mode on a live single-voter Raft group, with a
+/// committed ring of {this node, `peer`, `others`}, `peer` connected, and a
+/// peer manager installed (the pair transition needs one).
+async fn downgrade_setup(
+    others: &[uuid::Uuid],
+    connected: &[uuid::Uuid],
+) -> (
+    TestCluster,
+    Arc<ModeController>,
+    uuid::Uuid,
+    tempfile::TempDir,
+) {
     let cluster = TestCluster::with_voters(1).await;
     cluster
         .wait_for_leader(Duration::from_secs(10))
         .await
         .expect("single-voter leader");
-    let raft = cluster.leader_node().raft.clone();
-
     let dir = tempfile::tempdir().unwrap();
     let controller = build_controller(dir.path(), uuid::Uuid::new_v4());
     controller.set_mode_for_test(ferrosa_common::deployment_mode::DeploymentMode::Cluster);
-    controller.set_raft_for_dc("dc1", raft);
+    controller.set_raft_for_dc("dc1", cluster.leader_node().raft.clone());
+    let pm = Arc::new(ferrosa_net::peer::PeerManager::new(
+        Arc::new(NetConfig::default()),
+        controller.host_id(),
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    let peer = uuid::Uuid::new_v4();
+    let mut ring = TokenRing::new();
+    let members = [controller.host_id(), peer]
+        .into_iter()
+        .chain(others.iter().copied());
+    for (i, host) in members.enumerate() {
+        let id = uuid_to_node_id(host);
+        ring.add_node(id, member(host));
+        ring.assign_tokens(id, &[(i as i64 + 1) * 100]);
+    }
+    controller.set_token_ring(Arc::new(ring));
+    let addr: std::net::SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    let up = std::iter::once(peer)
+        .chain(connected.iter().copied())
+        .map(|h| (h, addr))
+        .collect();
+    controller.set_connected_peers_for_test(up);
+    (cluster, controller, peer, dir)
+}
+
+/// P0-5 / t_ad872ac7 shortcut: Raft is running and every member is up. A
+/// one-step cluster->pair from here keeps a live voter and replica the pair
+/// writes past (split brain), so it is refused and Raft keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_is_refused_while_raft_runs_and_no_node_is_down() {
+    let third = uuid::Uuid::new_v4();
+    let (cluster, controller, peer, _dir) = downgrade_setup(&[third], &[third]).await;
 
     let err = controller
-        .downgrade_to_pair(Some(uuid::Uuid::new_v4()))
-        .expect_err("a downgrade while Raft runs must be refused");
+        .downgrade_to_pair(Some(peer))
+        .await
+        .expect_err("a downgrade with every member up must be refused");
 
-    assert!(
-        err.to_string().contains("Raft is running"),
-        "the refusal must say Raft is still running, got: {err}"
-    );
+    assert!(err.to_string().contains("still up"), "{err}");
     assert_eq!(
         controller.mode(),
-        ferrosa_common::deployment_mode::DeploymentMode::Cluster,
-        "a refused downgrade must leave the node untouched"
+        ferrosa_common::deployment_mode::DeploymentMode::Cluster
+    );
+    assert!(
+        controller.raft().is_some(),
+        "a refused downgrade must leave Raft running"
+    );
+    cluster.shutdown().await;
+}
+
+/// P0-5 / t_ad872ac7 allowed path: an operator brought a node down, then runs
+/// the downgrade naming the peer. The node STOPS its Raft group before it
+/// installs the pair path, so it is no longer a voter committing beside the
+/// pair: the split brain of the old action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downgrade_to_pair_after_a_node_is_down_stops_raft_and_pairs() {
+    let down = uuid::Uuid::new_v4();
+    let (cluster, controller, peer, _dir) = downgrade_setup(&[down], &[]).await;
+    let raft = cluster.leader_node().raft.clone();
+
+    let paired_with = controller
+        .downgrade_to_pair(Some(peer))
+        .await
+        .expect("node down + explicit named downgrade must be accepted");
+
+    assert_eq!(paired_with, peer);
+    assert_eq!(
+        controller.mode(),
+        ferrosa_common::deployment_mode::DeploymentMode::Pair
+    );
+    assert!(
+        controller.raft().is_none(),
+        "the downgraded node must hold no Raft group"
+    );
+    assert!(
+        raft.client_write(RaftCommand {
+            op: RaftOp::ApproveNode {
+                host_id: uuid::Uuid::new_v4(),
+            },
+            schema_version: uuid::Uuid::new_v4(),
+        })
+        .await
+        .is_err(),
+        "the Raft group must be shut down, not merely forgotten"
     );
     cluster.shutdown().await;
 }

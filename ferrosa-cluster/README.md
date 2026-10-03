@@ -345,10 +345,11 @@ early acknowledgement.
     (`Applied { applied }` / `Rejected { reason }`); `StreamSender::send_stream`
     returns the verified applied count and fails on a rejection or a pre-upgrade
     peer's bare `ok`.
-- `ModeController::downgrade_to_pair(Some(peer))` — operator downgrade. Refuses
-  without a named peer, while any Raft group runs on the node, or while the
-  ring holds any other member (CL-42). With no in-place Raft shutdown it is
-  refused in every live cluster.
+- `ModeController::downgrade_to_pair(Some(peer))` — operator downgrade, with
+  friction by design (t_ad872ac7): accepted only after a node was taken down,
+  i.e. every ring member other than this node and the named, connected peer is
+  down. It then STOPS this node's Raft group(s) and installs the pair path.
+  Every shortcut is refused (CL-42). The member taken down must stay down.
 
 ### Accord transactions (`accord/`)
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →

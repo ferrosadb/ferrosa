@@ -170,8 +170,9 @@ dependency/apply check, without remote read-vote fanout. See
     after every range the node replicates reached each new owner and the
     receiver verified it. A failure leaves the node `Joining` / `Leaving` and is
     logged and counted (CL-40, CL-41). Existing `Normal` members are
-    grandfathered: they need no record. `downgrade_to_pair` refuses while Raft
-    runs (CL-42).
+    grandfathered: they need no record. `downgrade_to_pair` is accepted only
+    after a node was taken down, and stops this node's Raft before pairing
+    (CL-42).
 
 ## Correctness evidence (be honest)
 

@@ -48,79 +48,97 @@ impl ModeController {
     /// [`Self::force_promote`] -- and like that one it is reachable only through
     /// this deliberate call, never from a timeout or a peer event.
     ///
-    /// Refused, leaving the node untouched, when (P0-5):
+    /// Ben's rule (t_ad872ac7): "to become a pair an operator needs to bring one
+    /// node down then do a downgrade — friction is the point." So the ONLY
+    /// accepted shape is:
     ///
-    /// - no peer is named. The old action paired with `connected_peers.first()`,
-    ///   so the replication target was whichever peer connected first.
-    /// - any Raft group is still running on this node. While Raft runs the node
-    ///   is a voter and a replica; installing the pair write path on top commits
-    ///   writes a quorum never saw while the cluster still counts this node.
-    ///   That is split brain. There is no supported way to stop Raft and shrink
-    ///   membership to the named peer yet, so in a live cluster this refuses
-    ///   outright (fail loud, never fake).
-    /// - the token ring still holds a member other than this node and the named
-    ///   peer: that member is still a replica of ranges this node would write
-    ///   without it.
-    /// - the named peer is not currently connected: a pair needs somewhere to
-    ///   replicate. The message names the connected peers.
-    /// - the T-300 jsonb guard refuses leaving standalone (checked inside the
-    ///   pair transition, so it cannot be bypassed by going through here).
+    /// 1. the operator has taken at least one member down, and every member
+    ///    other than this node and the named peer is down (not connected);
+    /// 2. the operator names the peer, and it is a connected cluster member;
+    /// 3. this node stops its Raft group(s) BEFORE it installs the pair path,
+    ///    so it is never a voter committing beside a pair write path (P0-5).
+    ///
+    /// Every shortcut is refused loudly, leaving the node untouched: no named
+    /// peer (the old action used `connected_peers.first()`); no committed ring
+    /// to check; a named peer outside the ring or not connected; no member
+    /// down; any other member still up; the T-300 jsonb guard; no peer manager.
     ///
     /// On success the real pair machinery is installed (coordinator, DDL path,
-    /// write path, pair state), not merely the mode -- so the node genuinely
-    /// behaves as a pair afterwards rather than reporting pair mode while still
-    /// writing through the cluster path.
-    pub fn downgrade_to_pair(&self, named_peer: Option<Uuid>) -> Result<Uuid> {
+    /// write path, pair state), not merely the mode. The member that was taken
+    /// down must stay down: if it returns while the named peer still runs Raft,
+    /// those two form a Raft majority beside this pair.
+    pub async fn downgrade_to_pair(&self, named_peer: Option<Uuid>) -> Result<Uuid> {
+        let refuse = |msg: String| Err(ClusterError::ModeTransitionRejected(msg));
         let Some(named_peer) = named_peer else {
-            return Err(ClusterError::ModeTransitionRejected(
+            return refuse(
                 "downgrade to pair requires a named peer to replicate to; pass the \
                  peer's host id"
                     .into(),
-            ));
+            );
         };
-        let running_groups = self.raft_groups.load().len();
-        if running_groups > 0 {
-            return Err(ClusterError::ModeTransitionRejected(format!(
-                "downgrade to pair refused: Raft is running ({running_groups} group(s)); \
-                 this node is still a voter and a replica, so committing point-to-point \
-                 would split the cluster. Decommission the other members first; an \
-                 in-place Raft shutdown is not supported yet"
-            )));
-        }
-        if let Some(ring) = self.token_ring() {
-            let allowed = [
-                crate::raft::uuid_to_node_id(self.local_host_id),
-                crate::raft::uuid_to_node_id(named_peer),
-            ];
-            let others: Vec<String> = ring
-                .node_ids()
-                .into_iter()
-                .filter(|id| !allowed.contains(id))
-                .map(|id| {
-                    ring.get_node(id)
-                        .map(|n| n.host_id.to_string())
-                        .unwrap_or_else(|| format!("node_id {id}"))
-                })
-                .collect();
-            if !others.is_empty() {
-                return Err(ClusterError::ModeTransitionRejected(format!(
-                    "downgrade to pair refused: the token ring still holds members other \
-                     than this node and {named_peer}: {others:?}. They are still replicas; \
-                     decommission them first"
-                )));
-            }
+        let Some(ring) = self.token_ring() else {
+            return refuse(
+                "downgrade to pair refused: no committed token ring, so this node \
+                 cannot check which cluster members are down"
+                    .into(),
+            );
+        };
+        let local = crate::raft::uuid_to_node_id(self.local_host_id);
+        let peer_node = crate::raft::uuid_to_node_id(named_peer);
+        if ring.get_node(peer_node).is_none() {
+            return refuse(format!(
+                "downgrade to pair refused: {named_peer} is not a cluster member"
+            ));
         }
         let peers = self.connected_peers.lock().clone();
+        let is_up = |host: Uuid| peers.iter().any(|(id, _)| *id == host);
+        let others: Vec<Uuid> = ring
+            .node_ids()
+            .into_iter()
+            .filter(|id| *id != local && *id != peer_node)
+            .filter_map(|id| ring.get_node(id).map(|n| n.host_id))
+            .collect();
+        if others.is_empty() {
+            return refuse(format!(
+                "downgrade to pair refused: no member has been taken down. The ring \
+                 holds only this node and {named_peer}; bring one node down first, \
+                 then run the downgrade"
+            ));
+        }
+        let still_up: Vec<String> = others
+            .iter()
+            .filter(|h| is_up(**h))
+            .map(Uuid::to_string)
+            .collect();
+        if !still_up.is_empty() {
+            return refuse(format!(
+                "downgrade to pair refused: member(s) {still_up:?} still up. Every member \
+                 other than this node and {named_peer} must be down first; a live member \
+                 is a voter and replica this pair would write past"
+            ));
+        }
         let Some((peer_host_id, peer_addr)) =
             peers.iter().copied().find(|(id, _)| *id == named_peer)
         else {
             let connected: Vec<String> = peers.iter().map(|(id, _)| id.to_string()).collect();
-            return Err(ClusterError::ModeTransitionRejected(format!(
+            return refuse(format!(
                 "downgrade to pair requires the named peer {named_peer} to be a connected \
                  peer to replicate to; connected peers: {connected:?} — is the intended \
                  peer running and reachable?"
-            )));
+            ));
         };
+        // Check what the pair transition would refuse BEFORE stopping Raft, so a
+        // refusal can never leave a node with no Raft and no pair path.
+        if !self.leaving_standalone_permitted(DeploymentMode::Pair) {
+            return refuse(
+                "the T-300 jsonb guard refuses this transition (see the node log)".into(),
+            );
+        }
+        if self.peer_manager.load().is_none() {
+            return refuse("downgrade to pair refused: no peer manager installed".into());
+        }
+
+        self.stop_raft_for_downgrade().await?;
         {
             // Hold `transition_guard` across the transition so the mode cannot
             // move underneath the check-and-install in `transition_to_pair`.
@@ -128,16 +146,42 @@ impl ModeController {
             self.transition_to_pair_operator_override(peer_host_id, peer_addr);
         }
         if **self.mode.load() != DeploymentMode::Pair {
+            tracing::error!(
+                %peer_host_id,
+                "OPERATOR ACTION FAILED: Raft was stopped but the pair transition was \
+                 refused; this node serves no writes. Restart it to rejoin the cluster"
+            );
             return Err(ClusterError::ModeTransitionRejected(
-                "the pair transition was refused (see the node log); the node is                  unchanged"
+                "Raft was stopped but the pair transition was refused (see the node log); \
+                 restart the node to rejoin the cluster"
                     .into(),
             ));
         }
         tracing::warn!(
             %peer_host_id,
-            "OPERATOR ACTION: downgraded from cluster to pair mode. This node now              replicates point-to-point and no longer commits through Raft."
+            down = ?others,
+            "OPERATOR ACTION: downgraded from cluster to pair mode. Raft is stopped on \
+             this node; it replicates point-to-point to the named peer. The members \
+             taken down must stay down."
         );
         Ok(peer_host_id)
+    }
+
+    /// Shut down every Raft group on this node and drop them, so it is no
+    /// longer a voter. A failed shutdown aborts the downgrade.
+    async fn stop_raft_for_downgrade(&self) -> Result<()> {
+        let groups = self.raft_groups.load_full();
+        for (id, raft) in groups.iter() {
+            raft.shutdown().await.map_err(|e| {
+                ClusterError::RaftError(format!(
+                    "downgrade to pair: failed to stop Raft group {id:?}: {e}"
+                ))
+            })?;
+            tracing::warn!(group = ?id, "OPERATOR ACTION: Raft group stopped for downgrade to pair");
+        }
+        self.raft_groups
+            .store(Arc::new(std::collections::HashMap::new()));
+        Ok(())
     }
 
     /// Returns the current promote epoch (Lamport counter).

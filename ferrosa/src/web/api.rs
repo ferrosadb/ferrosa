@@ -445,7 +445,7 @@ async fn cluster_downgrade_to_pair(
             )
         }
     };
-    match mc.downgrade_to_pair(named_peer) {
+    match mc.downgrade_to_pair(named_peer).await {
         Ok(peer_host_id) => (
             StatusCode::OK,
             Json(json!({
@@ -1861,7 +1861,32 @@ mod tests {
         let peer = uuid::Uuid::from_u128(local.as_u128() - 1);
         assert!(peer < local, "the peer must sort below the local host");
         mc.on_peer_connected((peer, "127.0.0.1:7000".parse().unwrap()));
+        // Ben's rule (t_ad872ac7): a downgrade is accepted only after a member
+        // was taken down. The ring holds this node, the peer, and one member
+        // that is not connected.
+        install_ring(&mc, &[local, peer, uuid::Uuid::new_v4()]);
         state
+    }
+
+    /// Commit a token ring holding `members`, one token each.
+    fn install_ring(mc: &ferrosa_cluster::ModeController, members: &[uuid::Uuid]) {
+        let mut ring = ferrosa_cluster::ring::TokenRing::new();
+        for (i, host_id) in members.iter().enumerate() {
+            let id = ferrosa_cluster::raft::uuid_to_node_id(*host_id);
+            ring.add_node(
+                id,
+                ferrosa_cluster::raft::NodeInfo {
+                    host_id: *host_id,
+                    addr: "127.0.0.1:7000".into(),
+                    data_center: "dc1".into(),
+                    rack: "rack1".into(),
+                    state: ferrosa_cluster::raft::NodeState::Normal,
+                    cql_broadcast: None,
+                },
+            );
+            ring.assign_tokens(id, &[(i as i64 + 1) * 10]);
+        }
+        mc.set_token_ring(std::sync::Arc::new(ring));
     }
 
     /// A committed cluster member WITH a connected peer is downgraded by the
@@ -1946,13 +1971,13 @@ mod tests {
     #[tokio::test]
     async fn api_downgrade_to_pair_returns_409_without_a_connected_peer() {
         let state = make_state();
+        let mc = state.mode_controller.clone();
+        let peer = uuid::Uuid::new_v4();
+        install_ring(&mc, &[mc.host_id(), peer, uuid::Uuid::new_v4()]);
         let router = crate::web::build_router(state);
         let req = Request::builder()
             .method("POST")
-            .uri(format!(
-                "/api/cluster/downgrade-to-pair?peer={}",
-                uuid::Uuid::new_v4()
-            ))
+            .uri(format!("/api/cluster/downgrade-to-pair?peer={peer}"))
             .body(Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
