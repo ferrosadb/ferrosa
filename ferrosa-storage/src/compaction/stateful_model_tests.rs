@@ -220,14 +220,15 @@ async fn run_compaction(engine: &Arc<StorageEngine>, table: &TableId, cancel: bo
     true
 }
 
-async fn run_program(program: &[u8]) {
+/// Runs `program` against table `ks.<table_name>`. The cancel hooks are a
+/// process-wide map keyed by table, so every test that runs a program in
+/// parallel with the property test needs its own table name.
+async fn run_program(table_name: &str, program: &[u8]) {
     let dir = tempfile::tempdir().expect("model tempdir");
-    let table = TableId::new("ks", "compaction_model");
+    let table = TableId::new("ks", table_name);
     let config = test_config(dir.path());
     let engine = Arc::new(StorageEngine::new(config, None).expect("open model engine"));
-    engine
-        .register_table(schema("compaction_model", None))
-        .unwrap();
+    engine.register_table(schema(table_name, None)).unwrap();
     let mut engine = Some(engine);
     let mut model = HashMap::new();
     let mut timestamp = 1_000i64;
@@ -313,8 +314,26 @@ proptest! {
             .enable_all()
             .build()
             .expect("build model runtime")
-            .block_on(run_program(&ops));
+            .block_on(run_program("compaction_model", &ops));
     }
+}
+
+/// Shrunk counterexample found at PROPTEST_CASES=5000: key 0 is deleted, the
+/// node crashes and restarts (replaying the delete into the memtable only),
+/// then crashes and restarts again before any flush. The cancelled
+/// compaction in the shrunk program is incidental; replay deleting the
+/// segments it had only replayed into memory was the bug.
+#[test]
+fn delete_survives_second_crash_after_replay() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build model runtime")
+        .block_on(run_program(
+            "compaction_model_replay",
+            &[236, 150, 17, 21, 142, 253, 254, 143, 43],
+        ));
 }
 
 #[tokio::test]
