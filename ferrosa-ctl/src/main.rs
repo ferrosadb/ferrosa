@@ -597,11 +597,11 @@ enum ClusterAction {
     /// automatic lifecycle never does this: a multi-node Raft cluster does not
     /// revert to a pair on its own, because a pair replicates point-to-point
     /// and accepts writes a quorum would have refused while the rest of the
-    /// cluster keeps committing through Raft. The peer must be NAMED and
-    /// connected. The node refuses while Raft still runs on it or while the
-    /// ring holds any member other than itself and that peer: a node that is
-    /// still a voter and a replica must not commit point-to-point. After it
-    /// succeeds, that node no longer commits through Raft.
+    /// cluster keeps committing through Raft. Friction is the point: first
+    /// take a node down, so every member other than this node and the named
+    /// peer is down, then run this naming the (connected) peer. The node stops
+    /// its Raft group and installs the pair path; any shortcut is refused.
+    /// The member taken down must stay down.
     DowngradeToPair {
         /// Host id of the peer to pair with.
         peer: String,

@@ -430,9 +430,10 @@ fn demote_to_learner_body(host_id: &str) -> serde_json::Value {
 /// timeout no longer downgrades. So this command is the whole of the "operator
 /// action" the node's warning log refers to.
 ///
-/// Issues `POST /api/cluster/downgrade-to-pair?peer=<host_id>`. The named peer
-/// must be connected, and the node refuses while Raft still runs on it or the
-/// ring holds any other member; the server says which condition failed.
+/// Issues `POST /api/cluster/downgrade-to-pair?peer=<host_id>`. Accepted only
+/// after a node was taken down: every member other than this node and the
+/// named (connected) peer must be down. The node then stops Raft and pairs;
+/// the server says which condition failed otherwise.
 pub async fn cluster_downgrade_to_pair(
     host: &str,
     web_port: u16,
