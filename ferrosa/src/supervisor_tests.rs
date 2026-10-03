@@ -159,7 +159,7 @@ async fn exceeding_the_flush_restart_intensity_escalates() {
 
 #[test]
 fn failures_older_than_the_period_leave_the_window() {
-    let mut window = IntensityWindow::new(RestartIntensity {
+    let window = IntensityWindow::new(RestartIntensity {
         max_restarts: 2,
         period: Duration::from_secs(60),
     });

@@ -155,7 +155,7 @@ pub struct SyncHealth {
     inject_panic: AtomicBool,
 }
 
-/// A point-in-time copy of [`SyncHealth`] for supervisors and metrics.
+/// A point-in-time copy of the sync strategy's `SyncHealth` for supervisors and metrics.
 #[derive(Clone, Debug)]
 pub struct SyncHealthSnapshot {
     /// Whether this strategy runs a background sync thread at all.

@@ -501,6 +501,9 @@ pub struct FlushSupervisor {
 }
 
 impl FlushSupervisor {
+    /// A flush supervisor with its own restart window (tests; the
+    /// maintenance loop shares one through [`Self::with_window`]).
+    #[cfg(test)]
     pub fn new(
         status: Arc<SupervisionStatus>,
         intensity: RestartIntensity,
@@ -515,7 +518,7 @@ impl FlushSupervisor {
         )
     }
 
-    /// Like [`Self::new`], counting failures in a window that outlives this
+    /// A flush supervisor counting failures in a window that outlives this
     /// supervisor (one per maintenance-loop incarnation shares it).
     pub(crate) fn with_window(
         status: Arc<SupervisionStatus>,
@@ -958,7 +961,7 @@ pub async fn supervise<F, Fut>(
     F: FnMut() -> Fut,
     Fut: Future<Output = ()>,
 {
-    let mut window = IntensityWindow::new(intensity);
+    let window = IntensityWindow::new(intensity);
     loop {
         // The child future owns its state; whatever a panic left half-updated
         // is dropped with it, so asserting unwind safety is sound.
@@ -1091,7 +1094,7 @@ impl MaintenanceWatchdog {
         }
     }
 
-    /// How often [`run_maintenance_watchdog`] checks.
+    /// How often [`spawn_maintenance_watchdog`]'s thread checks.
     pub fn poll_interval(&self) -> Duration {
         (self.deadline / 10).max(Duration::from_millis(100))
     }
