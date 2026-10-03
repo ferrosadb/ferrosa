@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ferrosa_net::pool::PriorityPool;
-use futures::StreamExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
@@ -175,154 +174,63 @@ impl ModeController {
         Ok(())
     }
 
-    /// Initiate decommission of a node.
+    /// Decommission this node (P0-2).
     ///
-    /// 1. Propose `LeaveNode` via Raft — removes the node from membership
-    ///    and cleans up its tokens in the state machine.
-    /// 2. Identify token ranges owned by the leaving node.
-    /// 3. For each range, find new owner via `ring.replicas()` excluding the leaving node.
-    /// 4. Stream data from leaving node to new owners via `StreamSender`.
-    ///    (For MVP: the leaving node triggers its own streaming.)
-    /// 5. After Raft commits the `LeaveNode`, the node is fully removed.
+    /// 1. Mark it `Leaving` through Raft (out of `replicas()`, never promoted
+    ///    back by the restart pass).
+    /// 2. Stream every local partition of every range it REPLICATES (not only
+    ///    the ranges it is primary for) to each node that becomes a replica of
+    ///    that range, per keyspace replication strategy. Each batch must come
+    ///    back verified by the receiver (count, checksum, applied).
+    /// 3. Only then propose `LeaveNode`.
+    ///
+    /// Any read error, stream failure or short apply aborts before step 3: the
+    /// node stays `Leaving` with all its data and the error says what failed.
+    /// See [`super::data_movement::decommission_verified`].
+    ///
+    /// Only the leaving node can run this. It streams its OWN storage; run on
+    /// another node it would stream that node's copies and call the leaving
+    /// node's data moved. Removing a dead node needs streaming from the
+    /// surviving replicas, which this does not do, so it is refused.
     pub async fn initiate_decommission(&self, host_id: Uuid) -> Result<()> {
         let raft = self
             .raft()
             .ok_or_else(|| ClusterError::Internal("raft not initialized".into()))?;
-
+        if host_id != self.local_host_id {
+            return Err(ClusterError::ModeTransitionRejected(format!(
+                "decommission of {host_id} must run on that node: it streams the leaving \
+                 node's own data. This node is {}",
+                self.local_host_id
+            )));
+        }
         let node_id = uuid_to_node_id(host_id);
-
-        // 0. If this node is the Raft leader, wait for leadership to move.
-        // The departing node shouldn't coordinate its own removal.
-        // openraft 0.9 doesn't have transfer_leader(); instead, we proceed
-        // with decommission and let Raft auto-elect after LeaveNode removes
-        // this node from membership. The remaining nodes will elect a new
-        // leader via normal Raft election timeout (~1-2s).
-        if let Some(lid) = raft.current_leader().await {
-            if lid == node_id {
-                tracing::info!("decommissioning the leader — Raft will auto-elect after LeaveNode");
-            }
-        }
-
-        // 1. Mark node as Leaving (excluded from replicas(); streaming begins)
-        let set_leaving = RaftCommand {
-            op: decommission_drain_op(node_id),
-            schema_version: Uuid::new_v4(),
+        let ring = self
+            .token_ring()
+            .ok_or_else(|| ClusterError::Internal("decommission: no token ring".into()))?;
+        let peer_manager = self
+            .peer_manager
+            .load()
+            .as_ref()
+            .clone()
+            .ok_or_else(|| ClusterError::Internal("peer_manager not set".into()))?;
+        let tables = super::data_movement::replicated_tables(&self.schema.snapshot())?;
+        let storage = self.storage.clone();
+        let scan = move |table: &ferrosa_storage::TableId| storage.range_iter(table, None, None);
+        let streamer = super::data_movement::StreamSenderStreamer {
+            peer_manager,
+            ring: ring.clone(),
+            source_node: node_id,
         };
-        raft.client_write(set_leaving)
-            .await
-            .map_err(|e| ClusterError::RaftError(format!("SetNodeState failed: {e}")))?;
-
-        // 2. Stream data from the leaving node to new token owners.
-        // Read all user tables, find partitions whose primary owner is this node,
-        // and stream them to the next replica.
-        if let Some(ring) = &**self.ring.load() {
-            let peer_manager = match &**self.peer_manager.load() {
-                Some(pm) => pm.clone(),
-                None => {
-                    tracing::warn!("decommission: no peer_manager, skipping streaming");
-                    return Err(ClusterError::Internal("peer_manager not set".into()));
-                }
-            };
-            let schema_snap = self.schema.snapshot();
-            let config = crate::streaming::StreamConfig::default();
-            let mut session_counter = 0_u64;
-
-            for (ks, tbl) in schema_snap.tables.keys() {
-                if ks.starts_with("system") {
-                    continue;
-                }
-                let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
-                let mut partitions = self.storage.range_iter(&table_id, None, None);
-
-                while let Some(partition) = partitions.next().await {
-                    let partition = match partition {
-                        Ok(partition) => partition,
-                        Err(e) => {
-                            tracing::warn!(%e, ks, tbl, "decommission: failed to read partition");
-                            continue;
-                        }
-                    };
-                    let token = partition.key.token.0;
-                    if ring.primary_owner(token) == Some(node_id) {
-                        // This partition is owned by the leaving node — find next replica
-                        let replicas = ring.replicas(token, 2);
-                        let target = replicas.iter().find(|&&nid| nid != node_id);
-                        if let Some(&target_nid) = target {
-                            let target_uuid = ring
-                                .get_node(target_nid)
-                                .map(|n| n.host_id)
-                                .unwrap_or_default();
-                            // Serialize all rows via RowWire for full fidelity
-                            // (clustering keys, all cells, deletion, liveness).
-                            use crate::raft::handlers::RowWire;
-                            let wire_rows: Vec<RowWire> =
-                                partition.rows.iter().cloned().map(RowWire::from).collect();
-                            // An empty payload used to stand in for a failed
-                            // encode, and the receiver stored it as a live cell.
-                            let row_bytes = match bincode::serialize(&wire_rows) {
-                                Ok(bytes) => bytes,
-                                Err(e) => {
-                                    tracing::error!(
-                                        %e,
-                                        ks,
-                                        tbl,
-                                        partition_key = ?partition.key,
-                                        "decommission: failed to serialize rows, partition NOT streamed"
-                                    );
-                                    continue;
-                                }
-                            };
-                            let ts = partition
-                                .rows
-                                .first()
-                                .and_then(|r| r.cells.first())
-                                .map(|(_, cv)| cv.timestamp)
-                                .unwrap_or(0);
-
-                            session_counter += 1;
-                            let mutations = vec![crate::streaming::StreamedMutation {
-                                keyspace: ks.clone(),
-                                table: tbl.clone(),
-                                key: partition.key.key.as_bytes().to_vec(),
-                                row: row_bytes,
-                                timestamp: ts,
-                            }];
-                            if let Err(e) = crate::streaming::sender::StreamSender::send_stream(
-                                mutations,
-                                &peer_manager,
-                                target_uuid,
-                                session_counter,
-                                (i64::MIN, i64::MAX),
-                                node_id,
-                                &config,
-                            )
-                            .await
-                            {
-                                tracing::warn!(%e, "decommission streaming failed for {ks}.{tbl}");
-                            }
-                        }
-                    }
-                }
-            }
-            tracing::info!("decommission streaming complete");
-        }
-
-        // 3. Propose LeaveNode via Raft — removes node from membership and tokens.
-        let leave_cmd = RaftCommand {
-            op: RaftOp::LeaveNode { node_id },
-            schema_version: Uuid::new_v4(),
-        };
-        raft.client_write(leave_cmd)
-            .await
-            .map_err(|e| ClusterError::RaftError(format!("LeaveNode proposal failed: {e}")))?;
-
-        tracing::info!(
-            host_id = %host_id,
+        super::data_movement::decommission_verified(
+            raft.as_ref(),
+            &ring,
             node_id,
-            "node decommission complete: data streamed + LeaveNode committed"
-        );
-
-        Ok(())
+            &tables,
+            scan,
+            &streamer,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Trigger join admission for a peer that connected while in cluster mode.
@@ -708,7 +616,7 @@ mod decommission_drain_tests {
         ]
         .into();
         assert!(
-            promote_joining_members(&members).is_empty(),
+            promote_joining_members(&members, &[draining].into()).is_empty(),
             "the recovery promote pass would undo the decommission of node {draining} \
              (drain state {state:?})"
         );

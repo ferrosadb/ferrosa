@@ -328,11 +328,33 @@ early acknowledgement.
   make that degraded state reportable; `GET /api/cluster/ring` returns
   `ring_healthy`, `non_normal_members` and `data_scatter_risk` (CL-29).
 - `repair/coordinator.rs::promote_joining_members` — pure Promote-phase planner:
-  one `SetNodeState{Normal}` per `Joining` member, and nothing for
+  one `SetNodeState{Normal}` per `Joining` member WHOSE BOOTSTRAP IS RECORDED
+  (`RaftOp::RecordBootstrapComplete`, CL-41), and nothing for
   `Leaving` / `Decommissioned` / `Learner` (operator intent and the ADR-014
-  learner state are never reversed). The controller runs it on the
-  recovered-topology path, which previously skipped promotion outright and so
-  left a mid-join node stuck `Joining` across every restart (CL-29).
+  learner state are never reversed). `joiners_awaiting_bootstrap` names the
+  unrecorded joiners, which stay `Joining`. The controller runs it on the
+  recovered-topology path (CL-29); a joiner found unrecorded there reruns its
+  own bootstrap.
+- `controller/data_movement.rs` — no replica-ownership change without verified
+  data movement (CL-40, CL-41):
+  - `decommission_verified`: `Leaving` → stream every partition of every range
+    the leaving node REPLICATES (per keyspace strategy, `DecommissionPlan`) to
+    each new owner, each batch verified by the receiver → only then
+    `LeaveNode`. Any read error, stream rejection, short apply or range left
+    with no replica aborts; the node stays `Leaving` with its data
+    (`DECOMMISSION_ABORTS`). `ModeController::initiate_decommission` runs it and
+    only for the local node.
+  - `bootstrap_verified`: one Merkle anti-entropy session per (table, range the
+    joiner will replicate, current replica), all must succeed, then
+    `RecordBootstrapComplete`, then `Normal` (`BOOTSTRAP_ABORTS`).
+  - The row-stream `StreamEnd` reply carries a `StreamEndAck` verdict
+    (`Applied { applied }` / `Rejected { reason }`); `StreamSender::send_stream`
+    returns the verified applied count and fails on a rejection or a pre-upgrade
+    peer's bare `ok`.
+- `ModeController::downgrade_to_pair(Some(peer))` — operator downgrade. Refuses
+  without a named peer, while any Raft group runs on the node, or while the
+  ring holds any other member (CL-42). With no in-place Raft shutdown it is
+  refused in every live cluster.
 
 ### Accord transactions (`accord/`)
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →

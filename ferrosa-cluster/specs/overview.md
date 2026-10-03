@@ -163,6 +163,15 @@ dependency/apply check, without remote read-vote fanout. See
     resumes the Promote phase via `promote_joining_members` rather than
     skipping it on every restart. Promote touches `Joining` only: `Leaving`,
     `Decommissioned` and `Learner` are never promoted (CL-29).
+11. **No replica-ownership change without verified data movement.** A
+    `Joining` member becomes `Normal` only after a committed
+    `RecordBootstrapComplete` (every range it will replicate pulled from every
+    current replica by anti-entropy); a decommission proposes `LeaveNode` only
+    after every range the node replicates reached each new owner and the
+    receiver verified it. A failure leaves the node `Joining` / `Leaving` and is
+    logged and counted (CL-40, CL-41). Existing `Normal` members are
+    grandfathered: they need no record. `downgrade_to_pair` refuses while Raft
+    runs (CL-42).
 
 ## Correctness evidence (be honest)
 

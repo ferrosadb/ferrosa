@@ -135,6 +135,14 @@ pub fn cluster_routes() -> Router<WebAppState> {
         .route("/repair", post(repair_handler))
 }
 
+/// Query parameters for `POST /api/cluster/downgrade-to-pair`.
+#[derive(serde::Deserialize)]
+struct DowngradeToPairParams {
+    /// Host id of the peer to pair with. Required: the controller refuses
+    /// without it.
+    peer: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 struct RepairParams {
     keyspace: Option<String>,
@@ -422,8 +430,22 @@ async fn cluster_promote(State(mc): State<Arc<ModeController>>) -> (StatusCode, 
 /// POST with an explicit path rather than anything a health check can trigger.
 async fn cluster_downgrade_to_pair(
     State(mc): State<Arc<ModeController>>,
+    axum::extract::Query(params): axum::extract::Query<DowngradeToPairParams>,
 ) -> (StatusCode, Json<Value>) {
-    match mc.downgrade_to_pair() {
+    // The peer is named by the operator, never picked from whatever connected
+    // first (P0-5). A malformed id is a 400; a missing one is refused by the
+    // controller with a message saying a named peer is required.
+    let named_peer = match params.peer.as_deref().map(str::parse::<uuid::Uuid>) {
+        None => None,
+        Some(Ok(id)) => Some(id),
+        Some(Err(e)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid peer host id: {e}") })),
+            )
+        }
+    };
+    match mc.downgrade_to_pair(named_peer) {
         Ok(peer_host_id) => (
             StatusCode::OK,
             Json(json!({
@@ -1863,11 +1885,12 @@ mod tests {
             ferrosa_common::deployment_mode::DeploymentMode::Cluster,
             "precondition: the node starts as a committed cluster member"
         );
+        let peer = uuid::Uuid::from_u128(mc.host_id().as_u128() - 1);
 
         let router = crate::web::build_router(state);
         let req = Request::builder()
             .method("POST")
-            .uri("/api/cluster/downgrade-to-pair")
+            .uri(format!("/api/cluster/downgrade-to-pair?peer={peer}"))
             .body(Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
@@ -1930,7 +1953,10 @@ mod tests {
         let router = crate::web::build_router(state);
         let req = Request::builder()
             .method("POST")
-            .uri("/api/cluster/downgrade-to-pair")
+            .uri(format!(
+                "/api/cluster/downgrade-to-pair?peer={}",
+                uuid::Uuid::new_v4()
+            ))
             .body(Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
@@ -1951,6 +1977,37 @@ mod tests {
         assert!(
             error.contains("connected peer"),
             "the error must name the missing peer, got: {error}"
+        );
+    }
+
+    /// P0-5: the endpoint refuses a downgrade that names no peer, even when a
+    /// peer is connected. The old endpoint took no argument and paired with
+    /// whichever peer connected first.
+    #[tokio::test]
+    async fn api_downgrade_to_pair_returns_409_without_a_named_peer() {
+        let state = make_state_in_cluster_with_peer();
+        let mc = state.mode_controller.clone();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/downgrade-to-pair")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("named peer"),
+            "the error must say a named peer is required, got: {error}"
+        );
+        assert_eq!(
+            mc.mode(),
+            ferrosa_common::deployment_mode::DeploymentMode::Cluster,
+            "a refused downgrade must leave the node untouched"
         );
     }
 
