@@ -43,4 +43,21 @@ fn copied_node_commitlog_replays_and_flushes() {
     engine
         .flush_all()
         .expect("every table must flush after replay on this build");
+
+    // How much legacy whole-value collection data the log held, per table:
+    // every expansion is counted in the Prometheus text.
+    let expansions: Vec<String> = ferrosa_storage::metrics::render_prometheus()
+        .lines()
+        .filter(|l| l.starts_with("ferrosa_storage_collection_blob_expansions_total{"))
+        .map(str::to_string)
+        .collect();
+    let report = if expansions.is_empty() {
+        "none\n".to_string()
+    } else {
+        expansions.join("\n") + "\n"
+    };
+    eprintln!("whole-value collection cells expanded:\n{report}");
+    // Also left beside the copy, since a passing test's stderr is not kept.
+    std::fs::write(dir.join("collection-blob-expansions.txt"), &report)
+        .expect("write the expansion report into the copied data dir");
 }
