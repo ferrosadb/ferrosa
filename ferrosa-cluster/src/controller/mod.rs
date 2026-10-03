@@ -23,6 +23,7 @@
 pub mod bootstrap;
 pub mod cluster;
 pub mod cluster_rejoin;
+pub mod data_movement;
 mod invite;
 pub mod jsonb_gate;
 mod membership;
