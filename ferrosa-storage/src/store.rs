@@ -473,6 +473,14 @@ struct StoreView {
     /// A memtable that has been swapped out and is being flushed.
     /// Readable during the flush; `None` when no flush is in progress.
     flushing: Option<Arc<dyn Memtable>>,
+    /// Index postings of the `flushing` memtable, readable until the flush
+    /// installs the sidecar built from them (T1). Without them an index read
+    /// between the memtable swap and the sidecar install misses every row the
+    /// frozen memtable holds: `indexes` is already the new memtable's.
+    flushing_indexes: Option<Arc<HashMap<String, Arc<MemtableIndex>>>>,
+    /// Vector indexes of the `flushing` memtable, readable until the flush
+    /// installs its vector sidecars (the vector form of `flushing_indexes`).
+    flushing_vector_indexes: Option<Arc<HashMap<String, Arc<VectorMemtableIndex>>>>,
     /// Completed SSTables, newest first. Lightweight descriptors only — the
     /// readers are opened on demand through the engine-wide reader pool so
     /// resident memory is `O(reader_cap)` rather than `O(sstable_count)`.
@@ -1127,6 +1135,18 @@ type VectorIndexScopes = HashMap<String, Arc<std::collections::HashSet<Vec<u8>>>
 
 /// An index DDL's change to a catalog: the next catalog, or `None` for none.
 type CatalogEdit = Box<dyn FnOnce(&IndexCatalog) -> Option<IndexCatalog> + Send>;
+
+/// What [`TableStore::swap_compacted_sstables`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an output that was not swapped in must be deleted by the caller"]
+pub enum CompactionSwap {
+    /// The output replaced its inputs in the view.
+    Swapped,
+    /// At least one input had already left the view (a TRUNCATE, or another
+    /// compaction): installing the output would bring back rows the view no
+    /// longer holds, so nothing changed and the output must be discarded.
+    InputsGone,
+}
 
 /// What one queued memtable rotation asks for (see `TableStore::rotate`).
 enum RotationKind {
@@ -2143,13 +2163,14 @@ pub const UNSELECTIVE_INDEX_MIN_MATCHES: usize = 50;
 /// sidecar that holds the index.
 fn index_posting_sources<'a>(
     view: &'a StoreView,
-    memtable: Option<&'a crate::memtable::index::PostingList>,
+    memtables: [Option<&'a crate::memtable::index::PostingList>; 2],
     index_name: &str,
     key: &'a IndexKey,
     from: Option<&RowPosition>,
 ) -> Vec<PostingSource<'a>> {
     let mut sources: Vec<PostingSource<'a>> = Vec::with_capacity(view.sidecar_indexes.len() + 1);
-    if let Some(list) = memtable {
+    // The active memtable's postings and the flushing memtable's (T1).
+    for list in memtables.into_iter().flatten() {
         let postings = list.as_slice();
         let start = postings.partition_point(|p| from.is_some_and(|start| p < start));
         sources.push(Box::new(postings[start..].iter().map(RowPositionRef::from)));
@@ -2160,6 +2181,43 @@ fn index_posting_sources<'a>(
         }
     }
     sources
+}
+
+/// The generation `ann_search` files flushing-memtable results under, so
+/// their placeholder positions cannot collide with the active memtable's or
+/// a real SSTable's (flush generations never reach it).
+const FLUSHING_MEMTABLE_GENERATION: u64 = u64::MAX;
+
+/// The flushing memtable's vector index named `index_name`, if any.
+fn flushing_vector_index<'a>(
+    view: &'a StoreView,
+    index_name: &str,
+) -> Option<&'a Arc<VectorMemtableIndex>> {
+    view.flushing_vector_indexes.as_ref()?.get(index_name)
+}
+
+/// The flushing memtable's postings for `key` in `index_name`, if any.
+fn flushing_posting_list(
+    view: &StoreView,
+    index_name: &str,
+    key: &IndexKey,
+) -> Option<crate::memtable::index::PostingList> {
+    view.flushing_indexes
+        .as_ref()?
+        .get(index_name)?
+        .posting_list(key)
+}
+
+/// The active and the flushing memtable's index named `index_name`.
+fn memtable_indexes_named<'a>(
+    view: &'a StoreView,
+    index_name: &'a str,
+) -> impl Iterator<Item = &'a Arc<MemtableIndex>> + 'a {
+    view.indexes.get(index_name).into_iter().chain(
+        view.flushing_indexes
+            .as_ref()
+            .and_then(|flushing| flushing.get(index_name)),
+    )
 }
 
 /// K-way merge of whole sidecars in `(key, row)` order, yielding each entry
@@ -2293,6 +2351,8 @@ impl<F: FlushTarget> TableStore<F> {
         let initial_view = StoreView {
             active,
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
             indexes,
@@ -2503,6 +2563,8 @@ impl<F: FlushTarget> TableStore<F> {
         let initial_view = StoreView {
             active,
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(descriptors),
             sstable_ids: Arc::new(initial_ids),
             indexes,
@@ -2592,6 +2654,8 @@ impl<F: FlushTarget> TableStore<F> {
         let initial_view = StoreView {
             active,
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(descriptors),
             sstable_ids: Arc::new(initial_ids),
             indexes,
@@ -4236,6 +4300,8 @@ impl<F: FlushTarget> TableStore<F> {
                 let next = StoreView {
                     active: Arc::clone(&new_active),
                     flushing: Some(Arc::clone(&old_active)),
+                    flushing_indexes: Some(Arc::new(old_indexes.by_name.clone())),
+                    flushing_vector_indexes: Some(Arc::clone(&old_vector_indexes)),
                     sstables: Arc::clone(&current.sstables),
                     sstable_ids: Arc::clone(&current.sstable_ids),
                     indexes: Arc::clone(&fresh_indexes),
@@ -4298,6 +4364,8 @@ impl<F: FlushTarget> TableStore<F> {
                 let next = StoreView {
                     active: Arc::clone(&live.active),
                     flushing: None,
+                    flushing_indexes: None,
+                    flushing_vector_indexes: None,
                     sstables: Arc::clone(&live.sstables),
                     sstable_ids: Arc::clone(&live.sstable_ids),
                     indexes: Arc::clone(&live.indexes),
@@ -4388,6 +4456,8 @@ impl<F: FlushTarget> TableStore<F> {
                 let next = StoreView {
                     active: Arc::clone(&live.active),
                     flushing: None,
+                    flushing_indexes: None,
+                    flushing_vector_indexes: None,
                     sstables: Arc::clone(&live.sstables),
                     sstable_ids: Arc::clone(&live.sstable_ids),
                     indexes: Arc::clone(&live.indexes),
@@ -4520,6 +4590,44 @@ impl<F: FlushTarget> TableStore<F> {
         // can reach any more.
         let sidecar_indexes =
             self.flush_sidecar_indexes(&old_indexes, &target_catalog, &partitions);
+        // Serve exactly these postings for the flushing memtable until the
+        // sidecar is installed: an index the rotating DDL added now reads the
+        // frozen rows too, and one it dropped no longer answers from them.
+        let published: Arc<HashMap<String, Arc<MemtableIndex>>> =
+            Arc::new(sidecar_indexes.iter().cloned().collect());
+        // The vector indexes the target catalog declares, for the frozen rows:
+        // its own index, or one built from the rows for an index the rotating
+        // DDL added. The same map feeds the vector sidecars below.
+        let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
+            target_catalog
+                .vector_index_configs
+                .iter()
+                .map(|cfg| {
+                    let index = match old_vector_indexes.get(&cfg.index_name) {
+                        Some(index) => Arc::clone(index),
+                        None => vector_index_from_rows(cfg, &partitions),
+                    };
+                    (cfg.index_name.clone(), index)
+                })
+                .collect(),
+        );
+        self.update_view("flush:publish_flushing_postings", |current| {
+            if current.flushing.is_none() {
+                return (None, ());
+            }
+            let next = StoreView {
+                active: Arc::clone(&current.active),
+                flushing: current.flushing.clone(),
+                flushing_indexes: Some(Arc::clone(&published)),
+                flushing_vector_indexes: Some(Arc::clone(&flush_vector_indexes)),
+                sstables: Arc::clone(&current.sstables),
+                sstable_ids: Arc::clone(&current.sstable_ids),
+                indexes: Arc::clone(&current.indexes),
+                sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+                vector_indexes: Arc::clone(&current.vector_indexes),
+            };
+            (Some(next), ())
+        })?;
         let pinned_indexes: Vec<(&str, crate::memtable::index::IndexSnapshot)> = sidecar_indexes
             .iter()
             .map(|(index_name, memtable_idx)| (index_name.as_str(), memtable_idx.pin()))
@@ -4648,18 +4756,10 @@ impl<F: FlushTarget> TableStore<F> {
         //   - Never silently skip: a missing vector sidecar causes ANN queries
         //     to fall back to full scans without the caller knowing.
         for cfg in &target_catalog.vector_index_configs {
-            // A vector index the rotating DDL added has no memtable index on
-            // the frozen memtable; build it from the frozen rows instead.
-            let built_from_rows;
-            let vi = match old_vector_indexes.get(&cfg.index_name) {
-                Some(vi) => Some(vi),
-                None => {
-                    built_from_rows = vector_index_from_rows(cfg, &partitions);
-                    Some(&built_from_rows)
-                }
-            };
-            if let Some(vi) = vi {
-                let drained_with_scopes = vi.drain_with_scopes();
+            // Read, not drained: readers keep searching this index through
+            // `flushing_vector_indexes` until the sidecar is installed.
+            if let Some(vi) = flush_vector_indexes.get(&cfg.index_name) {
+                let drained_with_scopes = vi.entries_with_scopes();
                 if drained_with_scopes.is_empty() {
                     continue;
                 }
@@ -4842,6 +4942,8 @@ impl<F: FlushTarget> TableStore<F> {
             let next = StoreView {
                 active: Arc::clone(&current_view.active),
                 flushing: None,
+                flushing_indexes: None,
+                flushing_vector_indexes: None,
                 sstables: Arc::new(new_sstables),
                 sstable_ids: Arc::new(new_ids),
                 indexes: Arc::clone(&current_view.indexes),
@@ -5049,6 +5151,8 @@ impl<F: FlushTarget> TableStore<F> {
             let next = StoreView {
                 active: Arc::clone(&current_view.active),
                 flushing: None,
+                flushing_indexes: None,
+                flushing_vector_indexes: None,
                 sstables: Arc::new(new_sstables),
                 sstable_ids: Arc::new(new_ids),
                 indexes: Arc::clone(&current_view.indexes),
@@ -6968,6 +7072,7 @@ impl<F: FlushTarget> TableStore<F> {
             .indexes
             .get(index_name)
             .and_then(|index| index.posting_list(&lookup_key));
+        let flushing = flushing_posting_list(&guard, index_name, &lookup_key);
         // Seek to the cursor's PARTITION, inclusive: a partition posting
         // (pk, []) sorts before every row of pk, and a page that stopped
         // inside pk must reopen it. Rows at or before the cursor are dropped
@@ -6978,7 +7083,7 @@ impl<F: FlushTarget> TableStore<F> {
         });
         let sources = index_posting_sources(
             &guard,
-            memtable.as_ref(),
+            [memtable.as_ref(), flushing.as_ref()],
             index_name,
             &lookup_key,
             from.as_ref(),
@@ -7047,8 +7152,14 @@ impl<F: FlushTarget> TableStore<F> {
             .indexes
             .get(index_name)
             .and_then(|index| index.posting_list(&lookup_key));
-        let sources =
-            index_posting_sources(&guard, memtable.as_ref(), index_name, &lookup_key, None);
+        let flushing = flushing_posting_list(&guard, index_name, &lookup_key);
+        let sources = index_posting_sources(
+            &guard,
+            [memtable.as_ref(), flushing.as_ref()],
+            index_name,
+            &lookup_key,
+            None,
+        );
         Ok(OrderedPostings::new(sources).take(threshold).count() >= threshold)
     }
 
@@ -7229,8 +7340,8 @@ impl<F: FlushTarget> TableStore<F> {
             Ok(())
         };
 
-        // 1. Memtable index.
-        if let Some(idx) = guard.indexes.get(index_name) {
+        // 1. Memtable indexes: the active memtable's and the flushing one's.
+        for idx in memtable_indexes_named(&guard, index_name) {
             append_in_partition(idx.lookup(key))?;
         }
 
@@ -7326,8 +7437,8 @@ impl<F: FlushTarget> TableStore<F> {
             })
             .collect();
 
-        // 1. Memtable index: ordered range scan per range.
-        if let Some(idx) = guard.indexes.get(index_name) {
+        // 1. Memtable indexes (active and flushing): ordered range scan per range.
+        for idx in memtable_indexes_named(&guard, index_name) {
             for (start_key, end_key) in &key_ranges {
                 append_positions(idx.range(start_key, end_key))?;
             }
@@ -8146,13 +8257,26 @@ impl<F: FlushTarget> TableStore<F> {
                 merged.insert(VectorRowRef::memtable(result.position), result);
             }
         }
+        if let Some(vi) = flushing_vector_index(&guard, index_name) {
+            let results = vi.search(query, k, ef_search).map_err(|e| {
+                ferrosa_common::Error::InvalidData(format!(
+                    "ann_search flushing memtable failed: {e}"
+                ))
+            })?;
+            for result in results {
+                merged.insert(
+                    VectorRowRef::sstable(FLUSHING_MEMTABLE_GENERATION, result.position),
+                    result,
+                );
+            }
+        }
 
         for (gen_str, _dir) in guard.sstable_ids.iter() {
             if let Ok(gen) = gen_str.parse::<u64>() {
                 match method {
                     VectorIndexMethod::Hnsw => {
                         if let Some(vec_bytes) =
-                            self.flush_target.read_vector_sidecar(gen, index_name)
+                            self.flush_target.read_vector_sidecar(gen, index_name)?
                         {
                             match ferrosa_index::vector::hnsw::search_from_bytes(
                                 &vec_bytes, query, k, ef_search,
@@ -8243,13 +8367,28 @@ impl<F: FlushTarget> TableStore<F> {
                 merged.insert(VectorRowRef::memtable(result.position), result);
             }
         }
+        if let Some(vi) = flushing_vector_index(&guard, index_name) {
+            let results = vi
+                .search_with_scope(query, k, ef_search, partition_scope)
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidData(format!(
+                        "ann_search scoped flushing memtable failed: {e}"
+                    ))
+                })?;
+            for result in results {
+                merged.insert(
+                    VectorRowRef::sstable(FLUSHING_MEMTABLE_GENERATION, result.position),
+                    result,
+                );
+            }
+        }
 
         let scoped_index_name = scoped_vector_sidecar_name(index_name, partition_scope);
         for (gen_str, _dir) in guard.sstable_ids.iter() {
             if let Ok(gen) = gen_str.parse::<u64>() {
                 if let Some(vec_bytes) = self
                     .flush_target
-                    .read_vector_sidecar(gen, &scoped_index_name)
+                    .read_vector_sidecar(gen, &scoped_index_name)?
                 {
                     match ferrosa_index::vector::hnsw::search_from_bytes(
                         &vec_bytes, query, k, ef_search,
@@ -8333,7 +8472,12 @@ impl<F: FlushTarget> TableStore<F> {
         // Source (a): active memtable — scope carried inline.
         let guard = self.view.load();
         let mut scopeless_memtable_hits = 0usize;
-        if let Some(vi) = guard.vector_indexes.get(index_name) {
+        let memtable_vector_indexes = guard
+            .vector_indexes
+            .get(index_name)
+            .into_iter()
+            .chain(flushing_vector_index(&guard, index_name));
+        for vi in memtable_vector_indexes {
             let results = vi.search_with_scopes(query, k, ef_search).map_err(|e| {
                 ferrosa_common::Error::InvalidData(format!(
                     "ann_search_partitions memtable failed: {e}"
@@ -8643,6 +8787,8 @@ impl<F: FlushTarget> TableStore<F> {
         let new_view = StoreView {
             active: new_memtable(),
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
             indexes: new_indexes(Arc::clone(&catalog), self.schema.load_full()),
@@ -8729,7 +8875,7 @@ impl<F: FlushTarget> TableStore<F> {
         output_path: std::path::PathBuf,
         add: Arc<SSTableReader<F::Reader>>,
         output_sidecars: HashMap<String, SidecarReader>,
-    ) -> Result<()> {
+    ) -> Result<CompactionSwap> {
         // Build the descriptor for the compacted output and seed its reader
         // into the pool once; the view swap below may derive more than once.
         let out_desc = SstableDescriptor::from_reader(output_id.clone(), output_path.clone(), &add);
@@ -8750,24 +8896,46 @@ impl<F: FlushTarget> TableStore<F> {
                 &output_sidecars,
             )
         })?;
+        let Some(removed) = removed else {
+            // An input already left the view (a TRUNCATE or another
+            // compaction got there first). The output holds rows the view no
+            // longer has; installing it would resurrect them.
+            self.reader_pool.remove(&self.pool_key(&out_desc));
+            tracing::warn!(
+                output = %output_id,
+                inputs = ?input_id_set,
+                "compaction swap refused: an input is no longer in the view; the output must be discarded"
+            );
+            return Ok(CompactionSwap::InputsGone);
+        };
 
         // Evict every removed input generation from the pool so a stale reader
         // can never be served or reopened after its files are deleted (FMEA #4).
         for desc in &removed {
             self.reader_pool.remove(&self.pool_key(desc));
         }
-        Ok(())
+        Ok(CompactionSwap::Swapped)
     }
 
     /// `current` with the compaction inputs removed and the output prepended,
-    /// plus the input descriptors it removed.
+    /// plus the input descriptors it removed; `(None, None)` when an input is
+    /// no longer in `current`.
     fn view_with_compaction_output(
         current: &StoreView,
         input_id_set: &std::collections::HashSet<&str>,
         out_desc: &SstableDescriptor,
         (output_id, output_path): (&String, &std::path::PathBuf),
         output_sidecars: &Arc<HashMap<String, SidecarReader>>,
-    ) -> (Option<StoreView>, Vec<SstableDescriptor>) {
+    ) -> (Option<StoreView>, Option<Vec<SstableDescriptor>>) {
+        let all_present = input_id_set.iter().all(|input| {
+            current
+                .sstable_ids
+                .iter()
+                .any(|(id, _)| id.as_str() == *input)
+        });
+        if !all_present {
+            return (None, None);
+        }
         // Keep SSTables whose ID is NOT in the compaction input set.
         // Match on ID only — the path in the view may be empty (from flush)
         // while the compaction task resolves it to the table directory. Matching
@@ -8804,13 +8972,15 @@ impl<F: FlushTarget> TableStore<F> {
         let next = StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
+            flushing_indexes: current.flushing_indexes.clone(),
+            flushing_vector_indexes: current.flushing_vector_indexes.clone(),
             sstables: Arc::new(new_sstables),
             sstable_ids: Arc::new(new_ids),
             indexes: Arc::clone(&current.indexes),
             sidecar_indexes: Arc::new(new_sidecars),
             vector_indexes: Arc::clone(&current.vector_indexes),
         };
-        (Some(next), removed)
+        (Some(next), Some(removed))
     }
 
     /// Collects sidecar entries from SSTables matching the given `(id, path)` pairs for merging.
@@ -8881,6 +9051,8 @@ impl<F: FlushTarget> TableStore<F> {
             let next = StoreView {
                 active: Arc::clone(&guard.active),
                 flushing: guard.flushing.clone(),
+                flushing_indexes: guard.flushing_indexes.clone(),
+                flushing_vector_indexes: guard.flushing_vector_indexes.clone(),
                 sstables: Arc::clone(&guard.sstables),
                 sstable_ids: Arc::clone(&guard.sstable_ids),
                 indexes: Arc::clone(&guard.indexes),
@@ -9962,6 +10134,8 @@ mod tests {
         let replacement = StoreView {
             active: Arc::new(SnapshotMemtable { partitions }),
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::clone(&current.sstables),
             sstable_ids: Arc::clone(&current.sstable_ids),
             indexes: Arc::clone(&current.indexes),
@@ -10993,6 +11167,8 @@ mod tests {
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![good_desc, corrupt_desc]),
             sstable_ids: Arc::new(vec![
                 ("good".to_string(), std::path::PathBuf::new()),
@@ -11056,6 +11232,8 @@ mod tests {
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![("truncated".to_string(), std::path::PathBuf::new())]),
             indexes: Arc::clone(&current.indexes),
@@ -11114,6 +11292,8 @@ mod tests {
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![("corrupt-gen".to_string(), std::path::PathBuf::new())]),
             indexes: Arc::clone(&current.indexes),
@@ -11179,6 +11359,8 @@ mod tests {
         store.view.store(Arc::new(StoreView {
             active: Arc::clone(&current.active),
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(vec![desc.clone()]),
             sstable_ids: Arc::new(vec![(
                 "corrupt-gen-2".to_string(),
@@ -11267,6 +11449,8 @@ mod tests {
         store.view.store(Arc::new(StoreView {
             active: new_memtable(),
             flushing: None,
+            flushing_indexes: None,
+            flushing_vector_indexes: None,
             sstables: Arc::new(descs),
             sstable_ids: Arc::new(ids),
             indexes: Arc::clone(&current.indexes),
@@ -11792,6 +11976,8 @@ mod tests {
         store.view.store(Arc::new(StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
+            flushing_indexes: current.flushing_indexes.clone(),
+            flushing_vector_indexes: current.flushing_vector_indexes.clone(),
             sstables: Arc::new(keep.iter().map(|i| current.sstables[*i].clone()).collect()),
             sstable_ids: Arc::new(
                 keep.iter()
@@ -12542,7 +12728,7 @@ mod tests {
         let input_id_paths: Vec<(String, std::path::PathBuf)> =
             current_id_paths.iter().rev().take(2).cloned().collect();
 
-        store
+        let swap = store
             .swap_compacted_sstables(
                 &input_id_paths,
                 "compacted".to_string(),
@@ -12551,6 +12737,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
+        assert_eq!(swap, CompactionSwap::Swapped);
         assert_eq!(store.sstable_count(), 3); // 4 - 2 + 1 = 3
 
         // Verify output is present and inputs are gone.
@@ -12568,6 +12755,97 @@ mod tests {
                 "input {id} should be removed"
             );
         }
+    }
+
+    /// An index read during a flush must find every row written before the
+    /// memtable rotated (T1). After the swap the view's memtable indexes are
+    /// the NEW memtable's; the frozen memtable's postings must stay readable
+    /// until its sidecar is installed. The flush is held between the swap and
+    /// the sidecar install by its own swap callback, so no sleep is involved.
+    #[test]
+    fn an_index_read_during_a_flush_finds_rows_written_before_the_rotation() {
+        let store = Arc::new(test_store());
+        let _rotation: FlushOutcome = store
+            .add_index("idx_main".to_string(), 0, IndexType::BTree)
+            .unwrap();
+        store
+            .write(&make_key("before"), make_row(b"v", 1000))
+            .unwrap();
+
+        let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let flush = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.flush_with_swap_callback(move || {
+                    rotated_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        rotated_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // The memtable has rotated; no sidecar for its rows exists yet.
+        let during = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec()));
+        release_tx.send(()).unwrap();
+        assert_eq!(flush.join().unwrap().unwrap(), FlushOutcome::Published);
+
+        let during = during.unwrap();
+        assert_eq!(
+            during.len(),
+            1,
+            "a row written before the rotation was missing from an index read during the flush"
+        );
+        let after = collect_index_results(&store, "idx_main", &IndexKey(b"v".to_vec())).unwrap();
+        assert_eq!(after.len(), 1);
+    }
+
+    /// A compaction swap must not install its output once its inputs have left
+    /// the view (T2). Compaction merges inputs A and B; TRUNCATE commits while
+    /// it runs; then the swap arrives. Installing the merged output would bring
+    /// the truncated rows back. The swap must refuse, and change nothing.
+    #[test]
+    fn a_compaction_swap_after_truncate_does_not_resurrect_rows() {
+        let store = test_store();
+        store.write(&make_key("a"), make_row(b"va", 1000)).unwrap();
+        store.flush().unwrap();
+        store.write(&make_key("b"), make_row(b"vb", 2000)).unwrap();
+        store.flush().unwrap();
+        let inputs: Vec<(String, std::path::PathBuf)> =
+            store.view.load().sstable_ids.iter().cloned().collect();
+        // Stand in for the merged output: an SSTable holding both rows.
+        let merged = sstable_reader_from_partitions(
+            &test_schema(),
+            &[
+                make_partition("a", b"va", 1000),
+                make_partition("b", b"vb", 2000),
+            ],
+            None,
+        );
+
+        store.truncate().unwrap();
+        let swapped = store.swap_compacted_sstables(
+            &inputs,
+            "merged".to_string(),
+            std::path::PathBuf::new(),
+            Arc::new(merged),
+            HashMap::new(),
+        );
+
+        assert!(
+            matches!(swapped, Ok(CompactionSwap::InputsGone)),
+            "the swap must refuse an output whose inputs were truncated: {swapped:?}"
+        );
+        assert_eq!(store.sstable_count(), 0);
+        assert!(
+            store.read(&make_key("a")).unwrap().is_none(),
+            "truncated row a resurrected"
+        );
+        assert!(
+            store.read(&make_key("b")).unwrap().is_none(),
+            "truncated row b resurrected"
+        );
     }
 
     /// P0 data loss: two flushes to same partition key, different clustering
@@ -12816,7 +13094,7 @@ mod tests {
 
         // Swap: this MUST remove the 2 inputs even though their paths
         // don't match the view's empty PathBuf.
-        store
+        let swap = store
             .swap_compacted_sstables(
                 &input_ids_with_real_path,
                 "output".to_string(),
@@ -12825,6 +13103,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
+        assert_eq!(swap, CompactionSwap::Swapped);
 
         // Before the fix, this was 4 (2 inputs kept + output + merged).
         // After the fix, inputs are removed: 3 - 2 + 1 = 2.
@@ -14157,6 +14436,7 @@ mod tests {
             store
                 .flush_target
                 .read_vector_sidecar(gen, "vec_idx")
+                .unwrap()
                 .is_none(),
             "quantized method must not write the legacy HNSW/VEC sidecar"
         );
@@ -14489,6 +14769,7 @@ mod tests {
         let sidecar_bytes = store
             .flush_target
             .read_vector_sidecar(gen, "vec_idx")
+            .unwrap()
             .expect("vector sidecar must be present after flush");
         assert!(
             !sidecar_bytes.is_empty(),
@@ -14520,6 +14801,108 @@ mod tests {
             "first result score should be near 0.0 for exact-match vector, got {}",
             results[0].score
         );
+    }
+
+    /// ANN during a flush must find rows written before the memtable rotated:
+    /// the vector-index form of T1. The flush is held between the swap and
+    /// the sidecar install by its swap callback.
+    #[test]
+    fn ann_during_a_flush_finds_rows_written_before_the_rotation() {
+        let store = Arc::new(TableStore::new(
+            vector_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        ));
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+
+        let (rotated_tx, rotated_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let flush = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.flush_with_swap_callback(move || {
+                    rotated_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        rotated_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let during = store.ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20);
+        let raw = store.ann_search("vec_idx", &[1.0, 0.0, 0.0], 1, 20);
+        release_tx.send(()).unwrap();
+        assert_eq!(flush.join().unwrap().unwrap(), FlushOutcome::Published);
+
+        assert_eq!(
+            during.unwrap().len(),
+            1,
+            "ANN during the flush missed the frozen row"
+        );
+        assert_eq!(
+            raw.unwrap().len(),
+            1,
+            "raw ANN during the flush missed the frozen row"
+        );
+        let after = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+            .unwrap();
+        assert_eq!(after.len(), 1);
+    }
+
+    /// A vector index declared AFTER rows were written must answer for those
+    /// rows. Its DDL rotates the memtable, so the rows leave with the frozen
+    /// memtable; the rotation's flush must give them a vector sidecar that ANN
+    /// reads find (regression: `vector_index_registered_and_ann_orders_correctly`).
+    #[test]
+    fn a_vector_index_added_after_rows_answers_ann_for_them() {
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+            .unwrap();
+        let _rotation: FlushOutcome = store
+            .add_vector_index(VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            })
+            .unwrap();
+
+        let partitions = store
+            .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+            .unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "ANN found no row written before the index"
+        );
+        assert_eq!(partitions[0].key.key.as_bytes(), b"k0");
     }
 
     #[test]
@@ -15706,7 +16089,7 @@ mod tests {
         // lives in the high-bit synthetic space — no collision with inputs).
         let out_gen = "compacted".to_string();
 
-        store
+        let swap = store
             .swap_compacted_sstables(
                 &input_id_paths,
                 out_gen.clone(),
@@ -15715,6 +16098,7 @@ mod tests {
                 HashMap::new(),
             )
             .unwrap();
+        assert_eq!(swap, CompactionSwap::Swapped);
         // 3 inputs removed, 1 compacted output inserted → exactly 1 remaining.
         assert_eq!(store.sstable_count(), 1, "3 inputs - 3 + 1 output = 1");
 
