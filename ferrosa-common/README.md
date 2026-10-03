@@ -89,6 +89,9 @@ HLC reading the system clock:
   repair signal.
 - **`accord`** — Accord timestamps, ballots, HLC, and per-txn state.
 - **`schema`** — `TableSchema` and the marshal-type / clustering validators.
+  `vector_dimension` reads a vector column's dimension from either spelling
+  (`vector<float, 3>` or `VectorType(...FloatType,3)`, element class
+  qualified or not).
 - **`geometry`** — WKB marshal/parse for the supported geometry subset.
 - **`task_pool`** — runtime-aware spawn helper.
 
