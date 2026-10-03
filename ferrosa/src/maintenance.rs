@@ -5,7 +5,10 @@
 //!   panics or returns) and every flush is a `FlushSupervisor` attempt (a panic
 //!   is restarted on the next tick, a hang is reported as a stall and no longer
 //!   wedges the loop). State that must survive a loop restart, the last
-//!   persisted schema version, lives in the context, not the loop.
+//!   persisted schema version, lives in the context, not the loop. So does
+//!   the flush restart window, so a loop restart does not reset it. Every
+//!   iteration beats `ctx.heartbeat`; `supervisor::MaintenanceWatchdog` reads it
+//!   from its own thread and reports a loop that stopped iterating.
 //! Last revised: 2026-10-03
 //! Last changed: Extracted from `main` and supervised (t_7681b32b). Before, a
 //!   flush panic was one ERROR line, a hung flush blocked every arm of the loop
@@ -18,7 +21,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use crate::supervisor::{
-    self, EscalationPolicy, FlushRun, FlushSupervisor, RestartIntensity, SupervisionStatus,
+    self, EscalationPolicy, FlushRun, FlushSupervisor, Heartbeat, IntensityWindow,
+    RestartIntensity, SupervisionStatus,
 };
 
 /// Tick periods for the maintenance loop.
@@ -43,6 +47,11 @@ pub struct MaintenanceContext {
     pub intensity: RestartIntensity,
     pub flush_stall_deadline: Duration,
     pub escalation: Arc<EscalationPolicy>,
+    /// Beaten on every loop iteration; read by the `MaintenanceWatchdog`.
+    pub heartbeat: Arc<Heartbeat>,
+    /// The flush supervisor's restart window, shared by every loop
+    /// incarnation so a loop restart does not reset it.
+    pub flush_window: IntensityWindow,
 }
 
 /// Run the maintenance loop under supervision until the process exits.
@@ -60,9 +69,9 @@ pub async fn run_supervised(ctx: MaintenanceContext) {
 /// One incarnation of the loop. Never returns on its own; the supervisor
 /// treats a return as a failure.
 async fn run_maintenance_loop(ctx: MaintenanceContext) {
-    let mut flusher = FlushSupervisor::new(
+    let mut flusher = FlushSupervisor::with_window(
         ctx.supervision.clone(),
-        ctx.intensity,
+        ctx.flush_window.clone(),
         ctx.flush_stall_deadline,
         ctx.escalation.clone(),
     );
@@ -75,6 +84,7 @@ async fn run_maintenance_loop(ctx: MaintenanceContext) {
     let mut schema_sync_interval = tokio::time::interval(Duration::from_secs(30));
 
     loop {
+        ctx.heartbeat.beat();
         tokio::select! {
             _ = flush_interval.tick() => periodic_flush(&ctx, &mut flusher, has_s3).await,
             _ = compact_interval.tick() => {

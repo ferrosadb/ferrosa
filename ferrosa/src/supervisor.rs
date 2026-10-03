@@ -50,7 +50,6 @@
 //! restarts a crash, not a clean non-zero exit. A deterministic flush panic
 //! will crash again after replay; that crash loop is loud by design.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -189,35 +188,59 @@ pub fn env_or<T: std::str::FromStr + std::fmt::Display + Copy>(key: &str, defaul
     }
 }
 
-/// Failure instants inside the current period. Owned by one supervisor.
-pub(crate) struct IntensityWindow {
+/// The most recent `max_restarts + 1` failure instants, in a ring of atomics.
+///
+/// Cloning shares the ring, which is how a supervisor that is rebuilt keeps
+/// its history: the flush supervisor is recreated with every maintenance-loop
+/// incarnation, and before this was shared a loop restart reset the flush
+/// restart window. Exceeded means all `max_restarts + 1` most recent failures
+/// fall inside the period, the same rule as an OTP restart intensity.
+#[derive(Clone)]
+pub struct IntensityWindow {
     intensity: RestartIntensity,
-    failures: VecDeque<Instant>,
+    ring: Arc<FailureRing>,
+}
+
+struct FailureRing {
+    base: Instant,
+    next: AtomicU64,
+    /// Nanoseconds since `base`, plus one; 0 is an empty slot.
+    slots: Box<[AtomicU64]>,
 }
 
 impl IntensityWindow {
-    pub(crate) fn new(intensity: RestartIntensity) -> Self {
+    pub fn new(intensity: RestartIntensity) -> Self {
+        let len = intensity.max_restarts as usize + 1;
         Self {
             intensity,
-            failures: VecDeque::with_capacity(intensity.max_restarts as usize + 1),
+            ring: Arc::new(FailureRing {
+                base: Instant::now(),
+                next: AtomicU64::new(0),
+                slots: (0..len).map(|_| AtomicU64::new(0)).collect(),
+            }),
         }
     }
 
-    /// Record a failure at `now` and return how many fall within the period.
-    /// The queue never holds more than `max_restarts + 1` entries.
-    pub(crate) fn record(&mut self, now: Instant) -> usize {
-        while let Some(&oldest) = self.failures.front() {
-            if now.saturating_duration_since(oldest) < self.intensity.period {
-                break;
-            }
-            self.failures.pop_front();
-        }
-        self.failures.push_back(now);
-        let in_period = self.failures.len();
-        while self.failures.len() > self.intensity.max_restarts as usize + 1 {
-            self.failures.pop_front();
-        }
-        in_period
+    /// Record a failure at `now` and return how many of the most recent
+    /// `max_restarts + 1` fall within the period.
+    pub(crate) fn record(&self, now: Instant) -> usize {
+        let ring = &self.ring;
+        let stamp = |at: Instant| {
+            at.saturating_duration_since(ring.base)
+                .as_nanos()
+                .min(u128::from(u64::MAX - 1)) as u64
+                + 1
+        };
+        let len = ring.slots.len() as u64;
+        let slot = (ring.next.fetch_add(1, Ordering::AcqRel) % len) as usize;
+        ring.slots[slot].store(stamp(now), Ordering::Release);
+        ring.slots
+            .iter()
+            .map(|slot| slot.load(Ordering::Acquire))
+            .filter(|&stamped| stamped != 0)
+            .map(|stamped| ring.base + Duration::from_nanos(stamped - 1))
+            .filter(|&failed| now.saturating_duration_since(failed) < self.intensity.period)
+            .count()
     }
 
     fn exceeded(&self, in_period: usize) -> bool {
@@ -484,13 +507,30 @@ impl FlushSupervisor {
         stall_deadline: Duration,
         escalation: Arc<EscalationPolicy>,
     ) -> Self {
+        Self::with_window(
+            status,
+            IntensityWindow::new(intensity),
+            stall_deadline,
+            escalation,
+        )
+    }
+
+    /// Like [`Self::new`], counting failures in a window that outlives this
+    /// supervisor (one per maintenance-loop incarnation shares it).
+    pub(crate) fn with_window(
+        status: Arc<SupervisionStatus>,
+        window: IntensityWindow,
+        stall_deadline: Duration,
+        escalation: Arc<EscalationPolicy>,
+    ) -> Self {
         assert!(
             !stall_deadline.is_zero(),
             "a zero stall deadline would report every flush as stalled"
         );
+        let intensity = window.intensity;
         Self {
             status,
-            window: IntensityWindow::new(intensity),
+            window,
             intensity,
             stall_deadline,
             escalation,
@@ -959,6 +999,175 @@ pub async fn supervise<F, Fut>(
         );
         status.record_recovery(child);
     }
+}
+
+/// The last time a supervised loop made progress, as one atomic.
+pub struct Heartbeat {
+    base: Instant,
+    /// Nanoseconds since `base` of the last beat.
+    last: AtomicU64,
+}
+
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Heartbeat {
+    pub fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    pub fn beat(&self) {
+        self.beat_at(Instant::now());
+    }
+
+    pub(crate) fn beat_at(&self, now: Instant) {
+        let nanos = now
+            .saturating_duration_since(self.base)
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        self.last.fetch_max(nanos, Ordering::AcqRel);
+    }
+
+    /// How long since the last beat, as of `now`.
+    pub(crate) fn silent_for(&self, now: Instant) -> Duration {
+        let last = self.base + Duration::from_nanos(self.last.load(Ordering::Acquire));
+        now.saturating_duration_since(last)
+    }
+}
+
+/// Default for how long the maintenance loop may go without a beat.
+pub fn default_maintenance_stall_deadline(flush_stall_deadline: Duration) -> Duration {
+    // One arm may legitimately wait a whole flush stall deadline for the
+    // flusher; twice that is a loop that is not coming back on its own.
+    flush_stall_deadline.saturating_mul(2)
+}
+
+/// Watches the maintenance loop's [`Heartbeat`] from outside the loop.
+///
+/// The loop beats on every iteration. A hang the loop cannot report itself
+/// (an `.await` in `poll_compactions` that never completes, commit-log GC
+/// blocked on a lock) stops the beats: each elapsed `deadline` of silence is
+/// a `maintenance_loop` stall, counted toward the intensity and escalated
+/// past it. A hung future cannot be restarted from outside; escalation
+/// (commit-log sync, then abort) is the restart.
+pub struct MaintenanceWatchdog {
+    heartbeat: Arc<Heartbeat>,
+    deadline: Duration,
+    status: Arc<SupervisionStatus>,
+    window: IntensityWindow,
+    intensity: RestartIntensity,
+    escalation: Arc<EscalationPolicy>,
+    stalls_recorded: u64,
+    escalated: bool,
+}
+
+impl MaintenanceWatchdog {
+    pub fn new(
+        heartbeat: Arc<Heartbeat>,
+        deadline: Duration,
+        status: Arc<SupervisionStatus>,
+        intensity: RestartIntensity,
+        escalation: Arc<EscalationPolicy>,
+    ) -> Self {
+        assert!(
+            !deadline.is_zero(),
+            "a zero deadline would stall every check"
+        );
+        Self {
+            heartbeat,
+            deadline,
+            status,
+            window: IntensityWindow::new(intensity),
+            intensity,
+            escalation,
+            stalls_recorded: 0,
+            escalated: false,
+        }
+    }
+
+    /// How often [`run_maintenance_watchdog`] checks.
+    pub fn poll_interval(&self) -> Duration {
+        (self.deadline / 10).max(Duration::from_millis(100))
+    }
+
+    pub fn check(&mut self, now: Instant) {
+        let silent = self.heartbeat.silent_for(now);
+        if silent < self.deadline {
+            if self.stalls_recorded > 0 {
+                self.stalls_recorded = 0;
+                if !self.escalated && self.status.record_recovery(Child::MaintenanceLoop) {
+                    tracing::warn!(
+                        task = Child::MaintenanceLoop.label(),
+                        "maintenance loop is making progress again"
+                    );
+                }
+            }
+            return;
+        }
+        let due = (silent.as_nanos() / self.deadline.as_nanos()).min(u128::from(u64::MAX)) as u64;
+        let newly_due = due.saturating_sub(self.stalls_recorded);
+        self.stalls_recorded = due.max(self.stalls_recorded);
+        let detail = format!(
+            "no maintenance-loop iteration for {}s, past the {}s watchdog deadline",
+            silent.as_secs(),
+            self.deadline.as_secs()
+        );
+        for _ in 0..newly_due.min(u64::from(self.intensity.max_restarts) + 1) {
+            self.status
+                .record_failure(Child::MaintenanceLoop, FailureKind::Stall, &detail);
+            let in_period = self.window.record(now);
+            if self.escalated {
+                continue;
+            }
+            if self.window.exceeded(in_period) {
+                self.escalated = true;
+                self.escalation.escalate(
+                    &self.status,
+                    &EscalationReport {
+                        child: Child::MaintenanceLoop,
+                        failures_in_period: in_period,
+                        intensity: self.intensity,
+                        last_failure: detail.clone(),
+                    },
+                );
+                continue;
+            }
+            tracing::error!(
+                task = Child::MaintenanceLoop.label(),
+                failures_in_period = in_period,
+                max_restarts = self.intensity.max_restarts,
+                %detail,
+                "maintenance loop is hung; the node reports not ready"
+            );
+        }
+    }
+}
+
+/// Run a [`MaintenanceWatchdog`] on its own OS thread, so a maintenance loop
+/// that wedges the runtime it shares cannot also stop its watchdog. A panic in
+/// one check is logged and the next check runs.
+pub fn spawn_maintenance_watchdog(mut watchdog: MaintenanceWatchdog) -> std::io::Result<()> {
+    let poll = watchdog.poll_interval();
+    std::thread::Builder::new()
+        .name("maintenance-watchdog".into())
+        .spawn(move || loop {
+            std::thread::park_timeout(poll);
+            if let Err(payload) =
+                std::panic::catch_unwind(AssertUnwindSafe(|| watchdog.check(Instant::now())))
+            {
+                tracing::error!(
+                    panic = %panic_message(payload.as_ref()),
+                    "maintenance watchdog check panicked; the next check runs"
+                );
+            }
+        })
+        .map(|_detached| ())
 }
 
 #[cfg(test)]

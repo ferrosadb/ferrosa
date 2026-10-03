@@ -3170,6 +3170,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Supervised (t_7681b32b): the loop is restarted if it panics or returns,
     // each flush runs as a supervised attempt, and past the restart intensity
     // the process syncs the commit log and aborts — see `supervisor`.
+    let maintenance_intensity = supervisor::RestartIntensity::from_env();
+    let flush_stall_deadline = std::time::Duration::from_secs(
+        supervisor::env_or(
+            "FERROSA_FLUSH_STALL_DEADLINE_SECS",
+            supervisor::DEFAULT_FLUSH_STALL_DEADLINE.as_secs(),
+        )
+        .max(1),
+    );
+    let maintenance_heartbeat = Arc::new(supervisor::Heartbeat::new());
     let maintenance_context = maintenance::MaintenanceContext {
         engine: storage.clone(),
         schema: schema.clone(),
@@ -3185,22 +3194,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             maintenance_last_schema_version(schema.snapshot().version),
         )),
         supervision: supervision_status.clone(),
-        intensity: supervisor::RestartIntensity::from_env(),
-        flush_stall_deadline: std::time::Duration::from_secs(
-            supervisor::env_or(
-                "FERROSA_FLUSH_STALL_DEADLINE_SECS",
-                supervisor::DEFAULT_FLUSH_STALL_DEADLINE.as_secs(),
-            )
-            .max(1),
-        ),
+        intensity: maintenance_intensity,
+        flush_stall_deadline,
         escalation: Arc::new(supervisor::EscalationPolicy::AbortProcess {
             engine: storage.clone(),
         }),
+        heartbeat: maintenance_heartbeat.clone(),
+        flush_window: supervisor::IntensityWindow::new(maintenance_intensity),
     };
     // The supervisor never returns: it restarts the loop or aborts the process.
     runtimes
         .background
         .spawn(maintenance::run_supervised(maintenance_context));
+
+    // A hang inside the loop (an await that never completes, a blocked GC)
+    // is invisible to `supervise`, which only sees panics and returns. The
+    // watchdog reads the loop's heartbeat from its own thread.
+    let maintenance_stall_deadline = std::time::Duration::from_secs(
+        supervisor::env_or(
+            "FERROSA_MAINTENANCE_STALL_DEADLINE_SECS",
+            supervisor::default_maintenance_stall_deadline(flush_stall_deadline).as_secs(),
+        )
+        .max(1),
+    );
+    supervisor::spawn_maintenance_watchdog(supervisor::MaintenanceWatchdog::new(
+        maintenance_heartbeat,
+        maintenance_stall_deadline,
+        supervision_status.clone(),
+        maintenance_intensity,
+        Arc::new(supervisor::EscalationPolicy::AbortProcess {
+            engine: storage.clone(),
+        }),
+    ))?;
 
     // P0-6 (t_88479cda): supervise the commit log's fsync thread. The commit
     // log refuses writes on its own while the thread is dead or behind; this

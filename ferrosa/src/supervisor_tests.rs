@@ -663,3 +663,113 @@ fn the_supervisor_restarts_a_real_dead_commit_log_sync_thread() {
     assert!(status.impaired().is_empty(), "{:?}", status.impaired());
     assert_eq!(escalations.load(Ordering::SeqCst), 0);
 }
+
+// ---------------------------------------------------------------------------
+// The flush window survives a loop restart; a hung loop is seen from outside
+// ---------------------------------------------------------------------------
+
+/// Before, each maintenance-loop incarnation built a fresh flush supervisor
+/// with a fresh window, so a flush that panicked and took the loop with it
+/// never reached the intensity.
+#[tokio::test]
+async fn the_flush_restart_window_survives_a_maintenance_loop_restart() {
+    let status = Arc::new(SupervisionStatus::default());
+    let escalations = Arc::new(AtomicU64::new(0));
+    let window = IntensityWindow::new(intensity(3));
+    let escalation = Arc::new(EscalationPolicy::Record(escalations.clone()));
+    let incarnation = || {
+        FlushSupervisor::with_window(
+            status.clone(),
+            window.clone(),
+            Duration::from_secs(30),
+            escalation.clone(),
+        )
+    };
+
+    let mut first = incarnation();
+    first.run("storage-flush", || panic!("p1")).await;
+    first.run("storage-flush", || panic!("p2")).await;
+    let mut second = incarnation();
+    second.run("storage-flush", || panic!("p3")).await;
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        0,
+        "3 panics are within 3"
+    );
+    second.run("storage-flush", || panic!("p4")).await;
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        1,
+        "the 4th panic counts the 3 from before the loop restarted"
+    );
+}
+
+fn watchdog(
+    max_restarts: u32,
+    deadline: Duration,
+) -> (
+    MaintenanceWatchdog,
+    Arc<Heartbeat>,
+    Arc<SupervisionStatus>,
+    Arc<AtomicU64>,
+) {
+    let heartbeat = Arc::new(Heartbeat::new());
+    let status = Arc::new(SupervisionStatus::default());
+    let escalations = Arc::new(AtomicU64::new(0));
+    let watchdog = MaintenanceWatchdog::new(
+        heartbeat.clone(),
+        deadline,
+        status.clone(),
+        intensity(max_restarts),
+        Arc::new(EscalationPolicy::Record(escalations.clone())),
+    );
+    (watchdog, heartbeat, status, escalations)
+}
+
+#[test]
+fn a_hung_maintenance_loop_is_a_stall_per_deadline_and_escalates() {
+    let (mut watchdog, heartbeat, status, escalations) = watchdog(2, Duration::from_secs(10));
+    let t0 = Instant::now();
+    heartbeat.beat_at(t0);
+
+    watchdog.check(t0 + Duration::from_secs(9));
+    assert!(status.impaired().is_empty(), "inside the deadline");
+
+    watchdog.check(t0 + Duration::from_secs(21));
+    assert_eq!(
+        status.failures(Child::MaintenanceLoop, FailureKind::Stall),
+        2,
+        "two elapsed deadlines are two stalls"
+    );
+    let impaired = status.impaired();
+    assert_eq!(impaired[0].0, "maintenance_loop");
+    assert!(impaired[0].1.contains("watchdog deadline"), "{impaired:?}");
+    watchdog.check(t0 + Duration::from_secs(22));
+    assert_eq!(
+        status.failures(Child::MaintenanceLoop, FailureKind::Stall),
+        2,
+        "the same deadline is not counted twice"
+    );
+    assert_eq!(escalations.load(Ordering::SeqCst), 0);
+
+    watchdog.check(t0 + Duration::from_secs(30));
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        1,
+        "a third stall exceeds max_restarts=2"
+    );
+}
+
+#[test]
+fn a_maintenance_loop_that_beats_again_recovers() {
+    let (mut watchdog, heartbeat, status, escalations) = watchdog(5, Duration::from_secs(10));
+    let t0 = Instant::now();
+    heartbeat.beat_at(t0);
+    watchdog.check(t0 + Duration::from_secs(15));
+    assert!(!status.impaired().is_empty());
+
+    heartbeat.beat_at(t0 + Duration::from_secs(16));
+    watchdog.check(t0 + Duration::from_secs(17));
+    assert!(status.impaired().is_empty(), "the loop made progress");
+    assert_eq!(escalations.load(Ordering::SeqCst), 0);
+}
