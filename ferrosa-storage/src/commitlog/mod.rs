@@ -2000,15 +2000,24 @@ mod tests {
     #[test]
     fn replayed_mutation_survives_a_second_crash_before_flush() {
         let dir = tempfile::tempdir().unwrap();
-        let config = CommitLogConfig::test_config(dir.path());
+        // A sync interval no test outlives: the re-logged copy is durable
+        // only because replay fsyncs it before deleting the old segment.
+        let config = CommitLogConfig {
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: std::time::Duration::from_secs(3600),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
         let cl = CommitLog::new(config.clone()).unwrap();
         let written = simple_mutation();
         cl.append(&written).unwrap();
+        cl.force_sync().unwrap();
         drop(cl);
 
         let (first, replayed) = CommitLog::open_and_replay(config.clone()).unwrap();
         assert_eq!(replayed.len(), 1, "first restart replays the write");
-        drop(first);
+        // kill -9: no Drop, so no sync strategy gets a final flush in.
+        std::mem::forget(first);
 
         let (_second, replayed) = CommitLog::open_and_replay(config).unwrap();
         assert_eq!(
