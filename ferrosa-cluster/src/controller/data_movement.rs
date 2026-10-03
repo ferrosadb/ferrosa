@@ -712,11 +712,6 @@ mod tests {
         }
     }
 
-    /// Nodes 1..=4 with one token each at 100, 200, 300, 400. A token `t` is
-    /// owned by the first ring token >= t, so with RF=2:
-    /// - token 50  -> [1, 2]  (node 1 PRIMARY)
-    /// - token 350 -> [4, 1]  (node 1 a NON-primary replica)
-    /// - token 250 -> [3, 4]  (node 1 not a replica)
     /// Decommission and bootstrap stream through this one encoder, so it must
     /// carry a partition's static row and partition deletion (P0-3), not only
     /// its clustered rows: without the deletion, rows the source deleted
@@ -738,6 +733,11 @@ mod tests {
         assert_eq!(decoded.rows.count(), source.rows.len());
     }
 
+    /// Nodes 1..=4 with one token each at 100, 200, 300, 400. A token `t` is
+    /// owned by the first ring token >= t, so with RF=2:
+    /// - token 50  -> [1, 2]  (node 1 PRIMARY)
+    /// - token 350 -> [4, 1]  (node 1 a NON-primary replica)
+    /// - token 250 -> [3, 4]  (node 1 not a replica)
     fn four_node_ring(leaving: u64) -> TokenRing {
         let mut ring = TokenRing::new();
         for id in 1..=4u64 {
