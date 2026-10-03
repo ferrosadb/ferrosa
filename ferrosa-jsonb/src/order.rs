@@ -140,7 +140,7 @@ fn step<'a>(
 /// postgres:16 (`tests/order.rs`, `PG_TABLE`).
 fn top_level_exception(a: ValueRef<'_>, b: ValueRef<'_>) -> Result<Option<Ordering>, JsonbError> {
     let empty_array = |v: ValueRef<'_>| -> Result<bool, JsonbError> {
-        Ok(v.kind()? == ValueKind::Array && v.as_array()?.len() == 0)
+        Ok(v.kind()? == ValueKind::Array && v.as_array()?.is_empty())
     };
     let scalar = |v: ValueRef<'_>| -> Result<bool, JsonbError> {
         Ok(!matches!(v.kind()?, ValueKind::Array | ValueKind::Object))
