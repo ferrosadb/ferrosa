@@ -502,11 +502,16 @@ mod tests {
         assert_eq!(a.cmp(&b), Ordering::Less);
         assert_eq!(b.cmp(&a), Ordering::Greater);
         // D18 kind order: Object > Array > Boolean > Number > String > Null.
-        assert!(jsonb_of("{}") > jsonb_of("[]"));
-        assert!(jsonb_of("[]") > jsonb_of("true"));
+        // A non-empty array stands for the Array kind: PostgreSQL sorts a
+        // top-level EMPTY array below every scalar, null included (eafcfb3c).
+        assert!(jsonb_of("{}") > jsonb_of("[1]"));
+        assert!(jsonb_of("[1]") > jsonb_of("true"));
         assert!(jsonb_of("true") > jsonb_of("1"));
         assert!(jsonb_of("1") > jsonb_of("\"s\""));
         assert!(jsonb_of("\"s\"") > jsonb_of("null"));
+        // The PostgreSQL exception: a top-level empty array sorts lowest.
+        assert!(jsonb_of("[]") < jsonb_of("null"));
+        assert!(jsonb_of("[]") < jsonb_of("[1]"));
     }
 
     #[test]
