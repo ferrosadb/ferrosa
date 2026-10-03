@@ -189,16 +189,46 @@ What happens on the first start of this build:
 2. That query, and every adjacency query arriving while it runs, waits for
    one complete reconcile of every `agent_memory` edge table. Queries that
    need no adjacency (plain `RETURN`, vertex lookups) are not held.
-3. The pass writes back every tombstoned entry of a live edge, tombstones the
-   live entries of deleted edges, and logs one WARN line:
-   `graph engine: adjacency heal repaired the index before serving
-   traversals` with `entries_repaired`, `entries_removed` and `elapsed_ms`.
+3. The pass rewrites every entry to every replica (below), and logs one WARN
+   line: `graph engine: adjacency heal repaired the index before serving
+   traversals` with `entries_repaired` (tombstoned or missing here),
+   `entries_removed` (live here for a deleted edge), `entries_rewritten`
+   (already right here) and `elapsed_ms`. On the first start after the
+   deploy expect `entries_repaired` near twice the live typed-edge count.
 4. If any read or write failed, the query gets HTTP 503 / Bolt
    `Neo.TransientError.General.DatabaseUnavailable` with "being repaired;
    retry", the WARN line says `adjacency heal incomplete`, and the next query
    heals again. No partial answer is returned as complete.
 
-**Time at production scale.** HEAL_TIMING_PLACEHOLDER
+**The heal rewrites every entry, on every replica.** Each node's pre-fix
+background pass damaged its own replica at its own time, and replica reads do
+not ship row tombstones, so a node cannot see another replica's damage. The
+heal (`ReconcileMode::Rewrite`) therefore writes every entry the edge tables
+imply — live entries for live edges, tombstones for deleted ones — under the
+adjacency keyspace's own replication at CL ALL, stamped at the pass start
+(later than every pre-fix write, earlier than any client write during the
+pass). It reads only to count what was damaged. A replica that is down fails
+the heal, and queries are refused retryably until it is back. Do not start
+the new build while another node is down.
+
+**Time at production scale.** Measured by
+`slow::deploy_heal_at_memory_cluster_scale` (release build, single node,
+production commit-log sync) on the memory cluster's shape: 102,780 entities
+and 21,000 typed edges (20,055 live), every live entry tombstoned by main's
+pre-fix reconcile. The first query, heal included, answered in **337–466 ms**
+(three runs), and a second pass found nothing to repair (156–204 ms). In
+cluster mode each entry is one CL ALL write fanned out to the three
+replicas, so expect several times that, still seconds rather than minutes;
+the WARN line's `elapsed_ms` reports the real figure. Run it with:
+
+```bash
+cargo test --release -p ferrosa-graph --features slow-tests \
+  --test adjacency_deploy_heal -- slow:: --nocapture
+```
+
+The heal runs on every process start, not only the first after the deploy.
+Restarts therefore pay the same cost, and a node never serves traversals
+from an index it has not reconciled in this process.
 
 **Verify on one node** before rolling the others:
 
@@ -224,7 +254,13 @@ each heals its own index on its own first query.
 Not repaired, and harmless to traversals: the pre-fix reconcile's phase 1 also
 wrote junk `typed_edges` entries keyed by raw composite key bytes, which no
 vertex id matches. The current reconcile cannot point-check that layout, so
-they stay until removed separately.
+they stay until removed separately (t_f3d48248).
+
+Known gap, not part of the deploy hazard (t_9049eab1): a hop binds one edge
+row per adjacency entry, so ferrosa-memory's `list_typed_edges_to` returns one
+`edge_type` of a pair linked by two, and without `edge_type` in the pattern it
+scans the whole edge table per neighbour (24 s for one vertex at the scale
+above).
 
 ### Edge-table endpoint-label contract
 
@@ -285,7 +321,12 @@ External: `axum`/`axum-server` (`tls-rustls-no-provider`), `rustls`, `tokio-rust
 353 in-crate unit/`tokio` tests plus four integration suites under `tests/`
 (`adjacency_replication.rs`, `graph_http_integration.rs`, `parser_proptest.rs`,
 `listener_tls.rs` — graph HTTP and Bolt over TLS, plaintext refused,
-`require_tls` without a certificate refuses to start).
+`require_tls` without a certificate refuses to start), and
+`adjacency_deploy_heal.rs` — the index damage left by the pre-330a0c29
+reconcile, reproduced with main's own reconcile code, healed before the first
+traversal answers, on one node and across two replicas; its
+`slow::deploy_heal_at_memory_cluster_scale` (feature `slow-tests`) measures
+the heal at the memory cluster's size.
 No `#[ignore]`, no `TODO`/`FIXME` markers in source. Highest coverage:
 `parser/parse_impl.rs` (81), `executor/eval.rs` (47), `executor/expand.rs` (44).
 

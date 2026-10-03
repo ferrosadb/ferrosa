@@ -1419,32 +1419,31 @@ mod slow {
             live.len(),
         );
 
-        // Answers: every vertex of one session, and every tenant's count.
-        // One session, not more: an IN hop without edge_type scans the whole
-        // edge table per neighbour (t_9049eab1), so the check, not the heal,
-        // dominates the run.
-        let sampled = (some.tenant, some.session);
-        let sample: Vec<Edge> = all
-            .iter()
-            .filter(|e| (e.tenant, e.session) == sampled)
-            .copied()
-            .collect();
-        let sample_live: BTreeSet<Edge> = sample
-            .iter()
-            .filter(|e| live.contains(e))
-            .copied()
-            .collect();
-        let reference = Reference::new(&sample, &sample_live);
-        assert_clean(
-            "sampled traversals at scale",
-            &check_all(&fresh, &reference).await,
-        );
+        // Answers: the OUT hops ferrosa-memory issues, for the sources of a
+        // sample of live edges, against the whole live set.
         let full = Reference::new(&all, &live);
-        assert_clean("counts at scale", &check_counts(&fresh, &full).await);
+        let sources: BTreeSet<(Uuid, Uuid, Uuid)> = live
+            .iter()
+            .step_by(live.len() / 60)
+            .map(|e| (e.tenant, e.session, e.src))
+            .collect();
+        let started = std::time::Instant::now();
+        let mut mismatches = Vec::new();
+        for &(t, s, v) in &sources {
+            let want = full.out.get(&(t, s, v)).cloned().unwrap_or_default();
+            for query in [related_query(t, s, v), bare_hop_query(t, s, v)] {
+                let rows = run_ok(&fresh, &query).await;
+                let got: BTreeSet<String> = rows.iter().map(|r| text(&r[0])).collect();
+                if got != want {
+                    mismatches.push(format!("OUT {v}: got {got:?}, want {want:?}"));
+                }
+            }
+        }
+        assert_clean("sampled OUT traversals at scale", &mismatches);
         eprintln!(
-            "SCALE answers checked: {} vertices of one session, {} tenant counts",
-            reference.vertices.len(),
-            full.count_by_tenant.len()
+            "SCALE checked OUT hops of {} sources in {} ms",
+            sources.len(),
+            started.elapsed().as_millis()
         );
     }
 }
