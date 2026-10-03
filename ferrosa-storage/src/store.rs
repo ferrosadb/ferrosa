@@ -886,7 +886,7 @@ impl IndexCatalog {
     }
 }
 
-/// A read-only list out of one [`IndexCatalog`] snapshot.
+/// A read-only list out of one `IndexCatalog` snapshot.
 ///
 /// Dereferences to a slice, so callers iterate it like the `&[T]` the
 /// accessors used to return; it keeps its snapshot alive, so a DDL that
@@ -2613,7 +2613,7 @@ impl<F: FlushTarget> TableStore<F> {
     ///
     /// Rows already in the memtable were written under the old schema, so
     /// this is a flush that publishes the new schema at its memtable swap:
-    /// see [`Self::flush_and_update_schema`].
+    /// see `TableStore::flush_and_update_schema`.
     pub fn update_schema(&self, new_schema: TableSchema) -> Result<()> {
         self.flush_and_update_schema(new_schema, || {})
             .map(|_outcome| ())
@@ -3798,7 +3798,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// Flush the active memtable to an SSTable.
     ///
     /// The flush sequence:
-    /// 1. Queue the rotation; one thread runs the queue (see [`Self::rotate`]).
+    /// 1. Queue the rotation; one thread runs the queue (see `TableStore::rotate`).
     /// 2. Install a fresh active memtable; move the old one to `flushing`.
     /// 3. Snapshot the flushing memtable.
     /// 4. If the snapshot is empty, clear `flushing` and return (no-op).
@@ -8681,7 +8681,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// SSTables will complete normally; the data is freed once those
     /// references drop. On-disk SSTable files remain until GC.
     ///
-    /// Runs as a rotation (see [`Self::rotate`]), so it never interleaves
+    /// Runs as a rotation (see `TableStore::rotate`), so it never interleaves
     /// with a flush or an index DDL of this table.
     pub fn truncate(&self) -> Result<()> {
         self.rotate(RotationKind::Truncate).map(|_outcome| ())
