@@ -216,34 +216,14 @@ impl StreamSession {
             let mutation: StreamedMutation = bincode::deserialize(&encoded).map_err(|e| {
                 ClusterError::Internal(format!("stream: failed to decode staged mutation: {e}"))
             })?;
+            // Decode BEFORE writing anything for this partition, so an
+            // undecodable row set fails the session instead of being stored.
+            let rows = decode_streamed_rows(&mutation)?;
             let table_id = TableId::new(&mutation.keyspace, &mutation.table);
             // Decorate with the key's real Murmur3 token. `DecoratedKey`
             // orders by token first, so a placeholder token files the
             // partition where no read at its real token will look.
-            let key = DecoratedKey::new(PartitionKey::new(mutation.key.clone()));
-
-            // Decode the row bytes. The sender serializes rows as
-            // Vec<RowWire> via bincode. Fall back to a single-cell
-            // placeholder if decoding fails (backwards compat with
-            // pre-RowWire streams).
-            use crate::raft::handlers::RowWire;
-            use ferrosa_common::CellValue;
-            use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
-
-            let rows: Vec<Row> = match bincode::deserialize::<Vec<RowWire>>(&mutation.row) {
-                Ok(wire_rows) if !wire_rows.is_empty() => {
-                    wire_rows.into_iter().map(Row::from).collect()
-                }
-                _ => {
-                    // Fallback: treat raw bytes as a single cell value.
-                    vec![Row {
-                        clustering: vec![],
-                        cells: vec![(0, CellValue::live(mutation.row.clone(), mutation.timestamp))],
-                        deletion: DeletionTime::LIVE,
-                        primary_key_liveness: LivenessInfo::with_timestamp(mutation.timestamp),
-                    }]
-                }
-            };
+            let key = DecoratedKey::new(PartitionKey::new(mutation.key));
 
             for row in rows {
                 storage
@@ -266,6 +246,32 @@ impl StreamSession {
             applied,
         })
     }
+}
+
+/// Decode a streamed partition's rows (`Vec<RowWire>`, bincode).
+///
+/// Every sender encodes `Vec<RowWire>`. Bytes that do not decode are refused:
+/// this used to store the raw bytes as a single live cell in column 0
+/// ("backwards compat with pre-RowWire streams"), so a corrupt or truncated
+/// payload -- or a sender's `unwrap_or_default()` empty encoding -- became a
+/// plausible-looking row. An empty row list writes nothing; it used to take
+/// the same fallback and store the encoded empty vector as a cell.
+fn decode_streamed_rows(mutation: &StreamedMutation) -> Result<Vec<ferrosa_sstable::types::Row>> {
+    use crate::raft::handlers::RowWire;
+    let wire_rows: Vec<RowWire> = bincode::deserialize(&mutation.row).map_err(|e| {
+        ClusterError::Internal(format!(
+            "stream: rows for {}.{} partition {:02x?} do not decode as RowWire ({} bytes): {e}; \
+             refusing to store them",
+            mutation.keyspace,
+            mutation.table,
+            &mutation.key[..mutation.key.len().min(16)],
+            mutation.row.len()
+        ))
+    })?;
+    Ok(wire_rows
+        .into_iter()
+        .map(ferrosa_sstable::types::Row::from)
+        .collect())
 }
 
 impl Drop for StreamSession {
@@ -743,13 +749,66 @@ mod tests {
     use crate::streaming::{compute_checksum, StreamChunkPayload, StreamConfig, StreamedMutation};
 
     fn make_mutation(i: usize) -> StreamedMutation {
+        use crate::raft::handlers::RowWire;
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(
+                0,
+                CellValue::live(format!("row_{i}").into_bytes(), i as i64),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(i as i64),
+        };
         StreamedMutation {
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key: (i as u64).to_be_bytes().to_vec(),
-            row: format!("row_{i}").into_bytes(),
+            row: bincode::serialize(&vec![RowWire::from(row)]).unwrap(),
             timestamp: i as i64,
         }
+    }
+
+    /// Row bytes that do not decode as `Vec<RowWire>` must fail the session,
+    /// not be stored as a single live cell holding the raw bytes.
+    #[tokio::test]
+    async fn undecodable_streamed_rows_are_refused_not_stored() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_table(&storage, "ks", "tbl");
+
+        let mut mutation = make_mutation(1);
+        mutation.row = b"\xff\xff\xff\xff\xff\xff\xff\xffnot rowwire".to_vec();
+        let checksum = compute_checksum(std::slice::from_ref(&mutation));
+        let start = StreamStartPayload {
+            session_id: 43,
+            source_node: 10,
+            token_range_start: i64::MIN,
+            token_range_end: i64::MAX,
+            estimated_bytes: 0,
+        };
+        let chunks = vec![StreamChunkPayload {
+            session_id: 43,
+            mutations: vec![mutation.clone()],
+        }];
+        let end = StreamEndPayload {
+            session_id: 43,
+            total_mutations: 1,
+            checksum,
+        };
+        let err = StreamReceiver::receive_and_apply(&storage, start, chunks, end)
+            .await
+            .expect_err("undecodable rows must fail the session");
+        assert!(err.to_string().contains("RowWire"), "{err}");
+        let stored = storage
+            .read(
+                &TableId::new("ks", "tbl"),
+                &DecoratedKey::new(PartitionKey::new(mutation.key)),
+            )
+            .unwrap();
+        assert!(stored.is_none(), "nothing may be stored: {stored:?}");
     }
 
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
