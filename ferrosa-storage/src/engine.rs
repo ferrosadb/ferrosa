@@ -3293,9 +3293,33 @@ impl StorageEngine {
                 );
 
                 // Spawn background archiver task.
+                // Each segment runs inside a panic boundary: before, one
+                // panic ended this task, and every later rotation's notify
+                // failed (now counted by `archive_notify_dropped_total`).
                 let handle = rt.spawn(async move {
                     while let Some(segment_id) = rx.recv().await {
-                        match archiver.archive_segment(segment_id).await {
+                        let archived = futures::FutureExt::catch_unwind(
+                            std::panic::AssertUnwindSafe(archiver.archive_segment(segment_id)),
+                        )
+                        .await;
+                        let archived = match archived {
+                            Ok(archived) => archived,
+                            Err(payload) => {
+                                let message = payload
+                                    .downcast_ref::<&str>()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                                tracing::error!(
+                                    segment_id,
+                                    panic = %message,
+                                    "commitlog-archiver: archiving a segment panicked; it is not \
+                                     archived and the archiver continues"
+                                );
+                                continue;
+                            }
+                        };
+                        match archived {
                             Ok(result) => {
                                 // Update manifest.
                                 let entry = crate::commitlog::manifest::ArchiveSegmentEntry {

@@ -113,6 +113,14 @@ fn observe_duration(total: &AtomicU64, max: &AtomicU64, duration: Duration) {
 /// a small steady-state count is expected on hard kills (OOM, host reboot).
 pub static EMPTY_SEGMENT_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Closed segments the archiver was never told about (queue full or archiver
+/// stopped). Each is missing from PITR and, with archiving on, never deleted.
+static ARCHIVE_NOTIFY_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn archive_notify_dropped_total() -> u64 {
+    ARCHIVE_NOTIFY_DROPPED_TOTAL.load(Ordering::Relaxed)
+}
+
 /// Reads the `EMPTY_SEGMENT_SKIPPED_TOTAL` counter.
 pub fn empty_segment_skipped_total() -> u64 {
     EMPTY_SEGMENT_SKIPPED_TOTAL.load(Ordering::Relaxed)
@@ -317,6 +325,12 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_commitlog_periodic_idle_flushes_skipped_total {}\n",
         sync::periodic_idle_flush_skipped_total()
+    ));
+    out.push_str("# HELP ferrosa_commitlog_archive_notify_dropped_total Closed commit-log segments never handed to the PITR archiver (queue full or archiver stopped).\n");
+    out.push_str("# TYPE ferrosa_commitlog_archive_notify_dropped_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_archive_notify_dropped_total {}\n",
+        ARCHIVE_NOTIFY_DROPPED_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_commitlog_not_durable_refusals_total Writes refused because the commit log could not make them durable (sync thread dead, fsync failing, or past the stall deadline).\n");
     out.push_str("# TYPE ferrosa_commitlog_not_durable_refusals_total counter\n");
@@ -1141,9 +1155,23 @@ impl CommitLog {
         closed.push(old_segment);
         drop(closed);
 
-        // Notify archiver of the closed segment (non-blocking).
+        // Notify archiver of the closed segment (non-blocking). A segment the
+        // archiver never hears about is never archived, and with archiving
+        // on, never deleted either; this used to be dropped silently.
         if let Some(tx) = &self.archive_tx {
-            let _ = tx.try_send(old_id);
+            if let Err(e) = tx.try_send(old_id) {
+                ARCHIVE_NOTIFY_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let why = match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "archiver queue full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "archiver stopped",
+                };
+                tracing::error!(
+                    segment_id = old_id,
+                    why,
+                    "commitlog: closed segment not handed to the archiver; it will not be \
+                     archived and stays on disk"
+                );
+            }
         }
 
         Ok(())
@@ -2544,6 +2572,24 @@ mod tests {
             "concurrent force_sync lost committed entries: only {} of {} replayable",
             replayed.len(),
             THREADS * ROUNDS
+        );
+        cl.shutdown().unwrap();
+    }
+
+    /// A closed segment the archiver cannot be told about is counted and
+    /// logged, not dropped silently (t_396d4c80).
+    #[test]
+    fn a_segment_the_archiver_never_hears_about_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cl = CommitLog::new(CommitLogConfig::test_config(dir.path())).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1);
+        drop(rx);
+        cl.set_archive_channel(tx);
+        let before = archive_notify_dropped_total();
+        cl.force_rotate().unwrap();
+        assert!(
+            archive_notify_dropped_total() > before,
+            "the stopped archiver missed a segment"
         );
         cl.shutdown().unwrap();
     }
