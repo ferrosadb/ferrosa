@@ -1,39 +1,28 @@
 //! Token generation and schema sync helpers.
 
-use bytes::Bytes;
-use ferrosa_net::codec::Lane;
-use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_schema::Schema;
 use uuid::Uuid;
 
-/// Send the full schema snapshot to a peer over the bulk lane.
+/// Send the full schema snapshot to a peer and confirm it converged.
 ///
 /// Used both after a force-promote rejoin (to sync schema + data replay) and
 /// after a normal pair reconnection (to catch up schema changes the secondary
-/// missed while it was offline).
+/// missed while it was offline). Returns whether the peer confirmed.
 pub(super) async fn send_schema_sync_to_peer(
     pm: &PeerManager,
     peer_host_id: Uuid,
     schema: &Schema,
-) {
-    let snap = schema.snapshot();
-    let wire_snap = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snap);
-    match serde_json::to_vec(&wire_snap) {
-        Ok(json) => {
-            match pm
-                .send(
-                    peer_host_id,
-                    Message::PairSchemaSync(Bytes::from(json)),
-                    Lane::Bulk,
-                )
-                .await
-            {
-                Ok(_) => tracing::info!("schema snapshot sent to rejoined peer"),
-                Err(e) => tracing::warn!(%e, "failed to send schema snapshot"),
-            }
+) -> bool {
+    match crate::pair::switchover::push_schema_and_confirm(pm, peer_host_id, schema).await {
+        Ok(()) => {
+            tracing::info!(%peer_host_id, "schema snapshot sent to rejoined peer; peer converged");
+            true
         }
-        Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot"),
+        Err(e) => {
+            tracing::warn!(%e, %peer_host_id, "schema catch-up to peer NOT confirmed");
+            false
+        }
     }
 }
 

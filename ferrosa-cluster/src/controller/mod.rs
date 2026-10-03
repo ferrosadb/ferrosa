@@ -119,6 +119,8 @@ pub(super) struct PairContext {
     pub(super) peer_host_id: Uuid,
     #[allow(dead_code)]
     pub(super) peer_addr: SocketAddr,
+    /// Data catch-up replayed to this peer after a force-promoted re-pair.
+    pub(super) catch_up: Arc<crate::pair::switchover::CatchUpGate>,
 }
 
 /// Atomic counters for lock contention measurements.
@@ -602,6 +604,7 @@ impl ModeController {
             role,
             peer_host_id: Uuid::new_v4(),
             peer_addr: "127.0.0.1:7000".parse().unwrap(),
+            catch_up: Arc::default(),
         };
 
         Arc::new(Self {

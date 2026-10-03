@@ -22,6 +22,53 @@ use crate::write_path::WritePath;
 use super::token::send_schema_sync_to_peer;
 use super::{ClusterStateHolder, ModeController, PairContext};
 
+/// Replay the local commit log to a rejoined peer. Returns `true` only when
+/// every mutation was acknowledged by the peer.
+async fn replay_commit_log_to_peer(
+    storage: &ferrosa_storage::StorageEngine,
+    pm: &ferrosa_net::peer::PeerManager,
+    peer_host_id: Uuid,
+) -> bool {
+    let position = CommitLogPosition {
+        segment_id: 0,
+        offset: 0,
+    };
+    let mutations = match storage.replay_from(position) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(%e, "catch-up replay_from failed; catch-up FAILED");
+            return false;
+        }
+    };
+    if mutations.is_empty() {
+        tracing::info!("no data to replay for catch-up");
+        return true;
+    }
+    tracing::info!(count = mutations.len(), "replaying data to rejoined peer");
+    for mutation in &mutations {
+        let body = encode_mutation(mutation);
+        match pm
+            .send(peer_host_id, Message::PairWriteForward(body), Lane::Data)
+            .await
+        {
+            Ok(Message::PairWriteAck(_)) => {}
+            Ok(other) => {
+                tracing::warn!(
+                    response = ?other.msg_type(),
+                    "catch-up replay: peer did not ack a mutation; catch-up FAILED"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(%e, "catch-up replay send failed; catch-up FAILED");
+                return false;
+            }
+        }
+    }
+    tracing::info!("catch-up replay complete");
+    true
+}
+
 impl ModeController {
     fn choose_pair_role(
         &self,
@@ -197,10 +244,12 @@ impl ModeController {
         )));
 
         // Store pair context for switchover/promote
+        let catch_up = Arc::new(crate::pair::switchover::CatchUpGate::default());
         *self.pair_context.lock() = Some(PairContext {
             role: role_arc,
             peer_host_id,
             peer_addr,
+            catch_up: catch_up.clone(),
         });
 
         if operator_override {
@@ -263,11 +312,14 @@ impl ModeController {
         }
 
         // After force-promoted re-pairing, correct the peer's role and replay data.
+        // `catch_up` stays in progress until every step is acknowledged, so a
+        // switchover cannot promote the peer half caught up.
         if was_promoted {
             let local_id = self.local_host_id;
             let pm = peer_manager;
             let storage = self.storage.clone();
             let schema = self.schema.clone();
+            catch_up.begin();
             self.spawn_tracked(async move {
                 // Retry sending RoleSwap until peer is ready (replaces 4s fixed sleep).
                 for _attempt in 0..8 {
@@ -291,41 +343,29 @@ impl ModeController {
                 {
                     Ok(_) => tracing::info!("sent role correction to rejoined peer"),
                     Err(e) => {
-                        tracing::warn!(%e, "failed to send role correction to peer");
+                        tracing::warn!(%e, "failed to send role correction to peer; catch-up FAILED");
+                        catch_up.fail();
                         return;
                     }
                 }
 
-                // Send schema snapshot before mutation replay.
-                send_schema_sync_to_peer(&pm, peer_host_id, &schema).await;
+                // Schema before mutation replay: replayed cells are positional,
+                // so they are only meaningful against the same table layout.
+                if !send_schema_sync_to_peer(&pm, peer_host_id, &schema).await {
+                    tracing::warn!("schema catch-up unconfirmed; not replaying data, catch-up FAILED");
+                    catch_up.fail();
+                    return;
+                }
 
                 // Force sync commit log to disk before replay.
                 if let Err(e) = storage.force_commit_log_sync() {
                     tracing::warn!(%e, "failed to force commit log sync before catch-up replay");
                 }
 
-                // Replay recent data to bring peer up to date.
-                let position = CommitLogPosition {
-                    segment_id: 0,
-                    offset: 0,
-                };
-                match storage.replay_from(position) {
-                    Ok(mutations) if !mutations.is_empty() => {
-                        tracing::info!(count = mutations.len(), "replaying data to rejoined peer");
-                        for mutation in &mutations {
-                            let body = encode_mutation(mutation);
-                            if let Err(e) = pm
-                                .send(peer_host_id, Message::PairWriteForward(body), Lane::Data)
-                                .await
-                            {
-                                tracing::warn!(%e, "catch-up replay send failed");
-                                break;
-                            }
-                        }
-                        tracing::info!("catch-up replay complete");
-                    }
-                    Ok(_) => tracing::info!("no data to replay for catch-up"),
-                    Err(e) => tracing::warn!(%e, "catch-up replay_from failed"),
+                if replay_commit_log_to_peer(&storage, &pm, peer_host_id).await {
+                    catch_up.complete();
+                } else {
+                    catch_up.fail();
                 }
             });
         } else if role == PairRole::Primary {

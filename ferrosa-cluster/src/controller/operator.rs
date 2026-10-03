@@ -105,14 +105,24 @@ impl ModeController {
     /// Initiate switchover: swap primary/secondary roles.
     ///
     /// Must be called on the current primary. Both nodes must be connected.
+    ///
+    /// Refused unless the peer is caught up: no data catch-up replay may be
+    /// running or have failed, and the peer must confirm it converged to this
+    /// node's schema (pushed here, so a missed ALTER is applied first).
+    /// Promoting a peer that is behind makes it serve wrong answers -- a
+    /// written value read back as null.
     pub async fn switchover(&self) -> Result<()> {
-        let (role_arc, peer_host_id) = {
+        let (role_arc, peer_host_id, catch_up) = {
             let ctx = self.pair_context.lock();
             let ctx = ctx.as_ref().ok_or(ClusterError::ModeTransitionRejected(
                 "switchover requires pair mode; current node is standalone".into(),
             ))?;
-            (ctx.role.clone(), ctx.peer_host_id)
+            (ctx.role.clone(), ctx.peer_host_id, ctx.catch_up.clone())
         };
+        if **role_arc.load() != crate::pair::PairRole::Primary {
+            return Err(ClusterError::NotPrimary);
+        }
+        catch_up.ready()?;
 
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
@@ -122,6 +132,9 @@ impl ModeController {
                 ));
             }
         };
+
+        crate::pair::switchover::push_schema_and_confirm(&peer_manager, peer_host_id, &self.schema)
+            .await?;
 
         crate::pair::switchover::initiate_switchover(
             &peer_manager,

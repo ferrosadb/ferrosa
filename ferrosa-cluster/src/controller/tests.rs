@@ -4446,3 +4446,256 @@ fn only_the_raft_leader_may_send_a_schema_snapshot() {
          it must not send"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Switchover guard (nightly pair smoke, 2026-10-01..03): node2 switched over
+// to a rejoined node1 whose schema had never caught up, and node1 then served
+// a written key with v = null.
+// ---------------------------------------------------------------------------
+
+fn switchover_kv_table(with_extra: bool) -> ferrosa_schema::metadata::table::TableMetadata {
+    use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+    use ferrosa_schema::metadata::table::{TableMetadata, TableParams};
+    let column = |name: &str, kind: ColumnKind| ColumnMetadata {
+        name: name.to_string(),
+        kind,
+        position: 0,
+        column_type: "text".to_string(),
+        clustering_order: ClusteringOrder::None,
+        mask: None,
+    };
+    let mut columns = indexmap::IndexMap::new();
+    columns.insert("k".to_string(), column("k", ColumnKind::PartitionKey));
+    columns.insert("v".to_string(), column("v", ColumnKind::Regular));
+    if with_extra {
+        columns.insert("extra".to_string(), column("extra", ColumnKind::Regular));
+    }
+    TableMetadata {
+        keyspace: "smoke_ks".to_string(),
+        name: "kv".to_string(),
+        id: Uuid::from_u128(0x5eed),
+        columns,
+        partition_key: vec!["k".to_string()],
+        clustering_key: vec![],
+        params: TableParams::default(),
+        flags: std::collections::HashSet::new(),
+        extensions: HashMap::new(),
+        is_system: false,
+    }
+}
+
+fn install_kv(schema: &Schema, storage: &StorageEngine, with_extra: bool) {
+    use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+    schema
+        .create_keyspace_internal(KeyspaceMetadata {
+            name: "smoke_ks".to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: [("replication_factor".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        })
+        .unwrap();
+    let table = switchover_kv_table(with_extra);
+    storage.register_table(table.to_storage_schema()).unwrap();
+    schema.create_table_internal(table).unwrap();
+}
+
+/// A schema-sync handler that acknowledges without converging -- what an old
+/// peer (empty ack) or a peer that failed to apply looks like to the primary.
+struct UnconvergedSchemaSync;
+
+#[async_trait::async_trait]
+impl RpcHandler for UnconvergedSchemaSync {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        match msg {
+            Message::PairSchemaSync(_) => Some(Message::PairDdlAck(bytes::Bytes::new())),
+            _ => None,
+        }
+    }
+}
+
+struct SwitchoverPeer {
+    _server: Arc<RpcServer>,
+    addr: SocketAddr,
+    role: Arc<ArcSwap<PairRole>>,
+}
+
+/// A live peer at `peer_id`, a pair secondary, with `schema_sync` answering
+/// `PairSchemaSync` and a real `RoleSwapHandler`.
+async fn start_switchover_peer(
+    peer_id: Uuid,
+    schema_sync: Arc<dyn RpcHandler>,
+    role: Arc<ArcSwap<PairRole>>,
+) -> SwitchoverPeer {
+    let config = NetConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        ..NetConfig::default()
+    };
+    let registry = Arc::new(HandlerRegistry::new());
+    registry.register(MsgType::PairSchemaSync, schema_sync);
+    registry.register(
+        MsgType::RoleSwap,
+        Arc::new(crate::pair::switchover::RoleSwapHandler::new(
+            peer_id,
+            role.clone(),
+        )),
+    );
+    let server = Arc::new(RpcServer::new(config, peer_id, registry));
+    let addr = server.start_and_get_addr().await.unwrap();
+    SwitchoverPeer {
+        _server: server,
+        addr,
+        role,
+    }
+}
+
+/// A controller that is the pair primary for `peer`, with its reverse
+/// connection to the peer established.
+async fn primary_paired_with(
+    peer_id: Uuid,
+    peer: &SwitchoverPeer,
+    storage: Arc<StorageEngine>,
+    schema: Arc<Schema>,
+) -> Arc<ModeController> {
+    let local_id = Uuid::from_u128(1);
+    assert!(local_id < peer_id, "lower host id elects primary");
+    let net_config = Arc::new(NetConfig::default());
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm.clone());
+    controller.on_inbound_peer((peer_id, peer.addr), None, Some(peer.addr.to_string()));
+    assert_eq!(controller.role(), Some(PairRole::Primary));
+    for _ in 0..100 {
+        if pm.has_peer(peer_id) {
+            return controller;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("reverse connection to the switchover peer never came up");
+}
+
+/// RED (b): a switchover must not promote a peer that cannot confirm it has
+/// the primary's schema. Promoting it is how node1 came to serve v = null.
+#[tokio::test]
+async fn switchover_is_refused_when_the_peer_does_not_confirm_schema_convergence() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, true);
+
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let peer = start_switchover_peer(peer_id, Arc::new(UnconvergedSchemaSync), peer_role).await;
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+
+    let result = controller.switchover().await;
+
+    let err = result.expect_err(
+        "switchover promoted a peer that never confirmed it holds the primary's schema",
+    );
+    assert!(
+        err.to_string().contains("schema"),
+        "the refusal must say the peer's schema is not confirmed, got: {err}"
+    );
+    assert_eq!(
+        **peer.role.load(),
+        PairRole::Secondary,
+        "the peer must not have been told to become primary"
+    );
+    assert_eq!(controller.role(), Some(PairRole::Primary));
+}
+
+/// RED (b): a switchover must not promote a peer whose data catch-up replay
+/// is still running or has failed.
+#[tokio::test]
+async fn switchover_is_refused_while_the_catch_up_replay_is_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, true);
+
+    let peer_dir = tempfile::tempdir().unwrap();
+    let peer_storage = test_storage(peer_dir.path());
+    let peer_schema = test_schema();
+    install_kv(&peer_schema, &peer_storage, true);
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let sync = Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+        peer_schema,
+        peer_storage,
+        peer_role.clone(),
+    ));
+    let peer = start_switchover_peer(peer_id, sync, peer_role).await;
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+
+    let gate = controller
+        .pair_context
+        .lock()
+        .as_ref()
+        .map(|ctx| ctx.catch_up.clone())
+        .expect("pair context");
+    gate.begin();
+    let in_progress = controller.switchover().await;
+    gate.fail();
+    let failed = controller.switchover().await;
+
+    assert!(
+        in_progress.is_err() && failed.is_err(),
+        "switchover must be refused while catch-up is running ({in_progress:?}) and \
+         after it failed ({failed:?})"
+    );
+    assert_eq!(**peer.role.load(), PairRole::Secondary);
+    assert_eq!(controller.role(), Some(PairRole::Primary));
+}
+
+/// (b), the positive half: a switchover first pushes the primary's schema,
+/// so a peer that missed an ALTER converges before it is promoted.
+#[tokio::test]
+async fn switchover_converges_the_peer_schema_before_swapping_roles() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, true);
+
+    let peer_dir = tempfile::tempdir().unwrap();
+    let peer_storage = test_storage(peer_dir.path());
+    let peer_schema = test_schema();
+    install_kv(&peer_schema, &peer_storage, false);
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let sync = Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+        peer_schema.clone(),
+        peer_storage,
+        peer_role.clone(),
+    ));
+    let peer = start_switchover_peer(peer_id, sync, peer_role).await;
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+
+    controller
+        .switchover()
+        .await
+        .expect("switchover to a peer that converges must succeed");
+
+    let kv = peer_schema
+        .snapshot()
+        .tables
+        .get(&("smoke_ks".to_string(), "kv".to_string()))
+        .cloned()
+        .expect("kv on the peer");
+    assert!(
+        kv.columns.contains_key("extra"),
+        "the peer was promoted still holding the pre-ALTER table"
+    );
+    assert_eq!(**peer.role.load(), PairRole::Primary);
+    assert_eq!(controller.role(), Some(PairRole::Secondary));
+}
