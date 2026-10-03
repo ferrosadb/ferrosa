@@ -287,6 +287,13 @@ early acknowledgement.
   reporting healthy on `/readyz`, so an unpinned stack can hand you a node that
   looks up but serves nothing.
 - `rebalance.rs` — token-skew rebalancing with data streaming.
+- `raft/handlers.rs` `RowWire`/`CellValueWire` — the bincode row format of
+  coordinator reads, anti-entropy repair, range-read streaming, digests and
+  bootstrap/decommission/rebalance streaming. A complex (non-frozen collection)
+  cell carries its path behind leading tag `2`; simple cells keep the legacy
+  bytes. A node older than this format refuses a complex cell with a decode
+  error rather than flattening it, and the row-stream receiver fails a session
+  whose payload does not decode (FMEA CL-30).
 - `controller/jsonb_gate.rs` (T-300, D24) — while any table holds jsonb, a
   standalone node may not move to Pair, Forming or Cluster: the transition entry
   points and `try_transition_mode` refuse, naming the tables and the D15a
