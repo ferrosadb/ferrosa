@@ -381,30 +381,14 @@ pub fn replicated_tables(
 /// Encode one partition as the row-stream wire mutation.
 ///
 /// The single place a membership transfer turns a `Partition` into a
-/// `StreamedMutation`, so a change to what travels (static rows and partition
-/// deletions are p0-streaming-statics' work) lands here once.
+/// `StreamedMutation`. It uses the same encoder as rebalance and repair
+/// streaming, so the static row and the partition deletion travel too (P0-3).
 pub fn partition_to_streamed_mutation(
     table: &TableId,
     partition: Partition,
 ) -> std::result::Result<crate::streaming::StreamedMutation, String> {
-    use crate::raft::handlers::RowWire;
-    let timestamp = partition
-        .rows
-        .first()
-        .and_then(|r| r.cells.first())
-        .map(|(_, cv)| cv.timestamp)
-        .unwrap_or(0);
-    let Partition { key, rows, .. } = partition;
-    let wire_rows: Vec<RowWire> = rows.into_iter().map(RowWire::from).collect();
-    let row = bincode::serialize(&wire_rows)
-        .map_err(|e| format!("{table}: failed to encode partition {key:?}: {e}"))?;
-    Ok(crate::streaming::StreamedMutation {
-        keyspace: table.keyspace().to_string(),
-        table: table.table().to_string(),
-        key: key.key.as_bytes().to_vec(),
-        row,
-        timestamp,
-    })
+    crate::streaming::StreamedMutation::from_partition(table.keyspace(), table.table(), &partition)
+        .map_err(|e| format!("{table}: failed to encode partition {:?}: {e}", partition.key))
 }
 
 /// Production [`PartitionStreamer`]: one row-stream session per batch, with
