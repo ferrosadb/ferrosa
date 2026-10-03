@@ -71,11 +71,10 @@ def main() -> int:
     if TRAILER.search(git("log", "--format=%B", f"{base}..HEAD")):
         print(f"waiver check: {len(found)} waiver line(s) added, approved by Ben's trailer")
         return 0
-    print("waiver check: FAIL. Waivers added without approval:")
+    # Show what each waiver does, nothing more.
+    print("waiver check: FAIL, unapproved waivers added:")
     for path, text in found:
         print(f"  {path}: {text}")
-    print("Fix the finding instead. Only Ben can approve a waiver, recorded as a")
-    print("'Waiver-Approved-By: Ben Kearns' trailer on a commit in this change.")
     return 1
 
 

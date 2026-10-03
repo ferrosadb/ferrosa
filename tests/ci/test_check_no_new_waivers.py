@@ -125,6 +125,17 @@ class WaiverCheck(unittest.TestCase):
         self.assertIn("src/lib.rs", out)
         self.assertIn("#[ignore]", out)
 
+    def test_failure_output_is_only_the_waiver_lines(self):
+        # The output shows what each waiver does, not why the rule exists.
+        self.write("src/lib.rs", "#[test]\n#[ignore]\nfn a() {}\n")
+        self.commit("skip a")
+        code, out = self.run_check()
+        self.assertEqual(code, 1, out)
+        lines = [l for l in out.splitlines() if l.strip()]
+        self.assertEqual(lines[-1].strip(), "src/lib.rs: #[ignore]", out)
+        self.assertNotIn("Fix the finding", out)
+        self.assertNotIn("Only Ben", out)
+
     def test_ignore_with_a_reason_fails(self):
         self.write("src/lib.rs", '#[test]\n#[ignore = "slow"]\nfn a() {}\n')
         self.commit("skip a")
