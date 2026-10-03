@@ -23138,6 +23138,212 @@ mod tests {
         engine.shutdown().unwrap();
     }
 
+    /// The test schema with its `val` column typed as a 3-float vector,
+    /// spelled as `CREATE TABLE` stores it (`cql_to_marshal_type` passes
+    /// `vector<..>` through).
+    fn vector_test_schema() -> ferrosa_common::TableSchema {
+        let mut schema = test_schema();
+        schema.regular_columns[0].type_name = "vector<float, 3>".to_string();
+        schema
+    }
+
+    fn vector_test_row(v: &[f32; 3]) -> Row {
+        Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::live(ferrosa_index::vec_f32_to_bytes(v), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        }
+    }
+
+    /// Persist a vector index on `val` the way the DDL write path does.
+    fn persist_vector_index_row(engine: &StorageEngine, name: &str) {
+        let meta = ferrosa_schema::metadata::index::IndexMetadata {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            name: name.to_string(),
+            index_type: ferrosa_index::IndexType::Vector,
+            target_columns: vec!["val".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        let row = ferrosa_schema::system::persistence::index_to_rows(&meta);
+        engine
+            .write(
+                &TableId::new("system_schema", "indexes"),
+                &row.key,
+                row.row,
+                now_micros_for_test(),
+            )
+            .unwrap();
+    }
+
+    /// Write `rows` and a vector index over them, flush everything, and close.
+    fn seed_flushed_vectors(dir: &std::path::Path, rows: &[(&str, [f32; 3])]) {
+        let engine = StorageEngine::new(StorageEngineConfig::test_config(dir), None).unwrap();
+        engine.register_table(vector_test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+        let tid = table_id();
+        engine.add_vector_index(&tid, "vec_idx", 0, 3).unwrap();
+        persist_vector_index_row(&engine, "vec_idx");
+        for (key, vector) in rows {
+            engine
+                .write(&tid, &make_key(key), vector_test_row(vector), 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        engine
+            .flush(&TableId::new("system_schema", "indexes"))
+            .unwrap();
+        engine.shutdown().unwrap();
+    }
+
+    /// Reopen the engine in `dir` with the boot sequence: open, system
+    /// tables, then indexes reloaded from `system_schema.indexes`.
+    fn reopen_with_indexes(dir: &std::path::Path) -> StorageEngine {
+        let (engine, _pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir), None).unwrap();
+        engine.register_system_tables().unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
+        assert_eq!(
+            (outcome.restored, outcome.skipped),
+            (1, 0),
+            "the persisted vector index must be re-registered at reopen"
+        );
+        engine
+    }
+
+    fn ann_keys(engine: &StorageEngine, query: &[f32; 3], k: usize) -> Vec<Vec<u8>> {
+        engine
+            .ann_search_partitions(&table_id(), "vec_idx", query, k, 20)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.key.key.as_bytes().to_vec())
+            .collect()
+    }
+
+    /// T4: the set of scopes with a flushed scoped vector sidecar lived only
+    /// in memory, so after a restart `ann_search_partitions` probed no
+    /// sidecar and `ORDER BY col ANN OF` answered from the memtable alone —
+    /// every embedding flushed before the restart vanished with no error.
+    #[test]
+    fn flushed_vectors_answer_ann_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_flushed_vectors(
+            dir.path(),
+            &[
+                ("k0", [1.0, 0.0, 0.0]),
+                ("k1", [0.0, 1.0, 0.0]),
+                ("k2", [0.0, 0.0, 1.0]),
+            ],
+        );
+
+        let engine = reopen_with_indexes(dir.path());
+        assert_eq!(
+            ann_keys(&engine, &[0.0, 1.0, 0.0], 3).len(),
+            3,
+            "every flushed vector must answer ANN after a restart"
+        );
+        assert_eq!(
+            ann_keys(&engine, &[0.0, 1.0, 0.0], 1),
+            vec![b"k1".to_vec()],
+            "the nearest flushed row ranks first after a restart"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    fn vector_sidecar_files(dir: &std::path::Path) -> Vec<String> {
+        let table_dir = dir.join("sstables").join("test_ks.test_table");
+        std::fs::read_dir(table_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.contains("-VEC-"))
+            .collect()
+    }
+
+    /// The scope set is rebuilt from sidecar files, so dropping an index must
+    /// delete them: an index re-created under the same name would otherwise
+    /// answer ANN from the dropped index's vectors.
+    #[test]
+    fn dropping_a_vector_index_deletes_its_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_flushed_vectors(
+            dir.path(),
+            &[("k0", [1.0, 0.0, 0.0]), ("k1", [0.0, 1.0, 0.0])],
+        );
+        assert_eq!(
+            vector_sidecar_files(dir.path()).len(),
+            3,
+            "sanity: a global and two scoped sidecars were flushed"
+        );
+
+        let engine = reopen_with_indexes(dir.path());
+        assert!(engine.drop_index(&table_id(), "vec_idx").unwrap());
+        assert_eq!(vector_sidecar_files(dir.path()), Vec::<String>::new());
+        assert!(
+            ann_keys(&engine, &[1.0, 0.0, 0.0], 3).is_empty(),
+            "a dropped index answers nothing"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// A scoped sidecar that exists but cannot be searched must fail the ANN
+    /// query; skipping it answered without that partition's rows.
+    #[test]
+    fn a_corrupt_scoped_vector_sidecar_fails_ann_instead_of_shrinking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_flushed_vectors(
+            dir.path(),
+            &[("k0", [1.0, 0.0, 0.0]), ("k1", [0.0, 1.0, 0.0])],
+        );
+        let table_dir = dir.path().join("sstables").join("test_ks.test_table");
+        let k1_sidecar = vector_sidecar_files(dir.path())
+            .into_iter()
+            .find(|name| name.ends_with("__scope_6b31.db"))
+            .expect("k1's scoped sidecar was flushed");
+        std::fs::write(table_dir.join(k1_sidecar), b"not an hnsw graph").unwrap();
+
+        let engine = reopen_with_indexes(dir.path());
+        let result = engine.ann_search_partitions(&table_id(), "vec_idx", &[0.0, 1.0, 0.0], 2, 20);
+        assert!(
+            result.is_err(),
+            "a corrupt sidecar must fail ANN, got {} rows",
+            result.map(|rows| rows.len()).unwrap_or_default()
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// A sidecar carrying the index's scope prefix whose scope cannot be
+    /// decoded fails registration: its rows cannot be probed, and registering
+    /// without them would answer ANN short with no error.
+    #[test]
+    fn a_vector_sidecar_with_an_undecodable_scope_fails_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_flushed_vectors(dir.path(), &[("k0", [1.0, 0.0, 0.0])]);
+        let table_dir = dir.path().join("sstables").join("test_ks.test_table");
+        let generation = vector_sidecar_files(dir.path())[0]
+            .split_once("-VEC-")
+            .unwrap()
+            .0
+            .to_string();
+        std::fs::write(
+            table_dir.join(format!("{generation}-VEC-vec_idx__scope_zz.db")),
+            b"x",
+        )
+        .unwrap();
+
+        let (engine, _pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_system_tables().unwrap();
+        let err = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .expect_err("an undecodable scoped sidecar must fail the index reload");
+        assert!(err.to_string().contains("vec_idx__scope_zz"), "{err}");
+        engine.shutdown().unwrap();
+    }
+
     /// An index stream whose producer panics must end with an ERROR, never a
     /// clean end of stream: the producer's sender drops during unwind, so the
     /// consumer would read the rows delivered so far and then a normal close —

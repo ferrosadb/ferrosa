@@ -540,6 +540,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   their HNSW/HVQ method from the persisted options. It returns `Ok(false)`, with
   a log line saying why, for a non-scalar index on a key column or a vector
   target whose declared type carries no dimension.
+  Registering a vector index also rebuilds its set of partition scopes from
+  the scoped sidecar files of live generations, so `ann_search_partitions`
+  (CQL `ORDER BY .. ANN OF`) still finds flushed vectors after a restart; a
+  sidecar that cannot be listed, decoded or searched is an error, never a
+  shorter answer, and DROP INDEX deletes the index's vector sidecars (ST-71).
   A global index read (`read_by_index_each`) of an index the table does not
   declare returns an error naming the index, never zero rows: the planner
   chooses indexes from the CQL schema, so a consult of an undeclared index

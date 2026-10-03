@@ -1441,6 +1441,37 @@ fn scoped_vector_sidecar_name(index_name: &str, scope: &[u8]) -> String {
     format!("{index_name}__scope_{}", hex_scope(scope))
 }
 
+/// The scope of `sidecar_name` if it is one of `index_name`'s scoped
+/// sidecars (the inverse of [`scoped_vector_sidecar_name`]); `None` if it
+/// belongs to another index or is the global sidecar.
+///
+/// # Errors
+///
+/// The name carries `index_name`'s scope prefix but not a hex scope. That
+/// sidecar's scope cannot be recovered, and skipping it would silently drop
+/// its rows from ANN.
+fn scope_of_vector_sidecar(index_name: &str, sidecar_name: &str) -> Option<Result<Vec<u8>>> {
+    let hex = sidecar_name
+        .strip_prefix(index_name)?
+        .strip_prefix("__scope_")?;
+    let malformed = || {
+        ferrosa_common::Error::InvalidData(format!(
+            "vector sidecar {sidecar_name} of index {index_name} has a malformed scope"
+        ))
+    };
+    // Exactly what `hex_scope` writes, so the scope maps back to this file.
+    let lower_hex = |b: u8| matches!(b, b'0'..=b'9' | b'a'..=b'f');
+    if hex.len() % 2 != 0 || !hex.bytes().all(lower_hex) {
+        return Some(Err(malformed()));
+    }
+    let scope = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(malformed);
+    Some(scope)
+}
+
 /// Route a range-scan `producer` through the bounded scheduler pool, wiring the
 /// two admission properties the raw [`ferrosa_sched::SchedPool::submit_scan`]
 /// primitive exposes so a range scan is a well-behaved scheduler citizen:
@@ -7548,6 +7579,62 @@ impl<F: FlushTarget> TableStore<F> {
         }
     }
 
+    /// Record every scope that has a scoped sidecar for `index_name` in a
+    /// live SSTable, read from the sidecar files themselves.
+    ///
+    /// The recorded set lives in memory and is otherwise filled only by
+    /// flushes, so after a restart it was empty: `ann_search_partitions`
+    /// probed no flushed sidecar and ANN answered from the memtable alone.
+    /// The files are the durable record, so the set is rebuilt from them
+    /// whenever the index is registered, which a restart does from
+    /// `system_schema.indexes`.
+    ///
+    /// # Errors
+    ///
+    /// The sidecars cannot be listed, or one carries a scope that cannot be
+    /// decoded. Registration fails rather than leave the index answering
+    /// without those rows.
+    fn recover_vector_scopes(&self, index_name: &str) -> Result<()> {
+        let live: std::collections::HashSet<u64> = self
+            .view
+            .load()
+            .sstable_ids
+            .iter()
+            .filter_map(|(gen, _dir)| gen.parse().ok())
+            .collect();
+        let mut scopes = Vec::new();
+        for (gen, sidecar) in self.flush_target.list_vector_sidecars()? {
+            if !live.contains(&gen) {
+                continue;
+            }
+            if let Some(scope) = scope_of_vector_sidecar(index_name, &sidecar) {
+                scopes.push(scope?);
+            }
+        }
+        tracing::debug!(
+            index_name,
+            scopes = scopes.len(),
+            "recovered scoped vector sidecars from disk"
+        );
+        self.record_vector_scopes(index_name, scopes.iter());
+        Ok(())
+    }
+
+    /// Delete every vector sidecar of `index_name`, global and scoped.
+    ///
+    /// Registration rebuilds the scope set from these files, so a dropped
+    /// index's sidecars must not outlive it: a later index created under the
+    /// same name, possibly on another column, would otherwise answer ANN from
+    /// the dropped index's vectors.
+    fn remove_vector_sidecars(&self, index_name: &str) -> Result<()> {
+        for (gen, sidecar) in self.flush_target.list_vector_sidecars()? {
+            if sidecar == index_name || scope_of_vector_sidecar(index_name, &sidecar).is_some() {
+                self.flush_target.remove_vector_sidecar(gen, &sidecar)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Forget every scope recorded for `index_name`; whether there were any.
     fn forget_vector_scopes(&self, index_name: &str) -> Result<bool> {
         crate::lockfree::update(&self.vector_index_scopes, "vector index scopes", |map| {
@@ -7629,8 +7716,10 @@ impl<F: FlushTarget> TableStore<F> {
     /// [`add_clustering_index`](Self::add_clustering_index): future writes no
     /// longer update a memtable index, reads no longer consult active or
     /// sidecar state for the name, and vector-index metadata is unwired too.
-    /// Persisted sidecar files/readers are left as inert orphan artifacts; the
-    /// declaration metadata and read guards stop naming them immediately.
+    /// Persisted scalar and full-text sidecar files are left as inert orphan
+    /// artifacts; the declaration metadata and read guards stop naming them
+    /// immediately. Vector sidecars are deleted, because registering a vector
+    /// index rebuilds its scopes from whatever sidecars carry its name.
     /// Returns whether anything named `index_name` was declared, and what the
     /// rotation's flush did.
     pub fn remove_index(&self, index_name: &str) -> Result<(bool, FlushOutcome)> {
@@ -7644,6 +7733,7 @@ impl<F: FlushTarget> TableStore<F> {
         })?;
         let mut removed = declared.load(std::sync::atomic::Ordering::Acquire);
         removed |= self.forget_vector_scopes(index_name)?;
+        self.remove_vector_sidecars(index_name)?;
         Ok((removed, outcome))
     }
 
@@ -8209,7 +8299,8 @@ impl<F: FlushTarget> TableStore<F> {
         // select it and turn a correct brute-force ANN query into an empty
         // result. The rotation avoids that: the rows already written leave
         // with the frozen memtable, whose flush builds their vector sidecar.
-        self.rotate_catalog(move |catalog| {
+        let index_name = config.index_name.clone();
+        let outcome = self.rotate_catalog(move |catalog| {
             if catalog
                 .vector_index_configs
                 .iter()
@@ -8222,7 +8313,9 @@ impl<F: FlushTarget> TableStore<F> {
                 .insert(config.index_name.clone(), method);
             catalog.vector_index_configs.push(config);
             true
-        })
+        })?;
+        self.recover_vector_scopes(&index_name)?;
+        Ok(outcome)
     }
 
     /// Perform an approximate nearest-neighbor search across memtable and
@@ -8278,46 +8371,32 @@ impl<F: FlushTarget> TableStore<F> {
                         if let Some(vec_bytes) =
                             self.flush_target.read_vector_sidecar(gen, index_name)?
                         {
-                            match ferrosa_index::vector::hnsw::search_from_bytes(
+                            let results = ferrosa_index::vector::hnsw::search_from_bytes(
                                 &vec_bytes, query, k, ef_search,
-                            ) {
-                                Ok(results) => {
-                                    for result in results {
-                                        merged.insert(
-                                            VectorRowRef::sstable(gen, result.position),
-                                            result,
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        %e, index_name, gen,
-                                        "ann_search: HNSW sidecar search failed"
-                                    );
-                                }
+                            )
+                            .map_err(|e| {
+                                ferrosa_common::Error::InvalidData(format!(
+                                    "vector sidecar {index_name} of generation {gen} \
+                                     cannot be searched: {e}"
+                                ))
+                            })?;
+                            for result in results {
+                                merged.insert(VectorRowRef::sstable(gen, result.position), result);
                             }
                         }
                     }
                     VectorIndexMethod::QuantizedIvf => {
-                        match self
+                        let results = self
                             .flush_target
                             .search_quantized_vector_sidecar(gen, index_name, query, k, ef_search)
-                        {
-                            Ok(Some(results)) => {
-                                for result in results {
-                                    merged.insert(
-                                        VectorRowRef::sstable(gen, result.position),
-                                        result,
-                                    );
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::error!(
-                                    %e, index_name, gen,
-                                    "ann_search: quantized vector artifact search failed"
-                                );
-                            }
+                            .map_err(|e| {
+                                ferrosa_common::Error::InvalidData(format!(
+                                    "quantized vector artifact {index_name} of generation \
+                                     {gen} cannot be searched: {e}"
+                                ))
+                            })?;
+                        for result in results.into_iter().flatten() {
+                            merged.insert(VectorRowRef::sstable(gen, result.position), result);
                         }
                     }
                 }
@@ -8390,20 +8469,19 @@ impl<F: FlushTarget> TableStore<F> {
                     .flush_target
                     .read_vector_sidecar(gen, &scoped_index_name)?
                 {
-                    match ferrosa_index::vector::hnsw::search_from_bytes(
+                    // A sidecar that cannot be searched fails the query:
+                    // skipping it would answer without this scope's rows.
+                    let results = ferrosa_index::vector::hnsw::search_from_bytes(
                         &vec_bytes, query, k, ef_search,
-                    ) {
-                        Ok(results) => {
-                            for result in results {
-                                merged.insert(VectorRowRef::sstable(gen, result.position), result);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                %e, index_name = %scoped_index_name, gen,
-                                "ann_search: scoped HNSW sidecar search failed"
-                            );
-                        }
+                    )
+                    .map_err(|e| {
+                        ferrosa_common::Error::InvalidData(format!(
+                            "scoped vector sidecar {scoped_index_name} of generation {gen} \
+                             cannot be searched: {e}"
+                        ))
+                    })?;
+                    for result in results {
+                        merged.insert(VectorRowRef::sstable(gen, result.position), result);
                     }
                 }
             }
@@ -8433,8 +8511,10 @@ impl<F: FlushTarget> TableStore<F> {
     /// - **Active/flushing memtable**: the partition key is carried inline by
     ///   [`VectorMemtableIndex::search_with_scopes`]; rows are recovered exactly.
     /// - **Flushed scoped sidecars**: written per partition-key prefix at flush
-    ///   time and remembered in `vector_index_scopes`, so each is probed under
-    ///   its own scope and the partition key is recovered from that scope.
+    ///   time and remembered in `vector_index_scopes` (rebuilt from the files
+    ///   when the index is registered, so it survives a restart), so each is
+    ///   probed under its own scope and the partition key is recovered from
+    ///   that scope.
     /// - **Flushed *global* HNSW sidecar / quantized `.qvec`**: these persist
     ///   only a placeholder offset and therefore carry **no** partition key. A
     ///   result that arrives only from such a scope-less source cannot be mapped
@@ -9794,6 +9874,32 @@ mod tests {
                 "sidecar extra_{i} was installed and then lost"
             );
         });
+    }
+
+    /// A scoped sidecar name maps back to the scope it was written for, and
+    /// nothing else is mistaken for one of the index's scoped sidecars.
+    #[test]
+    fn scoped_vector_sidecar_names_round_trip() {
+        for scope in [b"k0".to_vec(), vec![], vec![0x00, 0xff, 0x10]] {
+            let name = scoped_vector_sidecar_name("vec_idx", &scope);
+            assert_eq!(
+                scope_of_vector_sidecar("vec_idx", &name).map(Result::unwrap),
+                Some(scope)
+            );
+        }
+        assert!(scope_of_vector_sidecar("vec_idx", "vec_idx").is_none());
+        assert!(scope_of_vector_sidecar("vec_idx", "other__scope_6b30").is_none());
+        for malformed in [
+            "vec_idx__scope_6b3",
+            "vec_idx__scope_zz",
+            "vec_idx__scope_6B30",
+            "vec_idx__scope_+f",
+        ] {
+            assert!(
+                matches!(scope_of_vector_sidecar("vec_idx", malformed), Some(Err(_))),
+                "{malformed} must be refused, not skipped"
+            );
+        }
     }
 
     /// `vector_index_scopes` was a `Mutex<HashMap>`; recording scopes from

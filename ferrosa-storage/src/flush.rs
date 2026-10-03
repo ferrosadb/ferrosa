@@ -506,6 +506,28 @@ pub trait FlushTarget {
         Ok(None)
     }
 
+    /// Every `(generation, index_name)` with a vector sidecar written by
+    /// [`FlushTarget::write_vector_sidecar`], in no particular order.
+    ///
+    /// The store rebuilds its set of partition-scoped sidecars from this when
+    /// a vector index is registered, so the set survives a restart: the files
+    /// are the one record of which scopes were flushed. The default is empty,
+    /// matching the default `write_vector_sidecar`, which persists nothing.
+    ///
+    /// # Errors
+    ///
+    /// The sidecars cannot be listed. The caller must not treat that as "no
+    /// sidecars": ANN would silently answer without every flushed row.
+    fn list_vector_sidecars(&self) -> Result<Vec<(u64, String)>> {
+        Ok(Vec::new())
+    }
+
+    /// Delete the vector sidecar `write_vector_sidecar` wrote for
+    /// `(generation, index_name)`. One that is already gone is not an error.
+    fn remove_vector_sidecar(&self, _generation: u64, _index_name: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Write a quantized vector artifact (`{gen}-QVEC-{index_name}.qvec`).
     fn write_quantized_vector_sidecar(
         &self,
@@ -705,6 +727,22 @@ impl FlushTarget for InMemoryFlushTarget {
                 .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(bytes)
+    }
+
+    fn list_vector_sidecars(&self) -> Result<Vec<(u64, String)>> {
+        let map = self
+            .vector_sidecars
+            .lock()
+            .expect("vector_sidecars poisoned");
+        Ok(map.keys().cloned().collect())
+    }
+
+    fn remove_vector_sidecar(&self, generation: u64, index_name: &str) -> Result<()> {
+        self.vector_sidecars
+            .lock()
+            .expect("vector_sidecars poisoned")
+            .remove(&(generation, index_name.to_string()));
+        Ok(())
     }
 
     fn write_quantized_vector_sidecar(
@@ -2535,6 +2573,51 @@ impl FlushTarget for FileFlushTarget {
         }
     }
 
+    /// Lists `{generation}-VEC-{index_name}.db` in the base directory, where
+    /// `write_vector_sidecar` puts every one. Any other file is not a vector
+    /// sidecar and is passed over; a directory that cannot be read is an
+    /// error.
+    fn list_vector_sidecars(&self) -> Result<Vec<(u64, String)>> {
+        let unreadable = |e: std::io::Error| {
+            ferrosa_common::Error::InvalidData(format!(
+                "cannot list vector sidecars in {}: {e}",
+                self.base_dir.display()
+            ))
+        };
+        let entries = match std::fs::read_dir(&self.base_dir) {
+            Ok(entries) => entries,
+            // Nothing flushed yet: the directory is created on first flush.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(unreadable(e)),
+        };
+        let mut sidecars = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(unreadable)?;
+            if let Some(sidecar) = entry
+                .file_name()
+                .to_str()
+                .and_then(parse_vector_sidecar_name)
+            {
+                sidecars.push(sidecar);
+            }
+        }
+        Ok(sidecars)
+    }
+
+    fn remove_vector_sidecar(&self, generation: u64, index_name: &str) -> Result<()> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-VEC-{index_name}.db"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ferrosa_common::Error::InvalidData(format!(
+                "cannot remove vector sidecar {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
     fn write_quantized_vector_sidecar(
         &self,
         generation: u64,
@@ -2574,9 +2657,38 @@ impl FlushTarget for FileFlushTarget {
     }
 }
 
+/// `(generation, index_name)` for a `{generation}-VEC-{index_name}.db` file
+/// name; `None` for any other file.
+fn parse_vector_sidecar_name(file_name: &str) -> Option<(u64, String)> {
+    let (generation, rest) = file_name.split_once("-VEC-")?;
+    let index_name = rest.strip_suffix(".db")?;
+    if index_name.is_empty() {
+        return None;
+    }
+    Some((generation.parse().ok()?, index_name.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_sidecar_names_parse_and_other_files_do_not() {
+        assert_eq!(
+            parse_vector_sidecar_name("42-VEC-idx_e__scope_0010.db"),
+            Some((42, "idx_e__scope_0010".to_string()))
+        );
+        for other in [
+            "42-Data.db",
+            "42-FTI-idx_e.db",
+            "42-QVEC-idx_e.qvec",
+            "x-VEC-idx_e.db",
+            "42-VEC-.db",
+            "42-VEC-idx_e.tmp",
+        ] {
+            assert_eq!(parse_vector_sidecar_name(other), None, "{other}");
+        }
+    }
 
     use ferrosa_common::cell::CellValue;
     use ferrosa_common::key::{DecoratedKey, PartitionKey};
