@@ -53,8 +53,8 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_profiling_libunwind_link.py
       - name: Check CI cache workflow contract
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
-      - name: Check the no-new-OOM-waivers guard
-        run: python3 -m unittest -q tests/ci/test_check_no_new_oom_waivers.py
+      - name: Check the no-new-waivers guard
+        run: python3 -m unittest -q tests/ci/test_check_no_new_waivers.py
       # Pins the daily OOM-audit workflow: that it still runs on a schedule,
       # still enforces, and still runs byte-for-byte the same command as the
       # Clippy job's audit step below. A safety control whose nightly can be
@@ -150,16 +150,17 @@ jobs:
         # is the run date so expired allow entries (the t_15417b35 migration
         # deadline) start failing the gate and force the streaming fix.
         run: cargo run --quiet -p xtask --all-features -- p0-oom-audit --enforce --today "$(date -u +%F)"
-      - name: No new or extended OOM-audit waivers without Ben's approval
-        # A p0-oom-audit finding is fixed in code, never allowlisted. Adding an
-        # [[allow]] entry or extending an expiry needs a
-        # 'Waiver-Approved-By: Ben Kearns' trailer on the commit that does it.
+      - name: No new waivers (#[ignore] or dated exemptions) without Ben's approval
+        # A finding is fixed, never waived. An added #[ignore], or a dated
+        # exemption (expires/until/deadline after today, e.g. a p0-oom-audit
+        # allowlist entry or renewal), needs a 'Waiver-Approved-By: Ben Kearns'
+        # trailer on a commit in the change.
         # The checkout is shallow; deepen it so the merge base is reachable.
         run: |
           base="${{ github.base_ref || 'main' }}"
           git fetch --no-tags --unshallow origin || git fetch --no-tags origin
           git fetch --no-tags origin "$base"
-          python3 scripts/check-no-new-oom-waivers.py "origin/$base"
+          python3 scripts/check-no-new-waivers.py "origin/$base"
 
   # ── Stage 2: Tests ──────────────────────────────────────────────────
   test:
