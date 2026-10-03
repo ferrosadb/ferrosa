@@ -29,7 +29,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   STATIC row (cells must be static ordinals), lifted into
   `Partition::static_row`. `StorageEngine::apply_partition`
   (`partition_apply.rs`) applies a whole partition received from another
-  replica — deletion, static row, rows — and `partition_to_rows` is the shared
+  replica — deletion, static row, rows — and `partition_rows` is the shared
   conversion for senders that ship a `Mutation` (P0-3, ST-71). When a legacy
   whole-value collection and path-keyed collection elements meet during replay
   or a live update, the merge expands the whole value into a deletion sentinel
