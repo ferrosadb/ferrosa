@@ -172,6 +172,7 @@ impl ModeController {
         let schema_sync_handler = Arc::new(PairSchemaSyncHandler::new(
             self.schema.clone(),
             self.storage.clone(),
+            role_arc.clone(),
         ));
         self.registry
             .register(MsgType::PairSchemaSync, schema_sync_handler);
