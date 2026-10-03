@@ -197,7 +197,7 @@ pub fn build_serialization_header(
 /// [`build_serialization_header`] for a memtable flush. When the output is
 /// complex-framed and some partition still holds a whole-value collection
 /// cell, the header is widened to cover the deletion sentinel that
-/// [`crate::memtable::expand_collection_blobs_for_writer`] will mint for it.
+/// `crate::memtable::expand_collection_blobs_for_writer` will mint for it.
 /// Every flush writer must feed its partitions through that function.
 pub fn header_for_flush(schema: &TableSchema, partitions: &[Partition]) -> SerializationHeader {
     let mut header = build_serialization_header(schema, partitions);
