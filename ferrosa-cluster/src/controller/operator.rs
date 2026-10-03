@@ -125,17 +125,49 @@ impl ModeController {
             // Hold `transition_guard` across the transition so the mode cannot
             // move underneath the check-and-install in `transition_to_pair`.
             let _guard = self.transition_guard.lock();
-            self.transition_to_pair_operator_override(peer_host_id, peer_addr);
-        }
+            let current = **self.mode.load();
+            if current != DeploymentMode::Cluster {
+                return Err(ClusterError::ModeTransitionRejected(format!(
+                    "downgrade to pair refused: this node is not a cluster member (mode is \
+                     {current}); the node is unchanged"
+                )));
+            }
+            let peers = self.connected_peers.lock().clone();
+            let target = match peers.as_slice() {
+                [] => {
+                    return Err(ClusterError::ModeTransitionRejected(
+                        "downgrade to pair requires a connected peer to replicate to; none is \
+                         connected — is the intended peer running and reachable?"
+                            .into(),
+                    ))
+                }
+                [only] => *only,
+                // Pair mode replicates to exactly one peer. With several
+                // connected, picking one is an arbitrary choice the operator did
+                // not make, and the others keep committing through Raft.
+                many => {
+                    let ids: Vec<String> = many.iter().map(|(id, _)| id.to_string()).collect();
+                    return Err(ClusterError::ModeTransitionRejected(format!(
+                        "downgrade to pair refused: more than one peer is connected ({}), so \
+                         the pair target is ambiguous; remove the other members first. The \
+                         node is unchanged",
+                        ids.join(", ")
+                    )));
+                }
+            };
+            self.transition_to_pair_operator_override(target.0, target.1);
+            target
+        };
         if **self.mode.load() != DeploymentMode::Pair {
             return Err(ClusterError::ModeTransitionRejected(
-                "the pair transition was refused (see the node log); the node is                  unchanged"
-                    .into(),
+                "the pair transition was refused (see the node log); the node is unchanged".into(),
             ));
         }
         tracing::warn!(
             %peer_host_id,
-            "OPERATOR ACTION: downgraded from cluster to pair mode. This node now              replicates point-to-point and no longer commits through Raft."
+            %peer_addr,
+            "OPERATOR ACTION: downgraded from cluster to pair mode. This node now \
+             replicates point-to-point and no longer commits through Raft."
         );
         Ok(peer_host_id)
     }
