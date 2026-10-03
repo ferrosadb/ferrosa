@@ -23717,6 +23717,45 @@ mod tests {
         engine.shutdown().unwrap();
     }
 
+    /// A vector column spelled the way Cassandra spells it, with the element
+    /// class qualified too, was read as "no vector dimension", so its index
+    /// was not rebuilt at restart and ANN over it had nothing (t_ad6d3122).
+    #[test]
+    fn a_vector_index_on_a_fully_qualified_vector_type_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            let mut schema = test_schema();
+            schema.regular_columns[0].type_name = "org.apache.cassandra.db.marshal.VectorType(\
+                org.apache.cassandra.db.marshal.FloatType,3)"
+                .to_string();
+            engine.register_table(schema).unwrap();
+            engine.register_system_tables().unwrap();
+            engine
+                .add_vector_index(&table_id(), "vec_idx", 0, 3)
+                .unwrap();
+            persist_vector_index_row(&engine, "vec_idx");
+            engine
+                .write(
+                    &table_id(),
+                    &make_key("k0"),
+                    vector_test_row(&[1.0, 0.0, 0.0]),
+                    1000,
+                )
+                .unwrap();
+            engine.flush(&table_id()).unwrap();
+            engine
+                .flush(&TableId::new("system_schema", "indexes"))
+                .unwrap();
+            engine.shutdown().unwrap();
+        }
+        // reopen_with_indexes asserts the index is re-registered.
+        let engine = reopen_with_indexes(dir.path());
+        assert_eq!(ann_keys(&engine, &[1.0, 0.0, 0.0], 1), vec![b"k0".to_vec()]);
+        engine.shutdown().unwrap();
+    }
+
     fn vector_table_dir(dir: &std::path::Path) -> std::path::PathBuf {
         dir.join("sstables").join("test_ks.test_table")
     }
@@ -32515,6 +32554,79 @@ mod tests {
                 "row {key} of an evicted SSTable must survive a restart"
             );
         }
+        engine.shutdown().unwrap();
+    }
+
+    /// t_4b574e44: vector sidecars are local-only, so the 2026-09-29 restore
+    /// of evicted SSTables brought their rows back with no vectors. A
+    /// generation restored from the object store with no vector sidecars must
+    /// be rebuilt from its rows, and every row answer ANN afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vectors_of_a_generation_restored_from_the_object_store_are_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "test-evicted-vectors";
+        let tid = table_id();
+        {
+            let engine = evicting_s3_engine(dir.path(), &store, prefix);
+            engine.register_table(vector_test_schema()).unwrap();
+            engine.add_vector_index(&tid, "vec_idx", 0, 3).unwrap();
+            for (key, vector) in &SIX_VECTORS {
+                engine
+                    .write(&tid, &make_key(key), vector_test_row(vector), 1000)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            assert!(engine.sync_sstables_to_s3().await.unwrap() >= 1);
+            engine.shutdown().unwrap();
+        }
+        // The local cache lost everything but the eviction markers: the
+        // object store holds the SSTable, and nothing holds its vectors.
+        // The eviction itself already removed the local vector sidecars
+        // with the rest of the generation's local files; this is the state
+        // the 2026-09-29 restore left.
+        assert_eq!(
+            vector_sidecar_files(dir.path()),
+            Vec::<String>::new(),
+            "precondition: no vector sidecar survives the eviction"
+        );
+        let evicted: Vec<String> = StorageEngine::evicted_generations(&dir.path().join("sstables"))
+            .into_values()
+            .flatten()
+            .collect();
+        assert_eq!(evicted.len(), 1, "one evicted generation: {evicted:?}");
+
+        let engine = evicting_s3_engine(dir.path(), &store, prefix);
+        StorageEngine::install_s3_file_read_rehydration_hook(
+            dir.path().to_path_buf(),
+            prefix.to_string(),
+            Arc::clone(&store),
+        );
+        engine.register_table(vector_test_schema()).unwrap();
+        assert_eq!(
+            engine.sstable_count(&tid),
+            1,
+            "the evicted generation is live"
+        );
+        engine.add_vector_index(&tid, "vec_idx", 0, 3).unwrap();
+        let engine = tokio::task::spawn_blocking(move || {
+            finish_vector_repair(&engine);
+            engine
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            ann_keys(&engine, &[0.0, 1.0, 0.0], 6).len(),
+            6,
+            "every restored row must answer ANN after the rebuild"
+        );
+        assert!(
+            vector_table_dir(dir.path())
+                .join(format!("{}-VEC-vec_idx__manifest.db", evicted[0]))
+                .exists(),
+            "the restored generation's sidecars were rebuilt from its rows"
+        );
         engine.shutdown().unwrap();
     }
 
