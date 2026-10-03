@@ -8119,7 +8119,9 @@ impl<F: FlushTarget> TableStore<F> {
     }
 
     /// Write `reader`'s scoped sidecars and manifest for `cfg` as generation
-    /// `gen`, record the scopes, then mark the generation complete.
+    /// `gen` and record the scopes. The caller marks the generation complete
+    /// ([`Self::complete_vector_build`]) once it has counted the build, so
+    /// anyone who sees it complete also sees it counted.
     fn build_vector_sidecars_from(
         &self,
         reader: &SSTableReader<F::Reader>,
@@ -8135,12 +8137,19 @@ impl<F: FlushTarget> TableStore<F> {
                 scopes.insert(s.to_vec());
             })?;
         self.try_record_vector_scopes(&cfg.index_name, scopes.iter())?;
-        let key = vector_ready_key(&gen.to_string(), &cfg.index_name);
-        if let Err(e) = self.vector_verified.insert(&key) {
-            tracing::error!(%e, gen, index_name = %cfg.index_name, "could not mark freshly built vector sidecars verified; they are decoded once more");
-        }
-        self.mark_vector_ready(&gen.to_string(), &cfg.index_name);
         Ok(manifest)
+    }
+
+    /// Mark generation `gen`'s freshly built sidecars for `index_name`
+    /// verified and complete: ANN answers over it from here on.
+    fn complete_vector_build(&self, gen: &str, index_name: &str) {
+        if let Err(e) = self
+            .vector_verified
+            .insert(&vector_ready_key(gen, index_name))
+        {
+            tracing::error!(%e, gen, index_name, "could not mark freshly built vector sidecars verified; they are decoded once more");
+        }
+        self.mark_vector_ready(gen, index_name);
     }
 
     /// Rebuild, from their rows, the scoped vector sidecars of every live
@@ -8201,6 +8210,7 @@ impl<F: FlushTarget> TableStore<F> {
                         index_name,
                         self.take_vector_invalid_reason(&key).as_str(),
                     );
+                    self.complete_vector_build(&gen, index_name);
                     tracing::info!(
                         index_name,
                         gen = %gen,
@@ -8559,6 +8569,7 @@ impl<F: FlushTarget> TableStore<F> {
                 Ok(manifest) => {
                     outcome.repaired += 1;
                     outcome.vectors += manifest.vectors;
+                    self.complete_vector_build(output_gen, &cfg.index_name);
                 }
                 Err(e) => {
                     outcome.failed += 1;
