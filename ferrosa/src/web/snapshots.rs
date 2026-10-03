@@ -569,6 +569,7 @@ mod tests {
             auth_disabled: true,
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
+            supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
         }
     }
 
@@ -652,6 +653,7 @@ mod tests {
             auth_disabled: true,
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
+            supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
         };
         (state, dir)
     }
