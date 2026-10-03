@@ -16,8 +16,8 @@ use ferrosa_schema::Schema;
 use ferrosa_sstable::types::DeletionTime;
 use ferrosa_storage::{Mutation, TableId};
 
-use crate::adjacency::observer::make_adjacency_mutation;
-use crate::adjacency::schema::{adjacency_keyspace_name, DIRECTION_IN, DIRECTION_OUT};
+use crate::adjacency::observer::derive_adjacency_mutations;
+use crate::adjacency::schema::{adjacency_keyspace_name, row_is_deleted, DIRECTION_OUT};
 use crate::executor::expand::extract_neighbor_id;
 
 /// Reconciliation metrics.
@@ -48,6 +48,21 @@ async fn skip_immediate_reconciliation_tick(ticker: &mut tokio::time::Interval) 
     ticker.tick().await;
 }
 
+/// Whether an edge table's partition key is exactly its `graph.source` column
+/// and its clustering key exactly its `graph.target` column, so an adjacency
+/// entry's (vertex, neighbour) names the edge's storage key.
+fn edge_keyed_by_source_and_target(meta: &ferrosa_schema::metadata::table::TableMetadata) -> bool {
+    let (Some(source), Some(target)) = (
+        meta.extensions.get("graph.source"),
+        meta.extensions.get("graph.target"),
+    ) else {
+        return false;
+    };
+    meta.partition_key.as_slice() == std::slice::from_ref(source)
+        && meta.clustering_key.len() == 1
+        && &meta.clustering_key[0].0 == target
+}
+
 /// Run one reconciliation pass for a keyspace.
 pub async fn reconcile_once(
     schema: &Schema,
@@ -69,6 +84,11 @@ pub async fn reconcile_once(
 
     let adj_ks = adjacency_keyspace_name(keyspace);
     let adj_table_id = TableId::new(&adj_ks, "adjacency");
+    let point_checkable_edge_tables: std::collections::HashSet<String> = edge_tables
+        .iter()
+        .filter(|(_, meta)| edge_keyed_by_source_and_target(meta))
+        .map(|(tid, _)| format!("{}.{}", tid.keyspace, tid.table))
+        .collect();
 
     // Phase 1: For each edge table, scan partitions and verify adjacency entries exist.
     for (edge_tid, edge_meta) in &edge_tables {
@@ -79,11 +99,6 @@ pub async fn reconcile_once(
             continue;
         }
 
-        let edge_label = edge_meta
-            .extensions
-            .get("graph.label")
-            .cloned()
-            .unwrap_or_else(|| edge_tid.table.clone());
         let edge_table_fqn = format!("{}.{}", edge_tid.keyspace, edge_tid.table);
 
         // Scan all edge table partitions — STREAMED, one partition per pull
@@ -124,63 +139,49 @@ pub async fn reconcile_once(
                 }
             };
             edge_partitions_scanned += 1;
-            let source_id = partition.key.key.as_bytes().to_vec();
-            let source_key = partition.key.clone();
 
             for row in &partition.rows {
-                let target_id = row.clustering.clone();
+                // A deleted edge has nothing to repair: recreating its entries
+                // would make it traversable again.
+                if row_is_deleted(row) {
+                    continue;
+                }
                 metrics.entries_checked += 1;
 
-                // Check OUT adjacency: source -> target
-                if !adjacency_entry_exists(
-                    write_path,
-                    &adj_table_id,
-                    &source_key,
-                    DIRECTION_OUT,
-                    &edge_label,
-                    &target_id,
-                )
-                .await
-                {
-                    // Repair: create OUT adjacency entry.
-                    let mutation = make_adjacency_mutation(
-                        &adj_ks,
-                        &source_id,
-                        DIRECTION_OUT,
-                        &edge_label,
-                        &target_id,
-                        &edge_table_fqn,
-                        now_micros(),
-                    );
-                    if write_mutation(write_path, mutation).await.is_ok() {
-                        metrics.entries_repaired += 1;
+                // The entries the write-time observer derives for this edge,
+                // so a composite-key edge table is keyed by its graph.source
+                // and graph.target columns, not by its raw key bytes.
+                let edge = Mutation::new(
+                    edge_tid.keyspace.clone(),
+                    edge_tid.table.clone(),
+                    partition.key.clone(),
+                    vec![row.clone()],
+                    now_micros(),
+                );
+                for expected in derive_adjacency_mutations(schema, edge_tid, &edge) {
+                    let present = match expected.rows.first() {
+                        Some(entry) => {
+                            adjacency_entry_exists(
+                                write_path,
+                                &adj_table_id,
+                                &expected.key,
+                                &entry.clustering,
+                            )
+                            .await
+                        }
+                        None => true,
+                    };
+                    if present {
+                        continue;
                     }
-                }
-
-                // Check IN adjacency: target -> source
-                let target_key = DecoratedKey::new(PartitionKey::new(target_id.clone()));
-                if !adjacency_entry_exists(
-                    write_path,
-                    &adj_table_id,
-                    &target_key,
-                    DIRECTION_IN,
-                    &edge_label,
-                    &source_id,
-                )
-                .await
-                {
-                    // Repair: create IN adjacency entry.
-                    let mutation = make_adjacency_mutation(
-                        &adj_ks,
-                        &target_id,
-                        DIRECTION_IN,
-                        &edge_label,
-                        &source_id,
-                        &edge_table_fqn,
-                        now_micros(),
-                    );
-                    if write_mutation(write_path, mutation).await.is_ok() {
-                        metrics.entries_repaired += 1;
+                    match write_mutation(write_path, expected).await {
+                        Ok(()) => metrics.entries_repaired += 1,
+                        Err(e) => tracing::warn!(
+                            table = %edge_table_fqn,
+                            error = %e,
+                            "adjacency reconcile: could not write a missing adjacency entry; \
+                             the next pass retries"
+                        ),
                     }
                 }
 
@@ -241,6 +242,10 @@ pub async fn reconcile_once(
             let vertex_id = partition.key.key.as_bytes().to_vec();
 
             for row in &partition.rows {
+                // Already removed.
+                if row_is_deleted(row) {
+                    continue;
+                }
                 // Standard composite: [u16 1][1B direction][...].
                 // Direction byte sits at offset 2 after the u16 length prefix.
                 if row.clustering.len() < 3 {
@@ -271,6 +276,14 @@ pub async fn reconcile_once(
                     None => continue,
                 };
 
+                // Only an edge table keyed exactly (graph.source) / (graph.target)
+                // can be point-checked from an adjacency entry. For any other
+                // layout (agent_memory's typed_edges carries a tenant in its
+                // partition key) the entry does not name the edge's key, and
+                // checking the wrong key would delete every entry as an orphan.
+                if !point_checkable_edge_tables.contains(&edge_table_fqn) {
+                    continue;
+                }
                 // Parse "keyspace.table" from the FQN.
                 let (edge_ks, edge_tbl) = match edge_table_fqn.split_once('.') {
                     Some(pair) => pair,
@@ -288,13 +301,27 @@ pub async fn reconcile_once(
                 // Verify the edge exists in the edge table.
                 let source_key = DecoratedKey::new(PartitionKey::new(source_id));
                 let edge_exists = match write_path.read(&edge_tid, &source_key).await {
-                    Ok(Some(p)) => p.rows.iter().any(|r| r.clustering == target_id),
-                    _ => false,
+                    Ok(Some(p)) => p
+                        .rows
+                        .iter()
+                        .any(|r| r.clustering == target_id && !row_is_deleted(r)),
+                    Ok(None) => false,
+                    // A failed read proves nothing; deleting on it would drop a
+                    // live edge from every traversal.
+                    Err(e) => {
+                        tracing::warn!(
+                            table = %edge_table_fqn,
+                            error = %e,
+                            "adjacency reconcile: could not read an edge to check an \
+                             adjacency entry; keeping the entry for this pass"
+                        );
+                        continue;
+                    }
                 };
 
                 if !edge_exists {
                     // Write a tombstone to remove this orphan adjacency entry.
-                    if write_tombstone(
+                    match write_tombstone(
                         write_path,
                         &adj_table_id,
                         &partition.key,
@@ -302,9 +329,14 @@ pub async fn reconcile_once(
                         &edge_label,
                     )
                     .await
-                    .is_ok()
                     {
-                        metrics.orphans_removed += 1;
+                        Ok(()) => metrics.orphans_removed += 1,
+                        Err(e) => tracing::warn!(
+                            table = %edge_table_fqn,
+                            error = %e,
+                            "adjacency reconcile: could not remove an orphan adjacency \
+                             entry; the next pass retries"
+                        ),
                     }
                 }
 
@@ -328,33 +360,32 @@ pub async fn reconcile_once(
     metrics
 }
 
-/// Check whether a specific adjacency entry exists for a vertex.
+/// Whether `vertex_key` holds a LIVE adjacency entry with `clustering`. A
+/// tombstoned entry is absent: counting it would leave a deleted entry
+/// unrepaired forever. A read error counts as present (designed fallback: the
+/// pass skips the repair, logs it, and the next pass retries) rather than
+/// rewriting entries on every transient failure.
 async fn adjacency_entry_exists(
     write_path: &WritePath,
     adj_table_id: &TableId,
     vertex_key: &DecoratedKey,
-    direction: u8,
-    edge_label: &str,
-    neighbor_id: &[u8],
+    clustering: &[u8],
 ) -> bool {
-    let partition = match write_path.read(adj_table_id, vertex_key).await {
-        Ok(Some(p)) => p,
-        _ => return false,
-    };
-
-    // Standard composite: [u16 1][1B direction][u16 label_len][label][u16 nid_len][nid]
-    let mut expected_clustering = Vec::new();
-    expected_clustering.extend_from_slice(&1u16.to_be_bytes());
-    expected_clustering.push(direction);
-    expected_clustering.extend_from_slice(&(edge_label.len() as u16).to_be_bytes());
-    expected_clustering.extend_from_slice(edge_label.as_bytes());
-    expected_clustering.extend_from_slice(&(neighbor_id.len() as u16).to_be_bytes());
-    expected_clustering.extend_from_slice(neighbor_id);
-
-    partition
-        .rows
-        .iter()
-        .any(|row| row.clustering == expected_clustering)
+    match write_path.read(adj_table_id, vertex_key).await {
+        Ok(Some(partition)) => partition
+            .rows
+            .iter()
+            .any(|row| row.clustering == clustering && !row_is_deleted(row)),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "adjacency reconcile: could not read an adjacency partition; \
+                 skipping its repair for this pass"
+            );
+            true
+        }
+    }
 }
 
 /// Extract the edge label string from an adjacency clustering key.
@@ -489,6 +520,9 @@ mod tests {
     use super::*;
 
     use std::collections::{HashMap, HashSet};
+
+    use crate::adjacency::observer::make_adjacency_mutation;
+    use crate::adjacency::schema::DIRECTION_IN;
 
     use ferrosa_common::schema::{ColumnDefinition, TableSchema};
     use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
@@ -868,6 +902,70 @@ mod tests {
         let wp = WritePath::direct(storage.clone());
         let metrics = reconcile_once(&schema, &wp, "social").await;
         assert_eq!(metrics.orphans_removed, 1);
+    }
+
+    /// Write a row tombstone over edge `source -> target` at `ts`.
+    fn delete_edge(storage: &StorageEngine, table: &str, source: &[u8], target: &[u8], ts: i64) {
+        let row = Row {
+            clustering: target.to_vec(),
+            cells: vec![],
+            deletion: DeletionTime::new(ts, 0),
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+        let key = DecoratedKey::new(PartitionKey::new(source.to_vec()));
+        storage
+            .write(&TableId::new("social", table), &key, row, ts)
+            .unwrap();
+    }
+
+    /// A deleted edge is not repaired back into the adjacency index, and an
+    /// adjacency entry that is only a tombstone counts as missing for a live
+    /// edge — otherwise a deleted edge comes back on the next pass, or a live
+    /// one stays untraversable forever.
+    #[tokio::test]
+    async fn reconcile_skips_deleted_edges_and_restores_tombstoned_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage_engine(tmp.path());
+        let schema = test_schema();
+        setup_edge_and_adjacency(&schema, &storage, "social", "knows");
+        write_edge(&storage, "social", "knows", b"alice", b"bob");
+        write_edge(&storage, "social", "knows", b"alice", b"carol");
+        delete_edge(&storage, "knows", b"alice", b"carol", 2000);
+
+        let wp = WritePath::direct(storage.clone());
+        let first = reconcile_once(&schema, &wp, "social").await;
+        assert_eq!(
+            (first.entries_checked, first.entries_repaired),
+            (1, 2),
+            "only the live edge is checked and given its OUT and IN entries"
+        );
+
+        // Tombstone alice's OUT entry for the live edge: it must come back.
+        let adj_tid = TableId::new(adjacency_keyspace_name("social"), "adjacency");
+        let entry = make_adjacency_mutation(
+            &adjacency_keyspace_name("social"),
+            b"alice",
+            DIRECTION_OUT,
+            // The edge table's graph.label, as the repair writes it.
+            "KNOWS",
+            b"bob",
+            "social.knows",
+            0,
+        );
+        let tombstone = Row {
+            clustering: entry.rows[0].clustering.clone(),
+            cells: vec![],
+            deletion: DeletionTime::new(now_micros(), 0),
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+        storage
+            .write(&adj_tid, &entry.key, tombstone, now_micros())
+            .unwrap();
+        let second = reconcile_once(&schema, &wp, "social").await;
+        assert_eq!(
+            second.entries_repaired, 1,
+            "a tombstoned entry for a live edge is missing and is repaired"
+        );
     }
 
     #[tokio::test]

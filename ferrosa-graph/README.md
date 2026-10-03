@@ -145,6 +145,18 @@ explicit, observable fallback: it scans edge tables to repair missing entries
 and scans the adjacency index to tombstone orphans, covering dropped-mutation
 and crash-recovery gaps. See [specs/data-flow.md](specs/data-flow.md).
 
+Deletion follows the same invariant. Deleting an edge tombstones its OUT and
+IN entries; the observer derives tombstones from an edge tombstone, and
+`DELETE r` writes them explicitly, as MERGE writes the live entries. Reads
+return row tombstones, so every traversal goes through
+`traversable_neighbor_id`, which skips a deleted entry
+(`adjacency::schema::row_is_deleted`) and the entries of the other direction.
+The reconciler derives expected entries with the observer's column
+extraction, never repairs a deleted edge, and removes orphans only from edge
+tables keyed exactly (`graph.source`) / (`graph.target`). For any other layout
+(agent_memory's `typed_edges`) an entry does not name the edge's key, so it
+cannot be point-checked.
+
 ### Edge-table endpoint-label contract
 
 A graph **edge** table (`graph.type = edge`) must declare, besides its endpoint
