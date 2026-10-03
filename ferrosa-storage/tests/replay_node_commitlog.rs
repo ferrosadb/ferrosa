@@ -72,7 +72,7 @@ fn copied_node_commitlog_replays_and_flushes() {
         })
         .expect("read the copy's sstables dir");
     let report = format!(
-        "replayed mutations={mutations} rows={rows} cells={cells}\n\
+        "handed back for deferred replay (open() replays registered tables itself): mutations={mutations} rows={rows} cells={cells}\n\
          tables flushed to SSTables={tables_with_sstables}\n\
          collection blob expansions: {}\n",
         if expansions.is_empty() {
