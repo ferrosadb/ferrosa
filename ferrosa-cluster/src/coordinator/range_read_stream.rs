@@ -2097,13 +2097,30 @@ impl ClusterCoordinator {
                     fanout.last_error.as_deref().unwrap_or("no replica tried")
                 )));
             }
+            // Refused, not warned about, for the same reason as the paged path
+            // (`paged_multi_replica_stream`): merging fewer sources than the CL
+            // needs is a silent read below the requested consistency level.
             if fanout.streams.len() < expected_done {
                 tracing::warn!(
                     failed = fanout.fire_failures,
                     succeeded = fanout.streams.len(),
                     needed = expected_done,
-                    "streaming range read: partial fan-out — some replicas could not be reached"
+                    "streaming range read: partial fan-out — refusing to serve below \
+                     the requested consistency level"
                 );
+                return Err(ClusterError::Internal(format!(
+                    "streaming range read: partial fan-out — reached {} of {} required \
+                     replicas ({} failed); refusing to serve a read below the requested \
+                     consistency level{}",
+                    fanout.streams.len(),
+                    expected_done,
+                    fanout.fire_failures,
+                    fanout
+                        .last_error
+                        .as_deref()
+                        .map(|e| format!(": {e}"))
+                        .unwrap_or_default()
+                )));
             }
 
             // N-way merge -> merge_rx.
