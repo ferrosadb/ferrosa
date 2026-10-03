@@ -15102,6 +15102,9 @@ impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
 mod cache_invariants;
 
 #[cfg(test)]
+mod flush_panic_recovery;
+
+#[cfg(test)]
 mod tests {
     include!("engine_wiring_tests.rs");
     include!("engine_evicted_ranged_tests.rs");

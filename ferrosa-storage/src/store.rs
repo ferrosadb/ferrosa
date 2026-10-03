@@ -1446,6 +1446,40 @@ pub fn filter_tombstoned_sidecar_entries(
 /// interpose a full compaction (view swap + input-file deletion) before the read
 /// opens its SSTables — reproducing the stale-view condition every time instead
 /// of relying on timing.
+/// Test-only fault injection for [`TableStore::flush_with_swap_callback`]:
+/// a panic armed on the calling thread fires at a named point of the flush,
+/// so a test can reproduce "the flush thread died mid-flush" (2026-10-02,
+/// node2: `writer.rs:1965` panicked after the memtable swap, t_7681b32b)
+/// without depending on a particular encoder bug still existing.
+#[cfg(test)]
+pub(crate) mod flush_fault_test_hook {
+    use std::cell::Cell;
+
+    /// Where in the flush an armed panic fires.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum FlushFault {
+        /// After the active memtable moved to `flushing`, before encoding.
+        AfterSwap,
+    }
+
+    thread_local! {
+        static ARMED: Cell<Option<FlushFault>> = const { Cell::new(None) };
+    }
+
+    /// Arm one panic at `at` for the next flush on this thread.
+    pub(crate) fn arm(at: FlushFault) {
+        ARMED.with(|armed| armed.set(Some(at)));
+    }
+
+    /// Fire (and disarm) the panic if one is armed for `at` on this thread.
+    pub(crate) fn fire(at: FlushFault) {
+        if ARMED.with(|armed| armed.get()) == Some(at) {
+            ARMED.with(|armed| armed.set(None));
+            panic!("injected flush panic at {at:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod read_race_test_hook {
     use std::sync::{Arc, Condvar, Mutex};
@@ -3241,11 +3275,24 @@ impl<F: FlushTarget> TableStore<F> {
         );
         let fresh_vector_indexes = new_vector_indexes(&self.vector_index_configs);
         let phase_start = Instant::now();
-        let (old_active, old_view_flushing, old_indexes, old_vector_indexes) = {
+        let (old_active, prev_flushing_present, old_indexes, old_vector_indexes) = {
             let _wb = self.write_barrier.write(); // block all writers
             let old_view = self.view.load();
-            let old_active = Arc::clone(&old_view.active);
-            let old_view_flushing = old_view.flushing.clone();
+            // `flush_guard` serializes flushes and every finished flush clears
+            // `flushing`, so a memtable still there belongs to a flush that
+            // failed or panicked after its swap. Stack it under the memtable
+            // being swapped out: the view has ONE `flushing` slot, and
+            // overwriting it made that memtable's rows unreadable until a
+            // restart replayed the commit log (t_7681b32b). The stack also
+            // makes this flush write both, exactly once.
+            let prev_flushing_present = old_view.flushing.is_some();
+            let old_active = match old_view.flushing.as_ref() {
+                Some(prev) => crate::memtable::stacked::StackedMemtable::stack(
+                    Arc::clone(&old_view.active),
+                    Arc::clone(prev),
+                ),
+                None => Arc::clone(&old_view.active),
+            };
             let old_indexes = Arc::clone(&old_view.indexes);
             let old_vector_indexes = Arc::clone(&old_view.vector_indexes);
             let current_sstables = Arc::clone(&old_view.sstables);
@@ -3267,7 +3314,7 @@ impl<F: FlushTarget> TableStore<F> {
             // Write barrier released here — writers resume with the new active.
             (
                 old_active,
-                old_view_flushing,
+                prev_flushing_present,
                 old_indexes,
                 old_vector_indexes,
             )
@@ -3277,46 +3324,14 @@ impl<F: FlushTarget> TableStore<F> {
             phase_start.elapsed(),
         );
         on_memtable_release();
+        #[cfg(test)]
+        flush_fault_test_hook::fire(flush_fault_test_hook::FlushFault::AfterSwap);
 
-        // Step 2: Snapshot the flushing memtable.
-        // Also capture any late writes from the PREVIOUS flushing memtable
-        // (kept alive since the last flush). These are writes that landed
-        // between the previous snapshot and the view swap.
-        let prev_flushing_present = old_view_flushing.is_some();
+        // Step 2: Snapshot the flushing memtable. When a failed flush left a
+        // memtable behind, `old_active` is the stack of both, and its snapshot
+        // merges partitions present in both with read-path semantics.
         let phase_start = Instant::now();
         let mut partitions = old_active.snapshot();
-        if let Some(ref prev_flushing) = old_view_flushing {
-            let prev_parts = prev_flushing.snapshot();
-            // Merge previous flushing data with current snapshot.
-            // When the same partition key exists in both, MERGE the rows
-            // (different clustering keys = different rows that must all
-            // be included). The old code skipped the entire partition
-            // from prev_flushing if the key existed in the current
-            // snapshot, silently dropping rows with different clustering
-            // keys — this was the P0 data loss bug.
-            let mut existing_map: std::collections::BTreeMap<
-                ferrosa_common::key::DecoratedKey,
-                usize,
-            > = partitions
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (p.key.clone(), i))
-                .collect();
-            for p in prev_parts {
-                if let Some(&idx) = existing_map.get(&p.key) {
-                    // Same partition key: merge rows from both sources using
-                    // the normal read-path semantics. A raw append preserves
-                    // data but can leave clustering rows out of order
-                    // (current flush rows followed by previous flushing rows),
-                    // which corrupts wide-row row-index construction.
-                    partitions[idx] = merge::merge_partitions(vec![partitions[idx].clone(), p]);
-                } else {
-                    let idx = partitions.len();
-                    existing_map.insert(p.key.clone(), idx);
-                    partitions.push(p);
-                }
-            }
-        }
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::SnapshotMemtable,
             phase_start.elapsed(),
