@@ -60,7 +60,7 @@ fn raw_collection_kind(type_name: &str) -> Option<RawCollectionKind> {
     }
 }
 
-fn take_collection_value(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
+fn take_collection_value<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     let len_bytes = bytes
         .get(*pos..*pos + 4)
         .ok_or_else(|| Error::InvalidData("truncated collection element length".into()))?;
@@ -70,20 +70,22 @@ fn take_collection_value(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
         .map_err(|_| Error::InvalidData("negative collection element length".into()))?;
     let value = bytes
         .get(*pos..*pos + len)
-        .ok_or_else(|| Error::InvalidData("truncated collection element value".into()))?
-        .to_vec();
+        .ok_or_else(|| Error::InvalidData("truncated collection element value".into()))?;
     *pos += len;
     Ok(value)
 }
 
-fn expand_legacy_collection_cell(
+/// Walk a whole-value collection blob (CQL v4+ wire encoding), handing each
+/// entry to `emit` as `(seq, first, second)`: a list element's value as
+/// `first`, a set element as `first`, a map entry as `(key, value)`. The
+/// single parser behind [`expand_legacy_collection_cell`] and
+/// [`validate_legacy_collection_blobs`], so the write-time check accepts
+/// exactly what a later flush can expand.
+fn walk_collection_blob<'a>(
     kind: RawCollectionKind,
-    blob: &CellValue,
-) -> Result<Vec<CellValue>> {
-    let bytes = blob
-        .value
-        .as_deref()
-        .ok_or_else(|| Error::InvalidData("live collection blob has no value".into()))?;
+    bytes: &'a [u8],
+    mut emit: impl FnMut(usize, &'a [u8], &'a [u8]),
+) -> Result<usize> {
     let count_bytes = bytes
         .get(..4)
         .ok_or_else(|| Error::InvalidData("truncated collection element count".into()))?;
@@ -105,7 +107,49 @@ fn expand_legacy_collection_cell(
         )));
     }
     let mut pos = 4;
-    let mut cells = Vec::with_capacity(count + 1);
+    for seq in 0..count {
+        let first = take_collection_value(bytes, &mut pos)?;
+        let second = match kind {
+            RawCollectionKind::Map => take_collection_value(bytes, &mut pos)?,
+            RawCollectionKind::List | RawCollectionKind::Set => &[],
+        };
+        emit(seq, first, second);
+    }
+    if pos != bytes.len() {
+        return Err(Error::InvalidData(format!(
+            "collection blob has {} trailing bytes",
+            bytes.len() - pos
+        )));
+    }
+    Ok(count)
+}
+
+fn expand_legacy_collection_cell(
+    kind: RawCollectionKind,
+    blob: &CellValue,
+) -> Result<Vec<CellValue>> {
+    let bytes = blob
+        .value
+        .as_deref()
+        .ok_or_else(|| Error::InvalidData("live collection blob has no value".into()))?;
+    let mut elements = Vec::new();
+    walk_collection_blob(kind, bytes, |seq, first, second| {
+        let (path, value) = match kind {
+            RawCollectionKind::List => (
+                ferrosa_row_bridge::collection::list_cell_path(blob.timestamp, seq as u16),
+                first.to_vec(),
+            ),
+            RawCollectionKind::Set => (first.to_vec(), Vec::new()),
+            RawCollectionKind::Map => (first.to_vec(), second.to_vec()),
+        };
+        elements.push(CellValue {
+            value: Some(value),
+            timestamp: blob.timestamp,
+            ttl: blob.ttl,
+            local_deletion_time: blob.local_deletion_time,
+            path: Some(path),
+        });
+    })?;
 
     // A whole-collection assignment is a deletion immediately before its new
     // elements. The one-microsecond offset leaves those replacement elements
@@ -114,39 +158,42 @@ fn expand_legacy_collection_cell(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let mut cells = Vec::with_capacity(elements.len() + 1);
     cells.push(CellValue::tombstone(
         blob.timestamp.saturating_sub(1),
         i32::try_from(now_secs).unwrap_or(i32::MAX),
     ));
-
-    for seq in 0..count {
-        let (path, value) = match kind {
-            RawCollectionKind::List => (
-                ferrosa_row_bridge::collection::list_cell_path(blob.timestamp, seq as u16),
-                take_collection_value(bytes, &mut pos)?,
-            ),
-            RawCollectionKind::Set => (take_collection_value(bytes, &mut pos)?, Vec::new()),
-            RawCollectionKind::Map => {
-                let key = take_collection_value(bytes, &mut pos)?;
-                let value = take_collection_value(bytes, &mut pos)?;
-                (key, value)
-            }
-        };
-        cells.push(CellValue {
-            value: Some(value),
-            timestamp: blob.timestamp,
-            ttl: blob.ttl,
-            local_deletion_time: blob.local_deletion_time,
-            path: Some(path),
-        });
-    }
-    if pos != bytes.len() {
-        return Err(Error::InvalidData(format!(
-            "collection blob has {} trailing bytes",
-            bytes.len() - pos
-        )));
-    }
+    cells.extend(elements);
     Ok(cells)
+}
+
+/// Refuse a row whose whole-value cell on a non-frozen collection column does
+/// not parse as that collection. The row is not changed: storage keeps the
+/// whole-value form until a complex-framed flush or compaction expands it
+/// ([`expand_legacy_collection_blobs`]), and a value that cannot be expanded
+/// there would fail every flush of the table. The error names the table,
+/// column and timestamp.
+pub(crate) fn validate_legacy_collection_blobs(row: &Row, schema: &TableSchema) -> Result<()> {
+    for (idx, cell) in &row.cells {
+        if cell.path.is_some() || cell.is_tombstone() {
+            continue;
+        }
+        let (Some(kind), Some(bytes)) = (collection_kind_at(schema, *idx), cell.value.as_deref())
+        else {
+            continue;
+        };
+        if let Err(e) = walk_collection_blob(kind, bytes, |_, _, _| {}) {
+            let column = schema
+                .column_at_ordinal(*idx)
+                .map_or("<unknown>", |c| c.name.as_str());
+            return Err(Error::InvalidData(format!(
+                "{}.{} (column \"{column}\", index {idx}, ts {}): value is not a well-formed \
+                 collection: {e}",
+                schema.keyspace, schema.table, cell.timestamp
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Convert legacy whole-value collection cells when either side of a row merge
@@ -240,33 +287,40 @@ fn collection_kind_at(schema: &TableSchema, idx: u16) -> Option<RawCollectionKin
 
 /// Expand every legacy whole-value collection cell (live, `path == None`, on a
 /// non-frozen list/set/map column) into a deletion sentinel plus per-element
-/// cells, in place. `row` is untouched when an error is returned.
+/// cells, in place. On `Err` the row's cells are part-consumed: the caller
+/// must discard the row.
 ///
 /// Commit-log segments written before collection writes were normalised can
-/// still carry such cells. Replayed as-is they reach the flush writer, which
-/// asserts `path == None` cells on a complex column are tombstones whenever
-/// ANY cell in the same flush has a path — so one old blob beside an element
-/// write on another partition panics the flush. Normalising at the replay
-/// producer keeps the writer's assertion intact.
+/// still carry such cells; replay expands them here. Rows that reach a flush
+/// or compaction unexpanded are handled by
+/// [`expand_collection_blobs_for_writer`].
 pub(crate) fn expand_legacy_collection_blobs(row: &mut Row, schema: &TableSchema) -> Result<()> {
+    expand_row_collection_blobs(row, |idx| collection_kind_at(schema, idx))
+}
+
+/// The expansion behind [`expand_legacy_collection_blobs`] and
+/// [`expand_collection_blobs_for_writer`]; `kind_at` maps a cell's column
+/// index to its collection kind under the caller's indexing convention.
+fn expand_row_collection_blobs(
+    row: &mut Row,
+    kind_at: impl Fn(u16) -> Option<RawCollectionKind>,
+) -> Result<()> {
     let is_blob = |cell: &CellValue| cell.path.is_none() && !cell.is_tombstone();
     if !row
         .cells
         .iter()
-        .any(|(idx, cell)| is_blob(cell) && collection_kind_at(schema, *idx).is_some())
+        .any(|(idx, cell)| is_blob(cell) && kind_at(*idx).is_some())
     {
         return Ok(());
     }
-    // Move the cells rather than cloning them: this runs per row on a replay
-    // path and `cell.clone()` copies row data (P0 OOM audit, rule
-    // `clone-on-row-data`). Taking the vec is safe because every caller hands
-    // this function a row it already owns — `expand_legacy_collection_blobs`'s
-    // caller normalizes a `row.clone()` and discards it wholesale on `Err`,
-    // quarantining the original — so a part-consumed row never reaches storage.
+    // Move the cells rather than cloning them: `cell.clone()` copies row data
+    // (P0 OOM audit, rule `clone-on-row-data`). Taking the vec is safe because
+    // every caller owns the row it hands in and discards it on `Err`, so a
+    // part-consumed row never reaches storage.
     let original = std::mem::take(&mut row.cells);
     let mut cells = Vec::with_capacity(original.len() + 1);
     for (idx, cell) in original {
-        match collection_kind_at(schema, idx).filter(|_| is_blob(&cell)) {
+        match kind_at(idx).filter(|_| is_blob(&cell)) {
             Some(kind) => cells.extend(
                 expand_legacy_collection_cell(kind, &cell)?
                     .into_iter()
@@ -278,6 +332,111 @@ pub(crate) fn expand_legacy_collection_blobs(row: &mut Row, schema: &TableSchema
     cells.sort_by(|(a_idx, a), (b_idx, b)| (a_idx, &a.path).cmp(&(b_idx, &b.path)));
     row.cells = cells;
     Ok(())
+}
+
+/// Collection kind of a writer header column (`(name, type)` pairs indexed
+/// from 0), or `None` for a non-collection, frozen or out-of-range column.
+fn header_collection_kind(columns: &[(Vec<u8>, String)], idx: u16) -> Option<RawCollectionKind> {
+    columns
+        .get(usize::from(idx))
+        .and_then(|(_, type_name)| raw_collection_kind(type_name))
+}
+
+/// True when `partition` holds a live path-less cell on a non-frozen
+/// collection column of `header`: a whole-value cell that
+/// [`expand_collection_blobs_for_writer`] must expand for a complex-framed
+/// output.
+pub(crate) fn partition_has_collection_blob(
+    partition: &Partition,
+    header: &ferrosa_sstable::statistics::SerializationHeader,
+) -> bool {
+    let has_blob = |row: &Row, columns: &[(Vec<u8>, String)]| {
+        row.cells.iter().any(|(idx, cell)| {
+            cell.path.is_none()
+                && !cell.is_tombstone()
+                && header_collection_kind(columns, *idx).is_some()
+        })
+    };
+    partition
+        .static_row
+        .as_ref()
+        .is_some_and(|row| has_blob(row, &header.static_columns))
+        || partition
+            .rows
+            .iter()
+            .any(|row| has_blob(row, &header.regular_columns))
+}
+
+/// Lower `header`'s minimum timestamp and local deletion time so the
+/// collection-deletion sentinel that [`expand_collection_blobs_for_writer`]
+/// mints (timestamp `blob.timestamp - 1`, local deletion time = now) stays
+/// inside the bounds the header advertises. A header built before expansion
+/// can sit one microsecond above that sentinel, which the writer's delta
+/// encoding and the compaction validator both refuse. Lowering a minimum is
+/// always safe; it only widens the delta base.
+pub(crate) fn widen_header_for_blob_sentinels(
+    header: &mut ferrosa_sstable::statistics::SerializationHeader,
+) {
+    if header.min_timestamp != ferrosa_common::NO_TIMESTAMP {
+        header.min_timestamp = header.min_timestamp.saturating_sub(1);
+    }
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let now = i32::try_from(now_secs).unwrap_or(i32::MAX);
+    header.min_local_deletion_time = header.min_local_deletion_time.min(now);
+}
+
+/// Make `partition` writable under `header`. A complex-framed SSTable
+/// (`header.complex_collections`) refuses a live path-less cell on a
+/// non-frozen collection column, yet storage legitimately holds whole-value
+/// cells beside element cells: a blob written by a non-CQL or mixed-version
+/// producer, a legacy simple-framed SSTable compacted with a complex one, or
+/// a blob partition flushed beside an element write on another partition.
+/// Each such cell is expanded here into the collection-deletion sentinel plus
+/// its elements, using the writer's own column indexing (statics and regulars
+/// each from 0). A simple-framed header, or a partition with no such cell, is
+/// returned borrowed and untouched.
+///
+/// This is the single fix for both writer refusals of 2026-10-03 (node2's
+/// `storage-flush`, node1's compaction). A blob that does not parse fails
+/// with an error naming the partition key.
+pub(crate) fn expand_collection_blobs_for_writer<'a>(
+    partition: &'a Partition,
+    header: &ferrosa_sstable::statistics::SerializationHeader,
+) -> Result<std::borrow::Cow<'a, Partition>> {
+    use std::borrow::Cow;
+    if !header.complex_collections {
+        return Ok(Cow::Borrowed(partition));
+    }
+    if !partition_has_collection_blob(partition, header) {
+        return Ok(Cow::Borrowed(partition));
+    }
+
+    let mut owned = partition.clone();
+    let expanded = owned
+        .static_row
+        .as_mut()
+        .map_or(Ok(()), |row| {
+            expand_row_collection_blobs(row, |idx| {
+                header_collection_kind(&header.static_columns, idx)
+            })
+        })
+        .and_then(|()| {
+            owned.rows.iter_mut().try_for_each(|row| {
+                expand_row_collection_blobs(row, |idx| {
+                    header_collection_kind(&header.regular_columns, idx)
+                })
+            })
+        });
+    expanded.map_err(|e| {
+        Error::InvalidData(format!(
+            "whole-value collection cell in partition key={:?} cannot be expanded for a \
+             complex-framed SSTable: {e}",
+            String::from_utf8_lossy(partition.key.key.as_bytes())
+        ))
+    })?;
+    Ok(Cow::Owned(owned))
 }
 
 pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Result<()> {

@@ -1878,14 +1878,21 @@ fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
         max_timestamp = NO_TIMESTAMP;
     }
 
-    SerializationHeader {
+    let mut header = SerializationHeader {
         complex_collections: has_complex,
         min_timestamp,
         max_timestamp,
         min_local_deletion_time,
         min_ttl,
         ..template
+    };
+    // A simple-framed input may hold whole-value collection cells, which a
+    // complex-framed output expands (`emit_partition`) into elements plus a
+    // deletion sentinel one microsecond older than the blob.
+    if has_complex && readers.iter().any(|r| !r.header().complex_collections) {
+        crate::memtable::widen_header_for_blob_sentinels(&mut header);
     }
+    header
 }
 
 /// Counts and token span of the partitions written to the compaction output.
@@ -1915,6 +1922,10 @@ fn emit_partition(
     tally: &mut OutputTally,
 ) -> std::result::Result<(), String> {
     let write_start = Instant::now();
+    // A legacy simple-framed input may carry whole-value collection cells that
+    // a complex-framed output cannot hold as-is.
+    let merged = &*crate::memtable::expand_collection_blobs_for_writer(merged, header)
+        .map_err(|e| format!("write partition: {e}"))?;
     validate_partition_writable(merged, header).map_err(|e| format!("write partition: {e}"))?;
     writer
         .add_partition(merged)

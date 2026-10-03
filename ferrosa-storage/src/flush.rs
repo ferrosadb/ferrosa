@@ -194,6 +194,23 @@ pub fn build_serialization_header(
     }
 }
 
+/// [`build_serialization_header`] for a memtable flush. When the output is
+/// complex-framed and some partition still holds a whole-value collection
+/// cell, the header is widened to cover the deletion sentinel that
+/// [`crate::memtable::expand_collection_blobs_for_writer`] will mint for it.
+/// Every flush writer must feed its partitions through that function.
+pub fn header_for_flush(schema: &TableSchema, partitions: &[Partition]) -> SerializationHeader {
+    let mut header = build_serialization_header(schema, partitions);
+    if header.complex_collections
+        && partitions
+            .iter()
+            .any(|p| crate::memtable::partition_has_collection_blob(p, &header))
+    {
+        crate::memtable::widen_header_for_blob_sentinels(&mut header);
+    }
+    header
+}
+
 /// Split token-sorted `partitions` into at most `num_shards` contiguous slices
 /// so each shard can be encoded into its own SSTable in parallel (parallel flush
 /// slice #3 — the encode phase is ~98% of flush time and single-threaded per
