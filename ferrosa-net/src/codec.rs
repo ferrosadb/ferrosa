@@ -165,6 +165,13 @@ pub enum MsgType {
     // routed to that partition's replicas only (t_430c4188)
     IndexReadInPartitionRequest = 0x66,
     IndexReadInPartitionResponse = 0x67,
+    /// Fetch the next page of a CQL result cursor parked on the receiving
+    /// node (ferrosa-cql `result_cursor`). Sent only to a peer that advertised
+    /// [`crate::handshake::CAP_RESULT_CURSOR_PAGE`]: an older node does not
+    /// know this byte and would drop the whole connection.
+    ResultCursorPage = 0x68,
+    /// Reply to [`MsgType::ResultCursorPage`]: the page, or a named refusal.
+    ResultCursorPageReply = 0x69,
     // Accord consensus
     AccordPreAccept = 0x70,
     AccordPreAcceptOK = 0x71,
@@ -303,6 +310,8 @@ impl TryFrom<u8> for MsgType {
             0x65 => Ok(Self::FulltextSearchResponse),
             0x66 => Ok(Self::IndexReadInPartitionRequest),
             0x67 => Ok(Self::IndexReadInPartitionResponse),
+            0x68 => Ok(Self::ResultCursorPage),
+            0x69 => Ok(Self::ResultCursorPageReply),
             0x70 => Ok(Self::AccordPreAccept),
             0x71 => Ok(Self::AccordPreAcceptOK),
             0x72 => Ok(Self::AccordAccept),

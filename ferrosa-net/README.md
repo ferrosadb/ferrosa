@@ -49,7 +49,18 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   `accept_handshake` exchange `Handshake`/`HandshakeAck`, verifying cluster name,
   protocol version, and an `HMAC-SHA256(psk, cluster_name|host_id|nonce)` auth
   token via the `hmac` crate's constant-time `verify_slice`. The handshake also
-  exchanges CQL- and internode-broadcast addresses.
+  exchanges CQL- and internode-broadcast addresses, and **capability bits**: a
+  trailing `u32` on BOTH `Handshake` and `HandshakeAck`
+  (`NetConfig::advertised_capabilities`, default `LOCAL_CAPABILITIES`), so the
+  initiator and the acceptor each learn the other's (`HandshakePeer::capabilities`,
+  `PeerManager::peer_capabilities`). A pre-capability peer sends none (read as
+  0) and ignores ours. A feature that adds a message type gates sending it on
+  the peer's bit, because an older node drops the whole connection on an
+  unknown type byte. Bits: `CAP_RESULT_CURSOR_PAGE` (1<<1) — the peer serves
+  `ResultCursorPage` (`0x68`) / `ResultCursorPageReply` (`0x69`), opaque
+  ferrosa-cql payloads forwarding a CQL result cursor's next page to the node
+  that owns it. Bit 0 is reserved for `CAP_RPC_ERROR_REPLY`
+  (fix/rpc-handler-panic-replies), which adds the same trailing field.
 - **Priority lanes + actor pool** (`pool`, `lane_actor`) — `PriorityPool` holds
   three TCP connections per peer, one per `Lane` (`Raft`, `Data`, `Bulk`). Each
   lane is owned by a dedicated actor task that processes `LaneCommand`s

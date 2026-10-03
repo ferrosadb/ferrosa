@@ -259,6 +259,7 @@ impl RpcServer {
                             reason: "overloaded".to_string(),
                             cql_broadcast: None,
                             internode_broadcast: None,
+                            capabilities: config.advertised_capabilities,
                         };
                         let mut body = bytes::BytesMut::new();
                         if ack.encode(&mut body).is_ok() {

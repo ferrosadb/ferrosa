@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-net
 status: implemented
-last_updated: 2026-09-09
+last_updated: 2026-10-03
 executive_summary: >
   The internode transport for ferrosa: a custom framed TCP wire protocol with a
   44-byte header, a PSK-HMAC handshake, three priority lanes (Raft/Data/Bulk) per
@@ -36,7 +36,7 @@ that is wrong — see `Cargo.toml` and `src/task_pool.rs`.)
 | `message` | `Message` enum + hand-rolled length-prefixed encode/decode for all `MsgType`s |
 | `protocol` | Generated Cap'n Proto envelope (v2) + adapter types, capability/feature negotiation, `encode/decode_message_envelope` |
 | `accord_messages` | `AccordMessageType` discriminants (Accord payloads carried as opaque `Bytes`) |
-| `handshake` | PSK-HMAC handshake (`initiate_handshake` / `accept_handshake`), `compute/verify_auth_token`, `HandshakePeer` |
+| `handshake` | PSK-HMAC handshake (`initiate_handshake` / `accept_handshake`), `compute/verify_auth_token`, `HandshakePeer`; capability bits exchanged both ways (`CAP_RESULT_CURSOR_PAGE`, `LOCAL_CAPABILITIES`) so a new message type is only sent to a peer that knows it |
 | `pool` | `PriorityPool`: 3 lanes per peer, connect/send/fire/shutdown, reconnect-host selection |
 | `lane_actor` | Per-lane actor task, `LaneHandle`, `LaneCommand`, stream-window dispatch, reconnect/dormant driving |
 | `reconnect` | `LaneState`, backoff constants, `connect_with_retry_cancelable`, alive watcher, dormant counters |

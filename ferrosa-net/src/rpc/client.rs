@@ -59,6 +59,8 @@ pub struct RpcClient {
     peer_cql_broadcast: Option<String>,
     /// Internode broadcast hostname the peer advertised during handshake.
     peer_internode_broadcast: Option<String>,
+    /// Capability bits the peer advertised in its HandshakeAck.
+    peer_capabilities: u32,
     pending: Arc<DashMap<u32, oneshot::Sender<Message>>>,
     tx: mpsc::Sender<Frame>,
     next_stream_id: Arc<AtomicU32>,
@@ -88,6 +90,12 @@ impl RpcClient {
     /// The peer's internode broadcast hostname, obtained during the handshake.
     pub fn peer_internode_broadcast(&self) -> Option<&str> {
         self.peer_internode_broadcast.as_deref()
+    }
+
+    /// Capability bits (`handshake::CAP_*`) the peer advertised, 0 for a peer
+    /// that predates them.
+    pub fn peer_capabilities(&self) -> u32 {
+        self.peer_capabilities
     }
 
     /// Subscribe to the connection liveness channel.
@@ -181,6 +189,7 @@ impl RpcClient {
         let peer_host_id = peer.host_id;
         let peer_cql_broadcast = peer.cql_broadcast;
         let peer_internode_broadcast = peer.internode_broadcast;
+        let peer_capabilities = peer.capabilities;
 
         let pending: Arc<DashMap<u32, oneshot::Sender<Message>>> = Arc::new(DashMap::new());
         let (tx, mut rx) = mpsc::channel::<Frame>(256);
@@ -282,6 +291,7 @@ impl RpcClient {
             peer_host_id,
             peer_cql_broadcast,
             peer_internode_broadcast,
+            peer_capabilities,
             pending,
             tx,
             next_stream_id: Arc::new(AtomicU32::new(1)),

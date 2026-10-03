@@ -420,6 +420,18 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
+    /// Capability bits (`handshake::CAP_*`) the peer advertised on its live
+    /// outbound connection, or `None` when there is no live connection to it.
+    /// A feature gated on a capability must check this before sending a
+    /// message type an older peer does not know.
+    pub async fn peer_capabilities(&self, host_id: uuid::Uuid) -> Option<u32> {
+        let peers = self.peers.read().await;
+        peers
+            .get(&host_id)
+            .and_then(|state| state.pool.as_ref())
+            .map(|pool| pool.peer_capabilities())
+    }
+
     /// Return the last known socket address for `host_id`, even if this peer
     /// currently has no active outbound pool.
     pub async fn peer_addr(&self, host_id: uuid::Uuid) -> Option<String> {

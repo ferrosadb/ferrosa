@@ -1546,7 +1546,9 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::RepairFetchRequest
             | MsgType::RepairFetchResponse
             | MsgType::RepairApplyRequest
-            | MsgType::RepairApplyResponse,
+            | MsgType::RepairApplyResponse
+            | MsgType::ResultCursorPage
+            | MsgType::ResultCursorPageReply,
         ) => MessageFamily::Data,
         Ok(
             MsgType::StreamStart
