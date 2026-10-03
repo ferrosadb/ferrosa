@@ -137,20 +137,35 @@ impl FullTextIndexBuilder {
     }
 
     /// Build the [`FullTextIndex`].
+    ///
+    /// A term's postings hold each key at most once. A key added more than
+    /// once is folded the way [`crate::fulltext::merge`] folds two sidecars:
+    /// term frequencies sum and the last-added document length wins. The
+    /// readers rely on this — `search` sums a key's postings through a score
+    /// map, while `search_top_k` streams postings into a heap with no map, so
+    /// a repeated key would score differently on the two paths.
     pub fn build(self) -> FullTextIndex {
         let terms = self
             .index
             .into_iter()
-            .map(|(term, postings_raw)| {
-                let doc_freq = postings_raw.len() as u32;
-                let postings = postings_raw
-                    .into_iter()
-                    .map(|(pk, tf, dl)| Posting {
-                        partition_key: pk,
-                        term_freq: tf,
-                        doc_len: dl,
-                    })
-                    .collect();
+            .map(|(term, mut postings_raw)| {
+                // Stable: among equal keys, add order (oldest first) survives.
+                postings_raw.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut postings: Vec<Posting> = Vec::with_capacity(postings_raw.len());
+                for (pk, tf, dl) in postings_raw {
+                    match postings.last_mut() {
+                        Some(last) if last.partition_key == pk => {
+                            last.term_freq += tf;
+                            last.doc_len = dl;
+                        }
+                        _ => postings.push(Posting {
+                            partition_key: pk,
+                            term_freq: tf,
+                            doc_len: dl,
+                        }),
+                    }
+                }
+                let doc_freq = postings.len() as u32;
                 (term, TermEntry { doc_freq, postings })
             })
             .collect();
