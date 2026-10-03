@@ -3885,11 +3885,22 @@ async fn a_former_cluster_member_never_falls_back_to_pair_on_timeout() {
     // Wait for the timeout to actually FIRE (its counter is monotonic and
     // process-wide), then assert the mode it settled on. Without waiting on the
     // counter this would pass vacuously by observing the starting mode.
+    //
+    // The counter alone is not enough: it is shared by every test in the
+    // process, so another test's formation timeout can advance it while this
+    // controller is still `Cluster` (observed: `left: Cluster`). Wait for THIS
+    // controller to leave the forming `Cluster` shape as well.
     let timeouts_before = crate::controller::cluster::bootstrap_silent_failure_counts().2;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
     let timed_out =
         || crate::controller::cluster::bootstrap_silent_failure_counts().2 > timeouts_before;
-    while !timed_out() && tokio::time::Instant::now() < deadline {
+    let forming = || {
+        matches!(
+            controller.mode(),
+            DeploymentMode::Cluster | DeploymentMode::Forming
+        )
+    };
+    while !(timed_out() && !forming()) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(

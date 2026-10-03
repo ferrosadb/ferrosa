@@ -203,12 +203,9 @@ impl ModeController {
             }
         }
 
-        // 1. Mark node as Leaving (still serves reads, but data streaming begins)
+        // 1. Mark node as Leaving (excluded from replicas(); streaming begins)
         let set_leaving = RaftCommand {
-            op: RaftOp::SetNodeState {
-                node_id,
-                state: crate::raft::NodeState::Joining, // reuse Joining = not serving
-            },
+            op: decommission_drain_op(node_id),
             schema_version: Uuid::new_v4(),
         };
         raft.client_write(set_leaving)
@@ -662,6 +659,59 @@ impl ModeController {
         });
 
         true
+    }
+}
+
+/// The Raft op that takes a node out of `replicas()` while decommission
+/// streams its data to the new owners.
+///
+/// It must be `Leaving`, never `Joining`. Both are excluded from `replicas()`,
+/// but `Joining` means "pre-bootstrap, promote me when ready": the restart
+/// recovery pass (`promote_joining_members`, CL-29) promotes every `Joining`
+/// member back to `Normal`. A decommission marked `Joining` was therefore
+/// undone by any node restarting mid-drain: the draining node served and took
+/// writes again, and writes it took after its stream passed their partition
+/// were lost at `LeaveNode`.
+pub(crate) fn decommission_drain_op(node_id: u64) -> RaftOp {
+    RaftOp::SetNodeState {
+        node_id,
+        state: NodeState::Leaving,
+    }
+}
+
+#[cfg(test)]
+mod decommission_drain_tests {
+    use std::collections::BTreeMap;
+
+    use super::decommission_drain_op;
+    use crate::raft::{NodeState, RaftOp};
+    use crate::repair::coordinator::promote_joining_members;
+
+    /// A node being decommissioned must not be promoted back to `Normal` by
+    /// the restart recovery pass, and must stay out of `replicas()`.
+    #[test]
+    fn a_draining_node_is_not_promoted_by_the_recovery_pass() {
+        let draining = 2_u64;
+        let RaftOp::SetNodeState { node_id, state } = decommission_drain_op(draining) else {
+            panic!("decommission must set the node state");
+        };
+        assert_eq!(node_id, draining);
+        assert!(
+            !state.is_voter(),
+            "a draining node must not serve as a voter"
+        );
+
+        let members: BTreeMap<u64, NodeState> = [
+            (1, NodeState::Normal),
+            (draining, state),
+            (3, NodeState::Normal),
+        ]
+        .into();
+        assert!(
+            promote_joining_members(&members).is_empty(),
+            "the recovery promote pass would undo the decommission of node {draining} \
+             (drain state {state:?})"
+        );
     }
 }
 

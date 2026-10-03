@@ -3008,7 +3008,7 @@ impl ModeController {
                     // otherwise have nowhere to receive a schema snapshot.
                     registry.register(
                         MsgType::PairSchemaSync,
-                        Arc::new(PairSchemaSyncHandler::new(
+                        Arc::new(PairSchemaSyncHandler::for_cluster(
                             schema_for_replay.clone(),
                             storage_for_bootstrap.clone(),
                         )),

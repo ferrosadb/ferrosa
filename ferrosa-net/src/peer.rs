@@ -259,8 +259,9 @@ impl PeerManager {
     }
 
     /// Deregister `dead` (a pool whose lane actors have exited) and dial a
-    /// replacement through [`Self::ensure_peer`], which also verifies peer
-    /// identity (t_a3df19a5).
+    /// replacement through [`Self::dial_verified`], which verifies peer
+    /// identity (t_a3df19a5). The replacement is installed only over this
+    /// call's own placeholder, so a peer removed mid-dial stays removed.
     ///
     /// Serialised by `replace_lock` so concurrent requests that hit the same
     /// dead pool produce ONE dial: later arrivals find the pool already
@@ -287,17 +288,40 @@ impl PeerManager {
             "peer's registered pool has dead lane actors; deregistering and re-dialing"
         );
         let placeholder = Arc::new(PeerState::awaiting_redial(state.peer_id, self.now_ms()));
-        self.peers.write().await.insert(host_id, placeholder);
+        self.peers
+            .write()
+            .await
+            .insert(host_id, Arc::clone(&placeholder));
         dead.shutdown().await;
-        if let Err(e) = self.ensure_peer(host_id, &addr.to_string()).await {
-            tracing::error!(
-                peer = %host_id, %addr, error = %e,
-                "replacing the dead pool failed; the heartbeat loop keeps re-dialing it until the \
-                 peer answers or is removed"
+        // Install only over our own placeholder, as the heartbeat re-dial
+        // does: a `remove_peer` that lands while this dial is in flight must
+        // not be undone by an unguarded `add_peer`.
+        let pool = match self.dial_verified(host_id, &addr.to_string(), addr).await {
+            Ok(pool) => pool,
+            Err(failure) => {
+                let e = NetError::from(failure);
+                tracing::error!(
+                    peer = %host_id, %addr, error = %e,
+                    "replacing the dead pool failed; the heartbeat loop keeps re-dialing it until the \
+                     peer answers or is removed"
+                );
+                return Err(NetError::Protocol(format!(
+                    "replacing dead pool for peer {host_id} at {addr} failed: {e}"
+                )));
+            }
+        };
+        if !self
+            .install_pool(state.peer_id, pool, Some(&placeholder))
+            .await
+        {
+            // Removed (the request fails "unknown peer") or replaced by another
+            // dial (the request uses that pool). The fresh pool was shut down.
+            tracing::debug!(
+                peer = %host_id,
+                "peer removed or replaced while its dead pool was re-dialed; replacement discarded"
             );
-            return Err(NetError::Protocol(format!(
-                "replacing dead pool for peer {host_id} at {addr} failed: {e}"
-            )));
+            let (_, current) = self.pool_for_peer(host_id).await?;
+            return Ok(current);
         }
         tracing::info!(peer = %host_id, %addr, "replaced dead pool with a fresh connection");
         let (_, fresh) = self.pool_for_peer(host_id).await?;
@@ -1658,6 +1682,110 @@ mod tests {
         );
 
         pm.remove_peer(server_id).await;
+    }
+
+    /// A TCP proxy to `upstream` whose new connections can be held at the
+    /// gate. `arrived` fires when a held connection is waiting; `release`
+    /// lets every held connection through.
+    struct GatedProxy {
+        addr: std::net::SocketAddr,
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        arrived: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    async fn gated_proxy(upstream: std::net::SocketAddr) -> GatedProxy {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = GatedProxy {
+            addr: listener.local_addr().unwrap(),
+            hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            arrived: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let (hold, arrived, release) = (
+            Arc::clone(&proxy.hold),
+            Arc::clone(&proxy.arrived),
+            Arc::clone(&proxy.release),
+        );
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let held = hold.load(Ordering::SeqCst);
+                let (arrived, release) = (Arc::clone(&arrived), Arc::clone(&release));
+                tokio::spawn(async move {
+                    if held {
+                        arrived.notify_one();
+                        let permit = release.acquire().await.expect("gate closed");
+                        permit.forget();
+                        release.add_permits(1); // released for every waiter
+                    }
+                    let mut outbound = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+            }
+        });
+        proxy
+    }
+
+    /// A peer removed while its dead pool is being replaced must stay
+    /// removed. `replace_dead_pool` re-dials through `ensure_peer`, whose
+    /// install is unguarded; the heartbeat re-dial guards the same install
+    /// with the placeholder (`install_pool(.., Some(placeholder))`) for
+    /// exactly this race. Without the guard a decommissioned node comes back
+    /// into the peer map, with its broadcasts, and is heartbeated forever.
+    #[tokio::test]
+    async fn a_peer_removed_during_dead_pool_replacement_stays_removed() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let upstream = server.start_and_get_addr().await.unwrap();
+        let proxy = gated_proxy(upstream).await;
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            Arc::new(TestListener::new()),
+        ));
+        pm.ensure_peer(server_id, &proxy.addr.to_string())
+            .await
+            .unwrap();
+        let (_, dead) = pm.pool_for_peer(server_id).await.unwrap();
+        dead.shutdown().await;
+
+        proxy.hold.store(true, Ordering::SeqCst);
+        let request = {
+            let pm = Arc::clone(&pm);
+            tokio::spawn(async move {
+                pm.send(
+                    server_id,
+                    Message::Ping {
+                        nonce: 1,
+                        sent_at: 0,
+                    },
+                    Lane::Data,
+                )
+                .await
+            })
+        };
+        // The replacement dial is in flight and held at the proxy.
+        proxy.arrived.notified().await;
+        pm.remove_peer(server_id).await;
+        proxy.release.add_permits(1);
+
+        let outcome = request.await.unwrap();
+        assert!(
+            !pm.has_peer(server_id),
+            "a peer removed mid-replacement was re-registered (request outcome: {outcome:?})"
+        );
+        assert!(
+            pm.get_peer_internode_broadcast(server_id).await.is_none()
+                && pm.get_peer_cql_broadcast(server_id).await.is_none(),
+            "a removed peer's broadcasts must not be re-published"
+        );
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]

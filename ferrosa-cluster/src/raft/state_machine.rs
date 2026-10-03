@@ -705,19 +705,7 @@ impl FerrosStateMachine {
         engine: &StorageEngine,
         table_id: &TableId,
     ) -> ferrosa_common::Result<bool> {
-        if engine.sstable_count(table_id) > 0 {
-            return Ok(true);
-        }
-
-        let table_dir = engine.table_sstable_dir(table_id);
-        if !StorageEngine::list_generations_in_dir(&table_dir).is_empty() {
-            return Ok(true);
-        }
-
-        let persisted_indexes = engine.read_persisted_indexes()?;
-        Ok(persisted_indexes.iter().any(|index| {
-            index.keyspace_name == table_id.keyspace() && index.table_name == table_id.table()
-        }))
+        table_has_local_artifacts(engine, table_id)
     }
 
     /// Unregister tables a snapshot explicitly dropped, exactly as
@@ -2091,6 +2079,28 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
+
+/// Whether `table_id` has anything durable on this node: SSTables (live or on
+/// disk) or a persisted index registration. A table like that cannot be
+/// dropped on the strength of its absence from an incoming schema (CL-22).
+pub(crate) fn table_has_local_artifacts(
+    engine: &StorageEngine,
+    table_id: &TableId,
+) -> ferrosa_common::Result<bool> {
+    if engine.sstable_count(table_id) > 0 {
+        return Ok(true);
+    }
+
+    let table_dir = engine.table_sstable_dir(table_id);
+    if !StorageEngine::list_generations_in_dir(&table_dir).is_empty() {
+        return Ok(true);
+    }
+
+    let persisted_indexes = engine.read_persisted_indexes()?;
+    Ok(persisted_indexes.iter().any(|index| {
+        index.keyspace_name == table_id.keyspace() && index.table_name == table_id.table()
+    }))
+}
 
 /// Convert an error into an `AnyError` for openraft storage errors.
 /// Non-system tables `previous` held that `next` does not: tables whose absence

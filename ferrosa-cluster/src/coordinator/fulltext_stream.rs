@@ -44,7 +44,7 @@ use ferrosa_net::task_pool::TaskPool;
 use ferrosa_storage::TableId;
 
 use super::stream_producer::ChunkSink;
-use super::stream_request_handler::SinkFactory;
+use super::stream_request_handler::{send_bounded, SinkFactory};
 use crate::raft::handlers::{
     FulltextSearchStreamCancelPayload, FulltextSearchStreamChunkPayload,
     FulltextSearchStreamDonePayload, FulltextSearchStreamHeartbeatPayload,
@@ -132,6 +132,9 @@ pub async fn handle_fulltext_stream_request_with_cancel<S, K>(
     let mut heartbeat_seq: u32 = 0;
     let mut chunk_seq: u32 = 0;
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(chunk_keys);
+    // Set when the request ends early: cancelled, or a frame the sink would
+    // not accept within the deadline (logged by `send_bounded`). Either way
+    // the walk is stopped and no Done is sent.
     let mut cancelled = false;
 
     loop {
@@ -145,7 +148,10 @@ pub async fn handle_fulltext_stream_request_with_cancel<S, K>(
                 Some(key) => {
                     batch.push(key);
                     if batch.len() >= chunk_keys {
-                        emit_chunk(&req, &mut batch, chunk_seq, sink).await;
+                        if !emit_chunk(&req, &mut batch, chunk_seq, sink, &cancel).await {
+                            cancelled = true;
+                            break;
+                        }
                         chunk_seq = chunk_seq.saturating_add(1);
                     }
                 }
@@ -160,7 +166,11 @@ pub async fn handle_fulltext_stream_request_with_cancel<S, K>(
                 let _ = heartbeat_seq; // debugging aid only
                 let bytes = bincode::serialize(&hb)
                     .expect("FulltextSearchStreamHeartbeatPayload serialization is infallible");
-                sink.send(Message::FulltextSearchStreamHeartbeat(Bytes::from(bytes))).await;
+                let heartbeat = Message::FulltextSearchStreamHeartbeat(Bytes::from(bytes));
+                if !send_bounded(sink, heartbeat, req.request_id, "fulltext search", &cancel).await {
+                    cancelled = true;
+                    break;
+                }
             }
         }
     }
@@ -198,7 +208,9 @@ pub async fn handle_fulltext_stream_request_with_cancel<S, K>(
     };
 
     if !truncated && !batch.is_empty() {
-        emit_chunk(&req, &mut batch, chunk_seq, sink).await;
+        if !emit_chunk(&req, &mut batch, chunk_seq, sink, &cancel).await {
+            return;
+        }
         chunk_seq = chunk_seq.saturating_add(1);
     }
 
@@ -209,8 +221,15 @@ pub async fn handle_fulltext_stream_request_with_cancel<S, K>(
     };
     let bytes = bincode::serialize(&done)
         .expect("FulltextSearchStreamDonePayload serialization is infallible");
-    sink.send(Message::FulltextSearchStreamDone(Bytes::from(bytes)))
-        .await;
+    // The last frame: a failure is already logged and nothing remains to release.
+    send_bounded(
+        sink,
+        Message::FulltextSearchStreamDone(Bytes::from(bytes)),
+        req.request_id,
+        "fulltext search",
+        &cancel,
+    )
+    .await;
 }
 
 async fn emit_chunk<K: ChunkSink>(
@@ -218,7 +237,8 @@ async fn emit_chunk<K: ChunkSink>(
     batch: &mut Vec<Vec<u8>>,
     seq: u32,
     sink: &K,
-) {
+    cancel: &CancellationToken,
+) -> bool {
     let payload = FulltextSearchStreamChunkPayload {
         request_id: req.request_id,
         seq,
@@ -226,8 +246,14 @@ async fn emit_chunk<K: ChunkSink>(
     };
     let bytes = bincode::serialize(&payload)
         .expect("FulltextSearchStreamChunkPayload serialization is infallible");
-    sink.send(Message::FulltextSearchStreamChunk(Bytes::from(bytes)))
-        .await;
+    send_bounded(
+        sink,
+        Message::FulltextSearchStreamChunk(Bytes::from(bytes)),
+        req.request_id,
+        "fulltext search",
+        cancel,
+    )
+    .await
 }
 
 /// `RpcHandler` shell: decodes `FulltextSearchStreamRequest`, spawns the
@@ -727,6 +753,92 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// A sink whose send never completes (the requesting node is stuck).
+    struct StuckSink;
+    #[async_trait]
+    impl ChunkSink for StuckSink {
+        async fn send(&self, _msg: Message) {
+            futures::future::pending::<()>().await;
+        }
+    }
+
+    /// A key source that records when its walk has returned. In production
+    /// the walk runs inside the engine's fulltext search and holds its locks
+    /// until it returns.
+    struct TrackedSource {
+        returned: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl FulltextKeySource for TrackedSource {
+        fn search_each(
+            &self,
+            _table_id: &TableId,
+            _index_name: &str,
+            _query: &str,
+            on_hit: &mut dyn FnMut(Vec<u8>) -> ControlFlow<()>,
+        ) -> ferrosa_common::Result<()> {
+            for i in 0..100_000_u32 {
+                if on_hit(i.to_be_bytes().to_vec()).is_break() {
+                    break;
+                }
+            }
+            self.returned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// INVARIANT: a fulltext responder whose outbound send never completes
+    /// stops its local walk within a deadline. The walk blocks in
+    /// `blocking_send` while the framer is stuck in `sink.send`, and the
+    /// framer checked cancel only around the receive.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_outbound_send_stops_the_local_fulltext_walk() {
+        let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source = Arc::new(TrackedSource {
+            returned: Arc::clone(&returned),
+        });
+        let handler = tokio::spawn(async move {
+            handle_fulltext_stream_request_with_cancel(
+                req(31),
+                source,
+                &StuckSink,
+                2,
+                CancellationToken::new(),
+            )
+            .await;
+        });
+
+        // `advance`, not `sleep`: a running spawn_blocking walk inhibits the
+        // paused clock's auto-advance, so a sleep here would never return.
+        // Let the walk fill the hand-off and the framer reach the stuck send.
+        std::thread::sleep(Duration::from_millis(50));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(
+            super::super::stream_request_handler::STREAM_SINK_SEND_DEADLINE
+                + Duration::from_secs(5),
+        )
+        .await;
+        // The walk runs on a real blocking thread: give it real time to
+        // observe the dropped receiver.
+        let mut waited = 0;
+        while !returned.load(std::sync::atomic::Ordering::SeqCst) && waited < 200 {
+            std::thread::sleep(Duration::from_millis(10));
+            tokio::task::yield_now().await;
+            waited += 1;
+        }
+        let walk_returned = returned.load(std::sync::atomic::Ordering::SeqCst);
+        // Abort BEFORE asserting: dropping the handler drops its receiver, so a
+        // parked walk unparks and the runtime can shut down instead of waiting
+        // on the blocking thread forever.
+        handler.abort();
+        assert!(
+            walk_returned,
+            "the local fulltext walk is still parked after its send stalled past the deadline"
+        );
     }
 
     fn req(id: u32) -> FulltextSearchStreamRequestPayload {

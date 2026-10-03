@@ -32,7 +32,7 @@ use ferrosa_common::accord::{
     TxnState,
 };
 use ferrosa_storage::accord::conflict_index::{ConflictIndex, InFlightWrite, TxnStatus};
-use ferrosa_storage::accord::sync_writer::SyncWriter;
+use ferrosa_storage::accord::sync_writer::{SyncWriteResult, SyncWriter};
 use tokio::sync::Notify;
 
 use crate::accord::apply::{
@@ -529,8 +529,11 @@ impl AccordStateMachine {
 
         // Persist before reply.
         let data = format!("PreAccepted:{}:{}", txn_id.0.time, t.time);
-        let result = self.sync_writer.write_and_sync(data.as_bytes());
-        if !result.is_ok() {
+        if let SyncWriteResult::FsyncFailed(e) = self.sync_writer.write_and_sync(data.as_bytes()) {
+            tracing::error!(
+                txn_id = ?txn_id, error = %e,
+                "accord: sync_writer failed during preaccept — rolling back the registration"
+            );
             // Persist failed: this PreAccept is NOT durable. Roll back the
             // conflict-index registration (and the TxnState if we created it) so
             // the non-durable txn does not linger as a phantom dependency that
@@ -598,20 +601,28 @@ impl AccordStateMachine {
         let mut deps_set: HashSet<TxnId> = deps.iter().copied().collect();
         deps_set.extend(state.deps.iter().copied());
         let accepted_deps: Vec<TxnId> = deps_set.iter().copied().collect();
-        state.accept(AcceptedBallot(ballot), t, deps_set);
+
+        // Persist BEFORE advancing in-memory state, as Commit and Apply do. A
+        // failed fsync sends no reply, so nothing may change here either: the
+        // conflict index must not carry a slow-path `t` this replica never
+        // durably accepted.
+        let data = format!("Accepted:{}:{}:{}", txn_id.0.time, t.time, ballot.0);
+        if let SyncWriteResult::FsyncFailed(e) = self.sync_writer.write_and_sync(data.as_bytes()) {
+            tracing::error!(
+                txn_id = ?txn_id, error = %e,
+                "accord: sync_writer failed during accept — not advancing to Accepted"
+            );
+            return SmResponse::None;
+        }
+        if let Some(state) = self.txn_states.get_mut(&txn_id) {
+            state.accept(AcceptedBallot(ballot), t, deps_set);
+        }
 
         // The slow path may move the execution timestamp; keep the conflict index
         // in sync so a later PreAccept bumps past the accepted `t` (t_813caf39),
         // and advance the node's shared clock past it too.
         self.conflict_index.set_commit_ts(&txn_id, t);
         self.witness_timestamp(t);
-
-        // Persist before reply.
-        let data = format!("Accepted:{}:{}:{}", txn_id.0.time, t.time, ballot.0);
-        let result = self.sync_writer.write_and_sync(data.as_bytes());
-        if !result.is_ok() {
-            return SmResponse::None;
-        }
 
         SmResponse::AcceptOK {
             txn_id,
@@ -893,7 +904,14 @@ impl AccordStateMachine {
         // Persist the protocol-log marker. Fail loud (return Err) on fsync
         // failure so the caller does not advance a non-durable apply.
         let data = format!("Applied:{}", txn_id.0.time);
-        if !self.sync_writer.write_and_sync(data.as_bytes()).is_ok() {
+        if let SyncWriteResult::FsyncFailed(e) = self.sync_writer.write_and_sync(data.as_bytes()) {
+            // Logged here because several callers (the cascade in
+            // `bookkeep_applied_dedup`, the no-write finalize) have no reply to
+            // withhold: without this line the txn silently stays Committed.
+            tracing::error!(
+                txn_id = ?txn_id, error = %e,
+                "accord: Applied marker fsync failed — txn stays Committed until its Apply is retried"
+            );
             return Err(());
         }
 
@@ -2416,6 +2434,43 @@ mod tests {
             vec![txn(2, 2000)],
             "healed commit must wake the parked dependency waiter"
         );
+    }
+
+    /// Accept must persist (fsync) BEFORE advancing in-memory state, like
+    /// Commit and Apply. A disk failure during Accept sends no reply, so the
+    /// coordinator never counts this replica — but the old code had already
+    /// marked the txn Accepted, adopted the ballot and pushed the slow-path `t`
+    /// into the conflict index, so the replica's memory ran ahead of its log:
+    /// later PreAccepts bumped past a `t` nobody durably accepted.
+    #[test]
+    fn sm_crash_during_accept_fsync_does_not_advance() {
+        let (mut sm, writer) = make_sm(1);
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        let before = sm.conflict_index.max_conflicting_timestamp(b"key1");
+
+        writer.set_fsync_failure(true);
+        let resp = sm.handle_accept(txn_id, t0, ts(5000), vec![], BallotNumber(1));
+
+        assert!(matches!(resp, SmResponse::None), "no reply without fsync");
+        let state = sm.get_state(&txn_id).unwrap();
+        assert_eq!(
+            state.phase,
+            TxnPhase::PreAccepted,
+            "fsync failed during accept: phase must NOT advance to Accepted"
+        );
+        assert_eq!(
+            sm.conflict_index.max_conflicting_timestamp(b"key1"),
+            before,
+            "fsync failed during accept: the conflict index must keep the \
+             durable PreAccept timestamp, not the unpersisted slow-path t"
+        );
+
+        writer.set_fsync_failure(false);
+        let resp = sm.handle_accept(txn_id, t0, ts(5000), vec![], BallotNumber(1));
+        assert!(matches!(resp, SmResponse::AcceptOK { .. }), "{resp:?}");
+        assert_eq!(sm.get_state(&txn_id).unwrap().phase, TxnPhase::Accepted);
     }
 
     // =======================================================================

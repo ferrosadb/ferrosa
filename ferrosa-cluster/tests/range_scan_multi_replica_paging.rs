@@ -1576,16 +1576,29 @@ fn quorum_scan_refuses_instead_of_serving_a_partial_fanout() {
             )
             .await;
 
-        match result {
-            Err(_) => {} // correct: refused a partial fan-out
-            Ok(stream) => {
-                let keys = drain_partition_keys(stream, "partial").await;
-                panic!(
-                    "a QUORUM scan served {} rows from a PARTIAL fan-out: only 1 remote \
-                     stream could be opened but QUORUM needs 2. This is a silent read \
-                     below the requested consistency level; it must refuse instead.",
-                    keys.len()
-                );
+        // The unpaged full scan (`coordinate_range_read_stream_all_with_projection`,
+        // the `expected_done > 1` N-way arm) reaches the same partial fan-out and
+        // must refuse it the same way: the guard on the paged path alone leaves
+        // the unpaged `SELECT *` serving below QUORUM.
+        let unpaged = wp
+            .range_read_stream_all_with(&table_id, 0, ConsistencyLevel::Quorum, &strategy)
+            .await;
+
+        for (what, result) in [("paged", result), ("unpaged", unpaged)] {
+            match result {
+                Err(e) => assert!(
+                    e.to_string().contains("partial fan-out"),
+                    "{what}: the refusal must name the partial fan-out, got: {e}"
+                ),
+                Ok(stream) => {
+                    let keys = drain_partition_keys(stream, what).await;
+                    panic!(
+                        "{what}: a QUORUM scan served {} rows from a PARTIAL fan-out: only 1 \
+                         remote stream could be opened but QUORUM needs 2. This is a silent \
+                         read below the requested consistency level; it must refuse instead.",
+                        keys.len()
+                    );
+                }
             }
         }
 

@@ -520,6 +520,24 @@ static SSTABLE_REHYDRATION_SECONDS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SSTABLE_REHYDRATION_SECONDS_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
 static SSTABLE_REHYDRATION_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static SSTABLE_REHYDRATION_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
+static OBJECT_STORE_DOWNLOAD_PROGRESS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Record bytes an object-store download has written locally, as they land
+/// (per streamed chunk or ranged part), not when the whole file completes.
+pub fn add_object_store_download_progress(bytes: u64) {
+    OBJECT_STORE_DOWNLOAD_PROGRESS_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Monotonic count of downloaded bytes on this node: an I/O PROGRESS signal.
+///
+/// A storage walk that is waiting on a rehydrate yields no rows, yet it is
+/// making progress while this advances. Streaming responders use it to decide
+/// whether a heartbeat is honest (cluster `handle_stream_request`). It is
+/// node-wide, so it can over-report progress for one walk while another walk
+/// downloads; it never under-reports one that is downloading.
+pub fn object_store_download_progress() -> u64 {
+    OBJECT_STORE_DOWNLOAD_PROGRESS_BYTES.load(Ordering::Relaxed)
+}
 
 fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().min(u64::MAX as u128) as u64
