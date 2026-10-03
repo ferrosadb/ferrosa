@@ -37,7 +37,12 @@ a CheckQuorum leader step-down.
 - `SchedPool` — wraps `FairAdmit`. `submit_scan(class, chunk_budget, f)` + a
   `ScanSlot`: the producer calls `slot.tick()` per produced chunk and every
   `chunk_budget` chunks re-competes for its slot in vruntime order, so a long
-  full-table scan cedes to more-deserving scans. `submit`/`submit_blocking` are
+  full-table scan cedes to more-deserving scans. `slot.park(wait)` runs a
+  block on the scan's *consumer* (a send to a client that stopped reading)
+  with the CPU slot and I/O permit released, then re-competes for both
+  (`FairAdmit::suspend`/`resume`; metric `ferrosa_sched_scan_parks_total`).
+  Without it one idle client per slot — a suspended PG portal, a socket left
+  undrained — stalls every scan on the node. `submit`/`submit_blocking` are
   the generic (Bulk-weight) entries.
 - `runqueue::{RunQueue, SchedEntity, weight_for_class}` +
   `scheduler::{advance_vruntime, should_switch}` — the pure vruntime primitives

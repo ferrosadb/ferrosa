@@ -117,6 +117,27 @@ fn enclosing_fn_name(src: &str, at: usize) -> String {
         .collect()
 }
 
+/// A producer that blocks on its consumer while holding a pool slot lets a
+/// client that stopped reading stall every other scan on the node
+/// (`pg_stalled_consumer_liveness`). Every send must go through `deliver`,
+/// which parks the slot while the send waits.
+#[test]
+fn no_producer_blocks_on_its_consumer_while_holding_a_slot() {
+    let src = store_src();
+    for (n, body) in producer_bodies(&src).iter().enumerate() {
+        assert!(
+            !body.contains("blocking_send"),
+            "range-scan producer #{n} calls blocking_send directly — it would hold its pool \
+             slot while a client that stopped reading leaves the send pending. Send through \
+             deliver()/deliver_error(), which park the slot."
+        );
+        assert!(
+            body.contains("deliver("),
+            "range-scan producer #{n} never sends through deliver()"
+        );
+    }
+}
+
 #[test]
 fn no_lock_held_across_the_cooperative_yield() {
     let src = store_src();
