@@ -25,8 +25,15 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   Per-partition merge-on-write (cell-level LWW, tombstone merge). When a legacy
   whole-value collection and path-keyed collection elements meet during replay
   or a live update, the merge expands the whole value into a deletion sentinel
-  plus sorted element cells. Flush therefore sees one collection
-  representation and cannot panic on a live pathless complex cell.
+  plus sorted element cells. Whole values in DIFFERENT partitions or SSTables
+  are expanded at the writer boundary: every flush and compaction whose output
+  is complex-framed runs `memtable::expand_collection_blobs_for_writer` (and
+  widens the header minimums for the sentinel), so a simple-framed blob never
+  reaches a complex writer. Every expansion is counted in
+  `ferrosa_storage_collection_blob_expansions_total{table}` and WARNs once per
+  (table, column). `TableStore::write` refuses a whole value that does not parse
+  as its collection or whose elements are not values of the element type
+  (FMEA ST-66).
 - **Commit log** (`commitlog/`) — segmented WAL with CAS-based lock-free
   allocation, forward-linked sync markers, crash-recovery replay, CDC reader,
   S3 archiver for PITR, and per-table checkpoints. Three sync strategies
@@ -705,7 +712,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `ferrosa-ctl commitlog set-aside <data-dir> [--apply]`
   (`StorageEngine::reingest_set_aside_offline`). Replay also
   expands legacy whole-value collection cells into element cells so the SSTable
-  writer's mixed-cell assertion cannot fire at the next flush.
+  writer's mixed-cell check cannot refuse the next flush.
   Mutations for tables absent while a schema exists are held in memory up to
   `FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS` (default 10000; invalid values fail
   `open` naming the variable) and the overflow goes to the same set-aside file,

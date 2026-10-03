@@ -30703,6 +30703,389 @@ mod tests {
         }
     }
 
+    /// Panic A of 2026-10-03, reproduced through the LIVE write path. Any
+    /// producer that hands `write` a whole-collection blob — a mixed-version
+    /// peer's MutationForward, an old hint or batchlog entry, a graph write,
+    /// a wire that dropped paths — stores it as a live path-less cell. One
+    /// element write on another partition then frames the flush complex, and
+    /// the writer refused the blob: on main that `assert!` killed
+    /// `storage-flush` for good. Normalising only on replay and on a merge
+    /// with an element row left this path open. The blob must be expanded
+    /// before it reaches a complex-framed writer, flush must succeed, and the
+    /// elements must read back.
+    #[test]
+    fn live_written_collection_blob_survives_a_complex_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "mixed_live");
+        let list_type = "org.apache.cassandra.db.marshal.ListType(\
+                         org.apache.cassandra.db.marshal.UTF8Type)";
+        let live_row = |cell: CellValue, ts: i64| Row {
+            clustering: vec![],
+            cells: vec![(0, cell)],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+        };
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(collection_schema("test_ks", "mixed_live", list_type))
+            .unwrap();
+        let blob = encode_cql_sequence(&[b"a", b"b"]);
+        engine
+            .write(
+                &tid,
+                &make_key("blob"),
+                live_row(CellValue::live(blob, 1_000), 1_000),
+                1_000,
+            )
+            .unwrap();
+        let element = CellValue::live(b"c".to_vec(), 2_000)
+            .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0));
+        engine
+            .write(&tid, &make_key("elem"), live_row(element, 2_000), 2_000)
+            .unwrap();
+
+        engine
+            .flush(&tid)
+            .expect("a blob written live must be expanded before it reaches a complex writer");
+
+        let blob_partition = engine.read(&tid, &make_key("blob")).unwrap().unwrap();
+        let cells = &blob_partition.rows[0].cells;
+        assert!(
+            cells
+                .iter()
+                .all(|(_, c)| c.path.is_some() || c.is_tombstone()),
+            "no live path-less cell may survive on a complex column: {cells:?}"
+        );
+        let values: Vec<_> = cells
+            .iter()
+            .filter(|(_, c)| c.path.is_some() && !c.is_tombstone())
+            .map(|(_, c)| c.value.clone().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "elements survive"
+        );
+        // The rewrite is counted, never silent.
+        assert_eq!(
+            crate::metrics::collection_blob_expansions_total("test_ks.mixed_live"),
+            1
+        );
+    }
+
+    /// A value that is NOT a well-formed collection on a list column (e.g. a
+    /// graph write of a plain string) must be refused at the write, loudly,
+    /// rather than stored to wedge a later flush.
+    #[test]
+    fn malformed_collection_blob_is_refused_at_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "bad_blob");
+        let list_type = "org.apache.cassandra.db.marshal.ListType(\
+                         org.apache.cassandra.db.marshal.UTF8Type)";
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(collection_schema("test_ks", "bad_blob", list_type))
+            .unwrap();
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"not a list".to_vec(), 1_000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1_000),
+        };
+        let err = engine
+            .write(&tid, &make_key("k"), row, 1_000)
+            .expect_err("a malformed collection value must be refused");
+        assert!(err.to_string().contains("collection"), "got: {err}");
+        assert!(engine.read(&tid, &make_key("k")).unwrap().is_none());
+    }
+
+    /// Panic A's compaction form (node1, 2026-10-03): a simple-framed SSTable
+    /// holding a whole-value blob, compacted with a complex-framed one, gives
+    /// a complex-framed output that cannot hold the blob as-is. The executor
+    /// must expand it, the compaction must swap in, and the elements must read
+    /// back from the output.
+    #[tokio::test]
+    async fn legacy_blob_sstable_compacts_with_a_complex_sstable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        // Only the explicit `force_compact_all` below may compact.
+        config.compaction.min_threshold = 50;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        let tid = TableId::new("test_ks", "mixed_compact");
+        let list_type = "org.apache.cassandra.db.marshal.ListType(\
+                         org.apache.cassandra.db.marshal.UTF8Type)";
+        engine
+            .register_table(collection_schema("test_ks", "mixed_compact", list_type))
+            .unwrap();
+        let live_row = |cell: CellValue, ts: i64| Row {
+            clustering: vec![],
+            cells: vec![(0, cell)],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+        };
+        // A blob alone flushes simple-framed (no cell has a path)...
+        let blob = encode_cql_sequence(&[b"a", b"b"]);
+        engine
+            .write(
+                &tid,
+                &make_key("blob"),
+                live_row(CellValue::live(blob, 1_000), 1_000),
+                1_000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        // ...an element alone flushes complex-framed.
+        let element = CellValue::live(b"c".to_vec(), 2_000)
+            .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0));
+        engine
+            .write(&tid, &make_key("elem"), live_row(element, 2_000), 2_000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 2);
+
+        engine.force_compact_all();
+        let mut polls = 0;
+        while engine.sstable_count(&tid) != 1 {
+            assert!(polls < 1500, "compaction never swapped in");
+            engine.poll_compactions().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            polls += 1;
+        }
+
+        let cells = engine.read(&tid, &make_key("blob")).unwrap().unwrap().rows[0]
+            .cells
+            .clone();
+        let values: Vec<_> = cells
+            .iter()
+            .filter(|(_, c)| c.path.is_some() && !c.is_tombstone())
+            .map(|(_, c)| c.value.clone().unwrap())
+            .collect();
+        assert_eq!(values, vec![b"a".to_vec(), b"b".to_vec()], "{cells:?}");
+        // The sentinel sits one microsecond below the blob, under the inputs'
+        // minimum timestamp; it must survive the delta encoding exactly.
+        assert!(
+            cells
+                .iter()
+                .any(|(_, c)| c.path.is_none() && c.is_tombstone() && c.timestamp == 999),
+            "collection-deletion sentinel at ts 999 expected: {cells:?}"
+        );
+        assert_eq!(
+            crate::metrics::collection_blob_expansions_total("test_ks.mixed_compact"),
+            1,
+            "the compaction's rewrite of the legacy blob must be counted"
+        );
+    }
+
+    /// Bytes that FRAME as a collection but whose elements cannot be values of
+    /// the declared element type are not a whole-value collection (for example
+    /// a path-dropped element). They must be refused, never expanded: a 3-byte
+    /// element in a `list<int>`, a non-UTF-8 element in a `set<text>`.
+    #[test]
+    fn implausible_collection_elements_are_refused_not_expanded() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let cases: [(&str, &str, Vec<u8>); 3] = [
+            (
+                "bad_int_list",
+                "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.Int32Type)",
+                encode_cql_sequence(&[&[0, 0, 1]]),
+            ),
+            (
+                "bad_text_set",
+                "org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.UTF8Type)",
+                encode_cql_sequence(&[&[0xff, 0xfe]]),
+            ),
+            (
+                "bad_map_value",
+                "org.apache.cassandra.db.marshal.MapType(org.apache.cassandra.db.marshal.UTF8Type,\
+                 org.apache.cassandra.db.marshal.Int32Type)",
+                encode_cql_map(&[(b"k", &[1, 2])]),
+            ),
+        ];
+        for (table, col_type, blob) in cases {
+            engine
+                .register_table(collection_schema("test_ks", table, col_type))
+                .unwrap();
+            let tid = TableId::new("test_ks", table);
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(blob, 1_000))],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1_000),
+            };
+            let err = engine
+                .write(&tid, &make_key("k"), row, 1_000)
+                .expect_err("an implausible element must be refused");
+            assert!(
+                err.to_string().contains("element") || err.to_string().contains("value"),
+                "{table}: {err}"
+            );
+            assert!(
+                engine.read(&tid, &make_key("k")).unwrap().is_none(),
+                "{table}"
+            );
+        }
+    }
+
+    /// Restart safety for node2 (2026-10-03): its unflushed commit log holds
+    /// `agent_memory.tasks` writes in BOTH collection shapes for the same
+    /// `set<text>` column — whole values from builds before e513bc60 beside
+    /// element cells from later builds, in separate partitions and in the same
+    /// row. Replay then flush must succeed, and every partition must assemble
+    /// to exactly the collection a reader expects.
+    #[test]
+    fn replayed_mixed_collection_shapes_flush_and_read_back() {
+        use ferrosa_common::{CqlType, CqlValue};
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "tasks_like");
+        let set_type = "org.apache.cassandra.db.marshal.SetType(\
+                        org.apache.cassandra.db.marshal.UTF8Type)";
+        let schema = || TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "tasks_like".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "related_entity_ids".to_string(),
+                    type_name: set_type.to_string(),
+                },
+                ColumnDefinition {
+                    name: "title".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+        let row = |cells: Vec<(u16, CellValue)>, ts: i64| Row {
+            clustering: vec![],
+            cells,
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+        };
+        let blob = |members: &[&[u8]], ts: i64| CellValue::live(encode_cql_sequence(members), ts);
+        // CQL's element shape: the deletion sentinel at ts-1, then one cell per
+        // member whose path is the member and whose value is empty.
+        let elements = |members: &[&[u8]], ts: i64| {
+            let mut cells = vec![(0, CellValue::tombstone(ts - 1, 1_700_000_000))];
+            cells.extend(
+                members
+                    .iter()
+                    .map(|m| (0, CellValue::live(Vec::new(), ts).with_path(m.to_vec()))),
+            );
+            cells
+        };
+        let title = |t: &str, ts: i64| (1, CellValue::live(t.as_bytes().to_vec(), ts));
+
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(schema()).unwrap();
+            let write = |key: &str, r: Row, ts: i64| {
+                engine.write(&tid, &make_key(key), r, ts).unwrap();
+            };
+            // Whole value only (pre-e513bc60 UPDATE).
+            write(
+                "blob",
+                row(
+                    vec![(0, blob(&[b"a", b"b"], 1_000)), title("t-blob", 1_000)],
+                    1_000,
+                ),
+                1_000,
+            );
+            // Elements only (current CQL).
+            let mut cells = elements(&[b"c"], 2_000);
+            cells.push(title("t-elem", 2_000));
+            write("elem", row(cells, 2_000), 2_000);
+            // Whole value, then a later element add to the same row.
+            write(
+                "blob_then_elem",
+                row(vec![(0, blob(&[b"x"], 1_000))], 1_000),
+                1_000,
+            );
+            write(
+                "blob_then_elem",
+                row(
+                    vec![(
+                        0,
+                        CellValue::live(Vec::new(), 2_000).with_path(b"y".to_vec()),
+                    )],
+                    2_000,
+                ),
+                2_000,
+            );
+            // Elements, then a later whole-value overwrite of the same row.
+            write(
+                "elem_then_blob",
+                row(elements(&[b"p"], 1_000), 1_000),
+                1_000,
+            );
+            write(
+                "elem_then_blob",
+                row(vec![(0, blob(&[b"q"], 2_000))], 2_000),
+                2_000,
+            );
+            // Whole value of the empty set.
+            write("empty_blob", row(vec![(0, blob(&[], 1_000))], 1_000), 1_000);
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        let (engine, pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(schema()).unwrap();
+        engine.replay_mutations(pending).unwrap();
+        engine
+            .flush(&tid)
+            .expect("replayed mixed collection shapes must flush");
+        assert!(engine.sstable_count(&tid) >= 1);
+
+        let set_of = |key: &str| -> Option<CqlValue> {
+            let partition = engine.read(&tid, &make_key(key)).unwrap().unwrap();
+            let cells: Vec<&CellValue> = partition.rows[0]
+                .cells
+                .iter()
+                .filter(|(idx, _)| *idx == 0)
+                .map(|(_, c)| c)
+                .collect();
+            ferrosa_row_bridge::collection::assemble_column_cells(
+                &CqlType::Set(Box::new(CqlType::Varchar)),
+                &cells,
+                1_800_000_000,
+            )
+            .unwrap()
+        };
+        let text_set = |members: &[&str]| {
+            Some(CqlValue::Set(
+                members
+                    .iter()
+                    .map(|m| CqlValue::Text(m.to_string()))
+                    .collect(),
+            ))
+        };
+        assert_eq!(set_of("blob"), text_set(&["a", "b"]));
+        assert_eq!(set_of("elem"), text_set(&["c"]));
+        assert_eq!(set_of("blob_then_elem"), text_set(&["x", "y"]));
+        assert_eq!(set_of("elem_then_blob"), text_set(&["q"]));
+        // Cassandra reads an emptied collection as absent.
+        assert_eq!(set_of("empty_blob"), None);
+        let blob_partition = engine.read(&tid, &make_key("blob")).unwrap().unwrap();
+        assert!(
+            blob_partition.rows[0]
+                .cells
+                .iter()
+                .any(|(idx, c)| *idx == 1 && c.value.as_deref() == Some(&b"t-blob"[..])),
+            "the scalar beside the collection survives"
+        );
+        assert!(
+            crate::metrics::collection_blob_expansions_total("test_ks.tasks_like") >= 4,
+            "every whole value rewritten on replay is counted"
+        );
+    }
+
     #[test]
     fn schema_survives_restart() {
         let dir = tempfile::tempdir().unwrap();

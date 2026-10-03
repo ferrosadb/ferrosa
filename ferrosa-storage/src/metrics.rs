@@ -865,6 +865,40 @@ pub fn inc_write_failure_reason(reason: WriteFailureReason) {
     WRITE_FAILURE_REASON_TOTAL[reason.idx()].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Whole-value collection cells expanded into elements at the SSTable writer
+/// boundary, per table (FMEA ST-66). Bounded by the number of tables.
+static COLLECTION_BLOB_EXPANSIONS: OnceLock<dashmap::DashMap<String, AtomicU64>> = OnceLock::new();
+/// (table, column) pairs that have already logged their first-expansion WARN.
+static COLLECTION_BLOB_EXPANSION_WARNED: OnceLock<dashmap::DashSet<(String, String)>> =
+    OnceLock::new();
+
+/// Add `n` whole-value collection expansions for `table`.
+pub fn add_collection_blob_expansions(table: &str, n: u64) {
+    let map = COLLECTION_BLOB_EXPANSIONS.get_or_init(dashmap::DashMap::new);
+    if let Some(counter) = map.get(table) {
+        counter.fetch_add(n, Ordering::Relaxed);
+        return;
+    }
+    map.entry(table.to_string())
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(n, Ordering::Relaxed);
+}
+
+/// Whole-value collection expansions recorded for `table` so far.
+pub fn collection_blob_expansions_total(table: &str) -> u64 {
+    COLLECTION_BLOB_EXPANSIONS
+        .get()
+        .and_then(|map| map.get(table).map(|c| c.load(Ordering::Relaxed)))
+        .unwrap_or(0)
+}
+
+/// True exactly once per (table, column) in this process: the WARN edge.
+pub fn first_collection_blob_expansion(table: &str, column: &str) -> bool {
+    COLLECTION_BLOB_EXPANSION_WARNED
+        .get_or_init(dashmap::DashSet::new)
+        .insert((table.to_string(), column.to_string()))
+}
+
 pub fn inc_write_inline_flush() {
     WRITE_INLINE_FLUSH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -1141,6 +1175,21 @@ pub fn render_prometheus() -> String {
             }
             !gauges.is_empty()
         });
+    }
+    out.push_str("# HELP ferrosa_storage_collection_blob_expansions_total Whole-value collection cells rewritten into element cells for a complex-framed SSTable.\n");
+    out.push_str("# TYPE ferrosa_storage_collection_blob_expansions_total counter\n");
+    if let Some(map) = COLLECTION_BLOB_EXPANSIONS.get() {
+        for entry in map.iter() {
+            let escaped = entry
+                .key()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            out.push_str(&format!(
+                "ferrosa_storage_collection_blob_expansions_total{{table=\"{escaped}\"}} {}\n",
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
     }
     out.push_str("# HELP ferrosa_storage_write_phase_seconds_total Total wall time spent in StorageEngine::write phases.\n");
     out.push_str("# TYPE ferrosa_storage_write_phase_seconds_total counter\n");

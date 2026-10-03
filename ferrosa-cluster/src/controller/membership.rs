@@ -260,7 +260,21 @@ impl ModeController {
                             use crate::raft::handlers::RowWire;
                             let wire_rows: Vec<RowWire> =
                                 partition.rows.iter().cloned().map(RowWire::from).collect();
-                            let row_bytes = bincode::serialize(&wire_rows).unwrap_or_default();
+                            // An empty payload used to stand in for a failed
+                            // encode, and the receiver stored it as a live cell.
+                            let row_bytes = match bincode::serialize(&wire_rows) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    tracing::error!(
+                                        %e,
+                                        ks,
+                                        tbl,
+                                        partition_key = ?partition.key,
+                                        "decommission: failed to serialize rows, partition NOT streamed"
+                                    );
+                                    continue;
+                                }
+                            };
                             let ts = partition
                                 .rows
                                 .first()

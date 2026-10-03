@@ -2633,7 +2633,18 @@ impl<F: FlushTarget> TableStore<F> {
     }
 
     /// [`Self::write`] once it holds an admission to `guard`'s memtable.
+    ///
+    /// A whole-value (path-less, live) cell on a non-frozen collection column
+    /// must parse as a collection, or the write is refused before anything
+    /// sees it: a complex-framed flush or compaction later expands that cell
+    /// into elements, and a value that cannot be expanded would fail every
+    /// flush of the table. Every write producer (CQL, mixed-version forwards,
+    /// hints, batchlog, graph writes, commit-log replay) passes through here.
+    /// It is checked against the schema bound to the admitted memtable, the
+    /// same schema its flush writes under, so a racing `ALTER` cannot pass a
+    /// cell under one schema and flush it under another.
     fn write_admitted(&self, guard: &StoreView, key: &DecoratedKey, row: Row) -> Result<()> {
+        crate::memtable::validate_legacy_collection_blobs(&row, &guard.indexes.schema)?;
         let catalog = Arc::clone(&guard.indexes.catalog);
 
         // Secondary index maintenance: extract indexed column values and insert
@@ -4343,16 +4354,18 @@ impl<F: FlushTarget> TableStore<F> {
                 .map(|()| FlushOutcome::Published);
         }
 
-        let header = flush::build_serialization_header(&schema, &partitions);
+        let header = flush::header_for_flush(&schema, &partitions);
         let staged_output = self.flush_target.file_output_staging_dir()?;
         let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db"))?
+            SSTableWriter::new_file_backed(options, header.clone(), staging_dir.join("Data.db"))?
         } else {
-            SSTableWriter::new(options, header)
+            SSTableWriter::new(options, header.clone())
         };
         let phase_start = Instant::now();
+        let table_label = format!("{}.{}", schema.keyspace, schema.table);
         for p in &partitions {
-            writer.add_partition(p)?;
+            let p = crate::memtable::expand_collection_blobs_for_writer(p, &header, &table_label)?;
+            writer.add_partition(&p)?;
         }
         let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
             let output = writer.finish_to_directory_deferred_sync(staging_dir)?;
@@ -4822,22 +4835,28 @@ impl<F: FlushTarget> TableStore<F> {
             .map(|_| self.flush_target.file_output_staging_dir().map(Staging))
             .collect::<Result<_>>()?;
         let phase_start = Instant::now();
+        let table_label = format!("{}.{}", schema.keyspace, schema.table);
         let outputs: Vec<ShardOutput> = crate::flush_executor::pool()?.install(|| {
             shards
                 .par_iter()
                 .zip(staging.par_iter())
                 .map(|(shard, stage)| {
-                    let header = flush::build_serialization_header(&schema, shard);
+                    let header = flush::header_for_flush(&schema, shard);
                     let mut writer = match &stage.0 {
                         Some(dir) => SSTableWriter::new_file_backed(
                             options.clone(),
-                            header,
+                            header.clone(),
                             dir.join("Data.db"),
                         )?,
-                        None => SSTableWriter::new(options.clone(), header),
+                        None => SSTableWriter::new(options.clone(), header.clone()),
                     };
                     for partition in shard {
-                        writer.add_partition(partition)?;
+                        let partition = crate::memtable::expand_collection_blobs_for_writer(
+                            partition,
+                            &header,
+                            &table_label,
+                        )?;
+                        writer.add_partition(&partition)?;
                     }
                     match &stage.0 {
                         Some(dir) => writer

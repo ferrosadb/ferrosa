@@ -65,7 +65,11 @@ resolution beyond the serialization header, or cluster routing.
   set → element, map → key). Read, write, and the projection/skip paths handle
   it; the element value uses the collection's element/value type. `marshal`
   detects multicell-ness from the type string (`ListType(..)` vs
-  `FrozenType(..)`).
+  `FrozenType(..)`). The writer validates each partition's cell layout before
+  writing it (`validate_row_cells`) and refuses a violation, such as a live
+  path-less cell on a complex column, with `Error::InvalidData` naming the
+  column, partition key and row, instead of panicking the calling thread
+  (FMEA ST-17).
 - **Trie index** — on-disk trie walker + builder (`trie/`) backing the partition
   index (Partitions.db) and the row index (Rows.db) for wide clustered
   partitions.
