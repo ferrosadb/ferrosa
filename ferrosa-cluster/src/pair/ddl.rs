@@ -860,15 +860,14 @@ impl PairSchemaSyncHandler {
     ) -> std::result::Result<(), String> {
         for (keyspace, table) in dropped {
             let tid = ferrosa_storage::TableId::new(keyspace, table);
-            let data_bearing = crate::raft::state_machine::table_has_local_artifacts(
-                &self.engine,
-                &tid,
-            )
-            .map_err(|e| {
-                format!(
+            let data_bearing =
+                crate::raft::state_machine::table_has_local_artifacts(&self.engine, &tid).map_err(
+                    |e| {
+                        format!(
                     "schema sync refused: could not check absent table {tid} for local data: {e}"
                 )
-            })?;
+                    },
+                )?;
             if data_bearing {
                 return Err(format!(
                     "schema sync refused: snapshot {} lacks table {tid}, which holds local data, \
