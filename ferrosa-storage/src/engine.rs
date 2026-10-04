@@ -20077,6 +20077,91 @@ mod tests {
     /// writer fails closed and requests a background flush. That gives the
     /// client backpressure without parking request handlers behind
     /// SSTable encoding/S3 cleanup.
+    /// Refusing a write must not lose the writes already accepted, and the
+    /// buffer must come back: once the device frees up and the flush drains,
+    /// every accepted row is readable and new writes are admitted again.
+    ///
+    /// This is the other half of backpressure. Refusing at the threshold is
+    /// only correct if "accepted" still means "will be written": a server that
+    /// sheds load by dropping what it already acknowledged is worse than one
+    /// that never acknowledged it. And a buffer that refuses but never drains
+    /// is a wedge, not backpressure — the client is told to retry forever
+    /// against a server that will never again say yes.
+    ///
+    /// The existing `write_requests_background_flush_when_backpressure_exceeded`
+    /// covers the refusal itself; nothing covered the recovery.
+    #[test]
+    fn accepted_writes_survive_a_refusal_and_the_buffer_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        // Hard refusal well below what the loop writes, and the flush threshold
+        // out of the way so ONLY the explicit flush below drains the memtable.
+        // Otherwise a background flush could drain it mid-loop and the test
+        // would never observe a refusal.
+        config.memtable_backpressure_bytes = 32 * 1024;
+        config.flush_threshold_bytes = 1 << 30;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // Write until the server refuses, remembering exactly what it accepted.
+        let mut accepted: Vec<String> = Vec::new();
+        let mut refused = None;
+        for seq in 0..4096u32 {
+            let key = format!("k{seq}");
+            match engine.write(&tid, &make_key(&key), make_row(b"data", 1000), 1000) {
+                Ok(()) => accepted.push(key),
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
+            }
+        }
+        let refused =
+            refused.expect("the engine must refuse once past memtable_backpressure_bytes");
+        assert!(
+            matches!(refused, ferrosa_common::Error::Overloaded { .. }),
+            "the refusal must be the typed, retryable overload: {refused}"
+        );
+        assert!(
+            !accepted.is_empty(),
+            "the engine must accept what it can before refusing"
+        );
+
+        // The device frees up: drain the buffer.
+        engine.flush(&tid).unwrap();
+
+        // 1. Nothing accepted was lost.
+        for key in &accepted {
+            let row = engine
+                .read(&tid, &make_key(key))
+                .unwrap_or_else(|error| panic!("reading accepted row {key} failed: {error}"));
+            assert!(
+                row.is_some(),
+                "row {key} was ACCEPTED before the refusal and must still be readable \
+                 after the drain; an acknowledged write that vanishes is worse than a refusal"
+            );
+        }
+
+        // 2. The buffer actually drained, so writes are admitted again. A
+        //    buffer that only ever refuses from here is wedged, not throttled.
+        engine
+            .write(
+                &tid,
+                &make_key("after-drain"),
+                make_row(b"data", 1000),
+                1000,
+            )
+            .expect("once the buffer has drained the engine must admit writes again");
+        assert!(
+            engine
+                .read(&tid, &make_key("after-drain"))
+                .unwrap()
+                .is_some(),
+            "the post-drain write must be readable"
+        );
+    }
+
     #[test]
     fn write_requests_background_flush_when_backpressure_exceeded() {
         let dir = tempfile::tempdir().unwrap();
