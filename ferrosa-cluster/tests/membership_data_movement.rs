@@ -172,43 +172,8 @@ async fn downgrade_to_pair_is_refused_while_raft_runs_and_no_node_is_down() {
     cluster.shutdown().await;
 }
 
-/// P0-5 / t_ad872ac7 allowed path: an operator brought a node down, then runs
-/// the downgrade naming the peer. The node STOPS its Raft group before it
-/// installs the pair path, so it is no longer a voter committing beside the
-/// pair: the split brain of the old action.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn downgrade_to_pair_after_a_node_is_down_stops_raft_and_pairs() {
-    let down = uuid::Uuid::new_v4();
-    let (cluster, controller, peer, _dir) = downgrade_setup(&[down], &[]).await;
-    let raft = cluster.leader_node().raft.clone();
-
-    let paired_with = controller
-        .downgrade_to_pair(Some(peer))
-        .await
-        .expect("node down + explicit named downgrade must be accepted");
-
-    assert_eq!(paired_with, peer);
-    assert_eq!(
-        controller.mode(),
-        ferrosa_common::deployment_mode::DeploymentMode::Pair
-    );
-    assert!(
-        controller.raft().is_none(),
-        "the downgraded node must hold no Raft group"
-    );
-    assert!(
-        raft.client_write(RaftCommand {
-            op: RaftOp::ApproveNode {
-                host_id: uuid::Uuid::new_v4(),
-            },
-            schema_version: uuid::Uuid::new_v4(),
-        })
-        .await
-        .is_err(),
-        "the Raft group must be shut down, not merely forgotten"
-    );
-    cluster.shutdown().await;
-}
+// The allowed downgrade path (node down, explicit named downgrade, both pair
+// nodes durably out of Raft) is driven end to end in pair_downgrade_fence.rs.
 
 fn member(host_id: uuid::Uuid) -> NodeInfo {
     NodeInfo {

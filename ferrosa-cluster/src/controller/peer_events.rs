@@ -174,6 +174,29 @@ async fn refresh_outbound_peer_for_inbound(
 }
 
 impl ModeController {
+    /// Whether a connecting peer may be tracked at all. After the cluster was
+    /// dissolved into a pair only the partner is admitted: a former member
+    /// counted as a peer would make the pair re-enter cluster formation and
+    /// rebuild the old group (t_47bbeb66).
+    fn admits_peer_after_dissolution(
+        &self,
+        host_id: uuid::Uuid,
+        addr: std::net::SocketAddr,
+    ) -> bool {
+        let state = self.dissolution.load();
+        if state.admits_peer(self.local_host_id, host_id) {
+            return true;
+        }
+        tracing::error!(
+            peer = %host_id,
+            %addr,
+            reason = ?state.raft_refusal(),
+            "refusing a peer: this node's cluster was dissolved into a pair and it \
+             is not the pair partner"
+        );
+        false
+    }
+
     fn execute_peer_event_plan(
         &self,
         actions: Vec<PeerEventAction>,
@@ -424,6 +447,9 @@ impl PeerEventListener for ModeController {
             );
             return;
         }
+        if !self.admits_peer_after_dissolution(host_id, addr) {
+            return;
+        }
         tracing::info!(peer = %host_id, %addr, "peer connected");
 
         // Track this peer
@@ -572,6 +598,9 @@ impl InboundPeerCallback for ModeController {
                 %addr,
                 "rejecting inbound self-connection from cluster formation"
             );
+            return;
+        }
+        if !self.admits_peer_after_dissolution(host_id, addr) {
             return;
         }
         let reverse_addr = resolve_inbound_reverse_addr(

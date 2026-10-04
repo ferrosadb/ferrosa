@@ -24,6 +24,7 @@ pub mod bootstrap;
 pub mod cluster;
 pub mod cluster_rejoin;
 pub mod data_movement;
+pub mod dissolution;
 mod invite;
 pub mod jsonb_gate;
 mod membership;
@@ -189,6 +190,15 @@ pub struct ModeController {
     pub(super) promote_epoch: std::sync::atomic::AtomicU64,
     /// All connected peers, tracked across mode transitions.
     pub(super) connected_peers: Mutex<Vec<(Uuid, SocketAddr)>>,
+    /// Whether this node's cluster was dissolved into a pair (t_47bbeb66).
+    /// Loaded from the durable marker at construction and set by the
+    /// downgrade; while not `None`, Raft never starts and only the pair
+    /// partner is admitted as a peer.
+    pub(super) dissolution: ArcSwap<dissolution::DissolutionState>,
+    /// Test override for how the downgrade reaches its named peer. `None`
+    /// uses the internode connection ([`dissolution::NetPairDissolveTransport`]).
+    pub(super) pair_dissolve_transport:
+        ArcSwap<Option<Arc<dyn dissolution::PairDissolveTransport>>>,
     /// Per-DC Raft groups, set asynchronously after cluster transition
     /// completes. Multi-DC deployments populate one entry per DC; single-DC
     /// (the default) populates a single entry under
@@ -398,7 +408,21 @@ impl ModeController {
         // that genuinely keeps Raft state there sets `raft_data_dir` or
         // `FERROSA_DATA_DIR`; anything else is an unconfigured controller,
         // which in practice means a test.
+        let dissolution_state = match super::controller::cluster::configured_raft_dir(&config) {
+            Some(raft_dir) => dissolution::read_dissolution(&raft_dir),
+            None => dissolution::DissolutionState::None,
+        };
         let initial_mode = match super::controller::cluster::configured_raft_dir(&config) {
+            // A dissolved cluster outranks the cluster-member marker: the node
+            // is half of a pair now, never a returning member (t_47bbeb66).
+            Some(_) if dissolution_state != dissolution::DissolutionState::None => {
+                tracing::warn!(
+                    reason = ?dissolution_state.raft_refusal(),
+                    "this node's cluster was dissolved into a pair; starting Standalone, \
+                     Raft disabled, only the pair partner admitted"
+                );
+                DeploymentMode::Standalone
+            }
             Some(raft_dir) => {
                 DeploymentMode::initial_for_restart(DeploymentMode::was_cluster_member(&raft_dir))
             }
@@ -438,6 +462,8 @@ impl ModeController {
             force_promoted: AtomicBool::new(false),
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
+            dissolution: ArcSwap::from_pointee(dissolution_state),
+            pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_dcs: Mutex::new(HashMap::new()),
             hint_store,
@@ -557,6 +583,8 @@ impl ModeController {
             force_promoted: AtomicBool::new(false),
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
+            dissolution: ArcSwap::from_pointee(dissolution::DissolutionState::None),
+            pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_dcs: Mutex::new(HashMap::new()),
             hint_store,
@@ -628,6 +656,8 @@ impl ModeController {
             force_promoted: AtomicBool::new(false),
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
+            dissolution: ArcSwap::from_pointee(dissolution::DissolutionState::None),
+            pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             peer_dcs: Mutex::new(HashMap::new()),
             hint_store,
@@ -698,6 +728,12 @@ impl ModeController {
         self.registry.register(
             MsgType::ClusterMembershipForward,
             Arc::new(crate::raft_forward::ClusterMembershipForwardUnavailableHandler),
+        );
+        self.registry.register(
+            MsgType::PairDissolve,
+            Arc::new(dissolution::PairDissolveHandler {
+                controller: Arc::downgrade(self),
+            }),
         );
 
         self.peer_manager.store(Arc::new(Some(pm)));
@@ -978,6 +1014,33 @@ impl ModeController {
     /// downgrade). Production code must never call this.
     pub fn set_connected_peers_for_test(&self, peers: Vec<(Uuid, SocketAddr)>) {
         *self.connected_peers.lock() = peers;
+    }
+
+    /// Replace how the operator downgrade reaches its named peer.
+    ///
+    /// **Test helper**: lets a test wire two in-process controllers together
+    /// without sockets. Production code must never call this.
+    pub fn set_pair_dissolve_transport_for_test(
+        &self,
+        transport: Arc<dyn dissolution::PairDissolveTransport>,
+    ) {
+        self.pair_dissolve_transport
+            .store(Arc::new(Some(transport)));
+    }
+
+    /// Why this node must not start Raft, if it must not (t_47bbeb66).
+    pub fn raft_start_refusal(&self) -> Option<String> {
+        self.dissolution.load().raft_refusal()
+    }
+
+    /// The peers this node currently tracks as connected. **Test helper.**
+    pub fn connected_peers_for_test(&self) -> Vec<(Uuid, SocketAddr)> {
+        self.connected_peers.lock().clone()
+    }
+
+    /// What this node knows about a dissolution of its cluster into a pair.
+    pub fn dissolution_state(&self) -> dissolution::DissolutionState {
+        (**self.dissolution.load()).clone()
     }
 
     /// Override the deployment mode without performing a real cluster transition.

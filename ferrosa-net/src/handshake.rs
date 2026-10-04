@@ -29,9 +29,15 @@ pub const CAP_RPC_ERROR_REPLY: u32 = 1 << 0;
 /// that type — an unknown type byte drops the whole internode connection.
 pub const CAP_RESULT_CURSOR_PAGE: u32 = 1 << 1;
 
+/// The node serves `MsgType::PairDissolve`: phase 1 of the operator downgrade
+/// from cluster to pair (t_47bbeb66). A peer without the bit must never be
+/// sent that type, and the downgrade is refused instead.
+pub const CAP_PAIR_DISSOLVE: u32 = 1 << 2;
+
 /// Every capability this build understands, advertised in its Handshake and
 /// HandshakeAck.
-pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY | CAP_RESULT_CURSOR_PAGE;
+pub const LOCAL_CAPABILITIES: u32 =
+    CAP_RPC_ERROR_REPLY | CAP_RESULT_CURSOR_PAGE | CAP_PAIR_DISSOLVE;
 
 /// Peer metadata learned from a completed handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]

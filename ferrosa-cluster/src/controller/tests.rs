@@ -4448,6 +4448,104 @@ fn cluster_mode_controller(dir: &std::path::Path) -> Arc<ModeController> {
     controller
 }
 
+/// t_47bbeb66: a node holding the dissolution marker must refuse to start
+/// Raft even when cluster formation is triggered: no cluster-member marker
+/// written, mode unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dissolved_node_refuses_to_start_raft() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let raft_dir = super::cluster::configured_raft_dir(&config).expect("raft dir");
+    let me = Uuid::new_v4();
+    let partner = Uuid::new_v4();
+    super::dissolution::write_dissolution(
+        &raft_dir,
+        &super::dissolution::PairDissolution {
+            pair: [me, partner],
+            former_voters: vec![1, 2, 3],
+            dissolved_at_ms: 1,
+        },
+    )
+    .unwrap();
+    let (controller, _handles) = ModeController::new(
+        config,
+        Arc::new(NetConfig::default()),
+        me,
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    controller.set_peer_manager(Arc::new(PeerManager::with_weak_listener(
+        Arc::new(NetConfig::default()),
+        controller.host_id(),
+        controller.as_peer_listener(),
+    )));
+    let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+
+    controller.transition_to_cluster(vec![(partner, addr), (Uuid::new_v4(), addr)]);
+
+    assert_eq!(controller.mode(), DeploymentMode::Standalone);
+    assert!(controller.raft().is_none());
+    assert!(
+        !DeploymentMode::was_cluster_member(&raft_dir),
+        "a dissolved node must not record cluster membership again"
+    );
+}
+
+/// The internode handler of phase 1 replies with a decodable refusal when
+/// this node's preconditions fail, and on an undecodable request: never a
+/// bare acknowledgement the requester could read as "done".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pair_dissolve_handler_replies_with_a_named_refusal() {
+    use ferrosa_net::rpc::handler::RpcHandler;
+    let dir = tempfile::tempdir().unwrap();
+    let controller = cluster_mode_controller(dir.path());
+    let handler = super::dissolution::PairDissolveHandler {
+        controller: Arc::downgrade(&controller),
+    };
+    let from = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+    let decode = |reply: Option<ferrosa_net::message::Message>| match reply {
+        Some(ferrosa_net::message::Message::PairDissolveAck(b)) => {
+            bincode::deserialize::<super::dissolution::PairDissolveReply>(&b).unwrap()
+        }
+        other => panic!("expected PairDissolveAck, got {other:?}"),
+    };
+
+    let req = super::dissolution::PairDissolveRequest {
+        requester: Uuid::new_v4(),
+        peer: controller.host_id(),
+        former_voters: vec![1, 2, 3],
+    };
+    let reply = handler
+        .handle(
+            from,
+            ferrosa_net::message::Message::PairDissolve(bincode::serialize(&req).unwrap().into()),
+        )
+        .await;
+    assert!(
+        matches!(decode(reply), super::dissolution::PairDissolveReply::Refused(r) if r.contains("token ring")),
+        "a node with no committed ring must refuse"
+    );
+
+    let reply = handler
+        .handle(
+            from,
+            ferrosa_net::message::Message::PairDissolve(bytes::Bytes::from_static(b"junk")),
+        )
+        .await;
+    assert!(matches!(
+        decode(reply),
+        super::dissolution::PairDissolveReply::Refused(_)
+    ));
+    assert_eq!(
+        controller.dissolution_state(),
+        super::dissolution::DissolutionState::None
+    );
+}
+
 /// Install a committed ring holding this node, `peer`, and `others`, one token
 /// each. Whether a member is up is decided by `connected_peers`, not the ring.
 fn install_downgrade_ring(controller: &ModeController, peer: Uuid, others: &[Uuid]) {
@@ -4484,11 +4582,12 @@ fn connect(controller: &ModeController, peer: Uuid) {
 // the named peer is connected, and the operator runs the downgrade naming it.
 // Each test below is one shortcut that must be refused, plus the allowed path.
 
-/// Allowed path: a third member is down, the named peer is connected, the
-/// operator downgrades naming it. The MODE moves and the pair machinery is in
-/// place. Async: the pair transition spawns its reverse-pool task.
+/// With everything else in place, a node with no running Raft group cannot
+/// check the voter majority (t_47bbeb66), so the downgrade is refused. The
+/// allowed path, with real Raft on both pair nodes, is in
+/// `tests/pair_downgrade_fence.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn downgrade_to_pair_succeeds_after_a_node_is_brought_down() {
+async fn downgrade_to_pair_is_refused_without_a_running_raft_group() {
     let dir = tempfile::tempdir().unwrap();
     let controller = cluster_mode_controller(dir.path());
     let peer = Uuid::new_v4();
@@ -4496,26 +4595,15 @@ async fn downgrade_to_pair_succeeds_after_a_node_is_brought_down() {
     install_downgrade_ring(&controller, peer, &[down]);
     connect(&controller, peer);
 
-    let paired_with = controller
+    let err = controller
         .downgrade_to_pair(Some(peer))
         .await
-        .expect("node down + explicit named downgrade must be accepted");
+        .expect_err("no Raft group: the voter majority cannot be checked");
 
-    assert_eq!(
-        paired_with, peer,
-        "the named peer is the replication target"
-    );
-    assert_eq!(
-        controller.mode(),
-        DeploymentMode::Pair,
-        "the operator downgrade must actually move the mode"
-    );
+    assert!(err.to_string().contains("no Raft group running"), "{err}");
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
 }
 
-/// Shortcut: the node is not a cluster member. A node already in Pair would
-/// tear down and reinstall a live pair coordinator; a Standalone node has no
-/// cluster to leave. Both are refused with the node untouched, even when every
-/// other precondition holds. (Folded in from review/membership-invariants.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn downgrade_to_pair_is_refused_unless_the_node_is_a_cluster_member() {
     let dir = tempfile::tempdir().unwrap();
