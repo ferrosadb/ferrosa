@@ -29,24 +29,40 @@
 //! log-log exponent 1.00 from n = 1000 to n = 32000.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ferrosa_cluster::accord::reorder_buffer::{Message, ReorderBuffer, TimingConfig};
 use serial_test::serial;
 
-/// Counts allocations and allocated bytes while [`ARMED`] is set. Outside that
-/// window it is a pass-through, so it does not perturb the tests that do not
-/// measure allocation.
+/// Counts allocations and allocated bytes made BY THE MEASURING THREAD while
+/// its [`ARMED`] flag is set. Outside that window, and on every other thread,
+/// it is a pass-through.
+///
+/// The flag is thread-local on purpose. It was a process-global `AtomicBool`,
+/// so the count also took in whatever other threads allocated while the drain
+/// ran. libtest's main thread spawns the other `#[serial]` tests' threads (they
+/// then wait on the serial lock) while the first one is already measuring; on
+/// 2026-10-03 that put 16 allocations on a drain that makes one.
 struct CountingAlloc;
 
-static ARMED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    // `const` init: reading it never allocates, so it is safe inside `alloc`.
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the current thread is measuring. `try_with` because the allocator
+/// can run during thread-local teardown, when the flag is gone (not measuring).
+fn armed() -> bool {
+    ARMED.try_with(Cell::get).unwrap_or(false)
+}
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if armed() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
@@ -60,7 +76,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if armed() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
         }
@@ -72,13 +88,14 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
 
-/// Run `f` with allocation counting armed; returns `(output, allocations, bytes)`.
+/// Run `f` with allocation counting armed on this thread; returns
+/// `(output, allocations, bytes)`.
 fn measure_allocs<R>(f: impl FnOnce() -> R) -> (R, u64, u64) {
     ALLOCS.store(0, Ordering::SeqCst);
     BYTES.store(0, Ordering::SeqCst);
-    ARMED.store(true, Ordering::SeqCst);
+    ARMED.with(|a| a.set(true));
     let out = f();
-    ARMED.store(false, Ordering::SeqCst);
+    ARMED.with(|a| a.set(false));
     (
         out,
         ALLOCS.load(Ordering::SeqCst),

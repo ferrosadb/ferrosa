@@ -104,14 +104,17 @@ impl AppState {
             connections: QueryResult {
                 column_names: vec![],
                 rows: vec![],
+                paging_state: None,
             },
             queries: QueryResult {
                 column_names: vec![],
                 rows: vec![],
+                paging_state: None,
             },
             storage: QueryResult {
                 column_names: vec![],
                 rows: vec![],
+                paging_state: None,
             },
             scroll: 0,
             node: node.to_string(),
@@ -164,6 +167,7 @@ fn error_result(msg: &str) -> QueryResult {
         rows: vec![ResultRow {
             columns: vec![Some(msg.as_bytes().to_vec())],
         }],
+        paging_state: None,
     }
 }
 
@@ -412,6 +416,7 @@ mod tests {
                     columns: r.iter().map(|s| Some(s.as_bytes().to_vec())).collect(),
                 })
                 .collect(),
+            paging_state: None,
         }
     }
 

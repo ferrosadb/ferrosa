@@ -30,6 +30,9 @@ pub enum Action {
         table: TableKey,
         generations: Vec<u64>,
     },
+    /// Rebuild the table's invalid vector-index generations from their rows
+    /// (local, nothing is moved or lost; no replica posture needed).
+    RebuildVectorIndexes { table: TableKey },
     /// The issue cannot be remediated safely or has exhausted its attempts.
     /// The controller logs a loud ERROR, marks health = degraded, and stops
     /// retrying this issue. Covers FMEA #1 (no healthy replica) and FMEA #5
@@ -90,6 +93,9 @@ fn action_for(issue: &TableIssue) -> Option<Action> {
                 generations,
             })
         }
+        IssueKind::InvalidVectorIndex => Some(Action::RebuildVectorIndexes {
+            table: issue.table.clone(),
+        }),
         // Drain (bloat) and converge (divergence) are explicit follow-ups.
         // The fold already routes them here; returning None means "no action
         // wired yet" so the controller stays inert for them in this slice.
@@ -158,8 +164,12 @@ pub fn decide(snapshot: &HealthSnapshot, cfg: &SelfHealConfig) -> Option<Action>
                 reason: EscalateReason::NoHealthyReplica,
             });
         }
-        // FMEA #4: only the deterministic initiator performs the remediation.
-        if !snapshot.ring.is_initiator(&issue.table) {
+        // FMEA #4: only the deterministic initiator performs a remediation of
+        // SHARED state. A vector index's sidecars are this node's own files,
+        // so every replica rebuilds its own; gating that on the initiator left
+        // the other replicas' ANN refusing forever.
+        if issue.kind != IssueKind::InvalidVectorIndex && !snapshot.ring.is_initiator(&issue.table)
+        {
             continue;
         }
         // FMEA #5/#10: respect the per-issue cooldown.
@@ -399,6 +409,37 @@ mod tests {
             },
         };
         assert_eq!(decide(&snap, &cfg), None);
+    }
+
+    /// Vector sidecars are LOCAL files: every replica must rebuild its own.
+    /// The initiator rule (FMEA #4) picks one replica to act on SHARED state
+    /// (quarantine + refill); applied to vector indexes it meant only host 1 of
+    /// an RF=3 ring ever rebuilt, and the other replicas' ANN refused forever
+    /// (seen on node3, 2026-10-03: 4 of 5 indexes never rebuilt).
+    #[test]
+    fn non_initiator_still_rebuilds_its_own_vector_indexes() {
+        let cfg = SelfHealConfig::default();
+        let table = TableKey::new("ks", "t");
+        let mut owners = BTreeMap::new();
+        owners.insert(table.clone(), vec![1, 2, 3]);
+        let snap = HealthSnapshot {
+            tick: 1,
+            issues: vec![TableIssue {
+                table: table.clone(),
+                kind: IssueKind::InvalidVectorIndex,
+                corrupt_sstables: Vec::new(),
+                replica_posture: ReplicaPosture::HealthyReplicaAvailable,
+            }],
+            ledger: BTreeMap::new(),
+            ring: RingView {
+                this_host: 3,
+                owners_by_table: owners,
+            },
+        };
+        assert_eq!(
+            decide(&snap, &cfg),
+            Some(Action::RebuildVectorIndexes { table })
+        );
     }
 
     #[test]

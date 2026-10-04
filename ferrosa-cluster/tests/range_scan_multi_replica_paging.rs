@@ -80,8 +80,8 @@ const TBL_WIDE: &str = "test_wide";
 /// The ORIGINAL reason was that tests mutated the process-global
 /// `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` env var, so a mutation in one test
 /// could corrupt a scan another test was running. That env mutation is gone:
-/// tests now call `ferrosa_storage::range_merger::set_rows_per_fragment`, which
-/// is the supported single entry point.
+/// tests now call `ferrosa_storage::range_merger::set_rows_per_fragment`, whose
+/// guard restores the cap on drop (including when a test panics).
 ///
 /// The guard is still required, though — and removing it proved it, rather than
 /// reasoning about it. The cap remains PROCESS-GLOBAL by nature (it bounds a
@@ -920,7 +920,7 @@ fn multi_replica_many_windows_per_page_scan_is_not_silently_truncated() {
     // Force tiny windows: 1 row per fragment ⇒ 1 row per chunk ⇒ a 16-chunk
     // window is ~16 rows, so a wide partition spans hundreds of windows and the
     // continuation loop is exercised heavily.
-    ferrosa_storage::range_merger::set_rows_per_fragment(1);
+    let _k = ferrosa_storage::range_merger::set_rows_per_fragment(1);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -978,8 +978,6 @@ fn multi_replica_many_windows_per_page_scan_is_not_silently_truncated() {
 
         cluster.shutdown().await;
     });
-
-    ferrosa_storage::range_merger::reset_rows_per_fragment();
 }
 
 /// Seed a chosen subset of wide partitions on one replica. Models the live
@@ -1005,7 +1003,7 @@ fn seed_wide_pks(engine: &StorageEngine, pks: &[&str], rows_per: usize) {
 #[test]
 fn multi_replica_disjoint_data_many_windows_scan_unions_completely() {
     let _serial = serial_guard();
-    ferrosa_storage::range_merger::set_rows_per_fragment(1);
+    let _k = ferrosa_storage::range_merger::set_rows_per_fragment(1);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -1103,8 +1101,6 @@ fn multi_replica_disjoint_data_many_windows_scan_unions_completely() {
          the merged output was gone — a replica's failure vanished and the scan \
          could look complete while rows remained (t_a0f922a3 bug #2)"
     );
-
-    ferrosa_storage::range_merger::reset_rows_per_fragment();
 }
 
 /// A replica node whose streaming range-read handler is backed by a REAL
@@ -1576,16 +1572,29 @@ fn quorum_scan_refuses_instead_of_serving_a_partial_fanout() {
             )
             .await;
 
-        match result {
-            Err(_) => {} // correct: refused a partial fan-out
-            Ok(stream) => {
-                let keys = drain_partition_keys(stream, "partial").await;
-                panic!(
-                    "a QUORUM scan served {} rows from a PARTIAL fan-out: only 1 remote \
-                     stream could be opened but QUORUM needs 2. This is a silent read \
-                     below the requested consistency level; it must refuse instead.",
-                    keys.len()
-                );
+        // The unpaged full scan (`coordinate_range_read_stream_all_with_projection`,
+        // the `expected_done > 1` N-way arm) reaches the same partial fan-out and
+        // must refuse it the same way: the guard on the paged path alone leaves
+        // the unpaged `SELECT *` serving below QUORUM.
+        let unpaged = wp
+            .range_read_stream_all_with(&table_id, 0, ConsistencyLevel::Quorum, &strategy)
+            .await;
+
+        for (what, result) in [("paged", result), ("unpaged", unpaged)] {
+            match result {
+                Err(e) => assert!(
+                    e.to_string().contains("partial fan-out"),
+                    "{what}: the refusal must name the partial fan-out, got: {e}"
+                ),
+                Ok(stream) => {
+                    let keys = drain_partition_keys(stream, what).await;
+                    panic!(
+                        "{what}: a QUORUM scan served {} rows from a PARTIAL fan-out: only 1 \
+                         remote stream could be opened but QUORUM needs 2. This is a silent \
+                         read below the requested consistency level; it must refuse instead.",
+                        keys.len()
+                    );
+                }
             }
         }
 

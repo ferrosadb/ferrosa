@@ -30,7 +30,9 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
-ferrosa-storage = { path = "../ferrosa-storage", features = ["test-generators"] }
+# `test-support` exposes `compaction::cancel_harness`, used to hold a compaction
+# in flight deterministically (ddl_path drop-during-compaction test).
+ferrosa-storage = { path = "../ferrosa-storage", features = ["test-generators", "test-support"] }
 fs2 = "0.4"
 indexmap = "2"
 proptest = "1"

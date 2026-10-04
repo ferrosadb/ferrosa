@@ -276,6 +276,7 @@ async fn start() -> (tokio_postgres::Client, tempfile::TempDir) {
         accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
+        portals: Default::default(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
@@ -326,25 +327,32 @@ async fn select_larger_than_the_budget_streams_within_it() {
             .query_raw("SELECT id, name, score FROM t", Vec::<String>::new())
             .await?;
         futures::pin_mut!(rows);
-        let (mut count, mut payload, mut score_sum) = (0usize, 0usize, 0i64);
+        let (mut count, mut payload, mut score_sum, mut square_sum) = (0usize, 0usize, 0i64, 0i64);
         while let Some(row) = rows.try_next().await? {
+            let id: &str = row.get(0);
             let name: &str = row.get(1);
             let score: i32 = row.get(2);
+            // Each row's id names its own score: rows are not stitched together
+            // from two partitions.
+            assert_eq!(id, format!("row{score:08}"), "row id and score disagree");
             count += 1;
             payload += name.len();
             score_sum += i64::from(score);
+            square_sum += i64::from(score) * i64::from(score);
         }
-        Ok::<_, tokio_postgres::Error>((count, payload, score_sum))
+        Ok::<_, tokio_postgres::Error>((count, payload, score_sum, square_sum))
     }
     .await;
     ARMED.store(false, Ordering::Relaxed);
     let peak = PEAK.load(Ordering::Relaxed);
 
-    let (count, payload, score_sum) = outcome.expect("the query completes");
-    // 1. Every row arrives exactly once. A result bound is never the fix.
+    let (count, payload, score_sum, square_sum) = outcome.expect("the query completes");
+    // 1. Every row arrives exactly once. A result bound is never the fix. The
+    // square sum stops a dropped row and a duplicated one from cancelling out.
     assert_eq!(count, ROWS);
     assert_eq!(payload, ROWS * VALUE_BYTES);
     assert_eq!(score_sum, (0..ROWS as i64).sum::<i64>());
+    assert_eq!(square_sum, (0..ROWS as i64).map(|i| i * i).sum::<i64>());
 
     // 2. The window between executor and socket is a few batches, not the table.
     // Materialized, this result is ROWS * VALUE_BYTES = 12 MiB of payload, twice
@@ -374,7 +382,15 @@ async fn execute_max_rows_suspends_and_resumes_without_gap_or_duplicate() {
         .iter()
         .map(|row| row.get::<_, String>(0))
         .collect();
-    assert_eq!(all.len(), ROWS);
+    // The reference must itself be right, or `resumed == all` only proves the
+    // two paths share a bug: exactly the seeded ids, each once.
+    let mut seeded: Vec<String> = all.clone();
+    seeded.sort_unstable();
+    assert_eq!(
+        seeded,
+        (0..ROWS).map(|i| format!("row{i:08}")).collect::<Vec<_>>(),
+        "the unlimited run returns every seeded row exactly once"
+    );
 
     // The portal lives in a transaction, as the driver requires for `bind`.
     let tx = client.transaction().await.expect("begin");

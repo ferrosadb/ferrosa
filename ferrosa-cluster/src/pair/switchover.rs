@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,96 @@ use crate::pair::PairRole;
 
 /// Timeout for switchover RPC.
 const SWITCHOVER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Progress of the data catch-up a promoted primary replays to a rejoined
+/// peer. A switchover must not hand the primary role to a peer whose replay
+/// has not finished: it would serve reads missing the replayed rows.
+#[derive(Debug, Default)]
+pub struct CatchUpGate(AtomicU8);
+
+const CATCH_UP_NOT_PENDING: u8 = 0;
+const CATCH_UP_IN_PROGRESS: u8 = 1;
+const CATCH_UP_FAILED: u8 = 2;
+
+impl CatchUpGate {
+    /// A replay to the peer has started.
+    pub fn begin(&self) {
+        self.0.store(CATCH_UP_IN_PROGRESS, Ordering::SeqCst);
+    }
+
+    /// The replay finished and every mutation was acknowledged.
+    pub fn complete(&self) {
+        self.0.store(CATCH_UP_NOT_PENDING, Ordering::SeqCst);
+    }
+
+    /// The replay stopped short; the peer is missing data until a new
+    /// catch-up runs.
+    pub fn fail(&self) {
+        self.0.store(CATCH_UP_FAILED, Ordering::SeqCst);
+    }
+
+    /// `Ok` when no catch-up is outstanding.
+    pub fn ready(&self) -> Result<()> {
+        match self.0.load(Ordering::SeqCst) {
+            CATCH_UP_NOT_PENDING => Ok(()),
+            CATCH_UP_IN_PROGRESS => Err(ClusterError::ModeTransitionRejected(
+                "switchover refused: the data catch-up replay to the peer is still running; \
+                 retry when the log shows `catch-up replay complete`"
+                    .into(),
+            )),
+            _ => Err(ClusterError::ModeTransitionRejected(
+                "switchover refused: the data catch-up replay to the peer FAILED, so the peer \
+                 is missing writes; reconnect the peer to rerun catch-up (see the warn line \
+                 naming the failed step)"
+                    .into(),
+            )),
+        }
+    }
+}
+
+/// Push this node's schema to the peer and require the peer to acknowledge
+/// with the schema version it converged to.
+///
+/// `PairSchemaSyncHandler` acks with the version only after the peer's
+/// keyspaces and tables match the snapshot. Anything else -- an error, a
+/// timeout, an empty ack from an older peer, a different version -- leaves
+/// the peer's schema unconfirmed and is returned as an error.
+pub async fn push_schema_and_confirm(
+    peer_manager: &PeerManager,
+    peer_host_id: Uuid,
+    schema: &ferrosa_schema::Schema,
+) -> Result<()> {
+    let snapshot = schema.snapshot();
+    let wire = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snapshot);
+    let body = serde_json::to_vec(&wire)
+        .map_err(|e| ClusterError::Internal(format!("serialize schema snapshot: {e}")))?;
+    let resp = peer_manager
+        .send_with_timeout(
+            peer_host_id,
+            Message::PairSchemaSync(bytes::Bytes::from(body)),
+            Lane::Bulk,
+            SWITCHOVER_TIMEOUT,
+        )
+        .await
+        .map_err(|e| {
+            ClusterError::ModeTransitionRejected(format!(
+                "peer schema unconfirmed: pushing the schema to {peer_host_id} failed ({e})"
+            ))
+        })?;
+    match resp {
+        Message::PairDdlAck(version) if version.as_ref() == snapshot.version.as_bytes() => Ok(()),
+        Message::PairDdlAck(version) => Err(ClusterError::ModeTransitionRejected(format!(
+            "peer schema unconfirmed: {peer_host_id} acknowledged the schema push without \
+             reporting convergence to version {} (ack carried {} bytes)",
+            snapshot.version,
+            version.len()
+        ))),
+        other => Err(ClusterError::ModeTransitionRejected(format!(
+            "peer schema unconfirmed: expected PairDdlAck from {peer_host_id}, got {:?}",
+            other.msg_type()
+        ))),
+    }
+}
 
 /// Initiate switchover from the primary side.
 ///

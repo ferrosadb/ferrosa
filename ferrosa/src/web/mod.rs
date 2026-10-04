@@ -87,6 +87,15 @@ pub struct WebAppState {
     /// Health of the background client listeners (Postgres, SPARQL, graph, Bolt).
     /// A failed listener keeps `/readyz` from reporting ready.
     pub listeners: Arc<crate::listener_status::ListenerStatus>,
+    /// Health of the supervised background tasks (flusher, maintenance loop).
+    /// An impaired task keeps `/readyz` from reporting ready.
+    pub supervision: Arc<crate::supervisor::SupervisionStatus>,
+}
+
+impl FromRef<WebAppState> for Arc<crate::supervisor::SupervisionStatus> {
+    fn from_ref(state: &WebAppState) -> Self {
+        Arc::clone(&state.supervision)
+    }
 }
 
 impl FromRef<WebAppState> for Arc<crate::listener_status::ListenerStatus> {

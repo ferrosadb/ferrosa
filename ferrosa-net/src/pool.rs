@@ -48,6 +48,8 @@ pub struct PriorityPool {
     peer_cql_broadcast: Option<String>,
     /// Peer's internode broadcast hostname from handshake (if provided).
     peer_internode_broadcast: Option<String>,
+    /// Capability bits the peer advertised (`handshake::CAP_*`).
+    peer_capabilities: u32,
     raft: LaneHandle,
     data: LaneHandle,
     bulk: LaneHandle,
@@ -154,6 +156,7 @@ impl PriorityPool {
         let peer_host_id = raft_client.peer_host_id();
         let peer_cql_broadcast = raft_client.peer_cql_broadcast().map(String::from);
         let peer_internode_broadcast = raft_client.peer_internode_broadcast().map(String::from);
+        let peer_capabilities = raft_client.peer_capabilities();
         let peer_host = peer_host.to_owned();
 
         // For *reconnects*, prefer the peer's advertised, re-resolvable internode
@@ -237,6 +240,7 @@ impl PriorityPool {
             resolved_addr: peer_addr,
             peer_cql_broadcast,
             peer_internode_broadcast,
+            peer_capabilities,
             raft,
             data,
             bulk,
@@ -256,6 +260,11 @@ impl PriorityPool {
     /// Peer's internode broadcast hostname from the handshake, if provided.
     pub fn peer_internode_broadcast(&self) -> Option<&str> {
         self.peer_internode_broadcast.as_deref()
+    }
+
+    /// Capability bits (`handshake::CAP_*`) the peer advertised.
+    pub fn peer_capabilities(&self) -> u32 {
+        self.peer_capabilities
     }
 
     /// The socket address resolved during the initial connection.

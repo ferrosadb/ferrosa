@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-09-01
+last_updated: 2026-10-03
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -65,7 +65,7 @@ without changing the process environment. Digest verification is unconditional.
 | `timeseries/` | Ring aggregation, late-data, WASM aggregates, materialization |
 | `data_store` | `DataStore` trait + `LocalDataStore` |
 | `spill_budget` | Process RAM-budget detection (cgroup v2/v1 → `/proc/meminfo` → floor, injectable + cached) and the ORDER BY spill threshold (50% default; `FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`) |
-| `external_sort` | Bounded-memory spilling external merge sort of CQL rows (`ExternalSorter`, cascade k-way merge, `MERGE_FANIN`) for unbounded `ORDER BY`; fail-loud on spill/merge I/O |
+| `external_sort` | Bounded-memory spilling external merge sort of CQL rows (`ExternalSorter`, cascade k-way merge, `MERGE_FANIN`) for unbounded `ORDER BY`; `SortedRows::into_disk_backed` parks a remainder on disk for CQL result cursors; fail-loud on spill/merge I/O |
 | `metrics`, `virtual_tables`, `observer`, `subscription_observer` | Prometheus metrics; system virtual tables; write observers (CDC/SUBSCRIBE) |
 | `batchlog` | Batchlog manager for atomic multi-partition batches |
 
@@ -79,9 +79,14 @@ pressure admission: in the soft zone it requests a background flush and waits
 on that table's `Notify` until active-memtable capacity is released or a
 bounded deadline expires; pressure is checked once more before dispatch. The
 hard zone returns typed `Error::Overloaded`. Synchronous storage callers keep
-the hard admission check. On flush: a per-table `Mutex` serializes; a fresh
-memtable is swapped in and the old one becomes `flushing` (writes resume
-immediately); the flushing snapshot is serialized to a BTI SSTable via
+the hard admission check. On flush: the request goes through the table's
+rotation queue (one rotation at a time, no lock); a fresh memtable is swapped
+in and the old one becomes `flushing`, its write gate is sealed and the writes
+already inside it drain (new writes go to the new memtable at once). A
+memtable a failed flush left in `flushing` (a list of sealed memtables) stays
+there, readable, and the next rotation writes each sealed memtable to its own
+SSTable, taking it out of the list in the same view change that installs it.
+The flushing snapshot is serialized to a BTI SSTable via
 `FlushTarget`; the new descriptor is prepended; index/FTI sidecars are built;
 the SSTable components are submitted to `UploadManager` for S3 write-behind;
 STCS/UCS is evaluated.
@@ -132,29 +137,36 @@ volume or changing query results.
    backend has no conditional-PUT (CAS) support, so manifest saves use the
    unconditional path; this is safe because a single node is the sole writer.
 2. **Reads are wait-free; flush never blocks reads/writes.** All view
-   transitions go through `ArcSwap`; only flushes contend, on a per-table `Mutex`.
+   transitions are `ArcSwap` compare-and-swaps derived from the current view;
+   rotations run one at a time through a lock-free queue, and a writer that
+   meets a sealed memtable moves to the next one instead of waiting.
 3. **Cell-level last-write-wins everywhere.** Memtable merge-on-write, read-path
    merge, and compaction all resolve conflicts by `(column_index, timestamp)`;
    tombstones (partition/row/cell) suppress older data by `marked_for_delete_at`.
-4. **Durability is governed by the sync strategy.** Only `Batch` fsyncs every
-   write; the **default `Periodic`** has a bounded loss window (`sync_interval`).
+4. **Durability is governed by the sync strategy.** `Batch` fsyncs every
+   write and `Group` makes the writer wait for its fsync; the **default
+   `Periodic`** acknowledges before the fsync, bounded by refusal: a write
+   gets `Error::CommitLogNotDurable` instead of an ack when the sync thread
+   is dead, the last fsync failed, or the oldest unsynced write is older than
+   `sync_stall_deadline` (2 s). A crash therefore loses at most that window of
+   acknowledged writes (`max_delay`, 10 ms, while healthy). See FMEA ST-71.
 5. **Index registration is replay-safe and complete for live rows.** Repeating
    the same index declaration preserves the active memtable index and its
    unflushed postings; a conflicting column position or index type fails loud
-   instead of silently replacing it. A new scalar or vector declaration streams
-   the active and flushing memtables into the index before publication, so rows
-   written before CREATE INDEX are visible without materializing a fallback
-   table scan or briefly publishing an empty ANN index.
+   instead of silently replacing it. A new declaration rotates the memtable:
+   the rows written before CREATE INDEX leave with the frozen memtable, whose
+   flush builds the new index's sidecar from them, so they are indexed without
+   a fallback table scan and an empty ANN index is never published.
 6. **Table registration is compare-and-install.** A schema replay that loses
-   the table-map install race merges declarations into the already-live store;
-   it cannot replace active memtable rows or index postings.
+   the table-map compare-and-swap merges declarations into the already-live
+   store; it cannot replace active memtable rows or index postings.
 7. **Schema updates preserve ordinal identity.** Regular columns are ordered by
    name, so `ALTER TABLE ADD` can shift a column's cell ordinal. `update_schema`
    remaps every positional index declaration (scalar, full-text, vector,
    filtered-predicate clauses) through the old schema's column name, flushes
-   dirty pre-ALTER rows under their old serialization header before swapping in
-   the new schema, and index backfills remap current column ordinals through
-   each SSTable's stored header (ST-16).
+   dirty pre-ALTER rows under their old serialization header and publishes the
+   new schema in the same memtable rotation, and index backfills remap current
+   column ordinals through each SSTable's stored header (ST-16).
 8. **Malformed data is quarantined, not dropped or crashed on.** A row that
    fails cell/clustering validation at flush/replay is written to a durable
    `quarantine/*.jsonl` and the counter `FLUSH_QUARANTINED_ROWS_TOTAL`
@@ -182,6 +194,39 @@ volume or changing query results.
     would load (ST-27). Startup also sweeps stale `.tmp` sets and abandoned
     flush staging (`.sstable-staging/`, `.merge-spill/`) before that scan
     runs.
+13. **No lock guards the table registry or a table's index declarations.**
+    The table map is an `ArcSwap` (readers clone a table's `Arc` out before
+    any callback, blocking send or long scan); a table's `IndexCatalog` is
+    immutable and bound to its memtable; index DDL and `ALTER` rotate the
+    memtable. Invariant: a memtable's index postings are exactly the sidecars
+    its flush writes for the catalog it is bound to (ST-70).
+
+## Concurrency
+
+Shared state is published through `ArcSwap` and replaced by compare-and-swap
+(`lockfree::update`, bounded at 1,000 lost races, then a loud error). Since
+t_d938e6ae that covers the engine table map, each table's `StoreView`,
+`IndexCatalog`, schema and NVMe `PinState`.
+
+What replaced each per-table lock, and the test that pins the invariant it
+protected (each goes red when its mechanism is sabotaged):
+
+| Was | Now | Invariant / test |
+|-----|-----|------------------|
+| `write_barrier` (`RwLock<()>`) | `lockfree::WriteGate` per memtable: writers `fetch_add` in, a flush seals and drains | no write lands in a memtable after its flush snapshot: `no_write_lands_in_a_sealed_memtable` |
+| `flush_guard` (`Mutex<()>`) | `TableStore::rotate`: a queue one caller runs for everyone, claimed by compare-and-swap; StoreView changes by CAS | one rotation at a time, queued requests coalesce: `flushes_queued_behind_a_running_flush_coalesce_into_one_rotation`; no view change lost: `sidecar_installs_and_flushes_lose_no_view_change` |
+| `quarantined_sstables`, `index_unavailable_sstables` (`RwLock<HashSet>`) | `lockfree::SharedSet` | no lost insert/remove: `concurrent_set_changes_lose_no_update` |
+| `vector_index_scopes` (`Mutex<HashMap>`) | `ArcSwap` of per-index `Arc` sets | no lost scope: `concurrent_vector_scope_records_lose_none` |
+| `fulltext_sidecar_build_lock` (`Mutex<()>`) | per-sidecar claim in a `SharedSet`; a query that finds a build in flight scans instead of waiting | each sidecar built once: `concurrent_fts_sidecar_builds_build_each_sidecar_once` |
+
+Locks that remain (outside this change's scope): `MissingSstableCache`
+(`Mutex<HashMap>`, per table), and engine-wide `IndexStateTracker::states`,
+`StorageEngine::pending_index_uploads` and the set-aside status.
+
+Waiting that remains, by design: a flush waits (up to 30 s, then fails loud)
+for the writes already inside the memtable it sealed; a rotation caller waits
+for its own answer; DROP TABLE's `retire` waits for a rotation already
+running on that table.
 
 ## Position in the dependency graph
 

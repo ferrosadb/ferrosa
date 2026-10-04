@@ -732,8 +732,24 @@ impl CompactionExecutor {
                         };
                         crate::metrics::inc_compaction_running();
                         let task_start = Instant::now();
-                        let result =
-                            Self::execute_task_routed(&task, reader_pool.as_ref(), &cancel);
+                        // A panic is this task's failure, not the worker's
+                        // (t_8aae3ed7): it takes the Err path below, which
+                        // releases the input claims. Before, the panic ended
+                        // the thread with the claims held, so the table never
+                        // drained and TRUNCATE/DROP waited forever; the
+                        // worker's queued tasks leaked their claims too.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || Self::execute_task_routed(&task, reader_pool.as_ref(), &cancel),
+                        ))
+                        .unwrap_or_else(|payload| {
+                            crate::metrics::inc_compaction_panics();
+                            let message = payload
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "non-string panic payload".to_string());
+                            Err(format!("compaction panicked: {message}"))
+                        });
                         crate::metrics::dec_compaction_running();
                         drop(permit);
                         match result {
@@ -1363,7 +1379,9 @@ impl CompactionExecutor {
         }
         let mappings: Vec<ColumnOrdinalMapping> = readers
             .iter()
-            .map(|reader| ColumnOrdinalMapping::for_header(&task.schema, reader.header()))
+            // Compaction rewrites SSTables into an SSTable, so it stays in
+            // SSTable ordinal space (crate::ordinal_space).
+            .map(|reader| ColumnOrdinalMapping::for_rewrite(&task.schema, reader.header()))
             .collect();
 
         // 2. Build the output serialization header by combining the inputs'
@@ -1481,6 +1499,7 @@ impl CompactionExecutor {
         // Counts and min/max token across all merged output partitions so the
         // emitted SSTableMetadata can be filled without a second scan.
         let mut tally = OutputTally::default();
+        let table_label = task.table_id.to_string();
         // First partition that purged down to nothing, kept (unpurged) in case
         // every partition does: an empty output cannot be swapped in.
         let mut held_back: Option<ferrosa_sstable::types::Partition> = None;
@@ -1600,7 +1619,13 @@ impl CompactionExecutor {
                     }
                 }
             }
-            emit_partition(&mut writer, &output_header, &merged, &mut tally)?;
+            emit_partition(
+                &mut writer,
+                &output_header,
+                &table_label,
+                merged,
+                &mut tally,
+            )?;
         }
 
         if tally.partitions == 0 {
@@ -1616,7 +1641,7 @@ impl CompactionExecutor {
                 "compaction: every partition purged away; writing one unpurged partition \
                  so the output is not empty"
             );
-            emit_partition(&mut writer, &output_header, &kept, &mut tally)?;
+            emit_partition(&mut writer, &output_header, &table_label, kept, &mut tally)?;
         }
         if purged_markers > 0 {
             crate::metrics::add_compaction_purged_markers(purged_markers);
@@ -1878,14 +1903,21 @@ fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
         max_timestamp = NO_TIMESTAMP;
     }
 
-    SerializationHeader {
+    let mut header = SerializationHeader {
         complex_collections: has_complex,
         min_timestamp,
         max_timestamp,
         min_local_deletion_time,
         min_ttl,
         ..template
+    };
+    // A simple-framed input may hold whole-value collection cells, which a
+    // complex-framed output expands (`emit_partition`) into elements plus a
+    // deletion sentinel one microsecond older than the blob.
+    if has_complex && readers.iter().any(|r| !r.header().complex_collections) {
+        crate::memtable::widen_header_for_blob_sentinels(&mut header);
     }
+    header
 }
 
 /// Counts and token span of the partitions written to the compaction output.
@@ -1911,10 +1943,17 @@ impl Default for OutputTally {
 fn emit_partition(
     writer: &mut ferrosa_sstable::writer::SSTableWriter,
     header: &ferrosa_sstable::statistics::SerializationHeader,
-    merged: &ferrosa_sstable::types::Partition,
+    table: &str,
+    mut merged: ferrosa_sstable::types::Partition,
     tally: &mut OutputTally,
 ) -> std::result::Result<(), String> {
     let write_start = Instant::now();
+    // A legacy simple-framed input may carry whole-value collection cells that
+    // a complex-framed output cannot hold as-is. The merged partition is
+    // owned here, so it is expanded in place, never copied.
+    crate::memtable::expand_collection_blobs_in_place(&mut merged, header, table)
+        .map_err(|e| format!("write partition: {e}"))?;
+    let merged = &merged;
     validate_partition_writable(merged, header).map_err(|e| format!("write partition: {e}"))?;
     writer
         .add_partition(merged)
@@ -2446,6 +2485,46 @@ mod tests {
         executor.release_task_inputs(&task);
         assert!(executor.tracker.try_register(&task, &ticket).is_some());
         executor.release_task_inputs(&task);
+        executor.shutdown();
+    }
+
+    /// t_8aae3ed7: a compaction that panics must release its input claims.
+    /// Before, the panic killed the worker thread with the claims held, so
+    /// the table never drained and TRUNCATE / DROP waited on it forever.
+    #[test]
+    fn a_panicking_compaction_releases_its_input_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = real_compaction_task(tmp.path());
+        // A table no other test uses: the hook below is keyed by table id.
+        task.table_id = crate::TableId::new("panic_ks", "panic_compaction");
+        let table = task.table_id.clone();
+        let executor = CompactionExecutor::new();
+        let hook = crate::compaction::cancel_harness::CancelHookGuard::install(
+            table.to_string(),
+            Arc::new(|_| panic!("injected compaction panic")),
+        );
+        let failed_before = crate::metrics::compaction_panics_total();
+
+        assert!(executor.try_submit(task.clone()).unwrap());
+        let started = Instant::now();
+        while executor.table_has_tasks(&table) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "a panicked compaction leaked its input claims"
+            );
+            std::thread::yield_now();
+        }
+        assert!(crate::metrics::compaction_panics_total() > failed_before);
+        drop(hook);
+
+        assert!(
+            executor.try_submit(task).unwrap(),
+            "the inputs are claimable again"
+        );
+        assert!(
+            executor.await_result_available(std::time::Duration::from_secs(30)),
+            "the same inputs compact once the panic is gone"
+        );
         executor.shutdown();
     }
 

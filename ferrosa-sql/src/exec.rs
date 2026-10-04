@@ -82,14 +82,17 @@ pub(crate) fn order_cmp(a: &Value, b: &Value, dir: SortDir) -> Ordering {
 }
 
 /// A pull-based stream of rows flowing between the streaming operators.
-pub type RowStream<'a> = Box<dyn Iterator<Item = Row> + 'a>;
+///
+/// `Send`, so a suspended query can be held between pulls and resumed on
+/// whichever thread is free (see [`crate::RowCursor`]).
+pub type RowStream<'a> = Box<dyn Iterator<Item = Row> + Send + 'a>;
 
 /// A pull-based stream of rows that can fail.
 ///
 /// Blocking operators read and produce this: once an operator can spill, every
 /// pull can hit a spill/merge I/O error, and that error has to reach the caller
 /// rather than ending the stream early.
-pub type TryRowStream<'a> = Box<dyn Iterator<Item = Result<Row, SpillError>> + 'a>;
+pub type TryRowStream<'a> = Box<dyn Iterator<Item = Result<Row, SpillError>> + Send + 'a>;
 
 /// Lift an infallible stream (a scan, filter or projection) into a
 /// [`TryRowStream`] so a blocking operator can consume it.
@@ -422,8 +425,9 @@ impl Predicate {
     }
 }
 
-/// Scan all rows of a table.
-pub fn seq_scan(table: &dyn TableProvider) -> RowStream<'_> {
+/// Scan all rows of a table. The stream owns what it reads, so it outlives the
+/// borrow of `table`.
+pub fn seq_scan(table: &dyn TableProvider) -> RowStream<'static> {
     table.scan()
 }
 

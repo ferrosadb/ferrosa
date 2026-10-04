@@ -104,8 +104,12 @@ uses `[graph].bolt_port` / `FERROSA_BOLT_PORT` for its port, defaulting to
 ## Lifecycle
 
 Boot wires everything (see [data-flow.md](data-flow.md)); a background
-maintenance loop on the `background` runtime handles periodic + urgent flush,
-compaction polling, commit-log GC, and schema persistence (local + S3); shutdown
+maintenance loop on the `background` runtime (`maintenance.rs`) handles periodic
++ urgent flush, compaction polling, commit-log GC, and schema persistence (local
++ S3). It runs under `supervisor.rs`: flush attempts and the loop are restarted
+within a restart intensity, a hung flush is reported as a stall, an impaired task
+holds `/readyz` at 503, and past the intensity the process syncs the commit log
+and aborts (FMEA FE-9). Shutdown
 drains cluster tasks → internode → memtables → schema in a 30 s timeout window.
 
 ## Position in the dependency graph

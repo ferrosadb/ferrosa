@@ -57,6 +57,10 @@ pub enum IssueKind {
     Bloat,
     /// Replica Merkle divergence. *Follow-up (converge).*
     Divergence,
+    /// A vector index has generations whose sidecars are missing or invalid
+    /// (see `TableStore::verify_vector_index`). ANN over it refuses until
+    /// they are rebuilt from the rows, which is local and loses nothing.
+    InvalidVectorIndex,
 }
 
 impl IssueKind {
@@ -66,8 +70,9 @@ impl IssueKind {
     pub fn priority(self) -> u8 {
         match self {
             IssueKind::CorruptSstables => 0,
-            IssueKind::Divergence => 1,
-            IssueKind::Bloat => 2,
+            IssueKind::InvalidVectorIndex => 1,
+            IssueKind::Divergence => 2,
+            IssueKind::Bloat => 3,
         }
     }
 
@@ -76,6 +81,7 @@ impl IssueKind {
             IssueKind::CorruptSstables => "corrupt_sstables",
             IssueKind::Bloat => "bloat",
             IssueKind::Divergence => "divergence",
+            IssueKind::InvalidVectorIndex => "invalid_vector_index",
         }
     }
 }

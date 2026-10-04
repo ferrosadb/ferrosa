@@ -226,12 +226,30 @@ fn jsonb_debug_is_injective_and_untruncated() {
 /// datatype-json: "Object > Array > Boolean > Number > String > Null", "Object
 /// with n pairs > object with n - 1 pairs", "Array with n elements > array with
 /// n - 1 elements", and the documented `{"aa": 1, "c": 1} > {"b": 1, "d": 1}`.
+///
+/// Every pair was also checked against a live `postgres:16` (`a::jsonb <
+/// b::jsonb`), which is how the one exception the docs leave out was found: a
+/// TOP-LEVEL empty array sorts below every top-level scalar, `null` included.
+/// PostgreSQL stores a top-level scalar as a one-element "raw scalar" array and
+/// compares element counts first, so `[]` (0) < `null` (1). Nested, the kind
+/// rank holds: `[[]] > [null]`.
 const PG_TABLE: &[(&str, &str)] = &[
     ("null", "\"a\""),
     ("\"a\"", "0"),
     ("0", "false"),
     ("false", "true"),
-    ("true", "[]"),
+    ("[]", "true"),
+    ("[]", "false"),
+    ("[]", "0"),
+    ("[]", "-1e300"),
+    ("[]", "\"\""),
+    ("[]", "null"),
+    ("[]", "[null]"),
+    ("[null]", "[[]]"),
+    ("[\"\"]", "[[]]"),
+    ("true", "[0]"),
+    ("2", "[1]"),
+    ("1", "{}"),
     ("[]", "{}"),
     ("null", "{}"),
     ("\"zzz\"", "-5"),

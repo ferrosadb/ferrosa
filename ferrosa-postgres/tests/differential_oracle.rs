@@ -1092,6 +1092,7 @@ async fn start_ferrosa() -> (tokio_postgres::Client, tempfile::TempDir) {
         accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
+        portals: Default::default(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

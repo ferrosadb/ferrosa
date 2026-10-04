@@ -312,6 +312,40 @@ pub enum RaftOp {
         /// Opaque mutation payload — interpreted by higher layers.
         mutation: Vec<u8>,
     },
+
+    // ---- Verified data movement (P0-4) ----------------------------------
+    /// Record that a `Joining` member's bootstrap stream finished and was
+    /// verified for every range it will own.
+    ///
+    /// This is the durable, replicated fact the promote pass gates on: a
+    /// `Joining` member is promoted to `Normal` only once this record exists
+    /// (see `repair::coordinator::promote_joining_members`). Without it a
+    /// restart could not tell a join whose promotion was lost from a join whose
+    /// stream was cut off, and promoted both.
+    ///
+    /// Appended LAST so every earlier variant keeps its bincode tag.
+    RecordBootstrapComplete {
+        /// openraft `NodeId` of the member whose bootstrap completed.
+        node_id: u64,
+        /// What was moved and verified.
+        evidence: DataMovementEvidence,
+    },
+}
+
+/// Evidence that a membership data movement completed and was verified.
+///
+/// Carried by [`RaftOp::RecordBootstrapComplete`] and kept in
+/// `RaftState::bootstrap_complete`. The counts are what each verified session
+/// reported, so an operator can tell a real transfer from a vacuous one (an
+/// empty cluster legitimately moves zero partitions).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataMovementEvidence {
+    /// Verified transfer sessions (one per `(table, range, source)`).
+    pub sessions: u64,
+    /// Token ranges covered by the verified sessions.
+    pub ranges: u64,
+    /// Partitions moved into the joining node.
+    pub partitions: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +670,16 @@ mod tests {
             }),
             27,
             "ApproveNode"
+        );
+
+        // ---- Verified data movement: appended after AccordApply (29) ----
+        assert_eq!(
+            tag(&RaftOp::RecordBootstrapComplete {
+                node_id: 1,
+                evidence: DataMovementEvidence::default(),
+            }),
+            30,
+            "RecordBootstrapComplete"
         );
     }
 }

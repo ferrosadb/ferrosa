@@ -134,6 +134,12 @@ pub enum MutationError {
         /// The actual path length found (not 16).
         len: usize,
     },
+    /// More rows than the format's `row_count:u16` can describe. Refused
+    /// rather than written with a wrapped count.
+    TooManyRows {
+        /// The number of rows offered.
+        rows: usize,
+    },
 }
 
 impl std::fmt::Display for MutationError {
@@ -154,6 +160,11 @@ impl std::fmt::Display for MutationError {
                 f,
                 "cell has the Accord list-path rebind flag but a {len}-byte path (expected a \
                  16-byte v1 TimeUUID)"
+            ),
+            MutationError::TooManyRows { rows } => write!(
+                f,
+                "{rows} rows do not fit one mutation (row_count is a u16, max {})",
+                u16::MAX
             ),
         }
     }
@@ -451,6 +462,45 @@ impl Mutation {
         Self::serialize_row(&mut w, row);
     }
 
+    /// Serialize a mutation of borrowed rows into a new buffer, without
+    /// cloning the rows into an owned [`Mutation`] first. Byte-identical to
+    /// [`Self::serialize_into`] for the same fields.
+    ///
+    /// Refuses more than `u16::MAX` rows (`MutationError::TooManyRows`)
+    /// instead of wrapping the count.
+    pub fn serialize_borrowed_rows(
+        mutation_id: [u8; 16],
+        keyspace: &str,
+        table: &str,
+        key: &DecoratedKey,
+        timestamp: i64,
+        rows: &[&Row],
+    ) -> Result<Vec<u8>> {
+        let row_count = u16::try_from(rows.len())
+            .map_err(|_| MutationError::TooManyRows { rows: rows.len() })?;
+        let size = 16
+            + string_size(keyspace)
+            + string_size(table)
+            + byte_vec_size(key.key.as_bytes())
+            + 8
+            + 8
+            + 2
+            + rows.iter().map(|row| row_size(row)).sum::<usize>();
+        let mut buf = vec![0u8; size];
+        let mut w = WriteCursor::new(&mut buf);
+        w.write_bytes(&mutation_id);
+        w.write_string(keyspace);
+        w.write_string(table);
+        w.write_byte_vec(key.key.as_bytes());
+        w.write_i64(key.token.0);
+        w.write_i64(timestamp);
+        w.write_u16(row_count);
+        for row in rows {
+            Self::serialize_row(&mut w, row);
+        }
+        Ok(buf)
+    }
+
     fn serialize_row(w: &mut WriteCursor<'_>, row: &Row) {
         // Clustering key
         w.write_byte_vec(&row.clustering);
@@ -705,6 +755,41 @@ mod tests {
                 assert_eq!(ca, cb);
             }
         }
+    }
+
+    #[test]
+    fn borrowed_rows_serialize_like_an_owned_mutation() {
+        let m = simple_mutation();
+        let refs: Vec<&Row> = m.rows.iter().collect();
+        let borrowed = Mutation::serialize_borrowed_rows(
+            m.mutation_id,
+            &m.keyspace,
+            &m.table,
+            &m.key,
+            m.timestamp,
+            &refs,
+        )
+        .unwrap();
+        let mut owned = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut owned);
+        assert_eq!(borrowed, owned);
+    }
+
+    #[test]
+    fn borrowed_rows_beyond_the_u16_count_are_refused() {
+        let m = simple_mutation();
+        let row = &m.rows[0];
+        let refs: Vec<&Row> = std::iter::repeat_n(row, usize::from(u16::MAX) + 1).collect();
+        let err = Mutation::serialize_borrowed_rows(
+            m.mutation_id,
+            &m.keyspace,
+            &m.table,
+            &m.key,
+            m.timestamp,
+            &refs,
+        )
+        .unwrap_err();
+        assert_eq!(err, MutationError::TooManyRows { rows: 65_536 });
     }
 
     #[test]

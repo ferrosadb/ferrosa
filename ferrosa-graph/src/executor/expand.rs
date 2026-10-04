@@ -6,7 +6,7 @@
 //! 2. For each hop, reading the adjacency index to find neighbors
 //! 3. Building a `GraphResult` with columns from the return clause
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ferrosa_cluster::consistency::ConsistencyLevel;
@@ -58,7 +58,7 @@ struct MatchedTableRow {
     json: serde_json::Value,
 }
 
-fn graph_replication_strategy(
+pub(crate) fn graph_replication_strategy(
     schema: Option<&Schema>,
     keyspace: &str,
 ) -> Result<ReplicationStrategy> {
@@ -964,8 +964,8 @@ async fn pattern_predicate_exists(
             for source_key in &source_keys {
                 if let Some(partition) = write_path.read(&adj_table_id, source_key).await? {
                     for row in &partition.rows {
-                        if let Some(neighbor_id) = extract_neighbor_id_for_direction(
-                            &row.clustering,
+                        if let Some(neighbor_id) = traversable_neighbor_id(
+                            row,
                             hop.rel_type.as_deref(),
                             Some(DIRECTION_OUT),
                         ) {
@@ -1266,11 +1266,9 @@ async fn outgoing_neighbor_ids(
     for key in &source_keys {
         if let Some(partition) = write_path.read(&adj_table_id, key).await? {
             for row in &partition.rows {
-                if let Some(neighbor_id) = extract_neighbor_id_for_direction(
-                    &row.clustering,
-                    rel_type,
-                    Some(DIRECTION_OUT),
-                ) {
+                if let Some(neighbor_id) =
+                    traversable_neighbor_id(row, rel_type, Some(DIRECTION_OUT))
+                {
                     neighbor_ids.push(neighbor_id);
                 }
             }
@@ -1743,6 +1741,9 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
 
             if let Some(meta) = anchor_meta.as_ref() {
                 for row in &partition.rows {
+                    if crate::adjacency::schema::row_is_deleted(row) {
+                        continue;
+                    }
                     let row_json = row_to_json(meta, partition, row);
                     if !prop_map_passes(anchor_var, &anchor.props, &row_json)? {
                         continue;
@@ -1874,8 +1875,8 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                     .rows
                     .iter()
                     .filter_map(|row| {
-                        extract_neighbor_id_for_direction(
-                            &row.clustering,
+                        traversable_neighbor_id(
+                            row,
                             hop.edge_label.as_deref(),
                             expected_adjacency_direction(hop.direction),
                         )
@@ -2491,8 +2492,8 @@ async fn execute_optional_hops(
                     if !adjacency_row_matches_direction(&row.clustering, hop.direction) {
                         continue;
                     }
-                    let Some(neighbor_id) = extract_neighbor_id_for_direction(
-                        &row.clustering,
+                    let Some(neighbor_id) = traversable_neighbor_id(
+                        row,
                         hop.edge_label.as_deref(),
                         expected_adjacency_direction(hop.direction),
                     ) else {
@@ -2692,6 +2693,11 @@ async fn try_edge_anchored_initial_states(
         }
         stats.edges_read += partition.rows.len();
         for row in &partition.rows {
+            // A deleted edge in a partition that still holds live ones
+            // (typed_edges keeps a session's edges in one partition).
+            if crate::adjacency::schema::row_is_deleted(row) {
+                continue;
+            }
             let edge_json = row_to_json(&edge_meta, &partition, row);
             let edge_match = MatchedTableRow {
                 key: partition.key.clone(),
@@ -3161,11 +3167,9 @@ async fn find_edge_match(
             .pk_read(table_id, &key, ConsistencyLevel::One, &strategy)
             .await?
         {
-            if let Some(row) = partition
-                .rows
-                .iter()
-                .find(|row| row.clustering == clustering)
-            {
+            if let Some(row) = partition.rows.iter().find(|row| {
+                row.clustering == clustering && !crate::adjacency::schema::row_is_deleted(row)
+            }) {
                 return Ok(Some(MatchedTableRow {
                     key: partition.key.clone(),
                     clustering: row.clustering.clone(),
@@ -3184,6 +3188,9 @@ async fn find_edge_match(
     while let Some(partition) = partitions.next().await {
         let partition = partition?;
         for row in &partition.rows {
+            if crate::adjacency::schema::row_is_deleted(row) {
+                continue;
+            }
             let row_source =
                 extract_column_bytes_from_row(meta, partition.key.key.as_bytes(), row, source_col);
             let row_target =
@@ -3221,11 +3228,9 @@ async fn find_vertex_match(
             .pk_read(table_id, &key, ConsistencyLevel::One, &strategy)
             .await?
         {
-            if let Some(row) = partition
-                .rows
-                .iter()
-                .find(|row| row.clustering == clustering)
-            {
+            if let Some(row) = partition.rows.iter().find(|row| {
+                row.clustering == clustering && !crate::adjacency::schema::row_is_deleted(row)
+            }) {
                 let row_json = row_to_json(meta, &partition, row);
                 if prop_map_passes(var_name, target_props, &row_json)?
                     && graph_vertex_lookup_key(meta, &partition, row, target_props)
@@ -3250,6 +3255,9 @@ async fn find_vertex_match(
             continue;
         }
         for row in &partition.rows {
+            if crate::adjacency::schema::row_is_deleted(row) {
+                continue;
+            }
             let row_json = row_to_json(meta, &partition, row);
             if !prop_map_passes(var_name, target_props, &row_json)? {
                 continue;
@@ -3367,11 +3375,9 @@ async fn find_table_row_by_props(
         build_direct_lookup_shape(meta, &HashMap::new(), props, &HashMap::new())?
     {
         if let Some(partition) = write_path.read(table_id, &key).await? {
-            if let Some(row) = partition
-                .rows
-                .iter()
-                .find(|row| row.clustering == clustering)
-            {
+            if let Some(row) = partition.rows.iter().find(|row| {
+                row.clustering == clustering && !crate::adjacency::schema::row_is_deleted(row)
+            }) {
                 let row_json = row_to_json(meta, &partition, row);
                 if prop_map_passes(var_name, props, &row_json)? {
                     return Ok(Some(MatchedTableRow {
@@ -3401,6 +3407,9 @@ async fn find_table_row_by_props(
             continue;
         }
         for row in &partition.rows {
+            if crate::adjacency::schema::row_is_deleted(row) {
+                continue;
+            }
             let row_json = row_to_json(meta, &partition, row);
             if !prop_map_passes(var_name, props, &row_json)? {
                 continue;
@@ -4306,6 +4315,87 @@ async fn write_explicit_adjacency_entries(
         }
     }
 
+    Ok(())
+}
+
+/// After `DELETE r` tombstoned edge `deleted`'s adjacency entries, write back
+/// any of them that another live edge in the same partition still derives.
+///
+/// An entry is keyed by (vertex, label, neighbour), so edges that differ only
+/// in a non-endpoint key column share it — agent_memory's `typed_edges` keeps
+/// one row per `edge_type` between the same pair, in one partition. Deleting
+/// one of them tombstoned the entry its siblings need. The restore is written
+/// one microsecond after the delete, so it outranks both the explicit
+/// tombstone and the one the observer derived. (A sibling in ANOTHER partition
+/// is not seen here; the background reconcile restores that entry.)
+async fn restore_entries_shared_with_live_edges(
+    write_path: &WritePath,
+    table_id: &TableId,
+    key: &DecoratedKey,
+    deleted: &Row,
+    timestamp: i64,
+    schema: Option<&Schema>,
+) -> Result<()> {
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+    let derive = |row: &Row, ts: i64| {
+        let edge = Mutation::new(
+            table_id.keyspace.clone(),
+            table_id.table.clone(),
+            key.clone(),
+            vec![row.clone()],
+            ts,
+        );
+        derive_adjacency_mutations(schema, table_id, &edge)
+    };
+    let tombstoned: HashSet<(Vec<u8>, Vec<u8>)> = derive(deleted, timestamp)
+        .iter()
+        .flat_map(|m| {
+            m.rows
+                .iter()
+                .map(|r| (m.key.key.as_bytes().to_vec(), r.clustering.clone()))
+        })
+        .collect();
+    if tombstoned.is_empty() {
+        return Ok(());
+    }
+    let strategy = graph_replication_strategy(Some(schema), &table_id.keyspace)?;
+    let Some(partition) = write_path
+        .pk_read(table_id, key, graph_write_consistency(), &strategy)
+        .await?
+    else {
+        return Ok(());
+    };
+    let restore_at = timestamp.saturating_add(1);
+    let siblings = partition.rows.iter().filter(|row| {
+        row.clustering != deleted.clustering && !crate::adjacency::schema::row_is_deleted(row)
+    });
+    for sibling in siblings {
+        for derived in derive(sibling, restore_at) {
+            let adj_table_id = TableId::new(&derived.keyspace, &derived.table);
+            let adj_strategy = graph_replication_strategy(Some(schema), &derived.keyspace)?;
+            for entry in derived.rows {
+                let entry_id = (
+                    derived.key.key.as_bytes().to_vec(),
+                    entry.clustering.clone(),
+                );
+                if !tombstoned.contains(&entry_id) {
+                    continue;
+                }
+                adjacency_write_with_retry(
+                    write_path,
+                    &adj_table_id,
+                    &derived.key,
+                    entry,
+                    restore_at,
+                    &adj_strategy,
+                    table_id,
+                )
+                .await?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5896,12 +5986,35 @@ async fn execute_delete(
                     .write(
                         &table_id,
                         &key,
-                        tombstone_row,
+                        tombstone_row.clone(),
                         timestamp,
                         graph_write_consistency(),
                         &strategy,
                     )
                     .await?;
+                if is_edge_table {
+                    // The edge's OUT and IN adjacency entries go with it, as
+                    // MERGE writes them explicitly; otherwise every hop over
+                    // the adjacency index still finds the deleted edge.
+                    write_explicit_adjacency_entries(
+                        write_path,
+                        &table_id,
+                        &key,
+                        &tombstone_row,
+                        timestamp,
+                        schema,
+                    )
+                    .await?;
+                    restore_entries_shared_with_live_edges(
+                        write_path,
+                        &table_id,
+                        &key,
+                        &tombstone_row,
+                        timestamp,
+                        schema,
+                    )
+                    .await?;
+                }
                 stats.vertices_deleted += 1;
             }
         }
@@ -6448,7 +6561,7 @@ fn label_matches_alternative(actual: &str, expected: &str) -> bool {
         .any(|candidate| actual.eq_ignore_ascii_case(candidate.trim()))
 }
 
-fn expected_adjacency_direction(direction: Direction) -> Option<u8> {
+pub(crate) fn expected_adjacency_direction(direction: Direction) -> Option<u8> {
     match direction {
         Direction::Out => Some(DIRECTION_OUT),
         Direction::In => Some(DIRECTION_IN),
@@ -6456,7 +6569,21 @@ fn expected_adjacency_direction(direction: Direction) -> Option<u8> {
     }
 }
 
-fn extract_neighbor_id_for_direction(
+/// The neighbour a traversal may follow through adjacency `row`: `None` for
+/// a deleted edge (its entries are row tombstones, which reads return), a
+/// label mismatch, or the other direction.
+pub(crate) fn traversable_neighbor_id(
+    row: &Row,
+    expected_label: Option<&str>,
+    expected_direction: Option<u8>,
+) -> Option<Vec<u8>> {
+    if crate::adjacency::schema::row_is_deleted(row) {
+        return None;
+    }
+    extract_neighbor_id_for_direction(&row.clustering, expected_label, expected_direction)
+}
+
+pub(crate) fn extract_neighbor_id_for_direction(
     clustering: &[u8],
     expected_label: Option<&str>,
     expected_direction: Option<u8>,

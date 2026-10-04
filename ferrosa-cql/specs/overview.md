@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 status: implemented
-last_updated: 2026-09-05
+last_updated: 2026-10-03
 executive_summary: >
   The CQL native-protocol (v3/v4/v5) server and the largest, most central crate in
   the workspace (~54k LoC). It owns the full client path — TCP accept, frame
@@ -52,6 +52,7 @@ same encode/decode without depending on this large crate.
 | `transaction_keys` / `transaction_limits` | ~1.0k | Accord partition-key extraction, per-connection txn limits |
 | `planner` | ~0.8k | Scan planning: `PartitionKeyLookup` / `PartitionIndexLookup` (keyed index consult for full-PK + indexed residual, t_430c4188) / `SingleIndex` / `IndexScanWithFilter` / `IndexIntersection` / `FullScan` |
 | `error` / `paging` / `duration` / `session` / `topology` / `event` / `observability` / `prepared` | — | Error type + `From<RowBridgeError>` / `From<RowDecodeError>` (`CqlError::CorruptCell`, a server error naming the table), paging cursor, duration type, session, topology policy, EVENT, metrics, prepared cache |
+| `result_cursor` | ~0.9k | Server-side result cursors: an `ORDER BY` / `DISTINCT` / function-projection full scan computed once into spilled runs and read a page at a time; lock-free registry (`ArcSwap` map) with idle TTL, per-node cap, connection-close and cancel cleanup; signed, versioned cursor tokens |
 | `virtual_tables/` | ~4.5k | `system_observability.*` runtime introspection tables |
 
 ## Concurrency model

@@ -313,12 +313,15 @@ impl ModeController {
                 %peer_id,
                 "pushing the cluster schema to a (re)joining peer"
             );
-            super::token::send_schema_sync_to_peer(&peer_manager, peer_id, &schema).await;
             // Operator visibility, and the signal an integration test asserts on:
             // this counter is the only way to distinguish "the push ran" from
             // "the peer happened to converge some other way". Mirrors
-            // `INSTALLSNAPSHOT_PUSHES_TOTAL` in raft/snapshot_pusher.rs.
-            SCHEMA_SNAPSHOT_PUSHES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // `INSTALLSNAPSHOT_PUSHES_TOTAL` in raft/snapshot_pusher.rs. Counted
+            // only when the peer acknowledged it: a failed send is logged by the
+            // helper and must not read as a push that happened.
+            if super::token::send_schema_sync_to_peer(&peer_manager, peer_id, &schema).await {
+                SCHEMA_SNAPSHOT_PUSHES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         });
     }
 

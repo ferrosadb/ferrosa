@@ -46,6 +46,20 @@ use crate::raft::handlers::{
 /// stall.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Longest a responder waits for ONE outbound frame (chunk, heartbeat or Done)
+/// to be accepted by its sink before abandoning the request.
+///
+/// Chunk sends are fire-and-forget, so the lane's request deadline does not
+/// apply to them: `fire` can wait in the lane's pending queue, or on a full
+/// socket, for as long as the requesting node is stuck. While the handler
+/// waits it is not pulling its local storage stream, so the storage producer
+/// stays parked in `blocking_send` -- holding its slot and, for an index walk,
+/// the engine's `tables` read guard, which stalls every writer and then every
+/// reader on the node. Matches the coordinator's idle budget
+/// (`STREAMING_IDLE_TIMEOUT`, 30 s): by then the requester has given up on
+/// this stream anyway.
+pub(super) const STREAM_SINK_SEND_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Default ceiling on the number of clustered rows packed into one stream
 /// chunk frame. Matches `ferrosa_storage::range_merger`'s default fragment
 /// cap so a single full fragment flushes as one chunk. Env-tunable through
@@ -104,6 +118,14 @@ pub trait StreamRangeReader: Send + Sync {
             "streaming index reads are not supported by this reader".into(),
         ))
     }
+
+    /// Monotonic I/O progress behind this reader's walks (bytes downloaded by
+    /// rehydration, for the engine). A walk that yields no rows while this
+    /// advances is waiting on I/O, not stuck, and may still heartbeat.
+    /// Readers with no I/O of their own report a constant.
+    fn io_progress(&self) -> u64 {
+        0
+    }
 }
 
 impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
@@ -153,6 +175,10 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
     ) -> ferrosa_common::Result<PartitionStream<'a>> {
         let key = ferrosa_index::IndexKey(index_key.to_vec());
         Ok(self.read_by_index_stream_after(table_id, index_name, &key, after.cloned()))
+    }
+
+    fn io_progress(&self) -> u64 {
+        ferrosa_storage::metrics::object_store_download_progress()
     }
 }
 
@@ -236,7 +262,7 @@ pub async fn handle_stream_request_with_cancel<R, S>(
                 table = req.table,
                 "stream request: open failed: {e}"
             );
-            send_truncated_done(&req, sink).await;
+            send_truncated_done(&req, sink, &cancel).await;
             return;
         }
     };
@@ -272,6 +298,15 @@ pub async fn handle_stream_request_with_cancel<R, S>(
     // Flow-control window (t_a0f922a3 mode 2): `0` = unbounded.
     let max_chunks = req.max_chunks;
     let mut window_exhausted = false;
+    // Heartbeat gate: a heartbeat means "this walk progressed since the last
+    // one", never merely "this task is alive". `progress` is the items pulled
+    // from the walk plus the reader's I/O progress (rehydrate bytes). A walk
+    // stuck behind a lock moves neither, goes quiet, and the coordinator's
+    // idle watchdog releases its merge -- including the coordinator's own
+    // local walker, which the merge holds parked inside `tables.read()`.
+    let mut items_pulled: u64 = 0;
+    let mut last_heartbeat_progress = (items_pulled, reader.io_progress());
+    let mut withholding = false;
 
     'pull: loop {
         tokio::select! {
@@ -286,6 +321,7 @@ pub async fn handle_stream_request_with_cancel<R, S>(
             }
             next = stream.next() => match next {
                 Some(Ok(partition)) => {
+                    items_pulled = items_pulled.saturating_add(1);
                     let partition = match resume_filter_rows(partition, &start_key, &req) {
                         Some(p) => p,
                         None => continue,
@@ -308,7 +344,11 @@ pub async fn handle_stream_request_with_cancel<R, S>(
                     }
                     batch.push(partition);
                     if batch.len() >= chunk_size || batch_rows >= row_chunk_cap {
-                        emit_chunk(&req, &mut batch, chunk_seq, sink).await;
+                        // A send that is not accepted ends the request here:
+                        // returning drops `stream`, which unparks the producer.
+                        if !emit_chunk(&req, &mut batch, chunk_seq, sink, &cancel).await {
+                            return;
+                        }
                         batch_rows = 0;
                         chunk_seq = chunk_seq.saturating_add(1);
                         total_chunks_emitted = total_chunks_emitted.saturating_add(1);
@@ -336,6 +376,31 @@ pub async fn handle_stream_request_with_cancel<R, S>(
                 None => break 'pull, // stream exhausted
             },
             _ = ticker.tick() => {
+                let progress = (items_pulled, reader.io_progress());
+                if progress == last_heartbeat_progress {
+                    // Edge-logged: once when the walk stops progressing.
+                    if !withholding {
+                        withholding = true;
+                        tracing::warn!(
+                            request_id = req.request_id,
+                            keyspace = req.keyspace,
+                            table = req.table,
+                            items_pulled,
+                            "stream request: walk made no progress since the last heartbeat; \
+                             withholding heartbeats so the requester's idle timeout can fire"
+                        );
+                    }
+                    continue;
+                }
+                if withholding {
+                    withholding = false;
+                    tracing::info!(
+                        request_id = req.request_id,
+                        items_pulled,
+                        "stream request: walk progressing again; heartbeats resumed"
+                    );
+                }
+                last_heartbeat_progress = progress;
                 let hb = RangeReadStreamHeartbeatPayload {
                     request_id: req.request_id,
                     seq: heartbeat_seq,
@@ -343,14 +408,22 @@ pub async fn handle_stream_request_with_cancel<R, S>(
                 heartbeat_seq = heartbeat_seq.saturating_add(1);
                 let bytes = bincode::serialize(&hb)
                     .expect("RangeReadStreamHeartbeatPayload serialization is infallible");
-                sink.send(Message::RangeReadStreamHeartbeat(Bytes::from(bytes))).await;
+                let heartbeat = Message::RangeReadStreamHeartbeat(Bytes::from(bytes));
+                if !send_bounded(sink, heartbeat, req.request_id, "range read", &cancel).await {
+                    return;
+                }
             }
         }
     }
+    // The scan is over; release the producer before the final sends, so a
+    // slow terminator cannot keep it parked either.
+    drop(stream);
 
     // Flush any final partial batch.
     if !any_decode_error && !batch.is_empty() {
-        emit_chunk(&req, &mut batch, chunk_seq, sink).await;
+        if !emit_chunk(&req, &mut batch, chunk_seq, sink, &cancel).await {
+            return;
+        }
         total_chunks_emitted = total_chunks_emitted.saturating_add(1);
     }
 
@@ -374,8 +447,15 @@ pub async fn handle_stream_request_with_cancel<R, S>(
     };
     let bytes =
         bincode::serialize(&done).expect("RangeReadStreamDonePayload serialization is infallible");
-    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes)))
-        .await;
+    // The last frame: a failure is already logged and nothing remains to release.
+    send_bounded(
+        sink,
+        Message::RangeReadStreamDone(Bytes::from(bytes)),
+        req.request_id,
+        "range read",
+        &cancel,
+    )
+    .await;
 }
 
 /// Apply the within-partition resume filter (t_a0f922a3 mode 1): when the
@@ -396,6 +476,41 @@ fn resume_filter_rows(
     crate::write_path::filter_resumed_fragment(partition, start.key.as_bytes(), resume_ck)
 }
 
+/// Hand one frame of a streamed response to `sink`, bounded by
+/// [`STREAM_SINK_SEND_DEADLINE`] and by `cancel`. Returns `false` when the
+/// frame was not accepted; the caller must then abandon the request so its
+/// local storage stream is dropped and the producer behind it unparks. Logged
+/// here, once per request (callers return on the first failure). Shared by
+/// every responder that feeds a sink from a local storage walk.
+pub(super) async fn send_bounded<S: ChunkSink + ?Sized>(
+    sink: &S,
+    msg: Message,
+    request_id: u32,
+    what: &'static str,
+    cancel: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            tracing::debug!(request_id, what, "cancelled while a frame send was blocked");
+            false
+        }
+        sent = tokio::time::timeout(STREAM_SINK_SEND_DEADLINE, sink.send(msg)) => match sent {
+            Ok(()) => true,
+            Err(_elapsed) => {
+                tracing::error!(
+                    request_id,
+                    what,
+                    deadline_secs = STREAM_SINK_SEND_DEADLINE.as_secs(),
+                    "an outbound stream frame was not accepted within the deadline; abandoning \
+                     the request and releasing the local storage walk"
+                );
+                false
+            }
+        },
+    }
+}
+
 /// Build a `RangeReadStreamChunk` from `batch`, send it via `sink`,
 /// and clear `batch` so its backing allocation is reused for the
 /// next chunk. The partitions are moved out of the batch — no
@@ -406,7 +521,8 @@ async fn emit_chunk<S: ChunkSink>(
     batch: &mut Vec<Partition>,
     seq: u32,
     sink: &S,
-) {
+    cancel: &CancellationToken,
+) -> bool {
     // Drain into a wire-shaped Vec without cloning. After this
     // function returns, both the original Partition Vec and the
     // wire Vec are dropped.
@@ -419,11 +535,21 @@ async fn emit_chunk<S: ChunkSink>(
     };
     let bytes = bincode::serialize(&payload)
         .expect("RangeReadStreamChunkPayload serialization is infallible");
-    sink.send(Message::RangeReadStreamChunk(Bytes::from(bytes)))
-        .await;
+    send_bounded(
+        sink,
+        Message::RangeReadStreamChunk(Bytes::from(bytes)),
+        req.request_id,
+        "range read",
+        cancel,
+    )
+    .await
 }
 
-async fn send_truncated_done<S: ChunkSink>(req: &RangeReadStreamRequestPayload, sink: &S) {
+async fn send_truncated_done<S: ChunkSink>(
+    req: &RangeReadStreamRequestPayload,
+    sink: &S,
+    cancel: &CancellationToken,
+) {
     let done = RangeReadStreamDonePayload {
         request_id: req.request_id,
         total_chunks: 0,
@@ -432,8 +558,15 @@ async fn send_truncated_done<S: ChunkSink>(req: &RangeReadStreamRequestPayload, 
     };
     let bytes =
         bincode::serialize(&done).expect("RangeReadStreamDonePayload serialization is infallible");
-    sink.send(Message::RangeReadStreamDone(Bytes::from(bytes)))
-        .await;
+    // Nothing is held open on this path; a failed send is already logged.
+    send_bounded(
+        sink,
+        Message::RangeReadStreamDone(Bytes::from(bytes)),
+        req.request_id,
+        "range read",
+        cancel,
+    )
+    .await;
 }
 
 /// `RpcHandler` shell. Decodes the request, spawns the streaming
@@ -985,6 +1118,216 @@ mod tests {
         async fn send(&self, msg: Message) {
             self.sent.lock().unwrap().push(msg);
         }
+    }
+
+    /// A sink whose send never completes: the coordinator node stopped reading,
+    /// its lane queue is saturated, or its socket is full.
+    struct StuckSink {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ChunkSink for StuckSink {
+        async fn send(&self, _msg: Message) {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            futures::future::pending::<()>().await;
+        }
+    }
+
+    /// A reader whose stream records being dropped. On a real node the stream
+    /// is the storage producer's receiver: until it is dropped the producer
+    /// stays parked in `blocking_send`, holding its slot and (for an index
+    /// read) the engine's `tables` read guard.
+    struct DropTrackingReader {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl StreamRangeReader for DropTrackingReader {
+        fn range_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+            _projected_regular_ordinals: Option<&'a [u16]>,
+            _start: Option<&'a ferrosa_common::key::DecoratedKey>,
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
+            let flag = DropFlag(Arc::clone(&self.dropped));
+            let items = (0u8..=255).map(|tag| Ok(make_partition(tag)));
+            Ok(Box::pin(futures::stream::iter(items).map(move |item| {
+                let _keep = &flag;
+                item
+            })))
+        }
+    }
+
+    /// INVARIANT: a responder whose outbound send never completes releases its
+    /// local storage stream within a deadline. Without one, the handler parks
+    /// in `sink.send` forever, never observes cancel (the select only wraps the
+    /// pull), and keeps the producer parked behind it: the lane deadline bounds
+    /// the REQUESTER's wait for a reply, not the responder's chunk sends.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_outbound_send_releases_the_local_stream() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = Arc::new(DropTrackingReader {
+            dropped: Arc::clone(&dropped),
+        });
+        let sink = Arc::new(StuckSink {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let task_sink = Arc::clone(&sink);
+        let handler = tokio::spawn(async move {
+            handle_stream_request(req(21), reader, task_sink.as_ref(), 2).await;
+        });
+
+        tokio::time::sleep(STREAM_SINK_SEND_DEADLINE + Duration::from_secs(5)).await;
+        assert!(
+            sink.attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the handler must have reached the stuck send"
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the local stream is still held {}s after its send stalled",
+            (STREAM_SINK_SEND_DEADLINE + Duration::from_secs(5)).as_secs()
+        );
+        assert!(handler.is_finished(), "the handler must have returned");
+    }
+
+    /// A cancel arriving while a send is blocked ends the handler at once.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_a_stuck_send_releases_the_local_stream() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = Arc::new(DropTrackingReader {
+            dropped: Arc::clone(&dropped),
+        });
+        let sink = Arc::new(StuckSink {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cancel = CancellationToken::new();
+        let (task_sink, task_cancel) = (Arc::clone(&sink), cancel.clone());
+        let handler = tokio::spawn(async move {
+            handle_stream_request_with_cancel(req(22), reader, task_sink.as_ref(), 2, task_cancel)
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sink.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst) && handler.is_finished(),
+            "a cancel during a blocked send must release the local stream"
+        );
+    }
+
+    /// A reader whose walk never yields (stuck behind a lock, or a dead
+    /// rehydrate). `io` stands in for the node's I/O progress counter.
+    struct StuckWalkReader {
+        io: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl StreamRangeReader for StuckWalkReader {
+        fn range_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+            _projected_regular_ordinals: Option<&'a [u16]>,
+            _start: Option<&'a ferrosa_common::key::DecoratedKey>,
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn io_progress(&self) -> u64 {
+            self.io.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn heartbeats(sink: &VecSink) -> usize {
+        sink.take()
+            .iter()
+            .filter(|m| matches!(m, Message::RangeReadStreamHeartbeat(_)))
+            .count()
+    }
+
+    /// INVARIANT: a heartbeat proves PROGRESS, not that the handler task is
+    /// alive. A walk that yields nothing and moves no I/O sends no heartbeat,
+    /// so the coordinator's idle watchdog can fire and release its merge.
+    /// Unconditional heartbeats kept a stuck replica's stream "alive" forever
+    /// and pinned the coordinator's local walker inside `tables.read()`.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_walk_sends_no_heartbeats() {
+        let reader = Arc::new(StuckWalkReader {
+            io: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let sink = Arc::new(VecSink::new());
+        let task_sink = Arc::clone(&sink);
+        let handler = tokio::spawn(async move {
+            handle_stream_request(req(41), reader, task_sink.as_ref(), 2).await;
+        });
+        tokio::time::sleep(HEARTBEAT_INTERVAL * 10).await;
+        handler.abort();
+        assert_eq!(
+            heartbeats(&sink),
+            0,
+            "a walk that made no progress must not heartbeat"
+        );
+    }
+
+    /// The other side of the gate: a walk that yields no ROWS but whose I/O
+    /// moves (an R2 rehydrate in flight) keeps heartbeating, so a slow but
+    /// progressing walk is not killed by the idle watchdog.
+    #[tokio::test(start_paused = true)]
+    async fn a_walk_with_io_progress_keeps_heartbeating() {
+        let io = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reader = Arc::new(StuckWalkReader {
+            io: Arc::clone(&io),
+        });
+        let sink = Arc::new(VecSink::new());
+        let task_sink = Arc::clone(&sink);
+        let handler = tokio::spawn(async move {
+            handle_stream_request(req(42), reader, task_sink.as_ref(), 2).await;
+        });
+        for _ in 0..10 {
+            io.fetch_add(16 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        }
+        handler.abort();
+        assert!(
+            heartbeats(&sink) >= 8,
+            "a walk whose I/O progressed every interval must heartbeat each one"
+        );
+    }
+
+    /// A walk that yields rows too slowly to fill a chunk is progressing and
+    /// must heartbeat, even though no chunk frame goes out.
+    #[tokio::test(start_paused = true)]
+    async fn a_walk_yielding_rows_below_a_chunk_keeps_heartbeating() {
+        struct SlowRows;
+        impl StreamRangeReader for SlowRows {
+            fn range_iter<'a>(
+                &'a self,
+                _table_id: &TableId,
+                _projected_regular_ordinals: Option<&'a [u16]>,
+                _start: Option<&'a ferrosa_common::key::DecoratedKey>,
+            ) -> ferrosa_common::Result<PartitionStream<'a>> {
+                Ok(Box::pin(futures::stream::unfold(0u8, |tag| async move {
+                    tokio::time::sleep(HEARTBEAT_INTERVAL / 2).await;
+                    Some((Ok(make_partition(tag)), tag.wrapping_add(1)))
+                })))
+            }
+        }
+        let sink = Arc::new(VecSink::new());
+        let task_sink = Arc::clone(&sink);
+        let handler = tokio::spawn(async move {
+            // chunk_size far above what arrives, so no chunk is emitted.
+            handle_stream_request(req(43), Arc::new(SlowRows), task_sink.as_ref(), 10_000).await;
+        });
+        tokio::time::sleep(HEARTBEAT_INTERVAL * 10).await;
+        handler.abort();
+        assert!(
+            heartbeats(&sink) >= 8,
+            "row progress must keep heartbeats flowing"
+        );
     }
 
     /// Happy path: reader returns 5 partitions, chunk_size=2 →

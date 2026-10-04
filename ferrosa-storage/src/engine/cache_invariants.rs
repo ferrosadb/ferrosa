@@ -1133,13 +1133,36 @@ async fn i1_i2_compaction_over_evicted_inputs_keeps_the_bound_and_every_row() {
         h.write_cycle();
         h.flush_and_sync().await;
     }
-    h.engine().force_compact_all();
+    let before: Vec<usize> = h
+        .models
+        .iter()
+        .map(|model| h.engine().sstable_count(&model.tid))
+        .collect();
     assert!(
-        h.engine()
-            .await_compaction_result(std::time::Duration::from_secs(30)),
-        "compaction over evicted inputs produced no result"
+        before.iter().all(|&n| n >= 2),
+        "precondition: every table has inputs to compact: {before:?}"
     );
-    h.engine().poll_compactions().await;
+    h.engine().force_compact_all();
+    // Settle EVERY table's compaction on the executor's own completion
+    // signal (`drive_compactions_until_idle`), never on wall-clock time: the
+    // old `await_compaction_result(30s)` raced a 30 s budget against a
+    // rehydrating compaction and failed under load (t_e3aabb17). The guard
+    // below only turns a stuck worker into a loud failure. An input of a
+    // compaction still running is local and listed until its swap, which the
+    // cache bound below then counts against the cap.
+    for model in &h.models {
+        h.engine()
+            .drive_compactions_until_idle(&model.tid, std::time::Duration::from_secs(300))
+            .await;
+    }
+    for (model, before) in h.models.iter().zip(&before) {
+        let after = h.engine().sstable_count(&model.tid);
+        assert!(
+            after < *before,
+            "{}: compaction over evicted inputs produced no result ({before} -> {after} SSTables)",
+            model.name
+        );
+    }
     h.sync().await;
     let acct = h.assert_cache_bound("after compaction").await;
     assert_data_dwarfs_cache(&acct, params.cache_cap);

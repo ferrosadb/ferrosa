@@ -164,17 +164,64 @@ spill error, a storage error during the scan) is reported as an `ErrorResponse`
 after the rows already written — as PostgreSQL does — never as a
 `CommandComplete` and never as a silently short result (FMEA PG-Tf348ba0b).
 
-`ferrosa_sql::execute_streaming` is synchronous and CPU-bound (scan, filter,
-sort, hash-aggregate, hash-join). It must never run inline on the async
-handlers: doing so pins an async worker for the whole query and starves
-connection keepalives — the failure mode PR #131 fixed on the CQL path. Both
-call sites (simple and extended) start it through `result_stream::open_stream`,
-and `result_stream::tests::executor_does_not_run_on_the_async_worker` fails if
-that regresses (forge t_d3b2dec1).
+The executor (`ferrosa_sql::open_cursor`, then `RowCursor::next_row`) is
+synchronous and CPU-bound (scan, filter, sort, hash-aggregate, hash-join). It
+must never run inline on the async handlers: doing so pins an async worker for
+the whole query and starves connection keepalives — the failure mode PR #131
+fixed on the CQL path. Both call sites (simple and extended) start it through
+`result_stream::open_stream`, and
+`result_stream::tests::executor_does_not_run_on_the_async_worker` fails if that
+regresses (forge t_d3b2dec1).
 
-Cost of suspension: a suspended portal parks one `spawn_blocking` thread in a
-channel send until it resumes or is closed. The runtimes cap blocking threads,
-so many concurrently suspended portals consume that budget.
+**A waiting query holds no thread.** The query is an owned `RowCursor`, pulled
+on a blocking thread one fetch (16 rows) at a time; the next fetch starts as
+soon as a batch arrives. A fetch waits only on the executor's inputs, never on
+the client, so a suspended portal or a client that stopped reading its socket
+holds no blocking thread. Below it, the storage range scan pauses after a
+10 ms grace and gives back its pool slot and thread too, keeping its exact
+position (ferrosa-storage ST-82). Before this, each suspended portal parked
+two blocking threads, and about `cores` idle clients exhausted the listener
+runtime's bounded blocking pool (`tests/pg_suspended_portals_hold_no_thread.rs`:
+16 portals beside a 4-thread pool, every thread free, another session's
+SELECT completes; `tests/pg_stalled_reader_holds_no_thread.rs`: the same for
+8 clients that stopped reading their sockets).
+
+**Limits on suspended portals** (`portal_limits.rs`, FMEA PG-14/PG-15). A
+suspended portal still holds its query (a few batches of rows, the storage
+scan's open SSTable readers, spilled sort runs), so how many may wait, and for
+how long, is bounded:
+
+| `[postgres]` TOML | Environment | Default |
+|---|---|---|
+| `max_suspended_portals_per_connection` | `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS_PER_CONNECTION` | 64 |
+| `max_suspended_portals` | `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS` | 2048 |
+| `suspended_portal_idle_timeout_ms` | `FERROSA_POSTGRES_SUSPENDED_PORTAL_IDLE_TIMEOUT_MS` | 600000 |
+
+TOML wins over the environment; a malformed value is logged at ERROR and the
+defaults apply. A fresh portal executed with `max_rows` (the only kind that
+can suspend) takes its place under both limits before it runs; past either
+it is refused with SQLSTATE `53000` before any `DataRow`, as PostgreSQL
+refuses a resource limit before output. A portal that completes without
+suspending gives its place back. At the limit, such an `Execute` is refused
+even if its result would have fit in `max_rows`. A portal left untouched past the idle timeout is closed
+by its connection (which wakes for it even when the client sends nothing);
+a later `Execute` on it answers `57014` naming the timeout, never a silent
+restart. `Close`, a rebind, `Sync` outside a block, the end of a transaction
+(PostgreSQL destroys a transaction's portals) and disconnect release a portal
+at once. A portal run to its end answers a further `Execute` with no rows
+(`SELECT 0`), as PostgreSQL does, instead of re-running its query. Metrics:
+`ferrosa_pg_suspended_portals` (gauge), `ferrosa_pg_suspended_portal_refusals_total`,
+`ferrosa_pg_suspended_portal_expiries_total`; refusals WARN when they start
+and INFO when admission resumes.
+
+**What a suspended portal sees of concurrent writes.** Rows changed by
+PostgreSQL transactions follow the portal's MVCC snapshot (the overlay in
+`storage_provider`). Rows written outside PostgreSQL (CQL, or the storage
+engine directly) are read as the storage scan reaches them: a storage range
+scan is not a snapshot, so a row written ahead of the scan's position may or
+may not appear, suspended or not. Every row that existed when the portal
+started and was not deleted appears exactly once, in storage (token) order
+(`tests/pg_portal_resume.rs`).
 
 **DDL (`CREATE TABLE [IF NOT EXISTS]`, T-132a).** Simple protocol only. The
 statement is planned into a `TableMetadata` (`ddl.rs`) and applied through the

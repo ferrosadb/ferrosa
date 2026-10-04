@@ -181,6 +181,8 @@ mod tests {
             MsgType::ReadRequest as u8,
             MsgType::ReadResponse as u8,
             MsgType::PartitionSuffixReadRequest as u8,
+            MsgType::ResultCursorPage as u8,
+            MsgType::ResultCursorPageReply as u8,
             MsgType::RepairWrite as u8,
             MsgType::StreamStart as u8,
             MsgType::StreamChunk as u8,

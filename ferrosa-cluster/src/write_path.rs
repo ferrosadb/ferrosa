@@ -17,10 +17,12 @@ use ferrosa_storage::{Mutation, TableId};
 use futures::{Stream, StreamExt};
 
 use crate::consistency::ConsistencyLevel;
+use crate::coordinator::range_read_stream::ClusterPartitionStream;
 use crate::coordinator::ClusterCoordinator;
 use crate::error::ClusterError;
 use crate::pair::coordinator::PairCoordinator;
 use crate::ring::strategy::ReplicationStrategy;
+use ferrosa_net::task_pool::TaskPool;
 
 /// Per-replica scan window for the LEGACY single-shot range RPC.
 ///
@@ -205,6 +207,97 @@ fn local_projected_range_stream(
     let stream = engine
         .range_iter_projected(table_id, wanted, partition_limit, None, None)
         .map(|item| item.map_err(crate::error::ClusterError::Storage));
+    Box::pin(stream)
+}
+
+// ── Partition-count bounding for cluster-wide projected scans ─────────────
+//
+// INVARIANTS this must preserve (an innocuous "simplification" here silently
+// truncates a user's result set):
+//
+//   I1. COMPLETE PARTITIONS. A bound of `N` yields at most `N` DISTINCT
+//       partition keys, and every row belonging to those keys. Fragments of one
+//       key arrive consecutively in the merge output, so a key that is NOT the
+//       last emitted one is provably complete (a later key's arrival proves the
+//       previous one ended). Folding a fragment into the last emitted key is
+//       therefore ALWAYS allowed — including at the bound. Stopping on a key
+//       CHANGE is what guarantees no partition is cut mid-way, and it is why
+//       nothing is dropped that a materialized read would have returned.
+//
+//   I2. NO PARTIAL FAN-OUT. The bound applies on top of the existing
+//       consistency checks; `N >= remote_count_for_cl(...)` is the caller's
+//       responsibility (see `range_read_projected_stream_all_with`) so the
+//       first page cannot be served from fewer replicas than the CL demands.
+//
+//   I3. ERRORS SURFACE. A failing fragment is forwarded, never swallowed as an
+//       early end — a bound must not turn a replica failure into a short page.
+//
+//   I4. BOUNDED MEMORY. The pass holds one `current` partition plus the
+//       lookahead fragment that proved the key change: `O(one partition + one
+//       fragment)`, independent of table size and in-flight partitions.
+
+/// Whether the partition bound has been reached and the scan must stop.
+///
+/// Pure so the bound arithmetic is testable without a cluster. `emitted` counts
+/// distinct keys already produced.
+fn partition_bound_reached(emitted: usize, bound: usize) -> bool {
+    emitted >= bound
+}
+
+/// Wrap a cluster partition stream so it yields at most `limit` whole
+/// partitions.
+///
+/// Same streaming stage shape as the per-partition row cap
+/// (`apply_per_partition_row_limit`): an `mpsc` stage driven by a task, so the
+/// consumer never holds more than the channel buffer plus one partition.
+fn bounded_partition_stream(
+    mut inner: ClusterPartitionStream,
+    limit: usize,
+) -> PartitionResultStream {
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    TaskPool::current("range-read-projected-partition-cap").spawn(async move {
+        use futures::StreamExt as _;
+        // A zero bound is meaningless for a bounded read; floor at 1 the way
+        // `range_read_limited` does rather than emitting nothing.
+        let limit = limit.max(1);
+        let mut emitted: usize = 0;
+        let mut current: Option<Partition> = None;
+        while let Some(item) = inner.next().await {
+            let fragment = match item {
+                Ok(f) => f,
+                // I3: a failing fragment is surfaced, never swallowed as an
+                // early end — a bound must not turn a replica failure into a
+                // short page.
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            match current.as_mut() {
+                // I1: same key — always fold, even at the bound, so the last
+                // emitted partition is complete.
+                Some(held) if held.key == fragment.key => held.rows.extend(fragment.rows),
+                _ => {
+                    if let Some(done) = current.take() {
+                        emitted += 1;
+                        if tx.send(Ok(done)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if partition_bound_reached(emitted, limit) {
+                        return;
+                    }
+                    current = Some(fragment);
+                }
+            }
+        }
+        if let Some(done) = current {
+            let _ = tx.send(Ok(done)).await;
+        }
+    });
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
     Box::pin(stream)
 }
 
@@ -972,19 +1065,40 @@ impl WritePath {
                 ))
             }
             Self::Cluster(coordinator) => {
-                if partition_limit.is_some() {
-                    return Err(crate::error::ClusterError::Internal(
-                        "projected cluster range scan with partition_limit is not implemented; refusing to return partial results".into(),
-                    ));
-                }
-                coordinator
+                let stream = coordinator
                     .coordinate_range_read_projected_stream_all_with(
                         table_id,
-                        wanted,
+                        wanted.clone(),
                         cl,
                         strategy.replication_factor(),
                     )
-                    .await
+                    .await?;
+                match partition_limit {
+                    Some(limit) => {
+                        // `LIMIT N` on a projected cluster scan. The local paths
+                        // push the bound into the engine scan; the cluster path
+                        // has no such parameter (`range_iter_projected` takes one,
+                        // the coordinator fan-out does not), so bound the merged
+                        // output here instead of refusing the query.
+                        //
+                        // The refusal this replaces was an outage for a shape the
+                        // engine can answer: `SELECT chunk_id … LIMIT 10` failed
+                        // cluster-wide while `COUNT(*)` succeeded, because only the
+                        // projected+limited combination was unimplemented.
+                        //
+                        // No extra consistency guard is added here: the coordinator
+                        // already refuses a fan-out shorter than the CL demands
+                        // (`partial fan-out — refusing to serve below the requested
+                        // consistency level`) before any fragment reaches this
+                        // bound, so a short page cannot silently read below CL.
+                        Ok(bounded_partition_stream(stream, limit.max(1)))
+                    }
+                    None => {
+                        // Unbounded projected scan: forward the merged stream
+                        // directly, exactly as before.
+                        Ok(Box::pin(stream))
+                    }
+                }
             }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
                 "coordinate_range_read_projected_stream_all_with unavailable: write path is in degraded mode".into(),
@@ -1905,5 +2019,129 @@ mod tests {
             vec![0x06, 0x07],
             "only rows strictly greater than the resume clustering survive"
         );
+    }
+
+    // ── Bounded projected cluster scan (partition_limit on the cluster path) ──
+
+    fn frag(key_byte: u8, row_count: usize) -> Partition {
+        let key = DecoratedKey::new(PartitionKey::new(vec![key_byte]));
+        let rows: Vec<ferrosa_sstable::types::Row> = (0..row_count)
+            .map(|i| ferrosa_sstable::types::Row {
+                clustering: vec![i as u8],
+                cells: vec![],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1),
+            })
+            .collect();
+        Partition {
+            key,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        }
+    }
+
+    /// A bound of `N` yields AT MOST `N` distinct partition keys. This is the
+    /// property `LIMIT` needs: without it the cluster path refused the query.
+    #[tokio::test]
+    async fn bounded_projected_stream_yields_at_most_the_bound() {
+        let inner: ClusterPartitionStream = Box::pin(futures::stream::iter(vec![
+            Ok(frag(1, 1)),
+            Ok(frag(2, 1)),
+            Ok(frag(3, 1)),
+            Ok(frag(4, 1)),
+        ]));
+        let out: Vec<_> = bounded_partition_stream(inner, 2)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("no error"))
+            .collect();
+        assert_eq!(out.len(), 2, "a bound of 2 must yield 2 partitions");
+        assert_eq!(out[0].key, frag(1, 1).key);
+        assert_eq!(out[1].key, frag(2, 1).key);
+    }
+
+    /// A bound of `1` still yields ONE WHOLE partition — never a partial one.
+    /// This is the invariant that stops the bound corrupting a result: fragments
+    /// of a key arrive consecutively, so folding them is always allowed.
+    #[tokio::test]
+    async fn bounded_projected_stream_folds_whole_partitions() {
+        // Partition 1 arrives as three fragments (1 row + 2 rows + 1 row = 4);
+        // partition 2 must not be started.
+        let inner: ClusterPartitionStream = Box::pin(futures::stream::iter(vec![
+            Ok(frag(1, 1)),
+            Ok(frag(1, 2)),
+            Ok(frag(1, 1)),
+            Ok(frag(2, 5)),
+        ]));
+        let out: Vec<_> = bounded_partition_stream(inner, 1)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("no error"))
+            .collect();
+        assert_eq!(out.len(), 1, "bound of 1 yields exactly one partition");
+        assert_eq!(
+            out[0].rows.len(),
+            4,
+            "every row of the bounded partition must survive the fold"
+        );
+        assert_eq!(out[0].key, frag(1, 1).key);
+    }
+
+    /// Fewer partitions than the bound: everything is returned, and the last
+    /// partition is flushed after the stream ends (the `current` tail).
+    #[tokio::test]
+    async fn bounded_projected_stream_returns_everything_under_the_bound() {
+        let inner: ClusterPartitionStream =
+            Box::pin(futures::stream::iter(vec![Ok(frag(1, 1)), Ok(frag(2, 1))]));
+        let out: Vec<_> = bounded_partition_stream(inner, 10)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("no error"))
+            .collect();
+        assert_eq!(out.len(), 2, "under the bound, nothing is dropped");
+    }
+
+    /// A failing fragment is SURFACED. A bound must never turn a replica failure
+    /// into a silently short page.
+    #[tokio::test]
+    async fn bounded_projected_stream_surfaces_fragment_errors() {
+        let inner: ClusterPartitionStream = Box::pin(futures::stream::iter(vec![
+            Ok(frag(1, 1)),
+            Err(ClusterError::Internal("replica dropped mid-stream".into())),
+            Ok(frag(2, 1)),
+        ]));
+        let items: Vec<_> = bounded_partition_stream(inner, 10).collect().await;
+        assert!(
+            items.iter().any(|r| r.is_err()),
+            "the failure must reach the caller, not be swallowed as an early end"
+        );
+    }
+
+    /// A zero bound must not mean "return nothing" — it floors at 1, matching
+    /// `range_read_limited`.
+    #[tokio::test]
+    async fn bounded_projected_stream_floors_a_zero_bound_at_one() {
+        let inner: ClusterPartitionStream =
+            Box::pin(futures::stream::iter(vec![Ok(frag(1, 1)), Ok(frag(2, 1))]));
+        let out: Vec<_> = bounded_partition_stream(inner, 0)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("no error"))
+            .collect();
+        assert_eq!(out.len(), 1, "a zero bound floors at one partition");
+    }
+
+    #[test]
+    fn partition_bound_reached_is_the_emitted_versus_bound_rule() {
+        assert!(!partition_bound_reached(0, 1));
+        assert!(partition_bound_reached(1, 1));
+        assert!(partition_bound_reached(2, 1));
+        assert!(!partition_bound_reached(9, 10));
+        assert!(partition_bound_reached(10, 10));
     }
 }

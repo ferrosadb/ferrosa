@@ -16,6 +16,8 @@ pub const ENV_TICK_SECS: &str = "FERROSA_SELFHEAL_TICK_SECS";
 pub const ENV_MAX_ATTEMPTS: &str = "FERROSA_SELFHEAL_MAX_ATTEMPTS";
 /// Per-(table, issue) cooldown in ticks between attempts.
 pub const ENV_COOLDOWN_TICKS: &str = "FERROSA_SELFHEAL_COOLDOWN_TICKS";
+/// Vector-index generations decoded and checked per index per tick.
+pub const ENV_VECTOR_DECODE_BUDGET: &str = "FERROSA_SELFHEAL_VECTOR_DECODE_BUDGET";
 
 /// Deterministic, fixed configuration for the self-heal control loop.
 ///
@@ -37,6 +39,10 @@ pub struct SelfHealConfig {
     /// (table, issue) is eligible again (FMEA #5 / #10 deterministic
     /// backoff — keyed by attempt count below).
     pub cooldown_ticks: u64,
+    /// Not-yet-verified vector-index generations whose sidecars are decoded
+    /// and checked per index per tick. Bounds the read cost of verification;
+    /// cheap metadata checks run on every generation every tick regardless.
+    pub vector_decode_budget: usize,
 }
 
 impl Default for SelfHealConfig {
@@ -48,6 +54,7 @@ impl Default for SelfHealConfig {
             tick_interval: Duration::from_secs(30),
             max_attempts: 3,
             cooldown_ticks: 4,
+            vector_decode_budget: 8,
         }
     }
 }
@@ -65,18 +72,22 @@ impl SelfHealConfig {
         let tick_secs = parse_u64(ENV_TICK_SECS, d.tick_interval.as_secs()).max(1);
         let max_attempts = parse_u64(ENV_MAX_ATTEMPTS, d.max_attempts as u64).max(1) as u32;
         let cooldown_ticks = parse_u64(ENV_COOLDOWN_TICKS, d.cooldown_ticks);
+        let vector_decode_budget =
+            parse_u64(ENV_VECTOR_DECODE_BUDGET, d.vector_decode_budget as u64).max(1) as usize;
 
         let cfg = Self {
             enabled,
             tick_interval: Duration::from_secs(tick_secs),
             max_attempts,
             cooldown_ticks,
+            vector_decode_budget,
         };
         tracing::info!(
             enabled = cfg.enabled,
             tick_secs = cfg.tick_interval.as_secs(),
             max_attempts = cfg.max_attempts,
             cooldown_ticks = cfg.cooldown_ticks,
+            vector_decode_budget = cfg.vector_decode_budget,
             "self-heal: controller configuration resolved"
         );
         cfg

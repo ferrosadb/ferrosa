@@ -139,32 +139,152 @@ impl From<LivenessInfoWire> for LivenessInfo {
     }
 }
 
-/// Serializable mirror of [`CellValue`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Serializable mirror of [`CellValue`], including a complex (non-frozen
+/// collection) cell's [`path`](CellValue::path).
+///
+/// # Wire format (bincode, positional)
+///
+/// - **Simple cell** (`path == None`): the original layout, byte for byte —
+///   `value: Option<Vec<u8>>` (bincode Option tag `0`/`1`), `timestamp`,
+///   `ttl`, `local_deletion_time`. Old and new nodes exchange (and digest)
+///   simple data identically.
+/// - **Complex cell** (`path == Some`): [`COMPLEX_CELL_TAG`] (`2`) in the byte
+///   where the Option tag sits, then `value: Option<Vec<u8>>`, `path: Vec<u8>`,
+///   `timestamp`, `ttl`, `local_deletion_time`.
+///
+/// bincode rejects any Option tag other than `0`/`1`, so a node built before
+/// this format fails the whole message with the typed
+/// `bincode::ErrorKind::InvalidTagEncoding(2)` rather than reading an element
+/// as a path-less cell (`legacy_decoder_rejects_complex_cells_with_a_decode_error`).
+/// What the old node then does is up to its call site: reads count the replica
+/// as failed and range streams fail, but the old row-stream receiver stored an
+/// undecodable payload as a raw live cell, so topology changes (bootstrap,
+/// decommission, rebalance) must not stream from a new node to an old one.
+/// Before this format the sender asserted and the receiver dropped every path.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CellValueWire {
     pub value: Option<Vec<u8>>,
     pub timestamp: i64,
     pub ttl: i32,
     pub local_deletion_time: i32,
+    pub path: Option<Vec<u8>>,
+}
+
+/// Leading byte of a complex cell on the wire. Occupies the slot of the simple
+/// layout's Option tag (`0` = None, `1` = Some), so it must never be `0` or `1`.
+pub const COMPLEX_CELL_TAG: u8 = 2;
+
+/// Emit one cell in [`CellValueWire`]'s layout from borrowed parts. The single
+/// encoder behind the owned `Serialize` impl and the borrowed partition
+/// serializers, so the three cannot drift apart.
+fn serialize_cell_wire_into<W: std::io::Write>(
+    writer: &mut W,
+    cell: &CellValue,
+) -> Result<(), bincode::Error> {
+    match &cell.path {
+        None => bincode::serialize_into(&mut *writer, &cell.value)?,
+        Some(path) => {
+            bincode::serialize_into(&mut *writer, &COMPLEX_CELL_TAG)?;
+            bincode::serialize_into(&mut *writer, &cell.value)?;
+            bincode::serialize_into(&mut *writer, path)?;
+        }
+    }
+    bincode::serialize_into(&mut *writer, &cell.timestamp)?;
+    bincode::serialize_into(&mut *writer, &cell.ttl)?;
+    bincode::serialize_into(&mut *writer, &cell.local_deletion_time)?;
+    Ok(())
+}
+
+impl Serialize for CellValueWire {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        // A bincode tuple is its elements concatenated — the same bytes the
+        // derived struct impl produced for the simple layout.
+        match &self.path {
+            None => {
+                let mut t = s.serialize_tuple(4)?;
+                t.serialize_element(&self.value)?;
+                t.serialize_element(&self.timestamp)?;
+                t.serialize_element(&self.ttl)?;
+                t.serialize_element(&self.local_deletion_time)?;
+                t.end()
+            }
+            Some(path) => {
+                let mut t = s.serialize_tuple(6)?;
+                t.serialize_element(&COMPLEX_CELL_TAG)?;
+                t.serialize_element(&self.value)?;
+                t.serialize_element(path)?;
+                t.serialize_element(&self.timestamp)?;
+                t.serialize_element(&self.ttl)?;
+                t.serialize_element(&self.local_deletion_time)?;
+                t.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CellValueWire {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The longest layout (complex) has six elements; the simple one stops
+        // after four. bincode does not encode a tuple length, so the visitor
+        // reads exactly the elements the leading tag says are there.
+        d.deserialize_tuple(6, CellValueWireVisitor)
+    }
+}
+
+struct CellValueWireVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CellValueWireVisitor {
+    type Value = CellValueWire;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a CellValueWire (simple or complex layout)")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error as _;
+        fn next<'de, T: Deserialize<'de>, A: serde::de::SeqAccess<'de>>(
+            seq: &mut A,
+            field: &'static str,
+        ) -> Result<T, A::Error> {
+            seq.next_element()?
+                .ok_or_else(|| A::Error::custom(format!("CellValueWire: missing {field}")))
+        }
+
+        let tag: u8 = next(&mut seq, "leading tag")?;
+        let (value, path) = match tag {
+            0 => (None, None),
+            1 => (Some(next::<Vec<u8>, _>(&mut seq, "value")?), None),
+            COMPLEX_CELL_TAG => {
+                let value: Option<Vec<u8>> = next(&mut seq, "complex value")?;
+                let path: Vec<u8> = next(&mut seq, "complex path")?;
+                (value, Some(path))
+            }
+            other => {
+                return Err(A::Error::custom(format!(
+                    "CellValueWire: unknown leading tag {other} (0/1 = simple cell, \
+                     {COMPLEX_CELL_TAG} = complex cell); sent by a newer node?"
+                )))
+            }
+        };
+        Ok(CellValueWire {
+            value,
+            timestamp: next(&mut seq, "timestamp")?,
+            ttl: next(&mut seq, "ttl")?,
+            local_deletion_time: next(&mut seq, "local_deletion_time")?,
+            path,
+        })
+    }
 }
 
 impl From<CellValue> for CellValueWire {
     fn from(c: CellValue) -> Self {
-        // Fail loud: this streaming wire (bincode `RowWire`) cannot yet carry a
-        // complex-column cell path, and silently dropping it would lose collection
-        // elements during repair/bootstrap streaming. No write path emits complex
-        // cells today, so this never fires; it must be extended (with its own
-        // bincode-format versioning) before complex cells reach the streaming path
-        // (t_83c4f093, a later increment).
-        assert!(
-            c.path.is_none(),
-            "streaming RowWire cannot yet carry a complex-cell path"
-        );
         Self {
             value: c.value,
             timestamp: c.timestamp,
             ttl: c.ttl,
             local_deletion_time: c.local_deletion_time,
+            path: c.path,
         }
     }
 }
@@ -176,9 +296,7 @@ impl From<CellValueWire> for CellValue {
             timestamp: w.timestamp,
             ttl: w.ttl,
             local_deletion_time: w.local_deletion_time,
-            // CellValueWire predates complex-cell paths; extended with the wire
-            // format in a later increment.
-            path: None,
+            path: w.path,
         }
     }
 }
@@ -291,14 +409,9 @@ fn serialize_row_to_wire_borrowed<W: std::io::Write>(
     bincode::serialize_into(&mut *writer, &n_cells)?;
     for (idx, cell) in &row.cells {
         bincode::serialize_into(&mut *writer, idx)?;
-        // CellValueWire field order: value, timestamp, ttl,
-        // local_deletion_time. Identical field layout to the
-        // in-memory `CellValue`, so emitting field-by-field
-        // matches the bincode struct serialisation.
-        bincode::serialize_into(&mut *writer, &cell.value)?;
-        bincode::serialize_into(&mut *writer, &cell.timestamp)?;
-        bincode::serialize_into(&mut *writer, &cell.ttl)?;
-        bincode::serialize_into(&mut *writer, &cell.local_deletion_time)?;
+        // The shared CellValueWire encoder, so a complex cell's path is
+        // carried here exactly as the owned path carries it.
+        serialize_cell_wire_into(&mut *writer, cell)?;
     }
     serialize_deletion_time_borrowed(
         &mut *writer,
@@ -521,15 +634,9 @@ fn serialize_row_borrowed<W: std::io::Write>(
     bincode::serialize_into(&mut *writer, &n_cells)?;
     for (idx, cell) in &row.cells {
         bincode::serialize_into(&mut *writer, idx)?;
-        // CellValueWire fields in order: value, timestamp, ttl,
-        // local_deletion_time. CellValueWire is `Serialize` for a
-        // struct with named fields — bincode emits its fields in
-        // declaration order with no field tags, so emitting them
-        // individually here produces an identical byte stream.
-        bincode::serialize_into(&mut *writer, &cell.value)?;
-        bincode::serialize_into(&mut *writer, &cell.timestamp)?;
-        bincode::serialize_into(&mut *writer, &cell.ttl)?;
-        bincode::serialize_into(&mut *writer, &cell.local_deletion_time)?;
+        // Same encoder as the wire, so the digest covers a complex cell's
+        // path: replicas whose collections differ only by path must not agree.
+        serialize_cell_wire_into(&mut *writer, cell)?;
     }
     // deletion: DeletionTimeWire
     serialize_deletion_time(
@@ -642,42 +749,12 @@ fn serialize_deletion_time<W: std::io::Write>(
     Ok(())
 }
 
-/// Extract the newest timestamp from any row in the partition (including the
-/// static row), or `i64::MIN` if there are no rows.
+/// Newest timestamp anywhere in the partition — rows, static row, row and
+/// partition deletions — or `i64::MIN` if it holds nothing. The read
+/// coordinator compares this against its own full read with the same
+/// definition, so a replica holding a newer partition deletion is "newer".
 fn newest_timestamp(partition: &Partition) -> i64 {
-    let mut ts = i64::MIN;
-
-    if let Some(ref sr) = partition.static_row {
-        let row_ts = row_max_timestamp(sr);
-        if row_ts > ts {
-            ts = row_ts;
-        }
-    }
-
-    for row in &partition.rows {
-        let row_ts = row_max_timestamp(row);
-        if row_ts > ts {
-            ts = row_ts;
-        }
-    }
-
-    ts
-}
-
-fn row_max_timestamp(row: &Row) -> i64 {
-    let mut ts = if row.primary_key_liveness.has_timestamp() {
-        row.primary_key_liveness.timestamp
-    } else {
-        i64::MIN
-    };
-
-    for (_, cell) in &row.cells {
-        if cell.timestamp > ts {
-            ts = cell.timestamp;
-        }
-    }
-
-    ts
+    ferrosa_storage::partition_apply::partition_write_timestamp(partition)
 }
 
 // ---------------------------------------------------------------------------
@@ -1952,6 +2029,203 @@ mod tests {
             "borrowed partition serializer must emit byte-identical \
              output to the clone-then-bincode path"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Complex (non-frozen collection) cells on the RowWire (t_83c4f093)
+    // -----------------------------------------------------------------------
+
+    /// A partition holding a non-frozen collection in every shape the wire must
+    /// carry: a scalar beside it, the collection-deletion sentinel (a `path =
+    /// None` tombstone), an element whose path is EMPTY (a `set<text>` holding
+    /// `""`), a live element, a removed element, and a static collection.
+    /// Cells are in (col_idx, path) order, as storage keeps them.
+    fn make_complex_partition(element_path: &[u8]) -> Partition {
+        let mut p = make_partition(b"complex", 5_000);
+        p.rows[0].cells = vec![
+            (0, CellValue::live(b"scalar".to_vec(), 5_000)),
+            (1, CellValue::tombstone(4_999, 1_700_000_000)),
+            (1, CellValue::live(Vec::new(), 5_000).with_path(Vec::new())),
+            (
+                1,
+                CellValue::live(b"a".to_vec(), 5_000).with_path(element_path.to_vec()),
+            ),
+            (
+                1,
+                CellValue::tombstone(5_001, 1_700_000_001).with_path(b"zz".to_vec()),
+            ),
+        ];
+        p.static_row = Some(Row {
+            clustering: vec![],
+            cells: vec![(
+                0,
+                CellValue::live(b"s".to_vec(), 5_000).with_path(b"k".to_vec()),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(5_000),
+        });
+        p
+    }
+
+    /// The wire shape every build before t_83c4f093 decodes. Kept verbatim so
+    /// the compatibility tests below measure against what is actually deployed,
+    /// not against whatever `CellValueWire` happens to be today.
+    mod legacy {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub struct CellValueWire {
+            pub value: Option<Vec<u8>>,
+            pub timestamp: i64,
+            pub ttl: i32,
+            pub local_deletion_time: i32,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        pub struct DeletionTimeWire {
+            pub marked_for_delete_at: i64,
+            pub local_deletion_time: u32,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        pub struct LivenessInfoWire {
+            pub timestamp: i64,
+            pub ttl: i32,
+            pub local_deletion_time: i32,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        pub struct RowWire {
+            pub clustering: Vec<u8>,
+            pub cells: Vec<(u16, CellValueWire)>,
+            pub deletion: DeletionTimeWire,
+            pub primary_key_liveness: LivenessInfoWire,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        pub struct PartitionWire {
+            pub token: i64,
+            pub key_bytes: Vec<u8>,
+            pub deletion: DeletionTimeWire,
+            pub static_row: Option<RowWire>,
+            pub rows: Vec<RowWire>,
+        }
+    }
+
+    /// Every cell, path included, must survive `partition_to_wire` → bincode →
+    /// `partition_from_wire`. Before the fix the sender asserted (21 panics on
+    /// node1's `data-rt`, 2026-10-03) and the receiver set every path to None.
+    #[test]
+    fn row_wire_round_trips_complex_cell_paths() {
+        let original = make_complex_partition(b"pA");
+        let bytes = bincode::serialize(&partition_to_wire(original.clone())).unwrap();
+        let wire: PartitionWire = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(partition_from_wire(wire), original);
+    }
+
+    /// The borrowed serializer must emit the same bytes as the owned path for
+    /// complex cells too. It used to skip the path without a word, which would
+    /// hand a receiver each list element as a LIVE path-less cell. Its only
+    /// caller today is `stream_range_response`, which only tests reach
+    /// (production range streaming uses `partition_to_wire`), so this was not
+    /// the source of the 2026-10-03 writer refusals; the defect is real all
+    /// the same.
+    #[test]
+    fn borrowed_serializer_carries_complex_cell_paths() {
+        let original = make_complex_partition(b"pA");
+        let mut borrowed = Vec::new();
+        serialize_partition_to_wire_borrowed(&mut borrowed, &original).unwrap();
+        let wire: PartitionWire = bincode::deserialize(&borrowed).unwrap();
+        assert_eq!(partition_from_wire(wire), original);
+        assert_eq!(
+            borrowed,
+            bincode::serialize(&partition_to_wire(original)).unwrap(),
+            "borrowed and owned encoders must stay byte-identical"
+        );
+    }
+
+    /// Mixed-version cluster, new → old: a node that predates complex cells
+    /// must REFUSE a partition carrying one with a decode error. Decoding it
+    /// "successfully" would hand the old node path-less element cells, which
+    /// is the silent drop this format exists to prevent.
+    #[test]
+    fn legacy_decoder_rejects_complex_cells_with_a_decode_error() {
+        let partition = make_complex_partition(b"pA");
+        let expect_tag_error = |err: bincode::Error, what: &str| {
+            assert!(
+                matches!(*err, bincode::ErrorKind::InvalidTagEncoding(2)),
+                "{what}: expected the typed InvalidTagEncoding(2) error, got: {err:?}"
+            );
+        };
+
+        // Coordinator reads, repair Fetch/Apply and range streams carry
+        // `PartitionWire`; the complex cell sits after a simple one, so the
+        // old decoder reads the scalar fine and then hits the tag.
+        let bytes = bincode::serialize(&partition_to_wire(partition.clone())).unwrap();
+        expect_tag_error(
+            bincode::deserialize::<legacy::PartitionWire>(&bytes)
+                .expect_err("an old node must not decode a complex cell as a simple one"),
+            "PartitionWire",
+        );
+
+        // Bootstrap/decommission/rebalance carry `Vec<RowWire>` per partition.
+        let rows: Vec<RowWire> = partition.rows.iter().cloned().map(RowWire::from).collect();
+        let bytes = bincode::serialize(&rows).unwrap();
+        expect_tag_error(
+            bincode::deserialize::<Vec<legacy::RowWire>>(&bytes)
+                .expect_err("an old node must not decode streamed complex rows"),
+            "Vec<RowWire>",
+        );
+    }
+
+    /// Mixed-version cluster, both directions: a partition with no complex
+    /// cells must keep the exact pre-t_83c4f093 byte layout, so old and new
+    /// nodes keep exchanging (and digesting) simple data unchanged.
+    #[test]
+    fn simple_partitions_keep_the_legacy_byte_layout() {
+        let p = make_partition(b"simple", 77);
+        let new_bytes = bincode::serialize(&partition_to_wire(p.clone())).unwrap();
+        let row = &p.rows[0];
+        let legacy = legacy::PartitionWire {
+            token: p.key.token.0,
+            key_bytes: p.key.key.as_bytes().to_vec(),
+            deletion: legacy::DeletionTimeWire {
+                marked_for_delete_at: p.deletion.marked_for_delete_at,
+                local_deletion_time: p.deletion.local_deletion_time,
+            },
+            static_row: None,
+            rows: vec![legacy::RowWire {
+                clustering: row.clustering.clone(),
+                cells: vec![(
+                    0,
+                    legacy::CellValueWire {
+                        value: row.cells[0].1.value.clone(),
+                        timestamp: row.cells[0].1.timestamp,
+                        ttl: row.cells[0].1.ttl,
+                        local_deletion_time: row.cells[0].1.local_deletion_time,
+                    },
+                )],
+                deletion: legacy::DeletionTimeWire {
+                    marked_for_delete_at: row.deletion.marked_for_delete_at,
+                    local_deletion_time: row.deletion.local_deletion_time,
+                },
+                primary_key_liveness: legacy::LivenessInfoWire {
+                    timestamp: row.primary_key_liveness.timestamp,
+                    ttl: row.primary_key_liveness.ttl,
+                    local_deletion_time: row.primary_key_liveness.local_deletion_time,
+                },
+            }],
+        };
+        assert_eq!(new_bytes, bincode::serialize(&legacy).unwrap());
+        // ...and an old node's bytes decode on a new node.
+        let back: PartitionWire = bincode::deserialize(&new_bytes).unwrap();
+        assert_eq!(partition_from_wire(back), p);
+    }
+
+    /// Two replicas whose collections differ only in an element's path hold
+    /// different data, so their digests must differ — otherwise anti-entropy
+    /// repair reads the divergence as agreement and never fixes it.
+    #[test]
+    fn digest_distinguishes_complex_cell_paths() {
+        let a = compute_partition_digest(&make_complex_partition(b"pA")).unwrap();
+        let b = compute_partition_digest(&make_complex_partition(b"pB")).unwrap();
+        assert_ne!(a, b, "a path-only difference must change the digest");
     }
 
     #[test]

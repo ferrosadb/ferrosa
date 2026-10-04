@@ -55,11 +55,14 @@ impl std::fmt::Display for TableId {
 
 /// Sync strategy selection.
 ///
-/// | Strategy | Throughput | Latency | Durability Window |
-/// |----------|-----------|---------|-------------------|
-/// | Periodic | Highest | Lowest | Up to sync_interval |
+/// | Strategy | Throughput | Latency | Acked-but-unsynced window |
+/// |----------|-----------|---------|---------------------------|
+/// | Periodic | Highest | Lowest | `max_delay` healthy; at most `sync_stall_deadline` |
 /// | Batch | Lowest | Highest | Zero |
-/// | Group | Good | Bounded | Up to max_wait |
+/// | Group | Good | Bounded | Zero (the writer waits, then fails) |
+///
+/// Production runs Periodic (the default). See `sync` for how the bound is
+/// enforced: writes are refused, not acknowledged, once sync falls behind.
 #[derive(Debug, Clone)]
 pub enum SyncStrategyConfig {
     /// Fsync on a timer. Best throughput, small durability window.
@@ -95,32 +98,59 @@ pub struct CommitLogBatchConfig {
     pub target_bytes: u64,
     /// Maximum time to hold a dirty batch open.
     pub max_delay: Duration,
+    /// How long the oldest unsynced write may wait for an fsync before the
+    /// commit log refuses new writes (Periodic) or fails the waiting writer
+    /// (Group). This bounds the ack-before-fsync window; see `sync`.
+    pub sync_stall_deadline: Duration,
 }
 
 impl CommitLogBatchConfig {
     pub const DEFAULT_TARGET_BYTES: u64 = 64 * 1024;
 
+    /// 200 periodic sync intervals. A healthy fsync takes milliseconds, even
+    /// `F_FULLFSYNC` under load; two seconds without one means the sync thread
+    /// is dead, wedged, or the disk is failing.
+    pub const DEFAULT_SYNC_STALL_DEADLINE: Duration = Duration::from_secs(2);
+
     pub fn with_max_delay(max_delay: Duration) -> Self {
         Self {
             target_bytes: Self::DEFAULT_TARGET_BYTES,
             max_delay,
+            sync_stall_deadline: Self::DEFAULT_SYNC_STALL_DEADLINE,
         }
     }
 
+    /// Read `FERROSA_COMMITLOG_BATCH_TARGET_BYTES`,
+    /// `FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS` and
+    /// `FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS`. A set but unusable value
+    /// is reported and replaced by the default; it used to be dropped silently.
     pub fn from_env(default: Self) -> Self {
-        let target_bytes = std::env::var("FERROSA_COMMITLOG_BATCH_TARGET_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        let target_bytes = env_u64("FERROSA_COMMITLOG_BATCH_TARGET_BYTES")
             .filter(|v| *v > 0)
             .unwrap_or(default.target_bytes);
-        let max_delay = std::env::var("FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        let max_delay = env_u64("FERROSA_COMMITLOG_BATCH_MAX_DELAY_MICROS")
             .map(Duration::from_micros)
             .unwrap_or(default.max_delay);
+        let sync_stall_deadline = env_u64("FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS")
+            .filter(|v| *v > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(default.sync_stall_deadline);
         Self {
             target_bytes,
             max_delay,
+            sync_stall_deadline,
+        }
+    }
+}
+
+/// Parse `key` as a `u64`; `None` when unset or unparseable (the latter logged).
+fn env_u64(key: &str) -> Option<u64> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::error!(key, value = %raw, %e, "unparseable commit-log setting; using the default");
+            None
         }
     }
 }
@@ -203,7 +233,10 @@ pub const DEFAULT_MAX_SEGMENT_AGE: Duration = Duration::from_secs(300);
 ///
 /// All sizes are configurable. Defaults are suitable for general workloads:
 /// - 32 MB segments with 5-minute max age
-/// - Periodic sync every 10ms (best throughput, up to 10ms data loss on crash)
+/// - Periodic sync every 10ms (best throughput). An acknowledged write is
+///   fsynced within ~10ms while sync is healthy; when it is not, writes are
+///   refused once the oldest unsynced write is `sync_stall_deadline` (2s) old,
+///   so a crash loses at most that window of acknowledged writes.
 /// - 64 KiB commit-log sync batches under sustained write load
 #[derive(Debug, Clone)]
 pub struct CommitLogConfig {

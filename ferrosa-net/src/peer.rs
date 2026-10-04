@@ -34,12 +34,45 @@ pub trait PeerEventListener: Send + Sync {
     fn on_peer_failed(&self, peer_id: uuid::Uuid);
 }
 
+/// How a [`PeerManager`] reaches its event listener.
+///
+/// `Owner` is for a listener that owns the peer manager (the cluster
+/// `ModeController` holds it in `set_peer_manager`). A strong reference there
+/// is a cycle: neither is ever freed, nor the storage engine and threads the
+/// controller holds. Each leaked controller cost ~11 threads; the nightly
+/// fuzz job's per-case controllers exhausted the runner (2026-10-01..03).
+#[derive(Clone)]
+enum ListenerRef {
+    Owned(Arc<dyn PeerEventListener>),
+    Owner(std::sync::Weak<dyn PeerEventListener>),
+}
+
+impl ListenerRef {
+    /// The listener, or `None` once an owning listener has been dropped: the
+    /// owner is gone, so there is no one left to tell. Logged, not silent.
+    fn get(&self, event: &'static str) -> Option<Arc<dyn PeerEventListener>> {
+        match self {
+            Self::Owned(l) => Some(Arc::clone(l)),
+            Self::Owner(w) => {
+                let l = w.upgrade();
+                if l.is_none() {
+                    tracing::info!(
+                        event,
+                        "peer event dropped: its listener (owner) has shut down"
+                    );
+                }
+                l
+            }
+        }
+    }
+}
+
 /// Manages all peer connections and runs failure detection.
 pub struct PeerManager {
     config: Arc<NetConfig>,
     local_host_id: uuid::Uuid,
     peers: RwLock<HashMap<uuid::Uuid, Arc<PeerState>>>,
-    listener: Arc<dyn PeerEventListener>,
+    listener: ListenerRef,
     /// CQL broadcast addresses learned from peer handshakes.
     peer_cql_broadcasts: RwLock<HashMap<uuid::Uuid, String>>,
     /// Internode broadcast hostnames learned from peer handshakes. Used so the
@@ -159,6 +192,14 @@ impl PeerManager {
         local_host_id: uuid::Uuid,
         listener: Arc<dyn PeerEventListener>,
     ) -> Self {
+        Self::with_listener_ref(config, local_host_id, ListenerRef::Owned(listener))
+    }
+
+    fn with_listener_ref(
+        config: Arc<NetConfig>,
+        local_host_id: uuid::Uuid,
+        listener: ListenerRef,
+    ) -> Self {
         Self {
             config,
             local_host_id,
@@ -171,6 +212,16 @@ impl PeerManager {
             started_at: tokio::time::Instant::now(),
             replace_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// A peer manager whose listener OWNS it (the `ModeController`): holds the
+    /// listener weakly so the pair can be freed.
+    pub fn with_weak_listener(
+        config: Arc<NetConfig>,
+        local_host_id: uuid::Uuid,
+        listener: std::sync::Weak<dyn PeerEventListener>,
+    ) -> Self {
+        Self::with_listener_ref(config, local_host_id, ListenerRef::Owner(listener))
     }
 
     pub fn set_raft_runtime(&self, runtime: Arc<tokio::runtime::Runtime>) {
@@ -259,8 +310,9 @@ impl PeerManager {
     }
 
     /// Deregister `dead` (a pool whose lane actors have exited) and dial a
-    /// replacement through [`Self::ensure_peer`], which also verifies peer
-    /// identity (t_a3df19a5).
+    /// replacement through [`Self::dial_verified`], which verifies peer
+    /// identity (t_a3df19a5). The replacement is installed only over this
+    /// call's own placeholder, so a peer removed mid-dial stays removed.
     ///
     /// Serialised by `replace_lock` so concurrent requests that hit the same
     /// dead pool produce ONE dial: later arrivals find the pool already
@@ -287,17 +339,40 @@ impl PeerManager {
             "peer's registered pool has dead lane actors; deregistering and re-dialing"
         );
         let placeholder = Arc::new(PeerState::awaiting_redial(state.peer_id, self.now_ms()));
-        self.peers.write().await.insert(host_id, placeholder);
+        self.peers
+            .write()
+            .await
+            .insert(host_id, Arc::clone(&placeholder));
         dead.shutdown().await;
-        if let Err(e) = self.ensure_peer(host_id, &addr.to_string()).await {
-            tracing::error!(
-                peer = %host_id, %addr, error = %e,
-                "replacing the dead pool failed; the heartbeat loop keeps re-dialing it until the \
-                 peer answers or is removed"
+        // Install only over our own placeholder, as the heartbeat re-dial
+        // does: a `remove_peer` that lands while this dial is in flight must
+        // not be undone by an unguarded `add_peer`.
+        let pool = match self.dial_verified(host_id, &addr.to_string(), addr).await {
+            Ok(pool) => pool,
+            Err(failure) => {
+                let e = NetError::from(failure);
+                tracing::error!(
+                    peer = %host_id, %addr, error = %e,
+                    "replacing the dead pool failed; the heartbeat loop keeps re-dialing it until the \
+                     peer answers or is removed"
+                );
+                return Err(NetError::Protocol(format!(
+                    "replacing dead pool for peer {host_id} at {addr} failed: {e}"
+                )));
+            }
+        };
+        if !self
+            .install_pool(state.peer_id, pool, Some(&placeholder))
+            .await
+        {
+            // Removed (the request fails "unknown peer") or replaced by another
+            // dial (the request uses that pool). The fresh pool was shut down.
+            tracing::debug!(
+                peer = %host_id,
+                "peer removed or replaced while its dead pool was re-dialed; replacement discarded"
             );
-            return Err(NetError::Protocol(format!(
-                "replacing dead pool for peer {host_id} at {addr} failed: {e}"
-            )));
+            let (_, current) = self.pool_for_peer(host_id).await?;
+            return Ok(current);
         }
         tracing::info!(peer = %host_id, %addr, "replaced dead pool with a fresh connection");
         let (_, fresh) = self.pool_for_peer(host_id).await?;
@@ -330,6 +405,21 @@ impl PeerManager {
             tracing::error!(
                 peer = %host_id,
                 "rejecting self before network peer admission"
+            );
+            pool.shutdown().await;
+            return false;
+        }
+        // The single admission point for every pool, so the identity check
+        // `dial_verified` performs also covers callers that dial with
+        // `PriorityPool::connect` and register through `add_peer` (t_b78e8e9a).
+        let answered_by = pool.peer_host_id();
+        if answered_by != host_id {
+            tracing::error!(
+                expected = %host_id,
+                %answered_by,
+                addr = %peer_id.1,
+                answered_by_self = answered_by == self.local_host_id,
+                "refusing to pool a connection: the handshake was answered by a different node"
             );
             pool.shutdown().await;
             return false;
@@ -367,7 +457,9 @@ impl PeerManager {
             self.store_broadcasts(host_id, &cql_broadcast, &internode_broadcast)
                 .await;
         }
-        self.listener.on_peer_connected(peer_id);
+        if let Some(l) = self.listener.get("connected") {
+            l.on_peer_connected(peer_id);
+        }
         if let Some(pool) = old_pool {
             pool.shutdown().await;
         }
@@ -418,6 +510,18 @@ impl PeerManager {
                     .unwrap_or(false)
             })
             .unwrap_or(false)
+    }
+
+    /// Capability bits (`handshake::CAP_*`) the peer advertised on its live
+    /// outbound connection, or `None` when there is no live connection to it.
+    /// A feature gated on a capability must check this before sending a
+    /// message type an older peer does not know.
+    pub async fn peer_capabilities(&self, host_id: uuid::Uuid) -> Option<u32> {
+        let peers = self.peers.read().await;
+        peers
+            .get(&host_id)
+            .and_then(|state| state.pool.as_ref())
+            .map(|pool| pool.peer_capabilities())
     }
 
     /// Return the last known socket address for `host_id`, even if this peer
@@ -520,7 +624,9 @@ impl PeerManager {
         }
         let state = Arc::new(PeerState::new(peer_id, None, self.now_ms()));
         self.peers.write().await.insert(host_id, state);
-        self.listener.on_peer_connected(peer_id);
+        if let Some(l) = self.listener.get("connected") {
+            l.on_peer_connected(peer_id);
+        }
     }
 
     /// Send a message to a peer on the specified lane.
@@ -652,32 +758,40 @@ impl PeerManager {
 
             // Notify listener and trigger reconnection outside the lock.
             for (peer_id, pool_opt) in suspected {
-                self.listener.on_peer_suspected(peer_id);
+                if let Some(l) = self.listener.get("suspected") {
+                    l.on_peer_suspected(peer_id);
+                }
 
                 let (host_id, _addr) = peer_id;
 
                 if let Some(pool) = pool_opt {
                     pool.reconnect_all_lanes();
 
-                    let listener = Arc::clone(&self.listener);
+                    let listener = self.listener.clone();
                     task_pool.spawn(async move {
                         for _ in 0u32..120 {
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
                             match pool.all_lanes_resolved().await {
                                 LaneOutcome::AllConnected => {
-                                    listener.on_peer_recovered(host_id);
+                                    if let Some(l) = listener.get("recovered") {
+                                        l.on_peer_recovered(host_id);
+                                    }
                                     return;
                                 }
                                 LaneOutcome::AnyFailed => {
-                                    listener.on_peer_failed(host_id);
+                                    if let Some(l) = listener.get("failed") {
+                                        l.on_peer_failed(host_id);
+                                    }
                                     return;
                                 }
                                 LaneOutcome::StillReconnecting => {}
                             }
                         }
 
-                        listener.on_peer_failed(host_id);
+                        if let Some(l) = listener.get("failed") {
+                            l.on_peer_failed(host_id);
+                        }
                     });
                 }
             }
@@ -833,7 +947,9 @@ impl PeerManager {
             if let Some(pool) = &state.pool {
                 pool.shutdown().await;
             }
-            self.listener.on_peer_disconnected(state.peer_id);
+            if let Some(l) = self.listener.get("disconnected") {
+                l.on_peer_disconnected(state.peer_id);
+            }
         }
     }
 
@@ -1660,6 +1776,110 @@ mod tests {
         pm.remove_peer(server_id).await;
     }
 
+    /// A TCP proxy to `upstream` whose new connections can be held at the
+    /// gate. `arrived` fires when a held connection is waiting; `release`
+    /// lets every held connection through.
+    struct GatedProxy {
+        addr: std::net::SocketAddr,
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        arrived: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    async fn gated_proxy(upstream: std::net::SocketAddr) -> GatedProxy {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = GatedProxy {
+            addr: listener.local_addr().unwrap(),
+            hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            arrived: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let (hold, arrived, release) = (
+            Arc::clone(&proxy.hold),
+            Arc::clone(&proxy.arrived),
+            Arc::clone(&proxy.release),
+        );
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let held = hold.load(Ordering::SeqCst);
+                let (arrived, release) = (Arc::clone(&arrived), Arc::clone(&release));
+                tokio::spawn(async move {
+                    if held {
+                        arrived.notify_one();
+                        let permit = release.acquire().await.expect("gate closed");
+                        permit.forget();
+                        release.add_permits(1); // released for every waiter
+                    }
+                    let mut outbound = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+            }
+        });
+        proxy
+    }
+
+    /// A peer removed while its dead pool is being replaced must stay
+    /// removed. `replace_dead_pool` re-dials through `ensure_peer`, whose
+    /// install is unguarded; the heartbeat re-dial guards the same install
+    /// with the placeholder (`install_pool(.., Some(placeholder))`) for
+    /// exactly this race. Without the guard a decommissioned node comes back
+    /// into the peer map, with its broadcasts, and is heartbeated forever.
+    #[tokio::test]
+    async fn a_peer_removed_during_dead_pool_replacement_stays_removed() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let upstream = server.start_and_get_addr().await.unwrap();
+        let proxy = gated_proxy(upstream).await;
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            Arc::new(TestListener::new()),
+        ));
+        pm.ensure_peer(server_id, &proxy.addr.to_string())
+            .await
+            .unwrap();
+        let (_, dead) = pm.pool_for_peer(server_id).await.unwrap();
+        dead.shutdown().await;
+
+        proxy.hold.store(true, Ordering::SeqCst);
+        let request = {
+            let pm = Arc::clone(&pm);
+            tokio::spawn(async move {
+                pm.send(
+                    server_id,
+                    Message::Ping {
+                        nonce: 1,
+                        sent_at: 0,
+                    },
+                    Lane::Data,
+                )
+                .await
+            })
+        };
+        // The replacement dial is in flight and held at the proxy.
+        proxy.arrived.notified().await;
+        pm.remove_peer(server_id).await;
+        proxy.release.add_permits(1);
+
+        let outcome = request.await.unwrap();
+        assert!(
+            !pm.has_peer(server_id),
+            "a peer removed mid-replacement was re-registered (request outcome: {outcome:?})"
+        );
+        assert!(
+            pm.get_peer_internode_broadcast(server_id).await.is_none()
+                && pm.get_peer_cql_broadcast(server_id).await.is_none(),
+            "a removed peer's broadcasts must not be re-published"
+        );
+        server.shutdown(Duration::from_millis(50)).await;
+    }
+
     #[tokio::test]
     async fn has_live_peer_is_false_for_placeholder_entries() {
         let config = Arc::new(NetConfig::default());
@@ -1854,6 +2074,63 @@ mod tests {
         );
         assert!(fx.pm.has_peer(fx.peer_id), "the peer entry must be kept");
         fx.pm.remove_peer(fx.peer_id).await;
+    }
+
+    /// `add_peer` must refuse a pool whose handshake was answered by a
+    /// different node than the id it is being registered under.
+    ///
+    /// `ensure_peer` and the re-dial path verify identity (`dial_verified`), but
+    /// six controller paths (pair reverse dial, formation, membership refresh,
+    /// inbound reverse dial, pair node) call `PriorityPool::connect` and then
+    /// `add_peer` directly. Without the check at the install point, any of them
+    /// pools whoever answers the address under the expected id: the
+    /// t_b78e8e9a "unknown peer: <local>" shape when that is this node, and an
+    /// impostor otherwise. The other side of the boundary (a matching id is
+    /// installed) is `install_after_removal_is_refused_and_leaves_no_trace`'s
+    /// sibling flow and every `ensure_peer` test.
+    #[tokio::test]
+    async fn add_peer_refuses_a_pool_answered_by_a_different_node() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let actual_id = uuid::Uuid::new_v4();
+        let server = Arc::new(RpcServer::new(
+            config.clone(),
+            actual_id,
+            registry_with_ping(),
+        ));
+        let addr = server.start_and_get_addr().await.unwrap();
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(
+            Arc::new(config.clone()),
+            uuid::Uuid::new_v4(),
+            listener.clone(),
+        );
+        let pool = PriorityPool::connect(
+            Arc::new(config),
+            pm.local_host_id(),
+            &addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pool.peer_host_id(), actual_id);
+
+        let expected_id = uuid::Uuid::new_v4();
+        pm.add_peer((expected_id, addr), pool).await;
+
+        assert!(
+            !pm.has_peer(expected_id),
+            "a pool answered by {actual_id} was registered under {expected_id}"
+        );
+        assert_eq!(
+            listener.connected_count.load(Ordering::Relaxed),
+            0,
+            "a refused pool must not announce a connected peer"
+        );
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     /// A re-dial that completes after its peer was removed must be refused:

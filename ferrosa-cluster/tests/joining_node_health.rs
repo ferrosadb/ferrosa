@@ -45,7 +45,8 @@
 
 use ferrosa_cluster::raft::{NodeInfo, NodeState, RaftOp};
 use ferrosa_cluster::repair::coordinator::{
-    promote_joining_members, ring_data_scatter_risk, ring_health, RingHealth,
+    joiners_awaiting_bootstrap, promote_joining_members, ring_data_scatter_risk, ring_health,
+    RingHealth,
 };
 use ferrosa_cluster::ring::TokenRing;
 
@@ -178,7 +179,8 @@ fn promote_plan_emits_one_promotion_per_joining_member() {
     members.insert(2u64, NodeState::Joining);
     members.insert(3u64, NodeState::Normal);
 
-    let plan = promote_joining_members(&members);
+    // Node 2's bootstrap completed and was recorded (P0-4).
+    let plan = promote_joining_members(&members, &[2].into());
 
     assert_eq!(
         plan.len(),
@@ -203,7 +205,7 @@ fn promote_plan_is_empty_when_all_members_normal() {
     members.insert(2u64, NodeState::Normal);
     members.insert(3u64, NodeState::Normal);
 
-    let plan = promote_joining_members(&members);
+    let plan = promote_joining_members(&members, &Default::default());
 
     assert!(
         plan.is_empty(),
@@ -222,7 +224,7 @@ fn promote_plan_does_not_reverse_operator_intent() {
     members.insert(2u64, NodeState::Leaving);
     members.insert(3u64, NodeState::Decommissioned);
 
-    let plan = promote_joining_members(&members);
+    let plan = promote_joining_members(&members, &Default::default());
 
     assert!(
         plan.is_empty(),
@@ -239,7 +241,7 @@ fn promote_plan_does_not_promote_learners() {
     members.insert(1u64, NodeState::Normal);
     members.insert(2u64, NodeState::Learner { owns_tokens: true });
 
-    let plan = promote_joining_members(&members);
+    let plan = promote_joining_members(&members, &Default::default());
 
     assert!(
         plan.is_empty(),
@@ -268,7 +270,8 @@ fn recovered_ring_with_a_stuck_joiner_is_reported_and_repairable() {
         "the degraded ring must report unhealthy: {health:?}"
     );
 
-    let plan = promote_joining_members(&member_states(&ring));
+    // The joiner's bootstrap record committed; only its promotion was lost.
+    let plan = promote_joining_members(&member_states(&ring), &[2].into());
     assert_eq!(plan.len(), 1, "exactly the stuck joiner is repairable");
     match &plan[0] {
         RaftOp::SetNodeState { node_id, state } => {
@@ -277,4 +280,61 @@ fn recovered_ring_with_a_stuck_joiner_is_reported_and_repairable() {
         }
         other => panic!("expected SetNodeState{{Normal}} for node 2, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------- P0-4
+
+/// P0-4: a `Joining` member whose bootstrap never recorded completion must NOT
+/// be promoted by the restart pass. Before the fix every `Joining` member was
+/// promoted, including one whose stream a restart cut off, so it became a
+/// replica without its data and served short reads.
+#[test]
+fn promote_plan_skips_a_joiner_without_a_bootstrap_record() {
+    let mut members = std::collections::BTreeMap::new();
+    members.insert(1u64, NodeState::Normal);
+    members.insert(2u64, NodeState::Joining);
+    members.insert(3u64, NodeState::Joining);
+
+    // Only node 3 finished and recorded its bootstrap.
+    let recorded = [3u64].into();
+    let plan = promote_joining_members(&members, &recorded);
+
+    let promoted: Vec<u64> = plan
+        .iter()
+        .map(|op| match op {
+            RaftOp::SetNodeState {
+                node_id,
+                state: NodeState::Normal,
+            } => *node_id,
+            other => panic!("unexpected op {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        promoted,
+        vec![3],
+        "only the joiner with a bootstrap record may be promoted"
+    );
+    assert_eq!(
+        joiners_awaiting_bootstrap(&members, &recorded),
+        vec![2],
+        "the unrecorded joiner must be reported as awaiting bootstrap"
+    );
+}
+
+/// P0-4 migration: a cluster upgraded from a build with no records must not
+/// get stuck. Members already `Normal` are grandfathered: they need no record,
+/// are never demoted, and are never reported as awaiting bootstrap.
+#[test]
+fn normal_members_are_grandfathered_without_records() {
+    let mut members = std::collections::BTreeMap::new();
+    members.insert(1u64, NodeState::Normal);
+    members.insert(2u64, NodeState::Normal);
+    members.insert(3u64, NodeState::Normal);
+    let none = std::collections::BTreeSet::new();
+
+    assert!(promote_joining_members(&members, &none).is_empty());
+    assert!(
+        joiners_awaiting_bootstrap(&members, &none).is_empty(),
+        "grandfathered Normal members must not be flagged"
+    );
 }

@@ -62,9 +62,11 @@ mod cql_broadcast;
 mod listener_status;
 mod listener_tls;
 mod log_rotation;
+mod maintenance;
 mod repair_wiring;
 mod runtime;
 mod sentry_reporting;
+mod supervisor;
 mod web;
 
 use std::path::Path;
@@ -452,6 +454,40 @@ fn resolve_flight_bind(file_config: &toml::Value) -> std::net::SocketAddr {
         DEFAULT_FLIGHT_BIND,
     );
     parse_bind_addr("Arrow Flight", "FERROSA_FLIGHT_BIND", &flight_bind)
+}
+
+/// The PostgreSQL suspended-portal limits: `[postgres]
+/// max_suspended_portals_per_connection` / `max_suspended_portals` /
+/// `suspended_portal_idle_timeout_ms`, each overriding its
+/// `FERROSA_POSTGRES_*` variable (TOML wins). A malformed value is logged at
+/// ERROR and the defaults apply (`PortalLimits::resolve_or_default`).
+fn resolve_postgres_portal_limits(file_config: &toml::Value) -> ferrosa_postgres::PortalLimits {
+    use ferrosa_postgres::portal_limits::{
+        IDLE_TIMEOUT_MS_ENV, MAX_PER_CONNECTION_ENV, MAX_PER_NODE_ENV,
+    };
+    let per_connection = config_val_opt(
+        MAX_PER_CONNECTION_ENV,
+        file_config,
+        "postgres",
+        "max_suspended_portals_per_connection",
+    );
+    let per_node = config_val_opt(
+        MAX_PER_NODE_ENV,
+        file_config,
+        "postgres",
+        "max_suspended_portals",
+    );
+    let idle_ms = config_val_opt(
+        IDLE_TIMEOUT_MS_ENV,
+        file_config,
+        "postgres",
+        "suspended_portal_idle_timeout_ms",
+    );
+    ferrosa_postgres::PortalLimits::resolve_or_default(
+        per_connection.as_deref(),
+        per_node.as_deref(),
+        idle_ms.as_deref(),
+    )
 }
 
 fn resolve_postgres_bind(file_config: &toml::Value) -> std::net::SocketAddr {
@@ -1030,18 +1066,6 @@ fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
     load_or_generate_host_id_with(data_dir, std::env::var("FERROSA_HOST_ID").ok())
 }
 
-/// Adapts the live [`PeerManager`](ferrosa_net::peer::PeerManager) into the
-/// self-heal [`PeerHealthProbe`](ferrosa_storage::self_heal::PeerHealthProbe) so
-/// the controller's replica posture reflects currently-reachable peers at each
-/// tick (a healthy peer present ⇒ corrupt SSTables may be quarantined).
-struct LivePeerHealth(std::sync::Arc<ferrosa_net::peer::PeerManager>);
-
-impl ferrosa_storage::self_heal::PeerHealthProbe for LivePeerHealth {
-    fn healthy_peer_count(&self) -> usize {
-        self.0.live_peer_ids().len()
-    }
-}
-
 /// Core implementation that accepts an explicit host_id override.
 /// Avoids process-global env var mutation in tests.
 fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) -> Uuid {
@@ -1347,8 +1371,8 @@ fn maintenance_last_schema_version(current: uuid::Uuid) -> uuid::Uuid {
 
 /// Whether the maintenance loop should persist a schema snapshot this tick.
 ///
-/// Pure so the decision is unit-testable: the loop itself is an inline async
-/// block closed over runtime state and can never be driven from a test.
+/// Pure so the decision is unit-testable without driving the maintenance loop
+/// (`maintenance::run_maintenance_loop`).
 fn should_persist_schema(current: uuid::Uuid, last: uuid::Uuid) -> bool {
     current != last
 }
@@ -2212,6 +2236,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ferrosa_net::codec::MsgType::RepairApplyRequest,
         Arc::new(ferrosa_cluster::RepairApplyHandler::new(storage.clone())),
     );
+    // CQL result cursors (paged ORDER BY / DISTINCT) live on the node that
+    // built them; peers forward a client's next-page request here.
+    let result_cursors = Arc::new(ferrosa_cql::result_cursor::ResultCursorRegistry::new(
+        ferrosa_cql::result_cursor::ResultCursorConfig::from_env(),
+        host_id,
+    ));
+    registry.register(
+        ferrosa_net::codec::MsgType::ResultCursorPage,
+        Arc::new(ferrosa_cql::result_cursor::ResultCursorPageHandler::new(
+            result_cursors.clone(),
+        )),
+    );
 
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
         cluster_config,
@@ -2238,10 +2274,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime::install_consensus_panic_hook(mode_controller.consensus_health());
 
     // 6. Create PeerManager — ModeController is the PeerEventListener
-    let peer_manager = Arc::new(ferrosa_net::peer::PeerManager::new(
+    let peer_manager = Arc::new(ferrosa_net::peer::PeerManager::with_weak_listener(
         net_config.clone(),
         host_id,
-        mode_controller.clone(),
+        mode_controller.as_peer_listener(),
     ));
     peer_manager.set_raft_runtime(runtimes.raft.clone());
     peer_manager.set_data_runtime(runtimes.data.clone());
@@ -2267,30 +2303,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_pm.run_heartbeat_loop().await;
     });
 
-    // 6c. Self-healing controller: deterministic autonomous quarantine of
-    // corrupt SSTables. Spawned here (after the PeerManager) so the replica
-    // posture reflects LIVE membership: with a healthy peer reachable, a node
-    // quarantines its OWN local corrupt generations — moving them out of the
-    // active set so they stop being re-detected (and re-logged) every tick;
-    // isolated, it leaves them in place (FMEA #1: never quarantine a possibly-
-    // only copy). Quarantine only moves files, never deletes. Gated by
-    // FERROSA_SELFHEAL_ENABLED (default on). Startup smoke-test warnings fire
-    // independently of this controller.
-    {
-        let selfheal_cfg = ferrosa_storage::self_heal::SelfHealConfig::from_env();
-        let peer_probe: std::sync::Arc<dyn ferrosa_storage::self_heal::PeerHealthProbe> =
-            std::sync::Arc::new(LivePeerHealth(peer_manager.clone()));
-        let cluster_view: std::sync::Arc<dyn ferrosa_storage::self_heal::ClusterView> =
-            std::sync::Arc::new(ferrosa_storage::self_heal::ReplicaAwareClusterView::new(
-                ferrosa_cluster::raft::uuid_to_node_id(host_id),
-                peer_probe,
-            ));
-        ferrosa_storage::self_heal::SelfHealController::spawn(
-            storage.clone(),
-            cluster_view,
-            selfheal_cfg,
-        );
-    }
+    // 6c. The self-healing controller is spawned ONCE, below with the repair
+    // wiring, behind the verified-healthy-replica view. A second controller
+    // used to start here as well (t_396d4c80): two controllers scanned every
+    // table and acted on the same corrupt generations, and this one gated
+    // quarantine on peer LIVENESS, not on a peer proven to hold a good copy
+    // (FMEA #1).
 
     // 7. Start internode RPC server with inbound peer callback
     let rpc_server = Arc::new(
@@ -2514,6 +2532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         txn_registry: ferrosa_cql::txn_registry::TransactionRegistry::shared_with_config(
             txn_registry_config,
         ),
+        result_cursors,
     });
     // Start the open-transaction reaper (A1b): sweep cadence is configured with
     // the registry bounds; expired transactions are evicted without client input.
@@ -2649,6 +2668,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `/metrics` report it.
     let listener_status = std::sync::Arc::new(crate::listener_status::ListenerStatus::default());
 
+    // Health of the supervised background tasks (the flusher and the maintenance
+    // loop). A dead or hung flusher used to be one ERROR line while the node kept
+    // answering `/readyz` 200 and flushed nothing (t_7681b32b).
+    let supervision_status = std::sync::Arc::new(crate::supervisor::SupervisionStatus::default());
+
     // 9c. Arrow Flight (gRPC) query endpoint — port 8815, behind the `flight`
     // feature. Auth is enforced per-RPC (signed bearer tokens); only
     // anonymous-safe because every read RPC requires a verified token. TLS from
@@ -2708,6 +2732,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_disabled,
         debug: Some(web::debug::DebugState::new()),
         listeners: listener_status.clone(),
+        supervision: supervision_status.clone(),
     };
     // `[web] bind` is authoritative over FERROSA_WEB_BIND, then the loopback
     // default. The resolved address is the one passed to the listener.
@@ -3026,6 +3051,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // the compiled defaults, ceilings enforced). No default is applied
             // here: the PG front end gets exactly what startup resolved.
             jsonb_limits,
+            portals: {
+                let limits = resolve_postgres_portal_limits(&file_config);
+                tracing::info!(?limits, "PostgreSQL suspended-portal limits");
+                std::sync::Arc::new(ferrosa_postgres::SuspendedPortals::new(limits))
+            },
         });
         let pg_status = listener_status.clone();
         runtimes.background.spawn(async move {
@@ -3159,215 +3189,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .parse()
     .unwrap_or(100);
-    let maintenance_engine = storage.clone();
-    let maintenance_schema = schema.clone();
-    let maintenance_data_dir = data_dir.clone();
-    let has_s3 = maintenance_engine.has_s3();
-    runtimes.background.spawn(async move {
-        let mut flush_interval =
-            tokio::time::interval(std::time::Duration::from_secs(flush_interval_secs));
-        let mut urgent_flush_interval = tokio::time::interval(std::time::Duration::from_millis(
-            urgent_flush_interval_millis.max(1),
-        ));
-        let mut urgent_s3_sync_interval = tokio::time::interval(std::time::Duration::from_secs(
-            urgent_s3_sync_interval_secs.max(1),
-        ));
-        let mut compact_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        // Persist schema snapshot + flush all memtables to S3 every 30s.
-        let mut schema_sync_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    // Supervised (t_7681b32b): the loop is restarted if it panics or returns,
+    // each flush runs as a supervised attempt, and past the restart intensity
+    // the process syncs the commit log and aborts — see `supervisor`.
+    let maintenance_intensity = supervisor::RestartIntensity::from_env();
+    let flush_stall_deadline = std::time::Duration::from_secs(
+        supervisor::env_or(
+            "FERROSA_FLUSH_STALL_DEADLINE_SECS",
+            supervisor::DEFAULT_FLUSH_STALL_DEADLINE.as_secs(),
+        )
+        .max(1),
+    );
+    let maintenance_heartbeat = Arc::new(supervisor::Heartbeat::new());
+    let maintenance_context = maintenance::MaintenanceContext {
+        engine: storage.clone(),
+        schema: schema.clone(),
+        data_dir: data_dir.clone(),
+        intervals: maintenance::MaintenanceIntervals {
+            flush: std::time::Duration::from_secs(flush_interval_secs),
+            urgent_flush: std::time::Duration::from_millis(urgent_flush_interval_millis.max(1)),
+            urgent_s3_sync: std::time::Duration::from_secs(urgent_s3_sync_interval_secs.max(1)),
+        },
         // Seed from the version the registry ALREADY holds so the loop's
         // immediate first tick is a no-op. See `maintenance_last_schema_version`.
-        let mut last_schema_version =
-            maintenance_last_schema_version(maintenance_schema.snapshot().version);
+        last_persisted_schema: Arc::new(arc_swap::ArcSwap::from_pointee(
+            maintenance_last_schema_version(schema.snapshot().version),
+        )),
+        supervision: supervision_status.clone(),
+        intensity: maintenance_intensity,
+        flush_stall_deadline,
+        escalation: Arc::new(supervisor::EscalationPolicy::AbortProcess {
+            engine: storage.clone(),
+        }),
+        heartbeat: maintenance_heartbeat.clone(),
+        flush_window: supervisor::IntensityWindow::new(maintenance_intensity),
+    };
+    // The supervisor never returns: it restarts the loop or aborts the process.
+    runtimes
+        .background
+        .spawn(maintenance::run_supervised(maintenance_context));
 
-        loop {
-            tokio::select! {
-                _ = flush_interval.tick() => {
-                    // Run flush on a dedicated OS thread so SSTable encoding,
-                    // compression, and disk I/O do not consume Tokio's shared
-                    // blocking pool.
-                    let engine = maintenance_engine.clone();
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    match std::thread::Builder::new()
-                        .name("storage-flush".into())
-                        .spawn(move || {
-                            let _ = tx.send(engine.flush_if_needed());
-                        }) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!(%e, "failed to spawn storage flush thread");
-                            continue;
-                        }
-                    }
-                    match rx.await {
-                        Ok(Err(e)) => tracing::warn!(%e, "periodic flush failed"),
-                        Err(e) => tracing::error!(%e, "flush task panicked"),
-                        _ => {}
-                    }
+    // A hang inside the loop (an await that never completes, a blocked GC)
+    // is invisible to `supervise`, which only sees panics and returns. The
+    // watchdog reads the loop's heartbeat from its own thread.
+    let maintenance_stall_deadline = std::time::Duration::from_secs(
+        supervisor::env_or(
+            "FERROSA_MAINTENANCE_STALL_DEADLINE_SECS",
+            supervisor::default_maintenance_stall_deadline(flush_stall_deadline).as_secs(),
+        )
+        .max(1),
+    );
+    supervisor::spawn_maintenance_watchdog(supervisor::MaintenanceWatchdog::new(
+        maintenance_heartbeat,
+        maintenance_stall_deadline,
+        supervision_status.clone(),
+        maintenance_intensity,
+        Arc::new(supervisor::EscalationPolicy::AbortProcess {
+            engine: storage.clone(),
+        }),
+    ))?;
 
-                    // After flush, sync new SSTables to S3.
-                    // Run on a dedicated thread so HTTP uploads don't starve
-                    // the main tokio runtime (which handles Raft RPCs).
-                    if has_s3 {
-                        let engine = maintenance_engine.clone();
-                        let _ = std::thread::Builder::new()
-                            .name("s3-sync".into())
-                            .spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .expect("s3-sync runtime");
-                                rt.block_on(async {
-                                    match engine.sync_sstables_to_s3().await {
-                                        Ok(n) if n > 0 => {
-                                            tracing::info!(count = n, "synced SSTables to S3");
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(%e, "S3 SSTable sync failed");
-                                        }
-                                        _ => {}
-                                    }
-                                });
-                            });
-                    }
-
-                    // Commit log GC: discard segments with no remaining dirty tables.
-                    match maintenance_engine.discard_completed_commit_log_segments() {
-                        Ok(n) if n > 0 => {
-                            tracing::debug!(segments = n, "commit log GC cleaned up segments");
-                        }
-                        Err(e) => {
-                            tracing::warn!(%e, "commit log GC failed");
-                        }
-                        _ => {}
-                    }
-                }
-                _ = compact_interval.tick() => {
-                    maintenance_engine.poll_compactions().await;
-                }
-                _ = maintenance_engine.wait_for_compaction_retry_wakeup() => {
-                    maintenance_engine.poll_compactions().await;
-                }
-                _ = urgent_flush_interval.tick() => {
-                    if maintenance_engine.take_flush_request() {
-                        let engine = maintenance_engine.clone();
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        match std::thread::Builder::new()
-                            .name("storage-flush-urgent".into())
-                            .spawn(move || {
-                                let _ = tx.send(engine.flush_if_needed());
-                            }) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::error!(%e, "failed to spawn urgent storage flush thread");
-                                continue;
-                            }
-                        }
-                        match rx.await {
-                            Ok(Err(e)) => tracing::warn!(%e, "urgent flush failed"),
-                            Err(e) => tracing::error!(%e, "urgent flush task panicked"),
-                            _ => {}
-                        }
-                    }
-                }
-                _ = urgent_s3_sync_interval.tick(), if has_s3 => {
-                    if maintenance_engine.take_s3_sync_request() {
-                        let engine = maintenance_engine.clone();
-                        let _ = std::thread::Builder::new()
-                            .name("s3-sync-urgent".into())
-                            .spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .expect("s3-sync-urgent runtime");
-                                rt.block_on(async {
-                                    match engine.sync_sstables_to_s3().await {
-                                        Ok(n) => {
-                                            tracing::info!(
-                                                count = n,
-                                                "urgent S3 SSTable sync completed after write backpressure"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(%e, "urgent S3 SSTable sync failed");
-                                        }
-                                    }
-                                });
-                            });
-                    }
-                }
-                _ = schema_sync_interval.tick() => {
-                    let snap = maintenance_schema.snapshot();
-                    if should_persist_schema(snap.version, last_schema_version) {
-                        // Flush all memtables before persisting schema so SSTables
-                        // on disk match the schema snapshot. Run it outside the
-                        // Tokio blocking pool for the same reason as periodic
-                        // flushes: SSTable compression can be CPU-expensive.
-                        let engine = maintenance_engine.clone();
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        match std::thread::Builder::new()
-                            .name("storage-schema-flush".into())
-                            .spawn(move || {
-                                let _ = tx.send(engine.flush_all());
-                            }) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::error!(%e, "failed to spawn schema flush thread");
-                                continue;
-                            }
-                        }
-                        match rx.await {
-                            Ok(Err(e)) => {
-                                tracing::warn!(%e, "pre-schema-persist flush failed, skipping schema persist");
-                                continue; // Don't persist schema without data — retry next tick
-                            }
-                            Err(e) => {
-                                tracing::error!(%e, "pre-schema-persist flush task panicked");
-                                continue;
-                            }
-                            _ => {}
-                        }
-
-                        // Always persist schema locally for restart recovery.
-                        if let Err(e) = persist_schema_locally(
-                            Path::new(&maintenance_data_dir),
-                            &maintenance_schema,
-                        ) {
-                            tracing::error!(%e, "failed to persist authoritative local schema snapshot");
-                        }
-
-                        // Sync to S3 if configured — on a dedicated thread.
-                        if has_s3 {
-                            let engine = maintenance_engine.clone();
-                            let schema_ref = maintenance_schema.clone();
-                            let _ = std::thread::Builder::new()
-                                .name("s3-schema-sync".into())
-                                .spawn(move || {
-                                    let rt = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                        .expect("s3-schema-sync runtime");
-                                    rt.block_on(async {
-                                        match engine.sync_sstables_to_s3().await {
-                                            Ok(n) if n > 0 => {
-                                                tracing::info!(count = n, "pre-schema-persist S3 sync");
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(%e, "pre-schema-persist S3 sync failed");
-                                            }
-                                            _ => {}
-                                        }
-                                        persist_schema_to_s3(&engine, &schema_ref).await;
-                                    });
-                                });
-                        }
-
-                        last_schema_version = snap.version;
-                    }
-                }
-            }
-        }
-    });
+    // P0-6 (t_88479cda): supervise the commit log's fsync thread. The commit
+    // log refuses writes on its own while the thread is dead or behind; this
+    // restarts it, reports it on /readyz and the metrics, and escalates past
+    // the intensity. The watcher runs under `supervise` so a panic in the
+    // watcher itself is a counted, restarted failure, not a silent end.
+    {
+        let storage = storage.clone();
+        let status = supervision_status.clone();
+        let intensity = supervisor::RestartIntensity::from_env();
+        let escalation = Arc::new(supervisor::EscalationPolicy::AbortProcess {
+            engine: storage.clone(),
+        });
+        runtimes.background.spawn(supervisor::supervise(
+            supervisor::Child::CommitLogSync,
+            status.clone(),
+            intensity,
+            escalation.clone(),
+            move || {
+                supervisor::run_commit_log_sync_supervisor(
+                    supervisor::CommitLogSyncSupervisor::new(
+                        storage.clone(),
+                        status.clone(),
+                        intensity,
+                        escalation.clone(),
+                    ),
+                    supervisor::COMMIT_LOG_SYNC_POLL,
+                )
+            },
+        ));
+    }
 
     // 13. Wait for shutdown signal (SIGINT or SIGTERM)
     //
@@ -3478,6 +3389,20 @@ fn seeds_to_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// t_396d4c80: `main` spawned two self-heal controllers, one gated on
+    /// mere peer liveness. Startup is imperative code with no other seam to
+    /// test it through, so this guards the source.
+    #[test]
+    fn main_spawns_exactly_one_self_heal_controller() {
+        let source = include_str!("main.rs");
+        let spawns = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains(concat!("SelfHealController", "::spawn")))
+            .count();
+        assert_eq!(spawns, 1, "main must start one self-heal controller");
+    }
 
     fn udf_toml(v: &str) -> toml::Value {
         format!("[udf]\nmax_memory_bytes = {v}\n").parse().unwrap()

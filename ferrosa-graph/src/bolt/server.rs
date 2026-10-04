@@ -918,6 +918,7 @@ fn error_code(err: &GraphError) -> &'static str {
         GraphError::ResourceLimit(_) => "Neo.TransientError.General.OutOfMemoryError",
         GraphError::ConstraintViolation(_) => "Neo.ClientError.Schema.ConstraintValidationFailed",
         GraphError::Timeout => "Neo.TransientError.Transaction.LockClientStopped",
+        GraphError::Unavailable(_) => "Neo.TransientError.General.DatabaseUnavailable",
         GraphError::Storage(_) | GraphError::Schema(_) | GraphError::Internal(_) => {
             "Neo.DatabaseError.General.UnknownError"
         }
