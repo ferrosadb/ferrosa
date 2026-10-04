@@ -701,11 +701,27 @@ fn the_supervisor_restarts_a_real_dead_commit_log_sync_thread() {
         "the supervisor restarted the thread"
     );
 
-    log.append(&mutation("after_restart"))
-        .expect("acks resume after the supervised restart");
-    wait("the restarted thread to sync", &|| {
+    // Wait for the backlog to drain BEFORE expecting an ack, and note why the
+    // order matters. The stall clock is the age of the OLDEST UNSYNCED WRITE,
+    // not the time since the last fsync: `wakes_the_panic` was appended and
+    // never synced, so it keeps ageing for as long as the thread is dead. A
+    // restart does not retroactively make that write durable, so until the
+    // restarted thread drains it the write path is CORRECTLY still refusing.
+    //
+    // Expecting the very next append to succeed therefore assumed the whole
+    // die-detect-restart sequence fits inside the 2s deadline. That holds on an
+    // idle machine and does not on a loaded CI runner, where it ejected a PR
+    // from the merge queue: `CommitLogNotDurable ... 2054ms, past the 2000ms
+    // stall deadline`. The deadline is a production durability guard and is NOT
+    // the thing to relax; the unstated wall-clock assumption was.
+    //
+    // This still fails a broken restart: `wait` asserts after 10s, so a thread
+    // that never drains the backlog times out here instead of silently passing.
+    wait("the restarted thread to drain the backlog", &|| {
         log.sync_health().unsynced_for.is_none()
     });
+    log.append(&mutation("after_restart"))
+        .expect("acks resume once the restarted thread has drained the backlog");
     supervisor.check();
     assert!(status.impaired().is_empty(), "{:?}", status.impaired());
     assert_eq!(escalations.load(Ordering::SeqCst), 0);
