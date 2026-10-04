@@ -201,7 +201,17 @@ TOML wins over the environment; a malformed value is logged at ERROR and the
 defaults apply. A fresh portal executed with `max_rows` (the only kind that
 can suspend) takes its place under both limits before it runs; past either
 it is refused with SQLSTATE `53000` before any `DataRow`, as PostgreSQL
-refuses a resource limit before output. A portal that completes without
+refuses a resource limit before output. **Write backpressure uses the same
+class** (FMEA PG-BP-01): a write refused because the server cannot accept at
+the producer's pace answers `53000 insufficient_resources`, not `58000`.
+The class is the contract, not the message — class 58 is a system fault that
+drivers and poolers treat as terminal and do not retry, so a producer handed
+it is never told to slow down. `write_error_response` decides with the shared
+`ferrosa_common::Error::is_backpressure()`, so this front end and CQL cannot
+drift on what counts as backpressure; a genuine fault still answers `58000`.
+This covers the direct write, the MVCC autocommit path and the explicit
+`BEGIN..COMMIT` outcome. An Accord distributed commit cannot yet report an
+overload at all (t_93dd5e99). A portal that completes without
 suspending gives its place back. At the limit, such an `Execute` is refused
 even if its result would have fit in `max_rows`. A portal left untouched past the idle timeout is closed
 by its connection (which wakes for it even when the client sends nothing);
