@@ -123,6 +123,45 @@ impl SegmentSink for NullSink {
     // allocation-free for `NullSink`.
 }
 
+/// A `NullSink` whose calls take a fixed time AFTER the gate admits them, so a
+/// device call is deterministically still IN FLIGHT when the producer's
+/// `write_all` returns. Without it that window exists only under scheduler
+/// load, which is how the phase-boundary race ejected PRs from the merge queue
+/// instead of failing on every run. Sleeping allocates nothing.
+struct InFlightSink;
+
+impl InFlightSink {
+    fn linger() {
+        // Test-thread scaffolding only (the clippy.toml bar is on the PUMP's
+        // own waits, not on a simulated slow device).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+impl SegmentSink for InFlightSink {
+    fn pwrite(&mut self, _buf: &[u8], _offset: u64) -> Result<()> {
+        Self::linger();
+        Ok(())
+    }
+    fn pwritev(&mut self, _bufs: &[&[u8]], _offset: u64) -> Result<()> {
+        Self::linger();
+        Ok(())
+    }
+    fn sync_data(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn set_len(&mut self, _len: u64) -> Result<()> {
+        Ok(())
+    }
+    fn fadvise_dontneed(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn mode(&self) -> DirectMode {
+        DirectMode::Direct
+    }
+}
+
 /// A `SegmentSink` that, like `NullSink`, does no real I/O and never
 /// allocates — but every call spin-waits for a permit the test hands out
 /// through `permits` (an `AtomicUsize`, not a channel), so the test controls
@@ -462,7 +501,7 @@ fn backpressure_repeated_waits_allocate_zero_bytes_after_open() {
     const ITERATIONS: usize = 32;
     let gate = Arc::new(WriteGate::new(Duration::from_secs(5)));
     let mut pump = AlignedPump::open_with_depth(
-        gate.wrap(Box::new(NullSink)),
+        gate.wrap(Box::new(InFlightSink)),
         4096,
         4096,
         std::path::PathBuf::from("repeated-park.db"),
@@ -475,7 +514,9 @@ fn backpressure_repeated_waits_allocate_zero_bytes_after_open() {
     pump.write_all(&chunk).unwrap();
     gate.wait_for_attempts(1);
     let coordination = Arc::new((
-        Mutex::new((false, 0usize, 0usize)),
+        // (controller started, phases started, phases completed, phases the
+        // controller has quiesced and handed back to the producer)
+        Mutex::new((false, 0usize, 0usize, 0usize)),
         std::sync::Condvar::new(),
     ));
     let controller_coordination = Arc::clone(&coordination);
@@ -501,6 +542,15 @@ fn backpressure_repeated_waits_allocate_zero_bytes_after_open() {
                 );
             }
             let completed_before = state.2;
+            // Precondition of the no-completion window below: nothing the
+            // device already admitted may still be running, or its completion
+            // would be mistaken for an un-gated write. Calls parked awaiting a
+            // permit are fine; they cannot complete without one.
+            let at_window_open = controller_gate.progress();
+            assert_eq!(
+                at_window_open.admitted, at_window_open.completed,
+                "phase {phase} opened with a device call still in flight: {at_window_open:?}"
+            );
             let no_completion_deadline = std::time::Instant::now() + Duration::from_millis(5);
             while std::time::Instant::now() < no_completion_deadline {
                 let remaining =
@@ -512,30 +562,44 @@ fn backpressure_repeated_waits_allocate_zero_bytes_after_open() {
                     "write completed before the gate released a permit"
                 );
             }
-            drop(state);
-            let mut finished = false;
-            for _ in 0..3 {
-                controller_gate.release(1);
-                let mut state = state_lock.lock().unwrap();
-                let permit_deadline = std::time::Instant::now() + Duration::from_millis(5);
-                while state.2 == completed_before {
-                    let remaining =
-                        permit_deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    let (next, _) = changed.wait_timeout(state, remaining).unwrap();
+            // Feed permits one at a time, each only against a call that is
+            // actually parked (so no surplus permit is ever banked), and wait
+            // for that call to be admitted and finish before looking again. A
+            // write of three segments into the two-segment ring may need up to
+            // three device calls (fewer if the flusher coalesces); this loop
+            // stops as soon as the producer's `write_all` has returned.
+            let drive_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while state.2 == completed_before {
+                assert!(
+                    std::time::Instant::now() < drive_deadline,
+                    "permits granted to parked device calls never completed the staged write"
+                );
+                if let Some(target) = controller_gate.release_if_parked() {
+                    drop(state);
+                    controller_gate.wait_for_admitted(target);
+                    controller_gate.wait_for_no_inflight();
+                    state = state_lock.lock().unwrap();
+                } else {
+                    // Nothing parked yet: the flusher has not attempted its
+                    // next call, or the write is about to return. Poll.
+                    let (next, _) = changed
+                        .wait_timeout(state, Duration::from_millis(1))
+                        .unwrap();
                     state = next;
                 }
-                if state.2 > completed_before {
-                    finished = true;
-                    break;
-                }
             }
-            assert!(
-                finished,
-                "three permits must complete three staged segments"
-            );
+            drop(state);
+            // PHASE BOUNDARY. `write_all` returning does not mean the device is
+            // idle: a call admitted for this phase can still be running, and
+            // would complete inside the NEXT phase's "nothing may complete
+            // while gated" window, free a segment, and let that phase's write
+            // finish with no permit. Hold the producer until no admitted call
+            // is in flight. Parked calls are left alone: they need a permit
+            // and legitimately carry the ring's pressure into the next phase.
+            controller_gate.wait_for_no_inflight();
+            let mut state = state_lock.lock().unwrap();
+            state.3 = phase;
+            changed.notify_all();
         }
     });
     {
@@ -553,11 +617,21 @@ fn backpressure_repeated_waits_allocate_zero_bytes_after_open() {
     let before_events = alloc_events();
     let before_bytes = ALLOC_BYTES.load(Ordering::Relaxed);
     let before_waits = ferrosa_sstable::pump::pump_park_count();
-    for _ in 0..ITERATIONS {
+    for phase in 1..=ITERATIONS {
         {
             let (state_lock, changed) = &*coordination;
-            state_lock.lock().unwrap().1 += 1;
-            changed.notify_one();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut state = state_lock.lock().unwrap();
+            // Do not begin a phase until the controller has quiesced the
+            // previous one (no admitted device call still in flight).
+            while state.3 + 1 < phase {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero(), "controller did not quiesce phase");
+                let (next, _) = changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+            }
+            state.1 += 1;
+            changed.notify_all();
         }
         // Three segments exceed the complete two-segment ring, even if a
         // previous coalesced call returned every buffer before this operation.
@@ -565,7 +639,7 @@ fn backpressure_repeated_waits_allocate_zero_bytes_after_open() {
         {
             let (state_lock, changed) = &*coordination;
             state_lock.lock().unwrap().2 += 1;
-            changed.notify_one();
+            changed.notify_all();
         }
     }
     let events = alloc_events() - before_events;

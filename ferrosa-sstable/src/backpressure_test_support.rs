@@ -13,7 +13,12 @@ use crate::pump::SegmentSink;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Progress {
+    /// Device calls that reached the gate (parked or admitted).
     pub attempted: u64,
+    /// Device calls past the gate (permit consumed, or gate open/failed):
+    /// `admitted - completed` is the number IN FLIGHT, and
+    /// `attempted - admitted` the number PARKED awaiting a permit.
+    pub admitted: u64,
     pub completed: u64,
     pub bytes: u64,
 }
@@ -79,6 +84,65 @@ impl WriteGate {
         }
     }
 
+    /// Wait until no admitted device call is still running
+    /// (`admitted == completed`). Calls PARKED awaiting a permit do not count:
+    /// they need a permit to move, so waiting on them would hang, while an
+    /// admitted call always finishes on its own. This is the "no device call is
+    /// in flight" precondition a phase boundary needs before the next phase's
+    /// "nothing may complete while gated" window opens.
+    pub fn wait_for_no_inflight(&self) {
+        let deadline = Instant::now() + self.0.timeout;
+        let mut state = self.0.state.lock().unwrap();
+        while state.progress.admitted != state.progress.completed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (next, result) = self.0.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(
+                !result.timed_out() || state.progress.admitted == state.progress.completed,
+                "admitted device call never completed: {:?}",
+                state.progress
+            );
+        }
+    }
+
+    /// Wait until `count` device calls have been admitted (consumed a permit).
+    pub fn wait_for_admitted(&self, count: u64) {
+        let deadline = Instant::now() + self.0.timeout;
+        let mut state = self.0.state.lock().unwrap();
+        while state.progress.admitted < count {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (next, result) = self.0.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(
+                !result.timed_out() || state.progress.admitted >= count,
+                "device never admitted call {count}: {:?}",
+                state.progress
+            );
+        }
+    }
+
+    /// Release ONE permit only if a device call is parked awaiting one that no
+    /// outstanding permit already covers. Returns the `admitted` count that call
+    /// will reach once it consumes the permit, or `None` if nothing was parked.
+    ///
+    /// Unlike `release`, this can never bank a surplus permit: every permit it
+    /// grants has a parked call that will consume it at once.
+    pub fn release_if_parked(&self) -> Option<u64> {
+        let mut state = self.0.state.lock().unwrap();
+        let parked = state
+            .progress
+            .attempted
+            .saturating_sub(state.progress.admitted);
+        if parked <= state.permits {
+            return None;
+        }
+        state.permits += 1;
+        let target = state.progress.admitted + state.permits;
+        drop(state);
+        self.0.changed.notify_all();
+        Some(target)
+    }
+
     /// One permit admits one device call (which may contain coalesced segments).
     pub fn release(&self, count: u64) {
         self.0.state.lock().unwrap().permits += count;
@@ -132,6 +196,7 @@ impl Shared {
         if !state.open {
             state.permits -= 1;
         }
+        state.progress.admitted += 1;
         Ok(())
     }
 
