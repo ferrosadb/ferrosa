@@ -53,7 +53,11 @@ a CheckQuorum leader step-down.
   does, so a permit is only ever held by a slot holder: a scan that waited for
   the slot while keeping its permit deadlocked against the scan it yielded to
   (admitted to the slot, then waiting for the permit) — permanently on a 1-slot
-  pool. `submit`/`submit_blocking` are the generic (Bulk-weight) entries.
+  pool. Admitted scans run on the scheduler's own carrier runtime
+  (`scan_carrier`, `ferrosa-scan` threads), not the caller's `spawn_blocking`
+  pool: a scan's consumer (the PG executor) waits on a thread from that pool,
+  and a producer that needed one too deadlocked against it.
+  `submit`/`submit_blocking` are the generic (Bulk-weight) entries.
 - `runqueue::{RunQueue, SchedEntity, weight_for_class}` +
   `scheduler::{advance_vruntime, should_switch}` — the pure vruntime primitives
   `FairAdmit` is built from: a pick-min run queue with a monotonic `min_vruntime`

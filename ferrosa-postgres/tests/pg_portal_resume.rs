@@ -26,8 +26,8 @@ const ROWS: usize = 1_000;
 /// Rows per `Execute`; does not divide the internal batch sizes.
 const FETCH: i32 = 7;
 
-/// Longer than the storage scan's pause grace (100 ms), so a scan left alone
-/// this long has paused and must resume.
+/// Long enough that a scan left alone this long has paused (a full channel
+/// pauses it at once) and must resume.
 const IDLE: Duration = Duration::from_millis(250);
 
 fn storage_order(id: &str) -> DecoratedKey {
@@ -54,7 +54,7 @@ async fn a_portal_resumed_across_storage_pauses_returns_every_row_once_in_order(
             break;
         }
         if execute % 10 == 0 {
-            // Leave the portal idle past the grace, writing meanwhile: new
+            // Leave the portal idle so its scan pauses, writing meanwhile: new
             // rows on both sides of the scan's position, and overwrites.
             for _ in 0..3 {
                 write_row(&server.engine, ROWS + written);

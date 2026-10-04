@@ -525,26 +525,29 @@ impl SchedPool {
                     let io_permit = io_permits.acquire().await;
                     let io_permits = io_permits.clone();
                     let handle = tokio::runtime::Handle::current();
-                    let out = tokio::task::spawn_blocking(move || {
-                        let mut slot = ScanSlot {
-                            admit,
-                            id,
-                            chunk_budget: chunk_budget.max(1),
-                            since_yield: 0,
-                            yields: 0,
-                            handle,
-                            last_tick: Instant::now(),
-                            window_micros: 0,
-                            _io_permit: Some(io_permit),
-                            io_permits,
-                            finished: false,
-                        };
-                        let out = f(&mut slot);
-                        slot.finish();
-                        out
-                    })
-                    .await
-                    .expect("scheduler blocking task must not be cancelled");
+                    // On the scheduler's own carrier threads, NOT the caller
+                    // runtime's blocking pool: see `scan_carrier`.
+                    let out = scan_carrier()
+                        .spawn_blocking(move || {
+                            let mut slot = ScanSlot {
+                                admit,
+                                id,
+                                chunk_budget: chunk_budget.max(1),
+                                since_yield: 0,
+                                yields: 0,
+                                handle,
+                                last_tick: Instant::now(),
+                                window_micros: 0,
+                                _io_permit: Some(io_permit),
+                                io_permits,
+                                finished: false,
+                            };
+                            let out = f(&mut slot);
+                            slot.finish();
+                            out
+                        })
+                        .await
+                        .expect("scheduler blocking task must not be cancelled");
                     ScanOutcome::Ran(out)
                 }
                 Admitted::Overloaded => ScanOutcome::Overloaded,
@@ -552,6 +555,39 @@ impl SchedPool {
             }
         })
     }
+}
+
+/// Most carrier threads [`scan_carrier`] keeps. Running producers are bounded
+/// far below this by the pool's slots; the rest is headroom for producers
+/// parked on a full channel ([`ScanSlot::park`]), which hold their thread but
+/// no slot. Same figure as tokio's default blocking pool.
+const SCAN_CARRIER_MAX_THREADS: usize = 512;
+
+/// The threads admitted scan producers run on: a runtime owned by the
+/// scheduler, used only for its blocking pool.
+///
+/// Not the caller's `spawn_blocking` pool, because a scan's consumer often
+/// needs a thread from that pool to make progress — the PG executor pulls rows
+/// with `blocking_recv` on `spawn_blocking` from the PG listener's bounded
+/// pool. Sharing it made a cycle: with every thread held by an executor
+/// waiting for rows, the producer that would supply them could not get a
+/// thread to resume on, and the pool stayed full for good (four executors on a
+/// 4-thread pool beside eight slow PG readers). CPU use is still bounded by
+/// the pool's slots, which every producer must hold to run; these threads only
+/// carry them.
+fn scan_carrier() -> &'static tokio::runtime::Runtime {
+    static CARRIER: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    CARRIER.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(SCAN_CARRIER_MAX_THREADS)
+            .thread_name("ferrosa-scan")
+            .enable_time()
+            .build()
+            // Fail loud at the first scan: without carrier threads no scan
+            // can run at all, and there is no meaningful fallback.
+            .expect("ferrosa-sched: building the scan carrier runtime")
+    })
 }
 
 /// Outcome of a [`SchedPool::submit_scan`] producer.
@@ -1146,6 +1182,55 @@ mod tests {
         assert_eq!(pool.available_permits(), 1, "no slot leaked");
         assert_eq!(pool.io_permits().in_flight(), 0, "no I/O permit leaked");
         assert!(scan_parks_total() > parks_before, "the park is counted");
+    }
+
+    /// An admitted scan runs even when the caller runtime's blocking pool is
+    /// full of tasks waiting on that very scan — the PG executor pulling rows
+    /// with `blocking_recv` on `spawn_blocking`. One blocking thread, held by a
+    /// task that waits for the scan's output: if the producer needed a thread
+    /// from that pool it could never start.
+    ///
+    /// Own runtime with `shutdown_timeout`, so a regression FAILS with a message
+    /// instead of hanging on the wedged blocking thread.
+    #[test]
+    fn a_scan_runs_while_the_callers_blocking_pool_waits_on_it() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = rt.block_on(async {
+            let pool = SchedPool::new(Reservation::new(2, 0));
+            let (row_tx, row_rx) = std::sync::mpsc::channel::<u32>();
+            // The consumer occupies the runtime's only blocking thread while
+            // it waits for the producer's row.
+            let consumer = tokio::task::spawn_blocking(move || {
+                row_rx.recv_timeout(Duration::from_secs(10)).ok()
+            });
+            let producer = pool.submit_scan(
+                SchedClass::Bulk,
+                64,
+                std::future::pending::<()>(),
+                move |_slot| {
+                    let _consumer_listening = row_tx.send(7).is_ok();
+                },
+            );
+            tokio::time::timeout(Duration::from_secs(15), async {
+                ran(producer.await.expect("producer joined"));
+                consumer.await.expect("consumer joined")
+            })
+            .await
+        });
+        rt.shutdown_timeout(Duration::from_secs(1));
+        let row = outcome
+            .expect("deadlock: the producer waited for a blocking thread held by its own consumer");
+        assert_eq!(
+            row,
+            Some(7),
+            "the consumer never got the producer's row: the producer could not get a \
+             thread from the pool its consumer was holding"
+        );
     }
 
     /// A scan that yields its CPU slot at a budget boundary must yield its I/O
