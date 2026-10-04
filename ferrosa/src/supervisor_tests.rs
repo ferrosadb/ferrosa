@@ -508,6 +508,43 @@ fn a_dead_commit_log_sync_thread_is_reported_restarted_and_recovers() {
     assert_eq!(escalations.load(Ordering::SeqCst), 0);
 }
 
+/// A slow disk is not a dead sync thread. Seen on the native cluster
+/// 2026-10-04: fsyncs of 1–2 s under load each passed the 2 s deadline once
+/// and then completed; the fourth such episode in an hour aborted the node,
+/// which fixes nothing (the disk is still slow) and adds a replay's I/O.
+/// Each episode still refuses writes and reports not ready while it lasts.
+#[test]
+fn slow_fsync_episodes_that_recover_never_escalate() {
+    let target = FakeSync::new();
+    let (mut supervisor, status, escalations) = sync_supervisor(target.clone(), 3);
+
+    for _ in 0..6 {
+        target.set(|h| h.unsynced_for = Some(Duration::from_millis(2300)));
+        supervisor.check();
+        assert!(
+            !status.impaired().is_empty(),
+            "writes refused during the stall"
+        );
+        target.set(|h| h.unsynced_for = None);
+        supervisor.check();
+        assert!(
+            status.impaired().is_empty(),
+            "recovered once an fsync completed"
+        );
+    }
+
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        0,
+        "a recovered stall is not a crash"
+    );
+    assert_eq!(
+        status.failures(Child::CommitLogSync, FailureKind::Stall),
+        6,
+        "every stall stays observable in the failure metric"
+    );
+}
+
 #[test]
 fn a_stalled_commit_log_sync_counts_one_stall_per_deadline_and_escalates() {
     let target = FakeSync::new();
@@ -535,13 +572,23 @@ fn a_stalled_commit_log_sync_counts_one_stall_per_deadline_and_escalates() {
         "a stall is not a death"
     );
 
+    // The episode's first deadline only impairs; each further deadline of the
+    // same unbroken stall (an fsync that does not return) is a crash.
     target.set(|h| h.unsynced_for = Some(Duration::from_millis(6100)));
     supervisor.check();
     assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Stall), 3);
     assert_eq!(
         escalations.load(Ordering::SeqCst),
+        0,
+        "two counted deadlines do not exceed max_restarts=2"
+    );
+    target.set(|h| h.unsynced_for = Some(Duration::from_millis(8100)));
+    supervisor.check();
+    assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Stall), 4);
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
         1,
-        "three stalls exceed max_restarts=2"
+        "a hung fsync still escalates: three counted deadlines exceed max_restarts=2"
     );
     assert!(
         !status.impaired().is_empty(),
