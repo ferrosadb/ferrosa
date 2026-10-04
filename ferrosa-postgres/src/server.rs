@@ -771,6 +771,10 @@ fn expired_transaction_error(ctx: &QueryContext, session: &Session) -> Option<Ba
             "40001",
             "could not serialize PostgreSQL transaction",
         )),
+        // Backpressure answers 53000 (retryable); a real fault keeps 58000.
+        Err(MvccCommitError::Storage(error)) if error.is_backpressure() => Some(
+            query::error_response("53000", &format!("transaction refused: {error}")),
+        ),
         Err(MvccCommitError::Storage(error)) => Some(query::error_response(
             "58000",
             &format!("transaction validation failed: {error}"),
@@ -814,6 +818,12 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                     vec![query::error_response(
                         "40001",
                         "could not serialize PostgreSQL transaction",
+                    )]
+                }
+                MvccCommitError::Storage(error) if error.is_backpressure() => {
+                    vec![query::error_response(
+                        "53000",
+                        &format!("transaction refused: {error}"),
                     )]
                 }
                 MvccCommitError::Storage(error) => vec![query::error_response(
@@ -893,15 +903,19 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                                       let mutation_bytes = match metadata {
                                           Some(changes) => {
                                               let metadata = serde_json::to_vec(&changes).map_err(|error| {
-                                                  MvccCommitError::Storage(format!(
-                                                      "serialize PostgreSQL MVCC row versions: {error}"
+                                                  MvccCommitError::Storage(ferrosa_common::Error::InvalidData(
+                                                      format!("serialize PostgreSQL MVCC row versions: {error}"),
                                                   ))
                                               })?;
                                               ferrosa_storage::accord::encode_postgres_mvcc_mutation(
                                                   &bytes,
                                                   &metadata,
                                               )
-                                              .map_err(MvccCommitError::Storage)?
+                                              .map_err(|error| {
+                                                  MvccCommitError::Storage(
+                                                      ferrosa_common::Error::InvalidData(error),
+                                                  )
+                                              })?
                                           }
                                           None => bytes,
                                       };
@@ -916,10 +930,12 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                                       if changes_by_partition.is_empty() {
                                           Ok(writes)
                                       } else {
-                                          Err(MvccCommitError::Storage(format!(
-                                              "{} PostgreSQL row version(s) were not attached to an Accord partition",
-                                              changes_by_partition.values().map(Vec::len).sum::<usize>()
-                                          )))
+                                          Err(MvccCommitError::Storage(
+                                              ferrosa_common::Error::InvalidData(format!(
+                                                  "{} PostgreSQL row version(s) were not attached to an Accord partition",
+                                                  changes_by_partition.values().map(Vec::len).sum::<usize>()
+                                              )),
+                                          ))
                                       }
                                   });
                     let accord_writes = match accord_writes {
@@ -955,7 +971,18 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                         Ok(ferrosa_storage::accord::CommitOutcome::Aborted { .. }) => {
                             Err(MvccCommitError::SerializationFailure)
                         }
-                        Err(error) => Err(MvccCommitError::Storage(error.to_string())),
+                        // Accord's `CommitError` is itself only a `reason: String`,
+                        // so the typed error is already gone by the time it
+                        // reaches here — a THIRD erasure, in the committer trait,
+                        // too deep to widen in this change. Wrapping the reason in
+                        // `InvalidData` at least reaches `is_backpressure()`'s
+                        // documented string branch (`starts_with("overloaded:")`),
+                        // which matches `Error::Overloaded`'s Display, so a
+                        // distributed commit refused for pressure can still be
+                        // classified. Best-effort by construction, not by accident.
+                        Err(error) => Err(MvccCommitError::Storage(
+                            ferrosa_common::Error::InvalidData(error.reason),
+                        )),
                     }
                 }
             }
@@ -983,6 +1010,17 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
             "40001",
             "PostgreSQL transaction snapshot expired",
         )],
+        // The final outcome arm, which every non-empty explicit transaction
+        // lands on. Backpressure is retryable (53000); a real fault is not
+        // (58000). This arm answered 58000 unconditionally, so a transactional
+        // client was told its commit hit a system fault when the server was
+        // only refusing the pace.
+        Err(MvccCommitError::Storage(error)) if error.is_backpressure() => {
+            vec![query::error_response(
+                "53000",
+                &format!("transaction refused: {error}"),
+            )]
+        }
         Err(e @ MvccCommitError::Storage(_)) => vec![query::error_response(
             "58000",
             &format!("transaction commit failed: {e:?}"),
@@ -1813,6 +1851,22 @@ mod txn_atomicity_tests {
         (dir, ctx)
     }
 
+    /// `make_ctx` with hard write admission enabled, so a client can fill the
+    /// buffer and be refused. The flush threshold is raised out of the way so a
+    /// background flush cannot drain the memtable mid-test.
+    async fn make_ctx_with_write_admission(
+        backpressure_bytes: u64,
+    ) -> (tempfile::TempDir, QueryContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = engine_config(dir.path());
+        config.memtable_backpressure_bytes = backpressure_bytes;
+        config.flush_threshold_bytes = 1 << 30;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(kv_storage_schema()).unwrap();
+        let ctx = ctx_with(Arc::new(engine), Arc::new(schema_with_kv()));
+        (dir, ctx)
+    }
+
     /// Rows visible for key `k`, read back through the `execute_query` SELECT
     /// path with no transaction buffer.
     async fn row_count(ctx: &QueryContext, key: &str) -> usize {
@@ -2089,6 +2143,69 @@ mod txn_atomicity_tests {
             row_count(&ctx, "x").await,
             1,
             "the PostgreSQL MVCC commit applies the buffered row"
+        );
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// An explicit `BEGIN; INSERT; COMMIT` refused for write pressure must say
+    /// `53000`, like every other refusal.
+    ///
+    /// Found by review: the autocommit paths were fixed first, but the FINAL
+    /// outcome arm of `commit_txn` — the one every non-empty explicit
+    /// transaction lands on — still answered `58000 system_error`
+    /// unconditionally. A transactional client was therefore told its commit
+    /// hit a system fault when the server was simply refusing the pace, and
+    /// would not retry. The two autocommit tests could not catch it because
+    /// they never open a transaction.
+    #[tokio::test]
+    async fn a_refused_explicit_commit_says_insufficient_resources() {
+        const BACKPRESSURE_BYTES: u64 = 64 * 1024;
+        let (_dir, ctx) = make_ctx_with_write_admission(BACKPRESSURE_BYTES).await;
+        let mut session = Session::new(superuser());
+
+        // Fill the memtable with autocommit writes first. The transaction's own
+        // write-set is capped (`max_txn_writes` -> 53400), so the pressure has
+        // to be built outside the transaction, then the COMMIT's write is what
+        // crosses the admission threshold.
+        let payload = "x".repeat(1024);
+        let mut filled = false;
+        for seq in 0..4096u32 {
+            let sql = format!("INSERT INTO kv (k, v) VALUES ('fill-{seq}', '{payload}')");
+            let msgs = execute_simple(&ctx, &mut session, &sql).await;
+            if msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+            {
+                filled = true;
+                break;
+            }
+        }
+        assert!(
+            filled,
+            "the memtable must reach its admission threshold before the transaction"
+        );
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            &format!("INSERT INTO kv (k, v) VALUES ('txn-row', '{payload}')"),
+        )
+        .await;
+        let msgs = execute_simple(&ctx, &mut session, "COMMIT").await;
+
+        let code = msgs
+            .iter()
+            .find_map(|m| match m {
+                BackendMessage::ErrorResponse { fields } => Some(fields[1].1.clone()),
+                _ => None,
+            })
+            .expect("the COMMIT must be refused while the buffer is full");
+        assert_eq!(
+            code, "53000",
+            "a commit refused for backpressure must be retryable insufficient_resources, \
+             not 58000 system_error: {msgs:?}"
         );
 
         ctx.engine.shutdown().unwrap();

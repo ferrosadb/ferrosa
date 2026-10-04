@@ -80,6 +80,7 @@ async fn node(capabilities: u32, cursor_config: ResultCursorConfig) -> Node {
             host_id: Some(id),
             peer_manager: Some(peers.clone()),
             cursor_config,
+            ..StandaloneOptions::default()
         },
     );
     let registry = Arc::new(HandlerRegistry::new());

@@ -419,7 +419,7 @@ impl MvccManager {
         &self,
         snapshot: &MvccSnapshot,
         read_tables: &HashSet<String>,
-        apply: impl FnOnce() -> Result<Vec<RowChange>, String>,
+        apply: impl FnOnce() -> Result<Vec<RowChange>, ferrosa_common::Error>,
     ) -> Result<u64, MvccCommitError> {
         let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
         validate_snapshot(&state, snapshot, read_tables)?;
@@ -616,11 +616,22 @@ fn retain_snapshot_history<K: Copy + Ord, V>(
     !versions.is_empty()
 }
 
-#[derive(Debug, PartialEq, Eq)]
+// No `PartialEq`/`Eq`: `Storage` now carries `ferrosa_common::Error`, which
+// wraps `std::io::Error` and is deliberately not comparable. Match on the
+// variant instead of comparing whole values.
+#[derive(Debug)]
 pub(crate) enum MvccCommitError {
     SerializationFailure,
     SnapshotExpired,
-    Storage(String),
+    /// The commit's storage write failed, carrying the TYPED error.
+    ///
+    /// This used to be a `String`. Stringifying it here destroyed the one thing
+    /// the PostgreSQL front end needs to answer the client correctly: whether
+    /// the failure was deliberate backpressure (`Error::is_backpressure()`) or a
+    /// real fault. Without the type every commit failure mapped to SQLSTATE
+    /// `58000 system_error`, which drivers do not retry, so a producer
+    /// outrunning the device was never told to slow down.
+    Storage(ferrosa_common::Error),
 }
 
 #[cfg(test)]
@@ -706,7 +717,10 @@ mod tests {
             &HashSet::from(["public.items".to_string()]),
             || Ok(Vec::new()),
         );
-        assert_eq!(result, Err(MvccCommitError::SerializationFailure));
+        assert!(
+            matches!(result, Err(MvccCommitError::SerializationFailure)),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -806,9 +820,12 @@ mod tests {
         assert_eq!(expired, 1);
         assert_eq!(manager.active_snapshot_count(), 0);
         assert_eq!(manager.retained_version_count(), 1);
-        assert_eq!(
-            manager.validate_commit(&old_snapshot, &HashSet::new()),
-            Err(MvccCommitError::SnapshotExpired)
+        assert!(
+            matches!(
+                manager.validate_commit(&old_snapshot, &HashSet::new()),
+                Err(MvccCommitError::SnapshotExpired)
+            ),
+            "an expired snapshot must refuse its commit"
         );
     }
 

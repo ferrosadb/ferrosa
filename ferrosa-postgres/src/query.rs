@@ -1044,6 +1044,42 @@ pub(crate) fn encode_data_row(
 }
 
 /// Every statement that is not a table `SELECT`: bounded replies, returned whole.
+/// Map a failed storage write to a PostgreSQL error, distinguishing deliberate
+/// backpressure from a genuine failure.
+///
+/// The SQLSTATE class is the contract, not the message. `53000`
+/// (insufficient_resources) says "I cannot accept at this pace" and drivers,
+/// poolers and retry middleware back off and retry on it. `58000` is class 58,
+/// a system error external to PostgreSQL, which the same clients treat as fatal
+/// and do NOT retry. Collapsing an overload into 58000 means a producer that is
+/// outrunning the device is never told to slow down, so it keeps producing — the
+/// server sheds load it could have had the client pace instead.
+///
+/// `Error::is_backpressure()` is the shared classifier (it covers
+/// `Error::Overloaded` and the disk-reserve refusal), so this stays in step with
+/// the CQL front end rather than re-deciding what counts as backpressure.
+fn write_error_response(error: &ferrosa_common::Error) -> BackendMessage {
+    if error.is_backpressure() {
+        // `is_backpressure()` has two branches: the typed `Error::Overloaded`,
+        // and a legacy STRING match on `InvalidData` (`starts_with("overloaded:")`)
+        // that exists only because the error type is flattened on some paths.
+        // The string branch FAILS OPEN — if `Overloaded`'s Display ever changes,
+        // it silently stops matching and a refusal is reported as 58000 again,
+        // with nothing to show it regressed. So say when we relied on it. The
+        // CQL side already logs this; this keeps the two front ends symmetric.
+        if !matches!(error, ferrosa_common::Error::Overloaded { .. }) {
+            tracing::warn!(
+                %error,
+                "backpressure classified by the legacy string match, not by type; \
+                 the carrier on this path flattens the error (see t_01fe2523)"
+            );
+        }
+        error_response("53000", &format!("write refused: {error}"))
+    } else {
+        error_response("58000", &format!("write failed: {error}"))
+    }
+}
+
 async fn execute_statement(
     env: ReadEnv<'_>,
     stmt: Statement,
@@ -1197,6 +1233,10 @@ async fn apply_or_buffer(
                         "40001",
                         "could not serialize PostgreSQL transaction",
                     )],
+                    // Now that `Storage` carries the typed error, a commit
+                    // refused for backpressure answers 53000 like the direct
+                    // write path, instead of collapsing into 58000.
+                    Err(MvccCommitError::Storage(error)) => vec![write_error_response(&error)],
                     Err(error) => {
                         vec![error_response("58000", &format!("write failed: {error:?}"))]
                     }
@@ -1206,7 +1246,7 @@ async fn apply_or_buffer(
                 Ok(()) => vec![BackendMessage::CommandComplete {
                     tag: ok_tag.to_string(),
                 }],
-                Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
+                Err(e) => vec![write_error_response(&e)],
             },
         },
     }
@@ -1228,9 +1268,9 @@ pub(crate) fn commit_mutations(
     }
     let changes = prepare_row_changes(engine, schema, &mutations)?;
     mvcc.commit(snapshot, read_tables, || {
-        engine
-            .write_atomic_batch(mutations)
-            .map_err(|error| error.to_string())?;
+        // The typed error propagates: the front end must be able to ask
+        // `is_backpressure()` to choose between 53000 and 58000.
+        engine.write_atomic_batch(mutations)?;
         Ok(changes)
     })
 }
@@ -1266,7 +1306,9 @@ pub(crate) fn prepare_row_changes(
                     mutation,
                     &row.clustering,
                 )
-                .map_err(|error| format!("read before image failed: {error}"))?;
+                .map_err(|error| {
+                    ferrosa_common::Error::InvalidData(format!("read before image failed: {error}"))
+                })?;
                 if let Some((key, image)) = before {
                     partition_keys.insert(key.clone(), mutation.key.key.as_bytes().to_vec());
                     table_rows
@@ -1294,7 +1336,11 @@ pub(crate) fn prepare_row_changes(
                 &pending,
                 Some(&mut partition_keys),
             )
-            .map_err(|error| format!("build transaction row image failed: {error}"))?;
+            .map_err(|error| {
+                ferrosa_common::Error::InvalidData(format!(
+                    "build transaction row image failed: {error}"
+                ))
+            })?;
         }
         let mut changes = Vec::new();
         for ((keyspace, table), after_rows) in table_rows {
@@ -1305,7 +1351,9 @@ pub(crate) fn prepare_row_changes(
                 changes.push(RowChange {
                     table: format!("{keyspace}.{table}"),
                     partition_key: partition_keys.get(&key).cloned().ok_or_else(|| {
-                        "could not map PostgreSQL row version to its partition".to_string()
+                        ferrosa_common::Error::InvalidData(
+                            "could not map PostgreSQL row version to its partition".to_string(),
+                        )
                     })?,
                     before: before.get(&key).cloned().unwrap_or(None),
                     key,
@@ -3484,6 +3532,25 @@ mod txn_buffer_tests {
         (dir, engine, schema)
     }
 
+    /// `new_engine_and_schema` with hard write admission enabled, so a writer
+    /// can actually fill the buffer and be refused.
+    ///
+    /// Admission control defaults to `u64::MAX` everywhere else; the flush
+    /// threshold is raised out of the way so a flush draining the memtable
+    /// cannot race the fill.
+    async fn new_engine_with_write_admission(
+        backpressure_bytes: u64,
+    ) -> (tempfile::TempDir, Arc<StorageEngine>, Schema) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = engine_config(dir.path());
+        config.memtable_backpressure_bytes = backpressure_bytes;
+        config.flush_threshold_bytes = 1 << 30;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(kv_storage_schema()).unwrap();
+        let schema = schema_with_kv();
+        (dir, engine, schema)
+    }
+
     #[tokio::test]
     async fn buffered_insert_is_not_applied_until_mvcc_commit() {
         // An INSERT with `txn = Some(buffer)` is BUFFERED, never written to
@@ -3614,6 +3681,115 @@ mod txn_buffer_tests {
             "an over-cap write is never applied to storage"
         );
 
+        engine.shutdown().unwrap();
+    }
+
+    /// A PostgreSQL client that outruns the device must be told to back off in
+    /// the only language a driver reads: the SQLSTATE.
+    ///
+    /// The class is the entire point. `53000 insufficient_resources` is a
+    /// retryable "I cannot accept at this pace"; `58000 system_error` is class
+    /// 58, a system failure external to PostgreSQL, which drivers and poolers
+    /// treat as fatal and do NOT retry. Putting the word "overloaded" in the
+    /// message does not help — correct clients key on the code. A producer
+    /// handed 58000 never learns to slow down, so it keeps producing.
+    ///
+    /// Red before the fix: every storage write error, `Overloaded` included,
+    /// collapsed into `error_response("58000", ...)`.
+    #[tokio::test]
+    async fn a_full_write_buffer_refuses_the_next_pg_write_as_insufficient_resources() {
+        const BACKPRESSURE_BYTES: u64 = 64 * 1024;
+        let (_dir, engine, schema) = new_engine_with_write_admission(BACKPRESSURE_BYTES).await;
+        let limits = crate::jsonb_wire::test_limits();
+
+        // Autocommit (txn = None) so each INSERT reaches storage immediately
+        // rather than buffering into an MVCC write-set.
+        let payload = "x".repeat(1024);
+        let mut accepted = 0u32;
+        let mut refusal_code = None;
+        for seq in 0..4096u32 {
+            let sql = format!("INSERT INTO kv (k, v) VALUES ('row-{seq}', '{payload}')");
+            let msgs = execute_query(&engine, &schema, &sql, "public", &limits, None).await;
+            match &msgs[..] {
+                [BackendMessage::CommandComplete { .. }] => accepted += 1,
+                [BackendMessage::ErrorResponse { fields }] => {
+                    refusal_code = Some(fields[1].1.clone());
+                    break;
+                }
+                other => panic!("unexpected response to an INSERT: {other:?}"),
+            }
+        }
+
+        let code = refusal_code.expect(
+            "a full write buffer must refuse a write; the server accepted every row instead",
+        );
+        assert!(
+            accepted > 0,
+            "the server must accept what it can before refusing"
+        );
+        assert_eq!(
+            code, "53000",
+            "a full buffer must refuse with insufficient_resources, which a driver retries; \
+             58000 is a system error it will not retry, so the producer never backs off"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// The same contract on the MVCC commit path.
+    ///
+    /// With an MVCC manager present, an autocommit write goes through
+    /// `commit_mutations` rather than straight to `write_atomic_batch`, and
+    /// that path used to stringify the storage error
+    /// (`.map_err(|error| error.to_string())`) before MVCC ever saw it. A
+    /// stringified error cannot be asked `is_backpressure()`, so every commit
+    /// failure — overload included — collapsed into `58000`, and a
+    /// transactional PostgreSQL producer was never told to slow down.
+    ///
+    /// Red before the error type was widened to carry `ferrosa_common::Error`.
+    #[tokio::test]
+    async fn a_full_write_buffer_refuses_an_mvcc_commit_as_insufficient_resources() {
+        const BACKPRESSURE_BYTES: u64 = 64 * 1024;
+        let (_dir, engine, schema) = new_engine_with_write_admission(BACKPRESSURE_BYTES).await;
+        let mvcc = MvccManager::default();
+        let limits = crate::jsonb_wire::test_limits();
+
+        let payload = "x".repeat(1024);
+        let mut accepted = 0u32;
+        let mut refusal_code = None;
+        for seq in 0..4096u32 {
+            let sql = format!("INSERT INTO kv (k, v) VALUES ('mvcc-{seq}', '{payload}')");
+            let env = ReadEnv {
+                engine: &engine,
+                schema: &schema,
+                default_schema: "public",
+                mvcc: Some(&mvcc),
+                snapshot: None,
+                ddl: None,
+                jsonb_limits: &limits,
+            };
+            // txn = None: autocommit, but through the MVCC commit path.
+            let msgs = execute_query_with_mvcc(env, &sql, None).await;
+            match &msgs[..] {
+                [BackendMessage::CommandComplete { .. }] => accepted += 1,
+                [BackendMessage::ErrorResponse { fields }] => {
+                    refusal_code = Some(fields[1].1.clone());
+                    break;
+                }
+                other => panic!("unexpected response to an INSERT: {other:?}"),
+            }
+        }
+
+        let code = refusal_code
+            .expect("a full write buffer must refuse an MVCC commit; every row was accepted");
+        assert!(
+            accepted > 0,
+            "the server must accept what it can before refusing"
+        );
+        assert_eq!(
+            code, "53000",
+            "an MVCC commit refused for backpressure must say insufficient_resources, \
+             not 58000 system_error which clients will not retry"
+        );
         engine.shutdown().unwrap();
     }
 

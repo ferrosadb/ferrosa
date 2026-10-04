@@ -16532,6 +16532,23 @@ mod tests {
         setup_with_index_backend(ferrosa_storage::index::IndexBackendConfig::Local)
     }
 
+    /// `setup`, with hard write admission enabled at `backpressure_bytes`.
+    ///
+    /// Admission control is disabled (`u64::MAX`) in every other fixture, so
+    /// nothing else exercises the upward overload signal. The flush threshold
+    /// is raised out of the way on purpose: a flush drains the memtable, and a
+    /// drain racing the fill would make "the buffer got full" non-deterministic.
+    /// Here the buffer fills and stays full until a write is refused.
+    fn setup_with_write_admission(backpressure_bytes: u64) -> (SharedState, TempDir) {
+        setup_with_engine_overrides(
+            ferrosa_storage::index::IndexBackendConfig::Local,
+            |config| {
+                config.memtable_backpressure_bytes = backpressure_bytes;
+                config.flush_threshold_bytes = 1 << 30;
+            },
+        )
+    }
+
     /// `setup`, with the index build backend chosen by the caller.
     ///
     /// `IndexBackendConfig::Off` builds no scheduler, so `CREATE INDEX` marks
@@ -16540,6 +16557,16 @@ mod tests {
     /// is registered, incomplete, and known-incomplete by the tracker.
     fn setup_with_index_backend(
         index_backend: ferrosa_storage::index::IndexBackendConfig,
+    ) -> (SharedState, TempDir) {
+        setup_with_engine_overrides(index_backend, |_| {})
+    }
+
+    /// `setup_with_index_backend`, letting the caller adjust the engine config
+    /// before the engine is built. Kept to one seam so a fixture cannot drift
+    /// from the real one by copying it.
+    fn setup_with_engine_overrides(
+        index_backend: ferrosa_storage::index::IndexBackendConfig,
+        overrides: impl FnOnce(&mut StorageEngineConfig),
     ) -> (SharedState, TempDir) {
         let dir = TempDir::new().unwrap();
 
@@ -16571,6 +16598,8 @@ mod tests {
             memtable_num_shards: 64,
             cache_hot_window_secs: 900,
         };
+        let mut engine_config = engine_config;
+        overrides(&mut engine_config);
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
         // Real startup registers the system tables unconditionally (main.rs:802);
         // mirror that so the harness reflects standalone mode (system_auth.* must
@@ -17142,6 +17171,75 @@ mod tests {
              ALLOW FILTERING permits a scan, it does not require one"
         );
         taken.unwrap().expect("the keyed read should succeed");
+    }
+
+    /// A producer that outruns the device must be TOLD, through the CQL error
+    /// it already understands, that the server cannot accept at that pace.
+    ///
+    /// The contract is: accept what you can, then refuse with a typed,
+    /// retryable overload — never accept beyond the buffer, and never fail
+    /// opaquely. The error class is the whole point: `Overloaded` (CQL
+    /// 0x1001) tells a driver to back off and retry, while an internal-error
+    /// class tells it something broke and must not be retried. A producer that
+    /// is handed the wrong class never learns to slow down.
+    ///
+    /// Admission control is disabled in every other test fixture, so without
+    /// this the upward signal from a full write buffer reached no client.
+    #[tokio::test]
+    async fn a_full_write_buffer_refuses_the_next_cql_write_as_overloaded() {
+        const BACKPRESSURE_BYTES: u64 = 64 * 1024;
+        let (state, _dir) = setup_with_write_admission(BACKPRESSURE_BYTES);
+        let auth = dev_auth();
+        let current_keyspace = None;
+        let ctx = test_ctx(&auth, &current_keyspace);
+
+        for cql in [
+            "CREATE KEYSPACE pace WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            "CREATE TABLE pace.writes (tenant text, seq bigint, payload text, PRIMARY KEY (tenant, seq))",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // Enough rows that the buffer must fill: each carries ~1 KiB of
+        // payload against a 64 KiB threshold, and the flush threshold is out
+        // of the way so nothing drains it underneath us.
+        let payload = "x".repeat(1024);
+        let mut accepted = 0u32;
+        let mut refusal = None;
+        for seq in 0..4096u32 {
+            let insert = format!(
+                "INSERT INTO pace.writes (tenant, seq, payload) \
+                 VALUES ('tenant-a', {seq}, '{payload}')"
+            );
+            match route(&state, &ctx, crate::parser::parse(&insert).unwrap()).await {
+                Ok(_) => accepted += 1,
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+
+        let refusal = refusal.expect(
+            "a full write buffer must refuse a write; the server accepted every row instead",
+        );
+        // Accept what it can, THEN refuse: a server that refuses from the
+        // first write is not applying backpressure, it is broken.
+        assert!(
+            accepted > 0,
+            "the server must accept what it can before refusing"
+        );
+        assert!(
+            matches!(refusal, CqlError::Overloaded(_)),
+            "a full buffer must refuse with the typed, retryable overload, not {refusal:?}"
+        );
+        assert_eq!(
+            refusal.error_code(),
+            0x1001,
+            "the wire code a driver keys its backoff on"
+        );
     }
 
     #[tokio::test]

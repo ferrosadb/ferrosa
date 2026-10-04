@@ -63,6 +63,14 @@ pub struct StandaloneOptions {
     pub peer_manager: Option<Arc<ferrosa_net::peer::PeerManager>>,
     /// Result-cursor tunables (TTL, cap, close grace).
     pub cursor_config: crate::result_cursor::ResultCursorConfig,
+    /// Hard write-admission threshold: once the memtable reaches this, a write
+    /// is REFUSED with `Error::Overloaded` rather than accepted.
+    ///
+    /// `u64::MAX` (the default) disables admission control, which is what every
+    /// other test wants — they are not testing backpressure and an accidental
+    /// refusal would look like an unrelated failure. A test that opts in with a
+    /// small value is asserting the upward overload signal reaches the client.
+    pub memtable_backpressure_bytes: u64,
 }
 
 impl Default for StandaloneOptions {
@@ -72,6 +80,7 @@ impl Default for StandaloneOptions {
             host_id: None,
             peer_manager: None,
             cursor_config: crate::result_cursor::ResultCursorConfig::default(),
+            memtable_backpressure_bytes: u64::MAX,
         }
     }
 }
@@ -85,6 +94,7 @@ pub fn standalone_for_test_with(data_dir: &Path, options: StandaloneOptions) -> 
         host_id,
         peer_manager,
         cursor_config,
+        memtable_backpressure_bytes,
     } = options;
     let host_id = host_id.unwrap_or_else(uuid::Uuid::new_v4);
     let commit_log = CommitLogConfig {
@@ -100,7 +110,7 @@ pub fn standalone_for_test_with(data_dir: &Path, options: StandaloneOptions) -> 
         local_cache_max_bytes: 1024 * 1024,
         local_disk_free_reserve_bytes: 0,
         flush_threshold_bytes,
-        memtable_backpressure_bytes: u64::MAX,
+        memtable_backpressure_bytes,
         flush_max_age_secs: 5,
         data_dir: data_dir.to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
