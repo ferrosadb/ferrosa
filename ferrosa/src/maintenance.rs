@@ -1,6 +1,7 @@
 //! Module: the storage maintenance loop.
 //! Responsibility: periodic and urgent memtable flushes, compaction polling,
-//!   commit-log GC, schema persistence and S3 sync, run under supervision.
+//!   secondary-index backfill healing, commit-log GC, schema persistence and
+//!   S3 sync, run under supervision.
 //! Correctness: the loop is a child of `supervisor::supervise` (restarted if it
 //!   panics or returns) and every flush is a `FlushSupervisor` attempt (a panic
 //!   is restarted on the next tick, a hang is reported as a stall and no longer
@@ -9,10 +10,10 @@
 //!   the flush restart window, so a loop restart does not reset it. Every
 //!   iteration beats `ctx.heartbeat`; `supervisor::MaintenanceWatchdog` reads it
 //!   from its own thread and reports a loop that stopped iterating.
-//! Last revised: 2026-10-03
-//! Last changed: Extracted from `main` and supervised (t_7681b32b). Before, a
-//!   flush panic was one ERROR line, a hung flush blocked every arm of the loop
-//!   forever, the loop's own JoinHandle was dropped, and `/readyz` said 200.
+//! Last revised: 2026-10-04
+//! Last changed: Each compaction tick also heals secondary-index backfills
+//!   (storage ST-85). A failed or lost backfill used to leave its index
+//!   refusing reads until the next restart.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -89,6 +90,7 @@ async fn run_maintenance_loop(ctx: MaintenanceContext) {
             _ = flush_interval.tick() => periodic_flush(&ctx, &mut flusher, has_s3).await,
             _ = compact_interval.tick() => {
                 ctx.engine.poll_compactions().await;
+                heal_index_backfills(&ctx).await;
             }
             _ = ctx.engine.wait_for_compaction_retry_wakeup() => {
                 ctx.engine.poll_compactions().await;
@@ -119,6 +121,29 @@ async fn run_maintenance_loop(ctx: MaintenanceContext) {
             }
             _ = schema_sync_interval.tick() => schema_sync(&ctx, &mut flusher, has_s3).await,
         }
+    }
+}
+
+/// Retry failed or stalled secondary-index backfills and publish the
+/// `ferrosa_index_not_current` gauges. Off the async worker: a retry reads
+/// SSTable headers to resolve each generation's column layout.
+async fn heal_index_backfills(ctx: &MaintenanceContext) {
+    let engine = ctx.engine.clone();
+    match tokio::task::spawn_blocking(move || engine.heal_secondary_index_backfills()).await {
+        Ok(heal) if heal != ferrosa_storage::engine::IndexBackfillHeal::default() => {
+            tracing::info!(
+                retired = heal.retired,
+                resubmitted = heal.resubmitted,
+                settled = heal.settled,
+                "index backfill heal pass acted"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!(
+            %e,
+            "index backfill heal pass panicked or was cancelled; failed index backfills \
+             are not retried until the next tick"
+        ),
     }
 }
 

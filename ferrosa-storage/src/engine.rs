@@ -1277,6 +1277,75 @@ fn build_index_scheduler(
     (scheduler, tracker)
 }
 
+/// How long a pending secondary-index backfill may go without a build
+/// finishing (or a retry) before the healer resubmits it: a job that was
+/// never queued, or was lost, would otherwise leave the index refusing reads
+/// until a restart.
+pub const INDEX_BACKFILL_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A secondary index that is not current: reads through it are refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleSecondaryIndex {
+    /// The index's table.
+    pub table: TableId,
+    /// The index.
+    pub index: String,
+    /// Generations pending a backfill.
+    pub pending_generations: usize,
+    /// The last build error, while the index is failed and awaiting a retry.
+    pub last_error: Option<String>,
+}
+
+/// What one [`StorageEngine::heal_secondary_index_backfills`] pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexBackfillHeal {
+    /// Pending generations dropped because they left the live set.
+    pub retired: usize,
+    /// Pending generations resubmitted for a build.
+    pub resubmitted: usize,
+    /// Pending generations found to hold nothing for the index.
+    pub settled: usize,
+}
+
+/// What a scheduler build of one index reads: `(index name, cell position or
+/// key component, clustering source, partition-key source)`.
+type SchedulerIndexSource = (
+    String,
+    usize,
+    Option<crate::index::ClusteringComponentRef>,
+    Option<crate::index::PartitionKeyComponentRef>,
+);
+
+/// Every index of `store` the build scheduler builds: cell indexes, then
+/// clustering-column and partition-key-column indexes.
+fn scheduler_index_sources(store: &TableStore<FileFlushTarget>) -> Vec<SchedulerIndexSource> {
+    let ck_total = store.clustering_column_count();
+    let pk_total = store.partition_key_column_count();
+    let (cell_indexes, clustering_indexes, partition_key_indexes) = (
+        store.indexed_columns(),
+        store.indexed_clustering_columns(),
+        store.indexed_partition_key_columns(),
+    );
+    let cells = cell_indexes
+        .iter()
+        .map(|(name, pos)| (name.clone(), *pos, None, None));
+    let clustering = clustering_indexes.iter().map(|(name, component)| {
+        let source = crate::index::ClusteringComponentRef {
+            component: *component,
+            total: ck_total,
+        };
+        (name.clone(), *component, Some(source), None)
+    });
+    let partition_key = partition_key_indexes.iter().map(|(name, component)| {
+        let source = crate::index::PartitionKeyComponentRef {
+            component: *component,
+            total: pk_total,
+        };
+        (name.clone(), *component, None, Some(source))
+    });
+    cells.chain(clustering).chain(partition_key).collect()
+}
+
 /// Build a high-priority eager-index rebuild job for a single index on a newly
 /// materialized SSTable (flush output or compaction output).
 ///
@@ -1314,6 +1383,12 @@ fn eager_index_build_job(
                 ))
             })?,
     };
+    // A partial (Filtered) index's build must apply its predicate, mapped to
+    // this generation's ordinals; without it the sidecar holds every row.
+    let filter_predicate = store
+        .filter_predicate_for(index_name)
+        .map(|predicate| store.source_filter_predicate_for_sstable(&sstable_id, &predicate))
+        .transpose()?;
     Ok(crate::index::IndexBuildJob {
         sstable_id,
         index_name: index_name.to_string(),
@@ -1327,7 +1402,7 @@ fn eager_index_build_job(
         column_position: source_column_position,
         clustering_source,
         partition_key_source,
-        filter_predicate: None,
+        filter_predicate,
     })
 }
 
@@ -6317,12 +6392,17 @@ impl StorageEngine {
                         "engine: partition-key index backfill FAILED; rows in this SSTable \
                          are not in the index and reads through it will be incomplete"
                     );
+                    // The generation is live (it was just enumerated), so
+                    // an earlier "indexed" record no longer vouches for it.
+                    self.index_tracker
+                        .reopen_pending(keyspace, table, index_name, &sst_id);
                     self.index_tracker.mark_failed(
                         keyspace,
                         table,
                         index_name,
+                        &sst_id,
                         e,
-                        std::time::Duration::from_secs(60),
+                        crate::index::scheduler::BUILD_RETRY_DELAY,
                     );
                     coverage.record(BackfillOutcome::Failed);
                 }
@@ -6707,6 +6787,213 @@ impl StorageEngine {
         }
         degraded.sort_by(|a, b| (a.0.to_string(), &a.1).cmp(&(b.0.to_string(), &b.1)));
         degraded
+    }
+
+    /// Every secondary index that is not current, engine-wide, sorted. Reads
+    /// through each are refused until its backfill completes; `/readyz`
+    /// lists them under `stale_indexes`.
+    pub fn stale_secondary_indexes(&self) -> Vec<StaleSecondaryIndex> {
+        let mut stale: Vec<StaleSecondaryIndex> = self
+            .index_tracker
+            .all_states()
+            .into_iter()
+            .filter(|state| {
+                !state.pending_sstables.is_empty()
+                    || !matches!(state.status, crate::index::IndexStatus::Current)
+            })
+            .map(|state| StaleSecondaryIndex {
+                table: TableId::new(&state.table.0, &state.table.1),
+                last_error: match state.status {
+                    crate::index::IndexStatus::Failed { error, .. } => Some(error),
+                    _ => None,
+                },
+                index: state.index_name,
+                pending_generations: state.pending_sstables.len(),
+            })
+            .collect();
+        stale.sort_by(|a, b| (a.table.to_string(), &a.index).cmp(&(b.table.to_string(), &b.index)));
+        stale
+    }
+
+    /// Publish `ferrosa_index_not_current` / `ferrosa_index_backfill_failed`
+    /// from the tracker, and return what was published.
+    pub fn publish_index_backfill_status(&self) -> Vec<StaleSecondaryIndex> {
+        let stale = self.stale_secondary_indexes();
+        let gauges: Vec<crate::metrics::IndexBackfillGauge> = stale
+            .iter()
+            .map(|s| crate::metrics::IndexBackfillGauge {
+                table: s.table.to_string(),
+                index: s.index.clone(),
+                pending_generations: s.pending_generations as u64,
+                failed: s.last_error.is_some(),
+            })
+            .collect();
+        crate::metrics::set_index_backfill_status(&gauges);
+        stale
+    }
+
+    /// Heal secondary-index backfills that would otherwise never finish, and
+    /// publish the backfill gauges. The maintenance loop runs this every
+    /// compaction tick.
+    ///
+    /// A pending generation that left the live set (truncated, quarantined,
+    /// or retired by a path that does not reconcile the tracker) is dropped:
+    /// no build can run for it. An index whose last build failed is
+    /// resubmitted once its retry time passes, and one with no build
+    /// finished for [`INDEX_BACKFILL_STALL_AFTER`] is resubmitted too.
+    /// Before this, a failed or lost build left its index refusing every
+    /// read until the next restart, with no log line (2026-10-04).
+    pub fn heal_secondary_index_backfills(&self) -> IndexBackfillHeal {
+        self.heal_secondary_index_backfills_at(Instant::now(), INDEX_BACKFILL_STALL_AFTER)
+    }
+
+    /// [`Self::heal_secondary_index_backfills`] at a given clock, so a test
+    /// can step past the retry and stall bounds.
+    pub(crate) fn heal_secondary_index_backfills_at(
+        &self,
+        now: Instant,
+        stall_after: std::time::Duration,
+    ) -> IndexBackfillHeal {
+        let mut heal = IndexBackfillHeal {
+            retired: self.retire_non_live_pending_generations(),
+            ..IndexBackfillHeal::default()
+        };
+        for due in self.index_tracker.take_due_retries(now, stall_after) {
+            let (resubmitted, settled) = self.resubmit_backfill(&due);
+            heal.resubmitted += resubmitted;
+            heal.settled += settled;
+        }
+        crate::metrics::index_backfill_retried(heal.resubmitted as u64);
+        self.publish_index_backfill_status();
+        heal
+    }
+
+    /// Drop pending generations that are no longer in their table's live
+    /// set. The tracker is read BEFORE each live set: a generation is
+    /// published to the view before anything marks it pending, so every
+    /// pending generation seen here that the later view lacks is truly gone.
+    fn retire_non_live_pending_generations(&self) -> usize {
+        let mut retired = 0;
+        for state in self.index_tracker.all_states() {
+            if state.pending_sstables.is_empty() {
+                continue;
+            }
+            let table_id = TableId::new(&state.table.0, &state.table.1);
+            let Some(table) = self.table_state(&table_id) else {
+                continue;
+            };
+            let live: HashSet<String> = table.store.sstable_generation_ids().into_iter().collect();
+            let gone: Vec<String> = state
+                .pending_sstables
+                .iter()
+                .filter(|gen| !live.contains(*gen))
+                .cloned()
+                .collect();
+            if gone.is_empty() {
+                continue;
+            }
+            tracing::warn!(
+                table = %table_id,
+                index = %state.index_name,
+                generations = ?gone,
+                "index backfill: pending generations are no longer live; dropped from the \
+                 backfill (no build can run for them, and their rows are in no live SSTable)"
+            );
+            retired += gone.len();
+            self.index_tracker
+                .retire_sstables(table_id.keyspace(), table_id.table(), &gone, None);
+        }
+        retired
+    }
+
+    /// Resubmit every pending generation of `due` to the build scheduler.
+    /// Returns `(resubmitted, settled)`: a generation that does not carry the
+    /// index's column holds nothing for it and is marked indexed instead.
+    fn resubmit_backfill(&self, due: &crate::index::DueRetry) -> (usize, usize) {
+        let table_id = TableId::new(&due.keyspace, &due.table);
+        let reason = if due.failed { "failed" } else { "stalled" };
+        let Some(scheduler) = self.index_scheduler.as_ref() else {
+            tracing::warn!(
+                table = %table_id,
+                index = %due.index_name,
+                pending = due.pending.len(),
+                reason,
+                "index backfill is overdue and the index backend is off; an external \
+                 builder must build it, and reads through it are refused until then"
+            );
+            return (0, 0);
+        };
+        let Some(table) = self.table_state(&table_id) else {
+            return (0, 0);
+        };
+        let Some((_, position, clustering, partition_key)) = scheduler_index_sources(&table.store)
+            .into_iter()
+            .find(|(name, ..)| *name == due.index_name)
+        else {
+            tracing::error!(
+                table = %table_id,
+                index = %due.index_name,
+                pending = due.pending.len(),
+                "index backfill is overdue but the index is not one the build scheduler \
+                 builds on this table; it stays not current until rebuilt \
+                 (`ferrosa-ctl index rebuild`)"
+            );
+            return (0, 0);
+        };
+        let (mut resubmitted, mut settled) = (0, 0);
+        for gen in &due.pending {
+            let key_sourced = clustering.is_some() || partition_key.is_some();
+            if !key_sourced {
+                match table
+                    .store
+                    .source_regular_ordinal_for_sstable(gen, position)
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        // The column is absent from this generation: complete.
+                        self.index_tracker.mark_indexed(
+                            table_id.keyspace(),
+                            table_id.table(),
+                            &due.index_name,
+                            gen,
+                        );
+                        settled += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, table = %table_id, index = %due.index_name, sstable = %gen,
+                            "index backfill retry: cannot resolve this generation's column layout; it stays pending");
+                        continue;
+                    }
+                }
+            }
+            let job = eager_index_build_job(
+                &table.store,
+                &table_id,
+                gen.clone(),
+                &due.index_name,
+                position,
+                clustering,
+                partition_key,
+            );
+            match job.and_then(|job| scheduler.submit(job)) {
+                Ok(()) => resubmitted += 1,
+                Err(e) => {
+                    tracing::error!(%e, table = %table_id, index = %due.index_name, sstable = %gen,
+                    "index backfill retry: could not resubmit; it stays pending")
+                }
+            }
+        }
+        tracing::warn!(
+            table = %table_id,
+            index = %due.index_name,
+            reason,
+            resubmitted,
+            settled,
+            "index backfill retry: resubmitted the pending generations of an index that is \
+             not current"
+        );
+        (resubmitted, settled)
     }
 
     /// Live generations of `table_id` whose vector sidecars for `index_name`
@@ -10773,45 +11060,7 @@ impl StorageEngine {
             return;
         };
         let gen = state.store.last_flush_generation();
-        let ck_total = state.store.clustering_column_count();
-        let pk_total = state.store.partition_key_column_count();
-        let index_sources =
-            state
-                .store
-                .indexed_columns()
-                .iter()
-                .map(|(name, pos)| (name.clone(), *pos, None, None))
-                .chain(
-                    state
-                        .store
-                        .indexed_clustering_columns()
-                        .iter()
-                        .map(|(name, component)| {
-                            (
-                                name.clone(),
-                                *component,
-                                Some(crate::index::ClusteringComponentRef {
-                                    component: *component,
-                                    total: ck_total,
-                                }),
-                                None,
-                            )
-                        }),
-                )
-                .chain(state.store.indexed_partition_key_columns().iter().map(
-                    |(name, component)| {
-                        (
-                            name.clone(),
-                            *component,
-                            None,
-                            Some(crate::index::PartitionKeyComponentRef {
-                                component: *component,
-                                total: pk_total,
-                            }),
-                        )
-                    },
-                ))
-                .collect::<Vec<_>>();
+        let index_sources = scheduler_index_sources(&state.store);
         let written_by_flush = state.store.indexes_written_by_last_flush();
         for (index_name, col_pos, clustering_source, partition_key_source) in index_sources {
             // Only submit if the index needs building (not already current).
@@ -11634,6 +11883,17 @@ impl StorageEngine {
                     if let Err(e) = intent.write(&table_dir) {
                         tracing::error!(%e, %table_id, %task_id, "compaction: failed to advance replacement record to Swapped; startup reconciliation will still roll it forward from Promoting");
                     }
+                    // The inputs left the view: no backfill of them can run
+                    // any more. An input still pending hands that to the
+                    // output, whose eager build below completes it.
+                    let retired: Vec<String> =
+                        input_id_paths.iter().map(|(id, _)| id.clone()).collect();
+                    self.index_tracker.retire_sstables(
+                        table_id.keyspace(),
+                        table_id.table(),
+                        &retired,
+                        Some(&output.id),
+                    );
 
                     // Eager index build: submit high-priority rebuild for compacted output.
                     // Same as flush — keeps MemtableIndex bounded in steady state.
@@ -25284,6 +25544,266 @@ mod tests {
             error.to_string().contains("not current"),
             "pending-index error must explain why the read was refused: {error}"
         );
+    }
+
+    /// Wait (bounded) for `index_name` to become current. The bound is a hang
+    /// guard: a backfill over a handful of tiny SSTables takes milliseconds.
+    fn wait_for_index_current(engine: &StorageEngine, tid: &TableId, index_name: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !engine.index_is_current(tid, index_name) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        engine.index_is_current(tid, index_name)
+    }
+
+    /// The node1 outage of 2026-10-04 (consolidation_requests_state_idx): a
+    /// restart replays rows from the commit log, then re-registers the table's
+    /// BTree index. That registration flushes the replayed rows, which starts
+    /// a compaction, and marks every pre-restart SSTable pending a backfill.
+    /// The compaction retired those pending SSTables before their backfill ran
+    /// (behind every other index's restart backfill), so each build failed to
+    /// open its Data.db. The failure was recorded silently, the retired
+    /// generations stayed pending forever, and every read through the index
+    /// was refused as "not current" until the next restart.
+    ///
+    /// Sync, with its own runtime for `poll_compactions`: the test holds the
+    /// build workers (a guard) across the compaction, which must not span an
+    /// `.await`.
+    #[test]
+    fn an_index_reregistered_at_restart_becomes_current_when_compaction_retires_its_backfill() {
+        use ferrosa_index::IndexKey;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _context = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        let config = || {
+            let mut config = StorageEngineConfig::test_config(dir.path());
+            config.compaction.min_threshold = 50;
+            config
+        };
+        // Before the restart: two flushed SSTables (with index sidecars), and
+        // two rows only in the commit log.
+        {
+            let engine = StorageEngine::new(config(), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine
+                .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+                .unwrap();
+            for batch in [["k0", "k1"], ["k2", "k3"], ["k4", "k5"]] {
+                for key in batch {
+                    engine
+                        .write(&tid, &make_key(key), make_row(b"shared", 1000), 1000)
+                        .unwrap();
+                }
+                if batch[0] != "k4" {
+                    engine.flush(&tid).unwrap();
+                }
+            }
+        }
+
+        // The restart: the table comes back from the local schema with no
+        // index, the commit log replays k4/k5 into its memtable, and then the
+        // index is re-registered the way the boot reload does it.
+        let (engine, _pending) = StorageEngine::open(config(), None).unwrap();
+        assert!(
+            engine.read(&tid, &make_key("k4")).unwrap().is_some(),
+            "the commit log replays the unflushed rows"
+        );
+        let scheduler = engine
+            .index_scheduler
+            .as_ref()
+            .expect("local index backend");
+        let held = scheduler.hold_workers_for_test();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        assert_eq!(
+            engine.sstable_count(&tid),
+            3,
+            "two old SSTables + the replay flush"
+        );
+        assert!(
+            !engine.index_is_current(&tid, "val_idx"),
+            "the pre-restart SSTables are pending their backfill"
+        );
+
+        // The compaction retires every SSTable before any queued backfill runs.
+        engine.force_compact_all();
+        wait_for_compaction_result(&engine);
+        runtime.block_on(engine.poll_compactions());
+        assert_eq!(engine.sstable_count(&tid), 1, "compaction must swap in");
+        drop(held);
+
+        assert!(
+            wait_for_index_current(&engine, &tid, "val_idx"),
+            "the index must become current once its backfill settles: {:?}",
+            engine
+                .index_tracker()
+                .get_state(tid.keyspace(), tid.table(), "val_idx")
+        );
+        let found = collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+            .unwrap()
+            .len();
+        assert_eq!(found, 6, "every row is reachable through the index");
+    }
+
+    /// A backfill build that fails must not leave its index refusing reads
+    /// forever: it is reported (not current, failed, with the error) and the
+    /// healer retries it once its retry time passes. Before, the failure was
+    /// recorded with no log line and nothing ever retried it.
+    #[test]
+    fn a_failed_backfill_is_reported_and_healed_by_a_retry() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 50;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        for key in ["k0", "k1", "k2"] {
+            engine
+                .write(&tid, &make_key(key), make_row(b"shared", 1000), 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        let gen = engine
+            .table_state(&tid)
+            .unwrap()
+            .store
+            .sstable_generation_ids()[0]
+            .clone();
+        let data = StorageEngine::generation_component_path_for_test(
+            &engine.table_sstable_dir(&tid),
+            gen.parse().unwrap(),
+            "Data.db",
+        )
+        .expect("the flushed generation has a Data.db");
+        let hidden = data.with_extension("hidden");
+
+        // The backfill runs while the generation's Data.db is unreadable.
+        let held = engine
+            .index_scheduler
+            .as_ref()
+            .unwrap()
+            .hold_workers_for_test();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        std::fs::rename(&data, &hidden).unwrap();
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let failed = || {
+            engine
+                .stale_secondary_indexes()
+                .iter()
+                .any(|s| s.index == "val_idx" && s.last_error.is_some())
+        };
+        while !failed() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(failed(), "{:?}", engine.stale_secondary_indexes());
+
+        // Reported: not current, failed, in the gauges.
+        let stale = engine.publish_index_backfill_status();
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert_eq!(stale[0].pending_generations, 1);
+        assert!(
+            stale[0]
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("open data"),
+            "{stale:?}"
+        );
+        let table = tid.to_string();
+        assert_eq!(crate::metrics::index_not_current(&table, "val_idx"), 1);
+        assert!(crate::metrics::index_backfill_failed(&table, "val_idx"));
+
+        // Not before its retry time.
+        assert_eq!(engine.heal_secondary_index_backfills().resubmitted, 0);
+
+        // The file is back; once the retry time passes the healer resubmits
+        // the generation and the index becomes current.
+        std::fs::rename(&hidden, &data).unwrap();
+        let later = std::time::Instant::now() + crate::index::scheduler::BUILD_RETRY_DELAY;
+        let heal = engine.heal_secondary_index_backfills_at(later, INDEX_BACKFILL_STALL_AFTER);
+        assert_eq!(heal.resubmitted, 1, "{heal:?}");
+        assert!(
+            wait_for_index_current(&engine, &tid, "val_idx"),
+            "{:?}",
+            engine.stale_secondary_indexes()
+        );
+        assert_eq!(
+            collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(engine.publish_index_backfill_status().is_empty());
+        assert_eq!(crate::metrics::index_not_current(&table, "val_idx"), 0);
+        assert!(!crate::metrics::index_backfill_failed(&table, "val_idx"));
+    }
+
+    /// A rebuild of a partial (Filtered) index on a flush or compaction
+    /// output, or a healer retry, must carry the index's predicate. It did
+    /// not: the eager job said `filter_predicate: None`, so the scheduler
+    /// built a sidecar holding every row, not only the matching ones.
+    #[test]
+    fn an_eager_build_job_of_a_filtered_index_carries_its_predicate() {
+        use ferrosa_index::{FilterOp, FilterPredicate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        let predicate = FilterPredicate::single(0, FilterOp::Eq, b"active".to_vec());
+        engine
+            .add_index_with_predicate(
+                &tid,
+                "active_idx",
+                0,
+                ferrosa_index::IndexType::Filtered,
+                Some(predicate.clone()),
+            )
+            .unwrap();
+        engine
+            .write(&tid, &make_key("k0"), make_row(b"active", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        let state = engine.table_state(&tid).unwrap();
+        let gen = state.store.sstable_generation_ids()[0].clone();
+
+        let job =
+            eager_index_build_job(&state.store, &tid, gen, "active_idx", 0, None, None).unwrap();
+
+        assert_eq!(job.filter_predicate, Some(predicate));
+    }
+
+    /// A pending generation that left the live set by a path that does not
+    /// reconcile the tracker can never be built; the healer drops it rather
+    /// than leave the index refusing reads.
+    #[test]
+    fn the_healer_drops_a_pending_generation_that_is_no_longer_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        engine
+            .index_tracker
+            .mark_pending(tid.keyspace(), tid.table(), "val_idx", "1", 0);
+        assert!(!engine.index_is_current(&tid, "val_idx"));
+
+        let heal = engine.heal_secondary_index_backfills();
+
+        assert_eq!(heal.retired, 1, "{heal:?}");
+        assert!(engine.index_is_current(&tid, "val_idx"));
     }
 
     /// A partition-level DELETE as the write path receives it: empty clustering, no

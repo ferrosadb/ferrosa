@@ -497,6 +497,8 @@ static MEMTABLE_BACKPRESSURE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 static RANGE_READ_TRUNCATED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static INDEX_RELOAD_SKIPPED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static INDEX_BACKFILL_BUILD_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static INDEX_BACKFILL_RETRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VECTOR_GENERATIONS_REPAIRED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VECTOR_GENERATION_REPAIR_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VECTOR_GENERATIONS_PENDING: AtomicI64 = AtomicI64::new(0);
@@ -959,6 +961,84 @@ pub fn index_sidecar_mapped_bytes() -> i64 {
 /// Scalar index sidecar files currently memory-mapped.
 pub fn index_sidecar_mapped_files() -> i64 {
     INDEX_SIDECAR_MAPPED_FILES.load(Ordering::Relaxed)
+}
+
+/// `ferrosa_index_not_current{table,index}`: generations of a secondary index
+/// still pending a backfill; reads through the index are refused while it is
+/// listed. `ferrosa_index_backfill_failed{table,index}`: 1 while its last
+/// build failed and awaits a retry. Both are replaced whole by
+/// [`set_index_backfill_status`].
+static INDEX_NOT_CURRENT: OnceLock<
+    arc_swap::ArcSwap<std::collections::BTreeMap<(String, String), u64>>,
+> = OnceLock::new();
+static INDEX_BACKFILL_FAILED: OnceLock<
+    arc_swap::ArcSwap<std::collections::BTreeMap<(String, String), u64>>,
+> = OnceLock::new();
+
+/// One secondary index that is not current, as the backfill gauges report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexBackfillGauge {
+    /// `keyspace.table`.
+    pub table: String,
+    /// The index.
+    pub index: String,
+    /// Generations pending a backfill.
+    pub pending_generations: u64,
+    /// Whether its last build failed and awaits a retry.
+    pub failed: bool,
+}
+
+/// Publish the not-current secondary indexes, replacing the previous set: an
+/// index absent from `indexes` is current and leaves both gauges.
+pub fn set_index_backfill_status(indexes: &[IndexBackfillGauge]) {
+    let key = |g: &IndexBackfillGauge| (g.table.clone(), g.index.clone());
+    let not_current = indexes
+        .iter()
+        .map(|g| (key(g), g.pending_generations))
+        .collect();
+    let failed = indexes
+        .iter()
+        .filter(|g| g.failed)
+        .map(|g| (key(g), 1))
+        .collect();
+    labelled(&INDEX_NOT_CURRENT).store(std::sync::Arc::new(not_current));
+    labelled(&INDEX_BACKFILL_FAILED).store(std::sync::Arc::new(failed));
+}
+
+/// Pending generations of `table`'s `index` as last published (0 = current).
+pub fn index_not_current(table: &str, index: &str) -> u64 {
+    labelled(&INDEX_NOT_CURRENT)
+        .load()
+        .get(&(table.to_string(), index.to_string()))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Whether `table`'s `index` was last published as failed.
+pub fn index_backfill_failed(table: &str, index: &str) -> bool {
+    labelled(&INDEX_BACKFILL_FAILED)
+        .load()
+        .contains_key(&(table.to_string(), index.to_string()))
+}
+
+/// One secondary-index backfill build failed.
+pub fn index_backfill_build_failed() {
+    INDEX_BACKFILL_BUILD_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Secondary-index backfill builds that failed since startup.
+pub fn index_backfill_build_failures_total() -> u64 {
+    INDEX_BACKFILL_BUILD_FAILURES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// `generations` pending backfills were resubmitted by the healer.
+pub fn index_backfill_retried(generations: u64) {
+    INDEX_BACKFILL_RETRIES_TOTAL.fetch_add(generations, Ordering::Relaxed);
+}
+
+/// Generations the healer resubmitted since startup.
+pub fn index_backfill_retries_total() -> u64 {
+    INDEX_BACKFILL_RETRIES_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Total unresolvable `system_schema.indexes` rows skipped by index reloads
@@ -1726,6 +1806,40 @@ pub fn render_prometheus() -> String {
             "ferrosa_index_invalid{{table=\"{table}\",index=\"{index}\"}} {count}\n"
         ));
     }
+    out.push_str(
+        "# HELP ferrosa_index_not_current Generations of a secondary index pending a backfill; reads through the index are refused (not current) while it is listed.\n",
+    );
+    out.push_str("# TYPE ferrosa_index_not_current gauge\n");
+    for ((table, index), count) in labelled(&INDEX_NOT_CURRENT).load().iter() {
+        out.push_str(&format!(
+            "ferrosa_index_not_current{{table=\"{table}\",index=\"{index}\"}} {count}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP ferrosa_index_backfill_failed 1 while a secondary index's last backfill build failed and awaits a retry.\n",
+    );
+    out.push_str("# TYPE ferrosa_index_backfill_failed gauge\n");
+    for ((table, index), failed) in labelled(&INDEX_BACKFILL_FAILED).load().iter() {
+        out.push_str(&format!(
+            "ferrosa_index_backfill_failed{{table=\"{table}\",index=\"{index}\"}} {failed}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP ferrosa_index_backfill_build_failures_total Secondary-index backfill builds that failed.\n",
+    );
+    out.push_str("# TYPE ferrosa_index_backfill_build_failures_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_index_backfill_build_failures_total {}\n",
+        INDEX_BACKFILL_BUILD_FAILURES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_index_backfill_retries_total Pending secondary-index generations resubmitted for a build after a failure or a stall.\n",
+    );
+    out.push_str("# TYPE ferrosa_index_backfill_retries_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_index_backfill_retries_total {}\n",
+        INDEX_BACKFILL_RETRIES_TOTAL.load(Ordering::Relaxed)
+    ));
     out.push_str(
         "# HELP ferrosa_storage_vector_generations_repaired_total Generations whose vector sidecars were rebuilt from their rows (compacted without them, flushed before manifests, or a crashed build).\n",
     );

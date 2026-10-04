@@ -92,6 +92,12 @@ open work lives in specs and the items below.
 
 ## Recently landed
 
+- **Stale secondary index after restart (ST-85).** A compaction swap retires
+  its inputs from the index tracker, failed backfills log on their edges and
+  are retried by the maintenance loop's healer, and not-current indexes show
+  in `ferrosa_index_not_current` and `/readyz` `stale_indexes`. Next: move
+  `IndexStateTracker` off its `RwLock` onto the lock-free `ArcSwap` pattern.
+
 - **T-012 verification test isolation.** Digest-corruption tests disable the
   structural scan for their task only, preserving concurrent cancellation checks.
 

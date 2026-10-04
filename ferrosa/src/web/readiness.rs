@@ -5,9 +5,9 @@
 //! the missing condition otherwise.
 //! A failed consensus runtime overrides every deployment-mode shortcut and
 //! returns 503 without awaiting a Raft handle.
-//! Last revised: 2026-10-03
-//! Last changed: A ready answer names vector indexes being rebuilt under
-//!   `degraded_recall` (ST-81).
+//! Last revised: 2026-10-04
+//! Last changed: A ready answer names secondary indexes that are not current
+//!   under `stale_indexes`.
 //!
 //! ## Readiness criteria
 //!
@@ -38,6 +38,12 @@
 //! NOT hold readiness: every other query is unaffected. A ready answer then
 //! carries `"degraded_recall": [{"table","index","generations"}]`, because ANN
 //! over that index refuses (retryable) until the rebuild finishes.
+//!
+//! A secondary index that is not current does not hold readiness either, for
+//! the same reason; a ready answer carries
+//! `"stale_indexes": [{"table","index","pending_generations","state","last_error"}]`
+//! (`state` is `backfilling` or `failed`), because reads through it are
+//! refused until its backfill completes.
 //!
 //! It lives outside the `/api/*` auth middleware so external
 //! orchestrators (docker-compose, k8s, smoke scripts) can probe it without
@@ -94,28 +100,53 @@ fn mode_label(mode: DeploymentMode) -> &'static str {
 /// The `200` answer. A vector index with generations being rebuilt still
 /// answers ready — every other query is unaffected — but the body names it
 /// under `degraded_recall`: ANN over it refuses (retryable) until its
-/// sidecars are rebuilt from the rows.
+/// sidecars are rebuilt from the rows. Likewise a secondary index that is not
+/// current is named under `stale_indexes`: reads through it are refused
+/// until its backfill completes (and a failed one carries its last error).
 fn ready_response(storage: &ferrosa_storage::StorageEngine) -> (StatusCode, Json<Value>) {
     let degraded = storage.degraded_vector_indexes();
-    if degraded.is_empty() {
+    let stale = storage.stale_secondary_indexes();
+    if degraded.is_empty() && stale.is_empty() {
         return (StatusCode::OK, Json(json!({"ready": true})));
     }
-    let degraded: Vec<Value> = degraded
-        .into_iter()
-        .map(|(table, index, generations)| {
-            json!({"table": table.to_string(), "index": index, "generations": generations})
-        })
-        .collect();
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ready": true,
-            "degraded_recall": degraded,
-            "detail": "vector index generations are being rebuilt from their rows; ANN over \
-                these indexes refuses (retryable) until then; see the ferrosa_index_invalid \
-                metric"
-        })),
-    )
+    let mut body = serde_json::Map::new();
+    body.insert("ready".into(), json!(true));
+    let mut detail = Vec::new();
+    if !degraded.is_empty() {
+        let degraded: Vec<Value> = degraded
+            .into_iter()
+            .map(|(table, index, generations)| {
+                json!({"table": table.to_string(), "index": index, "generations": generations})
+            })
+            .collect();
+        body.insert("degraded_recall".into(), Value::Array(degraded));
+        detail.push(
+            "vector index generations are being rebuilt from their rows; ANN over these \
+             indexes refuses (retryable) until then; see the ferrosa_index_invalid metric",
+        );
+    }
+    if !stale.is_empty() {
+        let stale: Vec<Value> = stale
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "table": s.table.to_string(),
+                    "index": s.index,
+                    "pending_generations": s.pending_generations,
+                    "state": if s.last_error.is_some() { "failed" } else { "backfilling" },
+                    "last_error": s.last_error,
+                })
+            })
+            .collect();
+        body.insert("stale_indexes".into(), Value::Array(stale));
+        detail.push(
+            "secondary indexes are not current; reads through them are refused until their \
+             backfill completes (a failed one is retried by the maintenance loop); see the \
+             ferrosa_index_not_current and ferrosa_index_backfill_failed metrics",
+        );
+    }
+    body.insert("detail".into(), json!(detail.join(". ")));
+    (StatusCode::OK, Json(Value::Object(body)))
 }
 
 /// `GET /readyz` — leader-aware readiness probe.
@@ -550,6 +581,76 @@ mod tests {
             "{parsed}"
         );
         assert_eq!(parsed["degraded_recall"][0]["table"], "ks.docs", "{parsed}");
+    }
+
+    /// A secondary index that is not current keeps the node ready but is named
+    /// under `stale_indexes`, with its last error once a build has failed:
+    /// reads through it are refused until its backfill completes. The node1
+    /// outage of 2026-10-04 refused every such read for hours while this
+    /// endpoint said only `{"ready":true}`.
+    #[tokio::test]
+    async fn readyz_names_a_secondary_index_that_is_not_current() {
+        let state = make_state();
+        let storage = Arc::clone(&state.storage);
+        storage
+            .register_table(ferrosa_common::TableSchema {
+                keyspace: "ks".into(),
+                table: "requests".into(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ferrosa_common::ColumnDefinition {
+                    name: "state".into(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                }],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        let tracker = storage.index_tracker();
+        tracker.register_index("ks", "requests", "state_idx");
+        tracker.mark_pending("ks", "requests", "state_idx", "42", 0);
+
+        let readyz = |state: WebAppState| async move {
+            let resp = build_router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a stale index is not unready"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        let parsed = readyz(state.clone()).await;
+        assert_eq!(parsed["ready"], true);
+        let stale = &parsed["stale_indexes"][0];
+        assert_eq!(stale["table"], "ks.requests", "{parsed}");
+        assert_eq!(stale["index"], "state_idx", "{parsed}");
+        assert_eq!(stale["pending_generations"], 1, "{parsed}");
+        assert_eq!(stale["state"], "backfilling", "{parsed}");
+
+        tracker.mark_failed(
+            "ks",
+            "requests",
+            "state_idx",
+            "42",
+            "open data: No such file".into(),
+            std::time::Duration::from_secs(60),
+        );
+        let parsed = readyz(state).await;
+        let stale = &parsed["stale_indexes"][0];
+        assert_eq!(stale["state"], "failed", "{parsed}");
+        assert_eq!(stale["last_error"], "open data: No such file", "{parsed}");
     }
 
     /// A dead consensus lane overrides deployment mode and returns immediately.

@@ -91,4 +91,4 @@ pub use scheduler::{
     BuildPriority, ClusteringComponentRef, IndexBuildBackend, IndexBuildJob, IndexBuildResult,
     IndexBuildScheduler, LocalBackend, PartitionKeyComponentRef,
 };
-pub use tracker::{IndexState, IndexStateTracker, IndexStatus};
+pub use tracker::{BuildFailure, DueRetry, IndexState, IndexStateTracker, IndexStatus};
