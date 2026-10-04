@@ -693,6 +693,12 @@ fn the_supervisor_restarts_a_real_dead_commit_log_sync_thread() {
         "{refused:?}"
     );
 
+    // The dead thread left unsynced writes. On a loaded runner the death and
+    // the restart can take longer than the stall deadline, so the backlog is
+    // already past it when the new thread starts (CI, 2026-10-04: 2833 ms).
+    // Reproduce that deterministically.
+    std::thread::sleep(log.sync_health().stall_deadline + Duration::from_millis(200));
+
     supervisor.check();
     assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Panic), 1);
     assert_eq!(status.restarts(Child::CommitLogSync), 1);

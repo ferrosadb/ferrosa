@@ -54,6 +54,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   sync thread is dead, fsync is failing, or the oldest unsynced write is past
   `FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS` (2000). The sync thread exposes
   `sync_health()` / `restart_sync()` for the node supervisor (FMEA ST-71).
+  A restarted periodic sync thread syncs the dead thread's backlog at once
+  (no batch window), and `restart_sync()` returns only once that backlog is
+  durable or the stall deadline passes, so a node the supervisor restarted
+  acknowledges writes again instead of refusing them for as long as
+  scheduling takes.
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
   memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`, and
   every view change is a compare-and-swap derived from the current view.

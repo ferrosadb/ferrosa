@@ -589,6 +589,11 @@ struct PeriodicShared {
     batch: CommitLogBatchConfig,
 
     health: Arc<SyncHealth>,
+
+    /// Set by `restart()`: the new thread syncs the backlog the dead one left
+    /// at once, instead of treating it as a fresh batch and waiting out the
+    /// batch window while every write is refused.
+    sync_now: AtomicBool,
 }
 
 const PERIODIC_THREAD: &str = "commitlog-periodic-sync";
@@ -618,6 +623,7 @@ impl PeriodicSync {
                 pending_bytes: AtomicU64::new(0),
                 batch,
                 health,
+                sync_now: AtomicBool::new(false),
             }),
             handle: Mutex::new(None),
         }
@@ -631,6 +637,36 @@ impl PeriodicSync {
             move || shared.run(),
             || {},
         )
+    }
+
+    /// After a restart, wait (bounded by the stall deadline) for the new
+    /// thread to make the dead thread's backlog durable, so the restart
+    /// reports a node that acknowledges writes again rather than one that
+    /// still refuses them for as long as scheduling takes. A thread that dies
+    /// again, or a sync that outlasts the deadline, is reported and left to
+    /// the supervisor's next check; writes stay refused until then.
+    fn await_restart_durable(&self) {
+        let health = &self.shared.health;
+        let deadline = Instant::now() + health.stall_deadline;
+        let mut spins = 0u32;
+        while !health.all_durable() {
+            if health.is_dead() {
+                tracing::error!(
+                    "commitlog: the restarted sync thread died before syncing its backlog"
+                );
+                return;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    deadline_ms = health.stall_deadline.as_millis(),
+                    "commitlog: the restarted sync thread has not synced its backlog within the \
+                     stall deadline; writes stay refused until it does"
+                );
+                return;
+            }
+            spins = spins.saturating_add(1);
+            std::thread::sleep(Duration::from_millis(u64::from(spins.min(10))));
+        }
     }
 
     fn stop_inner(&self, flush_final: bool) {
@@ -671,7 +707,10 @@ impl PeriodicShared {
         while !self.stop_flag.load(Ordering::Acquire) {
             let (lock, cvar) = &self.wake;
             let mut stopped = lock.lock();
-            if self.is_clean() {
+            // A restart's inherited backlog is synced at once: no idle wait,
+            // no batch window.
+            let urgent = self.sync_now.swap(false, Ordering::AcqRel);
+            if !urgent && self.is_clean() {
                 let result = cvar.wait_for(&mut stopped, self.sync_interval);
                 if result.timed_out() && self.is_clean() {
                     PERIODIC_IDLE_FLUSH_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -685,7 +724,7 @@ impl PeriodicShared {
 
             let opened_at = Instant::now();
             loop {
-                if self.pending_bytes.load(Ordering::Acquire) >= self.batch.target_bytes {
+                if urgent || self.pending_bytes.load(Ordering::Acquire) >= self.batch.target_bytes {
                     break;
                 }
                 let elapsed = opened_at.elapsed();
@@ -803,10 +842,14 @@ impl SyncStrategy for PeriodicSync {
             join_sync_thread(PERIODIC_THREAD, dead);
         }
         // The new thread clears `dead` itself before its first sync, so a
-        // spawn failure leaves writes refused.
+        // spawn failure leaves writes refused. It syncs the inherited backlog
+        // at once (`sync_now`).
+        self.shared.sync_now.store(true, Ordering::Release);
         let handle = self.spawn()?;
         *slot = Some(handle);
+        drop(slot);
         self.shared.health.restarts.fetch_add(1, Ordering::Relaxed);
+        self.await_restart_durable();
         Ok(true)
     }
 
