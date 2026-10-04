@@ -150,6 +150,21 @@ pub struct SyncHealth {
     panics: AtomicU64,
     sync_failures: AtomicU64,
     restarts: AtomicU64,
+    /// Sync attempts STARTED, and attempts that have returned (either way).
+    ///
+    /// `unsynced_for` alone cannot explain a stall: "no fsync has completed for
+    /// 8.8 s" is produced identically by a slow device, by a sync thread that
+    /// was never scheduled, and by one that was never woken. Only the first is
+    /// a storage problem; the last is a bug (a lost wakeup in `on_write` was
+    /// found in this very module). Counting attempts separates them —
+    /// `started == completed` across a stall means NO fsync was ever issued, so
+    /// the thread, not the disk, is the problem.
+    attempts_started: AtomicU64,
+    attempts_completed: AtomicU64,
+    /// Nanoseconds since `base`, plus one, of the in-flight attempt's start;
+    /// 0 when no attempt is running. Gives the syscall's own elapsed time,
+    /// which is what distinguishes a slow device from an absent attempt.
+    attempt_started_at: AtomicU64,
     last_failure: ArcSwapOption<String>,
     #[cfg(any(test, feature = "test-support"))]
     inject_panic: AtomicBool,
@@ -169,6 +184,45 @@ pub struct SyncHealthSnapshot {
     pub unsynced_for: Option<Duration>,
     pub stall_deadline: Duration,
     pub last_failure: Option<String>,
+    /// Sync attempts started, and attempts that returned either way.
+    pub attempts_started: u64,
+    pub attempts_completed: u64,
+    /// How long the in-flight attempt has been running, if one is.
+    pub attempt_elapsed: Option<Duration>,
+}
+
+/// Why a stall is happening — the question `unsynced_for` cannot answer.
+///
+/// A stall means acknowledged writes are not durable, which is always worth
+/// refusing writes over. But the REMEDY differs completely by cause, and until
+/// now all three looked identical in the logs: a slow device needs capacity or
+/// a longer deadline, a starved thread needs scheduling priority, and a thread
+/// that was never woken needs a code fix. Restarting the thread only helps the
+/// last one, and aborting the node helps none of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallCause {
+    /// An fsync is in flight and has been for this long: the device is slow.
+    DeviceSlow,
+    /// No fsync was issued at all during the stall. The thread is alive but
+    /// did not run — descheduled, or never woken (a lost-wakeup bug).
+    NoAttemptIssued,
+    /// The last attempt returned an error; `last_failure` says what.
+    AttemptFailed,
+    /// The sync thread is gone.
+    ThreadDead,
+}
+
+impl std::fmt::Display for StallCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeviceSlow => write!(f, "device-slow(fsync in flight)"),
+            Self::NoAttemptIssued => {
+                write!(f, "no-fsync-attempted(thread starved or not woken)")
+            }
+            Self::AttemptFailed => write!(f, "fsync-returned-an-error"),
+            Self::ThreadDead => write!(f, "sync-thread-dead"),
+        }
+    }
 }
 
 impl SyncHealthSnapshot {
@@ -181,6 +235,31 @@ impl SyncHealthSnapshot {
     /// Writes are being refused (or would be): dead, failing or stalled.
     pub fn impaired(&self) -> bool {
         self.dead || self.failing || self.stalled()
+    }
+
+    /// Why the stall is happening, for the log line and the metric.
+    ///
+    /// `None` when not stalled. The ordering is deliberate: a dead thread and
+    /// a failed attempt are definite and checked first; between the remaining
+    /// two the question is simply whether an fsync is in flight.
+    pub fn stall_cause(&self) -> Option<StallCause> {
+        if !self.stalled() {
+            return None;
+        }
+        if self.dead {
+            return Some(StallCause::ThreadDead);
+        }
+        if self.failing {
+            return Some(StallCause::AttemptFailed);
+        }
+        if self.attempt_elapsed.is_some() {
+            Some(StallCause::DeviceSlow)
+        } else {
+            // Nothing in flight while writes wait past the deadline: the
+            // thread did not run. Restarting it is the only remedy that can
+            // help, and if a restart does not, it was never woken.
+            Some(StallCause::NoAttemptIssued)
+        }
     }
 }
 
@@ -208,6 +287,9 @@ impl SyncHealth {
             panics: AtomicU64::new(0),
             sync_failures: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
+            attempts_started: AtomicU64::new(0),
+            attempts_completed: AtomicU64::new(0),
+            attempt_started_at: AtomicU64::new(0),
             last_failure: ArcSwapOption::empty(),
             #[cfg(any(test, feature = "test-support"))]
             inject_panic: AtomicBool::new(false),
@@ -233,15 +315,43 @@ impl SyncHealth {
     }
 
     pub(crate) fn begin_sync(&self, now: Instant) -> SyncTicket {
+        // An attempt is STARTED here, before the flush runs. If a stall is
+        // observed and this counter has not moved, no fsync was issued at all,
+        // which points at the thread rather than the device.
+        self.attempts_started.fetch_add(1, Ordering::SeqCst);
+        self.attempt_started_at
+            .store(self.stamp(now), Ordering::SeqCst);
         SyncTicket {
             target: self.written_seq.load(Ordering::SeqCst),
             at: now,
         }
     }
 
+    /// Record that the in-flight attempt returned, whichever way it went.
+    ///
+    /// Called on both the success and failure paths: "completed" means the
+    /// syscall came back, not that it worked. A failed fsync is still evidence
+    /// the thread ran, which is exactly the distinction being drawn.
+    fn finish_attempt(&self) {
+        self.attempts_completed.fetch_add(1, Ordering::SeqCst);
+        self.attempt_started_at.store(0, Ordering::SeqCst);
+    }
+
+    /// How long the in-flight sync attempt has been running, if one is.
+    fn attempt_elapsed(&self, now: Instant) -> Option<Duration> {
+        let stamped = self.attempt_started_at.load(Ordering::SeqCst);
+        if stamped == 0 {
+            return None;
+        }
+        let started = Duration::from_nanos(stamped - 1);
+        now.checked_duration_since(self.base)
+            .and_then(|since_base| since_base.checked_sub(started))
+    }
+
     /// A flush covering `ticket` succeeded. Returns `true` on the
     /// failing -> healthy edge.
     pub(crate) fn sync_succeeded(&self, ticket: SyncTicket) -> bool {
+        self.finish_attempt();
         self.durable_seq.fetch_max(ticket.target, Ordering::SeqCst);
         // Writes numbered past the ticket are still unsynced, and none of them
         // started before the ticket was read, so the ticket's instant is a
@@ -267,6 +377,9 @@ impl SyncHealth {
 
     /// An fsync attempt failed. Returns `true` on the healthy -> failing edge.
     pub(crate) fn sync_failed(&self, error: &ferrosa_common::Error) -> bool {
+        // A failed fsync still means the thread RAN, which is the distinction
+        // the attempt counters exist to draw.
+        self.finish_attempt();
         self.sync_failures.fetch_add(1, Ordering::Relaxed);
         self.last_failure
             .store(Some(Arc::new(format!("fsync failed: {error}"))));
@@ -356,6 +469,9 @@ impl SyncHealth {
                 .last_failure
                 .load_full()
                 .map(|detail| detail.as_ref().clone()),
+            attempts_started: self.attempts_started.load(Ordering::SeqCst),
+            attempts_completed: self.attempts_completed.load(Ordering::SeqCst),
+            attempt_elapsed: self.attempt_elapsed(now),
         }
     }
 
@@ -1240,6 +1356,83 @@ mod tests {
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
     use crate::commitlog::mutation::Mutation;
+
+    /// A stall with NO fsync in flight must be reported as the thread not
+    /// running, not as a slow device.
+    ///
+    /// This is the distinction the live cluster could not make on 2026-10-04:
+    /// nodes logged "no commit-log fsync has completed for 8789ms" while a
+    /// direct fsync on the same volume measured 0.03 ms, so the device was
+    /// plainly not the problem — but nothing in the snapshot could say so, and
+    /// the supervisor restarted (then aborted) as if the thread were broken.
+    #[test]
+    fn a_stall_with_no_attempt_in_flight_blames_the_thread_not_the_device() {
+        let health = SyncHealth::new(Duration::from_millis(100));
+        let start = Instant::now();
+        // A write lands and nothing ever syncs it.
+        health.note_write(start);
+        let snap = health.snapshot(start + Duration::from_millis(500), true);
+
+        assert!(snap.stalled(), "500ms past a 100ms deadline is a stall");
+        assert_eq!(
+            snap.attempts_started, snap.attempts_completed,
+            "no attempt is outstanding"
+        );
+        assert_eq!(snap.attempt_elapsed, None, "nothing in flight");
+        assert_eq!(
+            snap.stall_cause(),
+            Some(StallCause::NoAttemptIssued),
+            "no fsync was issued, so the thread is the suspect"
+        );
+    }
+
+    /// The same stall WITH an fsync in flight must blame the device, and report
+    /// how long that syscall has been running — the number an operator needs.
+    #[test]
+    fn a_stall_with_an_attempt_in_flight_blames_the_device_and_times_it() {
+        let health = SyncHealth::new(Duration::from_millis(100));
+        let start = Instant::now();
+        health.note_write(start);
+        // The sync thread ran and is inside the fsync.
+        let _ticket = health.begin_sync(start + Duration::from_millis(50));
+        let snap = health.snapshot(start + Duration::from_millis(500), true);
+
+        assert!(snap.stalled());
+        assert_eq!(
+            snap.attempts_started - snap.attempts_completed,
+            1,
+            "exactly one attempt outstanding"
+        );
+        let elapsed = snap
+            .attempt_elapsed
+            .expect("an in-flight attempt must report its elapsed time");
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "the in-flight fsync has been running ~450ms, got {elapsed:?}"
+        );
+        assert_eq!(
+            snap.stall_cause(),
+            Some(StallCause::DeviceSlow),
+            "an fsync is in flight, so the device is the suspect"
+        );
+    }
+
+    /// A completed attempt clears the in-flight state, so the next stall is
+    /// attributed afresh rather than blaming a syscall that already returned.
+    #[test]
+    fn a_completed_attempt_stops_being_counted_as_in_flight() {
+        let health = SyncHealth::new(Duration::from_millis(100));
+        let start = Instant::now();
+        health.note_write(start);
+        let ticket = health.begin_sync(start + Duration::from_millis(10));
+        health.sync_succeeded(ticket);
+
+        let snap = health.snapshot(start + Duration::from_millis(20), true);
+        assert_eq!(snap.attempts_started, 1);
+        assert_eq!(snap.attempts_completed, 1);
+        assert_eq!(snap.attempt_elapsed, None, "the attempt returned");
+        assert_eq!(snap.stall_cause(), None, "and the write is durable");
+    }
 
     /// Helper to create a simple mutation for testing.
     fn simple_mutation() -> Mutation {

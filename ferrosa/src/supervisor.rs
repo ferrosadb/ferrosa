@@ -257,11 +257,38 @@ struct ChildHealth {
     last_failure: ArcSwapOption<String>,
 }
 
+/// The commit-log fsync stall causes, in counter order. The index of a cause
+/// is its position here; `stall_cause_index` is an exhaustive match, so adding
+/// a `StallCause` variant is a compile error until it is placed.
+const STALL_CAUSE_LABELS: [&str; 4] = [
+    "device_slow",
+    "no_attempt_issued",
+    "attempt_failed",
+    "sync_thread_dead",
+];
+
+/// Where a `StallCause` lands in the per-cause stall counters. Exhaustive on
+/// purpose: a new cause cannot be silently left uncounted.
+fn stall_cause_index(cause: ferrosa_storage::commitlog::StallCause) -> usize {
+    use ferrosa_storage::commitlog::StallCause;
+    match cause {
+        StallCause::DeviceSlow => 0,
+        StallCause::NoAttemptIssued => 1,
+        StallCause::AttemptFailed => 2,
+        StallCause::ThreadDead => 3,
+    }
+}
+
 /// Process-wide health of the supervised children. Read by `/readyz` and
 /// `/metrics`; written by the supervisors.
 #[derive(Default)]
 pub struct SupervisionStatus {
     children: [ChildHealth; 3],
+    /// Commit-log fsync stalls recorded per `StallCause`. A stall's cause is
+    /// only observable at the moment its first deadline fires — the snapshot
+    /// has moved on by the next check — so it is counted here rather than
+    /// reconstructed from live state.
+    sync_stall_causes: [AtomicU64; 4],
 }
 
 impl SupervisionStatus {
@@ -278,6 +305,17 @@ impl SupervisionStatus {
             .last_failure
             .store(Some(Arc::new(format!("{}: {detail}", kind.label()))));
         !health.impaired.swap(true, Ordering::AcqRel)
+    }
+
+    /// Count a commit-log fsync stall by cause, at the moment its first
+    /// deadline fires and the cause is still observable.
+    pub(crate) fn record_stall_cause(&self, cause: ferrosa_storage::commitlog::StallCause) {
+        self.sync_stall_causes[stall_cause_index(cause)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Commit-log fsync stalls since startup for `cause`.
+    pub fn sync_stall_causes(&self, cause: ferrosa_storage::commitlog::StallCause) -> u64 {
+        self.sync_stall_causes[stall_cause_index(cause)].load(Ordering::Relaxed)
     }
 
     /// Mark the child healthy. Returns `true` on the impaired -> healthy edge.
@@ -363,6 +401,20 @@ impl SupervisionStatus {
                 "ferrosa_supervised_task_restarts_total{{task=\"{}\"}} {}",
                 child.label(),
                 self.restarts(child)
+            );
+        }
+        out.push_str(
+            "# HELP ferrosa_commitlog_sync_stalls_total Commit-log fsync stalls by cause. \
+             cause=no_attempt_issued means no fsync was ever issued during the stall — the sync \
+             thread did not run, which a restart may help; device_slow means an fsync was in \
+             flight the whole time, which it will not.\n\
+             # TYPE ferrosa_commitlog_sync_stalls_total counter\n",
+        );
+        for (i, label) in STALL_CAUSE_LABELS.iter().enumerate() {
+            let count = self.sync_stall_causes[i].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "ferrosa_commitlog_sync_stalls_total{{cause=\"{label}\"}} {count}"
             );
         }
     }
@@ -882,13 +934,24 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
             self.stalls_recorded = 0;
             return;
         };
+        // The cause is knowable only while this stall is current: the snapshot
+        // has moved on (or recovered) by the next check. Record it now, and put
+        // it in the log line an operator actually reads — this is the wiring
+        // t_ca4e1f81 was left without.
+        let Some(cause) = health.stall_cause() else {
+            tracing::error!(
+                task = Child::CommitLogSync.label(),
+                "commit-log sync reports stalled with no stall cause; not counting this stall"
+            );
+            return;
+        };
         let due =
             (waited.as_nanos() / health.stall_deadline.as_nanos()).min(u128::from(u64::MAX)) as u64;
         let first_new = self.stalls_recorded + 1;
         let newly_due = due.saturating_sub(self.stalls_recorded);
         self.stalls_recorded = due.max(self.stalls_recorded);
         let detail = format!(
-            "no commit-log fsync for {}ms, past the {}ms stall deadline ({detail})",
+            "no commit-log fsync for {}ms, past the {}ms stall deadline (cause={cause}, {detail})",
             waited.as_millis(),
             health.stall_deadline.as_millis()
         );
@@ -905,6 +968,7 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
                     .status
                     .record_failure(Child::CommitLogSync, FailureKind::Stall, &detail)
                 {
+                    self.status.record_stall_cause(cause);
                     tracing::error!(
                         task = Child::CommitLogSync.label(),
                         %detail,

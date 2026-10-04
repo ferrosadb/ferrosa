@@ -69,8 +69,8 @@ use checkpoint::CommitLogCheckpoint;
 use config::CommitLogConfig as Config;
 use reader::SegmentReader;
 use segment::Segment;
-pub use sync::SyncHealthSnapshot;
 use sync::{AckPolicy, BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
+pub use sync::{StallCause, SyncHealthSnapshot};
 
 static COMMITLOG_APPENDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMMITLOG_APPEND_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
