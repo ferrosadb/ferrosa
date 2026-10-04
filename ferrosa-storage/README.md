@@ -54,6 +54,17 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   sync thread is dead, fsync is failing, or the oldest unsynced write is past
   `FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS` (2000). The sync thread exposes
   `sync_health()` / `restart_sync()` for the node supervisor (FMEA ST-71).
+  **A stall also says WHY** (FMEA ST-86): `unsynced_for` is time since an fsync
+  last *completed*, which a slow device, an unscheduled thread and a thread
+  that was never woken all produce identically — and only the last is a bug.
+  `SyncHealthSnapshot` therefore carries `attempts_started`,
+  `attempts_completed` (incremented on BOTH the success and failure paths: a
+  failed fsync still proves the thread ran) and `attempt_elapsed`, and
+  `stall_cause()` returns `StallCause::{DeviceSlow, NoAttemptIssued,
+  AttemptFailed, ThreadDead}`. `started == completed` across a stall means no
+  fsync was ever issued, so the thread is the suspect, not the disk. Not yet
+  surfaced in the supervisor's log line or a metric label — the data is in the
+  snapshot only.
   A restarted periodic sync thread syncs the dead thread's backlog at once
   (no batch window), and `restart_sync()` returns only once that backlog is
   durable or the stall deadline passes, so a node the supervisor restarted
