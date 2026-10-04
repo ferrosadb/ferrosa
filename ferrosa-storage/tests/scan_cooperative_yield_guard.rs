@@ -6,10 +6,12 @@
 //! * **T1.5** — the scheduler pool must be used *only* by the `range_iter*` scan
 //!   producers, so a `PartitionKeyLookup` point read never touches the scheduler
 //!   (zero overhead, never queued behind a scan).
-//! * **T1.7** — a producer must hold **no lock across `slot.tick()`**. `tick()`
-//!   blocks on a fair re-acquire of the pool permit (released only as *other*
-//!   scans yield), so a storage/index lock held across it could deadlock
-//!   (FM-3/FM-7), mirroring the Accord `handlers.rs` "no lock across `.await`".
+//! * **T1.7** — a producer must hold **no lock** in its run. A run that is told
+//!   to yield returns and is re-admitted later, so a storage/index lock held in
+//!   it would be held across a wait for the slot (FM-3/FM-7), mirroring the
+//!   Accord `handlers.rs` "no lock across `.await`".
+//! * **ST-84** — a producer never waits on its thread: one producer shape,
+//!   `RangeScan::run`, which pauses (returns) on a full channel.
 //!
 //! Static analysis can't see these call/no-call invariants, so this test greps
 //! the source — the same "guard the invariant at the source" pattern as the
@@ -18,37 +20,18 @@
 
 use std::fs;
 
-/// Extract each range-scan producer's body. Two shapes exist:
-///
-/// - fragment producers route a closure through the
-///   `spawn_bounded_range_scan(tx, ...)` helper (which wraps the raw
-///   `submit_scan` admission with cancellation + fail-loud overload); each body
-///   runs from that call up to the `Box::pin(futures::stream::unfold` stream
-///   return that immediately follows the closure. Matching
-///   `spawn_bounded_range_scan(tx` picks the call sites, not the
-///   `spawn_bounded_range_scan<F>(tx:` definition;
-/// - the whole-partition producer is `RangeScan::run`, run (and re-run after
-///   each pause) by `spawn_resumable_range_scan`.
+/// Every range-scan producer is `RangeScan::run` (whole partitions or
+/// fragments), run and re-run after each pause or yield by
+/// `spawn_resumable_range_scan`.
 fn producer_bodies(src: &str) -> Vec<&str> {
-    let mut bodies: Vec<&str> = src
-        .match_indices("spawn_bounded_range_scan(tx")
-        .map(|(start, _)| {
-            let rest = &src[start..];
-            let end = rest
-                .find("Box::pin(futures::stream::unfold")
-                .unwrap_or(rest.len());
-            &rest[..end]
-        })
-        .collect();
-    bodies.push(range_scan_run_body(src));
-    bodies
+    vec![range_scan_run_body(src)]
 }
 
 /// The body of `RangeScan::run`: from its declaration to the next item.
 fn range_scan_run_body(src: &str) -> &str {
     let impl_at = src
-        .find("impl<F: FlushTarget> RangeScan<F>")
-        .expect("RangeScan's impl must exist");
+        .find("impl<F: FlushTarget> PausableScan for RangeScan<F>")
+        .expect("RangeScan's PausableScan impl must exist");
     let rest = &src[impl_at..];
     let run_at = rest.find("fn run(").expect("RangeScan::run must exist");
     let body = &rest[run_at..];
@@ -56,25 +39,26 @@ fn range_scan_run_body(src: &str) -> &str {
     &body[..end]
 }
 
-/// Functions that may call `global_pool()`: the two helpers that route a range
+/// Functions that may call `global_pool()`: the one helper that routes a range
 /// scan through the scheduler.
-const POOL_HELPERS: [&str; 2] = ["spawn_bounded_range_scan", "spawn_resumable_range_scan"];
+const POOL_HELPERS: [&str; 1] = ["spawn_resumable_range_scan"];
 
+/// `store.rs` up to its unit-test module: the guards are about production
+/// call paths, and the tests drive the helpers directly.
 fn store_src() -> String {
-    fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/store.rs"))
-        .expect("read store.rs source")
+    let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/store.rs"))
+        .expect("read store.rs source");
+    let tests_at = src
+        .find("#[cfg(test)]\nmod tests {")
+        .expect("store.rs keeps its unit tests in `mod tests`");
+    src[..tests_at].to_string()
 }
 
 #[test]
 fn every_submit_scan_producer_calls_slot_tick() {
     let src = store_src();
     let bodies = producer_bodies(&src);
-    assert!(
-        bodies.len() >= 3,
-        "expected >= 3 store.rs scan producers (two fragment producers and RangeScan::run), \
-         found {} — did a producer switch back to submit_blocking (no cooperative yield)?",
-        bodies.len()
-    );
+    assert_eq!(bodies.len(), 1, "one producer shape: RangeScan::run");
     for (n, body) in bodies.iter().enumerate() {
         assert!(
             body.contains("slot.tick()"),
@@ -89,16 +73,14 @@ fn every_submit_scan_producer_calls_slot_tick() {
 fn scheduler_pool_is_reached_only_through_the_range_scan_helper() {
     // B1 T1.5 / FM-6 — interactive point-read bypass. Three invariants keep the
     // scheduler off the point-read path:
-    //   (a) `global_pool()` is called ONLY inside the two helpers that route a
-    //       scan through the pool (`POOL_HELPERS`);
-    //   (b) every `spawn_bounded_range_scan(...)` CALL site is a `range_iter*`
-    //       scan producer, and `spawn_resumable_range_scan(...)` is called only
-    //       from `whole_partition_range_scan`; and
-    //   (c) `whole_partition_range_scan` is called only from `range_iter*`.
+    //   (a) `global_pool()` is called ONLY inside `spawn_resumable_range_scan`;
+    //   (b) `spawn_resumable_range_scan(...)` is called only from
+    //       `range_scan_stream`; and
+    //   (c) `range_scan_stream` and `whole_partition_range_scan` are called only
+    //       from `range_iter*` (or each other).
     // Together they guarantee the point-read methods (`read` /
     // `read_limited_rows` / `read_clustering_row`) never touch the scheduler, so a
-    // `PartitionKeyLookup` has zero scheduler calls. Fails if a future edit routes
-    // a point read through the pool or calls the pool outside the helpers.
+    // `PartitionKeyLookup` has zero scheduler calls.
     let src = store_src();
 
     let mut pool_calls = 0usize;
@@ -113,61 +95,58 @@ fn scheduler_pool_is_reached_only_through_the_range_scan_helper() {
         pool_calls += 1;
     }
     assert!(
-        pool_calls >= 2,
-        "expected both {POOL_HELPERS:?} to call global_pool(), found {pool_calls}"
+        pool_calls >= 1,
+        "expected {POOL_HELPERS:?} to call global_pool()"
     );
 
     let mut call_sites = 0usize;
-    for (idx, _) in src.match_indices("spawn_bounded_range_scan(tx") {
-        let name = enclosing_fn_name(&src, idx);
-        assert!(
-            name.contains("range_iter"),
-            "spawn_bounded_range_scan is called from `{name}` — only range_iter* scan producers \
-             may route work through the scheduler pool (T1.5 / FM-6)."
-        );
-        call_sites += 1;
-    }
     for (idx, _) in src.match_indices("spawn_resumable_range_scan(tx") {
         let name = enclosing_fn_name(&src, idx);
         assert_eq!(
-            name, "whole_partition_range_scan",
+            name, "range_scan_stream",
             "spawn_resumable_range_scan is called from `{name}` (T1.5 / FM-6)"
         );
         call_sites += 1;
     }
-    for (idx, _) in src.match_indices("self.whole_partition_range_scan(") {
-        let name = enclosing_fn_name(&src, idx);
-        assert!(
-            name.contains("range_iter"),
-            "whole_partition_range_scan is called from `{name}` — only range_iter* scan \
-             producers may route work through the scheduler pool (T1.5 / FM-6)."
-        );
+    for pattern in [
+        "self.range_scan_stream(",
+        "self.whole_partition_range_scan(",
+    ] {
+        for (idx, _) in src.match_indices(pattern) {
+            let name = enclosing_fn_name(&src, idx);
+            assert!(
+                name.contains("range_iter") || name == "whole_partition_range_scan",
+                "{pattern} is called from `{name}` — only range_iter* scan producers may \
+                 route work through the scheduler pool (T1.5 / FM-6)."
+            );
+            call_sites += 1;
+        }
     }
     assert!(
-        call_sites >= 3,
-        "expected >= 3 range scan producer call sites, found {call_sites}"
+        call_sites >= 5,
+        "expected >= 5 range scan producer call sites, found {call_sites}"
     );
 }
 
-/// A whole-partition scan whose consumer stopped reading (a suspended PG
-/// portal, a client that left its socket full) must give back its thread, not
-/// only its slot: parked threads add up until the runtime's bounded blocking
-/// pool is gone (missing-guards entry 8). So `RangeScan::run` sends only
-/// through `deliver_or_pause`/`deliver_failure`, never the `deliver` that
-/// parks for as long as the consumer likes.
+/// A scan whose consumer stopped reading (a suspended PG portal, a client
+/// that left its socket full) must give back its thread, not only its slot,
+/// and must never wait for room on it: the consumer may need a thread to make
+/// room (ST-84). So `RangeScan::run` sends only through
+/// `deliver_or_pause`/`deliver_failure`, and nothing in it blocks on the
+/// channel.
 #[test]
-fn the_whole_partition_producer_pauses_instead_of_parking() {
+fn the_producer_pauses_instead_of_waiting() {
     let src = store_src();
     let run = range_scan_run_body(&src);
     assert!(
         run.contains("deliver_or_pause("),
         "RangeScan::run must send through deliver_or_pause"
     );
-    for parking in ["deliver(", "deliver_error(", "slot.park("] {
+    for waiting in ["blocking_send", "block_on", ".park(", "recv_timeout"] {
         assert!(
-            !run.contains(parking),
-            "RangeScan::run calls `{parking}`, which keeps the thread while the consumer \
-             is not reading — pause with deliver_or_pause/deliver_failure instead"
+            !run.contains(waiting),
+            "RangeScan::run calls `{waiting}`, which waits on the producer's thread — \
+             pause with deliver_or_pause/deliver_failure instead"
         );
     }
 }
@@ -182,41 +161,19 @@ fn enclosing_fn_name(src: &str, at: usize) -> String {
         .collect()
 }
 
-/// A producer that blocks on its consumer while holding a pool slot lets a
-/// client that stopped reading stall every other scan on the node
-/// (`pg_stalled_consumer_liveness`). Every send must go through `deliver`,
-/// which parks the slot while the send waits.
-#[test]
-fn no_producer_blocks_on_its_consumer_while_holding_a_slot() {
-    let src = store_src();
-    for (n, body) in producer_bodies(&src).iter().enumerate() {
-        assert!(
-            !body.contains("blocking_send"),
-            "range-scan producer #{n} calls blocking_send directly — it would hold its pool \
-             slot while a client that stopped reading leaves the send pending. Send through \
-             deliver()/deliver_error(), which park the slot."
-        );
-        assert!(
-            body.contains("deliver(") || body.contains("deliver_or_pause("),
-            "range-scan producer #{n} never sends through deliver()/deliver_or_pause()"
-        );
-    }
-}
-
 #[test]
 fn no_lock_held_across_the_cooperative_yield() {
     let src = store_src();
     for (n, body) in producer_bodies(&src).iter().enumerate() {
-        // `.lock()` is the clear mutex-guard signal. `tick()` blocks on a fair
-        // permit re-acquire, so a guard live across it risks deadlock (T1.7).
+        // `.lock()` is the clear mutex-guard signal. A run that yields is
+        // re-admitted later, so a guard taken in it risks deadlock (T1.7).
         // The producers deliberately use arc-swap `load_full()` (owned Arcs), so
         // no guard is held; this fails if a future edit introduces one.
         assert!(
             !body.contains(".lock()"),
-            "submit_scan producer #{n} acquires a `.lock()` guard inside the scan closure — \
-             a lock held across slot.tick()'s blocking permit re-acquire can deadlock \
-             (T1.7 / FM-3/FM-7). Load shared state via arc-swap (`load_full()`) instead, or \
-             scope the guard so it is dropped before the page loop."
+            "range-scan producer #{n} acquires a `.lock()` guard in its run — a run that \
+             yields is re-admitted later, so the lock would be held across a wait for the \
+             slot (T1.7 / FM-3/FM-7). Load shared state via arc-swap (`load_full()`) instead."
         );
     }
 }

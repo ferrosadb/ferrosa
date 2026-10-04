@@ -850,8 +850,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   fix.
 
 - **A range scan whose consumer stopped reading pauses and gives back its
-  thread (ST-82).** `range_iter` and `range_iter_projected` run a `RangeScan`
-  on the scheduler pool. As soon as the 4-item channel is full, the producer
+  thread (ST-82, ST-84).** Every range producer (`range_iter`,
+  `range_iter_projected` and the `*_fragmented` variants) is a `RangeScan` on
+  the scheduler pool. As soon as the 4-item channel is full, the producer
   returns its pool slot, I/O permit AND blocking thread; an async supervisor
   holds the item it could not hand over, waits for room, delivers it and
   resumes the scan. There is no grace wait on the producer's thread (ST-84):
@@ -860,8 +861,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   its merger across the pause (`OwnedMerger`: the merger plus the view,
   readers and mappings it borrows), so it resumes at its exact position with
   no re-open or re-seek. A suspended PG portal or an undrained socket
-  therefore holds no thread. The fragment producers still park theirs
-  (`ScanSlot::park`).
+  therefore holds no thread. A run told to yield its slot at a budget
+  boundary returns the same way and is re-admitted by the supervisor; no
+  producer waits on its thread for anything.
 
 ## Public API (key entry points)
 

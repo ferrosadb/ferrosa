@@ -22,8 +22,9 @@ a CheckQuorum leader step-down.
   least-`vruntime` waiter, **weighted by `SchedClass`**: a Foreground scan (1024)
   advances `vruntime` 4x slower than a Bulk scan (256), so under contention it
   gets ~4x the slot turns. Admission is async (a waiter is a cheap task, never a
-  parked blocking thread — the B0 property); a scan's mid-scan re-competes block
-  its own blocking thread. Deadlock-free and slot-leak-free (RAII).
+  parked blocking thread — the B0 property), and so is every mid-scan
+  re-admission (`readmit`, after a pause or a yield via `charge`): no scan
+  waits for a slot on a thread. Deadlock-free and slot-leak-free (RAII).
   `admit(class, cancel)` returns `Admitted::{Slot, Overloaded, Cancelled}`:
   **cancellable** — if the `cancel` future fires (or the future is dropped)
   before a slot is granted, a `WaitGuard` vacates the queue/waiter entry so a
@@ -35,29 +36,26 @@ a CheckQuorum leader step-down.
   `spawn_bounded_range_scan`, passing the consumer channel's `closed()` as the
   cancel signal and failing loud on overload (never a silent empty stream).
 - `SchedPool` — wraps `FairAdmit`. `submit_scan(class, chunk_budget, f)` + a
-  `ScanSlot`: the producer calls `slot.tick()` per produced chunk and every
-  `chunk_budget` chunks re-competes for its slot in vruntime order, so a long
-  full-table scan cedes to more-deserving scans. `slot.park(wait)` runs a
-  block on the scan's *consumer* (a send to a client that stopped reading)
-  with the CPU slot and I/O permit released, then re-competes for both
-  (`FairAdmit::suspend`/`resume`; metric `ferrosa_sched_scan_parks_total`).
-  Without it one idle client per slot — a suspended PG portal, a socket left
-  undrained — stalls every scan on the node. `slot.park_or_release(wait)` is
-  the same wait for a producer that can pause: when `wait` gives up (`None`)
-  the slot and permit stay released, the slot is finished, and the producer
-  returns, so it gives back its blocking thread too and resumes later from its
-  own cursor (metric `scan_releases_total`; any further use of the slot
-  panics). `ferrosa-storage`'s whole-partition range scans use it, because a
-  parked thread per idle client still exhausts the runtime's bounded blocking
-  pool. `tick`'s re-compete gives back the I/O permit with the slot, as `park`
-  does, so a permit is only ever held by a slot holder: a scan that waited for
-  the slot while keeping its permit deadlocked against the scan it yielded to
-  (admitted to the slot, then waiting for the permit) — permanently on a 1-slot
-  pool. Admitted scans run on the scheduler's own carrier runtime
-  (`scan_carrier`, `ferrosa-scan` threads), not the caller's `spawn_blocking`
-  pool: a scan's consumer (the PG executor) waits on a thread from that pool,
-  and a producer that needed one too deadlocked against it.
-  `submit`/`submit_blocking` are the generic (Bulk-weight) entries.
+  `ScanSlot`: the producer calls `slot.tick()` per produced chunk; every
+  `chunk_budget` chunks its `vruntime` is charged, and when a more deserving
+  scan waits `tick` gives the slot up and returns `Tick::Yield`.
+  **A producer never waits on its thread** — not for its consumer, not for its
+  slot to come back. When it must stop (a full channel: `slot.release()`, metric
+  `ferrosa_sched_scan_releases_total`; or a yield) it gives up its slot and I/O
+  permit and returns, and `resubmit_scan(slot.take_ticket(), ...)` admits the
+  next run as an async task, keeping the scan's id and `vruntime`. Every wait is
+  an async task, so no producer holds a thread something else needs: a parked
+  producer per idle client exhausted the PG listener's bounded blocking pool,
+  a short grace wait put every thread of it into waits the PG executor could
+  not end, and executors waiting for rows held every thread their producers
+  needed to resume. Admitted producers run on the scheduler's own carrier
+  runtime (`scan_carrier`, `ferrosa-scan` threads, bounded at the host's cores,
+  gauges `ferrosa_sched_scan_carrier_threads_{busy,capacity}`), never the
+  caller's `spawn_blocking` pool. Only slot holders run there and none of them
+  waits, so a slot holder waiting for a carrier thread always gets one.
+  I/O permits are taken after the slot and dropped with it, so only slot
+  holders hold them. `submit`/`submit_blocking` are the generic (Bulk-weight)
+  entries.
 - `runqueue::{RunQueue, SchedEntity, weight_for_class}` +
   `scheduler::{advance_vruntime, should_switch}` — the pure vruntime primitives
   `FairAdmit` is built from: a pick-min run queue with a monotonic `min_vruntime`

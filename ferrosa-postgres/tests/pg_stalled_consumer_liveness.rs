@@ -59,9 +59,8 @@ async fn suspended_portals_do_not_starve_other_sessions_scans() {
     // The premise: each suspended portal's storage producer really is blocked
     // on its consumer. Without this, a buffer large enough to hold the whole
     // table would make the test pass without exercising anything. A producer
-    // that met a full channel either parked (a fragment producer) or paused
-    // and gave its slot back (a whole-partition scan, which never waits).
-    let blocked = ferrosa_sched::scan_parks_total() + ferrosa_sched::scan_releases_total();
+    // that meets a full channel pauses, giving its slot (and thread) back.
+    let blocked = ferrosa_sched::scan_releases_total();
     assert!(
         blocked >= POOL_SLOTS as u64,
         "only {blocked} of {POOL_SLOTS} suspended scans blocked on their consumer"
