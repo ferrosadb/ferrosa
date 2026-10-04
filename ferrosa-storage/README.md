@@ -54,6 +54,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   sync thread is dead, fsync is failing, or the oldest unsynced write is past
   `FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS` (2000). The sync thread exposes
   `sync_health()` / `restart_sync()` for the node supervisor (FMEA ST-71).
+  A restarted periodic sync thread syncs the dead thread's backlog at once
+  (no batch window), and `restart_sync()` returns only once that backlog is
+  durable or the stall deadline passes, so a node the supervisor restarted
+  acknowledges writes again instead of refusing them for as long as
+  scheduling takes.
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
   memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`, and
   every view change is a compare-and-swap derived from the current view.
@@ -503,6 +508,19 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   builds run only when the flush published an SSTable
   (`FlushOutcome::Published`); a flush with nothing to write touches neither
   the tracker nor the pin accounting (ST-43).
+  A compaction swap retires its inputs from the tracker
+  (`IndexStateTracker::retire_sstables`); an input still pending hands that to
+  the output, whose eager build completes it. A failed build is logged on its
+  edges (ERROR when the index turns failed) and a build of a generation no
+  longer pending is not a failure. The maintenance loop's compaction tick runs
+  `StorageEngine::heal_secondary_index_backfills`: it drops pending generations
+  that left the live set, resubmits a failed index after
+  `scheduler::BUILD_RETRY_DELAY` (60 s) and one with no build finished for
+  `INDEX_BACKFILL_STALL_AFTER` (300 s), and publishes
+  `ferrosa_index_not_current{table,index}` and
+  `ferrosa_index_backfill_failed{table,index}`; `/readyz` lists not-current
+  indexes under `stale_indexes` (ST-85). Eager build jobs of a Filtered index
+  carry its predicate.
   Registrations are dogfooded to `system_schema.indexes`; `unregister_table`
   (the DROP TABLE choke point for every DDL route) cascades tombstones over the
   dropped table's registrations via `write_index_tombstones_for_table` and

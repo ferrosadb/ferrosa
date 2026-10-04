@@ -952,7 +952,12 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
 }
 
 /// Run a [`CommitLogSyncSupervisor`] every `poll` until the process exits.
-pub async fn run_commit_log_sync_supervisor<T: CommitLogSyncTarget + ?Sized>(
+///
+/// Each check runs on the blocking pool: a restart joins the dead thread and
+/// waits (bounded by the stall deadline) for the new one to sync its backlog,
+/// which must never hold an async worker. A panic inside a check is re-raised
+/// here, so the enclosing supervision sees it.
+pub async fn run_commit_log_sync_supervisor<T: CommitLogSyncTarget + ?Sized + 'static>(
     mut supervisor: CommitLogSyncSupervisor<T>,
     poll: Duration,
 ) {
@@ -960,7 +965,16 @@ pub async fn run_commit_log_sync_supervisor<T: CommitLogSyncTarget + ?Sized>(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        supervisor.check();
+        supervisor = match tokio::task::spawn_blocking(move || {
+            supervisor.check();
+            supervisor
+        })
+        .await
+        {
+            Ok(supervisor) => supervisor,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => panic!("commit-log sync supervisor check was cancelled: {e}"),
+        };
     }
 }
 

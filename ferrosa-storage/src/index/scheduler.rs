@@ -532,6 +532,10 @@ pub struct IndexBuildScheduler {
     data_dir: Option<PathBuf>,
     #[allow(dead_code)]
     on_build_complete: Arc<Option<BuildCompleteCallback>>,
+    /// The workers' shared receiver, kept so a test can hold every worker
+    /// at its dequeue (see `hold_workers_for_test`).
+    #[cfg(test)]
+    task_rx: Arc<Mutex<std::sync::mpsc::Receiver<IndexBuildJob>>>,
 }
 
 impl IndexBuildScheduler {
@@ -595,6 +599,8 @@ impl IndexBuildScheduler {
             stop_flag,
             data_dir: None,
             on_build_complete,
+            #[cfg(test)]
+            task_rx,
         }
     }
 
@@ -633,6 +639,8 @@ impl IndexBuildScheduler {
             stop_flag,
             data_dir: None,
             on_build_complete,
+            #[cfg(test)]
+            task_rx,
         }
     }
 
@@ -684,7 +692,19 @@ impl IndexBuildScheduler {
             stop_flag,
             data_dir: Some(data_dir),
             on_build_complete,
+            #[cfg(test)]
+            task_rx,
         }
+    }
+
+    /// Hold every worker at its dequeue until the guard drops: jobs submitted
+    /// meanwhile queue up and none runs. Lets a test order a build after an
+    /// event (a compaction retiring its SSTable) instead of racing it.
+    #[cfg(test)]
+    pub(crate) fn hold_workers_for_test(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, std::sync::mpsc::Receiver<IndexBuildJob>> {
+        self.task_rx.lock()
     }
 
     /// Submits a build job to the worker pool.
@@ -781,13 +801,7 @@ impl IndexBuildScheduler {
                             tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
                         }
                         Err(err) => {
-                            tracker.mark_failed(
-                                keyspace,
-                                table,
-                                &job.index_name,
-                                err,
-                                std::time::Duration::from_secs(60),
-                            );
+                            record_build_failure(tracker, &job, err);
                         }
                     }
                 }
@@ -836,33 +850,16 @@ impl IndexBuildScheduler {
                                     &job.sstable_id,
                                 ),
                                 Err(err) => {
-                                    tracing::error!(
-                                        %err,
-                                        keyspace,
-                                        table,
-                                        index_name = %job.index_name,
-                                        sstable = %job.sstable_id,
-                                        "index-build: sidecar built but not published; the index \
-                                         is NOT current for this SSTable"
-                                    );
-                                    tracker.mark_failed(
-                                        keyspace,
-                                        table,
-                                        &job.index_name,
-                                        err,
-                                        std::time::Duration::from_secs(60),
+                                    record_build_failure(
+                                        tracker,
+                                        &job,
+                                        format!("sidecar built but not published: {err}"),
                                     );
                                 }
                             }
                         }
                         Err(err) => {
-                            tracker.mark_failed(
-                                keyspace,
-                                table,
-                                &job.index_name,
-                                err,
-                                std::time::Duration::from_secs(60),
-                            );
+                            record_build_failure(tracker, &job, err);
                         }
                     }
                 }
@@ -871,6 +868,64 @@ impl IndexBuildScheduler {
             }
         }
     }
+}
+
+/// How long a failed backfill waits before the maintenance loop's healer
+/// (`StorageEngine::heal_secondary_index_backfills`) resubmits it.
+pub const BUILD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Record a failed build of `job` in the tracker, count it, and log it on the
+/// edges: ERROR when the index turns failed, WARN for a retry that failed
+/// again (at most once per [`BUILD_RETRY_DELAY`]), INFO for a build whose
+/// generation is no longer pending. Every failed build used to be recorded
+/// with no log line at all, and nothing ever retried it (2026-10-04).
+pub(crate) fn record_build_failure(
+    tracker: &IndexStateTracker,
+    job: &IndexBuildJob,
+    error: String,
+) -> crate::index::BuildFailure {
+    use crate::index::BuildFailure;
+
+    let (keyspace, table) = &job.table;
+    crate::metrics::index_backfill_build_failed();
+    let outcome = tracker.mark_failed(
+        keyspace,
+        table,
+        &job.index_name,
+        &job.sstable_id,
+        error.clone(),
+        BUILD_RETRY_DELAY,
+    );
+    match outcome {
+        BuildFailure::FirstFailure => tracing::error!(
+            %error,
+            keyspace = %keyspace,
+            table = %table,
+            index_name = %job.index_name,
+            sstable = %job.sstable_id,
+            retry_secs = BUILD_RETRY_DELAY.as_secs(),
+            "index backfill FAILED: the index is not current, so reads through it are \
+             refused until a retry builds this generation; see ferrosa_index_backfill_failed"
+        ),
+        BuildFailure::RepeatedFailure => tracing::warn!(
+            %error,
+            keyspace = %keyspace,
+            table = %table,
+            index_name = %job.index_name,
+            sstable = %job.sstable_id,
+            "index backfill retry failed again; reads through the index are still refused"
+        ),
+        BuildFailure::NotPending => tracing::info!(
+            %error,
+            keyspace = %keyspace,
+            table = %table,
+            index_name = %job.index_name,
+            sstable = %job.sstable_id,
+            "index build failed for a generation that is no longer pending (a compaction \
+             retired it, or it was already built); nothing is missing from the index"
+        ),
+    }
+    outcome
 }
 
 /// Write each built sidecar next to its SSTable and install it through
