@@ -53,7 +53,7 @@ pub enum Admitted {
 
 /// A scan that gave its slot back mid-run via [`FairAdmit::suspend`], with
 /// the scheduling state it re-enters the queue with on
-/// [`FairAdmit::resume`] — so parking does not reset its `vruntime`.
+/// [`FairAdmit::readmit`] — so a pause or yield does not reset its `vruntime`.
 #[derive(Debug)]
 pub struct Suspended {
     id: u64,
@@ -194,8 +194,18 @@ impl FairAdmit {
             }
             (id, notify)
         };
-        // From here the entry lives in the queue; if the future is dropped or
-        // `cancel` fires before the grant, `WaitGuard` vacates it.
+        self.await_grant(id, notify, cancel).await
+    }
+
+    /// Wait (as an async task) for queued scan `id` to be granted, or for
+    /// `cancel`. From here the entry lives in the queue; if the future is
+    /// dropped or `cancel` fires before the grant, `WaitGuard` vacates it.
+    async fn await_grant(
+        &self,
+        id: u64,
+        notify: Arc<Notify>,
+        cancel: impl Future<Output = ()>,
+    ) -> Admitted {
         let mut guard = WaitGuard {
             admit: self,
             id,
@@ -284,7 +294,7 @@ impl FairAdmit {
     /// Release running scan `id`'s slot without ending it: the scan is about to
     /// block on something other than CPU (its consumer stopped reading), and a
     /// slot held through that wait is a slot no other scan on the node can use.
-    /// Returns `None` if `id` holds no slot. Pair with [`resume`](Self::resume).
+    /// Returns `None` if `id` holds no slot. Pair with [`readmit`](Self::readmit).
     pub fn suspend(&self, id: u64) -> Option<Suspended> {
         let mut s = self.state.lock().expect("fair-admit poisoned");
         let (group, weight, entity) = s.running.remove(&id)?;
@@ -298,20 +308,56 @@ impl FairAdmit {
         })
     }
 
-    /// Re-compete for a slot after [`suspend`](Self::suspend), blocking (on
-    /// `handle`) until one is granted in vruntime order. Like a yielding scan,
-    /// a resuming one is not subject to the waiter bound: it was admitted once,
-    /// and shedding it now would fail a query mid-result.
-    pub fn resume(&self, handle: &tokio::runtime::Handle, suspended: Suspended) {
+    /// Account `service` for running scan `id` and, if a waiting scan is now
+    /// more deserving, give the slot up and return the scan's scheduling state
+    /// for [`readmit`](Self::readmit). Never blocks: a yielding producer
+    /// returns from its run instead of waiting on its thread for the slot to
+    /// come back. `None` means keep running (or `id` holds no slot).
+    pub fn charge(&self, id: u64, service: u64) -> Option<Suspended> {
+        let mut s = self.state.lock().expect("fair-admit poisoned");
+        let (group, weight, mut entity) = s.running.remove(&id)?;
+        entity.vruntime = advance_vruntime(entity.vruntime, service, entity.weight);
+        // Charge the group too, so its aggregate share reflects all its
+        // queries' service (B3 group fairness).
+        s.queue.charge(group, service);
+        // Yield only if a strictly-more-deserving scan waits, compared
+        // lexicographically (group `vruntime`, then query `vruntime`).
+        let group_vruntime = s.queue.group_vruntime(group).unwrap_or(entity.vruntime);
+        let running_key = (group_vruntime, entity.vruntime);
+        if !s.queue.peek_min().is_some_and(|min| min < running_key) {
+            s.running.insert(id, (group, weight, entity));
+            return None;
+        }
+        s.free += 1;
+        self.dispatch(&mut s);
+        Some(Suspended {
+            id,
+            group,
+            weight,
+            entity,
+        })
+    }
+
+    /// Re-compete, as an async task, for a slot for a scan that gave its slot
+    /// up through [`suspend`](Self::suspend) or [`charge`](Self::charge). It
+    /// keeps its id and `vruntime`, so a pause or yield does not reset its
+    /// fair share. Not subject to the waiter bound: it was admitted once, and
+    /// shedding it now would fail a query mid-result. `cancel` and dropping the
+    /// future behave as in [`admit`](Self::admit).
+    pub async fn readmit(
+        &self,
+        suspended: Suspended,
+        cancel: impl Future<Output = ()>,
+    ) -> Admitted {
         let id = suspended.id;
         let notify = {
             let mut s = self.state.lock().expect("fair-admit poisoned");
             match self.enqueue_waiter(&mut s, suspended) {
                 Some(notify) => notify,
-                None => return,
+                None => return Admitted::Slot(id),
             }
         };
-        self.wait_for_grant(handle, id, notify);
+        self.await_grant(id, notify, cancel).await
     }
 
     /// Queue `scan` for a slot and dispatch. `None` when it was granted at once;

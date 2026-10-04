@@ -1,5 +1,4 @@
-//! A whole-partition range scan never waits for its consumer while holding its
-//! blocking thread.
+//! A range-scan producer never waits on its thread for its consumer.
 //!
 //! The consumer of a range scan often needs a blocking thread itself to make
 //! room: the PG executor pulls rows with `blocking_recv` on `spawn_blocking`.
@@ -11,11 +10,10 @@
 //! (`pg_stalled_reader_holds_no_thread`), and locally it took 9 s against
 //! 0.1 s alone, with all four blocking threads in the producers' grace waits.
 //!
-//! The invariant: when the channel is full the producer pauses at once,
-//! returning its slot AND its thread; the async supervisor waits for room. A
-//! producer that waited on its thread and then went on is counted by
-//! `ferrosa_sched::scan_parks_total`, so that counter must not move while a
-//! consumer that is merely behind drains a whole-partition scan.
+//! The invariant: a producer never waits on its thread. When the channel is
+//! full it pauses at once, returning its slot AND its thread; the async
+//! supervisor waits for room. So while consumers are behind, no scheduler
+//! carrier thread is busy (`ferrosa_sched::scan_carrier_threads_busy`).
 //!
 //! Its own binary: both counters are process-wide.
 
@@ -97,7 +95,7 @@ fn seeded_engine(dir: &Path) -> (StorageEngine, TableId) {
 }
 
 #[test]
-fn a_consumer_that_falls_behind_never_holds_the_producers_thread_in_a_wait() {
+fn consumers_that_fall_behind_hold_no_producer_thread() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -106,11 +104,39 @@ fn a_consumer_that_falls_behind_never_holds_the_producers_thread_in_a_wait() {
     rt.block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let (engine, table_id) = seeded_engine(dir.path());
-        let parks_before = ferrosa_sched::scan_parks_total();
-        let resumes_before = ferrosa_storage::range_scan_resumes_total();
 
-        // A consumer slower than the producer, but never stalled: it drains
-        // within a fraction of a millisecond each time.
+        // Consumers that stopped reading: more of them than carrier threads.
+        // Each scan fills its channel and pauses; none may keep a thread.
+        let stalled_count = 2 * ferrosa_sched::scan_carrier_threads_capacity();
+        let releases_before = ferrosa_sched::scan_releases_total();
+        let mut stalled = Vec::with_capacity(stalled_count);
+        for _ in 0..stalled_count {
+            let mut stream = engine.range_iter_fragmented(&table_id, None, None);
+            let first = tokio::time::timeout(Duration::from_secs(30), stream.next())
+                .await
+                .expect("a scan was never admitted beside stalled ones");
+            assert!(matches!(first, Some(Ok(_))), "each scan yields a partition");
+            stalled.push(stream);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while ferrosa_sched::scan_releases_total() - releases_before < stalled_count as u64 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {stalled_count} stalled scans paused",
+                ferrosa_sched::scan_releases_total() - releases_before
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            ferrosa_sched::scan_carrier_threads_busy(),
+            0,
+            "{stalled_count} scans whose consumers stopped reading still occupy carrier \
+             threads: a producer is waiting on its thread"
+        );
+
+        // A consumer slower than the producer, but never stalled, still gets
+        // every partition, through pauses and resumes.
+        let resumes_before = ferrosa_storage::range_scan_resumes_total();
         let mut stream = engine.range_iter(&table_id, None, None);
         let mut delivered = 0usize;
         let drained = tokio::time::timeout(Duration::from_secs(60), async {
@@ -121,23 +147,24 @@ fn a_consumer_that_falls_behind_never_holds_the_producers_thread_in_a_wait() {
             }
         })
         .await;
-        assert!(drained.is_ok(), "the scan never finished");
+        assert!(drained.is_ok(), "the slow consumer's scan never finished");
         assert_eq!(delivered, PARTITIONS, "every partition is delivered");
-
-        // Each time the channel was full the producer either paused (a
-        // resume) or waited on its thread for room (a park).
-        let resumes = ferrosa_storage::range_scan_resumes_total() - resumes_before;
-        let parks = ferrosa_sched::scan_parks_total() - parks_before;
         assert!(
-            resumes + parks > 0,
-            "premise: the consumer must really fall behind the producer"
+            ferrosa_storage::range_scan_resumes_total() > resumes_before,
+            "premise: the slow consumer must really fall behind the producer"
         );
-        assert_eq!(
-            parks, 0,
-            "a range-scan producer waited {parks} times for its consumer on its own \
-             blocking thread ({resumes} pauses); a consumer that needs a blocking thread \
-             to make room (the PG executor) is starved by those waits"
-        );
+
+        // The stalled scans are intact once their consumers read again.
+        for (i, stream) in stalled.into_iter().enumerate() {
+            let rest = tokio::time::timeout(Duration::from_secs(30), stream.collect::<Vec<_>>())
+                .await
+                .unwrap_or_else(|_| panic!("stalled scan {i} never resumed"));
+            assert_eq!(
+                rest.len(),
+                PARTITIONS - 1,
+                "stalled scan {i} delivers the rest"
+            );
+        }
         engine.shutdown().unwrap();
     });
 }

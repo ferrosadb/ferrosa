@@ -1741,97 +1741,6 @@ fn partition_vectors(
     Ok(entries)
 }
 
-/// Route a range-scan `producer` through the bounded scheduler pool, wiring the
-/// two admission properties the raw [`ferrosa_sched::SchedPool::submit_scan`]
-/// primitive exposes so a range scan is a well-behaved scheduler citizen:
-///
-/// - **Cancellation** — the producer's channel `closed()` future is the cancel
-///   signal. If the consumer drops the stream while the scan is still *waiting*
-///   for a pool slot, the queued admission is vacated before it ever occupies a
-///   slot, instead of waking later, grabbing a slot, and doing work only to find
-///   the channel closed (t_6d0553ee).
-/// - **Fail-loud overload** — if admission is shed because the waiter queue was
-///   at its bound ([`ferrosa_sched::ScanOutcome::Overloaded`]), the producer
-///   never runs, so `rx` would otherwise end silently empty. A supervisor task
-///   surfaces a backpressure error into the stream instead (recognized by
-///   [`ferrosa_common::Error::is_backpressure`]), so the caller sees explicit
-///   overload, never a phantom empty result.
-///
-/// `tx` is a clone of the producer's channel sender used only for these two
-/// signals; the producer owns its own sender for delivering partitions.
-fn spawn_bounded_range_scan<F>(tx: tokio::sync::mpsc::Sender<Result<Partition>>, producer: F)
-where
-    F: FnOnce(&mut ferrosa_sched::ScanSlot) + Send + 'static,
-{
-    let cancel_probe = tx.clone();
-    let handle = ferrosa_sched::global_pool().submit_scan(
-        ferrosa_sched::SchedClass::Bulk,
-        ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
-        async move { cancel_probe.closed().await },
-        move |slot| producer(slot),
-    );
-    tokio::spawn(async move {
-        let failure = match handle.await {
-            Ok(ferrosa_sched::ScanOutcome::Ran(())) | Ok(ferrosa_sched::ScanOutcome::Cancelled) => {
-                return;
-            }
-            Ok(ferrosa_sched::ScanOutcome::Overloaded) => ferrosa_common::Error::InvalidData(
-                "overloaded: scan admission queue full — retry".to_string(),
-            ),
-            // The producer panicked (or its task was torn down). Its sender
-            // dropped during unwind, so without this error the consumer would
-            // read the partitions delivered so far followed by a normal close:
-            // a truncated scan reported as complete.
-            Err(join) => {
-                tracing::error!(error = %join, "range scan producer panicked; failing the scan");
-                ferrosa_common::Error::InvalidData(format!(
-                    "range scan producer panicked; the scan is incomplete: {join}"
-                ))
-            }
-        };
-        // `send().await`, not `try_send`: the error queues behind partitions
-        // already buffered (it must not be lost to a full channel, which would
-        // end the stream cleanly), and this sender keeps the channel open until
-        // it lands. It fails only when the consumer is already gone.
-        let _ = tx.send(Err(failure)).await;
-    });
-}
-
-/// Hand `item` to a bounded range scan's consumer; `false` when the consumer
-/// is gone.
-///
-/// The send blocks while the consumer is not reading — a suspended PG portal,
-/// a client that stopped draining its socket — and that can last as long as
-/// the client likes. The producer holds one of the node's few pool slots, so a
-/// blocking send made while holding it lets one idle client stall every other
-/// scan on the node. Only a send that would block gives the slot up
-/// ([`ferrosa_sched::ScanSlot::park`]); one with room costs nothing extra.
-fn deliver(
-    slot: &mut ferrosa_sched::ScanSlot,
-    tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
-    item: Result<Partition>,
-) -> bool {
-    use tokio::sync::mpsc::error::TrySendError;
-    match tx.try_send(item) {
-        Ok(()) => true,
-        Err(TrySendError::Closed(_)) => false,
-        Err(TrySendError::Full(item)) => slot.park(|| tx.blocking_send(item).is_ok()),
-    }
-}
-
-/// [`deliver`] a scan failure. Designed fallback: a consumer that has already
-/// gone has nobody to tell, so the error is logged rather than delivered.
-fn deliver_error(
-    slot: &mut ferrosa_sched::ScanSlot,
-    tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
-    error: ferrosa_common::Error,
-) {
-    let message = error.to_string();
-    if !deliver(slot, tx, Err(error)) {
-        tracing::debug!(error = %message, "range scan failed after its consumer went away");
-    }
-}
-
 /// How one delivery attempt by a pausable producer ended.
 enum Delivery {
     Sent,
@@ -1867,16 +1776,22 @@ fn deliver_or_pause(
         Ok(()) => Delivery::Sent,
         Err(TrySendError::Closed(_)) => Delivery::Gone,
         Err(TrySendError::Full(item)) => {
-            // `wait` returns `None` at once: the slot is finished and stays
-            // released, and the producer must return without producing more.
-            let resumed = slot.park_or_release(|| None::<()>);
-            debug_assert!(
-                resumed.is_none(),
-                "a release that never waits never resumes"
-            );
+            // The slot (and I/O permit) go back now; the producer must return
+            // without producing more, and its ticket admits the next run.
+            slot.release();
             Delivery::Stalled(item)
         }
     }
+}
+
+/// A producer [`spawn_resumable_range_scan`] can run, stop and resume: one
+/// run produces until it finishes or must stop, and never waits.
+trait PausableScan: Send + 'static {
+    fn run(
+        &mut self,
+        slot: &mut ferrosa_sched::ScanSlot,
+        tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+    ) -> ScanRun;
 }
 
 /// How one run of a pausable range-scan producer ended.
@@ -1887,6 +1802,9 @@ enum ScanRun {
     /// The consumer stopped reading. The item it would not take is handed to
     /// the supervisor, which delivers it when there is room and then resumes.
     Paused(Result<Partition>),
+    /// A more deserving scan waited at a budget boundary; the slot is given
+    /// up and the supervisor re-admits the scan at once.
+    Yielded,
 }
 
 /// A [`crate::range_merger::RangeMerger`] that owns everything it borrows: the
@@ -1974,9 +1892,10 @@ impl<R: ReadAt + Send + Sync + 'static> OwnedMerger<R> {
     }
 }
 
-/// A whole-partition range scan that can stop mid-range and resume where it
-/// stopped. Between runs it holds its merger (see [`OwnedMerger`]) and costs
-/// no pool slot and no thread.
+/// A range scan that can stop mid-range and resume where it stopped. Between
+/// runs it holds its merger (see [`OwnedMerger`]) and costs no pool slot and
+/// no thread. It yields whole partitions, or `<= K`-row fragments of them
+/// (`fragment_rows`) for the intra-partition streaming variants.
 ///
 /// A resumed run continues the same merger, so the scan yields exactly what an
 /// unpaused scan would. A storage range scan is not a snapshot: a write made
@@ -1991,6 +1910,9 @@ struct RangeScan<F: FlushTarget> {
     /// The cell ordinals to decode, for the projected variant.
     wanted: Option<Vec<u16>>,
     partition_limit: Option<usize>,
+    /// `Some(K)`: yield `<= K`-row fragments (`next_fragment`) instead of whole
+    /// partitions. A fragment scan has no partition limit.
+    fragment_rows: Option<usize>,
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
     /// Opened by the first run, after admission (t_6d0553ee), and kept across
@@ -2024,9 +1946,14 @@ where
             self.end.clone(),
         )
     }
+}
 
-    /// Produce until the range ends, the consumer goes away, or the channel is
-    /// full.
+impl<F: FlushTarget> PausableScan for RangeScan<F>
+where
+    F: Send + Sync + 'static,
+{
+    /// Produce until the range ends, the consumer goes away, the channel is
+    /// full, or the scan is told to yield its slot. Never waits.
     fn run(
         &mut self,
         slot: &mut ferrosa_sched::ScanSlot,
@@ -2046,22 +1973,35 @@ where
             if self.emitted >= cap {
                 return ScanRun::Finished;
             }
-            let partition = match owned.merger.next_merged_partition() {
+            let next = match self.fragment_rows {
+                Some(k) => owned
+                    .merger
+                    .next_fragment(k)
+                    .map(|fragment| fragment.map(|f| f.into_partition())),
+                None => owned.merger.next_merged_partition(),
+            };
+            let partition = match next {
                 Ok(Some(partition)) => partition,
                 Ok(None) => return ScanRun::Finished,
                 Err(e) => return deliver_failure(slot, tx, e),
             };
             match deliver_or_pause(slot, tx, Ok(partition)) {
                 Delivery::Sent => {
-                    self.emitted += 1;
-                    // B1 T1.2: account the chunk and cooperatively yield the
-                    // pool slot every budget partitions.
-                    slot.tick();
+                    if self.fragment_rows.is_none() {
+                        self.emitted += 1;
+                    }
+                    // B1 T1.2: account the chunk; every budget chunks a more
+                    // deserving scan may take the slot, and then this run ends.
+                    if slot.tick() == ferrosa_sched::Tick::Yield {
+                        return ScanRun::Yielded;
+                    }
                 }
                 Delivery::Gone => return ScanRun::Finished,
                 Delivery::Stalled(item) => {
                     // Handed out by the supervisor once there is room.
-                    self.emitted += 1;
+                    if self.fragment_rows.is_none() {
+                        self.emitted += 1;
+                    }
                     return ScanRun::Paused(item);
                 }
             }
@@ -2072,7 +2012,7 @@ where
 /// Deliver a scan failure from a pausable producer. If the consumer is not
 /// reading, the error is held while paused and delivered by the supervisor,
 /// never dropped. A consumer that has gone has nobody to tell, so that case
-/// is logged (designed fallback, as in [`deliver_error`]).
+/// is logged (designed fallback).
 fn deliver_failure(
     slot: &mut ferrosa_sched::ScanSlot,
     tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
@@ -2101,40 +2041,46 @@ pub fn range_scan_resumes_total() -> u64 {
 /// Run a [`RangeScan`] through the bounded scheduler pool, pausing it while its
 /// consumer is not reading and resuming it when the consumer makes room.
 ///
-/// The supervisor is an async task: while the scan is paused it waits for room
-/// in the channel and holds no pool slot and no thread. Each run is a fresh
-/// admission, so the same properties [`spawn_bounded_range_scan`] gives hold
-/// for every run: cancellation while queued (the consumer dropped the stream)
-/// and fail-loud overload. A producer panic is delivered as an error, never as
-/// a short stream.
-fn spawn_resumable_range_scan<F>(
+/// The supervisor is an async task: while the scan is paused, or queued after
+/// yielding its slot, it holds no pool slot and no thread — the producer never
+/// waits on a thread for anything. The first run is a fresh admission and
+/// every later one is re-admitted with the scan's ticket (its place in the
+/// fair queue). Every admission keeps two properties: cancellation while
+/// queued (the consumer dropped the stream) and fail-loud overload. A producer
+/// panic is delivered as an error, never as a short stream.
+fn spawn_resumable_range_scan<S: PausableScan>(
     tx: tokio::sync::mpsc::Sender<Result<Partition>>,
-    scan: RangeScan<F>,
-) where
-    F: FlushTarget + Send + Sync + 'static,
-{
+    scan: S,
+) {
     tokio::spawn(async move {
         let mut scan = scan;
+        let mut ticket: Option<ferrosa_sched::ScanTicket> = None;
         loop {
             let cancel_probe = tx.clone();
+            let cancel = async move { cancel_probe.closed().await };
             let producer_tx = tx.clone();
-            let handle = ferrosa_sched::global_pool().submit_scan(
-                ferrosa_sched::SchedClass::Bulk,
-                ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
-                async move { cancel_probe.closed().await },
-                move |slot| match scan.run(slot, &producer_tx) {
-                    ScanRun::Paused(pending) => Some((scan, pending)),
+            let produce = move |slot: &mut ferrosa_sched::ScanSlot| {
+                let outcome = scan.run(slot, &producer_tx);
+                match outcome {
                     // Release the readers and memtable views here, on the
                     // producer's thread, as the scan ends — not whenever this
                     // supervisor task is next polled.
                     ScanRun::Finished => None,
-                },
-            );
-            let pending = match handle.await {
-                Ok(ferrosa_sched::ScanOutcome::Ran(Some((back, pending)))) => {
-                    scan = back;
-                    pending
+                    stopped => Some((scan, stopped, slot.take_ticket())),
                 }
+            };
+            let pool = ferrosa_sched::global_pool();
+            let handle = match ticket.take() {
+                None => pool.submit_scan(
+                    ferrosa_sched::SchedClass::Bulk,
+                    ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
+                    cancel,
+                    produce,
+                ),
+                Some(next) => pool.resubmit_scan(next, cancel, produce),
+            };
+            let (back, stopped, next_ticket) = match handle.await {
+                Ok(ferrosa_sched::ScanOutcome::Ran(Some(stopped))) => stopped,
                 Ok(ferrosa_sched::ScanOutcome::Ran(None))
                 | Ok(ferrosa_sched::ScanOutcome::Cancelled) => return,
                 Ok(ferrosa_sched::ScanOutcome::Overloaded) => {
@@ -2149,6 +2095,25 @@ fn spawn_resumable_range_scan<F>(
                     fail_range_scan(&tx, format!("range scan producer failed: {join_error}")).await;
                     return;
                 }
+            };
+            scan = back;
+            let Some(next_ticket) = next_ticket else {
+                // A run stops early only by giving its slot up, which always
+                // leaves a ticket. Without one the scan cannot continue; fail
+                // it rather than end the stream as if it were complete.
+                fail_range_scan(
+                    &tx,
+                    "range scan stopped without a resume ticket; the scan is incomplete"
+                        .to_string(),
+                )
+                .await;
+                return;
+            };
+            ticket = Some(next_ticket);
+            let pending = match stopped {
+                ScanRun::Yielded => continue,
+                ScanRun::Paused(pending) => pending,
+                ScanRun::Finished => unreachable!("a finished run returns None"),
             };
             // Paused: no slot, no thread. Wait for room, hand over the item the
             // consumer would not take, then resume after it.
@@ -6076,6 +6041,23 @@ impl<F: FlushTarget> TableStore<F> {
     where
         F: Send + Sync + 'static,
     {
+        self.range_scan_stream(wanted, partition_limit, None, start, end)
+    }
+
+    /// Every range-scan producer: a [`RangeScan`] on the bounded pool, whole
+    /// partitions or (`fragment_rows`) `<= K`-row fragments, that pauses — no
+    /// slot, no thread — while its consumer is not reading.
+    fn range_scan_stream(
+        &self,
+        wanted: Option<Vec<u16>>,
+        partition_limit: Option<usize>,
+        fragment_rows: Option<usize>,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    where
+        F: Send + Sync + 'static,
+    {
         // Buffer is intentionally small. Per-partition body decode on cold
         // cache is the dominant cost (wide rows + embedding cells + dedup
         // across multiple SSTable runs sharing a key). A larger buffer turns a
@@ -6103,6 +6085,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_target: self.flush_target.clone(),
             wanted,
             partition_limit,
+            fragment_rows,
             start: start.cloned(),
             end: end.cloned(),
             merger: None,
@@ -6159,97 +6142,13 @@ impl<F: FlushTarget> TableStore<F> {
     where
         F: Send + Sync + 'static,
     {
-        const STREAM_BUFFER: usize = 4;
-        let view = self.view.load_full();
-        let schema = self.schema.load_full();
-        let start_owned = start.cloned();
-        let end_owned = end.cloned();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
-
-        // Capture the pooled-reader inputs so the producer opens its SSTable
-        // readers AFTER admission (t_6d0553ee): a cancelled or overloaded scan
-        // then never opens readers. `flush_target` is Arc-wrapped so a cheap
-        // clone moves into the 'static closure.
-        let reader_pool = self.reader_pool.clone();
-        let pool_table_key = self.pool_table_key.clone();
-        let flush_target = self.flush_target.clone();
-
-        // t_88223ad0: route the scan producer through the bounded scheduler pool
-        // (cores - reserved) instead of the unbounded blocking pool, so a broad
-        // scan cannot oversubscribe the cores and starve raft heartbeats.
-        // Every scan through the bounded pool is an unbounded full-table range
-        // scan (`ScanPlan::FullScan`-class work) — see ScanPlan::sched_class. The
-        // fair scheduler weights it as Bulk so it cedes to any Foreground work
-        // sharing the pool (interactive scans today bypass; B3 folds in
-        // compaction/repair, which this weighting then arbitrates).
-        spawn_bounded_range_scan(tx.clone(), move |slot| {
-            // Open the overlapping SSTable readers now that a slot is held —
-            // gated by admission, not before it.
-            let sst_readers = match open_pooled_readers(
-                &reader_pool,
-                &pool_table_key,
-                &*flush_target,
-                &view.sstables,
-                start_owned.as_ref(),
-                end_owned.as_ref(),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    deliver_error(slot, &tx, e);
-                    return;
-                }
-            };
-            let column_mappings = sstable_column_mappings(&schema, &sst_readers);
-            let active_iter = view
-                .active
-                .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iters: Vec<_> = view
-                .flushing
-                .iter()
-                .map(|sealed| {
-                    sealed
-                        .memtable
-                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
-                })
-                .collect();
-            let sstables_slice = &sst_readers[..];
-
-            let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
-                active_iter,
-                flushing_iters,
-                sstables_slice,
-                &column_mappings,
-                start_owned,
-                end_owned,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    deliver_error(slot, &tx, e);
-                    return;
-                }
-            };
-
-            let k = crate::range_merger::rows_per_fragment();
-            loop {
-                match merger.next_fragment(k) {
-                    Ok(Some(fragment)) => {
-                        if !deliver(slot, &tx, Ok(fragment.into_partition())) {
-                            return;
-                        }
-                        slot.tick(); // B1 T1.2 cooperative yield
-                    }
-                    Ok(None) => return,
-                    Err(e) => {
-                        deliver_error(slot, &tx, e);
-                        return;
-                    }
-                }
-            }
-        });
-
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }))
+        self.range_scan_stream(
+            None,
+            None,
+            Some(crate::range_merger::rows_per_fragment()),
+            start,
+            end,
+        )
     }
 
     /// Projection-aware intra-partition streaming variant of
@@ -6265,99 +6164,13 @@ impl<F: FlushTarget> TableStore<F> {
     where
         F: Send + Sync + 'static,
     {
-        const STREAM_BUFFER: usize = 4;
-        let view = self.view.load_full();
-        let schema = self.schema.load_full();
-        let start_owned = start.cloned();
-        let end_owned = end.cloned();
-        let wanted_owned = wanted;
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
-
-        // Capture the pooled-reader inputs so the producer opens its SSTable
-        // readers AFTER admission (t_6d0553ee): a cancelled or overloaded scan
-        // then never opens readers. `flush_target` is Arc-wrapped so a cheap
-        // clone moves into the 'static closure.
-        let reader_pool = self.reader_pool.clone();
-        let pool_table_key = self.pool_table_key.clone();
-        let flush_target = self.flush_target.clone();
-
-        // t_88223ad0: route the scan producer through the bounded scheduler pool
-        // (cores - reserved) instead of the unbounded blocking pool, so a broad
-        // scan cannot oversubscribe the cores and starve raft heartbeats.
-        // Every scan through the bounded pool is an unbounded full-table range
-        // scan (`ScanPlan::FullScan`-class work) — see ScanPlan::sched_class. The
-        // fair scheduler weights it as Bulk so it cedes to any Foreground work
-        // sharing the pool (interactive scans today bypass; B3 folds in
-        // compaction/repair, which this weighting then arbitrates).
-        spawn_bounded_range_scan(tx.clone(), move |slot| {
-            // Open the overlapping SSTable readers now that a slot is held —
-            // gated by admission, not before it.
-            let sst_readers = match open_pooled_readers(
-                &reader_pool,
-                &pool_table_key,
-                &*flush_target,
-                &view.sstables,
-                start_owned.as_ref(),
-                end_owned.as_ref(),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    deliver_error(slot, &tx, e);
-                    return;
-                }
-            };
-            let column_mappings = sstable_column_mappings(&schema, &sst_readers);
-            let active_iter = view
-                .active
-                .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iters: Vec<_> = view
-                .flushing
-                .iter()
-                .map(|sealed| {
-                    sealed
-                        .memtable
-                        .range_iter(start_owned.as_ref(), end_owned.as_ref())
-                })
-                .collect();
-            let sstables_slice = &sst_readers[..];
-
-            let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
-                active_iter,
-                flushing_iters,
-                sstables_slice,
-                &column_mappings,
-                &wanted_owned,
-                start_owned,
-                end_owned,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    deliver_error(slot, &tx, e);
-                    return;
-                }
-            };
-
-            let k = crate::range_merger::rows_per_fragment();
-            loop {
-                match merger.next_fragment(k) {
-                    Ok(Some(fragment)) => {
-                        if !deliver(slot, &tx, Ok(fragment.into_partition())) {
-                            return;
-                        }
-                        slot.tick(); // B1 T1.2 cooperative yield
-                    }
-                    Ok(None) => return,
-                    Err(e) => {
-                        deliver_error(slot, &tx, e);
-                        return;
-                    }
-                }
-            }
-        });
-
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }))
+        self.range_scan_stream(
+            Some(wanted),
+            None,
+            Some(crate::range_merger::rows_per_fragment()),
+            start,
+            end,
+        )
     }
 
     /// Read all partitions whose tokens fall in `[start_token, end_token)`,
@@ -12028,19 +11841,25 @@ mod tests {
     /// by a normal close: a truncated scan that reads as complete.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_panicking_scan_producer_ends_the_stream_with_an_error() {
+        /// Fills the channel, then panics mid-scan.
+        struct PanicsMidScan;
+        impl super::PausableScan for PanicsMidScan {
+            fn run(
+                &mut self,
+                _slot: &mut ferrosa_sched::ScanSlot,
+                tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+            ) -> super::ScanRun {
+                for i in 0..4 {
+                    tx.try_send(Ok(make_partition(&format!("before-panic-{i}"), b"v", 1)))
+                        .expect("the channel has room for four");
+                }
+                panic!("simulated producer bug mid-scan");
+            }
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Partition>>(4);
-        let producer_tx = tx.clone();
-        drop(tx);
         // Fill the channel to capacity before panicking, so the error has to
         // wait behind buffered partitions rather than find a free slot.
-        super::spawn_bounded_range_scan(producer_tx.clone(), move |_slot| {
-            for i in 0..4 {
-                producer_tx
-                    .blocking_send(Ok(make_partition(&format!("before-panic-{i}"), b"v", 1)))
-                    .expect("consumer is alive");
-            }
-            panic!("simulated producer bug mid-scan");
-        });
+        super::spawn_resumable_range_scan(tx, PanicsMidScan);
         // Let the panic land while the buffer is still full.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         for _ in 0..4 {
