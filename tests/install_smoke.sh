@@ -264,24 +264,45 @@ tenant_id = "$MEM_TENANT"
 EOF
 }
 
+# How long ferrosa-memory may take to answer /healthz/ready. On first connect
+# it migrates the whole agent_memory schema (dozens of tables, ~200-550 ms of
+# work each), and on a cold, loaded CI runner that has run to ~200 s. It is
+# therefore sized on the WALL CLOCK with headroom, not a fixed tick count: a
+# 90x1 s loop reported a healthy-but-migrating server as "never became ready"
+# while it was still creating tables. Overridable for local iteration.
+MEM_READY_TIMEOUT="${MEM_READY_TIMEOUT:-300}"
+
 start_memory() {
   : > "$LOGDIR/memory.log"
   HOME="$HOME_DIR" FERROSA_MEMORY_CONFIG="$INSTALL/config/ferrosa-memory.toml" \
     "$INSTALL/bin/ferrosa-memory-mcp" >> "$LOGDIR/memory.log" 2>&1 &
   MEMORY_PID=$!
   # Readiness = connected to ferrosa (CQL) AND agent_memory keyspace migrated.
-  local i=0
-  while [ "$i" -lt 90 ]; do
-    if [ "$(curl -fsS "http://127.0.0.1:$MEM_PORT/healthz/ready" 2>/dev/null)" = "ready" ]; then
+  # The probe is bounded (-m 2) so one hung connect cannot consume the whole
+  # budget, and the deadline is wall-clock so a slow cold migration is waited
+  # out rather than mistaken for a failure.
+  local deadline=$(( SECONDS + MEM_READY_TIMEOUT )) last=""
+  while (( SECONDS < deadline )); do
+    # No -f: keep a non-2xx body so the timeout diagnostic can show it.
+    last="$(curl -sS -m 2 "http://127.0.0.1:$MEM_PORT/healthz/ready" 2>/dev/null || true)"
+    if [ "$last" = "ready" ]; then
       ok "ferrosa-memory /healthz/ready=ready (connected to ferrosa, agent_memory keyspace ready)"
       return 0
     fi
     kill -0 "$MEMORY_PID" 2>/dev/null \
       || { cat "$LOGDIR/memory.log" >&2; fail "ferrosa-memory-mcp exited during startup"; }
-    sleep 1; i=$((i+1))
+    sleep 1
   done
-  cat "$LOGDIR/memory.log" >&2
-  fail "ferrosa-memory never became ready on :$MEM_PORT (could not connect to ferrosa?)"
+  # The server is alive but not ready. Surface WHY rather than guessing: the
+  # last readiness body and the tail of its log name the failing migration, so
+  # a genuine regression is not mislabelled as a ferrosa connection problem.
+  {
+    echo "--- last /healthz/ready body ---"
+    printf '%s\n' "${last:-<no response body>}"
+    echo "--- last ferrosa-memory log ---"
+    tail -40 "$LOGDIR/memory.log"
+  } >&2
+  fail "ferrosa-memory never became ready on :$MEM_PORT within ${MEM_READY_TIMEOUT}s (server is alive; see the readiness body and log above — this is NOT necessarily a ferrosa connection failure)"
 }
 
 stop_memory() {
