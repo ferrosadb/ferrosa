@@ -862,6 +862,13 @@ impl ModeController {
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
     pub(super) fn transition_to_cluster(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        // A node whose cluster was dissolved into a pair never runs Raft again
+        // (t_47bbeb66): rebuilding it from the persisted log would rejoin the
+        // old group beside the pair.
+        if let Some(reason) = self.raft_start_refusal() {
+            tracing::error!(%reason, "refusing to start Raft");
+            return;
+        }
         // `peers` are internode addresses as tracked in `connected_peers`: the
         // address dialled for an outbound peer, the resolved advertised
         // address for an inbound one. They used to be rewritten to each

@@ -156,6 +156,13 @@ pub enum MsgType {
     PairBatchForward = 0x48,
     /// Acknowledgment for a PairBatchForward.
     PairBatchAck = 0x49,
+    /// Operator downgrade, phase 1: ask the named peer to durably record that
+    /// the cluster dissolved into a pair with the sender and stop its Raft
+    /// group. Sent only to a peer advertising
+    /// [`crate::handshake::CAP_PAIR_DISSOLVE`].
+    PairDissolve = 0x4A,
+    /// Reply to [`MsgType::PairDissolve`]: done, or a named refusal.
+    PairDissolveAck = 0x4B,
     // Batchlog
     BatchlogWrite = 0x50,
     BatchlogDelete = 0x51,
@@ -306,6 +313,8 @@ impl TryFrom<u8> for MsgType {
             0x47 => Ok(Self::PairDdlAck),
             0x48 => Ok(Self::PairBatchForward),
             0x49 => Ok(Self::PairBatchAck),
+            0x4A => Ok(Self::PairDissolve),
+            0x4B => Ok(Self::PairDissolveAck),
             0x50 => Ok(Self::BatchlogWrite),
             0x51 => Ok(Self::BatchlogDelete),
             0x52 => Ok(Self::BatchlogReplay),

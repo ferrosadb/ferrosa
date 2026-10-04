@@ -1578,7 +1578,9 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::PairDdlForward
             | MsgType::PairDdlAck
             | MsgType::PairBatchForward
-            | MsgType::PairBatchAck,
+            | MsgType::PairBatchAck
+            | MsgType::PairDissolve
+            | MsgType::PairDissolveAck,
         ) => MessageFamily::Pair,
         Ok(MsgType::BatchlogWrite | MsgType::BatchlogDelete | MsgType::BatchlogReplay) => {
             MessageFamily::Batchlog
