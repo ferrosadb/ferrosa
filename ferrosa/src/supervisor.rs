@@ -884,17 +884,37 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
         };
         let due =
             (waited.as_nanos() / health.stall_deadline.as_nanos()).min(u128::from(u64::MAX)) as u64;
+        let first_new = self.stalls_recorded + 1;
         let newly_due = due.saturating_sub(self.stalls_recorded);
         self.stalls_recorded = due.max(self.stalls_recorded);
-        for _ in 0..newly_due.min(u64::from(self.intensity.max_restarts) + 1) {
-            self.record_crash(
-                FailureKind::Stall,
-                format!(
-                    "no commit-log fsync for {}ms, past the {}ms stall deadline ({detail})",
-                    waited.as_millis(),
-                    health.stall_deadline.as_millis()
-                ),
-            );
+        let detail = format!(
+            "no commit-log fsync for {}ms, past the {}ms stall deadline ({detail})",
+            waited.as_millis(),
+            health.stall_deadline.as_millis()
+        );
+        for deadline in
+            (first_new..).take(newly_due.min(u64::from(self.intensity.max_restarts) + 2) as usize)
+        {
+            if deadline == 1 {
+                // The first deadline of an episode: writes are refused and the
+                // node is not ready, but a slow disk is not a dead thread, so
+                // an episode that ends in a completed fsync never counts toward
+                // the restart intensity. Only a stall that outlives further
+                // deadlines (an fsync that does not return) does.
+                if self
+                    .status
+                    .record_failure(Child::CommitLogSync, FailureKind::Stall, &detail)
+                {
+                    tracing::error!(
+                        task = Child::CommitLogSync.label(),
+                        %detail,
+                        "commit-log fsync stalled; writes are refused and the node reports not \
+                         ready until an fsync completes"
+                    );
+                }
+            } else {
+                self.record_crash(FailureKind::Stall, detail.clone());
+            }
         }
     }
 

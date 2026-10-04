@@ -37,9 +37,10 @@
 //! # Below the executor
 //!
 //! A storage scan the cursor reads from is fed by a producer on the scan pool.
-//! When the cursor is not pulled, that producer gives back its pool slot at
-//! once and, after a short grace, its thread too, and resumes from its cursor
-//! key when rows are wanted again (`ferrosa-storage`, FMEA PG-Tf348ba0b).
+//! When the cursor is not pulled, that producer gives back its pool slot and
+//! its thread at once (it never waits for room on a blocking thread, which
+//! the executor here needs), and resumes from its position when rows are
+//! wanted again (`ferrosa-storage`, FMEA PG-Tf348ba0b).
 
 use std::collections::VecDeque;
 use std::io;

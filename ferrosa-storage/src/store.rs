@@ -1832,56 +1832,50 @@ fn deliver_error(
     }
 }
 
-/// How long a whole-partition range scan waits for a consumer that stopped
-/// reading, its pool slot already given back, before it pauses and gives back
-/// its thread as well. A resume costs only a re-admission (the merger keeps
-/// its position), so this is short: it absorbs a consumer that is momentarily
-/// behind, and bounds how long a blocking thread is spent on one that is not.
-/// Many slow consumers each holding a thread through a long grace starve the
-/// bounded blocking pool the same way parked ones do.
-pub(crate) const RANGE_SCAN_PAUSE_GRACE: std::time::Duration = std::time::Duration::from_millis(10);
-
 /// How one delivery attempt by a pausable producer ended.
 enum Delivery {
     Sent,
     /// The consumer dropped the stream.
     Gone,
-    /// The consumer took nothing within the grace. The item comes back so the
-    /// scan can pause holding it.
+    /// The channel was full. The item comes back so the scan can pause
+    /// holding it.
     Stalled(Result<Partition>),
 }
 
-/// Hand `item` to the consumer. When the channel is full, wait up to `grace`
-/// for room with the pool slot and I/O permit released; past the grace, give
-/// up the slot for good and return the item ([`Delivery::Stalled`]), so the
-/// producer can pause and return its thread.
+/// Hand `item` to the consumer. When the channel is full, give up the pool
+/// slot and I/O permit for good and return the item ([`Delivery::Stalled`]),
+/// so the producer pauses and returns its thread; the async supervisor waits
+/// for room.
+///
+/// There is deliberately no wait here, not even a short one. The producer
+/// runs on a blocking thread, and its consumer often needs a blocking thread
+/// from the same bounded pool to make room (the PG executor pulls rows with
+/// `blocking_recv` on `spawn_blocking`). A producer that waits for room on
+/// its thread holds what its consumer needs: an earlier 10 ms grace wait put
+/// all four threads of the PG listener's blocking pool into such waits beside
+/// eight slow readers, every wait ran out, and another session's `SELECT`
+/// took 9 s instead of 0.1 s (20 s+ on a 4-vCPU CI runner). A resume costs
+/// one re-admission (the merger keeps its position), so pausing at once is
+/// cheap.
 fn deliver_or_pause(
     slot: &mut ferrosa_sched::ScanSlot,
     tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
     item: Result<Partition>,
-    grace: std::time::Duration,
 ) -> Delivery {
     use tokio::sync::mpsc::error::TrySendError;
-    let item = match tx.try_send(item) {
-        Ok(()) => return Delivery::Sent,
-        Err(TrySendError::Closed(_)) => return Delivery::Gone,
-        Err(TrySendError::Full(item)) => item,
-    };
-    // A producer runs on a blocking thread inside the runtime, so it has a
-    // handle, and blocking on it here is allowed.
-    let handle = tokio::runtime::Handle::current();
-    let room = slot.park_or_release(|| {
-        handle
-            .block_on(tokio::time::timeout(grace, tx.reserve()))
-            .ok()
-    });
-    match room {
-        Some(Ok(permit)) => {
-            permit.send(item);
-            Delivery::Sent
+    match tx.try_send(item) {
+        Ok(()) => Delivery::Sent,
+        Err(TrySendError::Closed(_)) => Delivery::Gone,
+        Err(TrySendError::Full(item)) => {
+            // `wait` returns `None` at once: the slot is finished and stays
+            // released, and the producer must return without producing more.
+            let resumed = slot.park_or_release(|| None::<()>);
+            debug_assert!(
+                resumed.is_none(),
+                "a release that never waits never resumes"
+            );
+            Delivery::Stalled(item)
         }
-        Some(Err(_closed)) => Delivery::Gone,
-        None => Delivery::Stalled(item),
     }
 }
 
@@ -1999,7 +1993,6 @@ struct RangeScan<F: FlushTarget> {
     partition_limit: Option<usize>,
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
-    grace: std::time::Duration,
     /// Opened by the first run, after admission (t_6d0553ee), and kept across
     /// pauses: the scan's position, and its SSTable readers, so compaction
     /// cannot pull an input out from under a paused scan.
@@ -2032,8 +2025,8 @@ where
         )
     }
 
-    /// Produce until the range ends, the consumer goes away, or the consumer
-    /// stalls past the grace.
+    /// Produce until the range ends, the consumer goes away, or the channel is
+    /// full.
     fn run(
         &mut self,
         slot: &mut ferrosa_sched::ScanSlot,
@@ -2042,10 +2035,9 @@ where
         if self.merger.is_none() {
             match self.open_merger() {
                 Ok(merger) => self.merger = Some(merger),
-                Err(e) => return deliver_failure(slot, tx, e, self.grace),
+                Err(e) => return deliver_failure(slot, tx, e),
             }
         }
-        let grace = self.grace;
         let cap = self.partition_limit.unwrap_or(usize::MAX);
         let Some(owned) = self.merger.as_mut() else {
             unreachable!("the merger is opened above");
@@ -2057,9 +2049,9 @@ where
             let partition = match owned.merger.next_merged_partition() {
                 Ok(Some(partition)) => partition,
                 Ok(None) => return ScanRun::Finished,
-                Err(e) => return deliver_failure(slot, tx, e, grace),
+                Err(e) => return deliver_failure(slot, tx, e),
             };
-            match deliver_or_pause(slot, tx, Ok(partition), grace) {
+            match deliver_or_pause(slot, tx, Ok(partition)) {
                 Delivery::Sent => {
                     self.emitted += 1;
                     // B1 T1.2: account the chunk and cooperatively yield the
@@ -2085,10 +2077,9 @@ fn deliver_failure(
     slot: &mut ferrosa_sched::ScanSlot,
     tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
     error: ferrosa_common::Error,
-    grace: std::time::Duration,
 ) -> ScanRun {
     let message = error.to_string();
-    match deliver_or_pause(slot, tx, Err(error), grace) {
+    match deliver_or_pause(slot, tx, Err(error)) {
         Delivery::Sent => ScanRun::Finished,
         Delivery::Gone => {
             tracing::debug!(error = %message, "range scan failed after its consumer went away");
@@ -6069,13 +6060,7 @@ impl<F: FlushTarget> TableStore<F> {
     where
         F: Send + Sync + 'static,
     {
-        self.whole_partition_range_scan(
-            Some(wanted),
-            partition_limit,
-            start,
-            end,
-            RANGE_SCAN_PAUSE_GRACE,
-        )
+        self.whole_partition_range_scan(Some(wanted), partition_limit, start, end)
     }
 
     /// The producer behind [`Self::range_iter`] and
@@ -6087,7 +6072,6 @@ impl<F: FlushTarget> TableStore<F> {
         partition_limit: Option<usize>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-        grace: std::time::Duration,
     ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
     where
         F: Send + Sync + 'static,
@@ -6121,7 +6105,6 @@ impl<F: FlushTarget> TableStore<F> {
             partition_limit,
             start: start.cloned(),
             end: end.cloned(),
-            grace,
             merger: None,
             emitted: 0,
         };
@@ -6150,7 +6133,7 @@ impl<F: FlushTarget> TableStore<F> {
     where
         F: Send + Sync + 'static,
     {
-        self.whole_partition_range_scan(None, None, start, end, RANGE_SCAN_PAUSE_GRACE)
+        self.whole_partition_range_scan(None, None, start, end)
     }
 
     /// Intra-partition streaming variant of [`Self::range_iter`]. A single
@@ -18503,9 +18486,8 @@ mod tests {
 
         let releases = ferrosa_sched::scan_releases_total();
         let resumes = range_scan_resumes_total();
-        // Grace zero: every time the 4-item channel fills, the producer pauses.
-        let paused =
-            store.whole_partition_range_scan(None, None, None, None, std::time::Duration::ZERO);
+        // Every time the 4-item channel fills, the producer pauses.
+        let paused = store.whole_partition_range_scan(None, None, None, None);
         let keys = drain_slowly(
             paused,
             std::time::Duration::from_millis(1),
@@ -18542,13 +18524,7 @@ mod tests {
             }
             keys
         };
-        let paused = store.whole_partition_range_scan(
-            Some(vec![0]),
-            Some(50),
-            None,
-            None,
-            std::time::Duration::ZERO,
-        );
+        let paused = store.whole_partition_range_scan(Some(vec![0]), Some(50), None, None);
         let keys = drain_slowly(paused, std::time::Duration::from_millis(1), 100, |_| {}).await;
         assert_eq!(keys, reference[..50].to_vec());
     }
@@ -18564,8 +18540,7 @@ mod tests {
         let original: std::collections::BTreeSet<DecoratedKey> =
             (0..N).map(|i| make_key(&format!("k{i:05}"))).collect();
         let writer = std::sync::Arc::clone(&store);
-        let paused =
-            store.whole_partition_range_scan(None, None, None, None, std::time::Duration::ZERO);
+        let paused = store.whole_partition_range_scan(None, None, None, None);
         // Bounded well above every key that can exist (originals plus one new
         // key per item read), so a scan that repeats itself stops and fails.
         let keys = drain_slowly(

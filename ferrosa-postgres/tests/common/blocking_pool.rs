@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 /// The server runtime's blocking pool, as in production but small.
 pub const MAX_BLOCKING: usize = 4;
 
-/// How long a released query may take to give its threads back. Covers the
-/// storage producer's short grace wait before it pauses.
+/// How long a released query may take to give its threads back.
 pub const SETTLE: Duration = Duration::from_secs(10);
 
 /// How many of the runtime's [`MAX_BLOCKING`] blocking threads are free.

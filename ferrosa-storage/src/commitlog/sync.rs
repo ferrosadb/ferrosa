@@ -1192,7 +1192,6 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::AtomicUsize;
-    use std::time::Instant;
 
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
@@ -1257,23 +1256,52 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (segment, offset) = write_mutation(dir.path());
 
-        // Create a flush callback that does nothing (we just want to test
-        // that on_write returns immediately).
-        let flush_cb: FlushCallback = Arc::new(|| Ok(()));
-        let sync = PeriodicSync::new(Duration::from_secs(60), flush_cb);
+        // Hold an fsync in progress: the flush callback reports that it was
+        // entered and then blocks until the test releases it. A write must
+        // return while that fsync is still running. (This used to time
+        // on_write against a 1 ms wall-clock bound, which measured the OS
+        // scheduler on a loaded runner, not whether on_write waits.)
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        let flush_cb: FlushCallback = Arc::new(move || {
+            if let Some(tx) = entered_tx.lock().take() {
+                tx.send(()).expect("test is waiting for the fsync to start");
+                release_rx
+                    .lock()
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("test releases the held fsync");
+            }
+            Ok(())
+        });
+        let sync = PeriodicSync::new(Duration::from_millis(5), flush_cb);
         sync.start().expect("start the sync thread");
 
-        let start = Instant::now();
         sync.on_write(&segment, offset, 128, AckPolicy::Durable)
-            .expect("a healthy sync strategy acknowledges the write");
-        let elapsed = start.elapsed();
+            .expect("first write");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the sync thread starts an fsync for the first write");
 
-        // on_write should return in under 1ms (it does nothing).
-        assert!(
-            elapsed < Duration::from_millis(1),
-            "periodic on_write should return immediately, took {:?}",
-            elapsed
-        );
+        // The fsync is now held. A second write must come back regardless.
+        let sync = Arc::new(sync);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let sync = Arc::clone(&sync);
+            let segment = segment.clone();
+            std::thread::spawn(move || {
+                done_tx
+                    .send(sync.on_write(&segment, offset, 128, AckPolicy::Durable))
+                    .expect("test waits for the write");
+            })
+        };
+        let returned = done_rx.recv_timeout(Duration::from_secs(10));
+        release_tx.send(()).expect("release the held fsync");
+        writer.join().expect("writer thread");
+        returned
+            .expect("periodic on_write returned while an fsync was in progress")
+            .expect("a healthy sync strategy acknowledges the write");
 
         sync.stop();
     }
