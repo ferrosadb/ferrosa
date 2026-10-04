@@ -397,6 +397,9 @@ fn healthy_sync() -> SyncHealthSnapshot {
         unsynced_for: None,
         stall_deadline: Duration::from_secs(2),
         last_failure: None,
+        attempts_started: 0,
+        attempts_completed: 0,
+        attempt_elapsed: None,
     }
 }
 
@@ -593,6 +596,89 @@ fn a_stalled_commit_log_sync_counts_one_stall_per_deadline_and_escalates() {
     assert!(
         !status.impaired().is_empty(),
         "an escalated child stays impaired"
+    );
+}
+
+#[test]
+fn a_stall_with_no_fsync_in_flight_is_logged_and_counted_as_the_thread() {
+    let target = FakeSync::new();
+    let (mut supervisor, status, _escalations) = sync_supervisor(target.clone(), 2);
+    // No attempt started, none completed, nothing in flight: the thread did
+    // not run. started == completed == 0.
+    target.set(|h| {
+        h.unsynced_for = Some(Duration::from_millis(2500));
+        h.attempts_started = 0;
+        h.attempts_completed = 0;
+        h.attempt_elapsed = None;
+    });
+    supervisor.check();
+
+    let detail = &status.impaired()[0].1;
+    assert!(
+        detail.contains("cause=no-fsync-attempted"),
+        "the log line must name the thread, not the disk: {detail}"
+    );
+    assert_eq!(
+        status.sync_stall_causes(ferrosa_storage::commitlog::StallCause::NoAttemptIssued),
+        1,
+        "the stall is counted under its cause"
+    );
+    assert_eq!(
+        status.sync_stall_causes(ferrosa_storage::commitlog::StallCause::DeviceSlow),
+        0
+    );
+    let rendered = metrics(&status);
+    assert!(
+        rendered.contains("ferrosa_commitlog_sync_stalls_total{cause=\"no_attempt_issued\"} 1"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn a_stall_with_an_fsync_in_flight_is_logged_and_counted_as_the_device() {
+    let target = FakeSync::new();
+    let (mut supervisor, status, _escalations) = sync_supervisor(target.clone(), 2);
+    target.set(|h| {
+        h.unsynced_for = Some(Duration::from_millis(2500));
+        h.attempts_started = 1;
+        h.attempts_completed = 0;
+        h.attempt_elapsed = Some(Duration::from_millis(2400));
+    });
+    supervisor.check();
+
+    let detail = &status.impaired()[0].1;
+    assert!(
+        detail.contains("cause=device-slow"),
+        "an fsync in flight the whole time is the device, not the thread: {detail}"
+    );
+    assert_eq!(
+        status.sync_stall_causes(ferrosa_storage::commitlog::StallCause::DeviceSlow),
+        1
+    );
+    assert_eq!(
+        status.sync_stall_causes(ferrosa_storage::commitlog::StallCause::NoAttemptIssued),
+        0
+    );
+}
+
+#[test]
+fn the_stall_cause_is_counted_once_per_episode_not_once_per_deadline() {
+    let target = FakeSync::new();
+    let (mut supervisor, status, _escalations) = sync_supervisor(target.clone(), 2);
+    target.set(|h| {
+        h.unsynced_for = Some(Duration::from_millis(2500));
+        h.attempt_elapsed = None;
+    });
+    supervisor.check();
+    // The same unbroken stall, three deadlines later: still one episode and
+    // one cause, even though further deadlines are counted as crashes.
+    target.set(|h| h.unsynced_for = Some(Duration::from_millis(8100)));
+    supervisor.check();
+
+    assert_eq!(
+        status.sync_stall_causes(ferrosa_storage::commitlog::StallCause::NoAttemptIssued),
+        1,
+        "the cause is a property of the episode, not of each deadline"
     );
 }
 
