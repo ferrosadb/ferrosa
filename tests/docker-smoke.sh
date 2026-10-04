@@ -313,6 +313,75 @@ cluster_status() {
     curl -s "http://localhost:${port}/api/cluster/status"
 }
 
+# Helper: run one CQL statement and FAIL the run if it errors. The bare
+# cql1/cql2/cql3 helpers discard the exit status, so a refused write or DDL
+# used to be followed by an unconditional `pass`.
+cql_ok() {
+    local port=$1 stmt=$2 description=$3
+    local out
+    if ! out=$(cqlsh --request-timeout=10 localhost "$port" -e "$stmt" 2>&1); then
+        fail "$description: $out"
+    fi
+}
+
+# Helper: the schema version a node holds, from its own membership snapshot.
+# Pair DDL stamps the primary's version on the secondary, and pair catch-up
+# acknowledges only after adopting it, so equal versions mean equal schemas.
+schema_version_of() {
+    local port=$1
+    curl --connect-timeout 2 --max-time 2 -sf "http://localhost:${port}/admin/membership-snapshot" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('schema_version',''))" 2>/dev/null
+}
+
+wait_for_schema_agreement() {
+    local port_a=$1 port_b=$2 description=$3 timeout=${4:-30}
+    local deadline=$((SECONDS + timeout)) va="" vb=""
+    while (( SECONDS < deadline )); do
+        va=$(schema_version_of "$port_a")
+        vb=$(schema_version_of "$port_b")
+        if [ -n "$va" ] && [ "$va" = "$vb" ]; then
+            pass "$description (schema version $va)"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "$description: schema versions differ after ${timeout}s (port $port_a='$va', port $port_b='$vb')"
+}
+
+# Helper: wait until `SELECT COUNT(*) FROM <table>` via <port> reaches at least
+# <expected>, at consistency <cl> (default ONE); FAIL with the last count.
+wait_for_row_count() {
+    local port=$1 table=$2 expected=$3 description=$4 timeout=${5:-30} cl=${6:-ONE}
+    local deadline=$((SECONDS + timeout)) count=0
+    while (( SECONDS < deadline )); do
+        count=$(cqlsh --request-timeout=10 localhost "$port" \
+            -e "CONSISTENCY ${cl}; SELECT COUNT(*) FROM ${table};" 2>/dev/null \
+            | grep -Eo '^ *[0-9]+ *$' | tr -d ' ' | tail -1)
+        count=${count:-0}
+        if [ "$count" -ge "$expected" ]; then
+            pass "$description: $count rows (>= $expected)"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "$description: $count rows after ${timeout}s (expected >= $expected)"
+}
+
+# Helper: wait for a node to report cluster mode.
+wait_for_cluster_mode() {
+    local port=$1 name=$2 timeout=${3:-60}
+    local deadline=$((SECONDS + timeout)) last=""
+    while (( SECONDS < deadline )); do
+        last=$(cluster_status "$port" 2>/dev/null || true)
+        if grep -q '"mode":"cluster"' <<<"$last"; then
+            pass "$name in cluster mode"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "$name did not reach cluster mode in ${timeout}s; last status: $last"
+}
+
 if $RUN_PAIR; then
 
 # ============================================================
@@ -344,35 +413,29 @@ sleep 5
 
 # Create schema on node1 only — DDL replication should propagate to node2
 info "Creating keyspace and table on node1..."
-cql1 "CREATE KEYSPACE smoke_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"
-cql1 "CREATE TABLE smoke_test.kv (k text PRIMARY KEY, v text)"
+cql_ok 9042 "CREATE KEYSPACE smoke_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}" \
+    "CREATE KEYSPACE on node1"
+cql_ok 9042 "CREATE TABLE smoke_test.kv (k text PRIMARY KEY, v text)" "CREATE TABLE on node1"
 pass "Schema created on node1"
 
-# Verify schema replicated to node2 via DDL forwarding
-# CQL is rejected on pair-mode secondaries, so verify via the REST API
-# (which is always available) instead of cqlsh.
+# Verify schema replicated to node2. A pair secondary rejects CQL, so compare
+# the schema version each node reports for itself: pair DDL stamps the
+# primary's version on the secondary when it applies the replicated change.
+# (This used to curl /api/schema/keyspaces, a route that does not exist, so
+# the check could never pass and was demoted to INFO.)
 info "Verifying schema replicated to node2..."
-sleep 2
-if curl -sf http://localhost:9091/api/schema/keyspaces 2>/dev/null | grep -q "smoke_test"; then
-    pass "Schema replicated to node2 via DDL forwarding"
-else
-    info "Schema replication not verified via API (may arrive after pair sync)"
-fi
+wait_for_schema_agreement 9090 9091 "Schema replicated to node2 via pair DDL"
 
 # Test ALTER TABLE replication
 info "Testing ALTER TABLE replication..."
-cql1 "ALTER TABLE smoke_test.kv ADD extra text"
-sleep 1
-# CQL on node2 is rejected (secondary), so just verify ALTER succeeded on node1
-if cql1 "SELECT extra FROM smoke_test.kv WHERE k = 'nonexistent';" 2>&1 | grep -qi "extra\|0 rows"; then
-    pass "ALTER TABLE succeeded on node1 (replication to node2 via pair sync)"
-else
-    info "ALTER TABLE replication not verified"
-fi
+cql_ok 9042 "ALTER TABLE smoke_test.kv ADD extra text" "ALTER TABLE on node1"
+cql_ok 9042 "SELECT extra FROM smoke_test.kv WHERE k = 'nonexistent';" \
+    "node1 must know the ALTERed column"
+wait_for_schema_agreement 9090 9091 "ALTER TABLE replicated to node2 via pair DDL"
 
 # Write to node1 (primary), read from both
 info "Writing to node1 (primary)..."
-cql1 "INSERT INTO smoke_test.kv (k, v) VALUES ('key1', 'from_node1')"
+cql_ok 9042 "INSERT INTO smoke_test.kv (k, v) VALUES ('key1', 'from_node1')" "write key1 to node1"
 pass "Write to node1 succeeded"
 sleep 1
 
@@ -388,7 +451,7 @@ info "Skipping CQL read from node2 (secondary rejects CQL until promoted)"
 # Write to node2 (secondary, should be forwarded to primary)
 # CQL forwarding from secondaries is not supported — writes go to node1.
 info "Writing to node1 instead (node2 is secondary, no CQL forwarding)..."
-cql1 "INSERT INTO smoke_test.kv (k, v) VALUES ('key2', 'from_node2')"
+cql_ok 9042 "INSERT INTO smoke_test.kv (k, v) VALUES ('key2', 'from_node2')" "write key2 to node1"
 pass "Write to node1 succeeded (on behalf of node2)"
 sleep 1
 
@@ -454,8 +517,10 @@ pass "Promoted node2 reads replicated key2=from_node2"
 
 # Writes should now work on node2
 info "Writing failover data on promoted node2..."
-cql2 "INSERT INTO smoke_test.kv (k, v) VALUES ('failover1', 'during_failover')"
-cql2 "INSERT INTO smoke_test.kv (k, v) VALUES ('failover2', 'also_failover')"
+cql_ok 9043 "INSERT INTO smoke_test.kv (k, v) VALUES ('failover1', 'during_failover')" \
+    "failover write failover1 on promoted node2"
+cql_ok 9043 "INSERT INTO smoke_test.kv (k, v) VALUES ('failover2', 'also_failover')" \
+    "failover write failover2 on promoted node2"
 pass "Failover writes succeeded on promoted node2"
 
 # Verify reads work
@@ -473,19 +538,14 @@ info "Restarting node1..."
 docker compose start node1
 wait_for_cluster_role 9090 "node1" "secondary" "$PAIR_CQL_TIMEOUT"
 
-# Wait for pair mode re-establishment and schema catch-up.
-# Schema should arrive via PairSchemaSync before mutation replay.
-info "Waiting for pair mode re-establishment and schema catch-up..."
-sleep 15
-
 # Verify schema was replicated via catch-up. Node1 is a healthy secondary and
-# intentionally rejects CQL, so use its always-available schema endpoint.
+# intentionally rejects CQL, so compare the schema version each node holds:
+# PairSchemaSync acknowledges only after the secondary's keyspaces and tables
+# match the primary's, and then adopts the primary's version. node1 restarted
+# from a schema.json written before the ALTER, so this is the check that
+# catches a catch-up that inserted missing tables but never applied the ALTER.
 info "Verifying schema catch-up on node1..."
-if curl -sf http://localhost:9090/api/schema/keyspaces 2>/dev/null | grep -q "smoke_test"; then
-    pass "Schema catch-up: smoke_test keyspace exists on node1"
-else
-    info "Schema catch-up did not arrive on node1 — keyspace not found"
-fi
+wait_for_schema_agreement 9090 9091 "Schema catch-up: rejoined node1 matches promoted node2" 60
 
 # ============================================================
 # Phase 5: Switchover
@@ -502,32 +562,35 @@ info "Initiating switchover from node2 (current primary) to node1..."
 SWITCHOVER_RESULT=$(curl -s -X POST "http://localhost:9091/api/cluster/switchover")
 info "Switchover result: $SWITCHOVER_RESULT"
 
-if echo "$SWITCHOVER_RESULT" | grep -q "switchover complete"; then
-    pass "Switchover completed successfully"
-
-    wait_for_cluster_role 9090 "node1" "primary" "$PAIR_CQL_TIMEOUT"
-    wait_cql 9042 "node1" "$PAIR_CQL_TIMEOUT"
-    info "Node1 status: $(cluster_status 9090)"
-    info "Node2 status: $(cluster_status 9091)"
-
-    # Node1 can now serve the data checks that were intentionally unavailable
-    # while it was the rejoining secondary.
-    wait_for_cql_value 9042 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" \
-        "from_node1" "switched node1 key1"
-    wait_for_cql_value 9042 "SELECT v FROM smoke_test.kv WHERE k = 'failover1';" \
-        "during_failover" "switched node1 failover1"
-    pass "Rejoined node1 serves original and failover data"
-
-    # Verify writes work through both nodes after switchover
-    info "Writing through node1 after switchover..."
-    cql1 "INSERT INTO smoke_test.kv (k, v) VALUES ('post_switch1', 'via_node1')"
-    pass "Write to node1 succeeded after switchover"
-
-    info "Skipping node2 CQL read while it is the post-switchover secondary"
-else
-    info "SKIP: Switchover not available (may require both nodes in pair mode)"
-    info "Result: $SWITCHOVER_RESULT"
+# Both nodes are connected pair members here, so a switchover must succeed.
+# It is refused when node1 has not caught up (schema unconfirmed or data
+# replay incomplete); that refusal is a failure of Phase 4, reported here.
+if ! echo "$SWITCHOVER_RESULT" | grep -q "switchover complete"; then
+    fail "Switchover refused or failed: $SWITCHOVER_RESULT"
 fi
+pass "Switchover completed successfully"
+
+wait_for_cluster_role 9090 "node1" "primary" "$PAIR_CQL_TIMEOUT"
+wait_cql 9042 "node1" "$PAIR_CQL_TIMEOUT"
+info "Node1 status: $(cluster_status 9090)"
+info "Node2 status: $(cluster_status 9091)"
+
+# Node1 can now serve the data checks that were intentionally unavailable
+# while it was the rejoining secondary.
+wait_for_cql_value 9042 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" \
+    "from_node1" "switched node1 key1"
+wait_for_cql_value 9042 "SELECT v FROM smoke_test.kv WHERE k = 'failover1';" \
+    "during_failover" "switched node1 failover1"
+pass "Rejoined node1 serves original and failover data"
+
+# Verify writes work through node1 after switchover
+info "Writing through node1 after switchover..."
+cql_ok 9042 "INSERT INTO smoke_test.kv (k, v) VALUES ('post_switch1', 'via_node1')" \
+    "write through node1 after switchover"
+pass "Write to node1 succeeded after switchover"
+
+# Informational by design: node2 is now the secondary and rejects CQL.
+info "Skipping node2 CQL read while it is the post-switchover secondary"
 
 # ============================================================
 # Phase 6: 3rd node joins → Cluster mode
@@ -540,27 +603,9 @@ docker compose up -d --build node3
 wait_cql 9044 "node3" "$PAIR_CQL_TIMEOUT"
 
 info "Waiting for cluster formation..."
-sleep 15
-
-# Check all 3 nodes' cluster status
-info "Node1 status: $(cluster_status 9090)"
-info "Node2 status: $(cluster_status 9091)"
-info "Node3 status: $(cluster_status 9092)"
-
-# Verify cluster mode (or at least all nodes responding)
-STATUS1=$(cluster_status 9090)
-STATUS2=$(cluster_status 9091)
-STATUS3=$(cluster_status 9092)
-
-if echo "$STATUS1" | grep -q '"mode":"cluster"'; then
-    pass "Node1 in cluster mode"
-else
-    info "Node1 mode: $STATUS1 (cluster transition may need more time)"
-fi
-
-if echo "$STATUS3" | grep -q '"mode"'; then
-    pass "Node3 responding to cluster API"
-fi
+wait_for_cluster_mode 9090 "Node1" 90
+wait_for_cluster_mode 9091 "Node2" 90
+wait_for_cluster_mode 9092 "Node3" 90
 
 # ============================================================
 # Phase 7: 3-node writes and reads
@@ -570,48 +615,40 @@ info "=== Phase 7: 3-Node Writes and Reads ==="
 
 # Create schema for cluster testing
 info "Creating cluster test keyspace..."
-cql1 "CREATE KEYSPACE IF NOT EXISTS cluster_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}"
-cql1 "CREATE TABLE IF NOT EXISTS cluster_test.data (k text PRIMARY KEY, v text, source text)"
-sleep 3
+cql_ok 9042 "CREATE KEYSPACE IF NOT EXISTS cluster_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" \
+    "CREATE KEYSPACE cluster_test"
+cql_ok 9042 "CREATE TABLE IF NOT EXISTS cluster_test.data (k text PRIMARY KEY, v text, source text)" \
+    "CREATE TABLE cluster_test.data"
+for port in 9043 9044; do
+    wait_for_cql_value "$port" "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'cluster_test';" \
+        "data" "cluster_test.data visible on port $port"
+done
 
 # Write to each node — coordinator should route to replicas
 info "Writing to node1..."
-cql1 "INSERT INTO cluster_test.data (k, v, source) VALUES ('key_a', 'value_a', 'node1')"
+cql_ok 9042 "INSERT INTO cluster_test.data (k, v, source) VALUES ('key_a', 'value_a', 'node1')" "write key_a via node1"
 pass "Write to node1 succeeded"
 
 info "Writing to node2..."
-cql2 "INSERT INTO cluster_test.data (k, v, source) VALUES ('key_b', 'value_b', 'node2')"
+cql_ok 9043 "INSERT INTO cluster_test.data (k, v, source) VALUES ('key_b', 'value_b', 'node2')" "write key_b via node2"
 pass "Write to node2 succeeded"
 
 info "Writing to node3..."
-cql3 "INSERT INTO cluster_test.data (k, v, source) VALUES ('key_c', 'value_c', 'node3')"
+cql_ok 9044 "INSERT INTO cluster_test.data (k, v, source) VALUES ('key_c', 'value_c', 'node3')" "write key_c via node3"
 pass "Write to node3 succeeded"
-sleep 2
 
 # Read from each node — any node should coordinate reads
 info "Reading key_a from node3 (cross-node read)..."
-RESULT=$(cql3 "SELECT v FROM cluster_test.data WHERE k = 'key_a';" 2>&1) || true
-if echo "$RESULT" | grep -q "value_a"; then
-    pass "Node3 reads data written to node1: key_a=value_a"
-else
-    info "Cross-node read pending: $RESULT"
-fi
+wait_for_cql_value 9044 "SELECT v FROM cluster_test.data WHERE k = 'key_a';" "value_a" "node3 cross-node read key_a"
+pass "Node3 reads data written to node1: key_a=value_a"
 
 info "Reading key_c from node1 (cross-node read)..."
-RESULT=$(cql1 "SELECT v FROM cluster_test.data WHERE k = 'key_c';" 2>&1) || true
-if echo "$RESULT" | grep -q "value_c"; then
-    pass "Node1 reads data written to node3: key_c=value_c"
-else
-    info "Cross-node read pending: $RESULT"
-fi
+wait_for_cql_value 9042 "SELECT v FROM cluster_test.data WHERE k = 'key_c';" "value_c" "node1 cross-node read key_c"
+pass "Node1 reads data written to node3: key_c=value_c"
 
 info "Reading key_b from node2 (local read)..."
-RESULT=$(cql2 "SELECT v FROM cluster_test.data WHERE k = 'key_b';" 2>&1) || true
-if echo "$RESULT" | grep -q "value_b"; then
-    pass "Node2 reads own data: key_b=value_b"
-else
-    info "Local read pending: $RESULT"
-fi
+wait_for_cql_value 9043 "SELECT v FROM cluster_test.data WHERE k = 'key_b';" "value_b" "node2 read key_b"
+pass "Node2 reads own data: key_b=value_b"
 
 # ============================================================
 # Phase 8: Single node failure — QUORUM still works
@@ -623,22 +660,19 @@ info "Stopping node3..."
 docker compose stop node3
 sleep 5
 
-# Writes should succeed (2 of 3 alive, QUORUM = 2)
+# Writes should succeed (2 of 3 alive, QUORUM = 2). The consistency level is
+# set explicitly: cqlsh defaults to ONE, under which this phase and Phase 9
+# assert nothing about quorum at all.
 info "Writing with 1 node down (QUORUM should succeed)..."
-if cql1 "INSERT INTO cluster_test.data (k, v, source) VALUES ('after_kill3', 'quorum_ok', 'node1')" 2>&1; then
-    pass "Write succeeds with 1 node down (QUORUM met: 2 of 3)"
-else
-    info "Write failed with 1 node down (coordinator may need QUORUM of 2)"
-fi
+cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('after_kill3', 'quorum_ok', 'node1')" \
+    "QUORUM write with 1 of 3 nodes down"
+pass "Write succeeds with 1 node down (QUORUM met: 2 of 3)"
 
 # Reads should succeed
 info "Reading with 1 node down..."
-RESULT=$(cql2 "SELECT v FROM cluster_test.data WHERE k = 'key_a';" 2>&1) || true
-if echo "$RESULT" | grep -q "value_a"; then
-    pass "Read succeeds with 1 node down"
-else
-    info "Read result: $RESULT"
-fi
+wait_for_cql_value 9043 "CONSISTENCY QUORUM; SELECT v FROM cluster_test.data WHERE k = 'key_a';" \
+    "value_a" "QUORUM read with 1 node down"
+pass "Read succeeds with 1 node down"
 
 # ============================================================
 # Phase 9: Second node failure — below QUORUM
@@ -650,26 +684,21 @@ info "Stopping node2..."
 docker compose stop node2
 sleep 3
 
-# Writes should FAIL (only 1 of 3 alive, QUORUM = 2, not met)
+# Writes should FAIL (only 1 of 3 alive, QUORUM = 2, not met). An
+# acknowledged QUORUM write here is a correctness failure, whatever the reason.
 info "Writing with 2 nodes down (should fail — below QUORUM)..."
-if cql1 "INSERT INTO cluster_test.data (k, v, source) VALUES ('should_fail', 'no', 'node1')" 2>&1; then
-    # Check if it actually worked (might succeed as standalone)
-    RESULT=$(cql1 "SELECT v FROM cluster_test.data WHERE k = 'should_fail';" 2>&1) || true
-    if echo "$RESULT" | grep -q "no"; then
-        info "Write succeeded despite 2 nodes down (node may have fallen back to standalone)"
-    fi
-else
-    pass "Write correctly fails with 2 nodes down (below QUORUM)"
+if cqlsh --request-timeout=15 localhost 9042 \
+    -e "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('should_fail', 'no', 'node1')" \
+    >/dev/null 2>&1; then
+    fail "QUORUM write was acknowledged with 2 of 3 nodes down"
 fi
+pass "Write correctly fails with 2 nodes down (below QUORUM)"
 
-# Reads may still work from local data
+# RF=3, so node1 holds every row and a CL=ONE read is served locally.
 info "Reading local data with 2 nodes down..."
-RESULT=$(cql1 "SELECT v FROM cluster_test.data WHERE k = 'key_a';" 2>&1) || true
-if echo "$RESULT" | grep -q "value_a"; then
-    pass "Local reads still work with 2 nodes down"
-else
-    info "Local reads failed (data may not be on this node)"
-fi
+wait_for_cql_value 9042 "CONSISTENCY ONE; SELECT v FROM cluster_test.data WHERE k = 'key_a';" \
+    "value_a" "CL=ONE local read with 2 nodes down"
+pass "Local reads still work with 2 nodes down"
 
 # ============================================================
 # Phase 10: Recovery — bring nodes back
@@ -681,34 +710,27 @@ info "Restarting node2 and node3..."
 docker compose start node2 node3
 wait_cql 9043 "node2" "$PAIR_CQL_TIMEOUT"
 wait_cql 9044 "node3" "$PAIR_CQL_TIMEOUT"
-sleep 10
 
 # Verify cluster re-forms
-info "Node1 status: $(cluster_status 9090)"
-info "Node2 status: $(cluster_status 9091)"
-info "Node3 status: $(cluster_status 9092)"
+wait_for_cluster_mode 9090 "Node1" 90
+wait_for_cluster_mode 9091 "Node2" 90
+wait_for_cluster_mode 9092 "Node3" 90
 
 # Writes should work again
 info "Writing after recovery..."
-cql1 "INSERT INTO cluster_test.data (k, v, source) VALUES ('recovered', 'yes', 'node1')"
+cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('recovered', 'yes', 'node1')" \
+    "QUORUM write after recovery"
 pass "Write succeeds after cluster recovery"
 
 # Cross-node reads should work
-sleep 2
-RESULT=$(cql3 "SELECT v FROM cluster_test.data WHERE k = 'recovered';" 2>&1) || true
-if echo "$RESULT" | grep -q "yes"; then
-    pass "Cross-node read works after recovery"
-else
-    info "Cross-node read after recovery: $RESULT"
-fi
+wait_for_cql_value 9044 "SELECT v FROM cluster_test.data WHERE k = 'recovered';" "yes" \
+    "node3 cross-node read after recovery"
+pass "Cross-node read works after recovery"
 
 # Data written during degraded mode should be readable
-RESULT=$(cql3 "SELECT v FROM cluster_test.data WHERE k = 'after_kill3';" 2>&1) || true
-if echo "$RESULT" | grep -q "quorum_ok"; then
-    pass "Data from degraded mode survived and replicated"
-else
-    info "Degraded-mode data replication pending: $RESULT"
-fi
+wait_for_cql_value 9044 "SELECT v FROM cluster_test.data WHERE k = 'after_kill3';" "quorum_ok" \
+    "node3 read of data written while it was down" 60
+pass "Data from degraded mode survived and replicated"
 
 # ============================================================
 # Phase 11: DDL replication across 3 nodes
@@ -718,25 +740,20 @@ info "=== Phase 11: DDL Replication (3 nodes) ==="
 
 # Create schema on node3, verify on node1 and node2
 info "Creating keyspace on node3..."
-cql3 "CREATE KEYSPACE ddl_cluster WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}"
-cql3 "CREATE TABLE ddl_cluster.items (id text PRIMARY KEY, name text)"
-sleep 3
+cql_ok 9044 "CREATE KEYSPACE ddl_cluster WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" \
+    "CREATE KEYSPACE ddl_cluster via node3"
+cql_ok 9044 "CREATE TABLE ddl_cluster.items (id text PRIMARY KEY, name text)" \
+    "CREATE TABLE ddl_cluster.items via node3"
 
 info "Verifying DDL on node1..."
-RESULT=$(cql1 "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = 'ddl_cluster';" 2>&1) || true
-if echo "$RESULT" | grep -q "ddl_cluster"; then
-    pass "DDL replicated to node1"
-else
-    info "DDL replication to node1 pending"
-fi
+wait_for_cql_value 9042 "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'ddl_cluster';" \
+    "items" "DDL replication to node1"
+pass "DDL replicated to node1"
 
 info "Verifying DDL on node2..."
-RESULT=$(cql2 "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = 'ddl_cluster';" 2>&1) || true
-if echo "$RESULT" | grep -q "ddl_cluster"; then
-    pass "DDL replicated to node2"
-else
-    info "DDL replication to node2 pending"
-fi
+wait_for_cql_value 9043 "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'ddl_cluster';" \
+    "items" "DDL replication to node2"
+pass "DDL replicated to node2"
 
 # ============================================================
 # Phase 12: FMEA-driven failure mode tests
@@ -747,50 +764,44 @@ info "=== Phase 12: FMEA Failure Mode Coverage ==="
 # FMEA #14 (RPN 240): Data accessibility on 3rd node
 # Data written before node3 joined should be readable on node3
 info "[FMEA #14] Data written before cluster should be on node3..."
-RESULT=$(cql3 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" 2>&1) || true
-if echo "$RESULT" | grep -q "from_node1"; then
-    pass "[FMEA #14] Pre-cluster data accessible on node3"
-else
-    info "[FMEA #14] Pre-cluster data not on node3 (streaming needed)"
-fi
+wait_for_cql_value 9044 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" "from_node1" \
+    "[FMEA #14] pre-cluster key1 read via node3" 60
+pass "[FMEA #14] Pre-cluster data accessible on node3"
 
 # FMEA #20 (RPN 175): DDL on non-leader/follower node
 # Creating a table on a follower should succeed (forwarded to leader)
 info "[FMEA #20] DDL on follower node..."
-cql2 "CREATE KEYSPACE IF NOT EXISTS fmea_ddl WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}"
-cql2 "CREATE TABLE IF NOT EXISTS fmea_ddl.test (id text PRIMARY KEY)"
-sleep 2
-RESULT=$(cql1 "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = 'fmea_ddl';" 2>&1) || true
-if echo "$RESULT" | grep -q "fmea_ddl"; then
-    pass "[FMEA #20] DDL on follower succeeded and replicated"
-else
-    info "[FMEA #20] DDL from follower not replicated"
-fi
+cql_ok 9043 "CREATE KEYSPACE IF NOT EXISTS fmea_ddl WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" \
+    "[FMEA #20] CREATE KEYSPACE on a follower"
+cql_ok 9043 "CREATE TABLE IF NOT EXISTS fmea_ddl.test (id text PRIMARY KEY)" \
+    "[FMEA #20] CREATE TABLE on a follower"
+wait_for_cql_value 9042 "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'fmea_ddl';" \
+    "test" "[FMEA #20] follower DDL visible on node1"
+pass "[FMEA #20] DDL on follower succeeded and replicated"
 
 # FMEA #18 (RPN 280): Stale data after node rejoin
 # Write data while a node is down, restart it, verify it catches up
 info "[FMEA #18] Stale data test: stop node3, write, restart, verify..."
 docker compose stop node3 >/dev/null 2>&1
 sleep 3
-cql1 "INSERT INTO cluster_test.data (k, v, source) VALUES ('while_n3_down', 'catch_me', 'node1')"
+cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('while_n3_down', 'catch_me', 'node1')" \
+    "[FMEA #18] QUORUM write while node3 is down"
 docker compose start node3 >/dev/null 2>&1
 wait_cql 9044 "node3" "$PAIR_CQL_TIMEOUT"
-sleep 10
-RESULT=$(cql3 "SELECT v FROM cluster_test.data WHERE k = 'while_n3_down';" 2>&1) || true
-if echo "$RESULT" | grep -q "catch_me"; then
-    pass "[FMEA #18] Rejoined node has fresh data (catch-up worked)"
-else
-    info "[FMEA #18] Rejoined node has stale data (catch-up needed)"
-fi
+# CL=ONE coordinated by node3: only node3's own replica can answer if the
+# coordinator picks itself, so this checks the rejoined node caught up.
+wait_for_cql_value 9044 "CONSISTENCY ONE; SELECT v FROM cluster_test.data WHERE k = 'while_n3_down';" \
+    "catch_me" "[FMEA #18] rejoined node3 read of a write it missed" 60
+pass "[FMEA #18] Rejoined node has fresh data (catch-up worked)"
 
 # FMEA #7 (RPN 105): Token distribution after transition
 # Verify cluster status shows reasonable token distribution
 info "[FMEA #7] Checking cluster status for token info..."
 STATUS=$(cluster_status 9090)
 info "Node1 cluster status: $STATUS"
-if echo "$STATUS" | grep -q '"mode"'; then
-    pass "[FMEA #7] Cluster status endpoint responding"
-fi
+grep -q '"mode":"cluster"' <<<"$STATUS" \
+    || fail "[FMEA #7] node1 cluster status does not report cluster mode: $STATUS"
+pass "[FMEA #7] Cluster status endpoint responding"
 
 # FMEA #9 (RPN 175): Write timeout behavior
 # Write to a table after stopping a node — should not hang forever
@@ -798,17 +809,21 @@ info "[FMEA #9] Write timeout test (1 node down, should complete quickly)..."
 docker compose stop node3 >/dev/null 2>&1
 sleep 3
 START_TIME=$(date +%s)
-cql1 "INSERT INTO cluster_test.data (k, v, source) VALUES ('timeout_test', 'fast', 'node1')" 2>/dev/null || true
+# Success or a timeout error are both acceptable here; the assertion is that
+# the write RETURNS promptly rather than hanging.
+cqlsh --request-timeout=30 localhost 9042 \
+    -e "INSERT INTO cluster_test.data (k, v, source) VALUES ('timeout_test', 'fast', 'node1')" \
+    >/dev/null 2>&1 || true
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
-if [ "$ELAPSED" -lt 15 ]; then
-    pass "[FMEA #9] Write completed in ${ELAPSED}s (no indefinite hang)"
-else
-    info "[FMEA #9] Write took ${ELAPSED}s (possible timeout issue)"
+if [ "$ELAPSED" -ge 15 ]; then
+    fail "[FMEA #9] Write with 1 node down took ${ELAPSED}s (>= 15s): timeout handling regressed"
 fi
+pass "[FMEA #9] Write completed in ${ELAPSED}s (no indefinite hang)"
 
 # Restart node3 for cleanup
 docker compose start node3 >/dev/null 2>&1
+wait_cql 9044 "node3" "$PAIR_CQL_TIMEOUT"
 
 # ============================================================
 # Phase 13: Cross-Node Subscription Test
@@ -817,30 +832,28 @@ echo ""
 info "=== Phase 13: Cross-Node Subscription Test ==="
 
 # Create a table for subscription testing
-cql1 "CREATE TABLE IF NOT EXISTS smoke_test.events (id text PRIMARY KEY, data text)"
+cql_ok 9042 "CREATE TABLE IF NOT EXISTS smoke_test.events (id text PRIMARY KEY, data text)" \
+    "CREATE TABLE smoke_test.events"
+wait_for_cql_value 9043 "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'smoke_test';" \
+    "events" "smoke_test.events visible on node2"
 pass "Created events table for subscription test"
 
 # Insert data on node1
-cql1 "INSERT INTO smoke_test.events (id, data) VALUES ('e1', 'first_event')"
-cql1 "INSERT INTO smoke_test.events (id, data) VALUES ('e2', 'second_event')"
+cql_ok 9042 "INSERT INTO smoke_test.events (id, data) VALUES ('e1', 'first_event')" "insert e1 via node1"
+cql_ok 9042 "INSERT INTO smoke_test.events (id, data) VALUES ('e2', 'second_event')" "insert e2 via node1"
 pass "Inserted events on node1"
 
-# Read from node2 — verifies data is replicated
-RESULT=$(cql2 "SELECT data FROM smoke_test.events WHERE id = 'e1'")
-if echo "$RESULT" | grep -q "first_event"; then
-    pass "Node2 can read event e1 written by node1"
-else
-    info "SKIP: Cross-node read not available (single-node mode)"
-fi
+# Read from node2 — verifies data is replicated. This runs in cluster mode
+# (Phase 6 asserted it), so there is no single-node excuse for a miss.
+wait_for_cql_value 9043 "SELECT data FROM smoke_test.events WHERE id = 'e1';" "first_event" \
+    "node2 read of e1 written via node1"
+pass "Node2 can read event e1 written by node1"
 
 # Update on node2, read back on node1
-cql2 "UPDATE smoke_test.events SET data = 'updated_first' WHERE id = 'e1'"
-RESULT=$(cql1 "SELECT data FROM smoke_test.events WHERE id = 'e1'")
-if echo "$RESULT" | grep -q "updated_first"; then
-    pass "Node1 sees update written by node2"
-else
-    info "SKIP: Cross-node update propagation not available"
-fi
+cql_ok 9043 "UPDATE smoke_test.events SET data = 'updated_first' WHERE id = 'e1'" "update e1 via node2"
+wait_for_cql_value 9042 "SELECT data FROM smoke_test.events WHERE id = 'e1';" "updated_first" \
+    "node1 read of the update written via node2"
+pass "Node1 sees update written by node2"
 
 pass "Phase 13 complete: cross-node data flow verified"
 
@@ -919,7 +932,7 @@ for n in 1 2 3; do
     fi
 done
 if [ -z "$LEADER_NODE" ]; then
-    info "[C1] No node reports mode=cluster yet — Raft may still be converging"
+    fail "[C1] No node reports mode=cluster after the peers formed"
 fi
 
 # ------------------------------------------------------------------
@@ -929,46 +942,36 @@ fi
 info ""
 info "=== C2: DDL Replication via Raft ==="
 
-cql_c1 "CREATE KEYSPACE IF NOT EXISTS c_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" || true
-cql_c1 "CREATE TABLE IF NOT EXISTS c_test.rows (k text PRIMARY KEY, v text, n int)" || true
-sleep 3
+cql_ok 9042 "CREATE KEYSPACE IF NOT EXISTS c_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" \
+    "[C2] CREATE KEYSPACE c_test"
+cql_ok 9042 "CREATE TABLE IF NOT EXISTS c_test.rows (k text PRIMARY KEY, v text, n int)" \
+    "[C2] CREATE TABLE c_test.rows"
 
-C2_PASS=true
-for fn in cql_c1 cql_c2 cql_c3; do
-    if $fn "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = 'c_test';" 2>/dev/null | grep -q "c_test"; then
-        pass "[C2] ${fn}: keyspace c_test visible"
-    else
-        info "[C2] ${fn}: c_test not yet visible (DDL replication pending)"
-        C2_PASS=false
-    fi
+for port in 9042 9043 9044; do
+    wait_for_cql_value "$port" "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'c_test';" \
+        "rows" "[C2] c_test.rows visible via port $port"
 done
-$C2_PASS && pass "[C2] DDL replicated to all 3 nodes" || info "[C2] DDL replication incomplete — may need more convergence time"
+pass "[C2] DDL replicated to all 3 nodes"
 
 # ------------------------------------------------------------------
 # C3: QUORUM writes and reads (100 rows)
 # Pass criteria: all 100 rows readable at QUORUM from each node.
+# (This used `INSERT ... USING CONSISTENCY QUORUM`, which is not CQL; every
+# insert failed over to an unchecked CL=ONE retry, so QUORUM was never tested.)
 # ------------------------------------------------------------------
 info ""
 info "=== C3: QUORUM Writes and Reads (100 rows) ==="
 
 info "Inserting 100 rows at QUORUM via node1..."
 for i in $(seq 1 100); do
-    cql_c1 "INSERT INTO c_test.rows (k, v, n) VALUES ('r${i}', 'val${i}', ${i}) USING CONSISTENCY QUORUM;" 2>/dev/null || \
-    cql_c1 "INSERT INTO c_test.rows (k, v, n) VALUES ('r${i}', 'val${i}', ${i});" 2>/dev/null || true
+    cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO c_test.rows (k, v, n) VALUES ('r${i}', 'val${i}', ${i});" \
+        "[C3] QUORUM write r${i}"
 done
-sleep 2
 
-C3_OK=true
-for fn in cql_c1 cql_c2 cql_c3; do
-    COUNT=$($fn "SELECT COUNT(*) FROM c_test.rows;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    if [ "$COUNT" -ge 100 ]; then
-        pass "[C3] ${fn}: $COUNT rows (>= 100)"
-    else
-        info "[C3] ${fn}: only $COUNT rows visible (replication pending)"
-        C3_OK=false
-    fi
+for port in 9042 9043 9044; do
+    wait_for_row_count "$port" c_test.rows 100 "[C3] QUORUM read via port $port" 30 QUORUM
 done
-$C3_OK && pass "[C3] All 100 rows readable at QUORUM from all 3 nodes" || info "[C3] Some nodes missing rows — replication may still be in progress"
+pass "[C3] All 100 rows readable at QUORUM from all 3 nodes"
 
 # ------------------------------------------------------------------
 # C4: Node failure tolerance — kill node3, write 50 more rows at QUORUM
@@ -981,20 +984,12 @@ info "Stopping cluster node3..."
 docker compose -f "$CLUSTER_COMPOSE" stop node3
 sleep 5
 
-C4_OK=true
 info "Writing 50 rows at QUORUM with node3 down (2 of 3 alive)..."
 for i in $(seq 101 150); do
-    if ! cql_c1 "INSERT INTO c_test.rows (k, v, n) VALUES ('r${i}', 'val${i}', ${i});" 2>/dev/null; then
-        info "[C4] Write r${i} failed"
-        C4_OK=false
-    fi
+    cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO c_test.rows (k, v, n) VALUES ('r${i}', 'val${i}', ${i});" \
+        "[C4] QUORUM write r${i} with node3 down"
 done
-
-if $C4_OK; then
-    pass "[C4] 50 QUORUM writes succeeded with node3 down"
-else
-    info "[C4] Some writes failed with node3 down (coordinator may require node3)"
-fi
+pass "[C4] 50 QUORUM writes succeeded with node3 down"
 
 # ------------------------------------------------------------------
 # C5: Read QUORUM with node3 down — expect 150 rows (100 + 50)
@@ -1003,35 +998,24 @@ fi
 info ""
 info "=== C5: Read QUORUM with Node3 Down (150 rows) ==="
 
-sleep 2
-for fn in cql_c1 cql_c2; do
-    COUNT=$($fn "SELECT COUNT(*) FROM c_test.rows;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    if [ "$COUNT" -ge 150 ]; then
-        pass "[C5] ${fn}: $COUNT rows (>= 150 at QUORUM with node3 down)"
-    else
-        info "[C5] ${fn}: $COUNT rows (expected >= 150)"
-    fi
+for port in 9042 9043; do
+    wait_for_row_count "$port" c_test.rows 150 "[C5] QUORUM read via port $port with node3 down" 30 QUORUM
 done
 
 # ------------------------------------------------------------------
 # C6: CL=ALL fails with node3 down
-# Pass criteria: INSERT at ALL returns an error (Unavailable).
+# Pass criteria: INSERT at ALL returns an error (Unavailable). An
+# acknowledged CL=ALL write with a replica down is a correctness failure.
 # ------------------------------------------------------------------
 info ""
 info "=== C6: CL=ALL Fails with Node3 Down ==="
 
-if cql_c1 "INSERT INTO c_test.rows (k, v, n) VALUES ('cl_all_test', 'should_fail', 999) USING CONSISTENCY ALL;" 2>&1 | grep -qiE "unavailable|all hosts|error|failed"; then
-    pass "[C6] INSERT at ALL correctly rejected (Unavailable) with node3 down"
-else
-    # CL=ALL syntax may differ — try raw query and check row doesn't exist
-    info "[C6] Unable to verify CL=ALL failure via cqlsh syntax — checking row absence"
-    RESULT=$(cql_c1 "SELECT v FROM c_test.rows WHERE k = 'cl_all_test';" 2>/dev/null || true)
-    if echo "$RESULT" | grep -q "should_fail"; then
-        info "[C6] Write at ALL unexpectedly succeeded (2-of-3 mode may allow it)"
-    else
-        pass "[C6] Row not written — consistent with CL=ALL failure"
-    fi
+if cqlsh --request-timeout=15 localhost 9042 \
+    -e "CONSISTENCY ALL; INSERT INTO c_test.rows (k, v, n) VALUES ('cl_all_test', 'should_fail', 999);" \
+    >/dev/null 2>&1; then
+    fail "[C6] INSERT at CL=ALL was acknowledged with node3 down"
 fi
+pass "[C6] INSERT at ALL correctly rejected with node3 down"
 
 # ------------------------------------------------------------------
 # C7: Restart node3; wait for reconnection (system.peers shows 3 again)
@@ -1049,7 +1033,7 @@ if wait_peers cql_c1 2 30; then
     pass "[C7] system.peers shows 2+ peers — node3 rejoined within 30s"
 else
     P=$(peer_count cql_c1)
-    info "[C7] system.peers shows $P peers after 30s (node3 may still be catching up)"
+    fail "[C7] system.peers shows $P peers 30s after node3 restarted (expected >= 2)"
 fi
 
 # ------------------------------------------------------------------
@@ -1060,20 +1044,7 @@ info ""
 info "=== C8: Hint Replay Verification ==="
 
 info "Waiting for hint replay on node3 (up to 60s)..."
-HINTS_REPLAYED=false
-for i in $(seq 1 60); do
-    COUNT=$(cql_c3 "SELECT COUNT(*) FROM c_test.rows;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    if [ "$COUNT" -ge 150 ]; then
-        HINTS_REPLAYED=true
-        pass "[C8] node3 has $COUNT rows (>= 150) — hints replayed within ${i}s"
-        break
-    fi
-    sleep 1
-done
-if ! $HINTS_REPLAYED; then
-    COUNT=$(cql_c3 "SELECT COUNT(*) FROM c_test.rows;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    info "[C8] node3 has $COUNT rows after 60s (hint replay may be incomplete)"
-fi
+wait_for_row_count 9044 c_test.rows 150 "[C8] node3 rows after hint replay" 60
 
 # ------------------------------------------------------------------
 # C9: Raft leader failover
@@ -1117,14 +1088,14 @@ if [ -n "$OLD_LEADER" ]; then
         sleep 1
     done
 
-    $NEW_LEADER_FOUND || info "[C9] New leader not detected within 10s — may need more time"
+    $NEW_LEADER_FOUND || fail "[C9] No surviving node reported mode=cluster within 10s of killing node${OLD_LEADER}"
 
     # Restart old leader for C10
     docker compose -f "$CLUSTER_COMPOSE" start "node${OLD_LEADER}" >/dev/null 2>&1 || true
     wait_cql_c $((9041 + OLD_LEADER)) "cluster-node${OLD_LEADER}" 60
     sleep 5
 else
-    info "[C9] No leader found — skipping failover test"
+    fail "[C9] No node reports mode=cluster — cannot run the failover test"
 fi
 
 # ------------------------------------------------------------------
@@ -1139,23 +1110,14 @@ DDL_NODE=1
 [ "$OLD_LEADER" = "1" ] && DDL_NODE=2
 
 info "Creating table via node${DDL_NODE} (post-failover leader)..."
-case "$DDL_NODE" in
-    1) cql_c1 "CREATE TABLE IF NOT EXISTS c_test.post_failover (id text PRIMARY KEY, val text);" 2>/dev/null || true ;;
-    2) cql_c2 "CREATE TABLE IF NOT EXISTS c_test.post_failover (id text PRIMARY KEY, val text);" 2>/dev/null || true ;;
-    3) cql_c3 "CREATE TABLE IF NOT EXISTS c_test.post_failover (id text PRIMARY KEY, val text);" 2>/dev/null || true ;;
-esac
-sleep 3
+cql_ok $((9041 + DDL_NODE)) "CREATE TABLE IF NOT EXISTS c_test.post_failover (id text PRIMARY KEY, val text);" \
+    "[C10] CREATE TABLE via node${DDL_NODE} after failover"
 
-C10_PASS=true
-for fn in cql_c1 cql_c2 cql_c3; do
-    if $fn "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'c_test' AND table_name = 'post_failover';" 2>/dev/null | grep -q "post_failover"; then
-        pass "[C10] ${fn}: table post_failover visible after leader failover"
-    else
-        info "[C10] ${fn}: table post_failover not yet visible (DDL replication pending)"
-        C10_PASS=false
-    fi
+for port in 9042 9043 9044; do
+    wait_for_cql_value "$port" "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'c_test' AND table_name = 'post_failover';" \
+        "post_failover" "[C10] post_failover visible via port $port"
 done
-$C10_PASS && pass "[C10] DDL replicated to all nodes after leader failover" || info "[C10] DDL replication incomplete"
+pass "[C10] DDL replicated to all nodes after leader failover"
 
 echo ""
 info "3-node cluster suite (C1-C10) complete."
@@ -1209,12 +1171,17 @@ for i in $(seq 1 15); do
     fi
     sleep 1
 done
-$F1_PASS || { P=$(peer_count cql_c1); info "[F1] system.peers shows $P peers after 15s (cluster may need more time)"; }
+$F1_PASS || { P=$(peer_count cql_c1); fail "[F1] system.peers shows $P peers after 15s (expected >= 4)"; }
 
 # Create keyspace for the quint suite
-cql_c1 "CREATE KEYSPACE IF NOT EXISTS f_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" 2>/dev/null || true
-cql_c1 "CREATE TABLE IF NOT EXISTS f_test.rows (k text PRIMARY KEY, v text, n int)" 2>/dev/null || true
-sleep 3
+cql_ok 9042 "CREATE KEYSPACE IF NOT EXISTS f_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" \
+    "[F] CREATE KEYSPACE f_test"
+cql_ok 9042 "CREATE TABLE IF NOT EXISTS f_test.rows (k text PRIMARY KEY, v text, n int)" \
+    "[F] CREATE TABLE f_test.rows"
+for port in 9042 9043 9044 9045 9046; do
+    wait_for_cql_value "$port" "SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'f_test';" \
+        "rows" "[F] f_test.rows visible via port $port"
+done
 
 # ------------------------------------------------------------------
 # F2: QUORUM writes/reads across all 5 nodes (200 rows)
@@ -1226,27 +1193,14 @@ info "=== F2: QUORUM Writes/Reads Across All 5 Nodes (200 rows) ==="
 info "Inserting 200 rows via round-robin across nodes..."
 for i in $(seq 1 200); do
     node_num=$(( (i % 5) + 1 ))
-    case "$node_num" in
-        1) cql_c1 "INSERT INTO f_test.rows (k, v, n) VALUES ('f${i}', 'val${i}', ${i});" 2>/dev/null || true ;;
-        2) cql_c2 "INSERT INTO f_test.rows (k, v, n) VALUES ('f${i}', 'val${i}', ${i});" 2>/dev/null || true ;;
-        3) cql_c3 "INSERT INTO f_test.rows (k, v, n) VALUES ('f${i}', 'val${i}', ${i});" 2>/dev/null || true ;;
-        4) cql_c4 "INSERT INTO f_test.rows (k, v, n) VALUES ('f${i}', 'val${i}', ${i});" 2>/dev/null || true ;;
-        5) cql_c5 "INSERT INTO f_test.rows (k, v, n) VALUES ('f${i}', 'val${i}', ${i});" 2>/dev/null || true ;;
-    esac
+    cql_ok $((9041 + node_num)) "CONSISTENCY QUORUM; INSERT INTO f_test.rows (k, v, n) VALUES ('f${i}', 'val${i}', ${i});" \
+        "[F2] QUORUM write f${i} via node${node_num}"
 done
-sleep 3
 
-F2_PASS=true
-for fn in cql_c1 cql_c2 cql_c3 cql_c4 cql_c5; do
-    COUNT=$($fn "SELECT COUNT(*) FROM f_test.rows;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    if [ "$COUNT" -ge 200 ]; then
-        pass "[F2] ${fn}: $COUNT rows (>= 200)"
-    else
-        info "[F2] ${fn}: only $COUNT rows visible (replication pending)"
-        F2_PASS=false
-    fi
+for port in 9042 9043 9044 9045 9046; do
+    wait_for_row_count "$port" f_test.rows 200 "[F2] QUORUM read via port $port" 30 QUORUM
 done
-$F2_PASS && pass "[F2] All 200 rows readable from all 5 nodes" || info "[F2] Some nodes have fewer rows — replication may be in progress"
+pass "[F2] All 200 rows readable from all 5 nodes"
 
 # ------------------------------------------------------------------
 # F3: Kill 2 nodes; QUORUM writes still succeed (3 of 5 alive, RF=3)
@@ -1262,15 +1216,26 @@ sleep 5
 # Record which nodes are stopped so we know to use others
 F4_KILLED_NODES="4 5"
 
-F3_OK=true
+# With RF=3 over 5 nodes, a key whose 3 replicas include both stopped nodes
+# has only 1 live replica and a QUORUM write to it MUST fail. Which keys those
+# are depends on the token ring, so this phase writes at QUORUM and counts:
+# every write must either succeed or fail with Unavailable, and at least one
+# must succeed. A write that hangs or errors otherwise fails the run.
 info "Writing 100 rows at QUORUM with 2 nodes down (3 of 5 alive)..."
+F3_OK=0
+F3_UNAVAILABLE=0
 for i in $(seq 201 300); do
-    if ! cql_c1 "INSERT INTO f_test.rows (k, v, n) VALUES ('f${i}', 'val${i}', ${i});" 2>/dev/null; then
-        info "[F3] Write f${i} failed"
-        F3_OK=false
+    if out=$(cqlsh --request-timeout=10 localhost 9042 \
+        -e "CONSISTENCY QUORUM; INSERT INTO f_test.rows (k, v, n) VALUES ('f${i}', 'val${i}', ${i});" 2>&1); then
+        F3_OK=$((F3_OK + 1))
+    elif grep -qi "unavailable" <<<"$out"; then
+        F3_UNAVAILABLE=$((F3_UNAVAILABLE + 1))
+    else
+        fail "[F3] QUORUM write f${i} failed other than Unavailable: $out"
     fi
 done
-$F3_OK && pass "[F3] 100 QUORUM writes succeeded with 2 nodes down (RF=3, QUORUM=2)" || info "[F3] Some writes failed with 2 nodes down"
+[ "$F3_OK" -gt 0 ] || fail "[F3] no QUORUM write succeeded with 3 of 5 nodes alive"
+pass "[F3] $F3_OK QUORUM writes succeeded, $F3_UNAVAILABLE correctly Unavailable, with 2 nodes down"
 
 # ------------------------------------------------------------------
 # F4: Kill Raft leader (among the 2 surviving nodes); new leader elected
@@ -1312,9 +1277,9 @@ if [ -n "$F4_OLD_LEADER" ]; then
         done
         sleep 1
     done
-    $F4_PASS || info "[F4] New leader not detected within 10s (may need more time)"
+    $F4_PASS || fail "[F4] No surviving node reported mode=cluster within 10s of killing node${F4_OLD_LEADER}"
 else
-    info "[F4] No leader detected among nodes 1-3 — skipping leader kill"
+    fail "[F4] No node among 1-3 reports mode=cluster — cannot run the leader kill"
 fi
 
 # ------------------------------------------------------------------
@@ -1331,50 +1296,25 @@ docker compose -f "$CLUSTER_COMPOSE" start node4 node5 2>/dev/null || true
 wait_cql_c 9045 "cluster-node4" 90
 wait_cql_c 9046 "cluster-node5" 90
 
-info "Waiting for hints to replay on all nodes (up to 120s)..."
-F5_PASS=false
-for i in $(seq 1 120); do
-    ALL_OK=true
-    for fn in cql_c1 cql_c2 cql_c3 cql_c4 cql_c5; do
-        COUNT=$($fn "SELECT COUNT(*) FROM f_test.rows;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-        [ "$COUNT" -ge 300 ] || ALL_OK=false
-    done
-    if $ALL_OK; then
-        F5_PASS=true
-        pass "[F5] All 300 rows readable on all 5 nodes within ${i}s (hints replayed)"
-        break
-    fi
-    sleep 1
+# Every acknowledged row: the 200 from F2 plus F3's successful writes.
+F_EXPECTED=$((200 + F3_OK))
+info "Waiting for hints to replay on all nodes (up to 120s, expecting $F_EXPECTED rows)..."
+for port in 9042 9043 9044 9045 9046; do
+    wait_for_row_count "$port" f_test.rows "$F_EXPECTED" "[F5] rows via port $port after hint replay" 120
 done
-
-if ! $F5_PASS; then
-    for fn in cql_c1 cql_c2 cql_c3 cql_c4 cql_c5; do
-        COUNT=$($fn "SELECT COUNT(*) FROM f_test.rows;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-        info "[F5] ${fn}: $COUNT rows (expected >= 300)"
-    done
-fi
+pass "[F5] All $F_EXPECTED acknowledged rows readable on all 5 nodes (hints replayed)"
 
 # ------------------------------------------------------------------
 # F6: SELECT at ALL returns consistent data across all 5 nodes
-# Pass criteria: 300 rows returned at CL=ALL from every node.
+# Pass criteria: every acknowledged row returned at CL=ALL from every node.
 # ------------------------------------------------------------------
 info ""
 info "=== F6: SELECT at ALL — Consistent Data Across All 5 Nodes ==="
 
-sleep 5  # Let any remaining replication settle
-F6_PASS=true
-for fn in cql_c1 cql_c2 cql_c3 cql_c4 cql_c5; do
-    # CL=ALL via USING CONSISTENCY not universally supported in cqlsh; use
-    # a direct count and check for consistency across all nodes.
-    COUNT=$($fn "SELECT COUNT(*) FROM f_test.rows;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    if [ "$COUNT" -ge 300 ]; then
-        pass "[F6] ${fn}: $COUNT rows (consistent at ALL)"
-    else
-        info "[F6] ${fn}: only $COUNT rows (data loss or replication lag)"
-        F6_PASS=false
-    fi
+for port in 9042 9043 9044 9045 9046; do
+    wait_for_row_count "$port" f_test.rows "$F_EXPECTED" "[F6] CL=ALL read via port $port" 30 ALL
 done
-$F6_PASS && pass "[F6] Consistent data across all 5 nodes" || info "[F6] Data inconsistency detected — review hint replay logs"
+pass "[F6] Consistent data across all 5 nodes"
 
 echo ""
 info "5-node cluster suite (F1-F6) complete."
@@ -1407,13 +1347,13 @@ wait_cql_c 9043 "cluster-node2" 90
 wait_cql_c 9044 "cluster-node3" 90
 
 # Baseline data for bootstrap verification
-cql_c1 "CREATE KEYSPACE IF NOT EXISTS l_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" 2>/dev/null || true
-cql_c1 "CREATE TABLE IF NOT EXISTS l_test.items (k text PRIMARY KEY, v text)" 2>/dev/null || true
-sleep 2
+cql_ok 9042 "CREATE KEYSPACE IF NOT EXISTS l_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" \
+    "[L*] CREATE KEYSPACE l_test"
+cql_ok 9042 "CREATE TABLE IF NOT EXISTS l_test.items (k text PRIMARY KEY, v text)" "[L*] CREATE TABLE l_test.items"
 for i in $(seq 1 50); do
-    cql_c1 "INSERT INTO l_test.items (k, v) VALUES ('item${i}', 'val${i}');" 2>/dev/null || true
+    cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO l_test.items (k, v) VALUES ('item${i}', 'val${i}');" \
+        "[L*] baseline QUORUM write item${i}"
 done
-sleep 2
 pass "[L*] Baseline: 3-node cluster running with 50 rows in l_test.items"
 
 # ------------------------------------------------------------------
@@ -1431,11 +1371,10 @@ APPROVE_RESULT=$(curl -s -X POST "http://localhost:9090/api/cluster/add-node" \
     -d "{\"host_id\": \"${L4_HOST_ID}\"}" 2>/dev/null || true)
 info "Approve result: $APPROVE_RESULT"
 
-if echo "$APPROVE_RESULT" | grep -q '"approved"'; then
-    pass "[L1] Node4 pre-approved via add-node API"
-else
-    info "[L1] Approval API response: $APPROVE_RESULT (may need Raft initialized)"
+if ! echo "$APPROVE_RESULT" | grep -q '"approved"'; then
+    fail "[L1] add-node did not approve node4: $APPROVE_RESULT"
 fi
+pass "[L1] Node4 pre-approved via add-node API"
 
 info "Starting node4 (quint profile starts node4)..."
 docker compose -f "$CLUSTER_COMPOSE" --profile quint up -d node4
@@ -1452,7 +1391,7 @@ for i in $(seq 1 60); do
     fi
     sleep 1
 done
-$L1_PASS || { P=$(peer_count cql_c1); info "[L1] system.peers shows $P peers after 60s"; }
+$L1_PASS || { P=$(peer_count cql_c1); fail "[L1] system.peers shows $P peers 60s after node4 started (expected >= 3)"; }
 
 # ------------------------------------------------------------------
 # L2: 4th node bootstraps (S3 + delta stream) — has all existing data
@@ -1462,20 +1401,7 @@ info ""
 info "=== L2: 4th Node Bootstrap Verification ==="
 
 info "Waiting for node4 to bootstrap existing data (up to 60s)..."
-L2_PASS=false
-for i in $(seq 1 60); do
-    COUNT=$(cql_c4 "SELECT COUNT(*) FROM l_test.items;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    if [ "$COUNT" -ge 50 ]; then
-        L2_PASS=true
-        pass "[L2] node4 has $COUNT rows (>= 50, bootstrap complete within ${i}s)"
-        break
-    fi
-    sleep 1
-done
-if ! $L2_PASS; then
-    COUNT=$(cql_c4 "SELECT COUNT(*) FROM l_test.items;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    info "[L2] node4 has $COUNT rows after 60s (S3 + delta stream bootstrap may be incomplete)"
-fi
+wait_for_row_count 9045 l_test.items 50 "[L2] node4 rows after bootstrap" 60
 
 # ------------------------------------------------------------------
 # L3: Write at QUORUM; 4th node receives new writes (readable at ONE)
@@ -1487,16 +1413,10 @@ info "=== L3: Write at QUORUM; 4th Node Receives New Writes ==="
 
 info "Inserting 20 post-join rows at QUORUM..."
 for i in $(seq 51 70); do
-    cql_c1 "INSERT INTO l_test.items (k, v) VALUES ('item${i}', 'val${i}');" 2>/dev/null || true
+    cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO l_test.items (k, v) VALUES ('item${i}', 'val${i}');" \
+        "[L3] post-join QUORUM write item${i}"
 done
-sleep 3
-
-COUNT=$(cql_c4 "SELECT COUNT(*) FROM l_test.items;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-if [ "$COUNT" -ge 70 ]; then
-    pass "[L3] node4 has $COUNT rows (>= 70, receives new writes)"
-else
-    info "[L3] node4 has $COUNT rows (expected >= 70; replication may be lagging)"
-fi
+wait_for_row_count 9045 l_test.items 70 "[L3] node4 rows after post-join writes" 30
 
 # ------------------------------------------------------------------
 # L4: Decommission 4th node
@@ -1511,11 +1431,10 @@ DECOMM_RESULT=$(curl -s -X POST "http://localhost:9090/api/cluster/decommission"
     -d "{\"host_id\": \"${L4_HOST_ID}\"}" 2>/dev/null || true)
 info "Decommission result: $DECOMM_RESULT"
 
-if echo "$DECOMM_RESULT" | grep -qE '"decommissioning"|"decommissioned"'; then
-    pass "[L4] Decommission initiated for node4"
-else
-    info "[L4] Decommission API response: $DECOMM_RESULT"
+if ! echo "$DECOMM_RESULT" | grep -qE '"decommissioning"|"decommissioned"'; then
+    fail "[L4] decommission of node4 not initiated: $DECOMM_RESULT"
 fi
+pass "[L4] Decommission initiated for node4"
 
 info "Waiting for node4 to disappear from system.peers (up to 120s)..."
 L4_PASS=false
@@ -1528,7 +1447,7 @@ for i in $(seq 1 120); do
     fi
     sleep 1
 done
-$L4_PASS || { P=$(peer_count cql_c1); info "[L4] system.peers shows $P peers after 120s (decommission may be incomplete)"; }
+$L4_PASS || { P=$(peer_count cql_c1); fail "[L4] system.peers still shows $P peers 120s after decommission (expected <= 2)"; }
 
 # Stop node4 container
 docker compose -f "$CLUSTER_COMPOSE" stop node4 2>/dev/null || true
@@ -1540,18 +1459,10 @@ docker compose -f "$CLUSTER_COMPOSE" stop node4 2>/dev/null || true
 info ""
 info "=== L5: 3 Remaining Nodes Have All Data ==="
 
-sleep 5
-L5_PASS=true
-for fn in cql_c1 cql_c2 cql_c3; do
-    COUNT=$($fn "SELECT COUNT(*) FROM l_test.items;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    if [ "$COUNT" -ge 70 ]; then
-        pass "[L5] ${fn}: $COUNT rows (>= 70, no data loss after decommission)"
-    else
-        info "[L5] ${fn}: only $COUNT rows (expected >= 70)"
-        L5_PASS=false
-    fi
+for port in 9042 9043 9044; do
+    wait_for_row_count "$port" l_test.items 70 "[L5] CL=ALL read via port $port after decommission" 30 ALL
 done
-$L5_PASS && pass "[L5] All data preserved across 3 nodes after decommission" || info "[L5] Data loss or replication lag detected"
+pass "[L5] All data preserved across 3 nodes after decommission"
 
 # ------------------------------------------------------------------
 # L6: 5-node cluster: add 4th and 5th via lifecycle
@@ -1586,7 +1497,7 @@ for i in $(seq 1 60); do
     fi
     sleep 1
 done
-$L6_PASS || { P=$(peer_count cql_c1); info "[L6] system.peers shows $P peers after 60s (expected >= 4)"; }
+$L6_PASS || { P=$(peer_count cql_c1); fail "[L6] system.peers shows $P peers after 60s (expected >= 4)"; }
 
 # ------------------------------------------------------------------
 # L7: Rebalance after adding nodes
@@ -1600,18 +1511,17 @@ info "Triggering token rebalance via node1 API..."
 REBALANCE_RESULT=$(curl -s -X POST "http://localhost:9090/api/cluster/rebalance" 2>/dev/null || true)
 info "Rebalance result: $REBALANCE_RESULT"
 
-if echo "$REBALANCE_RESULT" | grep -q '"rebalance complete"'; then
-    pass "[L7] Rebalance completed successfully"
-else
-    info "[L7] Rebalance API response: $REBALANCE_RESULT"
+if ! echo "$REBALANCE_RESULT" | grep -q '"rebalance complete"'; then
+    fail "[L7] rebalance did not complete: $REBALANCE_RESULT"
 fi
+pass "[L7] Rebalance completed successfully"
 
 # Verify cluster is still available during/after rebalance
-WRITE_OK=true
 for i in $(seq 1 10); do
-    cql_c1 "INSERT INTO l_test.items (k, v) VALUES ('rebal${i}', 'during_rebalance');" 2>/dev/null || WRITE_OK=false
+    cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO l_test.items (k, v) VALUES ('rebal${i}', 'during_rebalance');" \
+        "[L7] QUORUM write rebal${i} after rebalance"
 done
-$WRITE_OK && pass "[L7] Cluster accepts writes during rebalance" || info "[L7] Some writes failed during rebalance"
+pass "[L7] Cluster accepts writes during rebalance"
 
 # Check ring token distribution via API
 RING=$(curl -s "http://localhost:9090/api/cluster/ring" 2>/dev/null || true)
@@ -1639,8 +1549,8 @@ try:
 except Exception as e:
     print(f'ring parse error: {e}')
 " 2>/dev/null || echo "  (ring API unavailable)")
-    info "[L7] Token skew >= 5% or ring unavailable:"
     info "$TOKEN_INFO"
+    fail "[L7] Token skew >= 5% after rebalance, or the ring API is unavailable"
 fi
 
 echo ""
@@ -1672,13 +1582,13 @@ wait_cql_c 9043 "cluster-node2" 90
 wait_cql_c 9044 "cluster-node3" 90
 
 # Baseline schema
-cql_c1 "CREATE KEYSPACE IF NOT EXISTS fmea WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" 2>/dev/null || true
-cql_c1 "CREATE TABLE IF NOT EXISTS fmea.kv (k text PRIMARY KEY, v text)" 2>/dev/null || true
-sleep 2
+cql_ok 9042 "CREATE KEYSPACE IF NOT EXISTS fmea WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}" \
+    "[FMEA] CREATE KEYSPACE fmea"
+cql_ok 9042 "CREATE TABLE IF NOT EXISTS fmea.kv (k text PRIMARY KEY, v text)" "[FMEA] CREATE TABLE fmea.kv"
 for i in $(seq 1 30); do
-    cql_c1 "INSERT INTO fmea.kv (k, v) VALUES ('base${i}', 'val${i}');" 2>/dev/null || true
+    cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO fmea.kv (k, v) VALUES ('base${i}', 'val${i}');" \
+        "[FMEA] baseline QUORUM write base${i}"
 done
-sleep 2
 pass "[FMEA] Baseline: 30 rows in fmea.kv"
 
 # ------------------------------------------------------------------
@@ -1710,6 +1620,8 @@ if [ "$FMEA1_MODE" = "iptables" ]; then
 fi
 
 if [ "$FMEA1_MODE" = "stop" ]; then
+    # Informational by design: this names which partition method the run used;
+    # both methods are then held to the same assertions below.
     info "[FMEA-1] iptables not available — simulating partition by stopping node3"
     docker compose -f "$CLUSTER_COMPOSE" stop node3
 fi
@@ -1718,11 +1630,11 @@ sleep 5
 
 # Majority side (node1, node2) should continue
 info "[FMEA-1] Writing on majority side (node1/node2)..."
-FMEA1_OK=true
 for i in $(seq 31 50); do
-    cql_c1 "INSERT INTO fmea.kv (k, v) VALUES ('part${i}', 'majority');" 2>/dev/null || FMEA1_OK=false
+    cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO fmea.kv (k, v) VALUES ('part${i}', 'majority');" \
+        "[FMEA-1] QUORUM write part${i} on the majority side"
 done
-$FMEA1_OK && pass "[FMEA-1] QUORUM continues on majority side (node1/node2)" || info "[FMEA-1] Some writes failed on majority side"
+pass "[FMEA-1] QUORUM continues on majority side (node1/node2)"
 
 # Heal the partition
 if [ "$FMEA1_MODE" = "iptables" ]; then
@@ -1733,20 +1645,9 @@ else
     docker compose -f "$CLUSTER_COMPOSE" start node3
     wait_cql_c 9044 "cluster-node3" 60
 fi
-sleep 10
 
-# Verify node3 catches up within 60s
-FMEA1_HEALED=false
-for i in $(seq 1 60); do
-    COUNT=$(cql_c3 "SELECT COUNT(*) FROM fmea.kv;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0)
-    if [ "$COUNT" -ge 50 ]; then
-        FMEA1_HEALED=true
-        pass "[FMEA-1] Isolated node caught up ($COUNT rows) within $((10 + i))s of heal"
-        break
-    fi
-    sleep 1
-done
-$FMEA1_HEALED || { COUNT=$(cql_c3 "SELECT COUNT(*) FROM fmea.kv;" 2>/dev/null | grep -Eo '[0-9]+' | tail -1 || echo 0); info "[FMEA-1] node3 has $COUNT rows after 60s (catch-up incomplete)"; }
+# Verify node3 catches up within 70s of the heal
+wait_for_row_count 9044 fmea.kv 50 "[FMEA-1] isolated node3 rows after heal" 70
 
 # ------------------------------------------------------------------
 # FMEA-2: Coordinator crash mid-write
@@ -1760,6 +1661,8 @@ info ""
 info "=== FMEA-2: Coordinator Crash Mid-Write ==="
 
 info "[FMEA-2] Writing a row via node1 and killing node1 immediately..."
+# Unchecked on purpose: the coordinator is killed mid-write, so either outcome
+# is legal for the client; the assertion is node2/node3 agreement below.
 cql_c1 "INSERT INTO fmea.kv (k, v) VALUES ('crash_test', 'coordinator_write');" 2>/dev/null &
 WRITE_PID=$!
 sleep 0
@@ -1772,11 +1675,10 @@ sleep 3
 R2=$(cql_c2 "SELECT v FROM fmea.kv WHERE k = 'crash_test';" 2>/dev/null | grep -c "coordinator_write" || echo 0)
 R3=$(cql_c3 "SELECT v FROM fmea.kv WHERE k = 'crash_test';" 2>/dev/null | grep -c "coordinator_write" || echo 0)
 
-if [ "$R2" -eq "$R3" ]; then
-    pass "[FMEA-2] node2 and node3 agree on crash_test row (consistent: $R2 copies each)"
-else
-    info "[FMEA-2] Inconsistency detected: node2=$R2 copies, node3=$R3 copies"
+if [ "$R2" -ne "$R3" ]; then
+    fail "[FMEA-2] node2 and node3 disagree on the crash_test row after a coordinator crash: node2=$R2, node3=$R3"
 fi
+pass "[FMEA-2] node2 and node3 agree on crash_test row (consistent: $R2 copies each)"
 
 # Restart node1
 docker compose -f "$CLUSTER_COMPOSE" start node1 >/dev/null 2>&1 || true
@@ -1829,12 +1731,12 @@ if [ -n "$FMEA3_LEADER" ]; then
         done
         sleep 1
     done
-    $FMEA3_NEW_LEADER || info "[FMEA-3] New leader not detected within 10s (disk fill may not trigger step-down)"
-
-    # Clean up the fill file and restart if needed
+    # Clean up the fill file before any fail, so a failed run does not leave
+    # a 4 GiB file in the volume.
     docker compose -f "$CLUSTER_COMPOSE" exec -T "node${FMEA3_LEADER}" rm -f /var/lib/ferrosa/disk_fill_test 2>/dev/null || true
+    $FMEA3_NEW_LEADER || fail "[FMEA-3] No other node reported mode=cluster within 10s of filling node${FMEA3_LEADER}'s disk"
 else
-    info "[FMEA-3] No leader detected — skipping disk full simulation"
+    fail "[FMEA-3] No node reports mode=cluster — cannot run the disk-full scenario"
 fi
 
 # ------------------------------------------------------------------
@@ -1853,22 +1755,23 @@ docker compose -f "$CLUSTER_COMPOSE" exec -T node1 sh -c \
 sleep 3
 
 # Verify cluster continues accepting writes (hint overflow should not block cluster)
-FMEA4_OK=true
 for i in $(seq 1 10); do
-    cql_c1 "INSERT INTO fmea.kv (k, v) VALUES ('hint_overflow${i}', 'val');" 2>/dev/null || FMEA4_OK=false
+    cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO fmea.kv (k, v) VALUES ('hint_overflow${i}', 'val');" \
+        "[FMEA-4] QUORUM write hint_overflow${i} with the hint directory full"
 done
-$FMEA4_OK && pass "[FMEA-4] Cluster continues writing with hint directory full" || info "[FMEA-4] Some writes failed during hint overflow"
+pass "[FMEA-4] Cluster continues writing with hint directory full"
 
-# Check if needs_repair indicator appears (best-effort, may not be implemented yet)
-PEERS=$(cql_c2 "SELECT peer FROM system.peers;" 2>/dev/null || true)
-if echo "$PEERS" | grep -q "needs_repair\|true"; then
-    pass "[FMEA-4] needs_repair=true detected in system.peers"
-else
-    info "[FMEA-4] needs_repair field not detected in system.peers (may not be implemented yet)"
-fi
-
-# Clean up
+# Clean up before asserting, so a failure does not leave 1 GiB behind.
 docker compose -f "$CLUSTER_COMPOSE" exec -T node1 rm -f /var/lib/ferrosa/hints/overflow_test 2>/dev/null || true
+
+# The scenario's claim is that an overflow is surfaced as needs_repair. It
+# used to grep `SELECT peer` output for the word "true" and report INFO when
+# absent, so the claim was never checked. Query the column itself.
+PEERS=$(cqlsh --request-timeout=10 localhost 9043 -e "SELECT peer, needs_repair FROM system.peers;" 2>&1) \
+    || fail "[FMEA-4] system.peers has no readable needs_repair column: $PEERS"
+grep -q "True" <<<"$PEERS" \
+    || fail "[FMEA-4] hint overflow did not surface as needs_repair=true in system.peers: $PEERS"
+pass "[FMEA-4] needs_repair=true detected in system.peers"
 
 # ------------------------------------------------------------------
 # FMEA-5: S3 unavailable during bootstrap
@@ -1888,9 +1791,9 @@ docker compose -f "$CLUSTER_COMPOSE" --profile quint up -d node4 2>/dev/null || 
 sleep 10
 
 # Existing cluster should still be operational
-FMEA5_OK=true
-cql_c1 "INSERT INTO fmea.kv (k, v) VALUES ('s3_down_test', 'cluster_ok');" 2>/dev/null || FMEA5_OK=false
-$FMEA5_OK && pass "[FMEA-5] Existing cluster unaffected by S3 outage during bootstrap" || info "[FMEA-5] Writes to existing cluster failed during S3 outage"
+cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO fmea.kv (k, v) VALUES ('s3_down_test', 'cluster_ok');" \
+    "[FMEA-5] QUORUM write to the existing cluster during the S3 outage"
+pass "[FMEA-5] Existing cluster unaffected by S3 outage during bootstrap"
 
 # Restore rustfs
 info "[FMEA-5] Restoring rustfs..."
@@ -1911,7 +1814,7 @@ for i in $(seq 1 30); do
     fi
     sleep 1
 done
-$NODE4_UP || info "[FMEA-5] node4 did not become ready after rustfs restored (may need manual retry)"
+$NODE4_UP || fail "[FMEA-5] node4 did not become ready within 50s of rustfs being restored"
 
 # Stop node4
 docker compose -f "$CLUSTER_COMPOSE" stop node4 2>/dev/null || true
@@ -1925,7 +1828,8 @@ info ""
 info "=== FMEA-6: Rapid Leader Churn (3 kills in 30s) ==="
 
 # Write a sentinel row before churn
-cql_c1 "INSERT INTO fmea.kv (k, v) VALUES ('pre_churn', 'before');" 2>/dev/null || true
+cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO fmea.kv (k, v) VALUES ('pre_churn', 'before');" \
+    "[FMEA-6] QUORUM sentinel write before churn"
 
 info "[FMEA-6] Performing 3 rapid leader kills..."
 for churn in 1 2 3; do
@@ -1948,8 +1852,7 @@ for churn in 1 2 3; do
         docker compose -f "$CLUSTER_COMPOSE" start "node${CHURN_LEADER}" >/dev/null 2>&1 || true
         sleep 2
     else
-        info "[FMEA-6] No leader found on kill ${churn}/3 — cluster may be converging"
-        sleep 5
+        fail "[FMEA-6] No node reports mode=cluster before kill ${churn}/3"
     fi
 done
 
@@ -1968,20 +1871,14 @@ for i in $(seq 1 30); do
     fi
     sleep 1
 done
-$FMEA6_STABLE || info "[FMEA-6] Cluster not fully stable after 30s"
+$FMEA6_STABLE || fail "[FMEA-6] Not every node answered CQL within 30s of the churn"
 
 # Verify committed data is readable after churn
-FMEA6_DATA_OK=true
-for fn in cql_c1 cql_c2 cql_c3; do
-    RESULT=$($fn "SELECT v FROM fmea.kv WHERE k = 'pre_churn';" 2>/dev/null || true)
-    if echo "$RESULT" | grep -q "before"; then
-        pass "[FMEA-6] ${fn}: pre-churn row readable after rapid leader churn"
-    else
-        info "[FMEA-6] ${fn}: pre-churn row not readable (data may be lost)"
-        FMEA6_DATA_OK=false
-    fi
+for port in 9042 9043 9044; do
+    wait_for_cql_value "$port" "CONSISTENCY QUORUM; SELECT v FROM fmea.kv WHERE k = 'pre_churn';" "before" \
+        "[FMEA-6] pre-churn row via port $port after rapid leader churn"
 done
-$FMEA6_DATA_OK && pass "[FMEA-6] All committed data preserved after rapid leader churn" || info "[FMEA-6] Data loss detected after rapid churn"
+pass "[FMEA-6] All committed data preserved after rapid leader churn"
 
 echo ""
 info "FMEA suite complete."

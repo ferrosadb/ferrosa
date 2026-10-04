@@ -56,17 +56,22 @@ impl CellPath {
 /// over a total order — commutative, associative, and idempotent — which is what lets
 /// element cells converge across replicas independent of delivery order.
 pub fn reconcile(a: &CellValue, b: &CellValue) -> CellValue {
+    reconcile_ref(a, b).clone()
+}
+
+/// [`reconcile`] by reference: the winner of the two, without copying it.
+pub fn reconcile_ref<'a>(a: &'a CellValue, b: &'a CellValue) -> &'a CellValue {
     use std::cmp::Ordering;
     match a.timestamp.cmp(&b.timestamp) {
-        Ordering::Greater => a.clone(),
-        Ordering::Less => b.clone(),
+        Ordering::Greater => a,
+        Ordering::Less => b,
         Ordering::Equal => match (a.is_tombstone(), b.is_tombstone()) {
             // Equal timestamp: a deletion wins the tie (Cassandra semantics).
-            (true, false) => a.clone(),
-            (false, true) => b.clone(),
+            (true, false) => a,
+            (false, true) => b,
             // Same kind: deterministic total-order tiebreak (larger value / cell wins),
             // symmetric so `reconcile(a,b) == reconcile(b,a)`.
-            _ => a.max(b).clone(),
+            _ => a.max(b),
         },
     }
 }

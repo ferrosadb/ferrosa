@@ -5,10 +5,9 @@
 //! the missing condition otherwise.
 //! A failed consensus runtime overrides every deployment-mode shortcut and
 //! returns 503 without awaiting a Raft handle.
-//! Last revised: 2026-09-26
-//! Last changed: A node that declared `FERROSA_EXPECTED_CLUSTER_SIZE` is not ready
-//!   until that topology is met (a booting Standalone pod and a cluster that fell
-//!   back to Pair used to answer 200 while CQL refused connections).
+//! Last revised: 2026-10-03
+//! Last changed: A ready answer names vector indexes being rebuilt under
+//!   `degraded_recall` (ST-81).
 //!
 //! ## Readiness criteria
 //!
@@ -25,10 +24,20 @@
 //! | Cluster    | Ready only once a Raft leader is elected    |
 //! | Degraded*  | Mode rules apply unless consensus failed    |
 //!
+//! Independent of mode, a supervised background task that is failing, stalled
+//! or restarting (`storage_flush`, `maintenance_loop`; see `crate::supervisor`)
+//! answers `503 {"waiting_for":"background_tasks"}` naming each task and its last
+//! failure, until it recovers.
+//!
 //! Independent of mode, a node that holds set-aside commit-log mutations (rows
 //! startup replay could not bind to a schema, durable but invisible to reads)
 //! answers `503 {"waiting_for":"set_aside_mutations"}` with the counts, until
 //! they are re-ingested.
+//!
+//! A vector index whose generations are being rebuilt (FMEA ST-80/ST-81) does
+//! NOT hold readiness: every other query is unaffected. A ready answer then
+//! carries `"degraded_recall": [{"table","index","generations"}]`, because ANN
+//! over that index refuses (retryable) until the rebuild finishes.
 //!
 //! It lives outside the `/api/*` auth middleware so external
 //! orchestrators (docker-compose, k8s, smoke scripts) can probe it without
@@ -82,6 +91,33 @@ fn mode_label(mode: DeploymentMode) -> &'static str {
     }
 }
 
+/// The `200` answer. A vector index with generations being rebuilt still
+/// answers ready — every other query is unaffected — but the body names it
+/// under `degraded_recall`: ANN over it refuses (retryable) until its
+/// sidecars are rebuilt from the rows.
+fn ready_response(storage: &ferrosa_storage::StorageEngine) -> (StatusCode, Json<Value>) {
+    let degraded = storage.degraded_vector_indexes();
+    if degraded.is_empty() {
+        return (StatusCode::OK, Json(json!({"ready": true})));
+    }
+    let degraded: Vec<Value> = degraded
+        .into_iter()
+        .map(|(table, index, generations)| {
+            json!({"table": table.to_string(), "index": index, "generations": generations})
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ready": true,
+            "degraded_recall": degraded,
+            "detail": "vector index generations are being rebuilt from their rows; ANN over \
+                these indexes refuses (retryable) until then; see the ferrosa_index_invalid \
+                metric"
+        })),
+    )
+}
+
 /// `GET /readyz` — leader-aware readiness probe.
 ///
 /// # Standalone / Pair / Degraded modes
@@ -94,6 +130,7 @@ pub async fn readyz_handler(
     State(mc): State<Arc<ModeController>>,
     State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
     State(storage): State<Arc<ferrosa_storage::StorageEngine>>,
+    State(supervision): State<Arc<crate::supervisor::SupervisionStatus>>,
 ) -> (StatusCode, Json<Value>) {
     if !mc.consensus_is_healthy() {
         return (
@@ -102,6 +139,26 @@ pub async fn readyz_handler(
                 "ready": false,
                 "waiting_for": "consensus_runtime",
                 "detail": "consensus runtime failed; retry another node"
+            })),
+        );
+    }
+    // A supervised background task (the flusher, the maintenance loop) that is
+    // failing, stalled or restarting. A node that cannot flush keeps taking
+    // writes into memtables it cannot persist, so it must not look healthy.
+    let impaired = supervision.impaired();
+    if !impaired.is_empty() {
+        let impaired: Vec<Value> = impaired
+            .into_iter()
+            .map(|(task, reason)| json!({"task": task, "reason": reason}))
+            .collect();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ready": false,
+                "waiting_for": "background_tasks",
+                "impaired": impaired,
+                "detail": "a supervised background task is failing or restarting; see the \
+                    reasons and the ferrosa_supervised_task_up metric"
             })),
         );
     }
@@ -174,13 +231,11 @@ pub async fn readyz_handler(
 
     match mode {
         // Standalone always ready: no peers, no Raft.
-        DeploymentMode::Standalone => (StatusCode::OK, Json(json!({"ready": true}))),
+        DeploymentMode::Standalone => ready_response(&storage),
 
         // Pair modes: primary accepts connections, degraded pair allows stale
         // reads. Mirrors `is_cql_ready()` — if CQL is ready, so is the probe.
-        DeploymentMode::Pair | DeploymentMode::DegradedPair => {
-            (StatusCode::OK, Json(json!({"ready": true})))
-        }
+        DeploymentMode::Pair | DeploymentMode::DegradedPair => ready_response(&storage),
 
         // A degraded CLUSTER is not ready, and grouping it with the pair modes
         // above is what made the 2026-08-20 outage invisible. node1 sat outside
@@ -223,7 +278,7 @@ pub async fn readyz_handler(
                 Some(raft) => {
                     let leader = raft.current_leader().await;
                     if leader.is_some() {
-                        (StatusCode::OK, Json(json!({"ready": true})))
+                        ready_response(&storage)
                     } else {
                         (
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -336,6 +391,7 @@ mod tests {
             auth_disabled: true,
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
+            supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
         }
     }
 
@@ -428,6 +484,72 @@ mod tests {
             parsed["ready"], true,
             "standalone node must report ready=true"
         );
+    }
+
+    /// A vector index with a generation it cannot be rebuilt over keeps the
+    /// node ready (other queries are unaffected) but names the index under
+    /// `degraded_recall`, since ANN over it refuses until rebuilt.
+    #[tokio::test]
+    async fn readyz_names_a_vector_index_under_rebuild_as_degraded_recall() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let state = make_state();
+        let storage = Arc::clone(&state.storage);
+        let tid = ferrosa_storage::TableId::new("ks", "docs");
+        storage
+            .register_table(ferrosa_common::TableSchema {
+                keyspace: "ks".into(),
+                table: "docs".into(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ferrosa_common::ColumnDefinition {
+                    name: "embedding".into(),
+                    type_name: "vector<float, 3>".into(),
+                }],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        // Five bytes is no float vector: the rebuild of this generation
+        // fails, so it stays pending for the whole test.
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(
+                0,
+                ferrosa_common::cell::CellValue::live(vec![1, 2, 3, 4, 5], 1000),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        let key = DecoratedKey::new(PartitionKey::new(b"d0".to_vec()));
+        storage.write(&tid, &key, row, 1000).unwrap();
+        storage.flush(&tid).unwrap();
+        storage
+            .add_vector_index(&tid, "idx_embedding", 0, 3)
+            .unwrap();
+
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "degraded recall is not unready"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], true);
+        assert_eq!(
+            parsed["degraded_recall"][0]["index"], "idx_embedding",
+            "{parsed}"
+        );
+        assert_eq!(parsed["degraded_recall"][0]["table"], "ks.docs", "{parsed}");
     }
 
     /// A dead consensus lane overrides deployment mode and returns immediately.
@@ -693,6 +815,39 @@ what made this failure invisible"
             body["failed"].as_array().unwrap().len(),
             1,
             "only the failed one"
+        );
+    }
+
+    /// 2026-10-02, node2: the flush thread panicked and the node answered `/readyz`
+    /// 200 while nothing flushed (t_7681b32b). An impaired supervised task now
+    /// holds readiness, naming the task and its last failure.
+    #[tokio::test]
+    async fn readyz_is_not_ready_while_a_supervised_task_is_impaired() {
+        use crate::supervisor::{Child, FailureKind};
+        let state = make_state();
+        state.supervision.record_failure(
+            Child::StorageFlush,
+            FailureKind::Panic,
+            "storage-flush panicked: complex col_idx 8",
+        );
+        let (status, body) = probe(state.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["waiting_for"], "background_tasks");
+        assert_eq!(body["impaired"][0]["task"], "storage_flush");
+        assert!(
+            body["impaired"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("complex col_idx 8"),
+            "{body}"
+        );
+
+        state.supervision.record_recovery(Child::StorageFlush);
+        assert_eq!(
+            probe(state).await.0,
+            StatusCode::OK,
+            "a recovered task is ready"
         );
     }
 

@@ -208,6 +208,17 @@ pub struct RaftState {
     /// every replica.
     #[serde(default)]
     pub accord_apply_buffer: ReorderBuffer,
+    /// Members whose bootstrap stream completed and was verified, keyed by
+    /// openraft NodeId (P0-4). Written only by
+    /// `RaftOp::RecordBootstrapComplete`; the promote pass moves a `Joining`
+    /// member to `Normal` only when it has an entry here.
+    ///
+    /// `serde(skip)`: adding a field to this struct would change the bincode
+    /// layout of every persisted snapshot, and an upgraded node could no longer
+    /// load the snapshot its previous build wrote. The map travels instead in a
+    /// trailing `SnapshotExtension` after the unchanged `SnapshotData`.
+    #[serde(skip)]
+    pub bootstrap_complete: BTreeMap<u64, super::DataMovementEvidence>,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +232,45 @@ struct SnapshotData {
     state: RaftState,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
+}
+
+/// State appended AFTER the bincode of [`SnapshotData`] (P0-4).
+///
+/// `bincode::deserialize` accepts trailing bytes, so a reader built before this
+/// extension decodes `SnapshotData` and ignores it, and a snapshot written
+/// before it simply has no trailing bytes. That keeps the format compatible in
+/// both directions without touching `RaftState`'s field layout. Add new
+/// snapshot state here (at the end), never to `RaftState` directly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SnapshotExtension {
+    bootstrap_complete: BTreeMap<u64, super::DataMovementEvidence>,
+}
+
+/// Encode a snapshot: `SnapshotData` followed by its [`SnapshotExtension`].
+fn encode_snapshot(data: &SnapshotData) -> bincode::Result<Vec<u8>> {
+    let mut bytes = bincode::serialize(data)?;
+    let ext = SnapshotExtension {
+        bootstrap_complete: data.state.bootstrap_complete.clone(),
+    };
+    bytes.extend(bincode::serialize(&ext)?);
+    Ok(bytes)
+}
+
+/// Decode a snapshot written by [`encode_snapshot`] or by a build that
+/// predates the extension (no trailing bytes → empty extension). A trailing
+/// extension that does not decode is an error, not an empty map: silently
+/// dropping bootstrap records would let the promote pass refuse members that
+/// did complete, or worse, hide corruption.
+fn decode_snapshot(bytes: &[u8]) -> bincode::Result<SnapshotData> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let mut data: SnapshotData = bincode::deserialize_from(&mut cursor)?;
+    let consumed = usize::try_from(cursor.position()).unwrap_or(bytes.len());
+    let rest = &bytes[consumed.min(bytes.len())..];
+    if !rest.is_empty() {
+        let ext: SnapshotExtension = bincode::deserialize(rest)?;
+        data.state.bootstrap_complete = ext.bootstrap_complete;
+    }
+    Ok(data)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,7 +383,7 @@ impl FerrosStateMachine {
             return;
         };
 
-        let mut data: SnapshotData = match bincode::deserialize(&bytes) {
+        let mut data: SnapshotData = match decode_snapshot(&bytes) {
             Ok(data) => data,
             Err(e) => {
                 tracing::warn!(%e, "failed to deserialize cached raft snapshot for membership refresh");
@@ -343,7 +393,7 @@ impl FerrosStateMachine {
         data.last_membership = self.last_membership.clone();
         data.last_applied = self.last_applied;
 
-        let refreshed_bytes = match bincode::serialize(&data) {
+        let refreshed_bytes = match encode_snapshot(&data) {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!(%e, "failed to serialize refreshed raft snapshot membership");
@@ -638,7 +688,7 @@ impl FerrosStateMachine {
         meta: SnapshotMeta<u64, BasicNode>,
         bytes: Vec<u8>,
     ) -> Result<(), StorageIOError<u64>> {
-        let data: SnapshotData = bincode::deserialize(&bytes)
+        let data: SnapshotData = decode_snapshot(&bytes)
             .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
 
         let absent = tables_absent_from_snapshot(&self.state.tables, &data.state.tables);
@@ -705,19 +755,7 @@ impl FerrosStateMachine {
         engine: &StorageEngine,
         table_id: &TableId,
     ) -> ferrosa_common::Result<bool> {
-        if engine.sstable_count(table_id) > 0 {
-            return Ok(true);
-        }
-
-        let table_dir = engine.table_sstable_dir(table_id);
-        if !StorageEngine::list_generations_in_dir(&table_dir).is_empty() {
-            return Ok(true);
-        }
-
-        let persisted_indexes = engine.read_persisted_indexes()?;
-        Ok(persisted_indexes.iter().any(|index| {
-            index.keyspace_name == table_id.keyspace() && index.table_name == table_id.table()
-        }))
+        table_has_local_artifacts(engine, table_id)
     }
 
     /// Unregister tables a snapshot explicitly dropped, exactly as
@@ -926,6 +964,7 @@ impl FerrosStateMachine {
             for (&token, &node_id) in &self.state.token_map {
                 ring.assign_tokens(node_id, &[token]);
             }
+            ring.set_bootstrap_complete(self.state.bootstrap_complete.keys().copied().collect());
 
             let ring = Arc::new(ring);
             if let Some(ring_swap) = &self.ring {
@@ -1710,6 +1749,11 @@ impl FerrosStateMachine {
                     // already been replicated), but the state machine ignores it.
                 } else {
                     let node_id = super::uuid_to_node_id(node_info.host_id);
+                    // A (re)join that starts in `Joining` must bootstrap again:
+                    // an earlier record describes data that may be long gone.
+                    if node_info.state == super::NodeState::Joining {
+                        self.state.bootstrap_complete.remove(&node_id);
+                    }
                     self.state.members.insert(node_id, node_info);
                     // Auto-assign deterministic tokens so a late-joining node
                     // (e.g. the rejoin path via `ClusterDdlForwardHandler`,
@@ -1758,6 +1802,7 @@ impl FerrosStateMachine {
             RaftOp::LeaveNode { node_id } => {
                 schema_changed = false;
                 self.state.members.remove(&node_id);
+                self.state.bootstrap_complete.remove(&node_id);
                 self.state.token_map.retain(|_, n| *n != node_id);
                 self.sync_ring();
                 // Remove departing node from per-index build status.
@@ -1808,6 +1853,30 @@ impl FerrosStateMachine {
             } => {
                 schema_changed = false;
                 self.apply_accord_marked(txn_id, hlc, mutation);
+            }
+
+            // ---- Verified data movement (P0-4) -------------------------
+            RaftOp::RecordBootstrapComplete { node_id, evidence } => {
+                schema_changed = false;
+                if self.state.members.contains_key(&node_id) {
+                    tracing::info!(
+                        node_id,
+                        sessions = evidence.sessions,
+                        ranges = evidence.ranges,
+                        partitions = evidence.partitions,
+                        "bootstrap complete and verified; member may be promoted"
+                    );
+                    self.state.bootstrap_complete.insert(node_id, evidence);
+                    self.sync_ring();
+                } else {
+                    tracing::error!(
+                        node_id,
+                        "refusing RecordBootstrapComplete: node is not a member"
+                    );
+                    apply_errors.push(ApplyError::Other(format!(
+                        "RecordBootstrapComplete for node {node_id}: not a member"
+                    )));
+                }
             }
         }
 
@@ -1907,7 +1976,7 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
             last_membership: self.last_membership.clone(),
         };
 
-        let bytes = bincode::serialize(&data)
+        let bytes = encode_snapshot(&data)
             .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
 
         let snapshot_id = format!(
@@ -2091,6 +2160,28 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
+
+/// Whether `table_id` has anything durable on this node: SSTables (live or on
+/// disk) or a persisted index registration. A table like that cannot be
+/// dropped on the strength of its absence from an incoming schema (CL-22).
+pub(crate) fn table_has_local_artifacts(
+    engine: &StorageEngine,
+    table_id: &TableId,
+) -> ferrosa_common::Result<bool> {
+    if engine.sstable_count(table_id) > 0 {
+        return Ok(true);
+    }
+
+    let table_dir = engine.table_sstable_dir(table_id);
+    if !StorageEngine::list_generations_in_dir(&table_dir).is_empty() {
+        return Ok(true);
+    }
+
+    let persisted_indexes = engine.read_persisted_indexes()?;
+    Ok(persisted_indexes.iter().any(|index| {
+        index.keyspace_name == table_id.keyspace() && index.table_name == table_id.table()
+    }))
+}
 
 /// Convert an error into an `AnyError` for openraft storage errors.
 /// Non-system tables `previous` held that `next` does not: tables whose absence
@@ -5897,5 +5988,210 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// P0-4: the replicated "bootstrap complete" record.
+#[cfg(test)]
+mod bootstrap_record_tests {
+    use super::*;
+    use crate::raft::{DataMovementEvidence, NodeState};
+    use openraft::{CommittedLeaderId, Entry, EntryPayload};
+
+    fn entry(index: u64, op: RaftOp) -> Entry<FerrosRaftConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+            payload: EntryPayload::Normal(RaftCommand {
+                op,
+                schema_version: Uuid::new_v4(),
+            }),
+        }
+    }
+
+    fn joining(host_id: Uuid) -> RaftOp {
+        RaftOp::JoinNode(NodeInfo {
+            host_id,
+            addr: "10.0.0.2:7000".into(),
+            data_center: "dc1".into(),
+            rack: "rack1".into(),
+            state: NodeState::Joining,
+            cql_broadcast: None,
+        })
+    }
+
+    fn evidence() -> DataMovementEvidence {
+        DataMovementEvidence {
+            sessions: 3,
+            ranges: 2,
+            partitions: 17,
+        }
+    }
+
+    /// A record for a `Joining` member is kept, and the live ring carries it
+    /// so the promote pass (which reads the ring) can see it.
+    #[tokio::test]
+    async fn record_for_a_joining_member_is_kept_and_published_to_the_ring() {
+        let mut sm = FerrosStateMachine::new();
+        let ring = Arc::new(ArcSwap::from_pointee(TokenRing::new()));
+        sm.set_ring(ring.clone());
+        let host = Uuid::new_v4();
+        let node_id = crate::raft::uuid_to_node_id(host);
+
+        let responses = sm
+            .apply(vec![
+                entry(1, joining(host)),
+                entry(
+                    2,
+                    RaftOp::RecordBootstrapComplete {
+                        node_id,
+                        evidence: evidence(),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+
+        assert!(matches!(responses[1], RaftResponse::Ok), "{responses:?}");
+        assert_eq!(
+            sm.state().bootstrap_complete.get(&node_id),
+            Some(&evidence())
+        );
+        assert!(
+            ring.load().bootstrap_complete(node_id),
+            "the ring the promote pass reads must carry the record"
+        );
+    }
+
+    /// A record for a node that is not a member is refused loudly, not stored:
+    /// a stale record must not pre-authorise a later join.
+    #[tokio::test]
+    async fn record_for_a_non_member_is_refused() {
+        let mut sm = FerrosStateMachine::new();
+        let responses = sm
+            .apply(vec![entry(
+                1,
+                RaftOp::RecordBootstrapComplete {
+                    node_id: 42,
+                    evidence: evidence(),
+                },
+            )])
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&responses[0], RaftResponse::Error(msg) if msg.contains("not a member")),
+            "a record for a non-member must be an error response, got {responses:?}"
+        );
+        assert!(sm.state().bootstrap_complete.is_empty());
+    }
+
+    /// Leaving the cluster drops the record, and a fresh `Joining` JoinNode
+    /// clears any old one: a node that rejoins must bootstrap again.
+    #[tokio::test]
+    async fn leave_and_rejoin_clear_the_record() {
+        let mut sm = FerrosStateMachine::new();
+        let host = Uuid::new_v4();
+        let node_id = crate::raft::uuid_to_node_id(host);
+        let record = RaftOp::RecordBootstrapComplete {
+            node_id,
+            evidence: evidence(),
+        };
+
+        sm.apply(vec![entry(1, joining(host)), entry(2, record.clone())])
+            .await
+            .unwrap();
+        sm.apply(vec![entry(3, RaftOp::LeaveNode { node_id })])
+            .await
+            .unwrap();
+        assert!(
+            sm.state().bootstrap_complete.is_empty(),
+            "LeaveNode must drop the record"
+        );
+
+        sm.apply(vec![entry(4, joining(host)), entry(5, record)])
+            .await
+            .unwrap();
+        assert!(!sm.state().bootstrap_complete.is_empty());
+        sm.apply(vec![entry(6, joining(host))]).await.unwrap();
+        assert!(
+            sm.state().bootstrap_complete.is_empty(),
+            "a Joining JoinNode must clear an earlier record"
+        );
+    }
+
+    /// The record survives a snapshot build + install.
+    #[tokio::test]
+    async fn record_survives_a_snapshot_round_trip() {
+        let mut sm = FerrosStateMachine::new();
+        let host = Uuid::new_v4();
+        let node_id = crate::raft::uuid_to_node_id(host);
+        sm.apply(vec![
+            entry(1, joining(host)),
+            entry(
+                2,
+                RaftOp::RecordBootstrapComplete {
+                    node_id,
+                    evidence: evidence(),
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+        let snap = sm.build_snapshot().await.unwrap();
+
+        let mut restored = FerrosStateMachine::new();
+        restored
+            .install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            restored.state().bootstrap_complete.get(&node_id),
+            Some(&evidence()),
+            "a snapshot must carry the bootstrap record"
+        );
+    }
+
+    /// A snapshot written by the previous build (no extension) still loads,
+    /// with no records: the upgrade must not strand a node behind its own
+    /// snapshot. And the new format still decodes as the old struct, so a
+    /// not-yet-upgraded peer can load a snapshot an upgraded leader sends.
+    #[tokio::test]
+    async fn snapshot_format_is_compatible_in_both_directions() {
+        let mut sm = FerrosStateMachine::new();
+        let host = Uuid::new_v4();
+        let node_id = crate::raft::uuid_to_node_id(host);
+        sm.apply(vec![
+            entry(1, joining(host)),
+            entry(
+                2,
+                RaftOp::RecordBootstrapComplete {
+                    node_id,
+                    evidence: evidence(),
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+        let snap = sm.build_snapshot().await.unwrap();
+        let new_bytes = snap.snapshot.into_inner();
+
+        // Old reader on new bytes.
+        let old_view: SnapshotData =
+            bincode::deserialize(&new_bytes).expect("old reader must accept the new format");
+        assert!(old_view.state.members.contains_key(&node_id));
+
+        // New reader on old bytes.
+        let old_bytes = bincode::serialize(&old_view).unwrap();
+        let mut restored = FerrosStateMachine::new();
+        restored
+            .install_snapshot(&snap.meta, Box::new(Cursor::new(old_bytes)))
+            .await
+            .expect("new reader must accept a pre-upgrade snapshot");
+        assert!(restored.state().members.contains_key(&node_id));
+        assert!(
+            restored.state().bootstrap_complete.is_empty(),
+            "a pre-upgrade snapshot has no records"
+        );
     }
 }

@@ -24,6 +24,11 @@ pub const FLAG_COMPRESSED: u8 = 0x01;
 pub const FLAG_STREAM_START: u8 = 0x02;
 pub const FLAG_STREAM_END: u8 = 0x04;
 pub const FLAG_FIRE_AND_FORGET: u8 = 0x08;
+/// The frame answers a request with a failure instead of a response: the body
+/// is an [`crate::rpc::error_reply::RpcErrorReply`], and `msg_type` echoes the
+/// request's type. Sent only to peers that advertised
+/// [`crate::handshake::CAP_RPC_ERROR_REPLY`].
+pub const FLAG_RPC_ERROR: u8 = 0x10;
 
 /// Priority lane for a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -165,6 +170,13 @@ pub enum MsgType {
     // routed to that partition's replicas only (t_430c4188)
     IndexReadInPartitionRequest = 0x66,
     IndexReadInPartitionResponse = 0x67,
+    /// Fetch the next page of a CQL result cursor parked on the receiving
+    /// node (ferrosa-cql `result_cursor`). Sent only to a peer that advertised
+    /// [`crate::handshake::CAP_RESULT_CURSOR_PAGE`]: an older node does not
+    /// know this byte and would drop the whole connection.
+    ResultCursorPage = 0x68,
+    /// Reply to [`MsgType::ResultCursorPage`]: the page, or a named refusal.
+    ResultCursorPageReply = 0x69,
     // Accord consensus
     AccordPreAccept = 0x70,
     AccordPreAcceptOK = 0x71,
@@ -303,6 +315,8 @@ impl TryFrom<u8> for MsgType {
             0x65 => Ok(Self::FulltextSearchResponse),
             0x66 => Ok(Self::IndexReadInPartitionRequest),
             0x67 => Ok(Self::IndexReadInPartitionResponse),
+            0x68 => Ok(Self::ResultCursorPage),
+            0x69 => Ok(Self::ResultCursorPageReply),
             0x70 => Ok(Self::AccordPreAccept),
             0x71 => Ok(Self::AccordPreAcceptOK),
             0x72 => Ok(Self::AccordAccept),

@@ -3,44 +3,50 @@
 //! Correctness: Correct when (1) no more than a bounded window of rows is ever
 //! resident between the executor and the socket, whatever the result size;
 //! (2) every row the executor yields is delivered exactly once, in order, across
-//! any number of `Execute` calls on a suspended portal; and (3) a failure after
-//! rows were sent surfaces as an `ErrorResponse`, never as a `CommandComplete`.
-//! Last revised: 2026-09-28
-//! Last changed: Created — replaces the materialize-then-render path
-//!   (t_f348ba0b, FMEA PG-Tf348ba0b).
+//! any number of `Execute` calls on a suspended portal; (3) a failure after
+//! rows were sent surfaces as an `ErrorResponse`, never as a `CommandComplete`;
+//! and (4) a query waiting for its client — a portal suspended by `max_rows`, a
+//! socket that is not draining — holds no thread.
+//! Last revised: 2026-10-03
+//! Last changed: Pull-driven. The executor is an owned `RowCursor` pulled a
+//!   batch at a time on a blocking thread, so a waiting query parks no thread
+//!   (missing-guards entry 8, FMEA PG-Tf348ba0b).
 //!
 //! # Shape
 //!
-//! `ferrosa_sql::execute_streaming` is synchronous and pull-based, so it runs on
-//! a blocking thread (as `offload` did for the collecting call) and pushes its
-//! output through a **bounded** `tokio::sync::mpsc` channel of row *batches*.
-//! The async side pulls a batch at a time, encodes it to `DataRow`s and writes
-//! them to the socket. Three things bound memory:
+//! The query is opened as a [`ferrosa_sql::RowCursor`]: the whole operator
+//! pipeline, owned and `Send`, with nothing pulled yet. Pulling may block (on
+//! storage, on spilled runs), so a pull runs on a blocking thread — a *fetch*
+//! of at most [`RESULT_BATCH_ROWS`] rows that returns the cursor with the rows.
+//! The async side encodes a batch to `DataRow`s and writes it to the socket.
 //!
-//! - the producer holds at most one batch while it fills it,
-//! - the channel holds [`RESULT_CHANNEL_BATCHES`] batches, and
-//! - a suspended portal holds at most the unsent remainder of one batch.
+//! As soon as one batch arrives the next fetch starts, so the executor works
+//! while the socket write is in flight. A fetch never waits on the client: it
+//! ends when it has a batch, or the result ends. Between fetches the cursor is
+//! just a value, so neither a suspended portal nor a client that stopped
+//! reading holds a thread. Memory is bounded by
 //!
-//! Backpressure is the channel: while the socket (or a suspended portal) is not
-//! draining, the producer blocks in `blocking_send` and the pipeline does not
-//! advance. Dropping the [`ResultStream`] (portal `Close`, disconnect, session
-//! end) closes the receiver; the producer's next send fails and it stops, which
-//! drops the scan and, through it, the storage producer.
+//! - one batch being encoded or sent,
+//! - one prefetched batch, and
+//! - for a suspended portal, the unsent remainder of a batch.
 //!
-//! # Cost of suspension
+//! Dropping the [`ResultStream`] (portal `Close`, disconnect, session end)
+//! drops the cursor, and with it the scans and their storage producers; an
+//! in-flight fetch sees the cancel flag at its next row and stops.
 //!
-//! A suspended portal parks one `spawn_blocking` thread in `blocking_send`. The
-//! runtimes cap blocking threads (`max_blocking_threads`), so many concurrently
-//! suspended portals consume that budget until they are closed or the
-//! transaction ends. This is the price of not re-running the query per `Execute`
-//! and is recorded in FMEA PG-Tf348ba0b.
+//! # Below the executor
+//!
+//! A storage scan the cursor reads from is fed by a producer on the scan pool.
+//! When the cursor is not pulled, that producer gives back its pool slot at
+//! once and, after a short grace, its thread too, and resumes from its cursor
+//! key when rows are wanted again (`ferrosa-storage`, FMEA PG-Tf348ba0b).
 
 use std::collections::VecDeque;
 use std::io;
-use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use ferrosa_sql::{Catalog, Column, ColumnType, ExecError, Row, RowSink, SelectStmt, SpillCtx};
-use tokio::sync::mpsc;
+use ferrosa_sql::{Catalog, Column, ColumnType, ExecError, Row, RowCursor, SelectStmt, SpillCtx};
 use tokio::task::JoinHandle;
 
 use crate::messages::BackendMessage;
@@ -50,102 +56,73 @@ use crate::query::{
 };
 use crate::storage_provider::ScanFailure;
 
-/// Rows per batch handed from the executor thread to the async side.
+/// Rows one fetch pulls from the executor: the unit of work a blocking thread
+/// does per turn, and the unit handed to the socket.
 pub(crate) const RESULT_BATCH_ROWS: usize = 16;
 
-/// Batches the channel holds; with [`RESULT_BATCH_ROWS`] this is the whole
-/// in-flight window between executor and socket.
-pub(crate) const RESULT_CHANNEL_BATCHES: usize = 2;
-
-/// One message from the executor thread to the async consumer.
-enum Item {
-    Columns(Vec<Column>),
-    Rows(Vec<Row>),
-    /// The pipeline ran to completion.
+/// How a fetch left the cursor.
+enum FetchEnd {
+    /// The batch is full; the cursor has (or may have) more.
+    More(RowCursor),
+    /// The result ended after this batch.
     Done,
-    /// The pipeline failed; rows already sent are an incomplete result.
+    /// The pipeline failed after this batch; what was sent is incomplete.
     Failed(ExecError),
+    /// The stream was dropped while the fetch ran; nobody reads this.
+    Cancelled,
 }
 
-/// [`RowSink`] that batches rows into a bounded channel.
-struct ChannelSink {
-    tx: mpsc::Sender<Item>,
-    batch: Vec<Row>,
+/// One fetch's output: the rows, then how the cursor ended.
+struct Fetched {
+    rows: Vec<Row>,
+    end: FetchEnd,
 }
 
-impl ChannelSink {
-    fn new(tx: mpsc::Sender<Item>) -> Self {
-        Self {
-            tx,
-            batch: Vec::with_capacity(RESULT_BATCH_ROWS),
+/// Body of one fetch: pull up to [`RESULT_BATCH_ROWS`] rows. Runs on a
+/// blocking thread and waits only on the executor's own inputs, never on the
+/// client, so it always ends in bounded time.
+fn fetch(mut cursor: RowCursor, cancel: &AtomicBool) -> Fetched {
+    let mut rows = Vec::with_capacity(RESULT_BATCH_ROWS);
+    while rows.len() < RESULT_BATCH_ROWS {
+        if cancel.load(Ordering::Acquire) {
+            return Fetched {
+                rows,
+                end: FetchEnd::Cancelled,
+            };
+        }
+        match cursor.next_row() {
+            Some(Ok(row)) => rows.push(row),
+            Some(Err(error)) => {
+                return Fetched {
+                    rows,
+                    end: FetchEnd::Failed(error),
+                }
+            }
+            None => {
+                return Fetched {
+                    rows,
+                    end: FetchEnd::Done,
+                }
+            }
         }
     }
-
-    /// Send one item, blocking while the channel is full. `Break` means the
-    /// consumer dropped the stream.
-    fn send(&self, item: Item) -> ControlFlow<()> {
-        match self.tx.blocking_send(item) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
-        }
-    }
-
-    fn flush(&mut self) -> ControlFlow<()> {
-        if self.batch.is_empty() {
-            return ControlFlow::Continue(());
-        }
-        let full = std::mem::replace(&mut self.batch, Vec::with_capacity(RESULT_BATCH_ROWS));
-        self.send(Item::Rows(full))
-    }
-
-    /// Flush the partial batch, then send the terminal item.
-    fn finish(&mut self, end: Item) -> ControlFlow<()> {
-        self.flush()?;
-        self.send(end)
-    }
-}
-
-impl RowSink for ChannelSink {
-    fn columns(&mut self, columns: &[Column]) -> ControlFlow<()> {
-        self.send(Item::Columns(columns.to_vec()))
-    }
-
-    fn row(&mut self, row: Row) -> ControlFlow<()> {
-        self.batch.push(row);
-        if self.batch.len() >= RESULT_BATCH_ROWS {
-            self.flush()
-        } else {
-            ControlFlow::Continue(())
-        }
+    Fetched {
+        rows,
+        end: FetchEnd::More(cursor),
     }
 }
 
-/// Body of the blocking producer thread.
-fn run_producer<C: Catalog>(
-    stmt: &SelectStmt,
-    catalog: &C,
-    default_schema: &str,
-    params: &[ferrosa_sql::Value],
-    tx: mpsc::Sender<Item>,
-) {
-    let mut sink = ChannelSink::new(tx);
-    let outcome = ferrosa_sql::execute_streaming(
-        stmt,
-        catalog,
-        default_schema,
-        params,
-        &SpillCtx::default(),
-        &mut sink,
-    );
-    let end = match outcome {
-        Ok(()) => Item::Done,
-        Err(error) => Item::Failed(error),
-    };
-    if sink.finish(end).is_break() {
-        // Designed and observable: the consumer closed the portal or the
-        // connection went away, so nobody is left to read the rest.
-        tracing::debug!("result consumer went away before the stream ended");
-    }
+/// Where the executor is, between and during fetches.
+enum Exec {
+    /// A fetch is running, or finished and waiting to be collected.
+    Fetching(JoinHandle<Fetched>),
+    /// The result ended; nothing is left to pull.
+    Done,
+    /// The pipeline failed; reported once the rows before it are sent.
+    Failed(ExecError),
+    /// The stream gave up on the query (an encode failure, or drop); any
+    /// further pull is an internal error, never an end of result.
+    Abandoned,
 }
 
 /// How one [`ResultStream::pump`] call ended.
@@ -182,15 +159,16 @@ enum Batch {
 /// A running query whose rows are pulled on demand.
 pub(crate) struct ResultStream {
     columns: Vec<Column>,
-    rx: mpsc::Receiver<Item>,
-    producer: JoinHandle<()>,
+    exec: Exec,
     /// Unsent remainder of the last batch received.
     buffered: VecDeque<Row>,
     failure: ScanFailure,
+    /// Set on drop; an in-flight fetch stops at its next row.
+    cancel: Arc<AtomicBool>,
 }
 
-/// Start `stmt` on a blocking thread and wait for its column metadata, so a
-/// resolution error is reported before any output.
+/// Resolve and open `stmt` on a blocking thread, so a resolution error is
+/// reported before any output, and start fetching its first batch.
 ///
 /// # Errors
 ///
@@ -210,29 +188,49 @@ pub(crate) async fn open_stream<C>(
 where
     C: Catalog + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel(RESULT_CHANNEL_BATCHES);
-    let producer = tokio::task::spawn_blocking(move || {
-        run_producer(&stmt, &catalog, &default_schema, &params, tx);
-    });
-    let mut stream = ResultStream {
-        columns: Vec::new(),
-        rx,
-        producer,
+    let opened = tokio::task::spawn_blocking(move || {
+        ferrosa_sql::open_cursor(
+            &stmt,
+            &catalog,
+            &default_schema,
+            &params,
+            &SpillCtx::default(),
+        )
+    })
+    .await;
+    let cursor = match opened {
+        Ok(Ok(cursor)) => cursor,
+        Ok(Err(error)) => {
+            return Err(check_scan_failure(&failure).unwrap_or_else(|| exec_error_response(&error)))
+        }
+        Err(join_error) => return Err(executor_died(join_error)),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    Ok(ResultStream {
+        columns: cursor.columns().to_vec(),
+        exec: Exec::Fetching(spawn_fetch(cursor, &cancel)),
         buffered: VecDeque::new(),
         failure,
-    };
-    match stream.rx.recv().await {
-        Some(Item::Columns(columns)) => {
-            stream.columns = columns;
-            Ok(stream)
-        }
-        Some(Item::Failed(error)) => Err(stream.failure_or(&error)),
-        Some(Item::Rows(_) | Item::Done) => Err(error_response(
-            "XX000",
-            "internal error: query stream began without column metadata",
-        )),
-        None => Err(stream.producer_died().await),
+        cancel,
+    })
+}
+
+/// Pull the next batch from `cursor` on a blocking thread.
+fn spawn_fetch(cursor: RowCursor, cancel: &Arc<AtomicBool>) -> JoinHandle<Fetched> {
+    let cancel = Arc::clone(cancel);
+    tokio::task::spawn_blocking(move || fetch(cursor, &cancel))
+}
+
+/// A fetch's blocking task did not return: re-raise a panic, report anything
+/// else (runtime shutdown) as an internal error.
+fn executor_died(join_error: tokio::task::JoinError) -> BackendMessage {
+    if join_error.is_panic() {
+        std::panic::resume_unwind(join_error.into_panic());
     }
+    error_response(
+        "XX000",
+        &format!("internal error: query executor was cancelled: {join_error}"),
+    )
 }
 
 impl ResultStream {
@@ -241,47 +239,54 @@ impl ResultStream {
         &self.columns
     }
 
-    /// A recorded storage failure outranks an executor error computed from the
-    /// truncated scan beneath it.
-    fn failure_or(&self, error: &ExecError) -> BackendMessage {
-        check_scan_failure(&self.failure).unwrap_or_else(|| exec_error_response(error))
-    }
-
-    /// The channel closed with no terminal item: the executor thread died.
-    async fn producer_died(&mut self) -> BackendMessage {
-        match (&mut self.producer).await {
-            Err(join_error) if join_error.is_panic() => {
-                std::panic::resume_unwind(join_error.into_panic())
-            }
-            Err(join_error) => error_response(
-                "XX000",
-                &format!("internal error: query executor was cancelled: {join_error}"),
-            ),
-            Ok(()) => error_response(
-                "XX000",
-                "internal error: query stream ended without completing",
-            ),
-        }
-    }
-
+    /// Wait for the in-flight fetch and buffer its rows, starting the next
+    /// fetch at once if the result goes on. Rows are reported before the end
+    /// or failure that followed them.
     async fn next_batch(&mut self) -> Batch {
-        match self.rx.recv().await {
-            Some(Item::Rows(rows)) => {
-                self.buffered.extend(rows);
-                Batch::Rows
+        loop {
+            let handle = match &mut self.exec {
+                Exec::Fetching(handle) => handle,
+                Exec::Done => {
+                    return match check_scan_failure(&self.failure) {
+                        // A scan that died closed its channel, so the executor
+                        // finished "successfully" over a short row set. Never
+                        // report that as done.
+                        Some(error) => Batch::Failed(error),
+                        None => Batch::End,
+                    };
+                }
+                // A recorded storage failure outranks an executor error
+                // computed from the truncated scan beneath it.
+                Exec::Failed(error) => {
+                    return Batch::Failed(
+                        check_scan_failure(&self.failure)
+                            .unwrap_or_else(|| exec_error_response(error)),
+                    )
+                }
+                Exec::Abandoned => {
+                    return Batch::Failed(error_response(
+                        "XX000",
+                        "internal error: the query was abandoned and has no more rows",
+                    ))
+                }
+            };
+            let fetched = match handle.await {
+                Ok(fetched) => fetched,
+                Err(join_error) => {
+                    self.exec = Exec::Done;
+                    return Batch::Failed(executor_died(join_error));
+                }
+            };
+            self.exec = match fetched.end {
+                FetchEnd::More(cursor) => Exec::Fetching(spawn_fetch(cursor, &self.cancel)),
+                FetchEnd::Done => Exec::Done,
+                FetchEnd::Failed(error) => Exec::Failed(error),
+                FetchEnd::Cancelled => Exec::Abandoned,
+            };
+            if !fetched.rows.is_empty() {
+                self.buffered.extend(fetched.rows);
+                return Batch::Rows;
             }
-            Some(Item::Done) => match check_scan_failure(&self.failure) {
-                // A scan that died closed its channel, so the executor finished
-                // "successfully" over a short row set. Never report that as done.
-                Some(error) => Batch::Failed(error),
-                None => Batch::End,
-            },
-            Some(Item::Failed(error)) => Batch::Failed(self.failure_or(&error)),
-            Some(Item::Columns(_)) => Batch::Failed(error_response(
-                "XX000",
-                "internal error: query stream repeated its column metadata",
-            )),
-            None => Batch::Failed(self.producer_died().await),
         }
     }
 
@@ -345,9 +350,12 @@ impl ResultStream {
         (messages, None)
     }
 
-    /// Stop the executor: close the receiver so its next send fails.
+    /// Stop the executor. An in-flight fetch stops at its next row and drops
+    /// the cursor (its scans and spill files) when it returns; a finished one
+    /// is dropped with its handle.
     fn abandon(&mut self) {
-        self.rx.close();
+        self.cancel.store(true, Ordering::Release);
+        self.exec = Exec::Abandoned;
         self.buffered.clear();
     }
 }
@@ -382,7 +390,7 @@ mod tests {
             &self.schema
         }
 
-        fn scan(&self) -> Box<dyn Iterator<Item = Row> + '_> {
+        fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
             let produced = Arc::clone(&self.produced);
             let poison_at = self.poison_at;
             Box::new((0..self.n).map(move |i| {
@@ -505,6 +513,52 @@ mod tests {
             }
         }
         assert_eq!(seen, (0..100).collect::<Vec<_>>());
+    }
+
+    /// A suspended stream holds no blocking thread. With a blocking pool of
+    /// one thread, a stream parked in a send would leave nothing for anyone
+    /// else; here another blocking task runs while several streams sit
+    /// suspended mid-result.
+    #[test]
+    fn a_suspended_stream_holds_no_blocking_thread() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome = rt.block_on(async {
+            let mut suspended = Vec::new();
+            // Opening the next stream needs a blocking thread too, so a stream
+            // that kept one stalls the loop: every step has a deadline.
+            let step = Duration::from_secs(10);
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = tokio::time::timeout(step, open(100_000, None)).await
+                else {
+                    return Err(format!(
+                        "opening a stream stalled beside {} suspended streams",
+                        suspended.len()
+                    ));
+                };
+                let mut out: Vec<BackendMessage> = Vec::new();
+                let end = stream.pump(Some(1), &[], &mut out).await.expect("pump");
+                assert!(matches!(end, PumpEnd::Suspended), "got {end:?}");
+                suspended.push(stream);
+            }
+            let probe = tokio::task::spawn_blocking(|| std::thread::current().id());
+            match tokio::time::timeout(step, probe).await {
+                Ok(_) => Ok(()),
+                Err(_) => Err(format!(
+                    "a blocking task could not run beside {} suspended streams",
+                    suspended.len()
+                )),
+            }
+        });
+        // A thread parked forever must fail the test, not hang its teardown.
+        rt.shutdown_timeout(Duration::from_secs(1));
+        if let Err(message) = outcome {
+            panic!("{message}");
+        }
     }
 
     /// Dropping the stream (portal Close, disconnect) stops the executor: the

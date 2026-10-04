@@ -23,6 +23,7 @@
 pub mod bootstrap;
 pub mod cluster;
 pub mod cluster_rejoin;
+pub mod data_movement;
 mod invite;
 pub mod jsonb_gate;
 mod membership;
@@ -119,6 +120,8 @@ pub(super) struct PairContext {
     pub(super) peer_host_id: Uuid,
     #[allow(dead_code)]
     pub(super) peer_addr: SocketAddr,
+    /// Data catch-up replayed to this peer after a force-promoted re-pair.
+    pub(super) catch_up: Arc<crate::pair::switchover::CatchUpGate>,
 }
 
 /// Atomic counters for lock contention measurements.
@@ -602,6 +605,7 @@ impl ModeController {
             role,
             peer_host_id: Uuid::new_v4(),
             peer_addr: "127.0.0.1:7000".parse().unwrap(),
+            catch_up: Arc::default(),
         };
 
         Arc::new(Self {
@@ -663,6 +667,18 @@ impl ModeController {
     /// `/admin/membership-snapshot` endpoint (Sprint 2 W2.3).
     pub fn peer_manager_arc(&self) -> Option<Arc<ferrosa_net::peer::PeerManager>> {
         self.peer_manager.load().as_ref().clone()
+    }
+
+    /// This controller as the event listener of the peer manager it will own.
+    ///
+    /// Weak, so `PeerManager::with_weak_listener` does not form a cycle with
+    /// `set_peer_manager`: a strong one kept every controller, its storage
+    /// engine and the engine's threads alive forever (CL-35).
+    pub fn as_peer_listener(
+        self: &Arc<Self>,
+    ) -> std::sync::Weak<dyn ferrosa_net::peer::PeerEventListener> {
+        let listener: Arc<dyn ferrosa_net::peer::PeerEventListener> = self.clone();
+        Arc::downgrade(&listener)
     }
 
     pub fn set_peer_manager(self: &Arc<Self>, pm: Arc<ferrosa_net::peer::PeerManager>) {
@@ -953,6 +969,15 @@ impl ModeController {
     /// [`crate::coordinator::ClusterCoordinator::with_hint_store`].
     pub fn hint_store(&self) -> Arc<HintStore> {
         self.hint_store.clone()
+    }
+
+    /// Replace the set of connected peers without a network handshake.
+    ///
+    /// **Test helper**, like [`Self::set_mode_for_test`]: lets external-crate
+    /// tests state which members are up for checks that read it (the operator
+    /// downgrade). Production code must never call this.
+    pub fn set_connected_peers_for_test(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        *self.connected_peers.lock() = peers;
     }
 
     /// Override the deployment mode without performing a real cluster transition.

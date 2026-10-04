@@ -31,11 +31,14 @@ pub(crate) mod flush_executor;
 pub mod fulltext_observability;
 pub(crate) mod generation_guard;
 pub mod index;
+pub(crate) mod lockfree;
 pub mod manifest;
 pub mod memtable;
 pub mod merge;
 pub mod metrics;
 pub mod observer;
+pub mod ordinal_space;
+pub mod partition_apply;
 pub mod pin_config;
 pub mod quantized_range_cache;
 pub mod quarantine;
@@ -50,6 +53,8 @@ pub mod snapshot;
 pub mod spill_budget;
 pub mod spilling_dedup;
 pub(crate) mod sstable_health;
+#[cfg(test)]
+mod static_column_flush_tests;
 pub mod store;
 pub mod subscription_observer;
 pub mod table_drops;
@@ -86,7 +91,7 @@ pub use memtable::Memtable;
 pub use merge::merge_partitions;
 pub use observer::{ObserverConfig, ObserverMode, WriteObserver};
 pub use spill_budget::{process_spill_threshold_bytes, spill_threshold_bytes};
-pub use store::{TableStore, VectorIndexMethod};
+pub use store::{range_scan_resumes_total, TableStore, VectorIndexMethod};
 pub use subscription_observer::{
     SubscriptionConfig, SubscriptionFilter, SubscriptionId, SubscriptionObserver,
 };

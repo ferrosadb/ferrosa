@@ -142,9 +142,20 @@ fn cql_value_payload_bytes(v: &CqlValue) -> usize {
         // The canonical cell bytes are the heap payload (jsonb is document-sized,
         // so it must never account as 0: ST-T150-01).
         CqlValue::Jsonb(j) => j.as_bytes().len(),
-        // Heap-allocated payloads whose size is not tracked precisely.
-        // Listed explicitly so a new variant must choose its accounting.
-        CqlValue::Decimal { .. } | CqlValue::Varint(_) | CqlValue::Udt(_) => 0,
+        // A UDT owns its field names and values; counting it as 0 let rows of
+        // large UDTs accumulate past the spill threshold unaccounted.
+        CqlValue::Udt(fields) => fields
+            .iter()
+            .map(|(name, value)| {
+                name.len()
+                    + std::mem::size_of::<(String, Option<CqlValue>)>()
+                    + value.as_ref().map_or(0, cql_value_payload_bytes)
+            })
+            .sum(),
+        // Arbitrary precision: the digit buffer grows with the magnitude.
+        CqlValue::Varint(n) | CqlValue::Decimal { unscaled: n, .. } => {
+            usize::try_from(n.bits().div_ceil(8)).unwrap_or(usize::MAX)
+        }
     }
 }
 
@@ -401,6 +412,47 @@ pub enum SortedRows<T = Row, C = RowOrder> {
     Merged(KWayMerge<T, C>),
 }
 
+impl<T: SpillRow, C: SpillOrder<T>> SortedRows<T, C> {
+    /// Whether the remaining rows are read from run files (`true`) or held in
+    /// memory (`false`).
+    pub fn is_disk_backed(&self) -> bool {
+        matches!(self, SortedRows::Merged(_))
+    }
+
+    /// Move whatever an in-memory result still holds onto disk, so the value
+    /// can be kept between requests without pinning up to a spill threshold of
+    /// rows on the heap. A result already read from runs is returned as is.
+    ///
+    /// A server-side result cursor parks a [`SortedRows`] between pages for as
+    /// long as its client takes to ask for the next one. An un-spilled result
+    /// can hold up to the spill threshold (half the process budget by default),
+    /// so a handful of idle clients could pin the node's memory. On disk, a
+    /// parked result costs one buffered reader and one head row.
+    ///
+    /// `dir` must be the directory this result's runs live in (it is removed
+    /// with them); the run is created with `create_new`, so a second call into
+    /// the same directory fails loud rather than overwriting rows.
+    pub fn into_disk_backed(self, dir: &std::path::Path, order: C) -> Result<Self> {
+        let rows = match self {
+            SortedRows::Merged(merger) => return Ok(SortedRows::Merged(merger)),
+            SortedRows::InMemory(rows) => rows,
+        };
+        let path = dir.join("parked-run.bin");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| io_error(format!("external sort: create {}: {e}", path.display())))?;
+        let mut w = BufWriter::new(file);
+        for row in rows {
+            write_row(&mut w, &row)?;
+        }
+        w.flush()
+            .map_err(|e| io_error(format!("external sort: flush {}: {e}", path.display())))?;
+        Ok(SortedRows::Merged(KWayMerge::open(&[path], order)?))
+    }
+}
+
 impl<T: SpillRow, C: SpillOrder<T>> Iterator for SortedRows<T, C> {
     type Item = Result<T>;
 
@@ -526,6 +578,47 @@ mod tests {
         assert!(estimate_row_bytes(&row) > 1000);
     }
 
+    /// A UDT owns its fields' payloads. Counting it as 0 let an ORDER BY over
+    /// rows of large UDTs accumulate without ever reaching the spill
+    /// threshold — the unbounded in-memory sort this module exists to prevent.
+    #[test]
+    fn udt_payload_counts_its_fields() {
+        let big = "x".repeat(10_000);
+        let udt = CqlValue::Udt(vec![
+            ("name".to_string(), Some(CqlValue::Text(big))),
+            ("tags".to_string(), Some(CqlValue::Blob(vec![0; 5_000]))),
+            ("gone".to_string(), None),
+        ]);
+        let bytes = cql_value_payload_bytes(&udt);
+        assert!(
+            bytes >= 15_000,
+            "a UDT holding 15,000 payload bytes accounted as {bytes}"
+        );
+        // Nested: a list of UDTs accounts each element's fields.
+        let list = CqlValue::List(vec![udt.clone(), udt]);
+        assert!(cql_value_payload_bytes(&list) >= 30_000);
+    }
+
+    /// Arbitrary-precision numbers own a heap buffer proportional to their
+    /// magnitude; a 10,000-digit varint is several KiB, not 0.
+    #[test]
+    fn varint_and_decimal_payload_counts_their_magnitude() {
+        let huge: num_bigint::BigInt = "9".repeat(10_000).parse().expect("decimal digits");
+        let varint = cql_value_payload_bytes(&CqlValue::Varint(huge.clone()));
+        assert!(
+            varint >= 4_000,
+            "a 10,000-digit varint accounted as {varint}"
+        );
+        let decimal = cql_value_payload_bytes(&CqlValue::Decimal {
+            scale: 2,
+            unscaled: huge,
+        });
+        assert!(
+            decimal >= 4_000,
+            "a 10,000-digit decimal accounted as {decimal}"
+        );
+    }
+
     #[test]
     fn no_wildcard_default_for_new_variant() {
         // Variable-length payloads are counted; a large document-like value
@@ -568,6 +661,33 @@ mod tests {
         assert!(!s.spilled());
         let out: Vec<i64> = s.finish().unwrap().map(|r| ival(&r.unwrap())).collect();
         assert_eq!(out, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// Parking an in-memory result moves its REMAINING rows to disk, in order,
+    /// and keeps nothing on the heap but the merge head.
+    #[test]
+    fn into_disk_backed_keeps_the_remaining_rows_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let order = RowOrder::new(vec![(0, true)]);
+        let mut s = ExternalSorter::new(dir.path(), order.clone(), u64::MAX);
+        for v in [5i64, 1, 3, 2, 4] {
+            s.push(irow(v)).unwrap();
+        }
+        let mut rows = s.finish().unwrap();
+        assert!(!rows.is_disk_backed());
+        assert_eq!(ival(&rows.next().unwrap().unwrap()), 1);
+        let rows = rows.into_disk_backed(dir.path(), order.clone()).unwrap();
+        assert!(rows.is_disk_backed());
+        let out: Vec<i64> = rows.map(|r| ival(&r.unwrap())).collect();
+        assert_eq!(out, vec![2, 3, 4, 5]);
+        // A second park into the same directory must not overwrite the first.
+        let mut again = ExternalSorter::new(dir.path(), order.clone(), u64::MAX);
+        again.push(irow(1)).unwrap();
+        assert!(again
+            .finish()
+            .unwrap()
+            .into_disk_backed(dir.path(), order)
+            .is_err());
     }
 
     #[test]

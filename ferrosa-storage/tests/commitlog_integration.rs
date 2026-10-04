@@ -71,6 +71,16 @@ fn count_segment_files(dir: &Path) -> usize {
         .count()
 }
 
+/// Names of the commit-log segment files in `dir`.
+fn segment_file_names(dir: &std::path::Path) -> HashSet<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| n.starts_with("commitlog-") && n.ends_with(".log"))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: append_replay_round_trip
 // ---------------------------------------------------------------------------
@@ -643,6 +653,7 @@ fn open_and_replay_streaming_deletes_segments_after_callback() {
 
     let before = count_segment_files(dir.path());
     assert!(before >= 2, "need at least 2 segment files; got {before}");
+    let replayed_files = segment_file_names(dir.path());
 
     let config2 = CommitLogConfig {
         segment_size: 512,
@@ -656,22 +667,14 @@ fn open_and_replay_streaming_deletes_segments_after_callback() {
     .unwrap();
     assert!(callback_count > 0, "callback was never invoked");
 
-    // After streaming replay, only the freshly-allocated active segment of
-    // cl2 may remain; all replayed segments must be deleted.
-    let after_replay_files: HashSet<String> = fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            e.path()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-        })
-        .filter(|n| n.starts_with("commitlog-") && n.ends_with(".log"))
-        .collect();
+    // Every segment of the replayed generation is deleted. What remains is
+    // the new generation, which holds the re-logged copies of the replayed
+    // mutations (open_and_replay_streaming re-logs everything it delivers).
+    let after_replay_files = segment_file_names(dir.path());
+    let survivors: Vec<&String> = replayed_files.intersection(&after_replay_files).collect();
     assert!(
-        after_replay_files.len() <= 1,
-        "replayed segments must be deleted; remaining: {after_replay_files:?}"
+        survivors.is_empty(),
+        "replayed segments must be deleted; remaining: {survivors:?}"
     );
 
     cl2.shutdown().unwrap();

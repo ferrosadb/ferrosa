@@ -38,7 +38,8 @@
 //! measurement window).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -60,15 +61,37 @@ use ferrosa_net::config::NetConfig;
 use ferrosa_net::peer::{PeerEventListener, PeerManager};
 
 // --- peak-allocation tracker (scoped to this integration-test binary) ---
+//
+// Counts only allocations made by threads in the MEASURED SCOPE while a window
+// is open. A scope is one test's runtime: its own thread (the one calling
+// `block_on`) plus every thread the runtime starts, blocking-pool threads
+// included, because the fulltext walk runs on `spawn_blocking`. The window
+// flag used to be process-global, so allocations of other tests running
+// beside the measured one (seeding 8 000 x 4 KiB docs) were counted too, which
+// made the doc-size ratio a function of load (t_e3aabb17). Same idea as
+// f9ce2c65's thread-local arming, widened from one thread to one runtime.
 struct TrackingAlloc;
-static ARMED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    // `const` init: reading it never allocates, so it is safe inside `alloc`.
+    static SCOPE: Cell<u64> = const { Cell::new(0) };
+}
+/// The scope whose allocations are being counted; 0 = no window open.
+static ACTIVE_SCOPE: AtomicU64 = AtomicU64::new(0);
+static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
 static LIVE: AtomicI64 = AtomicI64::new(0);
 static PEAK: AtomicI64 = AtomicI64::new(0);
+
+/// Whether the current thread's allocations count right now. `try_with`
+/// because the allocator runs during thread-local teardown too (not counted).
+fn counting() -> bool {
+    let active = ACTIVE_SCOPE.load(Ordering::Relaxed);
+    active != 0 && SCOPE.try_with(Cell::get).is_ok_and(|scope| scope == active)
+}
 
 unsafe impl GlobalAlloc for TrackingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() && ARMED.load(Ordering::Relaxed) {
+        if !ptr.is_null() && counting() {
             let live =
                 LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed) + layout.size() as i64;
             PEAK.fetch_max(live, Ordering::Relaxed);
@@ -76,7 +99,7 @@ unsafe impl GlobalAlloc for TrackingAlloc {
         ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ARMED.load(Ordering::Relaxed) {
+        if counting() {
             // Clamp at zero. `measure_peak` zeroes LIVE at arm time, so a free
             // of memory allocated BEFORE the window would otherwise push the
             // counter negative — and because PEAK is a running maximum of LIVE,
@@ -98,13 +121,32 @@ static ALLOC: TrackingAlloc = TrackingAlloc;
 
 static MEASURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn measure_peak<R>(f: impl FnOnce() -> R) -> (R, i64) {
+/// A fresh measurement scope.
+fn new_scope() -> u64 {
+    NEXT_SCOPE.fetch_add(1, Ordering::SeqCst)
+}
+
+/// A current-thread runtime whose threads (blocking pool included) belong to
+/// `scope`.
+fn measured_runtime(scope: u64) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_start(move || SCOPE.with(|s| s.set(scope)))
+        .build()
+        .unwrap()
+}
+
+/// Run `f` on this thread with `scope`'s allocations counted; returns the
+/// peak additional heap of that scope during `f`.
+fn measure_peak<R>(scope: u64, f: impl FnOnce() -> R) -> (R, i64) {
     let _guard = MEASURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let previous = SCOPE.with(|s| s.replace(scope));
     LIVE.store(0, Ordering::SeqCst);
     PEAK.store(0, Ordering::SeqCst);
-    ARMED.store(true, Ordering::SeqCst);
+    ACTIVE_SCOPE.store(scope, Ordering::SeqCst);
     let out = f();
-    ARMED.store(false, Ordering::SeqCst);
+    ACTIVE_SCOPE.store(0, Ordering::SeqCst);
+    SCOPE.with(|s| s.set(previous));
     (out, PEAK.load(Ordering::SeqCst))
 }
 
@@ -127,7 +169,7 @@ fn measure_peak<R>(f: impl FnOnce() -> R) -> (R, i64) {
 fn peak_survives_frees_of_pre_window_allocations() {
     let pre_window = vec![0u8; 4 * 1024 * 1024];
 
-    let (_, peak) = measure_peak(|| {
+    let (_, peak) = measure_peak(new_scope(), || {
         // Released inside the window: must not lower the floor.
         drop(pre_window);
         let working_set = vec![0u8; 1024 * 1024];
@@ -138,6 +180,48 @@ fn peak_survives_frees_of_pre_window_allocations() {
         peak >= 1_000_000,
         "peak {peak} B lost the 1 MiB working set — a pre-window free drove the \
          live counter negative and suppressed the measurement"
+    );
+}
+
+/// Allocations made by a thread that is not doing the measured work (another
+/// test's seeding, libtest's own threads) must not be counted. The flag was
+/// process-global, so the 64 B / 4096 B arms each picked up whatever ran beside
+/// them: a 3.04x "doc size leak" under load (t_e3aabb17).
+#[test]
+fn peak_ignores_allocations_on_threads_outside_the_measured_work() {
+    let (_, peak) = measure_peak(new_scope(), || {
+        std::thread::spawn(|| {
+            let unrelated = vec![1u8; 8 * 1024 * 1024];
+            std::hint::black_box(unrelated.len())
+        })
+        .join()
+        .unwrap()
+    });
+    assert!(
+        peak < 1024 * 1024,
+        "peak {peak} B counted an unrelated thread's 8 MiB allocation"
+    );
+}
+
+/// The measured work's own threads ARE counted: the fulltext walk runs on the
+/// runtime's blocking pool, and its allocations are what the bound is about.
+#[test]
+fn peak_counts_the_measured_runtimes_blocking_threads() {
+    let scope = new_scope();
+    let rt = measured_runtime(scope);
+    let (_, peak) = measure_peak(scope, || {
+        rt.block_on(async {
+            tokio::task::spawn_blocking(|| {
+                let working_set = vec![1u8; 2 * 1024 * 1024];
+                std::hint::black_box(working_set.len())
+            })
+            .await
+            .unwrap()
+        })
+    });
+    assert!(
+        peak >= 2 * 1024 * 1024,
+        "peak {peak} B missed a 2 MiB allocation on the measured runtime's blocking pool"
     );
 }
 
@@ -271,10 +355,8 @@ fn cluster_fts_stream_peak(n: usize, doc_bytes: usize) -> (usize, i64) {
     seed_and_flush(&storage, n, doc_bytes);
     let wp = cluster_write_path(storage);
     let table_id = TableId::new(KS, TBL);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let scope = new_scope();
+    let rt = measured_runtime(scope);
 
     // Warm sanity pass OUTSIDE the window: the stream is real and complete.
     let warm: usize = rt.block_on(async {
@@ -297,7 +379,7 @@ fn cluster_fts_stream_peak(n: usize, doc_bytes: usize) -> (usize, i64) {
     });
     assert_eq!(warm, n, "warm pass must deliver every matching doc key");
 
-    measure_peak(|| {
+    measure_peak(scope, || {
         rt.block_on(async {
             let mut rx = wp
                 .fulltext_search_stream(

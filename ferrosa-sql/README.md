@@ -23,6 +23,11 @@ in-memory table in tests and by Ferrosa storage in production.
 
 **Parser** (`parse`, `parse_statement`):
 
+- Boolean expressions nest (parentheses, `NOT`) at most `MAX_EXPR_DEPTH`
+  (256) levels; deeper is `ParseError::TooDeep` (PG `54001`). The parser
+  recurses per level, so an unbounded depth overflows the worker stack and
+  aborts the process (`tests/parser_depth.rs`).
+
 - `SELECT [DISTINCT] <* | items> FROM t [alias] [INNER JOIN t2 [alias] ON a.x = b.y]
   [WHERE <bool-expr>] [GROUP BY ...] [HAVING <bool-expr>]
   [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET m]` — one inner equi-join only.
@@ -123,13 +128,21 @@ rows are an incomplete result and MUST be reported. `execute`/`execute_with`
 gather the rows into a `QueryResult` for tests and tools — they hold the whole
 result and are not for the wire (FMEA SQL-12, `t_f348ba0b`).
 
+`open_cursor` returns the same pipeline as a pull-based `RowCursor` instead of
+pushing it into a sink. The cursor owns everything it reads (its scans, copies
+of the predicates and parameters) and is `Send`, so a caller that wants rows on
+demand can hold it between pulls without holding a thread and pull the next
+chunk on any thread. The PostgreSQL front end does this for portals suspended
+by `max_rows` (FMEA SQL-13). To make that possible, `TableProvider::scan` returns
+an owned, `Send` iterator, and `RowStream`/`TryRowStream` are `Send`.
+
 ## Public API (key entry points)
 
 | Area | Items |
 |------|-------|
 | Parse | `parse`, `parse_statement`, `ParseError` |
 | AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `Expr`, `Operand`, `Term`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
-| Plan | `execute_streaming`, `RowSink`, `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
+| Plan | `execute_streaming`, `RowSink`, `open_cursor`, `RowCursor`, `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
 | Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `dedup`, `limit_offset`, `fallible`, `try_filter`, `try_project`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream`, `TryRowStream` |
 | Spill | `SpillCtx`, `SpillReserver`, `DirReserver`, `SpillStats`, `SpillError`, `default_temp_root`, `sweep_orphaned_temp_dirs` |
 | Catalog | `Catalog`, `MapCatalog`, `SharedTable`, `TableProvider`, `InMemoryTable` |

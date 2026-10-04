@@ -25,7 +25,7 @@ use crate::error::{ClusterError, Result};
 use super::{
     batch_mutations, compute_checksum, sstable_transfer, SstableStreamChunkPayload,
     SstableStreamEndPayload, SstableStreamStartPayload, StreamChunkPayload, StreamConfig,
-    StreamEndPayload, StreamStartPayload, StreamedMutation,
+    StreamEndAck, StreamEndOutcome, StreamEndPayload, StreamStartPayload, StreamedMutation,
 };
 
 /// Parameters for an SSTable file-based streaming request.
@@ -53,6 +53,42 @@ pub struct SstableSendRequest<'a> {
 /// Stateless namespace for outbound streaming operations.
 pub struct StreamSender;
 
+/// Check the receiver's `StreamEnd` reply and return the mutations it applied.
+///
+/// Succeeds only for a [`StreamEndAck`] for `session_id` whose outcome is
+/// `Applied` with exactly `sent` mutations. A pre-verdict receiver replies with
+/// a bare `b"ok"` whatever happened, so that reply is an error too: it does not
+/// say the data landed.
+pub(crate) fn verify_stream_end_reply(reply: &Message, session_id: u64, sent: u64) -> Result<u64> {
+    let Message::StreamEnd(bytes) = reply else {
+        return Err(ClusterError::Internal(format!(
+            "stream {session_id}: StreamEnd reply was {:?}, not StreamEnd",
+            reply.msg_type()
+        )));
+    };
+    let ack: StreamEndAck = bincode::deserialize(bytes).map_err(|e| {
+        ClusterError::Internal(format!(
+            "stream {session_id}: receiver did not verify the stream (no verdict in the \
+             StreamEnd reply; a pre-upgrade peer?): {e}"
+        ))
+    })?;
+    if ack.session_id != session_id {
+        return Err(ClusterError::Internal(format!(
+            "stream {session_id}: verdict is for session {}",
+            ack.session_id
+        )));
+    }
+    match ack.outcome {
+        StreamEndOutcome::Applied { applied } if applied == sent => Ok(applied),
+        StreamEndOutcome::Applied { applied } => Err(ClusterError::Internal(format!(
+            "stream {session_id}: receiver applied {applied} of {sent} mutations"
+        ))),
+        StreamEndOutcome::Rejected { reason } => Err(ClusterError::Internal(format!(
+            "stream {session_id}: receiver rejected the stream: {reason}"
+        ))),
+    }
+}
+
 impl StreamSender {
     /// Send `mutations` to `peer_id` as a streaming session.
     ///
@@ -62,8 +98,12 @@ impl StreamSender {
     /// 3. Compute a CRC32 across all mutations in order.
     /// 4. Send `StreamEnd` with the total count and checksum.
     ///
-    /// Returns `Ok(())` once the peer has received `StreamEnd`, or a
-    /// `ClusterError` on any network or serialisation failure.
+    /// Returns the number of mutations the receiver applied, once its
+    /// `StreamEnd` reply says the count and checksum matched and the session
+    /// was applied (see `verify_stream_end_reply`). Any network or serialisation
+    /// failure, a receiver rejection, or a reply that carries no verdict is a
+    /// `ClusterError`: callers that change membership must not treat an
+    /// unverified stream as moved data (P0-2).
     pub async fn send_stream(
         mutations: Vec<StreamedMutation>,
         peer_manager: &PeerManager,
@@ -72,7 +112,7 @@ impl StreamSender {
         token_range: (i64, i64),
         source_node: u64,
         config: &StreamConfig,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let estimated_bytes: u64 = mutations
             .iter()
             .map(|m| bincode::serialized_size(m).unwrap_or(0))
@@ -135,7 +175,7 @@ impl StreamSender {
             ClusterError::Internal(format!("stream: failed to serialise StreamEnd: {e}"))
         })?;
 
-        peer_manager
+        let reply = peer_manager
             .send(
                 peer_id,
                 Message::StreamEnd(Bytes::from(end_bytes)),
@@ -143,16 +183,18 @@ impl StreamSender {
             )
             .await
             .map_err(ClusterError::Net)?;
+        let applied = verify_stream_end_reply(&reply, session_id, total_mutations)?;
 
         tracing::info!(
             %peer_id,
             session_id,
             total_mutations,
+            applied,
             checksum,
-            "stream: session complete"
+            "stream: session complete and verified by the receiver"
         );
 
-        Ok(())
+        Ok(applied)
     }
 
     /// Encode a `StreamStart` payload to bytes without sending it.

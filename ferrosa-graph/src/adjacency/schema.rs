@@ -27,6 +27,24 @@ use ferrosa_schema::metadata::table::{TableFlag, TableMetadata, TableParams};
 pub const DIRECTION_OUT: u8 = 0;
 pub const DIRECTION_IN: u8 = 1;
 
+/// Whether a row read back (or written) is deleted: its row deletion covers
+/// its primary-key liveness and every cell. A non-live `deletion` alone is not
+/// enough — reads return the newest deletion beside newer data that outlives
+/// it (an edge deleted and then re-created).
+pub fn row_is_deleted(row: &ferrosa_sstable::types::Row) -> bool {
+    if row.deletion.is_live() {
+        return false;
+    }
+    let deleted_at = row.deletion.marked_for_delete_at;
+    let liveness_survives =
+        row.primary_key_liveness.has_timestamp() && row.primary_key_liveness.timestamp > deleted_at;
+    let cell_survives = row
+        .cells
+        .iter()
+        .any(|(_, cell)| cell.timestamp > deleted_at);
+    !liveness_survives && !cell_survives
+}
+
 /// Returns the system keyspace name for a user keyspace's adjacency data.
 pub fn adjacency_keyspace_name(user_keyspace: &str) -> String {
     format!("system_graph_{user_keyspace}")

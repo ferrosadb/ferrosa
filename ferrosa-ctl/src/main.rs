@@ -597,10 +597,15 @@ enum ClusterAction {
     /// automatic lifecycle never does this: a multi-node Raft cluster does not
     /// revert to a pair on its own, because a pair replicates point-to-point
     /// and accepts writes a quorum would have refused while the rest of the
-    /// cluster keeps committing through Raft. The node must have a connected
-    /// peer to replicate to. After it succeeds, that node no longer commits
-    /// through Raft; rejoin the cluster to restore quorum semantics.
-    DowngradeToPair,
+    /// cluster keeps committing through Raft. Friction is the point: first
+    /// take a node down, so every member other than this node and the named
+    /// peer is down, then run this naming the (connected) peer. The node stops
+    /// its Raft group and installs the pair path; any shortcut is refused.
+    /// The member taken down must stay down.
+    DowngradeToPair {
+        /// Host id of the peer to pair with.
+        peer: String,
+    },
 
     /// W8.5 — Demote a voter to a learner (ADR-014).
     ///
@@ -787,8 +792,8 @@ async fn main() {
             ClusterAction::DemoteToLearner { host_id } => {
                 commands::cluster_demote_to_learner(&web_host, web_port, &host_id).await
             }
-            ClusterAction::DowngradeToPair => {
-                commands::cluster_downgrade_to_pair(&web_host, web_port).await
+            ClusterAction::DowngradeToPair { peer } => {
+                commands::cluster_downgrade_to_pair(&web_host, web_port, &peer).await
             }
         },
         Commands::Restore {
@@ -965,17 +970,22 @@ mod tests {
     ///
     /// The node's formation-timeout log tells operators to use this action, so a
     /// rename or a misplaced variant would make that message point at a command
-    /// that does not exist. It takes no arguments: the node picks the peer it is
-    /// connected to, and refuses if there is none.
+    /// that does not exist. It takes the peer's host id: the node never picks a
+    /// peer itself (P0-5), so the bare form must not parse.
     #[test]
     fn parse_cluster_downgrade_to_pair() {
-        let cli = Cli::try_parse_from(["ferrosa-ctl", "cluster", "downgrade-to-pair"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["ferrosa-ctl", "cluster", "downgrade-to-pair", "peer-1"]).unwrap();
         match cli.command {
             Commands::Cluster {
-                action: ClusterAction::DowngradeToPair,
-            } => {}
+                action: ClusterAction::DowngradeToPair { peer },
+            } => assert_eq!(peer, "peer-1"),
             other => panic!("unexpected command: {other:?}"),
         }
+        assert!(
+            Cli::try_parse_from(["ferrosa-ctl", "cluster", "downgrade-to-pair"]).is_err(),
+            "a downgrade that names no peer must not parse"
+        );
     }
 
     /// Verify default host value is parsed correctly.

@@ -194,6 +194,23 @@ pub fn build_serialization_header(
     }
 }
 
+/// [`build_serialization_header`] for a memtable flush. When the output is
+/// complex-framed and some partition still holds a whole-value collection
+/// cell, the header is widened to cover the deletion sentinel that
+/// `crate::memtable::expand_collection_blobs_in_place` will mint for it.
+/// Every flush writer must feed its partitions through that function.
+pub fn header_for_flush(schema: &TableSchema, partitions: &[Partition]) -> SerializationHeader {
+    let mut header = build_serialization_header(schema, partitions);
+    if header.complex_collections
+        && partitions
+            .iter()
+            .any(|p| crate::memtable::partition_has_collection_blob(p, &header))
+    {
+        crate::memtable::widen_header_for_blob_sentinels(&mut header);
+    }
+    header
+}
+
 /// Split token-sorted `partitions` into at most `num_shards` contiguous slices
 /// so each shard can be encoded into its own SSTable in parallel (parallel flush
 /// slice #3 — the encode phase is ~98% of flush time and single-threaded per
@@ -479,13 +496,36 @@ pub trait FlushTarget {
     /// Read back a vector sidecar that was written by `write_vector_sidecar`.
     ///
     /// Returns `None` if no sidecar was written for this `(generation,
-    /// index_name)` pair, or if the target does not persist sidecars
-    /// (e.g. `FileFlushTarget` — the store loads those from disk instead).
+    /// index_name)` pair, or if the target does not persist sidecars.
     ///
-    /// Used in integration tests to verify the sidecar round-trip without
-    /// touching the filesystem.
-    fn read_vector_sidecar(&self, _generation: u64, _index_name: &str) -> Option<Vec<u8>> {
-        None
+    /// # Errors
+    ///
+    /// A sidecar that exists but cannot be read: the ANN query must fail
+    /// rather than answer without that SSTable's rows.
+    fn read_vector_sidecar(&self, _generation: u64, _index_name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Every vector sidecar written by [`FlushTarget::write_vector_sidecar`],
+    /// in no particular order.
+    ///
+    /// The store rebuilds its set of partition-scoped sidecars from this when
+    /// a vector index is registered, so the set survives a restart: the files
+    /// are the one record of which scopes were flushed. The default is empty,
+    /// matching the default `write_vector_sidecar`, which persists nothing.
+    ///
+    /// # Errors
+    ///
+    /// The sidecars cannot be listed. The caller must not treat that as "no
+    /// sidecars": ANN would silently answer without every flushed row.
+    fn list_vector_sidecars(&self) -> Result<Vec<VectorSidecarFile>> {
+        Ok(Vec::new())
+    }
+
+    /// Delete the vector sidecar `write_vector_sidecar` wrote for
+    /// `(generation, index_name)`. One that is already gone is not an error.
+    fn remove_vector_sidecar(&self, _generation: u64, _index_name: &str) -> Result<()> {
+        Ok(())
     }
 
     /// Write a quantized vector artifact (`{gen}-QVEC-{index_name}.qvec`).
@@ -676,7 +716,7 @@ impl FlushTarget for InMemoryFlushTarget {
         Ok(())
     }
 
-    fn read_vector_sidecar(&self, generation: u64, index_name: &str) -> Option<Vec<u8>> {
+    fn read_vector_sidecar(&self, generation: u64, index_name: &str) -> Result<Option<Vec<u8>>> {
         let map = self
             .vector_sidecars
             .lock()
@@ -686,7 +726,30 @@ impl FlushTarget for InMemoryFlushTarget {
             self.vector_sidecar_bytes_read
                 .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        bytes
+        Ok(bytes)
+    }
+
+    fn list_vector_sidecars(&self) -> Result<Vec<VectorSidecarFile>> {
+        let map = self
+            .vector_sidecars
+            .lock()
+            .expect("vector_sidecars poisoned");
+        Ok(map
+            .iter()
+            .map(|((generation, name), bytes)| VectorSidecarFile {
+                generation: *generation,
+                name: name.clone(),
+                len: bytes.len() as u64,
+            })
+            .collect())
+    }
+
+    fn remove_vector_sidecar(&self, generation: u64, index_name: &str) -> Result<()> {
+        self.vector_sidecars
+            .lock()
+            .expect("vector_sidecars poisoned")
+            .remove(&(generation, index_name.to_string()));
+        Ok(())
     }
 
     fn write_quantized_vector_sidecar(
@@ -2491,11 +2554,96 @@ impl FlushTarget for FileFlushTarget {
         index_name: &str,
         vec_bytes: &[u8],
     ) -> Result<()> {
+        // Through a temp file and a rename, so a reader (or a manifest
+        // check after a crash) sees the whole sidecar or none of it. The temp
+        // name carries no `-VEC-`, so a listing never mistakes it for one.
         let path = self
             .base_dir
             .join(format!("{generation}-VEC-{index_name}.db"));
-        std::fs::write(&path, vec_bytes)?;
+        let tmp = self.base_dir.join(format!(
+            ".vec-{generation}-{index_name}.{}.tmp",
+            std::process::id()
+        ));
+        if let Err(e) = std::fs::write(&tmp, vec_bytes).and_then(|()| std::fs::rename(&tmp, &path))
+        {
+            if let Err(cleanup) = std::fs::remove_file(&tmp) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %tmp.display(), %cleanup, "could not remove temp vector sidecar");
+                }
+            }
+            return Err(e.into());
+        }
         Ok(())
+    }
+
+    /// The HNSW sidecar `write_vector_sidecar` wrote, read back from disk.
+    ///
+    /// This target used to inherit the default `None`, so every HNSW sidecar
+    /// it wrote was write-only: ANN over a flushed SSTable found nothing, and
+    /// an ANN query returned only the rows still in the memtable.
+    fn read_vector_sidecar(&self, generation: u64, index_name: &str) -> Result<Option<Vec<u8>>> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-VEC-{index_name}.db"));
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ferrosa_common::Error::InvalidData(format!(
+                "vector sidecar {} is unreadable: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Lists `{generation}-VEC-{index_name}.db` in the base directory, where
+    /// `write_vector_sidecar` puts every one. Any other file is not a vector
+    /// sidecar and is passed over; a directory that cannot be read is an
+    /// error.
+    fn list_vector_sidecars(&self) -> Result<Vec<VectorSidecarFile>> {
+        let unreadable = |e: std::io::Error| {
+            ferrosa_common::Error::InvalidData(format!(
+                "cannot list vector sidecars in {}: {e}",
+                self.base_dir.display()
+            ))
+        };
+        let entries = match std::fs::read_dir(&self.base_dir) {
+            Ok(entries) => entries,
+            // Nothing flushed yet: the directory is created on first flush.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(unreadable(e)),
+        };
+        let mut sidecars = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(unreadable)?;
+            let Some((generation, name)) = entry
+                .file_name()
+                .to_str()
+                .and_then(parse_vector_sidecar_name)
+            else {
+                continue;
+            };
+            let len = entry.metadata().map_err(unreadable)?.len();
+            sidecars.push(VectorSidecarFile {
+                generation,
+                name,
+                len,
+            });
+        }
+        Ok(sidecars)
+    }
+
+    fn remove_vector_sidecar(&self, generation: u64, index_name: &str) -> Result<()> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-VEC-{index_name}.db"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ferrosa_common::Error::InvalidData(format!(
+                "cannot remove vector sidecar {}: {e}",
+                path.display()
+            ))),
+        }
     }
 
     fn write_quantized_vector_sidecar(
@@ -2537,9 +2685,50 @@ impl FlushTarget for FileFlushTarget {
     }
 }
 
+/// One vector sidecar on disk, as [`FlushTarget::list_vector_sidecars`]
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorSidecarFile {
+    /// The SSTable generation it belongs to.
+    pub generation: u64,
+    /// The sidecar's name: the index name, a scoped name, or a manifest.
+    pub name: String,
+    /// Its size in bytes.
+    pub len: u64,
+}
+
+/// `(generation, index_name)` for a `{generation}-VEC-{index_name}.db` file
+/// name; `None` for any other file.
+fn parse_vector_sidecar_name(file_name: &str) -> Option<(u64, String)> {
+    let (generation, rest) = file_name.split_once("-VEC-")?;
+    let index_name = rest.strip_suffix(".db")?;
+    if index_name.is_empty() {
+        return None;
+    }
+    Some((generation.parse().ok()?, index_name.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_sidecar_names_parse_and_other_files_do_not() {
+        assert_eq!(
+            parse_vector_sidecar_name("42-VEC-idx_e__scope_0010.db"),
+            Some((42, "idx_e__scope_0010".to_string()))
+        );
+        for other in [
+            "42-Data.db",
+            "42-FTI-idx_e.db",
+            "42-QVEC-idx_e.qvec",
+            "x-VEC-idx_e.db",
+            "42-VEC-.db",
+            "42-VEC-idx_e.tmp",
+        ] {
+            assert_eq!(parse_vector_sidecar_name(other), None, "{other}");
+        }
+    }
 
     use ferrosa_common::cell::CellValue;
     use ferrosa_common::key::{DecoratedKey, PartitionKey};

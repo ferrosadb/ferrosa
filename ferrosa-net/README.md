@@ -49,7 +49,18 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   `accept_handshake` exchange `Handshake`/`HandshakeAck`, verifying cluster name,
   protocol version, and an `HMAC-SHA256(psk, cluster_name|host_id|nonce)` auth
   token via the `hmac` crate's constant-time `verify_slice`. The handshake also
-  exchanges CQL- and internode-broadcast addresses.
+  exchanges CQL- and internode-broadcast addresses, and **capability bits**: a
+  trailing `u32` on BOTH `Handshake` and `HandshakeAck`
+  (`NetConfig::advertised_capabilities`, default `LOCAL_CAPABILITIES`), so the
+  initiator and the acceptor each learn the other's (`HandshakePeer::capabilities`,
+  `PeerManager::peer_capabilities`). A pre-capability peer sends none (read as
+  0) and ignores ours. A feature that adds a message type or frame kind gates
+  sending it on the peer's bit, because an older node drops the whole connection
+  on an unknown type byte. Bits: `CAP_RPC_ERROR_REPLY` (1<<0) — the peer
+  understands error-reply frames (`FLAG_RPC_ERROR`); `CAP_RESULT_CURSOR_PAGE`
+  (1<<1) — the peer serves `ResultCursorPage` (`0x68`) /
+  `ResultCursorPageReply` (`0x69`), opaque ferrosa-cql payloads forwarding a CQL
+  result cursor's next page to the node that owns it.
 - **Priority lanes + actor pool** (`pool`, `lane_actor`) — `PriorityPool` holds
   three TCP connections per peer, one per `Lane` (`Raft`, `Data`, `Bulk`). Each
   lane is owned by a dedicated actor task that processes `LaneCommand`s
@@ -76,7 +87,11 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   subscribes is not missed. Reconnects re-resolve the peer's advertised hostname
   so container IP churn is handled automatically. `NetError::LaneShutdown`
   means a pool's actors have exited (peer connection replaced); it is not
-  reconnect exhaustion. `PeerManager` re-issues a request once on the current
+  reconnect exhaustion. A listener that owns its `PeerManager` (the cluster
+  `ModeController`) is passed through `PeerManager::with_weak_listener` and
+  held weakly; `PeerManager::new` holds its listener strongly, for listeners
+  nothing else owns. Events for a dropped owner are logged and discarded.
+  `PeerManager` re-issues a request once on the current
   pool when the one it resolved was replaced mid-request. If the registered
   pool itself is dead, `PeerManager` deregisters it, re-dials once via
   `ensure_peer` (identity-checked), logs the failure and the recovery once
@@ -90,7 +105,27 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   connections, runs the acceptor handshake, and dispatches frames through a
   thread-safe `HandlerRegistry` (`MsgType` → `Arc<dyn RpcHandler>`) that supports
   dynamic registration after start. Graceful drain via `CancellationToken` with a
-  bounded wait.
+  bounded wait. Every request is answered: a handler panic (caught at the
+  dispatch boundary with `catch_unwind`), a response that fails to encode or
+  exceeds the frame limit, and a request body that fails to decode each get an
+  **error-reply frame** (`FLAG_RPC_ERROR`, body `rpc::error_reply::RpcErrorReply`)
+  on the request's `stream_id`, which the client surfaces as
+  `NetError::RemoteHandlerFailed { msg_type, kind, detail }` and which releases
+  the request's stream slot at once instead of at the lane timeout. Each failure
+  logs ERROR with peer, `msg_type`, `stream_id` and detail, and counts in
+  `ferrosa_net_rpc_handler_failures_total{kind}` (panics also in
+  `ferrosa_net_rpc_handler_panics_total{msg_type}`). Error replies go only to
+  peers whose Handshake advertised `CAP_RPC_ERROR_REPLY` (a trailing
+  `capabilities: u32` field; older peers send none and decode as `0`), and never
+  to fire-and-forget frames. During a rolling restart both directions are safe:
+  an old server reads the Handshake prefix and ignores the trailing field, and
+  because it never sends error replies, a new client's failed request falls
+  back to the lane deadline. A panic on the inline ordered-stream path no longer
+  takes the connection down. On the client, a connection that closes fails every
+  request still pending on it immediately ("connection closed before the
+  response arrived"), and an undecodable response fails its caller at once.
+  Requests always carry a deadline: the lane timeout (`Raft` 1 s, `Data` 10 s,
+  `Bulk` 60 s, or the caller's override) removes the slot if no reply comes.
 - **TLS** (`tls`) — optional rustls `TlsAcceptor`/`TlsConnector` built from PEM
   cert/key/CA paths; `require_tls` fails startup loudly when no cert is
   configured (acceptor AND connector). This module is the process's single
@@ -115,7 +150,7 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   tracking derived from heartbeats; the Accord protocol consumes `SkewMax`.
 - **Discovery** (`discovery`) — `SeedDiscovery` over a `Discovery` trait.
 - **Metrics** (`metrics`) — lane queue depth, in-flight RPCs, timeouts, dormant
-  peer counts, bandwidth.
+  peer counts, bandwidth, inbound handler panics and unanswerable requests.
 
 ## Public API (key entry points)
 
@@ -126,7 +161,7 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
 | Cap'n Proto envelope | `CapnpEnvelope`, `encode_message_envelope`, `decode_message_envelope`, `negotiate_capnp_capabilities` |
 | Handshake | `initiate_handshake`, `accept_handshake`, `compute_auth_token`, `verify_auth_token`, `HandshakePeer` |
 | Pool / lanes | `PriorityPool`, `LaneHandle`, `LaneOutcome`, `LaneStatusReport`, `spawn_lane_actor` |
-| RPC | `RpcServer`, `RpcClient`, `HandlerRegistry`, `RpcHandler`, `PeerId`, `InboundPeerCallback` |
+| RPC | `RpcServer`, `RpcClient`, `HandlerRegistry`, `RpcHandler`, `PeerId`, `InboundPeerCallback`, `RpcErrorReply`, `RemoteFailureKind`, `NetError::RemoteHandlerFailed` |
 | Config / errors | `NetConfig` (`from_lookup` → config + `ConfigIssue`s, `from_env`, `from_env_checked`), `NetError`, `bind_failure_diagnostic` |
 
 `NetConfig` no longer drops a bad `FERROSA_*` value silently. Every rejected value is

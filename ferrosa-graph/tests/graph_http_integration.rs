@@ -1157,6 +1157,88 @@ async fn http_var_length_and_shortest_path_are_fast_and_correct_on_cycle() {
     assert_eq!(rows, &vec![serde_json::json!(["VarPathD"])]);
 }
 
+/// Run `query` against the social keyspace and return its rows, sorted.
+async fn social_rows(
+    schema: &Arc<Schema>,
+    storage: &Arc<StorageEngine>,
+    query: &str,
+) -> Vec<Value> {
+    let app = build_app(Arc::clone(schema), Arc::clone(storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({ "query": query, "keyspace": "social" })),
+    );
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
+        .await
+        .unwrap_or_else(|_| panic!("{query} did not complete"))
+        .unwrap();
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{query}: {body:#}");
+    let mut rows = body["rows"].as_array().cloned().unwrap_or_default();
+    rows.sort_by_key(|row| row.to_string());
+    rows
+}
+
+/// A directed path follows edges forward only, and a deleted edge is not
+/// followed, on both the single-hop and the variable-length paths. Every edge
+/// leaves an OUT entry on its source and an IN entry on its target in the
+/// adjacency index, and a DELETE leaves both as row tombstones.
+#[tokio::test]
+async fn directed_paths_ignore_incoming_and_deleted_edges() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    for name in ["DirX", "DirY", "DirZ"] {
+        social_rows(
+            &schema,
+            &storage,
+            &format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+        )
+        .await;
+    }
+    for (src, dst) in [("DirX", "DirY"), ("DirY", "DirZ")] {
+        social_rows(
+            &schema,
+            &storage,
+            &format!(
+                "MERGE (a:Person {{name: '{src}'}})-[r:KNOWS]->(b:Person {{name: '{dst}'}}) RETURN r"
+            ),
+        )
+        .await;
+    }
+
+    // Y -> Z is Y's only outgoing edge; X -> Y comes in and must not be walked.
+    for query in [
+        "MATCH (a:Person {name: 'DirY'})-[:KNOWS]->(b:Person) RETURN b.name",
+        "MATCH (a:Person {name: 'DirY'})-[:KNOWS*1..2]->(b:Person) RETURN b.name",
+    ] {
+        assert_eq!(
+            social_rows(&schema, &storage, query).await,
+            vec![serde_json::json!(["DirZ"])],
+            "{query}"
+        );
+    }
+
+    social_rows(
+        &schema,
+        &storage,
+        "MATCH (a:Person {name: 'DirX'})-[r:KNOWS]->(b:Person {name: 'DirY'}) DELETE r",
+    )
+    .await;
+    for query in [
+        "MATCH (a:Person {name: 'DirX'})-[:KNOWS]->(b:Person) RETURN b.name",
+        "MATCH (a:Person {name: 'DirX'})-[:KNOWS*1..2]->(b:Person) RETURN b.name",
+    ] {
+        assert_eq!(
+            social_rows(&schema, &storage, query).await,
+            Vec::<Value>::new(),
+            "{query}: the only edge out of DirX was deleted"
+        );
+    }
+}
+
 #[tokio::test]
 async fn concurrent_merge_node_and_relationship_remain_idempotent() {
     let (schema, storage, _dir) = setup();

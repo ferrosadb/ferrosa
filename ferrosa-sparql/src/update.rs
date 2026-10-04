@@ -45,6 +45,8 @@ pub async fn execute_update(
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<UpdateResult, SparqlError> {
+    // The parser recurses per nesting level without a limit.
+    crate::nesting::check_nesting(update_str)?;
     let update = spargebra::SparqlParser::new()
         .parse_update(update_str)
         .map_err(|e| SparqlError::Parse(format!("{e}")))?;

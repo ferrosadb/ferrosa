@@ -44,7 +44,7 @@ use ferrosa_net::task_pool::TaskPool;
 use ferrosa_storage::TableId;
 
 use super::stream_producer::ChunkSink;
-use super::stream_request_handler::SinkFactory;
+use super::stream_request_handler::{send_bounded, SinkFactory};
 use crate::raft::handlers::{
     FulltextSearchStreamCancelPayload, FulltextSearchStreamChunkPayload,
     FulltextSearchStreamDonePayload, FulltextSearchStreamHeartbeatPayload,
@@ -73,6 +73,13 @@ pub trait FulltextKeySource: Send + Sync {
         query: &str,
         on_hit: &mut dyn FnMut(Vec<u8>) -> ControlFlow<()>,
     ) -> ferrosa_common::Result<()>;
+
+    /// Monotonic I/O progress behind this source's walks (see
+    /// `StreamRangeReader::io_progress`). A walk that delivers no key while
+    /// this advances is waiting on I/O and may still heartbeat.
+    fn io_progress(&self) -> u64 {
+        0
+    }
 }
 
 impl FulltextKeySource for Arc<ferrosa_storage::StorageEngine> {
@@ -86,6 +93,10 @@ impl FulltextKeySource for Arc<ferrosa_storage::StorageEngine> {
         ferrosa_storage::StorageEngine::fulltext_search_each(
             self, table_id, index_name, query, on_hit,
         )
+    }
+
+    fn io_progress(&self) -> u64 {
+        ferrosa_storage::metrics::object_store_download_progress()
     }
 }
 
@@ -129,10 +140,18 @@ pub async fn handle_fulltext_stream_request_with_cancel<S, K>(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await; // discard the immediate first tick
 
-    let mut heartbeat_seq: u32 = 0;
     let mut chunk_seq: u32 = 0;
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(chunk_keys);
+    // Set when the request ends early: cancelled, or a frame the sink would
+    // not accept within the deadline (logged by `send_bounded`). Either way
+    // the walk is stopped and no Done is sent.
     let mut cancelled = false;
+    // Heartbeat gate, as in the range-read responder: heartbeat only when the
+    // walk delivered a key or its I/O moved since the last heartbeat, so a
+    // stuck walk goes quiet and the requester's idle timeout can fire.
+    let mut keys_received: u64 = 0;
+    let mut last_heartbeat_progress = (keys_received, source.io_progress());
+    let mut withholding = false;
 
     loop {
         tokio::select! {
@@ -143,24 +162,54 @@ pub async fn handle_fulltext_stream_request_with_cancel<S, K>(
             }
             next = rx.recv() => match next {
                 Some(key) => {
+                    keys_received = keys_received.saturating_add(1);
                     batch.push(key);
                     if batch.len() >= chunk_keys {
-                        emit_chunk(&req, &mut batch, chunk_seq, sink).await;
+                        if !emit_chunk(&req, &mut batch, chunk_seq, sink, &cancel).await {
+                            cancelled = true;
+                            break;
+                        }
                         chunk_seq = chunk_seq.saturating_add(1);
                     }
                 }
                 None => break, // walk finished (or errored) and dropped tx
             },
             _ = ticker.tick() => {
+                let progress = (keys_received, source.io_progress());
+                if progress == last_heartbeat_progress {
+                    if !withholding {
+                        withholding = true;
+                        tracing::warn!(
+                            request_id = req.request_id,
+                            keyspace = req.keyspace,
+                            table = req.table,
+                            keys_received,
+                            "fulltext stream: walk made no progress since the last heartbeat; \
+                             withholding heartbeats so the requester's idle timeout can fire"
+                        );
+                    }
+                    continue;
+                }
+                if withholding {
+                    withholding = false;
+                    tracing::info!(
+                        request_id = req.request_id,
+                        keys_received,
+                        "fulltext stream: walk progressing again; heartbeats resumed"
+                    );
+                }
+                last_heartbeat_progress = progress;
                 let hb = FulltextSearchStreamHeartbeatPayload {
                     request_id: req.request_id,
                     seq: chunk_seq,
                 };
-                heartbeat_seq = heartbeat_seq.saturating_add(1);
-                let _ = heartbeat_seq; // debugging aid only
                 let bytes = bincode::serialize(&hb)
                     .expect("FulltextSearchStreamHeartbeatPayload serialization is infallible");
-                sink.send(Message::FulltextSearchStreamHeartbeat(Bytes::from(bytes))).await;
+                let heartbeat = Message::FulltextSearchStreamHeartbeat(Bytes::from(bytes));
+                if !send_bounded(sink, heartbeat, req.request_id, "fulltext search", &cancel).await {
+                    cancelled = true;
+                    break;
+                }
             }
         }
     }
@@ -198,7 +247,9 @@ pub async fn handle_fulltext_stream_request_with_cancel<S, K>(
     };
 
     if !truncated && !batch.is_empty() {
-        emit_chunk(&req, &mut batch, chunk_seq, sink).await;
+        if !emit_chunk(&req, &mut batch, chunk_seq, sink, &cancel).await {
+            return;
+        }
         chunk_seq = chunk_seq.saturating_add(1);
     }
 
@@ -209,8 +260,15 @@ pub async fn handle_fulltext_stream_request_with_cancel<S, K>(
     };
     let bytes = bincode::serialize(&done)
         .expect("FulltextSearchStreamDonePayload serialization is infallible");
-    sink.send(Message::FulltextSearchStreamDone(Bytes::from(bytes)))
-        .await;
+    // The last frame: a failure is already logged and nothing remains to release.
+    send_bounded(
+        sink,
+        Message::FulltextSearchStreamDone(Bytes::from(bytes)),
+        req.request_id,
+        "fulltext search",
+        &cancel,
+    )
+    .await;
 }
 
 async fn emit_chunk<K: ChunkSink>(
@@ -218,7 +276,8 @@ async fn emit_chunk<K: ChunkSink>(
     batch: &mut Vec<Vec<u8>>,
     seq: u32,
     sink: &K,
-) {
+    cancel: &CancellationToken,
+) -> bool {
     let payload = FulltextSearchStreamChunkPayload {
         request_id: req.request_id,
         seq,
@@ -226,8 +285,14 @@ async fn emit_chunk<K: ChunkSink>(
     };
     let bytes = bincode::serialize(&payload)
         .expect("FulltextSearchStreamChunkPayload serialization is infallible");
-    sink.send(Message::FulltextSearchStreamChunk(Bytes::from(bytes)))
-        .await;
+    send_bounded(
+        sink,
+        Message::FulltextSearchStreamChunk(Bytes::from(bytes)),
+        req.request_id,
+        "fulltext search",
+        cancel,
+    )
+    .await
 }
 
 /// `RpcHandler` shell: decodes `FulltextSearchStreamRequest`, spawns the
@@ -727,6 +792,191 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// A sink whose send never completes (the requesting node is stuck).
+    struct StuckSink {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ChunkSink for StuckSink {
+        async fn send(&self, _msg: Message) {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            futures::future::pending::<()>().await;
+        }
+    }
+
+    /// A key source that records when its walk has returned. In production
+    /// the walk runs inside the engine's fulltext search and holds its locks
+    /// until it returns.
+    struct TrackedSource {
+        returned: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl FulltextKeySource for TrackedSource {
+        fn search_each(
+            &self,
+            _table_id: &TableId,
+            _index_name: &str,
+            _query: &str,
+            on_hit: &mut dyn FnMut(Vec<u8>) -> ControlFlow<()>,
+        ) -> ferrosa_common::Result<()> {
+            for i in 0..100_000_u32 {
+                if on_hit(i.to_be_bytes().to_vec()).is_break() {
+                    break;
+                }
+            }
+            self.returned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// INVARIANT: a fulltext responder whose outbound send never completes
+    /// stops its local walk within a deadline. The walk blocks in
+    /// `blocking_send` while the framer is stuck in `sink.send`, and the
+    /// framer checked cancel only around the receive.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_outbound_send_stops_the_local_fulltext_walk() {
+        let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source = Arc::new(TrackedSource {
+            returned: Arc::clone(&returned),
+        });
+        let sink = Arc::new(StuckSink {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let task_sink = Arc::clone(&sink);
+        let handler = tokio::spawn(async move {
+            handle_fulltext_stream_request_with_cancel(
+                req(31),
+                source,
+                task_sink.as_ref(),
+                2,
+                CancellationToken::new(),
+            )
+            .await;
+        });
+
+        // Wait (real time, bounded) until the framer is IN the stuck send;
+        // advancing the clock before it gets there arms the send deadline
+        // after the advance, and it never fires. A fixed sleep raced the walk
+        // thread under load.
+        let mut waited = 0;
+        while sink.attempts.load(std::sync::atomic::Ordering::SeqCst) == 0 && waited < 500 {
+            std::thread::sleep(Duration::from_millis(10));
+            tokio::task::yield_now().await;
+            waited += 1;
+        }
+        let reached = sink.attempts.load(std::sync::atomic::Ordering::SeqCst) == 1;
+        if !reached {
+            handler.abort(); // unpark the walk so the runtime can shut down
+        }
+        assert!(reached, "the framer must have reached the stuck send");
+        // `advance`, not `sleep`: a running spawn_blocking walk inhibits the
+        // paused clock's auto-advance, so a sleep here would never return.
+        tokio::time::advance(
+            super::super::stream_request_handler::STREAM_SINK_SEND_DEADLINE
+                + Duration::from_secs(5),
+        )
+        .await;
+        // The walk runs on a real blocking thread: give it real time to
+        // observe the dropped receiver.
+        let mut waited = 0;
+        while !returned.load(std::sync::atomic::Ordering::SeqCst) && waited < 200 {
+            std::thread::sleep(Duration::from_millis(10));
+            tokio::task::yield_now().await;
+            waited += 1;
+        }
+        let walk_returned = returned.load(std::sync::atomic::Ordering::SeqCst);
+        // Abort BEFORE asserting: dropping the handler drops its receiver, so a
+        // parked walk unparks and the runtime can shut down instead of waiting
+        // on the blocking thread forever.
+        handler.abort();
+        assert!(
+            walk_returned,
+            "the local fulltext walk is still parked after its send stalled past the deadline"
+        );
+    }
+
+    /// A walk blocked until the test opens `gate` (a node's walk stuck behind
+    /// its tables lock). `io` stands in for the node's I/O progress.
+    struct GatedSource {
+        gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        io: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl FulltextKeySource for GatedSource {
+        fn search_each(
+            &self,
+            _table_id: &TableId,
+            _index_name: &str,
+            _query: &str,
+            _on_hit: &mut dyn FnMut(Vec<u8>) -> ControlFlow<()>,
+        ) -> ferrosa_common::Result<()> {
+            let gate = self.gate.lock().unwrap().take().expect("one walk");
+            let _ = gate.recv();
+            Ok(())
+        }
+
+        fn io_progress(&self) -> u64 {
+            self.io.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn fulltext_heartbeats(sink: &VecSink) -> usize {
+        sink.frames()
+            .iter()
+            .filter(|m| matches!(m, Message::FulltextSearchStreamHeartbeat(_)))
+            .count()
+    }
+
+    /// Drive a gated walk for ten heartbeat intervals, bumping `io` each
+    /// interval when `io_moves`; returns the heartbeats the sink received.
+    async fn heartbeats_from_gated_walk(io_moves: bool) -> usize {
+        let (open, gate) = std::sync::mpsc::channel();
+        let io = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let source = Arc::new(GatedSource {
+            gate: std::sync::Mutex::new(Some(gate)),
+            io: Arc::clone(&io),
+        });
+        let sink = Arc::new(VecSink::new());
+        let task_sink = Arc::clone(&sink);
+        let handler = tokio::spawn(async move {
+            handle_fulltext_stream_request_with_cancel(
+                req(51),
+                source,
+                task_sink.as_ref(),
+                2,
+                CancellationToken::new(),
+            )
+            .await;
+        });
+        // `advance`: the blocked walk thread inhibits auto-advance.
+        for _ in 0..10 {
+            if io_moves {
+                io.fetch_add(16 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+            }
+            tokio::time::advance(HEARTBEAT_INTERVAL).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let _ = open.send(());
+        handler.abort();
+        fulltext_heartbeats(&sink)
+    }
+
+    /// INVARIANT: a fulltext heartbeat proves progress. A walk that delivers
+    /// no key and moves no I/O goes quiet, so the coordinator's idle timeout
+    /// fires instead of waiting on it forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_fulltext_walk_sends_no_heartbeats() {
+        assert_eq!(heartbeats_from_gated_walk(false).await, 0);
+    }
+
+    /// Control: I/O progress (a rehydrate in flight) keeps heartbeats going.
+    #[tokio::test(start_paused = true)]
+    async fn a_fulltext_walk_with_io_progress_keeps_heartbeating() {
+        assert!(heartbeats_from_gated_walk(true).await >= 8);
     }
 
     fn req(id: u32) -> FulltextSearchStreamRequestPayload {

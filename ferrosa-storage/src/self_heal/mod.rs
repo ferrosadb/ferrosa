@@ -182,6 +182,10 @@ pub struct SelfHealController {
     /// quarantine (FMEA #10). Defaults to [`NoopRepairTrigger`]; the binary
     /// supplies a cluster-backed trigger on a real cluster.
     repair_trigger: Arc<dyn RepairTrigger>,
+    /// `(table, index)` of the vector indexes found invalid last tick, so
+    /// the WARN fires on the edges (became invalid, became valid again),
+    /// not every tick.
+    invalid_vector_indexes: std::collections::BTreeSet<(TableKey, String)>,
 }
 
 impl SelfHealController {
@@ -202,6 +206,7 @@ impl SelfHealController {
             verified_gens: BTreeMap::new(),
             refill: Box::new(LoggingRefillScheduler),
             repair_trigger: Arc::new(NoopRepairTrigger),
+            invalid_vector_indexes: std::collections::BTreeSet::new(),
         }
     }
 
@@ -256,7 +261,7 @@ impl SelfHealController {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                controller.run_one_tick();
+                controller.run_one_tick_guarded();
             }
         }))
     }
@@ -300,6 +305,9 @@ impl SelfHealController {
             }) {
                 issues.push(issue);
             }
+            if let Some(issue) = self.detect_invalid_vector_indexes(&table) {
+                issues.push(issue);
+            }
             // Extension point: detector::detect_bloat / detect_divergence here.
         }
 
@@ -314,10 +322,72 @@ impl SelfHealController {
         }
     }
 
+    /// Check the table's vector indexes (see
+    /// [`StorageEngine::check_vector_indexes`]) and report an
+    /// [`IssueKind::InvalidVectorIndex`] if any has incomplete generations.
+    /// WARNs on the edges: an index turning invalid, and turning valid again.
+    fn detect_invalid_vector_indexes(&mut self, table: &TableKey) -> Option<TableIssue> {
+        let tid = TableId::new(&table.keyspace, &table.table);
+        let checks = match self
+            .engine
+            .check_vector_indexes(&tid, self.config.vector_decode_budget)
+        {
+            Ok(checks) => checks,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    %table,
+                    "self-heal: vector index check failed; invalid vector indexes on this \
+                     table are not detected this tick"
+                );
+                return None;
+            }
+        };
+        let mut invalid = false;
+        for check in checks {
+            let key = (table.clone(), check.index_name.clone());
+            if check.verify.pending > 0 {
+                invalid = true;
+                if self.invalid_vector_indexes.insert(key) {
+                    tracing::warn!(
+                        %table,
+                        index = %check.index_name,
+                        generations = check.verify.pending,
+                        invalidated = ?check.verify.invalidated,
+                        "self-heal: vector index has invalid or missing sidecars; ANN over it \
+                         refuses (retryable) until they are rebuilt from the rows"
+                    );
+                }
+            } else if self.invalid_vector_indexes.remove(&key) {
+                tracing::warn!(
+                    %table,
+                    index = %check.index_name,
+                    "self-heal: vector index valid again; ANN over it answers"
+                );
+            }
+        }
+        invalid.then(|| TableIssue {
+            table: table.clone(),
+            kind: IssueKind::InvalidVectorIndex,
+            corrupt_sstables: Vec::new(),
+            replica_posture: ReplicaPosture::SingleNode,
+        })
+    }
+
     /// One full control-loop pass. Public for deterministic step-testing
     /// without a tokio runtime.
     pub fn run_one_tick(&mut self) {
         let snapshot = self.build_snapshot();
+        // A vector rebuild is local and loses nothing, so its attempts are
+        // counted per outage, not for the node's lifetime: once an index is
+        // valid again its ledger entry goes, and the next outage starts at 0.
+        self.ledger.retain(|(table, kind), _| {
+            *kind != IssueKind::InvalidVectorIndex
+                || snapshot
+                    .issues
+                    .iter()
+                    .any(|issue| issue.kind == *kind && issue.table == *table)
+        });
 
         // Update the gauge of currently-corrupt tables (loud-on-issue surface).
         let corrupt_tables = snapshot
@@ -334,6 +404,32 @@ impl SelfHealController {
         self.tick = self.tick.saturating_add(1);
     }
 
+    /// Run one tick inside a panic boundary. A panic is that tick's failure:
+    /// logged at ERROR, counted in `tick_panics_total`, and the next tick
+    /// runs. Before, a panic ended the controller's task for good, silently:
+    /// its JoinHandle is dropped by the caller (t_396d4c80). Returns whether
+    /// the tick completed.
+    pub(crate) fn run_one_tick_guarded(&mut self) -> bool {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_one_tick())) {
+            Ok(()) => true,
+            Err(payload) => {
+                metrics::inc_tick_panics();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                tracing::error!(
+                    tick = self.tick,
+                    panic = %message,
+                    "self-heal: controller tick panicked; the next tick runs"
+                );
+                self.tick = self.tick.saturating_add(1);
+                false
+            }
+        }
+    }
+
     /// Execute the chosen action (if any) and update the ledger.
     fn apply_decision(
         &mut self,
@@ -341,11 +437,17 @@ impl SelfHealController {
         decision: Option<Action>,
     ) -> Option<ActionOutcome> {
         let action = decision?;
+        if let Action::RebuildVectorIndexes { table } = &action {
+            return self.start_vector_rebuilds(snapshot, table);
+        }
         // Identify the (table, issue) this action targets so we can record an
         // attempt against the correct ledger entry.
         let (table, kind) = match &action {
             Action::QuarantineCorrupt { table, .. } => (table.clone(), IssueKind::CorruptSstables),
             Action::Escalate { table, kind, .. } => (table.clone(), *kind),
+            Action::RebuildVectorIndexes { table } => {
+                (table.clone(), IssueKind::InvalidVectorIndex)
+            }
         };
 
         let posture = self.cluster.replica_posture(&table);
@@ -381,8 +483,37 @@ impl SelfHealController {
                 entry.last_attempt_tick = Some(snapshot.tick);
                 entry.escalated = true;
             }
+            ActionOutcome::VectorRebuildStarted { .. } => {}
         }
         Some(outcome)
+    }
+
+    /// Start rebuilds of `table`'s invalid vector indexes. An attempt is
+    /// recorded only when a rebuild actually starts: one already running, or
+    /// held back by the engine-wide concurrency cap, is progress, not a
+    /// failed attempt, so a long rebuild never exhausts `max_attempts`.
+    fn start_vector_rebuilds(
+        &mut self,
+        snapshot: &HealthSnapshot,
+        table: &TableKey,
+    ) -> Option<ActionOutcome> {
+        let tid = TableId::new(&table.keyspace, &table.table);
+        let started = self.engine.start_vector_repairs(&tid);
+        if started == 0 {
+            return None;
+        }
+        metrics::inc_actions_executed();
+        let entry = self
+            .ledger
+            .entry((table.clone(), IssueKind::InvalidVectorIndex))
+            .or_default();
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.last_attempt_tick = Some(snapshot.tick);
+        tracing::info!(%table, indexes = started, "self-heal: started vector index rebuilds");
+        Some(ActionOutcome::VectorRebuildStarted {
+            table: table.clone(),
+            indexes: started,
+        })
     }
 
     /// Publish the health surface for this tick.
@@ -454,6 +585,39 @@ mod controller_tests {
         fn replica_posture(&self, _t: &TableKey) -> ReplicaPosture {
             self.posture
         }
+    }
+
+    struct PanickingCluster;
+    impl ClusterView for PanickingCluster {
+        fn this_host(&self) -> u64 {
+            0
+        }
+        fn owners(&self, _t: &TableKey) -> Option<Vec<u64>> {
+            panic!("cluster view exploded")
+        }
+        fn replica_posture(&self, _t: &TableKey) -> ReplicaPosture {
+            panic!("cluster view exploded")
+        }
+    }
+
+    /// t_396d4c80: a panicking tick must not end the controller.
+    #[test]
+    #[serial]
+    fn a_panicking_tick_is_counted_and_the_next_tick_runs() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        let engine = table_dir_with_n_generations_engine(2);
+        let mut c = SelfHealController::new(
+            engine,
+            Arc::new(PanickingCluster),
+            SelfHealConfig::default(),
+        );
+        assert!(!c.run_one_tick_guarded(), "the tick panicked");
+        assert!(
+            !c.run_one_tick_guarded(),
+            "and the controller ran the next one"
+        );
+        assert_eq!(metrics::self_heal_metrics().tick_panics_total, 2);
+        assert_eq!(c.tick(), 2, "a panicked tick still advances the clock");
     }
 
     #[test]

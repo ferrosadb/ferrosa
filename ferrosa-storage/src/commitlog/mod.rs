@@ -50,9 +50,10 @@ pub use mutation::{Mutation, CELL_REBIND_LIST_PATH_FLAG};
 /// durable data volume while bounding retained WAL disk usage.
 const RETAINED_WAL_SEGMENT_EQUIVALENTS: u64 = 8;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,7 +69,8 @@ use checkpoint::CommitLogCheckpoint;
 use config::CommitLogConfig as Config;
 use reader::SegmentReader;
 use segment::Segment;
-use sync::{BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
+pub use sync::SyncHealthSnapshot;
+use sync::{AckPolicy, BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
 
 static COMMITLOG_APPENDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMMITLOG_APPEND_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -111,6 +113,14 @@ fn observe_duration(total: &AtomicU64, max: &AtomicU64, duration: Duration) {
 /// if this rises rapidly (indicates pathological roll-then-crash behaviour);
 /// a small steady-state count is expected on hard kills (OOM, host reboot).
 pub static EMPTY_SEGMENT_SKIPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Closed segments the archiver was never told about (queue full or archiver
+/// stopped). Each is missing from PITR and, with archiving on, never deleted.
+static ARCHIVE_NOTIFY_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn archive_notify_dropped_total() -> u64 {
+    ARCHIVE_NOTIFY_DROPPED_TOTAL.load(Ordering::Relaxed)
+}
 
 /// Reads the `EMPTY_SEGMENT_SKIPPED_TOTAL` counter.
 pub fn empty_segment_skipped_total() -> u64 {
@@ -317,6 +327,18 @@ pub fn render_prometheus() -> String {
         "ferrosa_commitlog_periodic_idle_flushes_skipped_total {}\n",
         sync::periodic_idle_flush_skipped_total()
     ));
+    out.push_str("# HELP ferrosa_commitlog_archive_notify_dropped_total Closed commit-log segments never handed to the PITR archiver (queue full or archiver stopped).\n");
+    out.push_str("# TYPE ferrosa_commitlog_archive_notify_dropped_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_archive_notify_dropped_total {}\n",
+        ARCHIVE_NOTIFY_DROPPED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_commitlog_not_durable_refusals_total Writes refused because the commit log could not make them durable (sync thread dead, fsync failing, or past the stall deadline).\n");
+    out.push_str("# TYPE ferrosa_commitlog_not_durable_refusals_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_commitlog_not_durable_refusals_total {}\n",
+        sync::refused_writes_total()
+    ));
     out.push_str("# HELP ferrosa_commitlog_sync_batches_total Commit-log sync batches flushed.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_batches_total counter\n");
     out.push_str(&format!(
@@ -419,6 +441,27 @@ pub struct CommitLog {
     cdc: ArcSwapOption<CdcBus>,
 }
 
+/// What a replay consumer uses to keep a replayed mutation durable.
+///
+/// Replay deletes each segment of the previous generation once its entries
+/// have been delivered. A consumer that keeps a mutation only in memory —
+/// a memtable, a deferral buffer — must [`retain`](Self::retain) it first:
+/// the mutation is appended to the new generation, fsynced before the old
+/// segment is deleted, and discarded like any other entry once its table
+/// flushes past the returned position. A consumer that made the mutation
+/// durable elsewhere (the replay set-aside file) need not.
+pub struct ReplayRelog<'a> {
+    log: &'a CommitLog,
+}
+
+impl ReplayRelog<'_> {
+    /// Re-logs `mutation` (same id, timestamp and rows) into the new
+    /// generation and returns its new position.
+    pub fn retain(&self, mutation: &Mutation) -> ferrosa_common::Result<CommitLogPosition> {
+        self.log.append(mutation)
+    }
+}
+
 impl CommitLog {
     /// Creates a new commit log with the given configuration.
     ///
@@ -443,7 +486,7 @@ impl CommitLog {
         let active = Arc::new(ArcSwap::from(first_segment));
 
         let sync_strategy = Self::create_sync_strategy(&config, Arc::clone(&active));
-        sync_strategy.start();
+        sync_strategy.start()?;
 
         Ok(Self {
             config,
@@ -549,14 +592,25 @@ impl CommitLog {
     /// append order.
     ///
     /// See `specs/todo/bug-commitlog-replay-oom-on-large-log.md`.
+    ///
+    /// Every delivered mutation is re-logged into the new log generation
+    /// first (see [`ReplayRelog`]), because the callback's consumer is
+    /// assumed to hold it only in memory.
     pub fn open_and_replay_streaming<F>(
         config: Config,
-        on_mutation: F,
+        mut on_mutation: F,
     ) -> ferrosa_common::Result<Self>
     where
         F: FnMut(Mutation) -> ferrosa_common::Result<()>,
     {
-        Self::open_and_replay_streaming_with_barrier(config, on_mutation, || Ok(()))
+        Self::open_and_replay_streaming_with_barrier(
+            config,
+            |mutation, relog| {
+                relog.retain(&mutation)?;
+                on_mutation(mutation)
+            },
+            || Ok(()),
+        )
     }
 
     /// Like [`open_and_replay_streaming`](Self::open_and_replay_streaming), but
@@ -564,83 +618,88 @@ impl CommitLog {
     /// and BEFORE that segment file is deleted. A caller that persists
     /// mutations elsewhere (the no-schema set-aside) makes them durable there;
     /// if `segment_done` fails, replay stops and the segment stays on disk.
+    ///
+    /// The callback decides each mutation's durability: one it keeps only in
+    /// memory (a memtable, a deferral buffer) it MUST re-log through the
+    /// [`ReplayRelog`] it is handed, before the old segment is deleted.
     pub fn open_and_replay_streaming_with_barrier<F, B>(
         config: Config,
-        mut on_mutation: F,
-        mut segment_done: B,
+        on_mutation: F,
+        segment_done: B,
     ) -> ferrosa_common::Result<Self>
     where
-        F: FnMut(Mutation) -> ferrosa_common::Result<()>,
+        F: FnMut(Mutation, &ReplayRelog<'_>) -> ferrosa_common::Result<()>,
         B: FnMut() -> ferrosa_common::Result<()>,
     {
         let checkpoint = CommitLogCheckpoint::load(&config.checkpoint_dir)?;
-        let max_checkpoint_segment_id = checkpoint.values().map(|pos| pos.segment_id).max();
+        let segment_files = Self::scan_segment_files(&config.log_dir)?;
+        // The new generation starts above every id on disk or in the
+        // checkpoint, so its positions sort after anything replayed from.
+        let first_segment_id = segment_files
+            .last()
+            .map(|(id, _)| *id)
+            .into_iter()
+            .chain(checkpoint.values().map(|pos| pos.segment_id))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        // The new log exists before replay so a replayed mutation can be
+        // re-logged into it; see `ReplayRelog`.
+        let log = Self::new_with_first_segment_id(config, first_segment_id)?;
+        if let Err(e) = log.replay_segments(&segment_files, &checkpoint, on_mutation, segment_done)
+        {
+            if let Err(stop) = log.shutdown() {
+                tracing::error!(%stop, "commitlog: shutting down the new log after a failed replay");
+            }
+            return Err(e);
+        }
+        Ok(log)
+    }
 
-        // Scan for segment files in log_dir.
-        let mut segment_files: Vec<(u64, std::path::PathBuf)> = Vec::new();
-        if config.log_dir.exists() {
-            for entry in fs::read_dir(&config.log_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if let Some(id) = parse_segment_id(name) {
-                        segment_files.push((id, path));
-                    }
+    /// Segment files in `log_dir`, sorted by segment id.
+    fn scan_segment_files(log_dir: &Path) -> ferrosa_common::Result<Vec<(u64, PathBuf)>> {
+        let mut segment_files: Vec<(u64, PathBuf)> = Vec::new();
+        if log_dir.exists() {
+            for entry in fs::read_dir(log_dir)? {
+                let path = entry?.path();
+                if let Some(id) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(parse_segment_id)
+                {
+                    segment_files.push((id, path));
                 }
             }
         }
-
-        // Sort by segment ID for deterministic replay order.
         segment_files.sort_by_key(|(id, _)| *id);
-        let max_segment_file_id = segment_files.iter().map(|(id, _)| *id).max();
+        Ok(segment_files)
+    }
 
+    /// Streams the previous generation's `segment_files` to `on_mutation`,
+    /// deleting each one only after the mutations its consumer re-logged into
+    /// `self` are fsynced.
+    fn replay_segments<F, B>(
+        &self,
+        segment_files: &[(u64, PathBuf)],
+        checkpoint: &HashMap<TableId, CommitLogPosition>,
+        mut on_mutation: F,
+        mut segment_done: B,
+    ) -> ferrosa_common::Result<()>
+    where
+        F: FnMut(Mutation, &ReplayRelog<'_>) -> ferrosa_common::Result<()>,
+        B: FnMut() -> ferrosa_common::Result<()>,
+    {
+        let relog = ReplayRelog { log: self };
         // Stream segment by segment. The reader's `data` buffer (~segment_size)
         // and the per-segment entries Vec are dropped before the next iteration,
         // so peak memory is bounded by one segment regardless of how many
         // segments exist on disk. Each fully-replayed segment file is deleted
         // before moving on; on callback error, remaining segments are left
         // intact for retry.
-        for (id, path) in &segment_files {
-            // A too-short segment is the torn-create/torn-header state: the
-            // writer rolled to a new segment file, but was killed (OOM,
-            // kill -9, host reboot) before the header was durably completed.
-            // It carries no complete records, so it is safe — and mandatory —
-            // to skip it on replay rather than refuse to start. (See
-            // specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md.)
-            match fs::metadata(path) {
-                Ok(meta) if meta.len() < descriptor::HEADER_SIZE as u64 => {
-                    EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        segment_id = id,
-                        path = %path.display(),
-                        bytes = meta.len(),
-                        "commitlog: skipping too-short segment on replay (torn create/header from previous crash); \
-                         file will be cleaned up below"
-                    );
-                    if let Err(e) = fs::remove_file(path) {
-                        tracing::warn!(%e, "commitlog: failed to remove torn segment file");
-                    }
-                    continue;
-                }
-                Ok(_) if is_zeroed_segment_header(path)? => {
-                    EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        segment_id = id,
-                        path = %path.display(),
-                        "commitlog: skipping segment with all-zero header on replay \
-                         (preallocated/torn segment from previous crash); file will be cleaned up below"
-                    );
-                    if let Err(e) = fs::remove_file(path) {
-                        tracing::warn!(%e, "commitlog: failed to remove torn segment file");
-                    }
-                    continue;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(ferrosa_common::Error::from(e));
-                }
+        for (id, path) in segment_files {
+            if Self::skip_torn_segment(*id, path)? {
+                continue;
             }
-
             {
                 let mut reader = SegmentReader::open(path)?;
                 let entries = reader.read_all()?;
@@ -649,25 +708,60 @@ impl CommitLog {
                     let table_id = TableId::new(&mutation.keyspace, &mutation.table);
                     let dominated = checkpoint.get(&table_id).is_some_and(|cp| pos <= *cp);
                     if !dominated {
-                        on_mutation(mutation)?;
+                        on_mutation(mutation, &relog)?;
                     }
                 }
             }
 
+            // DURABILITY BARRIER (do not reorder): this segment is the only
+            // durable copy of what the callback re-logged until the new
+            // generation is fsynced. Deleting it first lost every replayed,
+            // still-unflushed mutation to a second crash (a confirmed DELETE
+            // came back). Rotated segments of the new generation were already
+            // fsynced by `force_rotate`; this covers the active one.
+            self.force_sync()?;
             segment_done()?;
             if let Err(e) = fs::remove_file(path) {
                 tracing::warn!(%e, "commitlog: failed to remove segment file");
             }
         }
+        Ok(())
+    }
 
-        let first_segment_id = max_segment_file_id
-            .into_iter()
-            .chain(max_checkpoint_segment_id)
-            .max()
-            .unwrap_or(0)
-            + 1;
-
-        Self::new_with_first_segment_id(config, first_segment_id)
+    /// Whether `path` is a torn segment to skip (and remove) on replay.
+    ///
+    /// A too-short segment is the torn-create/torn-header state: the writer
+    /// rolled to a new segment file, but was killed (OOM, kill -9, host
+    /// reboot) before the header was durably completed. It carries no
+    /// complete records, so it is safe — and mandatory — to skip it on replay
+    /// rather than refuse to start. (See
+    /// specs/in-process/bug-empty-commitlog-segment-blocks-startup-data-loss.md.)
+    fn skip_torn_segment(id: u64, path: &Path) -> ferrosa_common::Result<bool> {
+        let meta = fs::metadata(path)?;
+        if meta.len() < descriptor::HEADER_SIZE as u64 {
+            EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                segment_id = id,
+                path = %path.display(),
+                bytes = meta.len(),
+                "commitlog: skipping too-short segment on replay (torn create/header from previous crash); \
+                 file will be cleaned up below"
+            );
+        } else if is_zeroed_segment_header(path)? {
+            EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                segment_id = id,
+                path = %path.display(),
+                "commitlog: skipping segment with all-zero header on replay \
+                 (preallocated/torn segment from previous crash); file will be cleaned up below"
+            );
+        } else {
+            return Ok(false);
+        }
+        if let Err(e) = fs::remove_file(path) {
+            tracing::warn!(%e, "commitlog: failed to remove torn segment file");
+        }
+        Ok(true)
     }
 
     /// Appends a mutation to the commit log.
@@ -677,7 +771,32 @@ impl CommitLog {
     /// 2. Try to allocate space in the segment (lock-free CAS).
     /// 3. If the segment is full, rotate and retry.
     /// 4. Write the entry, update dirty tracking, notify sync strategy.
+    ///
+    /// `Err(CommitLogNotDurable)` means the sync machinery cannot stand
+    /// behind an acknowledgement (see `sync`): the entry may still reach disk,
+    /// so the write's outcome is unknown and the caller must not ack it.
     pub fn append(&self, mutation: &Mutation) -> ferrosa_common::Result<CommitLogPosition> {
+        self.append_with(mutation, AckPolicy::Durable)
+    }
+
+    /// Appends a mutation that the caller will make durable itself with
+    /// [`force_sync`](Self::force_sync) before acknowledging anything.
+    ///
+    /// Sync health cannot refuse it, so a multi-entry batch cannot be refused
+    /// partway and leave a torn prefix; the batch's `force_sync` is the
+    /// durability barrier instead.
+    pub fn append_for_explicit_sync(
+        &self,
+        mutation: &Mutation,
+    ) -> ferrosa_common::Result<CommitLogPosition> {
+        self.append_with(mutation, AckPolicy::CallerSyncs)
+    }
+
+    fn append_with(
+        &self,
+        mutation: &Mutation,
+        ack: AckPolicy,
+    ) -> ferrosa_common::Result<CommitLogPosition> {
         // DEBUG-level span so it costs nothing at the default INFO filter.
         let _span = tracing::debug_span!(
             "commitlog.write",
@@ -755,15 +874,18 @@ impl CommitLog {
             mark_dirty_start.elapsed(),
         );
 
-        // Notify sync strategy.
+        // Notify sync strategy. A refusal means the write is not durable:
+        // return it before CDC announces the write as done.
         let sync_notify_start = Instant::now();
-        self.sync_strategy
-            .on_write(&segment, offset, total_size as u64);
+        let synced = self
+            .sync_strategy
+            .on_write(&segment, offset, total_size as u64, ack);
         observe_duration(
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL,
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX,
             sync_notify_start.elapsed(),
         );
+        synced?;
 
         // CDC: publish the local change-data-capture event after the write is
         // durable in the segment buffer (WrittenOnNode stream).
@@ -854,13 +976,15 @@ impl CommitLog {
             mark_dirty_start.elapsed(),
         );
         let sync_notify_start = Instant::now();
-        self.sync_strategy
-            .on_write(&segment, offset, total_size as u64);
+        let synced =
+            self.sync_strategy
+                .on_write(&segment, offset, total_size as u64, AckPolicy::Durable);
         observe_duration(
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL,
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX,
             sync_notify_start.elapsed(),
         );
+        synced?;
 
         // CDC: publish the local change-data-capture event (WrittenOnNode).
         self.emit_written_on_node(
@@ -1104,9 +1228,23 @@ impl CommitLog {
         closed.push(old_segment);
         drop(closed);
 
-        // Notify archiver of the closed segment (non-blocking).
+        // Notify archiver of the closed segment (non-blocking). A segment the
+        // archiver never hears about is never archived, and with archiving
+        // on, never deleted either; this used to be dropped silently.
         if let Some(tx) = &self.archive_tx {
-            let _ = tx.try_send(old_id);
+            if let Err(e) = tx.try_send(old_id) {
+                ARCHIVE_NOTIFY_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let why = match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "archiver queue full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "archiver stopped",
+                };
+                tracing::error!(
+                    segment_id = old_id,
+                    why,
+                    "commitlog: closed segment not handed to the archiver; it will not be \
+                     archived and stays on disk"
+                );
+            }
         }
 
         Ok(())
@@ -1239,6 +1377,23 @@ impl CommitLog {
         // backwards patch made this quadratic in the bytes already
         // accumulated, on a path that runs per Accord apply.
         segment.flush_to_disk_repairing_marker(prev_marker_offset)
+    }
+
+    /// Health of the sync machinery, for the node supervisor and metrics.
+    pub fn sync_health(&self) -> SyncHealthSnapshot {
+        self.sync_strategy.health()
+    }
+
+    /// Replace a dead sync thread; the new thread first fsyncs what the dead
+    /// one left. `Ok(false)` when there was nothing to restart.
+    pub fn restart_sync(&self) -> ferrosa_common::Result<bool> {
+        self.sync_strategy.restart()
+    }
+
+    /// Make the sync thread panic at its next sync attempt.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_sync_panic(&self) {
+        self.sync_strategy.inject_panic();
     }
 
     /// Shuts down the commit log cleanly.
@@ -1920,6 +2075,78 @@ mod tests {
         assert_eq!(replayed[0].timestamp, fresh.timestamp);
     }
 
+    /// P0 regression: replay hands mutations to a volatile consumer (the
+    /// memtable), so deleting the replayed segment left them nowhere durable.
+    /// A second crash before the table flushed lost them for good — a
+    /// confirmed DELETE came back as the value it deleted.
+    #[test]
+    fn replayed_mutation_survives_a_second_crash_before_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        // A sync interval no test outlives: the re-logged copy is durable
+        // only because replay fsyncs it before deleting the old segment.
+        let config = CommitLogConfig {
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: std::time::Duration::from_secs(3600),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config.clone()).unwrap();
+        let written = simple_mutation();
+        cl.append(&written).unwrap();
+        cl.force_sync().unwrap();
+        drop(cl);
+
+        let (first, replayed) = CommitLog::open_and_replay(config.clone()).unwrap();
+        assert_eq!(replayed.len(), 1, "first restart replays the write");
+        // kill -9: no Drop, so no sync strategy gets a final flush in.
+        std::mem::forget(first);
+
+        let (_second, replayed) = CommitLog::open_and_replay(config).unwrap();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "a mutation replayed but never flushed must survive the next crash"
+        );
+        assert_eq!(replayed[0].mutation_id, written.mutation_id);
+        assert_eq!(replayed[0].timestamp, written.timestamp);
+    }
+
+    /// The re-logged copy is an ordinary entry of the new generation: once
+    /// its table flushes past the position `retain` returned, the next
+    /// restart replays nothing, so re-logging cannot accumulate.
+    #[test]
+    fn relogged_replay_copy_is_discarded_by_the_next_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config.clone()).unwrap();
+        cl.append(&simple_mutation()).unwrap();
+        drop(cl);
+
+        let mut retained = Vec::new();
+        let reopened = CommitLog::open_and_replay_streaming_with_barrier(
+            config.clone(),
+            |mutation, relog| {
+                retained.push(relog.retain(&mutation)?);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        let [position] = retained[..] else {
+            panic!("expected exactly one replayed mutation, got {retained:?}");
+        };
+        reopened
+            .discard_completed(&TableId::new("test_ks", "test_table"), position)
+            .unwrap();
+        drop(reopened);
+
+        let (_again, replayed) = CommitLog::open_and_replay(config).unwrap();
+        assert!(
+            replayed.is_empty(),
+            "a flushed re-logged copy must not replay again: {replayed:?}"
+        );
+    }
+
     #[test]
     fn periodic_sync_crash_replay_keeps_recent_mutation() {
         let dir = tempfile::tempdir().unwrap();
@@ -2491,6 +2718,103 @@ mod tests {
             replayed.len(),
             THREADS * ROUNDS
         );
+        cl.shutdown().unwrap();
+    }
+
+    /// A closed segment the archiver cannot be told about is counted and
+    /// logged, not dropped silently (t_396d4c80).
+    #[test]
+    fn a_segment_the_archiver_never_hears_about_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cl = CommitLog::new(CommitLogConfig::test_config(dir.path())).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1);
+        drop(rx);
+        cl.set_archive_channel(tx);
+        let before = archive_notify_dropped_total();
+        cl.force_rotate().unwrap();
+        assert!(
+            archive_notify_dropped_total() > before,
+            "the stopped archiver missed a segment"
+        );
+        cl.shutdown().unwrap();
+    }
+
+    /// P0-6 (t_88479cda): the production Periodic strategy, end to end.
+    ///
+    /// A dead sync thread must stop acknowledgements at once, and after a
+    /// restart every write that WAS acknowledged must be in the segment file
+    /// on disk — read straight from the file, the way a crash would see it,
+    /// before any shutdown flush could paper over a missing sync.
+    #[test]
+    fn acked_appends_reach_disk_across_a_sync_thread_panic_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 1024 * 1024,
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: Duration::from_millis(5),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+        let path = cl.active.load().path().to_path_buf();
+        let mut acked: Vec<String> = Vec::new();
+        let append = |table: &str, acked: &mut Vec<String>| {
+            let result = cl.append(&mutation_for_table("ks", table));
+            if result.is_ok() {
+                acked.push(table.to_string());
+            }
+            result
+        };
+
+        append("before", &mut acked).expect("healthy sync acknowledges");
+        cl.inject_sync_panic();
+        // Wakes the thread into its panic; acknowledged inside the window.
+        append("racing_the_panic", &mut acked).expect("the thread was alive");
+        let started = Instant::now();
+        while !cl.sync_health().dead {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the sync thread never died"
+            );
+            std::thread::yield_now();
+        }
+        match append("while_dead", &mut acked) {
+            Err(ferrosa_common::Error::CommitLogNotDurable { reason }) => {
+                assert!(reason.contains("sync thread died"), "{reason}")
+            }
+            other => panic!("a dead sync thread must refuse the write, got {other:?}"),
+        }
+
+        assert!(cl.restart_sync().unwrap(), "the dead thread is replaced");
+        append("after_restart", &mut acked).expect("acks resume after the restart");
+        let started = Instant::now();
+        while cl.sync_health().unsynced_for.is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the restarted thread never synced: {:?}",
+                cl.sync_health()
+            );
+            std::thread::yield_now();
+        }
+
+        let on_disk: std::collections::HashSet<String> = SegmentReader::open(&path)
+            .unwrap()
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| m.table)
+            .collect();
+        assert_eq!(
+            acked,
+            ["before", "racing_the_panic", "after_restart"],
+            "exactly the writes made while the thread lived were acknowledged"
+        );
+        for table in &acked {
+            assert!(
+                on_disk.contains(table),
+                "acknowledged write {table} is missing from the commit log on disk: {on_disk:?}"
+            );
+        }
         cl.shutdown().unwrap();
     }
 }

@@ -2002,19 +2002,56 @@ mod tests {
                 .unwrap();
             engine.flush(&tid).unwrap();
         }
+        // Hold the compaction at its first input open until released, so the
+        // drop below always meets an IN-FLIGHT compaction. Without the hold a
+        // two-SSTable compaction could finish first and the test would not
+        // exercise drop-during-compaction at all (it failed that way once).
+        use ferrosa_storage::compaction::cancel_harness::{CancelHookGuard, CancelPoint};
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let _hold = CancelHookGuard::install(
+            tid.to_string(),
+            Arc::new(move |point| {
+                if point != CancelPoint::InputOpen {
+                    return;
+                }
+                // Only the first InputOpen holds; the sender is taken once.
+                let Some(entered) = entered_tx.lock().unwrap().take() else {
+                    return;
+                };
+                entered.send(()).expect("test is waiting for the hold");
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("test releases the held compaction");
+            }),
+        );
         engine.force_compact_all();
-        assert!(engine
-            .unregister_table(&tid)
-            .unwrap_err()
-            .to_string()
-            .contains("active compaction"));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the forced compaction never reached its first input open");
 
-        ddl.execute(DdlOperation::DropTable {
+        // In flight: the non-waiting unregister must refuse.
+        let err = engine
+            .unregister_table(&tid)
+            .expect_err("unregister must refuse while a compaction is in flight");
+        assert!(err.to_string().contains("active compaction"), "{err}");
+
+        // The DDL drop must wait for the in-flight compaction: its first poll
+        // blocks in the compaction drain, and it completes once released.
+        let mut drop_table = Box::pin(ddl.execute(DdlOperation::DropTable {
             keyspace: "dtks".into(),
             table: "tbl".into(),
-        })
-        .await
-        .unwrap();
+        }));
+        assert!(
+            futures::poll!(&mut drop_table).is_pending(),
+            "DROP TABLE must wait for the in-flight compaction to drain"
+        );
+        release_tx.send(()).expect("the held compaction is waiting");
+        drop_table.await.unwrap();
         assert!(!schema
             .snapshot()
             .tables

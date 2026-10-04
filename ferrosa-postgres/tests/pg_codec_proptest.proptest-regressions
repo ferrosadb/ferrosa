@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7aa8ec6352dbf5b693f0ff440f8c455f5c3c094476ebd1aa0d7d283d86768339 # shrinks to frame = [83, 0, 0, 0, 5, 0], trailer = []

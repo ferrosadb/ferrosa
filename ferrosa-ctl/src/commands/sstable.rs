@@ -1741,6 +1741,7 @@ mod tests {
                     columns: vec![text("entity_id"), text("clustering"), int(0)],
                 },
             ],
+            paging_state: None,
         };
         let layout = parse_layout_from_result("agent_memory", "entity_store", &res).unwrap();
         assert_eq!(
@@ -1763,6 +1764,7 @@ mod tests {
                     Some((-1i32).to_be_bytes().to_vec()),
                 ],
             }],
+            paging_state: None,
         };
         assert!(parse_layout_from_result("ks", "t", &res).is_err());
     }

@@ -219,41 +219,23 @@ pub async fn execute_rebalance(
                         continue;
                     }
 
-                    // Serialize rows via RowWire for full fidelity
-                    // (clustering keys, all cells, deletion, liveness).
-                    use crate::raft::handlers::RowWire;
-                    let wire_rows: Vec<RowWire> =
-                        partition.rows.iter().cloned().map(RowWire::from).collect();
-                    let row_bytes = match bincode::serialize(&wire_rows) {
-                        Ok(bytes) => bytes,
+                    let mutation = match StreamedMutation::from_partition(ks, tbl, &partition) {
+                        Ok(mutation) => mutation,
                         Err(e) => {
                             tracing::error!(
                                 %e,
                                 partition_key = ?partition.key,
-                                "rebalance: failed to serialize rows, skipping partition"
+                                "rebalance: failed to serialize partition, skipping partition"
                             );
                             continue;
                         }
                     };
-                    let ts = partition
-                        .rows
-                        .first()
-                        .and_then(|r| r.cells.first())
-                        .map(|(_, cv)| cv.timestamp)
-                        .unwrap_or(0);
 
                     let target_uuid = ring
                         .get_node(target_node_id)
                         .map(|n| n.host_id)
                         .unwrap_or_default();
                     session_counter += 1;
-                    let mutation = StreamedMutation {
-                        keyspace: ks.clone(),
-                        table: tbl.clone(),
-                        key: partition.key.key.as_bytes().to_vec(),
-                        row: row_bytes,
-                        timestamp: ts,
-                    };
 
                     if let Err(e) = StreamSender::send_stream(
                         vec![mutation],

@@ -2,14 +2,12 @@
 //! Correctness: Correct when no more than `capacity` scans hold a slot at once,
 //!   a freed slot is always granted to the least-`vruntime` waiter (weighted by
 //!   class), a yielding scan re-competes and is never starved, and every slot is
-//!   released on finish OR drop.
-//! Last revised: 2026-07-22
-//! Last changed: New module — B1.5. Replaces the FIFO tokio-`Semaphore` that
-//!   `submit_scan` used for admission with the CFS-style vruntime scheduler, so
-//!   the `Scheduler`/`SchedTicket`/`SchedClass` machinery is the *live* admission
-//!   authority (not just tested in isolation). Weighting is real: a Foreground
-//!   scan (weight 1024) advances `vruntime` 4x slower than a Bulk scan (256), so
-//!   under contention it gets ~4x the slot turns.
+//!   released on finish OR drop, and a scan blocked on its consumer holds no
+//!   slot (`suspend`/`resume`).
+//! Last revised: 2026-10-03
+//! Last changed: `suspend`/`resume` — a scan whose consumer stopped reading
+//!   gives its slot back for the wait and re-competes with its `vruntime`
+//!   intact, so idle clients cannot hold every slot on the node.
 //!
 //! # Model
 //!
@@ -51,6 +49,17 @@ pub enum Admitted {
     /// slot is held. A scan whose consumer went away ends here without ever
     /// occupying a slot.
     Cancelled,
+}
+
+/// A scan that gave its slot back mid-run via [`FairAdmit::suspend`], with
+/// the scheduling state it re-enters the queue with on
+/// [`FairAdmit::resume`] — so parking does not reset its `vruntime`.
+#[derive(Debug)]
+pub struct Suspended {
+    id: u64,
+    group: GroupId,
+    weight: u32,
+    entity: SchedEntity,
 }
 
 struct State {
@@ -256,16 +265,72 @@ impl FairAdmit {
             }
             // Yield: release the slot and re-compete within its group.
             s.free += 1;
-            s.queue.enqueue(group, weight, entity);
-            let notify = Arc::new(Notify::new());
-            s.waiters.insert(id, notify.clone());
-            self.dispatch(&mut s);
-            if s.running.contains_key(&id) {
-                s.waiters.remove(&id);
-                return;
+            match self.enqueue_waiter(
+                &mut s,
+                Suspended {
+                    id,
+                    group,
+                    weight,
+                    entity,
+                },
+            ) {
+                Some(notify) => notify,
+                None => return,
             }
-            notify
         };
+        self.wait_for_grant(handle, id, notify);
+    }
+
+    /// Release running scan `id`'s slot without ending it: the scan is about to
+    /// block on something other than CPU (its consumer stopped reading), and a
+    /// slot held through that wait is a slot no other scan on the node can use.
+    /// Returns `None` if `id` holds no slot. Pair with [`resume`](Self::resume).
+    pub fn suspend(&self, id: u64) -> Option<Suspended> {
+        let mut s = self.state.lock().expect("fair-admit poisoned");
+        let (group, weight, entity) = s.running.remove(&id)?;
+        s.free += 1;
+        self.dispatch(&mut s);
+        Some(Suspended {
+            id,
+            group,
+            weight,
+            entity,
+        })
+    }
+
+    /// Re-compete for a slot after [`suspend`](Self::suspend), blocking (on
+    /// `handle`) until one is granted in vruntime order. Like a yielding scan,
+    /// a resuming one is not subject to the waiter bound: it was admitted once,
+    /// and shedding it now would fail a query mid-result.
+    pub fn resume(&self, handle: &tokio::runtime::Handle, suspended: Suspended) {
+        let id = suspended.id;
+        let notify = {
+            let mut s = self.state.lock().expect("fair-admit poisoned");
+            match self.enqueue_waiter(&mut s, suspended) {
+                Some(notify) => notify,
+                None => return,
+            }
+        };
+        self.wait_for_grant(handle, id, notify);
+    }
+
+    /// Queue `scan` for a slot and dispatch. `None` when it was granted at once;
+    /// otherwise the wakeup to wait on.
+    fn enqueue_waiter(&self, s: &mut State, scan: Suspended) -> Option<Arc<Notify>> {
+        let id = scan.id;
+        s.queue.enqueue(scan.group, scan.weight, scan.entity);
+        let notify = Arc::new(Notify::new());
+        s.waiters.insert(id, notify.clone());
+        self.dispatch(s);
+        if s.running.contains_key(&id) {
+            s.waiters.remove(&id);
+            return None;
+        }
+        Some(notify)
+    }
+
+    /// Block until scan `id` has been granted a slot.
+    fn wait_for_grant(&self, handle: &tokio::runtime::Handle, id: u64, notify: Arc<Notify>) {
         handle.block_on(async move {
             loop {
                 notify.notified().await;

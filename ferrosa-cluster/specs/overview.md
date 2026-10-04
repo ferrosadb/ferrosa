@@ -47,7 +47,7 @@ machine but are otherwise loosely coupled:
 | `rebalance.rs` | token-skew rebalancing with data streaming |
 | `repair/` | Merkle trees, repair coordinator/executor, scheduler, quarantine→refill trigger, RPC, cluster view |
 | `hints/` | per-peer hint segments, delivery/replay, CRC + crash recovery |
-| `accord/` | EPaxos-family transactions: coordinator, state machine, recovery, dep-wait, cross-shard/DC, electorate, durability, deterministic test cluster |
+| `accord/` | EPaxos-family transactions: coordinator, state machine, bounded decided-txn record (`finalized.rs`, CL-36), recovery, dep-wait, cross-shard/DC, electorate, durability, deterministic test cluster |
 | `state.rs` | `SingleNodeClusterState` / `PairClusterState` / `RaftClusterState` |
 | `write_path.rs`, `raft_forward.rs`, `ddl_path.rs`, `index_coordination.rs`, `streaming/`, `system_table_*` | write routing, leader forwarding, DDL routing, index build coordination, SSTable streaming, system-table persistence |
 
@@ -163,6 +163,16 @@ dependency/apply check, without remote read-vote fanout. See
     resumes the Promote phase via `promote_joining_members` rather than
     skipping it on every restart. Promote touches `Joining` only: `Leaving`,
     `Decommissioned` and `Learner` are never promoted (CL-29).
+11. **No replica-ownership change without verified data movement.** A
+    `Joining` member becomes `Normal` only after a committed
+    `RecordBootstrapComplete` (every range it will replicate pulled from every
+    current replica by anti-entropy); a decommission proposes `LeaveNode` only
+    after every range the node replicates reached each new owner and the
+    receiver verified it. A failure leaves the node `Joining` / `Leaving` and is
+    logged and counted (CL-40, CL-41). Existing `Normal` members are
+    grandfathered: they need no record. `downgrade_to_pair` is accepted only
+    after a node was taken down, and stops this node's Raft before pairing
+    (CL-42).
 
 ## Correctness evidence (be honest)
 

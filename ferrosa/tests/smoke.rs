@@ -143,6 +143,7 @@ fn setup_state_for(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> Arc<Share
         last_schema_event: tokio::sync::watch::channel(None).0,
         topology_policy: ClientTopologyPolicy::default(),
         txn_registry: ferrosa_cql::txn_registry::TransactionRegistry::shared_default(),
+        result_cursors: Default::default(),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
     })
 }

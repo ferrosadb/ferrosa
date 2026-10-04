@@ -218,6 +218,7 @@ async fn start_with_tls(rate_limit: RateLimitConfig, tls: server::PgTls) -> Fixt
         accord: AccordAccess::disabled(),
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
+        portals: Default::default(),
     });
     let store = Arc::new(SchemaVerifierStore::new(schema.clone()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

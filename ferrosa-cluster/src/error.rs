@@ -57,6 +57,9 @@ pub enum ClusterError {
     /// `feature` names the missing path so logs and clients can tell
     /// "QUORUM cross-DC" apart from "EACH_QUORUM cross-DC".
     NotImplemented { feature: String },
+    /// A membership change was refused because the data it moves was not
+    /// streamed and verified (P0-2, P0-4). The change was not committed.
+    DataMovementUnverified(String),
 }
 
 impl fmt::Display for ClusterError {
@@ -110,6 +113,12 @@ impl fmt::Display for ClusterError {
             Self::Internal(msg) => write!(f, "internal: {msg}"),
             Self::NotImplemented { feature } => {
                 write!(f, "not implemented: {feature}")
+            }
+            Self::DataMovementUnverified(msg) => {
+                write!(
+                    f,
+                    "data movement not verified, membership change aborted: {msg}"
+                )
             }
         }
     }

@@ -239,9 +239,9 @@ fn prepare_order_by_execution(
 /// bytes, CK from `Row.clustering` — both are already present in
 /// every row regardless of cell projection.
 ///
-/// Ordinal mapping mirrors `ferrosa_schema::convert` (Vec of regular
-/// columns sorted by `ColumnMetadata.position`) so the indexes match
-/// `SerializationHeader::regular_columns` on disk.
+/// Ordinals are storage's FLAT space (`TableMetadata::storage_column_index`:
+/// statics first, then regulars in name order); the storage layer maps them
+/// to each SSTable's own header ordinals.
 ///
 /// The caller must additionally confirm WHERE is empty — a predicate
 /// on a non-projected regular column would silently evaluate against
@@ -389,9 +389,8 @@ fn projection_storage_ordinals(
         .collect::<Option<Vec<_>>>()?;
 
     // Build the regular column list in Cassandra **name-sorted** order —
-    // exactly what `ferrosa_schema::convert::to_storage_schema` emits into the
-    // SSTable's `SerializationHeader.regular_columns` (and what
-    // `storage_column_index` indexes against). Sorting by declared `position`
+    // exactly the order `storage_column_index` uses after the statics.
+    // Sorting by declared `position`
     // here is WRONG: for a table whose declared column order differs from
     // name order, the projected SSTable read would then decode the wrong
     // column and the requested column would come back NULL once the memtable
@@ -403,6 +402,15 @@ fn projection_storage_ordinals(
         .collect();
     regulars.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
 
+    // Storage ordinals are FLAT: statics first, then the name-sorted
+    // regulars (`TableMetadata::storage_column_index`). Every storage read
+    // returns that space, SSTable reads included (t_65661473), so a projected
+    // regular column is `statics + position`.
+    let static_count = table_meta
+        .columns
+        .values()
+        .filter(|c| c.kind == ColumnKind::Static)
+        .count();
     let mut wanted: Vec<u16> = Vec::new();
     for name in &names {
         // Unknown column name — bail out so the legacy path returns the right
@@ -419,7 +427,7 @@ fn projection_storage_ordinals(
                         .iter()
                         .position(|c| c.name.eq_ignore_ascii_case(name))
                     {
-                        wanted.push(idx as u16);
+                        wanted.push((static_count + idx) as u16);
                     }
                 }
                 ColumnKind::PartitionKey | ColumnKind::Clustering => {
@@ -1200,12 +1208,12 @@ async fn extend_rows_from_partitions(
 /// Drain a projected partition stream into `all_rows`, moving each partition
 /// through the row builder one at a time.
 ///
-/// Unlike [`extend_rows_from_partitions`], this never materializes the whole
-/// scan into a `Vec<Partition>` first: in-flight memory is `O(num_sources)`
-/// partitions plus the accumulated result rows, and there is no server-side
-/// result cap — the scan is bounded only by the query's own LIMIT (already
-/// pushed into the producer as a partition stop) and the row-level predicate
-/// filter applied by the caller.
+/// This avoids a `Vec<Partition>`, but it DOES collect every result row into
+/// `all_rows`: memory is `O(result)`. Its remaining callers are bounded by a
+/// LIMIT/page partition stop, or fold the result (aggregates, ANN). Shapes
+/// that page through a whole table (`ORDER BY`, `DISTINCT`, function
+/// projections) are served from a result cursor instead
+/// ([`serve_result_cursor`]).
 async fn extend_rows_from_partition_stream(
     mut stream: ferrosa_cluster::write_path::PartitionResultStream,
     all_rows: &mut Vec<Vec<Option<CqlValue>>>,
@@ -1734,6 +1742,465 @@ fn plain_projection_page_shape(s: &SelectStatement) -> bool {
 /// portion of the set, in the same sense as `Vec::with_capacity`.
 const DISTINCT_DEDUP_RESIDENT_CAPACITY: usize = 65_536;
 
+/// [`DISTINCT_DEDUP_RESIDENT_CAPACITY`], unless
+/// `FERROSA_CQL_DISTINCT_RESIDENT_KEYS` sets a positive count. Read per call so
+/// an operator (or a test) can lower it without a restart.
+fn distinct_resident_capacity() -> usize {
+    std::env::var("FERROSA_CQL_DISTINCT_RESIDENT_KEYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DISTINCT_DEDUP_RESIDENT_CAPACITY)
+}
+
+/// Resolve the user-defined functions and aggregates a SELECT projects, with
+/// the column index each one fills. Built-in functions are handled inline and
+/// are not listed.
+fn resolve_select_functions(
+    state: &SharedState,
+    ks: &str,
+    s: &SelectStatement,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+) -> Result<Vec<(usize, ResolvedFunction)>, CqlError> {
+    let mut resolved_funcs: Vec<(usize, ResolvedFunction)> = Vec::new();
+    for (i, sc) in s.columns.iter().enumerate() {
+        if let SelectColumn::FunctionCall {
+            keyspace: func_ks,
+            name,
+            args,
+            alias,
+        } = sc
+        {
+            let fn_lower = name.to_lowercase();
+            // Skip built-in functions — they are handled inline.
+            if matches!(
+                fn_lower.as_str(),
+                "count"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "sum"
+                    | "writetime"
+                    | "ttl"
+                    | "uuid"
+                    | "now"
+                    | "totimestamp"
+                    | "todate"
+            ) {
+                continue;
+            }
+            let resolved = resolve_select_function(
+                ks,
+                func_ks.as_deref(),
+                name,
+                args,
+                alias.as_deref(),
+                all_col_names,
+                all_col_types,
+                &state.schema,
+            )?;
+            resolved_funcs.push((i, resolved));
+        }
+    }
+    Ok(resolved_funcs)
+}
+
+/// Whether a SELECT folds its whole result into one row: a built-in
+/// aggregate, or a resolved user-defined aggregate.
+fn select_is_aggregate(s: &SelectStatement, resolved_funcs: &[(usize, ResolvedFunction)]) -> bool {
+    let has_builtin_agg = s.columns.iter().any(|c| {
+        matches!(c, SelectColumn::FunctionCall { name, .. }
+            if name.eq_ignore_ascii_case("count")
+                || name.eq_ignore_ascii_case("avg")
+                || name.eq_ignore_ascii_case("min")
+                || name.eq_ignore_ascii_case("max")
+                || name.eq_ignore_ascii_case("sum"))
+    });
+    has_builtin_agg
+        || resolved_funcs
+            .iter()
+            .any(|(_, f)| matches!(f.kind, ResolvedFunctionKind::Aggregate { .. }))
+}
+
+/// Turn full table rows into result rows: column selection, scalar UDFs and
+/// `toJson()`. One row in, one row out, so it can run on any batch — the
+/// whole result, or one page of a result cursor.
+fn project_select_rows(
+    state: &SharedState,
+    s: &SelectStatement,
+    rows: &[Vec<Option<CqlValue>>],
+    all_col_names: &[String],
+    col_names: &[String],
+    resolved_funcs: &[(usize, ResolvedFunction)],
+) -> Result<Vec<Vec<Option<CqlValue>>>, CqlError> {
+    // Apply column selection if not Star
+    let selected_rows = select_columns(rows, all_col_names, col_names);
+
+    // Evaluate scalar UDFs on each projected row.
+    let scalar_funcs: Vec<&ResolvedFunction> = resolved_funcs
+        .iter()
+        .filter(|(_, f)| matches!(f.kind, ResolvedFunctionKind::Scalar))
+        .map(|(_, f)| f)
+        .collect();
+    let selected_rows = if scalar_funcs.is_empty() {
+        selected_rows
+    } else {
+        // We need the full rows to extract UDF args, then replace the UDF
+        // columns in the projected output.
+        let mut result_rows = selected_rows;
+        for (full_row, projected_row) in rows.iter().zip(result_rows.iter_mut()) {
+            let udf_results = evaluate_row_udfs(state, full_row, &scalar_funcs)?;
+            // Map UDF results back into the projected row. Each resolved
+            // func knows its column index in the SELECT list.
+            for ((col_idx, _), udf_val) in resolved_funcs.iter().zip(udf_results.iter()) {
+                // Find the position of col_idx in the projected columns.
+                if let Some(proj_pos) = col_names.iter().position(|n| {
+                    if let Some((_, ref f)) = resolved_funcs.iter().find(|(i, _)| i == col_idx) {
+                        *n == f.display_name
+                    } else {
+                        false
+                    }
+                }) {
+                    projected_row[proj_pos] = udf_val.clone();
+                }
+            }
+        }
+        result_rows
+    };
+
+    // Apply toJson() built-in on projected columns.
+    Ok(apply_tojson_projections(
+        &s.columns,
+        col_names,
+        all_col_names,
+        rows,
+        selected_rows,
+    ))
+}
+
+/// Everything a full-table result cursor needs about its query.
+struct CursorQuery<'a> {
+    state: &'a SharedState,
+    ctx: &'a RequestContext<'a>,
+    ks: &'a str,
+    s: &'a SelectStatement,
+    table_meta: &'a TableMetadata,
+    table_id: &'a TableId,
+    table_strategy: &'a ferrosa_cluster::ring::strategy::ReplicationStrategy,
+    row_limit: usize,
+    col_names: &'a [String],
+    col_types: &'a [CqlType],
+    rows: PartitionRowContext<'a>,
+    resolved_funcs: &'a [(usize, ResolvedFunction)],
+}
+
+/// A full-table SELECT whose result cannot be produced in scan order a page at
+/// a time — `ORDER BY` (every row must be seen first), `DISTINCT` over an
+/// arbitrary projection (must remember what it emitted), or a function
+/// projection (excluded from the scan-order page paths because aggregates
+/// share its syntax) — and is not itself an aggregate. These are answered from
+/// a [`crate::result_cursor::ResultCursor`].
+fn result_cursor_shape(
+    s: &SelectStatement,
+    count_only_select: bool,
+    resolved_funcs: &[(usize, ResolvedFunction)],
+) -> bool {
+    let has_function_projection = s
+        .columns
+        .iter()
+        .any(|c| matches!(c, SelectColumn::FunctionCall { .. }));
+    !count_only_select
+        && s.ann_of.is_none()
+        && (!s.order_by.is_empty() || s.distinct || has_function_projection)
+        && !select_is_aggregate(s, resolved_funcs)
+}
+
+/// Serve one response of a cursor-shaped SELECT.
+///
+/// - No paging state: build the cursor (one scan) and read its first page.
+/// - A paging state for a cursor on THIS node: read its next page here.
+/// - A paging state for a cursor on ANOTHER node (the driver moved to this
+///   coordinator — load balancing, or a retry after its connection broke):
+///   forward the page request to the owner over internode and relay its reply.
+///
+/// An unpaged request receives every remaining row in one response, as the
+/// protocol requires, read a batch at a time.
+async fn serve_result_cursor(q: CursorQuery<'_>) -> Result<SelectRawResult, CqlError> {
+    let registry = &q.state.result_cursors;
+    let fingerprint =
+        crate::result_cursor::query_fingerprint(&q.ctx.auth.role, q.ks, &format!("{:?}", q.s));
+    let bound = request_scan_bound(q.ctx);
+    let cap = bound
+        .row_cap()
+        .unwrap_or_else(crate::paging::default_scan_page_size);
+    let owner = Some(q.ctx.client_address.clone());
+
+    let (mut rows, mut next) = match q.ctx.paging.paging_state.as_deref() {
+        None => {
+            let mut cursor = build_result_cursor(&q, fingerprint).await?;
+            let page = cursor.next_page(cap)?;
+            let next = if page.more {
+                Some(registry.park(cursor, None, owner.clone())?.encode())
+            } else {
+                None
+            };
+            (page.rows, next)
+        }
+        Some(bytes) => fetch_cursor_page(&q, bytes, fingerprint, cap, owner.clone()).await?,
+    };
+    if bound.row_cap().is_none() {
+        // Unpaged: the protocol forbids a continuation, so read to the end.
+        let mut pages = 0usize;
+        while let Some(token) = next.take() {
+            pages += 1;
+            if pages > 10_000_000 {
+                return Err(CqlError::ServerError(
+                    "result cursor: unpaged read did not terminate".into(),
+                ));
+            }
+            let (more, after) =
+                fetch_cursor_page(&q, &token, fingerprint, cap, owner.clone()).await?;
+            rows.extend(more);
+            next = after;
+        }
+    }
+    Ok(SelectRawResult {
+        column_names: q.col_names.to_vec(),
+        column_types: q.col_types.to_vec(),
+        rows,
+        keyspace: q.ks.to_string(),
+        table: q.s.table.clone(),
+        paging_state: next,
+    })
+}
+
+/// Read the page `paging_state` names: here if this node owns the cursor,
+/// otherwise from its owner over internode.
+async fn fetch_cursor_page(
+    q: &CursorQuery<'_>,
+    paging_state: &[u8],
+    fingerprint: [u8; 16],
+    cap: usize,
+    owner: Option<String>,
+) -> Result<(Vec<Vec<Option<CqlValue>>>, Option<Vec<u8>>), CqlError> {
+    let registry = &q.state.result_cursors;
+    let token = crate::result_cursor::CursorToken::decode(paging_state)?;
+    if token.owner == registry.node() {
+        let (rows, next) = registry.serve_page(&token, &fingerprint, cap, owner)?;
+        return Ok((rows, next.map(|t| t.encode())));
+    }
+    crate::result_cursor::forward_page(
+        q.state.peer_manager.as_ref(),
+        &token,
+        paging_state,
+        fingerprint,
+        cap,
+    )
+    .await
+}
+
+/// Scan the table ONCE into a result cursor of FINAL result rows.
+///
+/// - `ORDER BY`: each filtered row is projected and prefixed with its sort-key
+///   values, then pushed into a spilling external sort on that prefix. The
+///   stored rows need no statement context to be read, so the cursor can serve
+///   a page for any coordinator.
+/// - otherwise: rows are projected (and, for `DISTINCT`, de-duplicated) as
+///   they arrive and spooled in arrival order; a `LIMIT` stops the scan once
+///   it is met.
+/// - `ORDER BY` with `DISTINCT`: the sorted rows are de-duplicated in sorted
+///   order (the first occurrence in sort order wins, as before) into a second,
+///   arrival-ordered spool.
+///
+/// The de-duplication set lives only while the cursor is built: a parked
+/// cursor holds no `DISTINCT` state. The scan runs to completion here, so a
+/// parked cursor never holds a storage scan or a scan-pool slot.
+async fn build_result_cursor(
+    q: &CursorQuery<'_>,
+    fingerprint: [u8; 16],
+) -> Result<crate::result_cursor::ResultCursor, CqlError> {
+    use ferrosa_storage::{ExternalSorter, RowOrder};
+
+    let permit = q.state.result_cursors.admit()?;
+    let spool = q
+        .state
+        .engine
+        .reserve_order_by_temp_sort_table(q.ks, &q.s.table)
+        .map_err(|e| {
+            CqlError::ServerError(format!("result cursor: temp-sort setup failed: {e}"))
+        })?;
+    let threshold = ferrosa_storage::process_spill_threshold_bytes();
+    let ordered = !q.s.order_by.is_empty();
+    // Source column of each sort key, in ORDER BY order; key `i` is stored at
+    // column `i` of every row, ahead of the result columns.
+    let key_sources: Vec<(usize, bool)> =
+        q.s.order_by
+            .iter()
+            .filter_map(|(col_name, dir)| {
+                let idx = q.rows.all_col_names.iter().position(|n| n == col_name)?;
+                Some((idx, *dir == OrderDirection::Asc))
+            })
+            .collect();
+    let key_len = key_sources.len();
+    // With no key the sorter's stable runs and run-index tie-break keep
+    // arrival order, so it is a spill-backed FIFO.
+    let order = RowOrder::new(
+        key_sources
+            .iter()
+            .enumerate()
+            .map(|(i, (_, asc))| (i, *asc))
+            .collect(),
+    );
+    let limit = literal_limit(q.s).map(|l| l as u64);
+    let project = |batch: &[Vec<Option<CqlValue>>]| {
+        project_select_rows(
+            q.state,
+            q.s,
+            batch,
+            q.rows.all_col_names,
+            q.col_names,
+            q.resolved_funcs,
+        )
+    };
+    let mut dedup = if q.s.distinct {
+        let dir = spool.path().join("distinct");
+        std::fs::create_dir(&dir).map_err(|e| {
+            CqlError::ServerError(format!(
+                "result cursor: DISTINCT spill dir {}: {e}",
+                dir.display()
+            ))
+        })?;
+        Some(ferrosa_storage::spilling_dedup::SpillingDedup::new(
+            dir,
+            distinct_resident_capacity(),
+        ))
+    } else {
+        None
+    };
+    let mut first_time = |row: &[Option<CqlValue>]| -> Result<bool, CqlError> {
+        match dedup.as_mut() {
+            None => Ok(true),
+            Some(seen) => seen
+                .insert(&crate::paging::distinct_dedup_key(row))
+                .map_err(|e| {
+                    CqlError::ServerError(format!("DISTINCT de-duplication spill failed: {e}"))
+                }),
+        }
+    };
+    let spill_err =
+        |e: ferrosa_common::Error| CqlError::ServerError(format!("result cursor spill: {e}"));
+
+    let mut sorter = ExternalSorter::new(spool.path(), order.clone(), threshold);
+    let mut kept: u64 = 0;
+    let mut stream = instrument_full_scan_rows(
+        q.state
+            .write_path
+            .load()
+            .range_read_stream_all_with(
+                q.table_id,
+                q.row_limit,
+                q.ctx.consistency,
+                q.table_strategy,
+            )
+            .await?,
+    );
+    let mut processed_partitions = 0usize;
+    'scan: while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        let mut rows = bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            q.rows.all_col_names,
+            q.rows.all_col_types,
+            q.rows.pk_indices,
+            q.rows.ck_indices,
+            q.rows.storage_to_table,
+        )?;
+        filter_rows_by_select_predicates(
+            &mut rows,
+            q.s,
+            q.rows.all_col_names,
+            q.rows.all_col_types,
+            q.table_meta,
+            q.ks,
+            q.state,
+        )?;
+        let projected = project(&rows)?;
+        if ordered {
+            for (full, result) in rows.iter().zip(projected) {
+                let mut stored: Vec<Option<CqlValue>> = Vec::with_capacity(key_len + result.len());
+                stored.extend(key_sources.iter().map(|(idx, _)| full[*idx].clone()));
+                stored.extend(result);
+                sorter.push(stored).map_err(spill_err)?;
+            }
+        } else {
+            for row in projected {
+                if first_time(&row)? {
+                    sorter.push(row).map_err(spill_err)?;
+                    kept += 1;
+                    if limit.is_some_and(|l| kept >= l) {
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    // Release the scan (and its pool slot) before any further work.
+    drop(stream);
+
+    let spilled = sorter.spilled();
+    let mut sorted = sorter.finish().map_err(spill_err)?;
+    let (rows, order, key_len) = if ordered && q.s.distinct {
+        let fifo_dir = spool.path().join("distinct-sorted");
+        std::fs::create_dir(&fifo_dir).map_err(|e| {
+            CqlError::ServerError(format!(
+                "result cursor: spool dir {}: {e}",
+                fifo_dir.display()
+            ))
+        })?;
+        let fifo_order = RowOrder::new(Vec::new());
+        let mut fifo = ExternalSorter::new(&fifo_dir, fifo_order.clone(), threshold);
+        for row in sorted.by_ref() {
+            let mut row = row.map_err(spill_err)?;
+            row.drain(..key_len);
+            if first_time(&row)? {
+                fifo.push(row).map_err(spill_err)?;
+                kept += 1;
+                if limit.is_some_and(|l| kept >= l) {
+                    break;
+                }
+            }
+        }
+        drop(sorted);
+        (fifo.finish().map_err(spill_err)?, fifo_order, 0)
+    } else {
+        (sorted, order, key_len)
+    };
+    drop(dedup);
+    tracing::debug!(
+        keyspace = q.ks,
+        table = %q.s.table,
+        spilled,
+        "built a result cursor"
+    );
+    Ok(crate::result_cursor::ResultCursor::new(
+        rows,
+        order,
+        key_len,
+        spool,
+        permit,
+        limit,
+        fingerprint,
+    ))
+}
+
 fn request_scan_bound(ctx: &RequestContext<'_>) -> crate::paging::ScanBound {
     crate::paging::ScanBound::from_request(ctx.paging.page_size)
 }
@@ -2226,6 +2693,9 @@ pub struct SharedState {
     /// the statements of one transaction need not land on the same TCP connection
     /// — this is what deletes the connection-affinity desync bug class.
     pub txn_registry: crate::txn_registry::SharedTransactionRegistry,
+    /// This node's parked result cursors: `ORDER BY` / `DISTINCT` results
+    /// computed once and read a page at a time (see [`crate::result_cursor`]).
+    pub result_cursors: Arc<crate::result_cursor::ResultCursorRegistry>,
 }
 
 impl std::ops::Deref for SharedState {
@@ -5368,6 +5838,28 @@ thread_local! {
     /// Rows retained by the bounded partition suffix read before its one-row
     /// continuation probe is discarded.
     static BOUNDED_PARTITION_ROWS_MATERIALIZED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Rows pulled from a full-table scan stream by the shapes that cannot be
+    /// served in scan order (`ORDER BY`, `DISTINCT`, function projections).
+    /// Paging through such a result must cost O(table) rows in total, not
+    /// O(table) per page.
+    static FULL_SCAN_ROWS_PULLED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test instrumentation: count the rows a full-table scan stream yields (see
+/// `FULL_SCAN_ROWS_PULLED`). A no-op outside tests.
+fn instrument_full_scan_rows(
+    stream: ferrosa_cluster::write_path::PartitionResultStream,
+) -> ferrosa_cluster::write_path::PartitionResultStream {
+    #[cfg(test)]
+    let stream: ferrosa_cluster::write_path::PartitionResultStream =
+        Box::pin(stream.inspect(|item| {
+            if let Ok(partition) = item {
+                FULL_SCAN_ROWS_PULLED
+                    .with(|count| count.set(count.get() + partition.rows.len().max(1)));
+            }
+        }));
+    stream
 }
 
 /// Run a user-table SELECT. A corrupt stored cell fails the read with the
@@ -5460,6 +5952,9 @@ async fn route_select_user_table_inner(
         .collect::<Result<Vec<_>, _>>()?;
     let storage_to_table = storage_to_table_indices(table_meta);
     let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
+    // User-defined functions in the projection, resolved once: the result
+    // cursor and the generic tail both project with them.
+    let select_funcs = resolve_select_functions(state, ks, s, &all_col_names, &all_col_types)?;
 
     // ── fts_match(): full-text index search ───────────────────────────────────
     //
@@ -6833,6 +7328,37 @@ async fn route_select_user_table_inner(
                                 table: s.table.clone(),
                                 paging_state: None,
                             });
+                        } else if result_cursor_shape(s, count_only_select, &select_funcs) {
+                            // ORDER BY / DISTINCT / function projection: scan
+                            // once into a server-side result cursor and read it a
+                            // page at a time (see `result_cursor`). Never
+                            // collected, never re-scanned per page.
+                            return serve_result_cursor(CursorQuery {
+                                state,
+                                ctx,
+                                ks,
+                                s,
+                                table_meta,
+                                table_id: &table_id,
+                                table_strategy: &table_strategy,
+                                row_limit: safe_partition_key_filter_row_limit(
+                                    s,
+                                    table_meta,
+                                    count_only_select,
+                                )
+                                .unwrap_or(0),
+                                col_names: &col_names,
+                                col_types: &col_types,
+                                rows: PartitionRowContext {
+                                    all_col_names: &all_col_names,
+                                    all_col_types: &all_col_types,
+                                    pk_indices: &pk_indices,
+                                    ck_indices: &ck_indices,
+                                    storage_to_table: &storage_to_table,
+                                },
+                                resolved_funcs: &select_funcs,
+                            })
+                            .await;
                         } else {
                             let scan_bound = if s.order_by.is_empty()
                                 && s.ann_of.is_none()
@@ -7024,7 +7550,7 @@ async fn route_select_user_table_inner(
                                         ferrosa_storage::process_spill_threshold_bytes();
                                     let (sorted, did_spill) =
                                         sort_rows_from_partition_stream_spilling(
-                                            stream,
+                                            instrument_full_scan_rows(stream),
                                             reservation.path(),
                                             ferrosa_storage::RowOrder::new(order_specs),
                                             threshold,
@@ -7171,7 +7697,7 @@ async fn route_select_user_table_inner(
                                 // rows. Partitions move from the reader into the row
                                 // builder one at a time — no full-table Vec, no cap.
                                 extend_rows_from_partition_stream(
-                                    stream,
+                                    instrument_full_scan_rows(stream),
                                     &mut all_rows,
                                     &all_col_names,
                                     &all_col_types,
@@ -7272,46 +7798,7 @@ async fn route_select_user_table_inner(
     };
 
     // Resolve UDFs/UDAs in SELECT columns.
-    let mut resolved_funcs: Vec<(usize, ResolvedFunction)> = Vec::new();
-    for (i, sc) in s.columns.iter().enumerate() {
-        if let SelectColumn::FunctionCall {
-            keyspace: func_ks,
-            name,
-            args,
-            alias,
-        } = sc
-        {
-            let fn_lower = name.to_lowercase();
-            // Skip built-in functions — they are handled inline.
-            if matches!(
-                fn_lower.as_str(),
-                "count"
-                    | "avg"
-                    | "min"
-                    | "max"
-                    | "sum"
-                    | "writetime"
-                    | "ttl"
-                    | "uuid"
-                    | "now"
-                    | "totimestamp"
-                    | "todate"
-            ) {
-                continue;
-            }
-            let resolved = resolve_select_function(
-                ks,
-                func_ks.as_deref(),
-                name,
-                args,
-                alias.as_deref(),
-                &all_col_names,
-                &all_col_types,
-                &state.schema,
-            )?;
-            resolved_funcs.push((i, resolved));
-        }
-    }
+    let resolved_funcs = select_funcs;
 
     // Check for aggregate functions (builtin COUNT/AVG/MIN/MAX/SUM or UDA).
     let has_builtin_agg = s.columns.iter().any(|c| {
@@ -7396,50 +7883,9 @@ async fn route_select_user_table_inner(
         });
     }
 
-    // Apply column selection if not Star
-    let selected_rows = select_columns(&rows, &all_col_names, &col_names);
-
-    // Evaluate scalar UDFs on each projected row.
-    let selected_rows = if resolved_funcs.is_empty() {
-        selected_rows
-    } else {
-        // We need the full rows to extract UDF args, then replace the UDF
-        // columns in the projected output.
-        let scalar_funcs: Vec<&ResolvedFunction> = resolved_funcs
-            .iter()
-            .filter(|(_, f)| matches!(f.kind, ResolvedFunctionKind::Scalar))
-            .map(|(_, f)| f)
-            .collect();
-
-        if scalar_funcs.is_empty() {
-            selected_rows
-        } else {
-            let mut result_rows = selected_rows;
-            for (full_row, projected_row) in rows.iter().zip(result_rows.iter_mut()) {
-                let udf_results = evaluate_row_udfs(state, full_row, &scalar_funcs)?;
-                // Map UDF results back into the projected row. Each resolved
-                // func knows its column index in the SELECT list.
-                for ((col_idx, _), udf_val) in resolved_funcs.iter().zip(udf_results.iter()) {
-                    // Find the position of col_idx in the projected columns.
-                    if let Some(proj_pos) = col_names.iter().position(|n| {
-                        if let Some((_, ref f)) = resolved_funcs.iter().find(|(i, _)| i == col_idx)
-                        {
-                            *n == f.display_name
-                        } else {
-                            false
-                        }
-                    }) {
-                        projected_row[proj_pos] = udf_val.clone();
-                    }
-                }
-            }
-            result_rows
-        }
-    };
-
-    // Apply toJson() built-in on projected columns.
+    // Project: column selection, scalar UDFs, toJson().
     let selected_rows =
-        apply_tojson_projections(&s.columns, &col_names, &all_col_names, &rows, selected_rows);
+        project_select_rows(state, s, &rows, &all_col_names, &col_names, &resolved_funcs)?;
 
     // DISTINCT deduped with a `BTreeSet<Vec<Option<CqlValue>>>`, which keeps a
     // full clone of every distinct row resident — O(distinct rows x row size),
@@ -7458,7 +7904,7 @@ async fn route_select_user_table_inner(
             .map_err(|e| CqlError::ServerError(format!("DISTINCT temp-table setup failed: {e}")))?;
         let mut seen = ferrosa_storage::spilling_dedup::SpillingDedup::new(
             reservation.path(),
-            DISTINCT_DEDUP_RESIDENT_CAPACITY,
+            distinct_resident_capacity(),
         );
         let mut deduped = Vec::new();
         for row in selected_rows {
@@ -10636,6 +11082,12 @@ async fn route_create_table(
 
 /// Persist the registry snapshot before a DDL statement is acknowledged.
 ///
+/// Called by CREATE, ALTER and DROP TABLE. ALTER matters as much as CREATE:
+/// without it a node killed after an acknowledged ALTER restarts with the
+/// pre-ALTER table in `schema.json`, binds that column layout, and reads rows
+/// written after the ALTER against the wrong ordinals (the pair smoke's
+/// `v = null`, 2026-10-01).
+///
 /// The storage-side record (`storage-schema.json`) alone cannot rebuild a
 /// CQL-nameable table after a crash: it carries the partition key's *type*
 /// (`org.apache.cassandra.db.marshal.Int32Type`) but never the key column's
@@ -10664,7 +11116,7 @@ fn persist_registry_snapshot_before_ack(
         .persist(&snapshot)
         .map_err(|e| {
             CqlError::ServerError(format!(
-                "CREATE TABLE durability barrier: registry snapshot persist failed for \
+                "DDL durability barrier: registry snapshot persist failed for \
                  {table_name}: {e}"
             ))
         })
@@ -10907,17 +11359,25 @@ async fn route_alter_table(
             let snap = state.schema.snapshot();
             if let Some(tbl) = snap.tables.get(&(ks.to_string(), s.table.clone())) {
                 let tid = ferrosa_storage::TableId::new(ks, &s.table);
-                if let Err(e) = state
+                // Fail the statement rather than acknowledge an ALTER the
+                // engine did not take: the registry now has the new columns
+                // and the engine the old ones, so writes would be misplaced.
+                state
                     .engine
                     .update_table_schema(&tid, tbl.to_storage_schema())
-                {
-                    tracing::error!(
-                        %e,
-                        keyspace = %ks,
-                        table = %s.table,
-                        "Direct ALTER: engine.update_table_schema failed — future flushes may panic on stale column count"
-                    );
-                }
+                    .map_err(|e| {
+                        tracing::error!(
+                            %e,
+                            keyspace = %ks,
+                            table = %s.table,
+                            "Direct ALTER: engine.update_table_schema failed; ALTER NOT acknowledged"
+                        );
+                        CqlError::ServerError(format!(
+                            "ALTER TABLE {ks}.{}: storage engine did not apply the new column \
+                             set: {e}",
+                            s.table
+                        ))
+                    })?;
             }
         }
         DdlPath::Pair(coordinator) => {
@@ -10942,6 +11402,8 @@ async fn route_alter_table(
             ));
         }
     }
+
+    persist_registry_snapshot_before_ack(state, &s.table)?;
 
     emit_schema_change(
         state,
@@ -11019,6 +11481,8 @@ async fn route_drop_table(
             ));
         }
     }
+
+    persist_registry_snapshot_before_ack(state, &s.table)?;
 
     emit_schema_change(
         state,
@@ -15999,6 +16463,9 @@ mod tests {
     use ferrosa_cluster::WritePath;
     use ferrosa_schema::NodeConfig;
 
+    /// Result cursors: ORDER BY / DISTINCT / function-projection paging.
+    mod streaming_results;
+
     // ── select_accord_replicas: live-path replica selection ───────────────────
 
     fn simple_replication_params(rf: usize) -> ReplicationParams {
@@ -16177,6 +16644,7 @@ mod tests {
             txn_registry: std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::txn_registry::TransactionRegistry::default(),
             )),
+            result_cursors: Default::default(),
         };
         (state, dir)
     }
@@ -21090,6 +21558,70 @@ mod tests {
             vec!["id".to_string()],
             "the registry snapshot must carry the partition-key column NAME, which \
              is the field the storage-side record cannot express"
+        );
+    }
+
+    /// RED (nightly pair smoke, 2026-10-01..03): the CREATE TABLE barrier
+    /// above persisted the registry snapshot, but ALTER TABLE did not, so a
+    /// node killed after an acknowledged ALTER restarted with the pre-ALTER
+    /// table in schema.json while storage-schema.json held the post-ALTER
+    /// layout. The engine binds the registry definition, so rows written after
+    /// the ALTER were read against the old column ordinals.
+    #[tokio::test]
+    async fn alter_and_drop_table_persist_the_registry_snapshot_before_acknowledging() {
+        let (state, dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let persisted = || {
+            ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(dir.path())
+                .load()
+                .expect("registry snapshot must load")
+                .expect("registry snapshot must exist")
+        };
+
+        for cql in [
+            "CREATE KEYSPACE dur_ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE dur_ks.t (id int PRIMARY KEY, v text)",
+            "CREATE TABLE dur_ks.gone (id int PRIMARY KEY, v text)",
+            "ALTER TABLE dur_ks.t ADD extra text",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let altered = persisted()
+            .tables
+            .get(&("dur_ks".to_string(), "t".to_string()))
+            .cloned()
+            .expect("t must be in the registry snapshot");
+        assert!(
+            altered.columns.contains_key("extra"),
+            "ALTER TABLE was acknowledged but schema.json still holds the pre-ALTER \
+             table (columns {:?}); a crash now restarts with the old column layout",
+            altered.columns.keys().collect::<Vec<_>>()
+        );
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("DROP TABLE dur_ks.gone").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !persisted()
+                .tables
+                .contains_key(&("dur_ks".to_string(), "gone".to_string())),
+            "DROP TABLE was acknowledged but schema.json still names the table; a \
+             crash now resurrects it in the registry over a deleted SSTable directory"
         );
     }
 

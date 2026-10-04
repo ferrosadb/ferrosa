@@ -24,6 +24,8 @@ It is the only crate in the workspace that depends on all the front-ends at once
 | Module | Responsibility |
 |--------|----------------|
 | `main.rs` (~2.8k LoC) | The whole startup sequence: config → host_id → storage → schema → cluster → listeners → maintenance loop → graceful shutdown |
+| `maintenance.rs` | The storage maintenance loop (periodic + urgent flush, compaction polling, commit-log GC, schema persist, S3 sync), run under `supervisor` |
+| `supervisor.rs` | OTP-style supervision of the maintenance loop and its flusher: restart within an intensity (`FERROSA_SUPERVISOR_MAX_RESTARTS`, default 3, per `FERROSA_SUPERVISOR_PERIOD_SECS`, default 3600), stall detection (`FERROSA_FLUSH_STALL_DEADLINE_SECS`, default 300), `/readyz` + `ferrosa_supervised_task_*` metrics, and escalation (commit-log sync, then abort) |
 | `runtime.rs` | `RuntimeManager` — dedicated tokio runtimes (raft, data, cql, background) so subsystems don't contend on one shared pool |
 | `repair_wiring.rs` | `BinaryRepairContext` / `build_repair_executor` — binds the self-heal + anti-entropy repair scheduler to the live ring |
 | `cql_broadcast.rs` | `parse_cql_broadcast` — resolves the externally-advertised CQL address/port for `system.local` |
@@ -47,7 +49,7 @@ apply when neither source sets the listener.
 | Graph HTTP | `127.0.0.1:7474` | `ferrosa-graph` | only if graph enabled; `FERROSA_GRAPH_BIND` / `[graph].bind` |
 | Bolt v5 | `127.0.0.1:7687` | `ferrosa-graph` | only if graph enabled; `FERROSA_BOLT_PORT` / `[graph].bolt_port`; uses the host resolved for Graph HTTP |
 | SPARQL HTTP | `127.0.0.1:8080` | `ferrosa-sparql` | enabled by default; `FERROSA_SPARQL_BIND` / `[sparql].bind` |
-| Web console + `/metrics` | `127.0.0.1:9090` | this crate (`web/`) | `FERROSA_WEB_BIND` / `[web].bind`. `/readyz` and `/health`: when `FERROSA_EXPECTED_CLUSTER_SIZE` is set they return 503 `waiting_for: declared_topology` until that topology is met (the same gate CQL uses). They also return 503 `waiting_for: listeners` while a background client listener (graph HTTP, Bolt, SPARQL, Postgres) has failed to bind or exited; `ferrosa_listener_up{listener="…"}` on `/metrics` is 1/0 for each. A bind failure there used to be one ERROR log line while the node kept probing ready |
+| Web console + `/metrics` | `127.0.0.1:9090` | this crate (`web/`) | `FERROSA_WEB_BIND` / `[web].bind`. `/readyz` and `/health`: when `FERROSA_EXPECTED_CLUSTER_SIZE` is set they return 503 `waiting_for: declared_topology` until that topology is met (the same gate CQL uses). They also return 503 `waiting_for: listeners` while a background client listener (graph HTTP, Bolt, SPARQL, Postgres) has failed to bind or exited; `ferrosa_listener_up{listener="…"}` on `/metrics` is 1/0 for each. A bind failure there used to be one ERROR log line while the node kept probing ready. A vector index whose generations are being rebuilt keeps them 200 but adds `degraded_recall: [{table, index, generations}]` (ANN over it refuses, retryable, until rebuilt; ST-81). They return 503 `waiting_for: background_tasks` while a supervised task (`storage_flush`, `maintenance_loop`) is failing, stalled or restarting, naming the task and its last failure; `ferrosa_supervised_task_up{task="…"}` is 1/0, with `_failures_total{kind}` and `_restarts_total` |
 
 ### TLS and production mode (t_d5d122ba)
 
@@ -120,7 +122,13 @@ cluster view, the `SharedState` before the CQL/Flight servers). See
 14. **Automatic repair** — self-heal controller with verified-replica cluster view + quarantine→refill trigger; periodic anti-entropy scheduler.
 15. **Graph** (HTTP `:7474` + Bolt `:7687`) if enabled; **Postgres** (`:5432`); **SPARQL** (`:8080`) if enabled.
 16. **Seeds** — background connect to `FERROSA_SEED` peers with exponential backoff.
-17. **Maintenance loop** — periodic + urgent flush, compaction polling, commit-log GC, schema persist (local + S3).
+17. **Maintenance loop** (`maintenance.rs`) — periodic + urgent flush, compaction polling, commit-log GC, schema persist (local + S3), supervised by `supervisor.rs` (t_7681b32b):
+    - Each flush runs on its own thread behind `catch_unwind`. A panic is that attempt's crash; the next tick restarts it. A flush that outlives the stall deadline is reported as a stall once per deadline and no longer blocks the loop's other arms; no second flush starts until it reports.
+    - The loop itself is restarted if it panics or returns. The last persisted schema version survives a restart, so a pending persist is not skipped.
+    - While a flush is failing, stalled or restarting, `/readyz` answers 503 and `ferrosa_supervised_task_up{task="storage_flush"}` is 0; ERROR lines mark the edges.
+    - Panics and stalls count toward the restart intensity; a flush that returns an error does not (it is impaired, not dead). Past the intensity the process syncs the commit log (10 s bound), prints a `FATAL: supervised task …` line naming the task and last failure, and aborts (SIGABRT, which launchd `KeepAlive { Crashed }` restarts). Not-ready alone was rejected: nothing gates CQL writes on storage health, so the node would keep acknowledging writes it could never flush.
+    - A hang the loop cannot report (an await that never completes, a blocked GC) is caught by `MaintenanceWatchdog`: the loop beats a heartbeat each iteration and the watchdog, on its own thread, counts a stall per `FERROSA_MAINTENANCE_STALL_DEADLINE_SECS` (600) of silence and escalates past the intensity. The flush restart window is shared across loop restarts.
+    - The commit log's fsync thread (`commitlog_sync`, P0-6 t_88479cda) is a third child: `CommitLogSyncSupervisor` samples its health every 100 ms, restarts it when it died, counts a stall per elapsed `FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS` (2000), and escalates past the intensity. The commit log refuses writes by itself while the thread is dead, failing or stalled (storage FMEA ST-71); the supervisor restores service and reports it.
 18. **Shutdown** — `SIGINT`/`SIGTERM` → 30 s graceful drain: stop cluster tasks → drain internode → flush memtables → persist schema (local + S3).
 
 ## How the subsystems compose

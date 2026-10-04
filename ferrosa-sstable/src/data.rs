@@ -94,16 +94,18 @@ enum PresentColumns {
 }
 
 impl PresentColumns {
+    /// Walk the present column indices in order. `Subset` is walked directly,
+    /// so a row costs O(present columns): filtering `0..num_columns` by
+    /// membership instead was O(columns x present) per row on wide tables, and
+    /// silently dropped any index the header did not have.
+    /// `read_columns_subset` guarantees a subset is ascending and in range.
     #[inline]
     fn iter(&self, num_columns: usize) -> impl Iterator<Item = usize> + '_ {
-        // `0..n` is an empty-but-typed range when n == 0, matching the old
-        // `(0..0).collect()` behaviour for a column-less row.
-        let all = 0..num_columns;
-        let selected = match self {
-            PresentColumns::All => None,
-            PresentColumns::Subset(v) => Some(v.as_slice()),
+        let (all, subset): (std::ops::Range<usize>, &[usize]) = match self {
+            PresentColumns::All => (0..num_columns, &[]),
+            PresentColumns::Subset(v) => (0..0, v.as_slice()),
         };
-        all.filter(move |i| selected.is_none_or(|s| s.contains(i)))
+        all.chain(subset.iter().copied())
     }
 
     #[inline]
@@ -1682,11 +1684,27 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         }
         let present_count = num_columns - missing_count;
         if present_count < num_columns / 2 {
-            let mut present = Vec::with_capacity(present_count);
+            // Present indices are written strictly ascending and each names a
+            // header column. Anything else cannot be decoded: the cell count
+            // read below would differ from the one written, and every later
+            // byte of the row would decode under the wrong column.
+            let mut present: Vec<usize> = Vec::with_capacity(present_count);
             for _ in 0..present_count {
                 let (idx, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
-                present.push(idx as usize);
+                let idx = usize::try_from(idx).unwrap_or(usize::MAX);
+                if idx >= num_columns {
+                    return Err(Error::InvalidData(format!(
+                        "columns subset present index {idx} exceeds {num_columns}"
+                    )));
+                }
+                if present.last().is_some_and(|&prev| idx <= prev) {
+                    return Err(Error::InvalidData(format!(
+                        "columns subset present index {idx} is not ascending after {prev}",
+                        prev = present[present.len() - 1]
+                    )));
+                }
+                present.push(idx);
             }
             Ok(present)
         } else {
@@ -2538,6 +2556,121 @@ mod tests {
         assert_eq!(row.cells.len(), 1);
         assert_eq!(row.cells[0].0, 0);
         assert_eq!(row.cells[0].1.value.as_deref(), Some(value.as_slice()));
+    }
+
+    /// A 70-column header: wide enough (>= 64) that a row with few present
+    /// columns encodes them as an explicit list of PRESENT indices.
+    fn wide_subset_header() -> SerializationHeader {
+        SerializationHeader {
+            complex_collections: false,
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+            static_columns: vec![],
+            regular_columns: (0..70)
+                .map(|i| {
+                    (
+                        format!("c{i}").into_bytes(),
+                        "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// One partition, one row whose subset lists `present` (as the >= 64
+    /// column encoding does: missing count, then each present index), with
+    /// one cell per listed index.
+    fn wide_subset_partition(present: &[u64]) -> Vec<u8> {
+        let mut row_body = Vec::new();
+        push_unsigned_vint(&mut row_body, 10);
+        push_unsigned_vint(&mut row_body, 70 - present.len() as u64);
+        for &idx in present {
+            push_unsigned_vint(&mut row_body, idx);
+        }
+        for &idx in present {
+            row_body.push(CELL_USE_ROW_TIMESTAMP);
+            let value = format!("v{idx}");
+            push_unsigned_vint(&mut row_body, value.len() as u64);
+            row_body.extend_from_slice(value.as_bytes());
+        }
+        let mut data = Vec::new();
+        let key = b"pk_wide_subset";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        data.push(HAS_TIMESTAMP);
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x07]);
+        push_unsigned_vint(&mut data, row_body.len() as u64);
+        push_unsigned_vint(&mut data, 0);
+        data.extend_from_slice(&row_body);
+        data.push(END_OF_PARTITION);
+        data
+    }
+
+    #[test]
+    fn wide_present_index_subset_decodes_each_listed_column_in_order() {
+        let header = wide_subset_header();
+        let data = wide_subset_partition(&[3, 66]);
+        let partition = DataReader::new(&data, &header, 0)
+            .read_partition()
+            .expect("a valid present-index subset must decode")
+            .expect("expected partition");
+        let cells: Vec<(u16, Option<&[u8]>)> = partition.rows[0]
+            .cells
+            .iter()
+            .map(|(idx, cell)| (*idx, cell.value.as_deref()))
+            .collect();
+        assert_eq!(
+            cells,
+            vec![(3, Some(b"v3".as_slice())), (66, Some(b"v66".as_slice()))]
+        );
+    }
+
+    /// A present index the header does not have cannot name a cell. Reading
+    /// past it decodes the following bytes under the wrong column, so the row
+    /// must be refused, not decoded with the index dropped (nor panic on
+    /// `columns[idx]`). Projected and full reads share the subset decoder.
+    #[test]
+    fn wide_present_index_subset_refuses_an_out_of_range_index() {
+        let header = wide_subset_header();
+        let data = wide_subset_partition(&[3, 200]);
+        let err = DataReader::new(&data, &header, 0)
+            .read_partition()
+            .expect_err("an out-of-range present index must fail the read");
+        assert!(
+            matches!(err, Error::InvalidData(ref m) if m.contains("present index")),
+            "unexpected error: {err:?}"
+        );
+        let err = DataReader::new(&data, &header, 0)
+            .read_partition_projected(&[3])
+            .expect_err("an out-of-range present index must fail a projected read");
+        assert!(
+            matches!(err, Error::InvalidData(ref m) if m.contains("present index")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Present indices are written strictly ascending. A repeated or
+    /// descending index would have the decoder read a cell count that differs
+    /// from what was written, so it must be refused.
+    #[test]
+    fn wide_present_index_subset_refuses_unordered_or_repeated_indices() {
+        let header = wide_subset_header();
+        for present in [[5u64, 5], [9, 4]] {
+            let data = wide_subset_partition(&present);
+            let err = DataReader::new(&data, &header, 0)
+                .read_partition()
+                .expect_err("a non-ascending present list must fail the read");
+            assert!(
+                matches!(err, Error::InvalidData(ref m) if m.contains("present index")),
+                "{present:?}: unexpected error: {err:?}"
+            );
+        }
     }
 
     #[test]

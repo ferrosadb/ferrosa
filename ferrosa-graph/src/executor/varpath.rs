@@ -19,8 +19,9 @@ use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
 use crate::executor::eval;
 use crate::executor::expand::{
-    build_columns, check_timeout, extract_column_bytes_from_row, extract_neighbor_id,
-    graph_vertex_lookup_key, row_to_json, sort_rows, table_metadata_for, GraphEngineConfig,
+    build_columns, check_timeout, expected_adjacency_direction, extract_column_bytes_from_row,
+    graph_vertex_lookup_key, row_to_json, sort_rows, table_metadata_for, traversable_neighbor_id,
+    GraphEngineConfig,
 };
 use crate::executor::result::{GraphResult, QueryStats};
 use crate::parser::Direction;
@@ -235,9 +236,14 @@ pub async fn execute_var_length(
             if let Some(partition) = adj_partition {
                 stats.edges_read += partition.rows.len();
                 for row in &partition.rows {
-                    if let Some(neighbor_id) =
-                        extract_neighbor_id(&row.clustering, hop.edge_label.as_deref())
-                    {
+                    // Each edge has an OUT entry on its source and an IN entry
+                    // on its target; reading both would walk `->` edges
+                    // backwards. A deleted edge's entries are tombstones.
+                    if let Some(neighbor_id) = traversable_neighbor_id(
+                        row,
+                        hop.edge_label.as_deref(),
+                        expected_adjacency_direction(hop.direction),
+                    ) {
                         neighbors_found += 1;
                         admit_neighbor(
                             neighbor_id,
@@ -580,10 +586,10 @@ mod tests {
 
     /// Build an adjacency row clustering key in standard composite layout:
     /// [u16 1][1B direction][u16 label_len][label][u16 id_len][id].
-    fn adjacency_clustering(label: &str, neighbor_id: &[u8]) -> Vec<u8> {
+    fn adjacency_clustering(direction: u8, label: &str, neighbor_id: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&1u16.to_be_bytes()); // direction component len
-        out.push(0x01); // direction byte (out)
+        out.push(direction);
         let label_bytes = label.as_bytes();
         out.extend_from_slice(&(label_bytes.len() as u16).to_be_bytes());
         out.extend_from_slice(label_bytes);
@@ -592,7 +598,8 @@ mod tests {
         out
     }
 
-    /// Write an adjacency entry: from `src` to `dst` with the given edge label.
+    /// Write an edge `src -> dst` the way the adjacency observer does: an OUT
+    /// entry on `src` and an IN entry on `dst`.
     fn write_adjacency(
         storage: &StorageEngine,
         keyspace: &str,
@@ -600,17 +607,19 @@ mod tests {
         label: &str,
         dst: &[u8],
     ) {
+        use crate::adjacency::schema::{DIRECTION_IN, DIRECTION_OUT};
         let adj_ks = adjacency_keyspace_name(keyspace);
         let adj_table_id = TableId::new(&adj_ks, "adjacency");
-        let dk = DecoratedKey::new(PartitionKey::new(src.to_vec()));
-        let clustering = adjacency_clustering(label, dst);
-        let row = Row {
-            clustering,
-            cells: vec![],
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(1),
-        };
-        storage.write(&adj_table_id, &dk, row, 1).unwrap();
+        for (owner, direction, other) in [(src, DIRECTION_OUT, dst), (dst, DIRECTION_IN, src)] {
+            let dk = DecoratedKey::new(PartitionKey::new(owner.to_vec()));
+            let row = Row {
+                clustering: adjacency_clustering(direction, label, other),
+                cells: vec![],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1),
+            };
+            storage.write(&adj_table_id, &dk, row, 1).unwrap();
+        }
     }
 
     fn make_anchor(var: &str) -> Anchor {
@@ -676,6 +685,92 @@ mod tests {
 
         // Should find exactly B reachable from A in 1 hop.
         assert_eq!(result.rows.len(), 1);
+    }
+
+    /// Every edge has an OUT entry on its source and an IN entry on its target,
+    /// so a directed var-length path must read only the entries of its own
+    /// direction. Graph: Z -> A -> B; anchored at A.
+    #[tokio::test]
+    async fn varpath_follows_only_the_hop_direction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = setup_storage(tmp.path());
+        write_vertex(&storage, "test_ks", "person_v", b"A");
+        write_adjacency(&storage, "test_ks", b"Z", "KNOWS", b"A");
+        write_adjacency(&storage, "test_ks", b"A", "KNOWS", b"B");
+        let wp = WritePath::direct(storage);
+
+        for (direction, expected) in [
+            (Direction::Out, 1),
+            (Direction::In, 1),
+            (Direction::Both, 2),
+        ] {
+            let hop = Hop {
+                direction,
+                ..make_hop("b")
+            };
+            let result = execute_var_length(
+                &wp,
+                "test_ks",
+                &make_anchor("a"),
+                &hop,
+                1,
+                2,
+                &simple_return("b"),
+                &test_config(),
+                Instant::now(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.rows.len(),
+                expected,
+                "{direction:?} from A over Z -> A -> B reaches {expected} vertices"
+            );
+        }
+    }
+
+    /// A deleted edge's adjacency entry is a row tombstone; traversal must not
+    /// follow it. Graph: A -> B, then the A -> B entry deleted.
+    #[tokio::test]
+    async fn varpath_does_not_follow_a_deleted_edge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = setup_storage(tmp.path());
+        write_vertex(&storage, "test_ks", "person_v", b"A");
+        write_adjacency(&storage, "test_ks", b"A", "KNOWS", b"B");
+        let adj_table_id = TableId::new(adjacency_keyspace_name("test_ks"), "adjacency");
+        let dk = DecoratedKey::new(PartitionKey::new(b"A".to_vec()));
+        let tombstone = Row {
+            clustering: adjacency_clustering(
+                crate::adjacency::schema::DIRECTION_OUT,
+                "KNOWS",
+                b"B",
+            ),
+            cells: vec![],
+            // As `expand::tombstone_mutation` deletes an adjacency entry.
+            deletion: DeletionTime::new(2, 0),
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+        storage.write(&adj_table_id, &dk, tombstone, 2).unwrap();
+        let wp = WritePath::direct(storage);
+
+        let result = execute_var_length(
+            &wp,
+            "test_ks",
+            &make_anchor("a"),
+            &make_hop("b"),
+            1,
+            2,
+            &simple_return("b"),
+            &test_config(),
+            Instant::now(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows.len(), 0, "a deleted edge was traversed");
     }
 
     #[tokio::test]

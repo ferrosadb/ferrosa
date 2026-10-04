@@ -50,6 +50,13 @@ pub enum Error {
         /// Largest partition token the corrupt SSTable covered.
         max_token: i64,
     },
+    /// The commit log cannot make a write durable: its sync thread died, its
+    /// fsyncs are failing, or they have fallen behind the stall deadline.
+    ///
+    /// The write is NOT acknowledged. Its entry may still be in the segment
+    /// buffer and reach disk later, so the outcome is unknown, exactly like a
+    /// write timeout: the caller must not report it as applied, and may retry.
+    CommitLogNotDurable { reason: String },
 }
 
 impl Error {
@@ -119,6 +126,10 @@ impl fmt::Display for Error {
                 "corrupt SSTable made the read unresolvable [gen={gen} \
                  tokens=[{min_token},{max_token}]]; quarantined and scheduled \
                  for anti-entropy repair"
+            ),
+            Error::CommitLogNotDurable { reason } => write!(
+                f,
+                "commit log not durable, write not acknowledged: {reason}"
             ),
         }
     }
