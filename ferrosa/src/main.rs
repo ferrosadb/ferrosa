@@ -135,6 +135,10 @@ fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str)
 /// tunables (which fall back to a sane default on garbage), a bad value here is
 /// a startup error: silently clamping a connection or in-flight limit is how a
 /// node ends up shedding every request with no operator-visible reason.
+///
+/// An *empty* value is treated as unset and falls back to `default` -- clearing a
+/// variable (`fly machine update --env KEY=`) is a request to unset it, not a
+/// malformed one, and must not become a node that cannot start.
 fn resolve_cql_positive_usize(
     env_key: &str,
     config: &toml::Value,
@@ -143,7 +147,15 @@ fn resolve_cql_positive_usize(
 ) -> Result<usize, String> {
     // `config_val` already applies the TOML-wins precedence and the default.
     let raw = config_val(env_key, config, "cql", key, &default.to_string());
-    let parsed = raw.trim().parse::<usize>().map_err(|_| {
+    let raw = raw.trim();
+    // An *empty* value means "unset", not "garbage". `fly machine update --env KEY=`
+    // is the only way to clear a variable, so rejecting "" would make the knob
+    // impossible to remove once set -- and would stop every node the moment a
+    // sweep cleared its tunables. An unset limit is not an error; a malformed one is.
+    if raw.is_empty() {
+        return Ok(default);
+    }
+    let parsed = raw.parse::<usize>().map_err(|_| {
         format!("[cql] {key} (or ${env_key}) must be a positive integer, got {raw:?}")
     })?;
     if parsed == 0 {
@@ -3903,6 +3915,35 @@ mod tests {
             got.is_err(),
             "a non-numeric limit must fail startup, not silently default"
         );
+    }
+
+    #[test]
+    fn cql_limit_treats_an_empty_env_var_as_unset() {
+        // `fly machine update --env KEY=` is the ONLY way to clear a variable, and
+        // sweeping tunables clears them exactly that way. Treating the resulting
+        // empty string as garbage would make the knob impossible to remove once
+        // set, and would crash every node on the next sweep.
+        let key = "FERROSA_TEST_CQL_LIMIT_EMPTY_5e4b";
+        std::env::set_var(key, "");
+        let got =
+            resolve_cql_positive_usize(key, &empty_config(), "max_in_flight_per_connection", 128);
+        std::env::remove_var(key);
+        assert_eq!(
+            got,
+            Ok(128),
+            "an empty env var means unset and must fall back to the default"
+        );
+    }
+
+    #[test]
+    fn cql_limit_toml_survives_an_empty_env_var() {
+        let key = "FERROSA_TEST_CQL_LIMIT_EMPTY_TOML_7c2d";
+        std::env::set_var(key, "");
+        let cfg: toml::Value =
+            toml::from_str("[cql]\nmax_in_flight_per_connection = 512\n").unwrap();
+        let got = resolve_cql_positive_usize(key, &cfg, "max_in_flight_per_connection", 128);
+        std::env::remove_var(key);
+        assert_eq!(got, Ok(512), "TOML must still win when the env var is empty");
     }
 
     #[test]
