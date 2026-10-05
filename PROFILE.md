@@ -223,6 +223,16 @@ default, and a TOML value that is not a whole number aborts startup.
 | `FERROSA_DATA_RUNTIME_THREADS` | Data runtime worker threads | `8` |
 | `FERROSA_CQL_RUNTIME_THREADS` | CQL runtime worker threads | `8` |
 | `FERROSA_BACKGROUND_RUNTIME_THREADS` | Background runtime worker threads | `2` |
+| `FERROSA_CQL_MAX_CONNECTIONS` | Maximum concurrent CQL client connections accepted (`[cql] max_connections`) | `1024` |
+| `FERROSA_CQL_MAX_CONNECTIONS_PER_IP` | Maximum concurrent CQL connections from one peer address (`[cql] max_connections_per_ip`) | `64` |
+| `FERROSA_CQL_MAX_IN_FLIGHT_PER_CONNECTION` | Concurrent CQL requests admitted per client connection before the node replies `Overloaded` (`"request backpressure"`). Also settable as `[cql] max_in_flight_per_connection`. **Raise only alongside a latency win:** sustained throughput is bounded by `in-flight ÷ service time`, so exceeding this valve converts a clean shed into unbounded queueing and tail latency. Values must be positive integers; an unparsable or zero value stops startup rather than silently defaulting | `128` |
+
+The three `FERROSA_CQL_*` limits above were previously only reachable by editing the
+source — `max_in_flight_per_connection` in particular was hardcoded and appeared nowhere
+in the config surface, so an operator could not raise the valve that causes
+`Overloaded("request backpressure")` under high concurrency. All three now accept TOML
+(which wins) or env. Precedence matches every other tunable here: `[cql] <key>` overrides
+`FERROSA_<KEY>`, which overrides the default.
 
 The eviction audit answers "why did the cache evict?" after the log has rotated.
 Each eviction pass that finds pressure appends one JSON line: trigger, cache cap,
