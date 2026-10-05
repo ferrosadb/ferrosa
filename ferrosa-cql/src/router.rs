@@ -6278,7 +6278,7 @@ async fn route_select_user_table_inner(
             let count = state
                 .write_path
                 .load()
-                .count_range_matching_with(&table_id, ctx.consistency, &matches)
+                .count_range_matching_with(&table_id, ctx.consistency, &table_strategy, &matches)
                 .await?;
             return Ok(SelectRawResult {
                 column_names: col_names.to_vec(),
@@ -6299,7 +6299,7 @@ async fn route_select_user_table_inner(
         let count = state
             .write_path
             .load()
-            .count_range_with(&table_id, ctx.consistency)
+            .count_range_with(&table_id, ctx.consistency, &table_strategy)
             .await?;
         return Ok(SelectRawResult {
             column_names: col_names.to_vec(),

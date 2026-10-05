@@ -1006,8 +1006,9 @@ impl WritePath {
         &self,
         table_id: &TableId,
         cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
     ) -> crate::error::Result<u64> {
-        self.count_range_matching_with(table_id, cl, &|_| true)
+        self.count_range_matching_with(table_id, cl, strategy, &|_| true)
             .await
     }
 
@@ -1018,12 +1019,13 @@ impl WritePath {
         &self,
         table_id: &TableId,
         cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
         matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
     ) -> crate::error::Result<u64> {
         match self {
             Self::Cluster(coordinator) => {
                 coordinator
-                    .coordinate_range_count_matching(table_id, cl, matches)
+                    .coordinate_range_count_matching(table_id, cl, strategy, matches)
                     .await
             }
             Self::Direct(engine) => engine
