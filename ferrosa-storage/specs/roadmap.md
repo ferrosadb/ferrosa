@@ -176,6 +176,31 @@ process RSS. The isolated pump benchmark reports its own heap/RSS/throughput;
 engine-level E1/E2/E3 RSS and Linux dirty-page/cgroup measurements remain live
 acceptance evidence to collect, not inferred passes.
 
+### Memtable write path: no per-write allocation
+
+The production-default `SkipListMemtable::put` re-wrote the whole partition on
+every row: it loaded the partition, deep-cloned it, merged one row, and
+CAS-published a fresh `Arc`. This was structural (`arc_swap` exposes no
+`DerefMut`, so CAS-publishing a changed value requires building a new one), and
+it walked every row twice to re-size the partition — O(rows-in-partition) per
+write, so filling one partition was O(N^2). On a live node replaying a commit
+log it dominated: 52% of wall time in `Arc<Partition>::drop_slow` → jemalloc
+free, ~95% CPU for 18+ minutes with no progress and no CQL listener. Measured:
+1000 writes into a growing partition cost 2,109,500 allocations (~2109/write),
+and the per-write cost grew with the partition.
+
+The write now merges **in place** under a per-partition `parking_lot::RwLock`
+(`Arc::make_mut` + `merge_row_into_partition`, mirroring `ShardedBTreeMemtable`),
+and looks the key up by reference on the hot path so the key clone is paid only
+on first insert. The `SkipMap` index stays lock-free; the lock is held for one
+row's merge. Measured after: **10 allocations for 4000 writes** (amortized `Vec`
+growth only). Regression guard:
+`ferrosa-storage/tests/memtable_write_alloc_bound.rs` asserts the per-write cost
+does not grow with the partition (a load-independent form of "no allocation per
+write"); the harness builds input rows outside the measured window and runs as
+one `#[test]` because the allocator counter is process-wide and not
+thread-aware.
+
 Read-ahead config: `FERROSA_COMPACTION_READAHEAD_BYTES`, default 1 MiB,
 range 1..=256 MiB, rounded up to 4096 bytes. Invalid values emit ERROR and fall back;
 valid normalization emits WARN with configured/effective sizes. Shutdown can
