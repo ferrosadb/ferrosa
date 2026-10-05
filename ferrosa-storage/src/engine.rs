@@ -4827,10 +4827,13 @@ impl StorageEngine {
         })?;
 
         // Load any SSTables that already exist on disk (e.g., after crash
-        // recovery). Phase 5 (FMEA #1): validation is *transient and bounded* —
-        // each generation is opened through the engine-wide pool, smoke-tested,
-        // reduced to a lightweight `SstableDescriptor`, then its reader Arc is
-        // dropped before the next generation opens. The pool's cap bounds how
+        // recovery). Full integrity validation is opt-in via `--validate`;
+        // normal startup still opens generations and checks their declared data
+        // extent, but does not walk every partition and row. When requested,
+        // validation is transient and bounded: each generation is opened through
+        // the engine-wide pool, checked, reduced to a lightweight descriptor,
+        // then its reader Arc is dropped before the next generation opens. The
+        // pool's cap bounds how
         // many readers stay resident, so a node bloated with thousands of
         // SSTables no longer materializes O(count) readers at startup (the
         // observed startup OOM). The pool is reused as this table's pool below,
@@ -7232,10 +7235,27 @@ impl StorageEngine {
         out
     }
 
+    fn startup_sstable_repair_mode_for(
+        validate_requested: bool,
+        configured: Option<&str>,
+    ) -> StartupSstableRepairMode {
+        if validate_requested {
+            return StartupSstableRepairMode::Warn;
+        }
+        configured
+            .map(StartupSstableRepairMode::from_env)
+            .unwrap_or(StartupSstableRepairMode::Off)
+    }
+
+    fn startup_validation_requested(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+        args.into_iter()
+            .any(|arg| arg == std::ffi::OsStr::new("--validate"))
+    }
+
     fn startup_sstable_repair_mode() -> StartupSstableRepairMode {
-        std::env::var("FERROSA_STARTUP_SMOKE_TEST")
-            .map(|value| StartupSstableRepairMode::from_env(&value))
-            .unwrap_or(StartupSstableRepairMode::Warn)
+        let validate_requested = Self::startup_validation_requested(std::env::args_os().skip(1));
+        let configured = std::env::var("FERROSA_STARTUP_SMOKE_TEST").ok();
+        Self::startup_sstable_repair_mode_for(validate_requested, configured.as_deref())
     }
 
     fn validate_sstable_for_startup_repair<R: ferrosa_sstable::io::ReadAt>(
@@ -7257,7 +7277,7 @@ impl StorageEngine {
             if let Some(previous) = &previous_key {
                 if key <= *previous {
                     return Err(ferrosa_common::Error::InvalidFormat(format!(
-                        "startup smoke test found Data.db partition order violation: \
+                        "SSTable integrity validation found a Data.db partition order violation: \
                          key {:?} token {} <= previous key {:?} token {}",
                         key.key.as_bytes(),
                         key.token.0,
@@ -7294,7 +7314,7 @@ impl StorageEngine {
         }
         if reader.header().min_timestamp == NO_TIMESTAMP && saw_real_cell_timestamp {
             return Err(ferrosa_common::Error::InvalidFormat(
-                "startup smoke test found real cell timestamps with NO_TIMESTAMP serialization header".to_string(),
+                "SSTable integrity validation found real cell timestamps with a NO_TIMESTAMP header".to_string(),
             ));
         }
         Ok(())
@@ -7312,7 +7332,7 @@ impl StorageEngine {
                 && cell.timestamp == row.primary_key_liveness.timestamp;
             if !uses_row_timestamp && cell.timestamp == NO_TIMESTAMP {
                 return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "startup smoke test found {row_kind} cell at column {column_idx} with NO_TIMESTAMP"
+                    "SSTable integrity validation found {row_kind} cell at column {column_idx} with NO_TIMESTAMP"
                 )));
             }
         }
@@ -7697,9 +7717,9 @@ impl StorageEngine {
         let mut ids: Vec<(String, std::path::PathBuf)> = Vec::new();
         let mut quarantined_count = 0usize;
         let mut excluded_count = 0usize;
-        let mut smoke_tested_count = 0usize;
-        let mut smoke_quarantined_count = 0usize;
-        let smoke_start = std::time::Instant::now();
+        let mut integrity_validated_count = 0usize;
+        let mut integrity_quarantined_count = 0usize;
+        let integrity_check_start = std::time::Instant::now();
         for gen in generations {
             let gen_str = gen.to_string();
 
@@ -7823,7 +7843,7 @@ impl StorageEngine {
                         continue;
                     }
                     if repair_mode != StartupSstableRepairMode::Off && !remote {
-                        smoke_tested_count += 1;
+                        integrity_validated_count += 1;
                         if let Err(e) = Self::validate_sstable_for_startup_repair(&reader) {
                             match repair_mode {
                                 StartupSstableRepairMode::Warn => {
@@ -7831,7 +7851,7 @@ impl StorageEngine {
                                         %e,
                                         gen,
                                         dir = %table_dir.display(),
-                                        "storage-engine: startup smoke test found corrupt SSTable; excluded from active readers, files remain in place for salvage"
+                                        "storage-engine: SSTable integrity check found corruption; excluded from readers, files kept for salvage"
                                     );
                                     excluded_count += 1;
                                     // Excluded — must never be served from the
@@ -7845,7 +7865,7 @@ impl StorageEngine {
                                         %e,
                                         gen,
                                         dir = %table_dir.display(),
-                                        "storage-engine: startup smoke test quarantining corrupt SSTable"
+                                        "storage-engine: SSTable integrity check found corruption; quarantining generation"
                                     );
                                     // Drop the held Arc and evict from the pool
                                     // before moving the files out from under it.
@@ -7856,10 +7876,10 @@ impl StorageEngine {
                                     if let Err(qe) =
                                         Self::quarantine_generation(table_dir, gen, &quarantine_dir)
                                     {
-                                        tracing::warn!(%qe, gen, "storage-engine: failed to quarantine SSTable after startup smoke-test failure");
+                                        tracing::warn!(%qe, gen, "storage-engine: failed to quarantine SSTable after integrity check failure");
                                     }
                                     quarantined_count += 1;
-                                    smoke_quarantined_count += 1;
+                                    integrity_quarantined_count += 1;
                                     continue;
                                 }
                                 StartupSstableRepairMode::Off => {}
@@ -7912,14 +7932,14 @@ impl StorageEngine {
 
         if repair_mode != StartupSstableRepairMode::Off {
             tracing::info!(
-                smoke_tested = smoke_tested_count,
-                smoke_quarantined = smoke_quarantined_count,
+                sstables_validated = integrity_validated_count,
+                sstables_quarantined = integrity_quarantined_count,
                 excluded = excluded_count,
-                elapsed_ms = smoke_start.elapsed().as_millis(),
+                elapsed_ms = integrity_check_start.elapsed().as_millis(),
                 loaded = descriptors.len(),
                 dir = %table_dir.display(),
                 mode = ?repair_mode,
-                "storage-engine: startup SSTable smoke test complete"
+                "storage-engine: SSTable startup integrity check complete"
             );
         }
 
@@ -15862,6 +15882,31 @@ mod tests {
     use ferrosa_sstable::statistics::{CompactionMetadata, StatsMetadata};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
 
+    #[test]
+    fn startup_sstable_validation_requires_explicit_opt_in() {
+        assert_eq!(
+            StorageEngine::startup_sstable_repair_mode_for(false, None),
+            StartupSstableRepairMode::Off,
+            "normal startup must skip the full SSTable integrity scan"
+        );
+        assert_eq!(
+            StorageEngine::startup_sstable_repair_mode_for(true, None),
+            StartupSstableRepairMode::Warn,
+            "--validate opts into a full integrity scan without quarantining data"
+        );
+        assert!(StorageEngine::startup_validation_requested([
+            std::ffi::OsString::from("--validate")
+        ]));
+        assert!(!StorageEngine::startup_validation_requested([
+            std::ffi::OsString::from("--version")
+        ]));
+        assert_eq!(
+            StorageEngine::startup_sstable_repair_mode_for(false, Some("quarantine")),
+            StartupSstableRepairMode::Quarantine,
+            "an explicit legacy repair setting remains supported"
+        );
+    }
+
     fn incremental_batch_metadata(
         id: &str,
         size_bytes: u64,
@@ -18632,13 +18677,13 @@ mod tests {
         );
     }
 
-    /// Regression: the default startup smoke test must not quarantine
+    /// Regression: default startup must not quarantine
     /// SSTables whose component headers open but whose Data.db contents cannot
     /// be fully iterated. It also must not admit them into the active reader
     /// set: a known-corrupt immutable file must not poison every range read
     /// until an operator manually moves it aside.
     #[test]
-    fn startup_warn_mode_excludes_sstable_that_opens_but_fails_full_iteration_without_moving_it() {
+    fn startup_default_excludes_truncated_sstable_without_moving_it() {
         let dir = tempfile::tempdir().unwrap();
         let schema = TableSchema {
             keyspace: "test_ks".to_string(),
@@ -18700,7 +18745,7 @@ mod tests {
             StorageEngine::load_existing_sstables_and_sidecars(&table_dir, &pool, "smoke-warn");
         assert!(
             ids.is_empty(),
-            "default warn-mode startup smoke test must not admit a corrupt SSTable into the live view"
+            "default startup must not admit a truncated SSTable into the live view"
         );
         assert!(
             descriptors.is_empty(),
@@ -18715,11 +18760,11 @@ mod tests {
         let quarantine_dir = table_dir.join("quarantine");
         assert!(
             !quarantine_dir.exists(),
-            "default warn-mode startup smoke test must not create quarantine"
+            "default startup must not create quarantine"
         );
         assert!(
             data_file.exists(),
-            "default warn-mode startup smoke test must leave corrupt components in place for salvage"
+            "default startup must leave corrupt components in place for salvage"
         );
     }
 
@@ -18938,7 +18983,7 @@ mod tests {
     /// generation on disk for salvage. This is the production recovery contract:
     /// corrupt immutable inputs degrade completeness, not availability.
     #[test]
-    fn startup_warn_mode_excludes_corrupt_sstable_but_keeps_healthy_sstables_queryable() {
+    fn startup_default_excludes_truncated_sstable_and_keeps_healthy_data_queryable() {
         let dir = tempfile::tempdir().unwrap();
         let tid = table_id();
         let schema = test_schema();

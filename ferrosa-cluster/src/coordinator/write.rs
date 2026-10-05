@@ -24,6 +24,14 @@ type ReplicaWriteTarget = (u64, Option<(uuid::Uuid, String)>, String);
 type ReplicaWriteJoin = JoinHandle<ReplicaResult>;
 type NtsReplicaWriteJoin = JoinHandle<(ReplicaResult, String)>;
 
+fn spawn_storage_blocking<T, F>(work: F) -> JoinHandle<Result<T, ferrosa_common::Error>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ferrosa_common::Error> + Send + 'static,
+{
+    ferrosa_common::task_pool::TaskPool::current("coordinator-local-write").spawn_blocking(work)
+}
+
 struct TrackedWritePermit {
     _permit: OwnedSemaphorePermit,
 }
@@ -344,10 +352,10 @@ impl ClusterCoordinator {
         } else {
             None
         };
-        // Build concurrent remote writes. The local write stays inline to avoid
-        // per-write task overhead on the hot local path. Remote writes are task
-        // backed so dropping the client-visible coordinator future after quorum
-        // does not cancel sends to lagging replicas.
+        // Build concurrent remote writes. StorageEngine::write is synchronous,
+        // so the local replica runs on Tokio's blocking pool instead of holding
+        // a CQL runtime worker during storage or commit-log waits. Remote writes
+        // remain task-backed so post-quorum sends survive coordinator return.
         let mut local_row = Some(row);
         let mut acks = 0usize;
         let mut failed_replicas: Vec<uuid::Uuid> = Vec::new();
@@ -360,17 +368,31 @@ impl ClusterCoordinator {
                         return None;
                     };
                     metrics::inc_replica_write_attempt(true);
-                    match self.storage.write(table_id, key, row, timestamp) {
-                        Ok(()) => {
-                            acks += 1;
-                            metrics::inc_replica_write_ack(true);
+                    let storage = Arc::clone(&self.storage);
+                    let table_id = table_id.clone();
+                    let key = key.clone();
+                    return Some(tokio::spawn(async move {
+                        match spawn_storage_blocking(move || {
+                            storage.write(&table_id, &key, row, timestamp)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                metrics::inc_replica_write_ack(true);
+                                ReplicaResult::Ack { host_id: None }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(%e, "local write failed");
+                                metrics::inc_replica_write_failure(true);
+                                ReplicaResult::Failure { host_id: None }
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "local storage worker failed");
+                                metrics::inc_replica_write_failure(true);
+                                ReplicaResult::Failure { host_id: None }
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(%e, "local write failed");
-                            metrics::inc_replica_write_failure(true);
-                        }
-                    }
-                    return None;
+                    }));
                 }
 
                 let work = ReplicaWriteWork::Remote {
@@ -667,8 +689,9 @@ impl ClusterCoordinator {
             .collect();
         drop(ring);
 
-        // Fan out. Remote writes are task-backed so post-quorum sends keep
-        // running instead of being canceled when the coordinator returns.
+        // Keep local storage off the async worker: a filesystem or commit-log
+        // wait must not consume a CQL runtime thread. Remote writes are
+        // task-backed so post-quorum sends survive coordinator return.
         let mut local_row = Some(row);
         let mut total_acks = 0usize;
         let mut dc_acks: std::collections::HashMap<String, usize> =
@@ -683,18 +706,32 @@ impl ClusterCoordinator {
                         return None;
                     };
                     metrics::inc_replica_write_attempt(true);
-                    match self.storage.write(table_id, key, row, timestamp) {
-                        Ok(()) => {
-                            total_acks += 1;
-                            *dc_acks.entry(dc).or_insert(0) += 1;
-                            metrics::inc_replica_write_ack(true);
-                        }
-                        Err(e) => {
-                            tracing::warn!(%e, "local NTS write failed");
-                            metrics::inc_replica_write_failure(true);
-                        }
-                    }
-                    return None;
+                    let storage = Arc::clone(&self.storage);
+                    let table_id = table_id.clone();
+                    let key = key.clone();
+                    return Some(tokio::spawn(async move {
+                        let result = match spawn_storage_blocking(move || {
+                            storage.write(&table_id, &key, row, timestamp)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                metrics::inc_replica_write_ack(true);
+                                ReplicaResult::Ack { host_id: None }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(%e, "local NTS write failed");
+                                metrics::inc_replica_write_failure(true);
+                                ReplicaResult::Failure { host_id: None }
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "local NTS storage worker failed");
+                                metrics::inc_replica_write_failure(true);
+                                ReplicaResult::Failure { host_id: None }
+                            }
+                        };
+                        (result, dc)
+                    }));
                 } else {
                     NtsReplicaWriteWork::Remote {
                         remote,
@@ -2177,5 +2214,37 @@ mod tests {
         }
         // If result is Ok, both mutations somehow succeeded (unlikely with
         // nonexistent table, but depends on coordinator error handling).
+    }
+}
+
+#[cfg(test)]
+mod blocking_storage_tests {
+    use super::spawn_storage_blocking;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_storage_work_does_not_starve_the_runtime_worker() {
+        let started = Arc::new(AtomicBool::new(false));
+        let work_started = Arc::clone(&started);
+        let work = spawn_storage_blocking(move || {
+            work_started.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(300));
+            Ok::<(), ferrosa_common::Error>(())
+        });
+
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let timer_started_at = Instant::now();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            timer_started_at.elapsed() < Duration::from_millis(150),
+            "a slow storage operation blocked the runtime worker"
+        );
+        work.await.unwrap().unwrap();
     }
 }

@@ -1431,7 +1431,7 @@ fn cli_meta_output(args: impl IntoIterator<Item = String>) -> Option<String> {
                     "{version}\n\n\
 The Ferrosa database server. Configuration comes from the TOML file\n\
 named by FERROSA_CONFIG (default /etc/ferrosa/ferrosa.toml) and from\n\
-FERROSA_* environment variables; the server takes no other arguments.\n\n\
+FERROSA_* environment variables. Pass --validate to scan local SSTables during startup; large scans can take a long time.\n\n\
   -V, --version    print the version and exit\n\
   -h, --help       print this help and exit"
                 ));
@@ -3648,6 +3648,7 @@ mod tests {
             let output = cli_meta_output(args(&[flag])).expect("help must be handled");
             assert!(output.starts_with("ferrosa "), "{output}");
             assert!(output.contains("FERROSA_CONFIG"), "{output}");
+            assert!(output.contains("--validate"), "{output}");
         }
     }
 
