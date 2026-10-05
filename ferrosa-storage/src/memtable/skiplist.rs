@@ -1,22 +1,52 @@
-//! Lock-free memtable backed by `crossbeam_skiplist::SkipMap`.
+//! Memtable backed by `crossbeam_skiplist::SkipMap`.
 //!
-//! All operations are lock-free: reads use `SkipMap::get()` + `ArcSwap::load()`,
-//! writes use `SkipMap::get_or_insert()` + CAS loop on `ArcSwap`.
+//! # Concurrency model
 //!
-//! # Merge-on-write protocol
+//! The **index** is lock-free: `SkipMap` gives concurrent iteration and lookup,
+//! so reads and scans (`get`, `range_iter`) never block a writer and never
+//! materialize. The **per-partition value** is guarded by a `parking_lot::RwLock`
+//! so a write can merge a row into the partition **in place**.
 //!
-//! 1. `get_or_insert_with()` atomically inserts an empty partition if key is new.
-//! 2. CAS loop on the per-partition `ArcSwap<Partition>` merges the row.
-//! 3. If another thread updates the same partition concurrently, the CAS retries.
+//! # Why an in-place merge (and not CAS-publish a new partition)
 //!
-//! This eliminates all lock contention — different partitions never interact,
-//! and same-partition contention is handled by the non-blocking CAS loop.
+//! This memtable previously published each merged partition through an
+//! `arc_swap::ArcSwap`, re-writing the whole partition per row:
+//!
+//! 1. `get_or_insert_with()` inserts an empty partition if the key is new.
+//! 2. A CAS loop `clone()`s the whole partition, merges one row, and swaps in a
+//!    fresh `Arc`.
+//!
+//! `arc_swap` offers no `DerefMut` on its guard, so CAS-publishing a changed
+//! value *requires* building a new value — the clone is structural, one deep
+//! clone plus a fresh `Arc` per write, and it walks every row twice to re-size
+//! the partition. That is O(rows-in-partition) per write, so filling one
+//! partition is O(N^2). On a live node replaying a commit log it dominated:
+//! 52% of wall time in `Arc<Partition>::drop_slow` -> jemalloc free, ~95% CPU for
+//! 18+ minutes with no progress and no CQL listener (replay is a barrier).
+//! Measured: 1000 writes into a growing partition cost 2,109,500 allocations
+//! (~2109/write), and the cost grew as the partition grew.
+//!
+//! The merge is done in place instead, exactly as `ShardedBTreeMemtable::put`
+//! does (`Arc::make_mut` + `merge_row_into_partition`). The lock is held only
+//! for the merge of one row; `SkipMap::insert` is lock-free, so distinct
+//! partitions never contend, and a same-partition CAS retry loop is replaced by
+//! a short critical section. Readers (`get`) clone the `Arc` under a read lock
+//! and release it immediately.
+//!
+//! Atomic merge: `super::sharded::merge_row_into_partition` only mutates the
+//! partition after both rows are validated (see
+//! `normalize_collection_rows_for_merge`, which parses every blob first and
+//! applies second), so a rejected row leaves the partition exactly as it was.
+//! The `validate_row_against_schema` guard runs before the lock is taken.
+//!
+//! See `ferrosa-storage/tests/memtable_write_alloc_bound.rs` for the regression
+//! guard: writes to an existing partition must not allocate per write.
 
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
+use parking_lot::RwLock;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
@@ -25,9 +55,10 @@ use ferrosa_sstable::types::{DeletionTime, Partition, Row};
 
 use super::Memtable;
 
-/// Lock-free memtable using crossbeam-skiplist.
+/// Memtable using crossbeam-skiplist for the index and a per-partition
+/// `RwLock<Arc<Partition>>` for the value (in-place merge; see module docs).
 pub struct SkipListMemtable {
-    map: SkipMap<DecoratedKey, ArcSwap<Partition>>,
+    map: SkipMap<DecoratedKey, RwLock<Arc<Partition>>>,
     size: AtomicUsize,
     count: AtomicUsize,
     /// Smallest timestamp of anything accepted by `put` (`i64::MAX` when empty).
@@ -54,68 +85,74 @@ impl Default for SkipListMemtable {
 impl Memtable for SkipListMemtable {
     fn put(&self, key: &DecoratedKey, row: Row, schema: &TableSchema) -> Result<()> {
         // Fail-loud guard: reject mis-sized cells before they reach the
-        // memtable (mirrors the check in `ShardedBTreeMemtable::put`).
+        // memtable (mirrors the check in `ShardedBTreeMemtable::put`). Runs
+        // before any lock is taken, so a rejected row never mutates the table.
         super::validate_row_against_schema(&row, schema)?;
         // Lowered before the row is visible; see `ShardedBTreeMemtable::put`.
         self.min_ts
             .fetch_min(super::row_min_timestamp(&row), Ordering::SeqCst);
-        // Atomically insert an empty partition if the key is new.
-        // No side effects in the closure — count is tracked via was_empty
-        // inside the CAS loop, which serializes concurrent writers.
-        let entry = self.map.get_or_insert_with(key.clone(), || {
-            ArcSwap::new(Arc::new(Partition {
-                key: key.clone(),
-                deletion: DeletionTime::LIVE,
-                static_row: None,
-                rows: vec![],
-            }))
-        });
 
-        // CAS loop to merge the row into the partition.
-        // load_full() returns Arc directly (not a Guard), so Arc::ptr_eq works.
-        loop {
-            let current = entry.value().load_full();
-            let was_empty = current.rows.is_empty();
-            let old_size = estimate_partition_size(&current);
+        // Take the index entry. A write to a partition already in the table
+        // looks the key up BY REFERENCE: `SkipMap`'s insert path needs an owned
+        // key, so calling `get_or_insert_with` unconditionally would clone the
+        // key, and `DecoratedKey`'s clone is a heap allocation (its key bytes
+        // are a `Vec`). That was the last allocation on the hot path. Only the
+        // first write to a key pays for the owned key the insert requires;
+        // `get_or_insert_with` still resolves a concurrent first-insert race
+        // atomically (its closure runs at most once per key). No side effects in
+        // the closure.
+        let entry = match self.map.get(key) {
+            Some(existing) => existing,
+            None => self.map.get_or_insert_with(key.clone(), || {
+                RwLock::new(Arc::new(Partition {
+                    key: key.clone(),
+                    deletion: DeletionTime::LIVE,
+                    static_row: None,
+                    rows: vec![],
+                }))
+            }),
+        };
 
-            let mut merged = (*current).clone();
-            super::sharded::merge_row_into_partition(&mut merged, row.clone(), schema)?;
-            let new_size = estimate_partition_size(&merged);
+        // Merge the row IN PLACE under the per-partition write lock. `Arc::make_mut`
+        // reuses the partition's buffer when this memtable holds the only `Arc`
+        // (the common case: readers clone the `Arc` only briefly), so an
+        // existing partition is not re-written per row. Holding only this
+        // partition's lock — never the map's — keeps distinct partitions
+        // independent and contention short. This is what removes the O(N)
+        // clone-per-write that made filling a partition O(N^2); see module docs.
+        let mut guard = entry.value().write();
+        let was_empty = guard.rows.is_empty();
+        let old_size = estimate_partition_size(&guard);
 
-            let new_arc = Arc::new(merged);
-            let prev = entry.value().compare_and_swap(&current, new_arc);
-            if Arc::ptr_eq(&prev, &current) {
-                // CAS succeeded. The CAS serializes concurrent writers, so
-                // exactly one thread sees was_empty=true for a new partition.
-                if was_empty {
-                    self.count.fetch_add(1, Ordering::Relaxed);
-                }
-                if new_size >= old_size {
-                    self.size.fetch_add(new_size - old_size, Ordering::Relaxed);
-                } else {
-                    self.size.fetch_sub(old_size - new_size, Ordering::Relaxed);
-                }
-                return Ok(());
-            }
-            // CAS failed — another thread updated; retry with their version.
+        let partition = Arc::make_mut(&mut guard);
+        super::sharded::merge_row_into_partition(partition, row, schema)?;
+
+        let new_size = estimate_partition_size(partition);
+        if new_size >= old_size {
+            self.size.fetch_add(new_size - old_size, Ordering::Relaxed);
+        } else {
+            self.size.fetch_sub(old_size - new_size, Ordering::Relaxed);
         }
+        if was_empty {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn get(&self, key: &DecoratedKey) -> Result<Option<Arc<Partition>>> {
-        Ok(self.map.get(key).map(|entry| {
-            let guard = entry.value().load();
-            Arc::clone(&guard)
-        }))
+        // Clone the `Arc` under a brief read lock, then release it. Cheap (one
+        // atomic refcount bump) and never deep-copies the partition.
+        Ok(self
+            .map
+            .get(key)
+            .map(|entry| Arc::clone(&entry.value().read())))
     }
 
     fn snapshot(&self) -> Vec<Partition> {
         // SkipMap iterates in key order (DecoratedKey: token then key bytes).
         self.map
             .iter()
-            .map(|entry| {
-                let guard = entry.value().load();
-                (**guard).clone()
-            })
+            .map(|entry| (**entry.value().read()).clone())
             .collect()
     }
 
@@ -132,10 +169,7 @@ impl Memtable for SkipListMemtable {
                 start.is_none_or(|s| key >= s) && end.is_none_or(|e| key <= e)
             })
             .take(limit)
-            .map(|entry| {
-                let guard = entry.value().load();
-                (**guard).clone()
-            })
+            .map(|entry| (**entry.value().read()).clone())
             .collect()
     }
 
@@ -156,10 +190,7 @@ impl Memtable for SkipListMemtable {
                     let key = entry.key();
                     start.as_ref().is_none_or(|s| key >= s) && end.as_ref().is_none_or(|e| key <= e)
                 })
-                .map(|entry| {
-                    let guard = entry.value().load();
-                    (**guard).clone()
-                }),
+                .map(|entry| (**entry.value().read()).clone()),
         )
     }
 

@@ -74,6 +74,28 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   Live RF=3 re-validation on the real `typed_edges` shape is the orchestrator's
   remaining confirmation step.
 
+- **`COUNT(*)` counted the local replica subset, not the ring (forge
+  t_8c4e44e8 — residual).** The 2026-06 fix (`74e42c3f`) made
+  `coordinate_range_count` reuse the CL/RF fan-out decision, but keyed it on the
+  coordinator's `default_rf` — the MAX RF across every user keyspace, frozen at
+  formation by `resolve_formation_rf`. Any cluster containing a keyspace with
+  `RF == node_count` therefore sets `default_rf == node_count`, and the
+  local-only fast path then ran for EVERY table, including lower-RF keyspaces
+  where the node owns only its share of the ring. `SELECT count(*)` returned
+  ~`rows/node_count` (observed `40 of 120` on a 3-node cluster with an RF=3
+  keyspace present), while a full `SELECT` fanned out and returned every row.
+  Fixed by threading the TABLE's `ReplicationStrategy` from the router
+  (`keyspace_strategy`) through `WritePath::count_range_with` /
+  `count_range_matching_with` into `coordinate_range_count_matching`, and
+  gating the fast path on `strategy.replication_factor()` instead of
+  `self.default_rf`. `RF >= node_count` tables keep the exact local metadata
+  fast path; `RF < node_count` tables fan out and token-dedup. Regression:
+  `tests/count_star_ring_scope.rs` — a real 3-node loopback cluster in the
+  production topology (each node owns a disjoint third, `default_rf = 3`,
+  `CL=ONE`, `RF=1` SimpleStrategy) must count the whole ring. RED on
+  `40 of 120` before the change; neutering the gate back to `self.default_rf`
+  restores the RED.
+
 - **Paged multi-replica stream lifecycle (t_dc729b1d / t_3fc6be3c, CL-14).**
   Fixed the phantom `expected_seq=0 observed_seq=5` gap-close on every abandoned
   page (seq-state creation now gated on route liveness; no-state+no-route is a

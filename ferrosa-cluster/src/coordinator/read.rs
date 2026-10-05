@@ -5180,7 +5180,13 @@ mod tests {
         // remote, and the remote is unreachable — so this must be an error,
         // NOT a silent local-only count of 1.
         let at_all = coordinator
-            .coordinate_range_count_with(&table_id, ConsistencyLevel::All)
+            .coordinate_range_count_with(
+                &table_id,
+                ConsistencyLevel::All,
+                &crate::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 3,
+                },
+            )
             .await;
         assert!(
             at_all.is_err(),

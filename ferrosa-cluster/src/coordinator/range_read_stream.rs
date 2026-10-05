@@ -289,7 +289,16 @@ impl ClusterCoordinator {
     /// count then drives the same CL-selected, token-deduped streaming
     /// range-read fan-out the full `SELECT` uses and sums the live rows.
     pub async fn coordinate_range_count(&self, table_id: &TableId) -> crate::error::Result<u64> {
-        self.coordinate_range_count_with(table_id, self.default_cl)
+        // Legacy no-strategy entry point. The production CQL COUNT path threads
+        // the table's real `ReplicationStrategy` through
+        // `coordinate_range_count_with`; this shim exists for callers with no
+        // keyspace in hand and falls back to the coordinator's formation
+        // default. Do NOT route a real table count here — keying the fan-out
+        // decision on a cluster-wide default is exactly the t_8c4e44e8 residue.
+        let fallback = crate::ring::strategy::ReplicationStrategy::Simple {
+            replication_factor: self.default_rf,
+        };
+        self.coordinate_range_count_with(table_id, self.default_cl, &fallback)
             .await
     }
 
@@ -310,8 +319,9 @@ impl ClusterCoordinator {
         &self,
         table_id: &TableId,
         cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
     ) -> crate::error::Result<u64> {
-        self.coordinate_range_count_matching(table_id, cl, &|_| true)
+        self.coordinate_range_count_matching(table_id, cl, strategy, &|_| true)
             .await
     }
 
@@ -331,22 +341,32 @@ impl ClusterCoordinator {
         &self,
         table_id: &TableId,
         cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
         matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
     ) -> crate::error::Result<u64> {
         // Correctness over speed (forge t_8c4e44e8): the local replica only
         // holds the partitions whose tokens fall in ITS owned ranges. When the
-        // keyspace RF does not span the whole ring (`RF < node_count`, or any
-        // CL that demands more than the local response), the local-only
+        // TABLE's keyspace RF does not span the whole ring (`RF < node_count`,
+        // or any CL that demands more than the local response), the local-only
         // metadata count silently returns a nondeterministic UNDERCOUNT — it
         // tallies only the locally-resident subset while a full `SELECT`
         // (which fans out + dedups by token) sees every row.
         //
-        // Reuse the same CL/RF fan-out decision the streaming range read uses.
+        // The fan-out decision MUST be keyed on THIS TABLE's replication
+        // strategy, never the coordinator's `default_rf`. `default_rf` is the
+        // MAX RF across every user keyspace, frozen at cluster formation
+        // (`resolve_formation_rf`), so any cluster that contains a keyspace with
+        // `RF == node_count` sets it to `node_count` and the gate would then
+        // conclude "local owns everything" for a lower-RF table too — counting
+        // just the local share. (That was the residue of the 2026-06 fix: it
+        // keyed on `default_rf`, so it held only when `RF >= node_count`.)
+        //
         // When `range_read_remotes` needs none the local node provably owns every
         // token range at this CL, so the fast metadata path is exact. Otherwise
         // we MUST fan out across replicas and count the token-deduped result —
         // never the local subset.
-        if self.range_read_remotes(cl, self.default_rf).needed == 0 {
+        let rf = strategy.replication_factor();
+        if self.range_read_remotes(cl, rf).needed == 0 {
             return self
                 .storage
                 .count_range_matching(table_id, None, None, matches)
@@ -361,7 +381,7 @@ impl ClusterCoordinator {
         // `StorageEngine::count_range`'s COUNT(*) semantics (one per row, plus
         // one for a present static row) but over the WHOLE ring.
         let mut stream = self
-            .coordinate_range_read_stream_all_with(table_id, 0, cl, self.default_rf)
+            .coordinate_range_read_stream_all_with(table_id, 0, cl, rf)
             .await?;
         let mut total: u64 = 0;
         while let Some(item) = stream.next().await {
