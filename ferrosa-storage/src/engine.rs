@@ -28080,7 +28080,7 @@ mod tests {
         output: &crate::compaction::metadata::SSTableMetadata,
     ) -> ferrosa_common::Result<crate::compaction::metadata::SSTableMetadata> {
         let (promoted_gen, target_dir, final_target) =
-        engine.reserve_compaction_promotion_target(tid, output)?;
+            engine.reserve_compaction_promotion_target(tid, output)?;
         StorageEngine::promote_compaction_output(output, promoted_gen, &target_dir, &final_target)
     }
 
