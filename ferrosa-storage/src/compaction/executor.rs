@@ -168,6 +168,39 @@ fn configured_compaction_workers() -> usize {
 /// `execute_task` and releases it (via the `CompactionPermit` guard) when the
 /// task finishes, so at most `cap` tasks ever execute concurrently regardless
 /// of how many worker threads exist.
+/// How saturated the whole compaction pipeline is, in `0.0..=1.0`.
+///
+/// `in_flight` is the count of tasks the executor is currently carrying — those
+/// holding a merge permit plus those queued or waiting on the gate. `capacity`
+/// is the configured merge concurrency. The planner uses this to defer before
+/// it spends a full planning round (`select` + one metadata rescan per emitted
+/// task) only to discover every worker queue is full: the task and result queues
+/// are one and two deep per worker, so the pipeline saturates almost
+/// immediately, and the planning work then buys no throughput while occupying
+/// the maintenance task that should be draining results.
+///
+/// A zero capacity reports no pressure rather than dividing by zero; callers
+/// pair this with [`compaction_planning_deferred`], whose default threshold
+/// (`1.0`) makes the gate inert.
+pub(crate) fn compaction_pressure(in_flight: usize, capacity: usize) -> f64 {
+    if capacity == 0 {
+        return 0.0;
+    }
+    (in_flight as f64 / capacity as f64).clamp(0.0, 1.0)
+}
+
+/// Whether the planner should skip this round because the compaction pipeline
+/// is already saturated.
+///
+/// `threshold` is operator-set (`FERROSA_COMPACTION_BACKPRESSURE_PRESSURE`) and
+/// validated into `0.0..=1.0`. The default is `1.0`: only a completely saturated
+/// pipeline defers, so an idle or lightly loaded node behaves exactly as before.
+/// A threshold of `0.0` disables the gate, for an operator who would rather
+/// always attempt a plan than ever defer one.
+pub(crate) fn compaction_planning_deferred(pressure: f64, threshold: f64) -> bool {
+    threshold > 0.0 && pressure >= threshold
+}
+
 struct CompactionGate {
     permits: Receiver<()>,
     returned: Sender<()>,
@@ -664,6 +697,9 @@ impl CompactionExecutor {
         let pending_results = Arc::new(AtomicUsize::new(0));
         let pending_failures = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(CompactionGate::new(max_concurrent));
+        // The planner reads merge capacity off the tracker, which every task
+        // already shares; the gate's permit channel cannot be duplicated.
+        let tracker = TaskTracker::with_capacity(tracker, max_concurrent);
         // The sole sender lives on `Self`; dropping it in `shutdown()` closes
         // this channel and wakes every worker's `select!` at once — no poll
         // interval (T-021 CD1, decisions.md D7).
@@ -881,6 +917,19 @@ impl CompactionExecutor {
 
     pub(crate) fn changed(&self) -> &tokio::sync::Notify {
         &self.tracker.changed
+    }
+
+    /// How many compaction tasks this executor is currently carrying (queued,
+    /// waiting on the merge gate, or running), across all tables. Paired with
+    /// [`Self::compaction_capacity`] it gives the planner a saturation signal
+    /// so it can defer before paying for a planning round that cannot submit.
+    pub fn compaction_in_flight(&self) -> usize {
+        self.tracker.in_flight_tasks()
+    }
+
+    /// Merge concurrency the executor runs at; zero means unknown.
+    pub fn compaction_capacity(&self) -> usize {
+        self.tracker.capacity()
     }
 
     /// Whether `table` still has a compaction task registered (queued, running,
@@ -2075,6 +2124,56 @@ mod tests {
         let ticket = executor.submission_ticket(&task.table_id).unwrap();
         let token = executor.tracker.try_register(&task, &ticket).unwrap();
         (task, token)
+    }
+
+    /// The planner must be able to see how deep the compaction pipeline is and
+    /// defer before it pays a full planning round.
+    ///
+    /// Compaction task and result queues are one and two deep per worker, so the
+    /// pipeline saturates almost immediately under load. `maybe_compact` then
+    /// paid the whole cost of `select` plus one metadata rescan per emitted task
+    /// only to find every worker queue full and return without submitting
+    /// anything: the quadratic planning work (PR #517) multiplied by the
+    /// flush-rate and 10 s tick, buying no throughput and holding the async
+    /// maintenance task that should be draining results. These are the pure
+    /// decision helpers the planner gates on.
+    #[test]
+    fn compaction_backpressure_reports_pipeline_saturation() {
+        assert_eq!(compaction_pressure(0, 8), 0.0);
+        assert!(compaction_pressure(1, 8) > 0.0);
+        assert_eq!(compaction_pressure(8, 8), 1.0);
+        assert!(
+            compaction_pressure(7, 8) > compaction_pressure(3, 8),
+            "pressure must be monotonic in the in-flight task count"
+        );
+        // A zero capacity must not divide by zero; treat it as no pressure.
+        assert_eq!(compaction_pressure(0, 0), 0.0);
+        assert_eq!(compaction_pressure(4, 0), 0.0);
+    }
+
+    #[test]
+    fn compaction_backpressure_defers_at_operator_threshold() {
+        // Default threshold is 1.0: only a fully saturated pipeline defers, so
+        // this changes nothing for an idle or lightly loaded executor.
+        assert!(!compaction_planning_deferred(0.0, 1.0));
+        assert!(compaction_planning_deferred(1.0, 1.0));
+        // A half-full pipeline with an operator-set 0.5 threshold defers.
+        assert!(compaction_planning_deferred(0.5, 0.5));
+        assert!(!compaction_planning_deferred(0.49, 0.5));
+        // A zero threshold disables the gate entirely, for operators who would
+        // rather always attempt a plan than ever defer one.
+        assert!(!compaction_planning_deferred(0.0, 0.0));
+        assert!(!compaction_planning_deferred(1.0, 0.0));
+    }
+
+    #[test]
+    fn compaction_backpressure_executor_in_flight_count() {
+        let executor = CompactionExecutor::new();
+        assert_eq!(executor.compaction_in_flight(), 0);
+        let (task, _token) = register_pressure_task(&executor, "a", 1);
+        assert_eq!(executor.compaction_in_flight(), 1);
+        executor.release_task_inputs(&task);
+        assert_eq!(executor.compaction_in_flight(), 0);
     }
 
     #[test]

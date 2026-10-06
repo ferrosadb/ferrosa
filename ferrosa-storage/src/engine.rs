@@ -12824,6 +12824,24 @@ impl StorageEngine {
     }
 
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) -> bool {
+        // Defer before planning anything when the compaction pipeline is already
+        // saturated. The task and result queues are one and two deep per worker,
+        // so a full planning round here would compute `select` plus one metadata
+        // rescan per emitted task and then submit nothing, while occupying the
+        // async maintenance task that needs to drain results. Default threshold
+        // is 1.0 (only a completely full pipeline defers), so an idle node is
+        // unaffected; `FERROSA_COMPACTION_BACKPRESSURE_PRESSURE` dials it.
+        let pressure = crate::compaction::compaction_pressure(
+            self.compaction_executor.compaction_in_flight(),
+            self.compaction_executor.compaction_capacity(),
+        );
+        if crate::compaction::compaction_planning_deferred(
+            pressure,
+            self.runtime_tuning.compaction_backpressure_pressure,
+        ) {
+            crate::metrics::inc_compaction_planning_deferred();
+            return false;
+        }
         if !self
             .compaction_retry
             .lock()
