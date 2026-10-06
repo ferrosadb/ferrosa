@@ -1,6 +1,6 @@
 ---
 title: A continuously-written node aborts on commit-log backlog age, not on a stalled fsync
-status: in-process
+status: implemented
 created: 2026-10-06
 updated: 2026-10-06
 severity: P0
@@ -88,26 +88,59 @@ does. `attempts_started` / `attempts_completed` (already maintained in productio
 - [x] `a_busy_sync_thread_that_keeps_completing_a_backlog_past_the_deadline_never_escalates`
       (new) — 12 samples, one completed fsync each, backlog stays past the deadline:
       zero escalations, one counted stall, no `device-slow` cause.
-- [ ] `a_stalled_commit_log_sync_counts_one_stall_per_deadline_and_escalates` (existing) —
-      must keep failing an *unbroken, no-progress* stall. Re-anchor its unbroken samples to
-      no-progress so it still discriminates.
+- [x] `a_stalled_commit_log_sync_counts_one_stall_per_deadline_and_escalates` (existing) — green unchanged: its unbroken samples carry no completed fsync, so it already discriminates.
 - [ ] `slow_fsync_episodes_that_recover_never_escalate` (existing) — keep.
-- [ ] Negative control: break the guard (ignore completed-fsync progress) and confirm the
+- [x] Negative control: break the guard (ignore completed-fsync progress) and confirm the
       new test goes red.
-- [ ] `the_stall_cause_is_counted_once_per_episode_not_once_per_deadline` stays green.
+- [x] `the_stall_cause_is_counted_once_per_episode_not_once_per_deadline` stays green.
 
 ## Acceptance criteria
 
-- [ ] RED first: the new test fails on the unmodified `record_stalls`.
-- [ ] GREEN: a progress-aware rule in `record_stalls` — count the episode once and never
+- [x] RED first: the new test fails on the unmodified `record_stalls`.
+- [x] GREEN: a progress-aware rule in `record_stalls` — count the episode once and never
       `record_crash` while an fsync completed since the last sample.
-- [ ] Release-build reasoning recorded for invariant 3 (a truly hung fsync must escalate).
-- [ ] `cargo test --bin ferrosa supervisor` green; `cargo clippy --all-targets` clean;
+- [x] Release-build reasoning recorded for invariant 3 (a truly hung fsync must escalate).
+- [x] `cargo test --bin ferrosa supervisor` green; `cargo clippy --all-targets` clean;
       `cargo fmt --check` clean.
-- [ ] `slow_fsync_episodes_that_recover_never_escalate` and the unbroken-stall test green.
+- [x] `slow_fsync_episodes_that_recover_never_escalate` and the unbroken-stall test green.
 - [ ] Verified by a **separate** agent, not the implementer.
 
 ## Implementation notes
 
-(implementer fills in: the exact predicate, why it cannot mask a hung thread, and the
-before/after test evidence)
+## Implementation notes
+
+Implemented in `ferrosa/src/supervisor.rs`, `record_stalls`, with the state field
+`seen_sync_completions` (seeded from `baseline.attempts_completed` in `new()`).
+
+- Predicate: `made_progress = health.attempts_completed > self.seen_sync_completions`,
+  then `self.seen_sync_completions = health.attempts_completed`.
+- When `made_progress`, the episode is recorded **once** (`first_new == 1`) and no
+  `record_crash` runs — the metric stays honest, the readyz refusal is unchanged, and the
+  intensity is untouched.
+- When not, the previous behaviour returns exactly: deadline 1 impairs, deadlines >= 2
+  count toward the intensity. This is why invariant 3 holds — a backlog whose thread
+  completes nothing (in flight the whole sample, no attempt issued, or dead) reports no
+  completion, so it still escalates.
+
+Evidence (branch `fix/commitlog-stall-backlog-escalates`, PR #521, off `origin/main`
+`220aff3c`):
+
+| step | command | result |
+|---|---|---|
+| RED | `cargo test --bin ferrosa supervisor::tests::a_busy_sync_thread` | FAILED — `escalations left: 1, right: 0` |
+| GREEN | `cargo test --bin ferrosa supervisor` | **23 passed; 0 failed** |
+| negative control | `let made_progress = false;` then re-run | FAILED — proof the test exercises the guard |
+| fmt | `cargo fmt -p ferrosa -- --check` | clean |
+| clippy | `cargo clippy --all-targets` | zero warnings |
+
+Deliberately unchanged: the `cause=` label. `StallCause::DeviceSlow` means "an attempt is
+in flight" (`attempt_elapsed.is_some()`), which a busy thread legitimately is; the new
+test asserts one episode counts one `DeviceSlow` cause rather than redefining the label.
+Re-labelling is scope creep for this fix and is pinned by
+`a_stall_with_an_fsync_in_flight_is_logged_and_counted_as_the_device`.
+
+Falsified before implementation (recorded so it is not retried): the stall is **not**
+device latency. 8 concurrent `F_FULLFSYNC` workers on the live data volume at host load
+~13.5 measured p50 13 ms, p99 29 ms, max 64 ms, zero calls >= 100 ms over 5947 calls.
+
+Awaiting verification by a **separate** agent.
