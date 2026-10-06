@@ -221,7 +221,11 @@ impl SizeTieredStrategy {
         let mut current_bucket: Vec<&SSTableMetadata> = vec![sorted[0]];
 
         for sst in &sorted[1..] {
-            let median = bucket_median(&current_bucket);
+            // `sorted` is ascending and every bucket is a contiguous run of it,
+            // so `current_bucket` is itself in ascending size order. Its median
+            // is therefore an O(1) index lookup; recomputing it by re-sorting
+            // the bucket on every element made a single planning round quadratic.
+            let median = median_of_sorted_run(&current_bucket);
             // When median is 0 (size not yet tracked), group all zero-size SSTables
             // together — they are homogeneous and should compact as one bucket.
             let in_bucket = if median == 0.0 {
@@ -372,17 +376,24 @@ pub fn legacy_rewrite_tasks(
 }
 
 /// Computes the median size of a bucket of SSTables.
-fn bucket_median(bucket: &[&SSTableMetadata]) -> f64 {
+///
+/// The bucket must be in ascending `size_bytes` order, which `bucket_sstables`
+/// guarantees: it pushes elements in ascending order and only ever starts a new
+/// run. The median is then the middle element (or the mean of the two middle
+/// elements) at an O(1) index cost, so a full planning pass stays O(n log n)
+/// for the initial sort. The earlier implementation allocated a `Vec<u64>` and
+/// `sort_unstable`ed it on every call; because it was called once per element it
+/// made a single `select()` quadratic, and `maybe_compact` runs per flush and on
+/// the 10 s maintenance tick.
+fn median_of_sorted_run(bucket: &[&SSTableMetadata]) -> f64 {
     if bucket.is_empty() {
         return 0.0;
     }
-    let mut sizes: Vec<u64> = bucket.iter().map(|s| s.size_bytes).collect();
-    sizes.sort_unstable();
-    let mid = sizes.len() / 2;
-    if sizes.len().is_multiple_of(2) {
-        (sizes[mid - 1] + sizes[mid]) as f64 / 2.0
+    let mid = bucket.len() / 2;
+    if bucket.len().is_multiple_of(2) {
+        (bucket[mid - 1].size_bytes + bucket[mid].size_bytes) as f64 / 2.0
     } else {
-        sizes[mid] as f64
+        bucket[mid].size_bytes as f64
     }
 }
 #[cfg(test)]
@@ -584,6 +595,139 @@ mod tests {
         let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].inputs.len(), 4);
+    }
+
+    /// Regression: one planning round must not recompute the bucket median by
+    /// re-sorting the bucket for every element.
+    ///
+    /// `bucket_sstables` walks the size-sorted SSTables once, so the bucket it
+    /// is building is always in ascending size order and its median is an O(1)
+    /// index lookup. The previous implementation collected the bucket's sizes
+    /// into a fresh `Vec<u64>` and `sort_unstable`ed it on *every* iteration,
+    /// making a single round quadratic. Measured in a debug build: 5k SSTables
+    /// 110 ms, 10k 429 ms, 20k 1 707 ms, 40k 7 152 ms — 4x per doubling. A table
+    /// in the husk state (see `engine.rs` retire comment) reaches tens of
+    /// thousands of SSTables, and `maybe_compact` runs after every flush and on
+    /// the 10 s maintenance tick, so the planner burns its slice on the thread
+    /// that would otherwise submit work.
+    #[test]
+    fn bucket_sstables_does_not_resort_per_element() {
+        let strategy = SizeTieredStrategy::new(test_config());
+        const N: usize = 20_000;
+        // Sizes within bucket_low..=bucket_high of one another form a single
+        // bucket: the worst case for a per-element median recomputation.
+        let sstables: Vec<SSTableMetadata> = (0..N)
+            .map(|i| make_metadata(&format!("s{i:05}"), 1000 + (i as u64 % 10)))
+            .collect();
+
+        let start = std::time::Instant::now();
+        let buckets = strategy.bucket_sstables(&sstables);
+        let elapsed = start.elapsed();
+
+        assert_eq!(buckets.len(), 1, "similar sizes must form a single bucket");
+        assert_eq!(buckets[0].len(), N);
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "bucket_sstables took {elapsed:?} for {N} SSTables; the bucket median \
+             must not be recomputed by re-sorting the bucket for every element"
+        );
+    }
+
+    /// The linear median lookup must partition exactly as the original
+    /// sort-per-element algorithm did, including the zero-size grouping branch
+    /// and inputs that straddle several tiers.
+    #[test]
+    fn bucket_partitioning_matches_reference_algorithm() {
+        let config = test_config();
+        let strategy = SizeTieredStrategy::new(config.clone());
+        let mut rng = 0x2545_F491_4F6C_DD1D_u64;
+        let mut multi_bucket_cases = 0;
+
+        for case in 0..200 {
+            let count = 1 + (next_rand(&mut rng) % 64) as usize;
+            let sstables: Vec<SSTableMetadata> = (0..count)
+                .map(|i| {
+                    // ~1 in 8 is empty (exercises the median == 0.0 branch);
+                    // the rest spread over five decades so buckets split often.
+                    let size = if next_rand(&mut rng).is_multiple_of(8) {
+                        0
+                    } else {
+                        let magnitude = next_rand(&mut rng) % 5;
+                        10u64.pow(magnitude as u32) * (10 + next_rand(&mut rng) % 90)
+                    };
+                    make_metadata(&format!("s{i}"), size)
+                })
+                .collect();
+
+            let got: Vec<Vec<String>> = strategy
+                .bucket_sstables(&sstables)
+                .into_iter()
+                .map(|bucket| bucket.into_iter().map(|s| s.id.clone()).collect())
+                .collect();
+            let want = reference_bucket_sstables(&config, &sstables);
+            if want.len() > 1 {
+                multi_bucket_cases += 1;
+            }
+            assert_eq!(
+                got, want,
+                "bucketing diverged from the reference in case {case}"
+            );
+        }
+
+        assert!(
+            multi_bucket_cases > 50,
+            "the oracle must actually exercise multi-bucket splits, got {multi_bucket_cases}"
+        );
+    }
+
+    /// Test oracle only: the original algorithm, which sorted the buckets it
+    /// built by *size* and recomputed the median from scratch per element.
+    fn reference_bucket_sstables(
+        config: &CompactionConfig,
+        sstables: &[SSTableMetadata],
+    ) -> Vec<Vec<String>> {
+        if sstables.is_empty() {
+            return Vec::new();
+        }
+        let mut sorted: Vec<&SSTableMetadata> = sstables.iter().collect();
+        sorted.sort_by_key(|s| s.size_bytes);
+        let mut buckets: Vec<Vec<String>> = Vec::new();
+        let mut current: Vec<&SSTableMetadata> = vec![sorted[0]];
+        for sst in &sorted[1..] {
+            let mut sizes: Vec<u64> = current.iter().map(|s| s.size_bytes).collect();
+            sizes.sort_unstable();
+            let median = if sizes.is_empty() {
+                0.0
+            } else {
+                let mid = sizes.len() / 2;
+                if sizes.len().is_multiple_of(2) {
+                    (sizes[mid - 1] + sizes[mid]) as f64 / 2.0
+                } else {
+                    sizes[mid] as f64
+                }
+            };
+            let in_bucket = if median == 0.0 {
+                sst.size_bytes == 0
+            } else {
+                let ratio = sst.size_bytes as f64 / median;
+                ratio >= config.bucket_low && ratio <= config.bucket_high
+            };
+            if in_bucket {
+                current.push(sst);
+            } else {
+                buckets.push(current.iter().map(|s| s.id.clone()).collect());
+                current = vec![sst];
+            }
+        }
+        buckets.push(current.iter().map(|s| s.id.clone()).collect());
+        buckets
+    }
+
+    fn next_rand(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
     }
 
     #[test]
