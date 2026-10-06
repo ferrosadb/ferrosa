@@ -145,7 +145,11 @@ mod tests {
         assert_eq!(parse_decay(None), None);
         assert_eq!(parse_decay(Some("")), None, "set-but-empty means unset");
         assert_eq!(parse_decay(Some("   ")), None);
-        assert_eq!(parse_decay(Some("nonsense")), None, "unparseable is not a guess");
+        assert_eq!(
+            parse_decay(Some("nonsense")),
+            None,
+            "unparseable is not a guess"
+        );
     }
 
     #[test]
