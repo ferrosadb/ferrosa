@@ -548,6 +548,59 @@ fn slow_fsync_episodes_that_recover_never_escalate() {
     );
 }
 
+/// A sync thread that keeps completing fsyncs while a backlog persists must
+/// never escalate, however long that backlog stays past the deadline.
+///
+/// Live cluster 2026-10-06: node3's oldest unsynced write sat ~2 s past the 2 s
+/// deadline while the thread completed an fsync every few hundred ms. The
+/// supervisor counts one failure per deadline the *backlog* has waited, so a
+/// continuously-written node reports 4 failures in ~8 s — past
+/// `max_restarts = 3` — and aborts, replaying I/O on a machine already short of
+/// it. The thread is provably alive (`attempts_completed` keeps rising), so no
+/// death occurred and none may be counted.
+#[test]
+fn a_busy_sync_thread_that_keeps_completing_a_backlog_past_the_deadline_never_escalates() {
+    let target = FakeSync::new();
+    let (mut supervisor, status, escalations) = sync_supervisor(target.clone(), 3);
+
+    // One completed fsync per sample; the oldest unsynced write stays behind.
+    // `started == completed` on every sample: nothing is in flight and no
+    // attempt failed, so the thread is demonstrably making progress.
+    for i in 1..=12u64 {
+        target.set(|h| {
+            // One fsync in flight and one more completed on every sample:
+            // `started == completed + 1` is a thread that is running, and the
+            // backlog behind it stays past the deadline.
+            h.attempts_started = i + 1;
+            h.attempts_completed = i;
+            h.attempt_elapsed = Some(Duration::from_millis(50));
+            h.unsynced_for = Some(Duration::from_millis(1000 + i * 1000));
+        });
+        supervisor.check();
+        assert!(
+            !status.impaired().is_empty(),
+            "writes are refused while the backlog is past the deadline"
+        );
+    }
+
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        0,
+        "a thread that completed 12 fsyncs never died; a slow disk is not a crash"
+    );
+    assert_eq!(
+        status.failures(Child::CommitLogSync, FailureKind::Stall),
+        1,
+        "the episode is counted once, so the metric stays honest"
+    );
+    assert_eq!(
+        status.sync_stall_causes(ferrosa_storage::commitlog::StallCause::DeviceSlow),
+        1,
+        "one episode, one cause — the label is the existing in-flight-fsync inference, \
+         not a new claim about the disk"
+    );
+}
+
 #[test]
 fn a_stalled_commit_log_sync_counts_one_stall_per_deadline_and_escalates() {
     let target = FakeSync::new();

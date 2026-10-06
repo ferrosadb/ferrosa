@@ -822,6 +822,10 @@ pub struct CommitLogSyncSupervisor<T: CommitLogSyncTarget + ?Sized> {
     seen_sync_failures: u64,
     /// Stall deadlines already recorded for the current stall episode.
     stalls_recorded: u64,
+    /// `attempts_completed` at the previous sample. A completion since then
+    /// means the sync thread is alive and making progress, so the backlog
+    /// behind it is age, not the death this supervisor aborts on.
+    seen_sync_completions: u64,
 }
 
 impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
@@ -842,6 +846,7 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
             seen_panics: baseline.panics,
             seen_sync_failures: baseline.sync_failures,
             stalls_recorded: 0,
+            seen_sync_completions: baseline.attempts_completed,
         }
     }
 
@@ -945,6 +950,14 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
             );
             return;
         };
+        // `unsynced_for` is the age of the *oldest unsynced write*, not the
+        // duration of one in-flight fsync. On a node under continuous write the
+        // backlog never empties, so the episode below never ends even though the
+        // thread is completing fsyncs the whole time. An fsync completed since
+        // the previous sample is definitive proof of a live thread, so this
+        // sample is backlog age rather than the death this aborts on.
+        let made_progress = health.attempts_completed > self.seen_sync_completions;
+        self.seen_sync_completions = health.attempts_completed;
         let due =
             (waited.as_nanos() / health.stall_deadline.as_nanos()).min(u128::from(u64::MAX)) as u64;
         let first_new = self.stalls_recorded + 1;
@@ -955,30 +968,47 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
             waited.as_millis(),
             health.stall_deadline.as_millis()
         );
-        for deadline in
-            (first_new..).take(newly_due.min(u64::from(self.intensity.max_restarts) + 2) as usize)
-        {
-            if deadline == 1 {
-                // The first deadline of an episode: writes are refused and the
-                // node is not ready, but a slow disk is not a dead thread, so
-                // an episode that ends in a completed fsync never counts toward
-                // the restart intensity. Only a stall that outlives further
-                // deadlines (an fsync that does not return) does.
-                if self
-                    .status
-                    .record_failure(Child::CommitLogSync, FailureKind::Stall, &detail)
-                {
-                    self.status.record_stall_cause(cause);
-                    tracing::error!(
-                        task = Child::CommitLogSync.label(),
-                        %detail,
-                        "commit-log fsync stalled; writes are refused and the node reports not \
-                         ready until an fsync completes"
-                    );
+        if !made_progress {
+            for deadline in (first_new..)
+                .take(newly_due.min(u64::from(self.intensity.max_restarts) + 2) as usize)
+            {
+                if deadline == 1 {
+                    // The first deadline of an episode: writes are refused and the
+                    // node is not ready, but a slow disk is not a dead thread, so
+                    // an episode that ends in a completed fsync never counts toward
+                    // the restart intensity. Only a stall that outlives further
+                    // deadlines (an fsync that does not return) does.
+                    if self
+                        .status
+                        .record_failure(Child::CommitLogSync, FailureKind::Stall, &detail)
+                    {
+                        self.status.record_stall_cause(cause);
+                        tracing::error!(
+                            task = Child::CommitLogSync.label(),
+                            %detail,
+                            "commit-log fsync stalled; writes are refused and the node reports not \
+                             ready until an fsync completes"
+                        );
+                    }
+                } else {
+                    self.record_crash(FailureKind::Stall, detail.clone());
                 }
-            } else {
-                self.record_crash(FailureKind::Stall, detail.clone());
             }
+        } else if first_new == 1
+            && self
+                .status
+                .record_failure(Child::CommitLogSync, FailureKind::Stall, &detail)
+        {
+            // One episode, counted once so the metric stays honest, while the
+            // thread is alive: a progress-making stall never escalates.
+            self.status.record_stall_cause(cause);
+            tracing::error!(
+                task = Child::CommitLogSync.label(),
+                %detail,
+                "commit-log fsync backlog is past the stall deadline while the sync thread keeps \
+                 completing fsyncs; writes are refused and the node reports not ready until the \
+                 backlog clears"
+            );
         }
     }
 
