@@ -20,6 +20,16 @@ const DEFAULT_DIGEST_READ_CHUNK_BYTES: usize = 1 << 20;
 const DEFAULT_TASK_QUEUE_CAPACITY_PER_WORKER: usize = 1;
 const DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER: usize = 2;
 
+/// Pipeline saturation (in-flight tasks / merge capacity) at which the planner
+/// stops starting new planning rounds. `1.0` means "only when the pipeline is
+/// completely full", which is the safe default: an idle or lightly loaded node
+/// is never gated. Lowering it defers planning earlier, trading compaction
+/// aggressiveness for a short maintenance tick. `0.0` disables the gate.
+const DEFAULT_COMPACTION_BACKPRESSURE_PRESSURE: f64 = 1.0;
+/// Upper bound is exactly `1.0`: a value above it could never be reached and
+/// would silently disable compaction planning altogether.
+const MAX_COMPACTION_BACKPRESSURE_PRESSURE: f64 = 1.0;
+
 // Practical upper bounds keep accepted operator overrides away from channel
 // allocation failure, pathological maintenance batches, and excessive worker
 // creation. They remain substantially above the defaults for larger hosts.
@@ -47,8 +57,21 @@ pub(crate) struct StorageRuntimeTuning {
     pub max_auto_compaction_parallelism: usize,
     pub max_flush_parallelism: usize,
     pub digest_read_chunk_bytes: usize,
+    /// Compaction pipeline depth and the planner backpressure threshold.
+    pub compaction_pipeline: CompactionPipelineTuning,
+}
+
+/// Compaction pipeline queue depths and the planner backpressure threshold.
+///
+/// Grouped into their own `Copy` type so `StorageRuntimeTuning` stays under the
+/// p0-oom-audit `copy-derive-large-type` field-count threshold, rather than
+/// carrying a waiver for the pipeline knobs it accumulated.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompactionPipelineTuning {
     pub task_queue_capacity_per_worker: usize,
     pub result_queue_capacity_per_worker: usize,
+    /// Planner backpressure threshold in `0.0..=1.0`; see the DEFAULT const.
+    pub backpressure_pressure: f64,
 }
 
 static TUNING: OnceLock<StorageRuntimeTuning> = OnceLock::new();
@@ -111,18 +134,28 @@ impl StorageRuntimeTuning {
                 1,
                 MAX_DIGEST_READ_CHUNK_BYTES,
             ),
-            task_queue_capacity_per_worker: read_usize(
-                "FERROSA_COMPACTION_TASK_QUEUE_CAPACITY_PER_WORKER",
-                defaults.task_queue_capacity_per_worker,
-                1,
-                MAX_TASK_QUEUE_CAPACITY_PER_WORKER,
-            ),
-            result_queue_capacity_per_worker: read_usize(
-                "FERROSA_COMPACTION_RESULT_QUEUE_CAPACITY_PER_WORKER",
-                defaults.result_queue_capacity_per_worker,
-                1,
-                MAX_RESULT_QUEUE_CAPACITY_PER_WORKER,
-            ),
+            compaction_pipeline: CompactionPipelineTuning {
+                task_queue_capacity_per_worker: read_usize(
+                    "FERROSA_COMPACTION_TASK_QUEUE_CAPACITY_PER_WORKER",
+                    defaults.compaction_pipeline.task_queue_capacity_per_worker,
+                    1,
+                    MAX_TASK_QUEUE_CAPACITY_PER_WORKER,
+                ),
+                result_queue_capacity_per_worker: read_usize(
+                    "FERROSA_COMPACTION_RESULT_QUEUE_CAPACITY_PER_WORKER",
+                    defaults
+                        .compaction_pipeline
+                        .result_queue_capacity_per_worker,
+                    1,
+                    MAX_RESULT_QUEUE_CAPACITY_PER_WORKER,
+                ),
+                backpressure_pressure: read_f64(
+                    "FERROSA_COMPACTION_BACKPRESSURE_PRESSURE",
+                    defaults.compaction_pipeline.backpressure_pressure,
+                    0.0,
+                    MAX_COMPACTION_BACKPRESSURE_PRESSURE,
+                ),
+            },
         }
     }
 }
@@ -139,8 +172,11 @@ impl Default for StorageRuntimeTuning {
             max_auto_compaction_parallelism: DEFAULT_MAX_AUTO_COMPACTION_PARALLELISM,
             max_flush_parallelism: DEFAULT_MAX_FLUSH_PARALLELISM,
             digest_read_chunk_bytes: DEFAULT_DIGEST_READ_CHUNK_BYTES,
-            task_queue_capacity_per_worker: DEFAULT_TASK_QUEUE_CAPACITY_PER_WORKER,
-            result_queue_capacity_per_worker: DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER,
+            compaction_pipeline: CompactionPipelineTuning {
+                task_queue_capacity_per_worker: DEFAULT_TASK_QUEUE_CAPACITY_PER_WORKER,
+                result_queue_capacity_per_worker: DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER,
+                backpressure_pressure: DEFAULT_COMPACTION_BACKPRESSURE_PRESSURE,
+            },
         }
     }
 }
@@ -196,6 +232,35 @@ fn parse_u64_env(
         }
         Ok(raw) => match raw.trim().parse::<u64>() {
             Ok(parsed) if (min..=max).contains(&parsed) => parsed,
+            _ => {
+                tracing::error!(setting = name, value = %raw, min, max, default, "invalid storage runtime setting; using default");
+                default
+            }
+        },
+    }
+}
+
+fn read_f64(name: &str, default: f64, min: f64, max: f64) -> f64 {
+    parse_f64_env(name, env::var(name), default, min, max)
+}
+
+fn parse_f64_env(
+    name: &str,
+    value: Result<String, env::VarError>,
+    default: f64,
+    min: f64,
+    max: f64,
+) -> f64 {
+    match value {
+        Err(env::VarError::NotPresent) => default,
+        Err(error @ env::VarError::NotUnicode(_)) => {
+            tracing::error!(setting = name, %error, default, "invalid storage runtime setting; using default");
+            default
+        }
+        // `parse::<f64>` accepts `NaN`, which would compare false against every
+        // threshold and silently disable the gate; reject non-finite values.
+        Ok(raw) => match raw.trim().parse::<f64>() {
+            Ok(parsed) if parsed.is_finite() && (min..=max).contains(&parsed) => parsed,
             _ => {
                 tracing::error!(setting = name, value = %raw, min, max, default, "invalid storage runtime setting; using default");
                 default
@@ -281,11 +346,11 @@ mod tests {
             DEFAULT_DIGEST_READ_CHUNK_BYTES
         );
         assert_eq!(
-            tuning.task_queue_capacity_per_worker,
+            tuning.compaction_pipeline.task_queue_capacity_per_worker,
             DEFAULT_TASK_QUEUE_CAPACITY_PER_WORKER
         );
         assert_eq!(
-            tuning.result_queue_capacity_per_worker,
+            tuning.compaction_pipeline.result_queue_capacity_per_worker,
             DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER
         );
     }
