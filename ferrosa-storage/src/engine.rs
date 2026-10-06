@@ -68,6 +68,48 @@ tokio::task_local! {
     static TEST_CRASH_AFTER_N_INPUT_RETIREMENTS: usize;
 }
 
+/// Test-observable count of blocking finalize steps pushed onto the blocking
+/// pool. Proves the synchronous I/O left the async runtime, and that the
+/// runtime would have stalled without the offload.
+#[cfg(test)]
+static FINALIZE_OFFLOADED_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// Fallback carrier for the task-local crash seam
+    /// (`TEST_CRASH_AFTER_N_INPUT_RETIREMENTS`) when input retirement runs on
+    /// a `spawn_blocking` thread: a `spawn_blocking` closure does not inherit
+    /// task-locals, so the count is stashed here around the offloaded call.
+    static TEST_CRASH_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Reset-on-drop guard so a crash-injection override never leaks onto a reused
+/// blocking-pool thread (including when `f` unwinds with the injected panic).
+#[cfg(test)]
+struct CrashOverrideGuard(Option<usize>);
+
+#[cfg(test)]
+impl Drop for CrashOverrideGuard {
+    fn drop(&mut self) {
+        TEST_CRASH_OVERRIDE.with(|c| c.set(self.0));
+    }
+}
+
+/// Run `f` with the crash seam's count forced to `n` on this thread (test-only).
+#[cfg(test)]
+fn with_crash_override<R>(n: Option<usize>, f: impl FnOnce() -> R) -> R {
+    match n {
+        Some(n) => {
+            let prev = TEST_CRASH_OVERRIDE.with(|c| c.replace(Some(n)));
+            let _guard = CrashOverrideGuard(prev);
+            f()
+        }
+        None => f(),
+    }
+}
+
 fn effective_compaction_input_bounds(
     min_threshold: usize,
     max_threshold: usize,
@@ -11604,6 +11646,90 @@ impl StorageEngine {
         }
     }
 
+    /// Run a synchronous filesystem step off the async runtime.
+    ///
+    /// `finalize_compactions` runs on the 2-thread `background` runtime, and
+    /// several of its steps are blocking syscalls: `fsync` (the replacement
+    /// record and directory barriers), `rename`, `unlink`, `read_dir`, and a
+    /// re-read of the staged output's `Digest.crc32`. Inlined on a runtime
+    /// worker they park that worker inside the kernel; on a CPU-scarce host the
+    /// frozen worker starves the process-wide scheduler and the CQL runtime's
+    /// liveness task. The 2026-10-05 diabolical run recorded exactly that as a
+    /// 540 ms `ferrosa_sched_runtime_stall_max_micros` event on a node whose
+    /// `compaction_running` was 1, and the client saw it as six `Query timed
+    /// out after PT2S` reads. Route each such step onto the blocking pool so
+    /// the runtime keeps scheduling.
+    ///
+    /// A `JoinError` (a panicked or cancelled step) is returned as `Err`; the
+    /// caller decides. This never silently swallows a blocking-pool panic.
+    async fn offload_blocking<T, F>(step: F) -> Result<T, tokio::task::JoinError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        #[cfg(test)]
+        FINALIZE_OFFLOADED_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::task::spawn_blocking(step).await
+    }
+
+    /// Retire a compaction task's input SSTables and persist the `Retired`
+    /// phase — the blocking half of finalization, offloaded so the runtime
+    /// worker keeps scheduling. Returns `false` when retirement or the phase
+    /// write failed (the caller preserves the inputs / record for replay).
+    async fn retire_inputs_for_finalize(
+        &self,
+        table_id: &TableId,
+        inputs: &[crate::compaction::metadata::SSTableMetadata],
+        intent: &mut crate::compaction::intent::CompactionIntentRecord,
+        table_dir: &std::path::Path,
+    ) -> bool {
+        let cleanup_start = Instant::now();
+        let retire_inputs = inputs.to_vec();
+        let retire_table = table_id.clone();
+        // The crash seam is a task-local; a `spawn_blocking` closure does not
+        // inherit it, so read it here (inside the caller's scope) and carry it
+        // across the boundary.
+        #[cfg(test)]
+        let crash_override = TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.try_with(|c| *c).ok();
+        let retired = match Self::offload_blocking(move || {
+            #[cfg(test)]
+            return with_crash_override(crash_override, || {
+                Self::evict_local_input_sstable_files(&retire_table, &retire_inputs)
+            });
+            #[cfg(not(test))]
+            Self::evict_local_input_sstable_files(&retire_table, &retire_inputs)
+        })
+        .await
+        {
+            Ok(retired) => retired,
+            Err(join) => {
+                tracing::error!(%join, %table_id, "compaction: input-retirement step panicked on the blocking pool; propagating");
+                std::panic::resume_unwind(join.into_panic());
+            }
+        };
+        if !retired {
+            return false;
+        }
+        crate::metrics::observe_compaction_phase(
+            crate::metrics::CompactionPhase::InputCleanup,
+            cleanup_start.elapsed(),
+        );
+        intent.phase = crate::compaction::intent::CompactionIntentPhase::Retired;
+        let record_clone = intent.clone();
+        let dir = table_dir.to_path_buf();
+        match Self::offload_blocking(move || record_clone.write(&dir)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                tracing::error!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to advance replacement record to Retired; startup reconciliation will retry retirement (idempotent)");
+                false
+            }
+            Err(join) => {
+                tracing::error!(%join, %table_id, task_id = %intent.task_id, "compaction: replacement-record write panicked on the blocking pool; propagating");
+                std::panic::resume_unwind(join.into_panic());
+            }
+        }
+    }
+
     async fn finalize_compactions(
         &self,
         results: Vec<crate::compaction::executor::CompactionResult>,
@@ -11657,12 +11783,15 @@ impl StorageEngine {
             // of this code did) so there is never a durable record pointing
             // at a placeholder id promotion is free to abandon.
             let task_id = result.output.id.clone();
-            let output_digest = match Self::read_generation_digest(
-                &result.output.path,
-                &result.output.id,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
+            let digest_dir = result.output.path.clone();
+            let digest_gen = result.output.id.clone();
+            let output_digest = match Self::offload_blocking(move || {
+                Self::read_generation_digest(&digest_dir, &digest_gen)
+            })
+            .await
+            {
+                Ok(Ok(d)) => d,
+                Ok(Err(e)) => {
                     let message = format!("failed to read staged output Digest.crc32: {e}");
                     crate::compaction::executor::remove_staged_output_components(
                         &result.output.path,
@@ -11674,6 +11803,10 @@ impl StorageEngine {
                         message,
                     }]);
                     continue;
+                }
+                Err(join) => {
+                    tracing::error!(%join, %table_id, %task_id, "compaction: staged output digest read panicked on the blocking pool; propagating");
+                    std::panic::resume_unwind(join.into_panic());
                 }
             };
             let table_paused = self
@@ -11709,20 +11842,31 @@ impl StorageEngine {
             }
 
             let promote_start = Instant::now();
-            let output = match self.promote_compaction_output(
-                &result.output,
-                promoted_gen,
-                &table_dir,
-                &final_target,
-            ) {
-                Ok(output) => {
+            // `promote_compaction_output` renames every component, fsyncs the
+            // destination directory, and deletes the staged source — all
+            // blocking. It holds no `self` state, so it runs on the blocking
+            // pool with owned clones.
+            let promote_output = result.output.clone();
+            let promote_target_dir = table_dir.clone();
+            let promote_final = final_target.clone();
+            let promoted = Self::offload_blocking(move || {
+                Self::promote_compaction_output(
+                    &promote_output,
+                    promoted_gen,
+                    &promote_target_dir,
+                    &promote_final,
+                )
+            })
+            .await;
+            let output = match promoted {
+                Ok(Ok(output)) => {
                     crate::metrics::observe_compaction_phase(
                         crate::metrics::CompactionPhase::PromoteOutput,
                         promote_start.elapsed(),
                     );
                     output
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     crate::metrics::observe_compaction_phase(
                         crate::metrics::CompactionPhase::PromoteOutput,
                         promote_start.elapsed(),
@@ -11737,6 +11881,14 @@ impl StorageEngine {
                     );
                     continue;
                 }
+                Err(join) => {
+                    crate::metrics::observe_compaction_phase(
+                        crate::metrics::CompactionPhase::PromoteOutput,
+                        promote_start.elapsed(),
+                    );
+                    tracing::error!(%join, %table_id, "compaction: promote step panicked on the blocking pool; propagating");
+                    std::panic::resume_unwind(join.into_panic());
+                }
             };
 
             cancel_point!(&table_id.to_string(), CancelPoint::AfterPromote);
@@ -11746,12 +11898,20 @@ impl StorageEngine {
             // record whose output_gen names the generation promotion just
             // produced (forge t_cb6fa288).
 
-            // Open the promoted compacted output SSTable.
+            // Open the promoted compacted output SSTable. Validating and
+            // opening every component is blocking I/O, so it runs on the
+            // blocking pool; `gen`/`dir` stay borrowed for the later steps.
             let gen = &output.id;
             let dir = &output.path;
-            let reader = match Self::open_sstable_from_dir(dir, gen) {
-                Ok(r) => Arc::new(r),
-                Err(e) => {
+            let open_gen = output.id.clone();
+            let open_dir = output.path.clone();
+            let reader = match Self::offload_blocking(move || {
+                Self::open_sstable_from_dir(&open_dir, &open_gen).map(Arc::new)
+            })
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     tracing::error!(%e, "compaction: failed to open output SSTable");
                     Self::rollback_compaction_intent(
                         table_id,
@@ -11761,6 +11921,10 @@ impl StorageEngine {
                         "output reader open failed",
                     );
                     continue;
+                }
+                Err(join) => {
+                    tracing::error!(%join, "compaction: output-open step panicked on the blocking pool; propagating");
+                    std::panic::resume_unwind(join.into_panic());
                 }
             };
 
@@ -12008,29 +12172,6 @@ impl StorageEngine {
             // Register in local cache.
             self.local_cache
                 .register(&output.id, output.path.clone(), output.size_bytes);
-            // Retire every input and persist the phase. For S3-backed tables,
-            // the record remains the recovery cursor through manifest save and
-            // input-delete enqueue. The pending-upload log carries the upload
-            // payload; it does not replace this record's phase.
-            let cleanup_inputs =
-                |record: &mut crate::compaction::intent::CompactionIntentRecord| -> bool {
-                    let cleanup_start = Instant::now();
-                    if !Self::evict_local_input_sstable_files(table_id, &result.task.inputs) {
-                        return false;
-                    }
-                    crate::metrics::observe_compaction_phase(
-                        crate::metrics::CompactionPhase::InputCleanup,
-                        cleanup_start.elapsed(),
-                    );
-                    record.phase = crate::compaction::intent::CompactionIntentPhase::Retired;
-                    if let Err(e) = record.write(&table_dir) {
-                        tracing::error!(%e, %table_id, task_id = %record.task_id, "compaction: failed to advance replacement record to Retired; startup reconciliation will retry retirement (idempotent)");
-                        false
-                    } else {
-                        true
-                    }
-                };
-
             // ── Skip S3 upload for pinned tables ────────────────────────────
             //
             // Pinned tables keep SSTables on local NVMe only. Track the
@@ -12045,7 +12186,15 @@ impl StorageEngine {
                 ) {
                     tracing::error!(%e, %table_id, sstable = %output.id, "compaction: pinned output not tracked; the pin cap will not count it");
                 }
-                if !cleanup_inputs(&mut intent) {
+                if !self
+                    .retire_inputs_for_finalize(
+                        table_id,
+                        &result.task.inputs,
+                        &mut intent,
+                        &table_dir,
+                    )
+                    .await
+                {
                     continue;
                 }
                 if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
@@ -12073,7 +12222,15 @@ impl StorageEngine {
                 .as_ref()
                 .or(self.upload_manager.as_ref());
             let Some(upload_mgr) = upload_mgr else {
-                if cleanup_inputs(&mut intent) {
+                if self
+                    .retire_inputs_for_finalize(
+                        table_id,
+                        &result.task.inputs,
+                        &mut intent,
+                        &table_dir,
+                    )
+                    .await
+                {
                     if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
                         &table_dir,
                         &intent.task_id,
@@ -12084,7 +12241,15 @@ impl StorageEngine {
                 continue;
             };
             let Some((store, prefix)) = self.resolve_store_and_prefix() else {
-                if cleanup_inputs(&mut intent) {
+                if self
+                    .retire_inputs_for_finalize(
+                        table_id,
+                        &result.task.inputs,
+                        &mut intent,
+                        &table_dir,
+                    )
+                    .await
+                {
                     if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
                         &table_dir,
                         &intent.task_id,
@@ -12168,7 +12333,10 @@ impl StorageEngine {
 
             // Inputs are now recoverable through the durable upload entry, so
             // their local components can be retired before uploading.
-            if !cleanup_inputs(&mut intent) {
+            if !self
+                .retire_inputs_for_finalize(table_id, &result.task.inputs, &mut intent, &table_dir)
+                .await
+            {
                 continue;
             }
 
@@ -15106,7 +15274,6 @@ impl StorageEngine {
     /// generation id. See that function's doc comment for why the choice and
     /// the move are separate calls.
     fn promote_compaction_output(
-        &self,
         output: &crate::compaction::metadata::SSTableMetadata,
         promoted_gen: u64,
         target_dir: &std::path::Path,
@@ -15389,7 +15556,11 @@ impl StorageEngine {
             #[cfg(test)]
             if TEST_CRASH_AFTER_N_INPUT_RETIREMENTS
                 .try_with(|count| idx + 1 == *count)
-                .unwrap_or(false)
+                .unwrap_or_else(|_| {
+                    TEST_CRASH_OVERRIDE
+                        .with(|c| c.get())
+                        .is_some_and(|count| idx + 1 == count)
+                })
             {
                 panic!(
                     "T-023 test seam: simulated crash after retiring {} of {} compaction inputs",
@@ -15892,6 +16063,7 @@ mod flush_panic_recovery;
 mod tests {
     include!("engine_wiring_tests.rs");
     include!("engine_evicted_ranged_tests.rs");
+    include!("engine_finalize_offload_tests.rs");
 
     use super::*;
 
@@ -27974,7 +28146,7 @@ mod tests {
     ) -> ferrosa_common::Result<crate::compaction::metadata::SSTableMetadata> {
         let (promoted_gen, target_dir, final_target) =
             engine.reserve_compaction_promotion_target(tid, output)?;
-        engine.promote_compaction_output(output, promoted_gen, &target_dir, &final_target)
+        StorageEngine::promote_compaction_output(output, promoted_gen, &target_dir, &final_target)
     }
 
     #[tokio::test]
