@@ -11485,19 +11485,19 @@ impl StorageEngine {
                     paused.insert(failure.table_id.clone(), DigestFailurePause::new(pause));
                     tracing::error!(
                         table_id = %failure.table_id,
-                        consecutive_digest_failures = streak,
+                        consecutive_failures = streak,
                         failure = %failure.message,
-                        "compaction: pausing table after repeated output digest/verification failures; operator resume or restart required"
+                        "compaction: pausing table after repeated retryable compaction failures; operator resume or restart required"
                     );
                     self.compaction_retry.lock().remove(&failure.table_id);
                 }
             } else {
                 tracing::warn!(
                     table_id = %failure.table_id,
-                    consecutive_digest_failures = streak,
+                    consecutive_failures = streak,
                     retry_delay_ms = delay.as_millis() as u64,
                     failure = %failure.message,
-                    "compaction: output digest/verification failed; retry scheduled with backoff"
+                    "compaction: retryable compaction failure; retry scheduled with backoff"
                 );
             }
             self.compaction_retry_notify.notify_one();

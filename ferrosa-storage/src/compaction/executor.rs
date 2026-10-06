@@ -587,6 +587,27 @@ fn is_digest_verification_failure(message: &str) -> bool {
         || message.contains("output sstable is corrupt")
 }
 
+/// True for any compaction failure that is worth retrying with backoff and that
+/// should eventually pause the table rather than loop forever.
+///
+/// Covers the digest/verification class (the compaction produced output that
+/// did not verify) **and** the input-component class (an input generation's
+/// component could not be found or rehydrated).
+///
+/// The input class matters as much as the digest class but was previously
+/// excluded, which silently disabled every mitigation for it: the failure never
+/// reached the retry controller, so the planner re-selected the same
+/// unreadable input on the next pass with no backoff and no pause. The result
+/// was an unbounded hot loop (`compaction_failed_total` climbing while
+/// `compaction_completed_total` stayed 0) that pinned a core and prevented
+/// evicted generations from ever merging away. Every message in this class is
+/// produced by [`ensure_compaction_component`] and names the component as an
+/// "SSTable component", which is the stable discriminator here.
+fn is_retryable_compaction_failure(message: &str) -> bool {
+    is_digest_verification_failure(message)
+        || message.to_ascii_lowercase().contains("sstable component")
+}
+
 /// Runs compaction tasks on a background thread.
 ///
 /// `StorageEngine` submits tasks via `submit()` and polls results via
@@ -815,7 +836,7 @@ impl CompactionExecutor {
                                 } else {
                                     crate::metrics::inc_compaction_failed();
                                     tracing::error!(%e, table_id = %task.table_id, "compaction: task failed");
-                                    if is_digest_verification_failure(&e) {
+                                    if is_retryable_compaction_failure(&e) {
                                         let failure = CompactionFailure {
                                             table_id: task.table_id,
                                             message: e,
@@ -3790,5 +3811,37 @@ mod tests {
             "compaction output SSTable is corrupt"
         ));
         assert!(!is_digest_verification_failure("finish: disk full"));
+    }
+
+    #[test]
+    fn compaction_backoff_classifies_missing_input_components() {
+        // Captured verbatim from a live occurrence (node2, table baselines.iot,
+        // generation 1791247442385015, 2026-10-06T00:48:27.429459Z). That
+        // generation had been evicted for cache_cap and was still selected as a
+        // compaction input, so its Data.db was neither local nor rehydratable.
+        // Before this class was retryable the failure never reached the retry
+        // controller: the planner re-selected the same input immediately, with
+        // no backoff and no pause, so `compaction_failed_total` climbed without
+        // bound while `compaction_completed_total` stayed 0.
+        assert!(is_retryable_compaction_failure(
+            "required SSTable component /var/lib/ferrosa/sstables/baselines.iot/1791247442385015-Data.db is missing"
+        ));
+        assert!(is_retryable_compaction_failure(
+            "required SSTable component /var/lib/ferrosa/sstables/baselines.iot/1-Partitions.db is empty after rehydration"
+        ));
+        assert!(is_retryable_compaction_failure(
+            "failed to rehydrate SSTable component /var/lib/ferrosa/sstables/baselines.iot/1-Data.db: object not found"
+        ));
+        assert!(is_retryable_compaction_failure(
+            "failed to inspect SSTable component /var/lib/ferrosa/sstables/baselines.iot/1-Data.db: permission denied"
+        ));
+        // Regression: the digest/verification class must stay retryable.
+        assert!(is_retryable_compaction_failure(
+            "flush output: Digest mismatch for Data.db"
+        ));
+        // Negative control: an unrelated transient error must NOT be folded in.
+        // If it were, the predicate would be a blanket `true` and the table
+        // would be paused for any error including harmless ones.
+        assert!(!is_retryable_compaction_failure("finish: disk full"));
     }
 }
