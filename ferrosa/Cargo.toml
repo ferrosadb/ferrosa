@@ -59,6 +59,9 @@ uuid = { version = "1", features = ["v4"] }
 # Confirmed by live podman testing on 2026-04-19 — cluster memory stays flat vs. climbing to OOM.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
+# Runtime control of the jemalloc options the compile-time `malloc_conf` below
+# can only set once, before `main`. Used by `jemalloc_tuning.rs` (mallctl).
+tikv-jemalloc-sys = "=0.7.1"
 
 [features]
 default = []
