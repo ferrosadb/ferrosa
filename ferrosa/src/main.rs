@@ -59,6 +59,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 mod cql_broadcast;
+#[cfg(not(target_env = "msvc"))]
+mod jemalloc_tuning;
 mod listener_status;
 mod listener_tls;
 mod log_rotation;
@@ -1483,6 +1485,14 @@ FERROSA_* environment variables. Pass --validate to scan local SSTables during s
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Apply jemalloc runtime knobs before any allocation-heavy setup (the tokio
+    // runtimes below are built right after this). No-op when the FERROSA_JEMALLOC_*
+    // vars are unset; see jemalloc_tuning.rs for why this cannot go through the
+    // compile-time `malloc_conf`. Gated like the allocator itself: jemalloc is not
+    // the global allocator on MSVC.
+    #[cfg(not(target_env = "msvc"))]
+    jemalloc_tuning::apply_from_env();
+
     // 0. Version/help, before ANYTHING else.
     //
     // This must run before tracing is initialised and before any config or

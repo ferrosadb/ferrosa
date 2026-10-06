@@ -2280,6 +2280,7 @@ dependencies = [
  "serde_yaml",
  "serial_test",
  "tempfile",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
