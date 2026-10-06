@@ -179,6 +179,13 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
    the row is read (fail closed; no row data and no existence signal on denial).
    `authorize_conditional_statement` applies this at the top of `route()`, and the
    `materialize_*` helpers (batches, transactions) share it.
+2a. **One ALLOW FILTERING scan WARN per plan.** A full scan states itself at WARN
+  the first time a `(keyspace, table, predicate column, operator)` plan is seen
+  on this node and at DEBUG thereafter, so one recurring scan cannot flood the
+  log (DT-16). This demotes the log line only — `FullScanTracker::record` still
+  runs on every scan for `system_observability.full_scan_reasons`; the dedup
+  lives in the same tracker (`FullScanTracker::scan_warn_is_first`), so the log
+  and the virtual table cannot disagree about what "first" means.
 3. **Batch size capped.** `MAX_BATCH_STATEMENTS` (default 500, M12) bounds BATCH.
 4. **Range-checked narrowing.** `bridge` range-checks all narrowing integer
    conversions (M5); no `unwrap()` on user data (M4).

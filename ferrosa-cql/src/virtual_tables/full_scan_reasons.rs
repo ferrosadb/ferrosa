@@ -6,8 +6,9 @@
 //!
 //! Virtual table: `system_observability.full_scan_reasons`
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferrosa_common::{CellValue, DataType};
@@ -34,10 +35,31 @@ pub struct FullScanReason {
     pub last_seen_ms: i64,
 }
 
+/// The predicate key the scan warning deduplicates on. Kept identical to the
+/// key the reason entries above are matched on, so "first scan of a plan" means
+/// the same thing in the log as in `system_observability.full_scan_reasons`.
+fn scan_warn_key(
+    keyspace: &str,
+    table_name: &str,
+    predicate_column: &str,
+    operator: &str,
+) -> String {
+    format!("{keyspace}|{table_name}|{predicate_column}|{operator}")
+}
+
 /// Tracker for full scan occurrences.
+///
+/// It owns BOTH the alertable signal and the log-dedup state, because they key
+/// on the same tuple (`keyspace, table_name, predicate_column, operator`):
+/// keeping them in one struct means "first scan of this plan" cannot come to
+/// mean something different in the log than in
+/// `system_observability.full_scan_reasons`.
 pub struct FullScanTracker {
     reasons: RwLock<Vec<FullScanReasonEntry>>,
     total_full_scans: AtomicU64,
+    /// Plans whose scan WARN has already been emitted on this node (DT-16).
+    /// See [`FullScanTracker::scan_warn_is_first`].
+    warn_seen: Mutex<HashSet<String>>,
 }
 
 struct FullScanReasonEntry {
@@ -55,10 +77,14 @@ impl FullScanTracker {
         Self {
             reasons: RwLock::new(Vec::new()),
             total_full_scans: AtomicU64::new(0),
+            warn_seen: Mutex::new(HashSet::new()),
         }
     }
 
     /// Record a full scan event.
+    ///
+    /// Counts the scan unconditionally, whatever the caller decides to log —
+    /// this is the alertable surface (`system_observability.full_scan_reasons`).
     pub fn record(&self, keyspace: &str, table_name: &str, predicate_column: &str, operator: &str) {
         self.total_full_scans.fetch_add(1, Ordering::Relaxed);
         let now_ms = SystemTime::now()
@@ -102,6 +128,39 @@ impl FullScanTracker {
             count: 1,
             last_seen_ms: now_ms,
         });
+    }
+
+    /// Whether this scan is the FIRST of its `(keyspace, table_name,
+    /// predicate_column, operator)` plan on this node since startup (DT-16):
+    /// `true` means report it at WARN, `false` means the plan was already warned
+    /// about and this repeat belongs at DEBUG.
+    ///
+    /// The dedup lives here rather than in the router because it keys on exactly
+    /// the tuple the reason entries above are matched on, so "first scan of a
+    /// plan" cannot come to mean something different in the log than in
+    /// `system_observability.full_scan_reasons`.
+    ///
+    /// This demotes the LOG LINE ONLY. It does not touch `record` or
+    /// `total_full_scans`, so a monitor on the virtual table still sees every
+    /// scan. It is a separate call because the router decides the log line
+    /// before the record site (and an ANN-served plan returns before that site),
+    /// so it cannot be folded into `record`'s return value without mis-keying.
+    ///
+    /// Poison-tolerant: a panic elsewhere while holding this lock must not turn
+    /// a log line into a panic here, so a poisoned lock is recovered.
+    pub fn scan_warn_is_first(
+        &self,
+        keyspace: &str,
+        table_name: &str,
+        predicate_column: &str,
+        operator: &str,
+    ) -> bool {
+        let key = scan_warn_key(keyspace, table_name, predicate_column, operator);
+        let mut seen = self
+            .warn_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        seen.insert(key)
     }
 
     /// Total full scans recorded since startup.
@@ -238,5 +297,39 @@ mod tests {
         assert_eq!(table.name(), "full_scan_reasons");
         assert_eq!(table.keyspace(), "system_observability");
         assert_eq!(table.columns().len(), 6);
+    }
+
+    /// DT-16 at the unit level: the scan-WARN verdict is "once per plan", and
+    /// asking for it does NOT touch the alertable count. The end-to-end router
+    /// test proves the WARN/DEBUG split; this pins the contract the router
+    /// depends on, including that a repeat of one plan is `false` and a novel
+    /// plan is `true` again.
+    #[test]
+    fn scan_warn_is_first_is_once_per_plan_and_never_touches_the_count() {
+        let tracker = FullScanTracker::new();
+        assert!(
+            tracker.scan_warn_is_first("ks", "t", "body", "="),
+            "the first scan of a plan must warn"
+        );
+        for _ in 0..24 {
+            assert!(
+                !tracker.scan_warn_is_first("ks", "t", "body", "="),
+                "a repeat of the same plan must NOT warn"
+            );
+        }
+        // A different operator, column, table or keyspace is a different plan.
+        assert!(tracker.scan_warn_is_first("ks", "t", "body", ">"));
+        assert!(tracker.scan_warn_is_first("ks", "t", "label", "="));
+        assert!(tracker.scan_warn_is_first("ks", "other", "body", "="));
+        assert!(tracker.scan_warn_is_first("other", "t", "body", "="));
+
+        // Asking whether to warn must not itself record a scan: the count is
+        // owned by `record`, which the router calls unconditionally.
+        assert_eq!(
+            tracker.total_full_scans(),
+            0,
+            "scan_warn_is_first must not count a scan — the log line is demoted, \
+             the signal is not"
+        );
     }
 }
