@@ -649,7 +649,7 @@ mod tests {
                 .map(|i| {
                     // ~1 in 8 is empty (exercises the median == 0.0 branch);
                     // the rest spread over five decades so buckets split often.
-                    let size = if next_rand(&mut rng) % 8 == 0 {
+                    let size = if next_rand(&mut rng).is_multiple_of(8) {
                         0
                     } else {
                         let magnitude = next_rand(&mut rng) % 5;
