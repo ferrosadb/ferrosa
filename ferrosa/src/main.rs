@@ -127,6 +127,45 @@ fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str)
         .or_else(|| std::env::var(env_key).ok())
 }
 
+/// Resolve a positive-`usize` CQL server limit. `[cql] <key>` (TOML) overrides
+/// `env_key`, which overrides `default` -- same TOML-wins precedence as
+/// [`config_val`].
+///
+/// The resolved value must be a *positive* integer. Unlike the runtime worker
+/// tunables (which fall back to a sane default on garbage), a bad value here is
+/// a startup error: silently clamping a connection or in-flight limit is how a
+/// node ends up shedding every request with no operator-visible reason.
+///
+/// An *empty* value is treated as unset and falls back to `default` -- clearing a
+/// variable (`fly machine update --env KEY=`) is a request to unset it, not a
+/// malformed one, and must not become a node that cannot start.
+fn resolve_cql_positive_usize(
+    env_key: &str,
+    config: &toml::Value,
+    key: &str,
+    default: usize,
+) -> Result<usize, String> {
+    // `config_val` already applies the TOML-wins precedence and the default.
+    let raw = config_val(env_key, config, "cql", key, &default.to_string());
+    let raw = raw.trim();
+    // An *empty* value means "unset", not "garbage". `fly machine update --env KEY=`
+    // is the only way to clear a variable, so rejecting "" would make the knob
+    // impossible to remove once set -- and would stop every node the moment a
+    // sweep cleared its tunables. An unset limit is not an error; a malformed one is.
+    if raw.is_empty() {
+        return Ok(default);
+    }
+    let parsed = raw.parse::<usize>().map_err(|_| {
+        format!("[cql] {key} (or ${env_key}) must be a positive integer, got {raw:?}")
+    })?;
+    if parsed == 0 {
+        return Err(format!(
+            "[cql] {key} (or ${env_key}) must be positive, got 0"
+        ));
+    }
+    Ok(parsed)
+}
+
 /// Resolve the UDF sandbox config: `[udf] max_memory_bytes` (TOML) overrides
 /// `FERROSA_UDF_MAX_MEMORY_BYTES`, which overrides the 16 MiB default.
 ///
@@ -2366,6 +2405,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "64",
     )
     .parse()?;
+    // Per-connection in-flight request ceiling. This is the valve that sheds with
+    // `Overloaded("request backpressure")` when a client drives more concurrent
+    // requests than the connection admits; it was previously unreachable from any
+    // config, which left the node shedding before CPU/disk were ever stressed.
+    // Raise it only alongside a latency win: throughput = in-flight / latency.
+    let cql_max_in_flight_per_connection: usize = resolve_cql_positive_usize(
+        "FERROSA_CQL_MAX_IN_FLIGHT_PER_CONNECTION",
+        &file_config,
+        "max_in_flight_per_connection",
+        128,
+    )?;
     let cql_config = ferrosa_cql::server::ServerConfig {
         bind_addr: cql_bind,
         auth_disabled: ferrosa_cql::server::resolve_auth_disabled(
@@ -2374,6 +2424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         max_connections: cql_max_connections,
         max_connections_per_ip: cql_max_connections_per_ip,
+        max_in_flight_per_connection: cql_max_in_flight_per_connection,
         tls_cert_path: cql_tls.cert,
         tls_key_path: cql_tls.key,
         require_tls: cql_tls.require_tls,
@@ -3804,6 +3855,101 @@ mod tests {
             result.as_deref(),
             Some("true"),
             "config file must win over env"
+        );
+    }
+
+    // ---- resolve_cql_positive_usize: the CQL server limits --------------------
+    // `max_connections`, `max_connections_per_ip` and (newly exposed)
+    // `max_in_flight_per_connection` all resolve through this, so a bad value
+    // must be loud rather than silently clamped to the default.
+
+    #[test]
+    fn cql_limit_returns_default_when_neither_env_nor_toml_set_it() {
+        let key = "FERROSA_TEST_CQL_LIMIT_UNSET_4c1a";
+        std::env::remove_var(key);
+        let got =
+            resolve_cql_positive_usize(key, &empty_config(), "max_in_flight_per_connection", 128);
+        assert_eq!(got, Ok(128));
+    }
+
+    #[test]
+    fn cql_limit_reads_toml_preferentially_over_env() {
+        // TOML-wins: the config file is authoritative, matching config_val.
+        let key = "FERROSA_TEST_CQL_LIMIT_TOML_BEATS_ENV_8f2d";
+        std::env::set_var(key, "256");
+        let cfg: toml::Value =
+            toml::from_str("[cql]\nmax_in_flight_per_connection = 512\n").unwrap();
+        let got = resolve_cql_positive_usize(key, &cfg, "max_in_flight_per_connection", 128);
+        std::env::remove_var(key);
+        assert_eq!(got, Ok(512), "TOML must win over env");
+    }
+
+    #[test]
+    fn cql_limit_falls_back_to_env_when_toml_absent() {
+        let key = "FERROSA_TEST_CQL_LIMIT_ENV_ONLY_2d9e";
+        std::env::set_var(key, "300");
+        let got =
+            resolve_cql_positive_usize(key, &empty_config(), "max_in_flight_per_connection", 128);
+        std::env::remove_var(key);
+        assert_eq!(got, Ok(300));
+    }
+
+    #[test]
+    fn cql_limit_rejects_zero_rather_than_clamping() {
+        // A zero in-flight limit would shed every request. Fail loud.
+        let key = "FERROSA_TEST_CQL_LIMIT_ZERO_6b3f";
+        std::env::remove_var(key);
+        let cfg: toml::Value = toml::from_str("[cql]\nmax_in_flight_per_connection = 0\n").unwrap();
+        let got = resolve_cql_positive_usize(key, &cfg, "max_in_flight_per_connection", 128);
+        assert!(
+            got.is_err(),
+            "zero must be rejected, not clamped to the default"
+        );
+    }
+
+    #[test]
+    fn cql_limit_rejects_non_numeric_rather_than_clamping() {
+        let key = "FERROSA_TEST_CQL_LIMIT_GARBAGE_9a7c";
+        std::env::remove_var(key);
+        let cfg: toml::Value =
+            toml::from_str("[cql]\nmax_in_flight_per_connection = \"lots\"\n").unwrap();
+        let got = resolve_cql_positive_usize(key, &cfg, "max_in_flight_per_connection", 128);
+        assert!(
+            got.is_err(),
+            "a non-numeric limit must fail startup, not silently default"
+        );
+    }
+
+    #[test]
+    fn cql_limit_treats_an_empty_env_var_as_unset() {
+        // `fly machine update --env KEY=` is the ONLY way to clear a variable, and
+        // sweeping tunables clears them exactly that way. Treating the resulting
+        // empty string as garbage would make the knob impossible to remove once
+        // set, and would crash every node on the next sweep.
+        let key = "FERROSA_TEST_CQL_LIMIT_EMPTY_5e4b";
+        std::env::set_var(key, "");
+        let got =
+            resolve_cql_positive_usize(key, &empty_config(), "max_in_flight_per_connection", 128);
+        std::env::remove_var(key);
+        assert_eq!(
+            got,
+            Ok(128),
+            "an empty env var means unset and must fall back to the default"
+        );
+    }
+
+    #[test]
+    fn cql_limit_toml_survives_an_empty_env_var() {
+        let key = "FERROSA_TEST_CQL_LIMIT_EMPTY_TOML_7c2d";
+        std::env::set_var(key, "");
+        let cfg: toml::Value =
+            toml::from_str("[cql]\nmax_in_flight_per_connection = 512\n").unwrap();
+        let got = resolve_cql_positive_usize(key, &cfg, "max_in_flight_per_connection", 128);
+        std::env::remove_var(key);
+        assert_eq!(
+            got,
+            Ok(512),
+            "TOML must still win when the env var is empty"
         );
     }
 
