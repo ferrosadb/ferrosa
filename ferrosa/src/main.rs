@@ -159,7 +159,9 @@ fn resolve_cql_positive_usize(
         format!("[cql] {key} (or ${env_key}) must be a positive integer, got {raw:?}")
     })?;
     if parsed == 0 {
-        return Err(format!("[cql] {key} (or ${env_key}) must be positive, got 0"));
+        return Err(format!(
+            "[cql] {key} (or ${env_key}) must be positive, got 0"
+        ));
     }
     Ok(parsed)
 }
@@ -3943,7 +3945,11 @@ mod tests {
             toml::from_str("[cql]\nmax_in_flight_per_connection = 512\n").unwrap();
         let got = resolve_cql_positive_usize(key, &cfg, "max_in_flight_per_connection", 128);
         std::env::remove_var(key);
-        assert_eq!(got, Ok(512), "TOML must still win when the env var is empty");
+        assert_eq!(
+            got,
+            Ok(512),
+            "TOML must still win when the env var is empty"
+        );
     }
 
     #[test]
