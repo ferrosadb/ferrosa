@@ -416,6 +416,21 @@ static COMPACTION_SKIPPED_OVERLAP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Planning rounds skipped because the compaction pipeline was already at or
+/// above `FERROSA_COMPACTION_BACKPRESSURE_PRESSURE`. A steadily rising counter
+/// is the signal that the pipeline is the bottleneck, not the planner: it is
+/// this number of full planning rounds (select + per-task metadata rescan) that
+/// were not paid. A zero value on a busy node means the gate never fired.
+static COMPACTION_PLANNING_DEFERRED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn inc_compaction_planning_deferred() {
+    COMPACTION_PLANNING_DEFERRED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn compaction_planning_deferred_total() -> u64 {
+    COMPACTION_PLANNING_DEFERRED_TOTAL.load(Ordering::Relaxed)
+}
 static COMPACTION_PAUSED_TABLES: AtomicU64 = AtomicU64::new(0);
 /// Compaction tasks that returned `Err` because their `CancelToken` was
 /// cancelled (T-021), as distinct from an ordinary failure.
@@ -1604,6 +1619,12 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_compaction_paused_tables {}\n",
         COMPACTION_PAUSED_TABLES.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_planning_deferred_total Planning rounds skipped because the compaction pipeline was already saturated (see FERROSA_COMPACTION_BACKPRESSURE_PRESSURE).\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_planning_deferred_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_planning_deferred_total {}\n",
+        COMPACTION_PLANNING_DEFERRED_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_compaction_retire_failures_total Input retirement failures retained for reconciliation.\n");
     out.push_str("# TYPE ferrosa_storage_compaction_retire_failures_total counter\n");

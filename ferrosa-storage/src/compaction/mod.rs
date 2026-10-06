@@ -48,6 +48,7 @@ pub mod strategy_ucs;
 #[cfg(any(test, feature = "compaction-validator"))]
 pub mod validator;
 
+pub(crate) use executor::{compaction_planning_deferred, compaction_pressure};
 pub use executor::{CompactionExecutor, CompactionResult};
 pub use metadata::{CompactionTask, SSTableMetadata};
 pub use strategy::{CompactionConfig, CompactionStrategy, SizeTieredStrategy};

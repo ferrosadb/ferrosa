@@ -18,6 +18,20 @@ use crate::TableId;
 pub(crate) struct TaskTracker {
     state: Arc<Mutex<State>>,
     pub(crate) changed: Arc<Notify>,
+    /// Merge concurrency this tracker's executor runs at, set once at
+    /// construction. Exposed so the planner can compute compaction pressure
+    /// without reaching into the merge gate, which is not shareable across
+    /// threads. Zero means "unknown"; pressure then reads as no pressure.
+    capacity: usize,
+}
+
+impl TaskTracker {
+    /// Sets the merge capacity this tracker reports (builder form, so the
+    /// derived `Default` keeps working for tests). See the `capacity` field doc.
+    pub(crate) fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        self
+    }
 }
 
 #[derive(Default)]
@@ -61,6 +75,17 @@ pub struct CompactionStopReport {
 }
 
 impl TaskTracker {
+    /// Number of input claims currently held, i.e. compaction tasks the
+    /// executor is carrying (queued, waiting on the merge gate, or running).
+    pub(crate) fn in_flight_tasks(&self) -> usize {
+        self.state.lock().tasks.len()
+    }
+
+    /// Merge concurrency this tracker was built with; see the field doc.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub(crate) fn submission_ticket(&self, table_id: &TableId) -> Option<SubmissionTicket> {
         let mut state = self.state.lock();
         if state.closed {
