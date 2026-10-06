@@ -601,8 +601,48 @@ fn a_busy_sync_thread_that_keeps_completing_a_backlog_past_the_deadline_never_es
     );
 }
 
+/// A commit-log sync stall that never recovers must not take the node down.
+///
+/// While the sync thread is stalled the commit log itself refuses every write
+/// (`SyncHealthSnapshot::impaired()`), so a stalled node acknowledges nothing:
+/// there is no unflushed work to lose and no memory to grow. Aborting therefore
+/// buys only a replay and a rejoin, and the node aborts again on the next stall.
+/// The node must instead keep refusing writes, stay observable, and log loudly.
 #[test]
-fn a_stalled_commit_log_sync_counts_one_stall_per_deadline_and_escalates() {
+fn a_commit_log_sync_stall_that_never_recovers_logs_loudly_and_never_aborts_the_node() {
+    let target = FakeSync::new();
+    // max_restarts = 1: two deadlines are already past the intensity.
+    let (mut supervisor, status, escalations) = sync_supervisor(target.clone(), 1);
+
+    for i in 1..=6u64 {
+        target.set(|h| {
+            // One attempt in flight forever: it never completes, so no fsync
+            // has been made durable and the stall is genuine, not backlog age.
+            h.attempts_started = 1;
+            h.attempts_completed = 0;
+            h.attempt_elapsed = Some(Duration::from_millis(1000 + i * 2000));
+            h.unsynced_for = Some(Duration::from_millis(1000 + i * 2000));
+        });
+        supervisor.check();
+    }
+
+    assert_eq!(
+        escalations.load(Ordering::SeqCst),
+        0,
+        "a stalled commit-log sync refuses writes; killing the node adds a replay and no safety"
+    );
+    assert!(
+        !status.impaired().is_empty(),
+        "writes stay refused for as long as the stall lasts"
+    );
+    assert!(
+        status.failures(Child::CommitLogSync, FailureKind::Stall) >= 3,
+        "every deadline is still counted, so the stall stays loud and alertable"
+    );
+}
+
+#[test]
+fn a_stalled_commit_log_sync_counts_every_deadline_but_never_aborts_the_node() {
     let target = FakeSync::new();
     let (mut supervisor, status, escalations) = sync_supervisor(target.clone(), 2);
 
@@ -628,27 +668,24 @@ fn a_stalled_commit_log_sync_counts_one_stall_per_deadline_and_escalates() {
         "a stall is not a death"
     );
 
-    // The episode's first deadline only impairs; each further deadline of the
-    // same unbroken stall (an fsync that does not return) is a crash.
+    // Each further deadline of the same unbroken stall (an fsync that does not
+    // return) is counted, so the stall stays loud, but none of them abort the
+    // node: a stalled commit log refuses writes already, so the node is losing
+    // nothing by staying up and recovering on its own.
     target.set(|h| h.unsynced_for = Some(Duration::from_millis(6100)));
     supervisor.check();
     assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Stall), 3);
-    assert_eq!(
-        escalations.load(Ordering::SeqCst),
-        0,
-        "two counted deadlines do not exceed max_restarts=2"
-    );
     target.set(|h| h.unsynced_for = Some(Duration::from_millis(8100)));
     supervisor.check();
     assert_eq!(status.failures(Child::CommitLogSync, FailureKind::Stall), 4);
     assert_eq!(
         escalations.load(Ordering::SeqCst),
-        1,
-        "a hung fsync still escalates: three counted deadlines exceed max_restarts=2"
+        0,
+        "a hung fsync no longer aborts the node; it keeps refusing writes and reporting"
     );
     assert!(
         !status.impaired().is_empty(),
-        "an escalated child stays impaired"
+        "an impaired child stays impaired until an fsync completes"
     );
 }
 
