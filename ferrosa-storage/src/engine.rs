@@ -369,7 +369,10 @@ fn compression_from_schema(
         .get("compression.class")
         .or_else(|| schema.extensions.get("compression.sstable_compression"))
     else {
-        return Ok(Some(ferrosa_sstable::Compression::Lz4));
+        // No per-table codec: fall back to the process-wide default so an
+        // operator can retune compression for the host's CPU/IOPS balance
+        // without an ALTER TABLE (`FERROSA_SSTABLE_COMPRESSION`).
+        return Ok(Some(default_sstable_compression()));
     };
 
     let class = class.trim();
@@ -390,12 +393,31 @@ fn compression_from_schema(
                 .get("compression.compression_level")
                 .or_else(|| schema.extensions.get("compression.level"))
                 .and_then(|v| v.parse::<i32>().ok())
-                .unwrap_or(3);
+                .unwrap_or_else(|| {
+                    crate::runtime_tuning::storage_runtime_tuning()
+                        .sstable_compression
+                        .zstd_level
+                });
             Ok(Some(ferrosa_sstable::Compression::Zstd { level }))
         }
         other => Err(ferrosa_common::Error::UnsupportedCompression(
             other.to_string(),
         )),
+    }
+}
+
+/// The process-wide default SSTable codec, used when a table schema does not
+/// select one (`FERROSA_SSTABLE_COMPRESSION`; default LZ4 — the same codec this
+/// path previously hardcoded). The zstd level for this path comes from
+/// `FERROSA_SSTABLE_ZSTD_LEVEL`.
+fn default_sstable_compression() -> ferrosa_sstable::Compression {
+    let tuning = crate::runtime_tuning::storage_runtime_tuning().sstable_compression;
+    match tuning.kind {
+        crate::runtime_tuning::SstableCompressionKind::None => ferrosa_sstable::Compression::None,
+        crate::runtime_tuning::SstableCompressionKind::Lz4 => ferrosa_sstable::Compression::Lz4,
+        crate::runtime_tuning::SstableCompressionKind::Zstd => ferrosa_sstable::Compression::Zstd {
+            level: tuning.zstd_level,
+        },
     }
 }
 
@@ -17100,6 +17122,25 @@ mod tests {
         );
         assert_eq!(options.chunk_size, 32 * 1024);
         assert!(!options.verify_output);
+    }
+
+    /// With no per-table codec selected, the write options carry the process-wide
+    /// default (`FERROSA_SSTABLE_COMPRESSION`), which is LZ4 when unset — the same
+    /// codec this path hardcoded before the knob existed.
+    #[test]
+    fn write_options_fall_back_to_the_process_default_codec() {
+        let schema = test_schema();
+        assert!(
+            !schema.extensions.contains_key("compression.class"),
+            "this test only means something when the schema selects no codec"
+        );
+        let options = write_options_for_schema(&schema, true).unwrap();
+        assert_eq!(options.compression, Some(default_sstable_compression()));
+        assert_eq!(
+            options.compression,
+            Some(ferrosa_sstable::Compression::Lz4),
+            "the default must not change without an explicit operator override"
+        );
     }
 
     #[test]
