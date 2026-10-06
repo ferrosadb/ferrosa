@@ -57,10 +57,21 @@ pub(crate) struct StorageRuntimeTuning {
     pub max_auto_compaction_parallelism: usize,
     pub max_flush_parallelism: usize,
     pub digest_read_chunk_bytes: usize,
+    /// Compaction pipeline depth and the planner backpressure threshold.
+    pub compaction_pipeline: CompactionPipelineTuning,
+}
+
+/// Compaction pipeline queue depths and the planner backpressure threshold.
+///
+/// Grouped into their own `Copy` type so `StorageRuntimeTuning` stays under the
+/// p0-oom-audit `copy-derive-large-type` field-count threshold, rather than
+/// carrying a waiver for the pipeline knobs it accumulated.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompactionPipelineTuning {
     pub task_queue_capacity_per_worker: usize,
     pub result_queue_capacity_per_worker: usize,
     /// Planner backpressure threshold in `0.0..=1.0`; see the DEFAULT const.
-    pub compaction_backpressure_pressure: f64,
+    pub backpressure_pressure: f64,
 }
 
 static TUNING: OnceLock<StorageRuntimeTuning> = OnceLock::new();
@@ -123,24 +134,28 @@ impl StorageRuntimeTuning {
                 1,
                 MAX_DIGEST_READ_CHUNK_BYTES,
             ),
-            task_queue_capacity_per_worker: read_usize(
-                "FERROSA_COMPACTION_TASK_QUEUE_CAPACITY_PER_WORKER",
-                defaults.task_queue_capacity_per_worker,
-                1,
-                MAX_TASK_QUEUE_CAPACITY_PER_WORKER,
-            ),
-            result_queue_capacity_per_worker: read_usize(
-                "FERROSA_COMPACTION_RESULT_QUEUE_CAPACITY_PER_WORKER",
-                defaults.result_queue_capacity_per_worker,
-                1,
-                MAX_RESULT_QUEUE_CAPACITY_PER_WORKER,
-            ),
-            compaction_backpressure_pressure: read_f64(
-                "FERROSA_COMPACTION_BACKPRESSURE_PRESSURE",
-                defaults.compaction_backpressure_pressure,
-                0.0,
-                MAX_COMPACTION_BACKPRESSURE_PRESSURE,
-            ),
+            compaction_pipeline: CompactionPipelineTuning {
+                task_queue_capacity_per_worker: read_usize(
+                    "FERROSA_COMPACTION_TASK_QUEUE_CAPACITY_PER_WORKER",
+                    defaults.compaction_pipeline.task_queue_capacity_per_worker,
+                    1,
+                    MAX_TASK_QUEUE_CAPACITY_PER_WORKER,
+                ),
+                result_queue_capacity_per_worker: read_usize(
+                    "FERROSA_COMPACTION_RESULT_QUEUE_CAPACITY_PER_WORKER",
+                    defaults
+                        .compaction_pipeline
+                        .result_queue_capacity_per_worker,
+                    1,
+                    MAX_RESULT_QUEUE_CAPACITY_PER_WORKER,
+                ),
+                backpressure_pressure: read_f64(
+                    "FERROSA_COMPACTION_BACKPRESSURE_PRESSURE",
+                    defaults.compaction_pipeline.backpressure_pressure,
+                    0.0,
+                    MAX_COMPACTION_BACKPRESSURE_PRESSURE,
+                ),
+            },
         }
     }
 }
@@ -157,9 +172,11 @@ impl Default for StorageRuntimeTuning {
             max_auto_compaction_parallelism: DEFAULT_MAX_AUTO_COMPACTION_PARALLELISM,
             max_flush_parallelism: DEFAULT_MAX_FLUSH_PARALLELISM,
             digest_read_chunk_bytes: DEFAULT_DIGEST_READ_CHUNK_BYTES,
-            task_queue_capacity_per_worker: DEFAULT_TASK_QUEUE_CAPACITY_PER_WORKER,
-            result_queue_capacity_per_worker: DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER,
-            compaction_backpressure_pressure: DEFAULT_COMPACTION_BACKPRESSURE_PRESSURE,
+            compaction_pipeline: CompactionPipelineTuning {
+                task_queue_capacity_per_worker: DEFAULT_TASK_QUEUE_CAPACITY_PER_WORKER,
+                result_queue_capacity_per_worker: DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER,
+                backpressure_pressure: DEFAULT_COMPACTION_BACKPRESSURE_PRESSURE,
+            },
         }
     }
 }
@@ -329,11 +346,11 @@ mod tests {
             DEFAULT_DIGEST_READ_CHUNK_BYTES
         );
         assert_eq!(
-            tuning.task_queue_capacity_per_worker,
+            tuning.compaction_pipeline.task_queue_capacity_per_worker,
             DEFAULT_TASK_QUEUE_CAPACITY_PER_WORKER
         );
         assert_eq!(
-            tuning.result_queue_capacity_per_worker,
+            tuning.compaction_pipeline.result_queue_capacity_per_worker,
             DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER
         );
     }

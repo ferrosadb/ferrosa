@@ -12837,7 +12837,9 @@ impl StorageEngine {
         );
         if crate::compaction::compaction_planning_deferred(
             pressure,
-            self.runtime_tuning.compaction_backpressure_pressure,
+            self.runtime_tuning
+                .compaction_pipeline
+                .backpressure_pressure,
         ) {
             crate::metrics::inc_compaction_planning_deferred();
             return false;

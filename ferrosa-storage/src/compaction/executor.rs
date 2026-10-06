@@ -687,10 +687,12 @@ impl CompactionExecutor {
              FERROSA_COMPACTION_WORKERS / FERROSA_MAX_CONCURRENT_COMPACTIONS)"
         );
         let (result_tx, result_rx) = crossbeam_channel::bounded::<CompactionResult>(
-            worker_count.saturating_mul(tuning.result_queue_capacity_per_worker),
+            worker_count
+                .saturating_mul(tuning.compaction_pipeline.result_queue_capacity_per_worker),
         );
         let (failure_tx, failure_rx) = crossbeam_channel::bounded::<CompactionFailure>(
-            worker_count.saturating_mul(tuning.result_queue_capacity_per_worker),
+            worker_count
+                .saturating_mul(tuning.compaction_pipeline.result_queue_capacity_per_worker),
         );
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let tracker = TaskTracker::default();
@@ -710,7 +712,7 @@ impl CompactionExecutor {
 
         for worker_idx in 0..worker_count {
             let (task_tx, task_rx) = crossbeam_channel::bounded::<QueuedCompactionTask>(
-                tuning.task_queue_capacity_per_worker,
+                tuning.compaction_pipeline.task_queue_capacity_per_worker,
             );
             task_txs.push(task_tx);
             let result_tx = result_tx.clone();
