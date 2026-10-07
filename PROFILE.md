@@ -141,6 +141,34 @@ out-of-range values log `ERROR` and fall back to defaults. Raising a limit can
 increase memory use per active writer, compressor, or reader; budget it against
 the number of concurrent operations.
 
+The **codec** itself is a separate, coarser trade: it buys on-disk size (and so
+bytes moved to object storage) with CPU on every flush and compaction output.
+A host with more CPU than storage bandwidth should compress harder; a
+bandwidth-rich, CPU-poor host should not.
+
+| Setting | What it changes | Default and accepted range |
+|---|---|---|
+| `FERROSA_SSTABLE_COMPRESSION` | Default codec for tables whose schema selects none. Set-but-empty is treated as unset, so `fly machine update --env KEY=` clears it | `lz4`; one of `lz4`, `zstd`, `none` |
+| `FERROSA_SSTABLE_ZSTD_LEVEL` | Zstd level for that codec and for the zstd schema fallback | `3`; `-7`–`22` |
+
+A per-table `compression.class` schema extension always wins over these; the
+knobs only supply the fallback. The extension is matched on its **last dotted
+segment**, so `org.apache.cassandra.io.compress.ZstdCompressor` and
+`ZstdCompressor` are equivalent:
+
+| `compression.class` | Codec |
+|---|---|
+| `LZ4Compressor`, `LZ4`, `lz4` | LZ4 |
+| `ZstdCompressor`, `Zstd`, `zstd`, `ZSTD` | Zstd (level from `compression.compression_level`/`compression.level`, else `FERROSA_SSTABLE_ZSTD_LEVEL`) |
+| `NoCompressor`, `NoopCompressor` | none |
+| empty, `none`, `null`, `false` | none |
+| `compression.enabled` = `false`/`0` | none (checked first, wins over `compression.class`) |
+
+`NoCompressor` is the class a Cassandra `ALTER TABLE ... WITH compression =
+{...}` writes to disable compression, so a table a real Cassandra client created
+uncompressed stays uncompressed here instead of failing with
+`UnsupportedCompression`. Any other unrecognized name is still rejected loudly.
+
 | Setting | What it changes | Default and accepted range |
 |---|---|---|
 | `FERROSA_SSTABLE_WRITE_SEGMENT_BYTES` | Aligned segment size used by each component writer | `1 MiB`; positive up to `FERROSA_SSTABLE_MAX_WRITE_SEGMENT_BYTES`; rounded up to a direct-I/O block multiple with a one-time `WARN` |
@@ -260,6 +288,29 @@ pool pressure, local cache size, and range spill together. Raising a buffer or
 worker limit can move pressure to the page cache, local disk, or cgroup rather
 than remove it. Keep the profiling workload and resource limits fixed between
 runs.
+
+### jemalloc page decay
+
+The binary ships a compile-time `malloc_conf` of `dirty_decay_ms:0,
+muzzy_decay_ms:0`, which returns freed pages to the OS as soon as they are
+released — the right default under a memory cap, but a trade against allocation
+throughput. `malloc_conf` is consumed by jemalloc **before `main` runs**, so it
+cannot be overridden from TOML or from ferrosa's own environment plumbing.
+These two knobs are applied through jemalloc's runtime control API (`mallctl`)
+as the first thing `main` does, before any tokio runtime is built.
+
+| Setting | What it changes | Default |
+|---|---|---|
+| `FERROSA_JEMALLOC_DIRTY_DECAY_MS` | `arenas.dirty_decay_ms`: how long a freed dirty page is retained for reuse before being purged | unset — leaves jemalloc's `malloc_conf` value (`0`, purge immediately) |
+| `FERROSA_JEMALLOC_MUZZY_DECAY_MS` | `arenas.muzzy_decay_ms`: the same for muzzy (already returned to the OS, still mapped) pages | unset — leaves `malloc_conf` (`0`) |
+
+A negative value means **never purge** (favours throughput and retains RSS); `0`
+purges immediately. Unset or empty leaves jemalloc untouched, so these are no-ops
+until set. Each write is read back and the effective value is logged; the root
+`opt.*` mallctl names look like the obvious targets but are read-only and return
+`EPERM`, which is the silent-no-op failure mode these knobs guard against.
+`background_thread` is deliberately **not** exposed: this jemalloc build lacks
+background-thread runtime support, so the mallctl node does not exist at all.
 
 ### PostgreSQL MVCC and SQL
 
