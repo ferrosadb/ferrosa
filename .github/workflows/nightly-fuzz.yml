@@ -24,9 +24,64 @@ permissions:
   issues: write
 
 jobs:
+  # T2b: ferrosa-jepsen's compose/topology tests run against the node image the
+  # cluster runs, and that image must exist BEFORE those tests start. ci.yml
+  # builds it LAST (after `test`), which is exactly why `test` excludes the two
+  # crates; nightly-slow-tests.yml builds it FIRST and gates its test job on it.
+  # This job reuses that proven shape so the comprehensive `fuzz` job can run
+  # the two crates without an ordering hazard.
+  build-node-image:
+    name: Build node image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: node-image
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Build the node image
+        # Same thin runtime image ci.yml's build-node-image produces from
+        # `cargo build --release`, so `docker load` below yields
+        # ferrosa-test-node:latest for the cluster AND for the Jepsen compose
+        # files (via FERROSA_NIGHTLY_IMAGE, see the run step).
+        run: |
+          set -euo pipefail
+          cargo build --release -p ferrosa -p ferrosa-ctl
+          mkdir -p node-bin
+          cp target/release/ferrosa target/release/ferrosa-ctl node-bin/
+          cat > node-bin/Dockerfile <<'DEOF'
+          FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                  ca-certificates gdb procps \
+              && rm -rf /var/lib/apt/lists/*
+          COPY ferrosa /usr/local/bin/ferrosa
+          COPY ferrosa-ctl /usr/local/bin/ferrosa-ctl
+          EXPOSE 9042 7000 9090 7474 7687
+          ENV FERROSA_DATA_DIR=/var/lib/ferrosa
+          CMD ["ferrosa"]
+          DEOF
+          for attempt in 1 2 3 4; do
+            docker build -t ferrosa-test-node:latest node-bin && break
+            [ "$attempt" = 4 ] && { echo "docker build failed after 4 attempts"; exit 1; }
+            echo "docker build attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          docker save ferrosa-test-node:latest | gzip > ferrosa-node-image.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferrosa-node-image
+          path: ferrosa-node-image.tar.gz
+          retention-days: 1
+
   fuzz:
     name: Property Test Fuzzing (bounded)
     runs-on: ubuntu-latest
+    # T2b: the node image must be loaded before the Jepsen compose tests run.
+    needs: build-node-image
     # Sized so the WHOLE job (setup + both bounded fuzz steps + verdict) fits
     # under the cap and the run completes instead of being cancelled. Each fuzz
     # step is bounded by an inner `timeout` (wall-clock budget) BELOW its step
@@ -38,6 +93,24 @@ jobs:
       # inside its fuzz budget. Backtraces keep file:line; nothing here runs a
       # debugger. Job-level so rust-cache hashes it into the key.
       CARGO_PROFILE_DEV_DEBUG: "1"
+      # T2b: the container-runtime prerequisites the Jepsen/loadgen harnesses
+      # read, set once for the whole job.
+      #
+      # Pin docker (ubuntu-latest also ships podman; a prior container job
+      # silently picked it up from PATH — docker_provision.rs's
+      # `select_container_runtime` honors this).
+      FERROSA_CONTAINER_RUNTIME: docker
+      # The node image the Jepsen compose files run, loaded from the
+      # build-node-image artifact above. `jepsen-cluster.yml` /
+      # `jepsen-cluster-t3.yml` / `docker-compose.compaction-test.yml` all name
+      # their node service `${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}`,
+      # so one image serves the orchestrator's own compose cluster (port 49042)
+      # AND every in-test compose bring-up.
+      FERROSA_NIGHTLY_IMAGE: ferrosa-test-node:latest
+      # `cluster_topology_invariants.rs` shells out to `docker run ... cqlsh`;
+      # redirect it to the digest-pinned mirror like ci.yml's `integration` job,
+      # so a Docker Hub outage cannot turn the nightly red for the wrong reason.
+      FERROSA_CASSANDRA_IMAGE: downloads.ferrosa.ai/cassandra@sha256:8819d1b7877ee6621751a761cc163332e9c3eaf671c8ef672f7c77a7c5bff05f
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -51,6 +124,117 @@ jobs:
         with:
           shared-key: workspace-test-all-features-debug1
           save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+
+      # ── T2b: provision the ferrosa-jepsen harness (ordering matters) ──────
+      # The node image artifact built by the `build-node-image` job above. It
+      # must be loaded BEFORE any step that brings up a compose cluster or runs
+      # the Jepsen compose tests — that is the ordering constraint that kept
+      # ferrosa-jepsen `--exclude`d everywhere.
+      - name: Download prebuilt node image
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ferrosa-node-image
+          path: .
+      - name: Load node image into Docker
+        run: docker load < ferrosa-node-image.tar.gz
+
+      # Pull the digest-pinned service images once, with the repo's bounded
+      # retry, so a transient registry blip names the image instead of surfacing
+      # later as a confusing cluster/compose failure. These are the images the
+      # Jepsen compose cluster (rustfs + bucket bootstrap) pulls.
+      - name: Pre-pull Jepsen compose images
+        run: |
+          scripts/pull-images.sh \
+            "downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d" \
+            "downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed" \
+            "$FERROSA_CASSANDRA_IMAGE"
+
+      # The orchestrator (`ferrosa-jepsen/src/orchestrator.rs`) with
+      # FERROSA_TEST_CONTAINERS set provisions its OWN 3-node cluster from
+      # `jepsen-cluster.yml` via `docker_provision.rs`, on host ports
+      # 49042-49044. `docker_mini_jepsen.rs` and `rust_driver_connects_to_cluster`
+      # also dial 49042 directly (`cql_session.rs:218`). Bring that stack up
+      # here so those tests have live endpoints AND so the compose stack is warm
+      # before the timed run step (a cold bring-up inside the fuzz budget would
+      # eat the wall clock). Teardown mirrors it below.
+      - name: Bring up the Jepsen compose cluster (49042-49044)
+        env:
+          FERROSA_TEST_CONTAINERS: "1"
+        run: |
+          set -euo pipefail
+          # --no-build: the node services carry a `build:` block (root
+          # Dockerfile, from source). `up --build` would RECOMPILE the whole
+          # ferrosa workspace and overwrite the loaded image; plain
+          # `up -d --no-build` runs FERROSA_NIGHTLY_IMAGE (ferrosa-test-node).
+          docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster.yml \
+            up -d --no-build
+          deadline=$((SECONDS + 180))
+          until python3 -c '
+          import socket, sys
+          for port in (49042, 49043, 49044):
+              try:
+                  socket.create_connection(("127.0.0.1", port), timeout=5).close()
+              except OSError:
+                  sys.exit(1)
+          '; do
+            if (( SECONDS >= deadline )); then
+              echo "::error::Jepsen cluster CQL ports did not open within 180s"
+              docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster.yml ps
+              exit 1
+            fi
+            sleep 5
+          done
+
+      # `cluster_topology_invariants.rs` hardcodes the standard 3-node cluster on
+      # host ports 9042-9044 (Gap 11 host_id/broadcast_address/token-ring
+      # invariants), and `test-cluster-up-ci.sh` emits
+      # FERROSA_TEST_CLUSTER_NODES=127.0.0.1:9042,9043,9044. Same bring-up
+      # ci.yml's `integration` job uses; it reuses the ferrosa-test-node image
+      # loaded above instead of rebuilding.
+      - name: Bring up the standard 3-node test cluster (9042-9044)
+        run: |
+          ./scripts/test-cluster-up-ci.sh > /tmp/cluster-env
+          cat /tmp/cluster-env >> "$GITHUB_ENV"
+
+      # T2b: export the remaining harness prerequisites once, so every step that
+      # needs them (the run step and the verdict step's `--list`) inherits them.
+      #
+      # FERROSA_TEST_CONTAINERS   — container-gated Jepsen + loadgen tests
+      # FERROSA_TEST_LOADGEN      — ferrosa-loadgen/tests/binary_smoke.rs
+      #   (FERROSA_TEST_CLUSTER_NODES came from the step above.)
+      #
+      # Blocked set — cannot pass on a GitHub-hosted ubuntu-latest runner even
+      # with these harnesses, because they need a VM/host the runner cannot
+      # provide (SSH or Firecracker). These belong in T3's asserted,
+      # evidence-backed permitted-exclusion set; T2b names them, it does not
+      # silently `--skip` them:
+      #   * ssh_execute_command, ssh_upload_file — need a Lima/Firecracker VM with
+      #     sshd on 127.0.0.1:2022 + rootfs/test_key
+      #     (ferrosa-jepsen/src/ssh.rs:237-317).
+      #   * provision_single_vm, provision_t1_cluster — Firecracker KVM
+      #     (ferrosa-jepsen/src/firecracker.rs:328, ferrosa-jepsen/src/cluster.rs:222).
+      #   * nemesis_correctness::{disk_fail_no_phantom_commits,
+      #     packet_reorder_linearizability, lwt_batch_atomicity_all} — inject via
+      #     SSH into the nodes, which the compose cluster does not expose
+      #     (ferrosa-jepsen/tests/nemesis_correctness.rs:36,86,133).
+      #   * tier_multi_dc_one_hour_bank_workload — panics unconditionally; the
+      #     1-hour run is jepsen-multi-dc-nightly.yml
+      #     (ferrosa-jepsen/tests/tier_multi_dc.rs:55-90).
+      #   * docker_mini_jepsen — needs the ~/src/ferrosa-memory compose cluster on
+      #     19042-19044 (ferrosa-jepsen/tests/docker_mini_jepsen.rs:8-13).
+      #   * loadgen ucs_load_s3_test — needs RustFS S3 on 29000 outside the run
+      #     (ferrosa-loadgen/tests/ucs_load_s3_test.rs:80-160).
+      # FERROSA_TEST_TYPED_EDGES_DIR is deliberately NOT set: the captured
+      #   typed_edges SSTables are explicitly NOT checked in
+      #   (ferrosa-cluster/src/coordinator/range_read_stream.rs:3796), so
+      #   real_typed_edges_paged_scan_* / count_range_metadata_merger_* stay
+      #   blocked, not silently run without their input.
+      - name: Export harness prerequisites
+        run: |
+          {
+            echo "FERROSA_TEST_CONTAINERS=1"
+            echo "FERROSA_TEST_LOADGEN=1"
+          } >> "$GITHUB_ENV"
 
       - name: Build AssemblyScript UDF toolchain bundle
         # --all-features enables `asc-udf` + `live-infra-tests`, which run the
@@ -89,9 +273,13 @@ jobs:
           # absolute wall-clock bounds out of this debug-profile fuzz session,
           # as ci.yml does; they ran here and failed at 56.7 ms on 2026-09-30.
           # The `perf-regression` job below enforces them unchanged.
-          # Crate excludes + skip list mirror ci.yml's proven --all-features run
-          # (jepsen/loadgen excluded; live-infra + heavy tests skipped by name);
-          # the file-IO repair fuzz is skipped here and run in the step below.
+          # Crate excludes removed by T2b: ferrosa-jepsen and ferrosa-loadgen are
+          # no longer excluded here — the job now provisions their harnesses
+          # (node image, compose cluster, FERROSA_TEST_CONTAINERS /
+          # _CLUSTER_NODES / _LOADGEN above), so the run includes them.
+          # NOTE (coordination): the `--skip` list below is owned by T2
+          # (`t_112d82ee`), which deletes it entirely; T2b changes only the
+          # `--exclude` flags. Merge this hunk onto T2's no-skip invocation.
           # Bound the fuzz to a wall-clock budget so the run COMPLETES (exit 0)
           # instead of being cancelled by the GH step/job timeout. `timeout`
           # returns 124 (SIGTERM at the budget) or 137 (SIGKILL after grace) —
@@ -99,7 +287,6 @@ jobs:
           # Any other non-zero is a real proptest failure and is surfaced.
           timeout --kill-after=30s "${FUZZ_BUDGET_SECS}" \
             cargo test --all-features --workspace --lib --tests \
-              --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
               -- -Z unstable-options --report-time \
                  --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                  --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
@@ -165,6 +352,15 @@ jobs:
           if [ "$status" != "0" ]; then echo "$status" > cargo-test-status; else echo "$prev" > cargo-test-status; fi
           exit 0
         continue-on-error: true
+
+      # T2b: tear down both test clusters the run used. Mirror-images of the
+      # bring-up steps above; `if: always()` so a failed run still cleans up.
+      - name: Tear down the test clusters
+        if: always()
+        run: |
+          docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster.yml \
+            down -v --remove-orphans 2>/dev/null || true
+          ./scripts/test-cluster-down.sh --ci 2>/dev/null || true
 
       - name: Check for regression files
         id: regressions
