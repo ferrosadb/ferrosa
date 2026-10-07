@@ -147,6 +147,40 @@ fail() {
 }
 info() { echo -e "${YELLOW}INFO${NC}: $1"; }
 
+# Helper: assert node1's CQL request runtime did not stall.
+#
+# Phase 8 tolerates one node being down, and the intermittent failure the
+# nightly saw was a *connect* timeout there — nondeterministic, and unprovable
+# after the fact. This turns it into a deterministic pass/fail over the real
+# invariant: node1's CQL-runtime liveness task (100 ms tick, 300 ms stall
+# threshold — ferrosa-sched/src/runtime_monitor.rs) must not be starved while 1
+# of 3 nodes is down. `ferrosa_sched_runtime_stall_max_micros` armed on node1 is
+# the mechanism node1 logged when the smoke run went red
+# (`runtime scheduling stall ... worst_ms=4956`).
+#
+# FAIL if any stall event was recorded, or the worst stall reached the 300 ms
+# liveness threshold. A zero-stall run proves the connect timeout could not
+# have been a CQL-runtime scheduling stall.
+NODE1_METRICS_URL="http://localhost:9090/metrics"
+STALL_THRESHOLD_MICROS=300000
+assert_node1_cql_runtime_not_stalled() {
+    local metrics events max_micros
+    metrics=$(curl --connect-timeout 2 --max-time 3 -sf "$NODE1_METRICS_URL" 2>/dev/null) || {
+        fail "Phase 8: could not scrape node1 /metrics to check for a CQL-runtime stall"
+    }
+    events=$(grep -E '^ferrosa_sched_runtime_stall_events_total ' <<<"$metrics" | awk '{print $2}')
+    max_micros=$(grep -E '^ferrosa_sched_runtime_stall_max_micros ' <<<"$metrics" | awk '{print $2}')
+    events=${events:-0}
+    max_micros=${max_micros:-0}
+    if (( events != 0 )); then
+        fail "Phase 8: node1 recorded ${events} CQL-runtime scheduling stall(s) with 1 of 3 nodes down (worst ${max_micros}us); the CQL request runtime was starved (ferrosa_sched_runtime_stall_events_total)"
+    fi
+    if (( max_micros >= STALL_THRESHOLD_MICROS )); then
+        fail "Phase 8: node1's worst CQL-runtime stall was ${max_micros}us (>= ${STALL_THRESHOLD_MICROS}us threshold); the liveness task missed its deadline with 1 of 3 nodes down"
+    fi
+    pass "node1 CQL runtime not stalled with 1 of 3 nodes down (events=${events}, worst=${max_micros}us)"
+}
+
 # Compose file for the cluster suite (trio / quint)
 CLUSTER_COMPOSE="tests/docker-compose.cluster.yml"
 
@@ -659,6 +693,12 @@ info "=== Phase 8: Single Node Failure (QUORUM) ==="
 info "Stopping node3..."
 docker compose stop node3
 sleep 5
+
+# Deterministic check for the CQL-runtime starvation that made this phase flaky:
+# with 1 of 3 nodes down, node1's CQL-runtime liveness task must not have been
+# starved. This runs BEFORE the QUORUM write so a regression fails on the real
+# invariant instead of an unattributable connect timeout.
+assert_node1_cql_runtime_not_stalled
 
 # Writes should succeed (2 of 3 alive, QUORUM = 2). The consistency level is
 # set explicitly: cqlsh defaults to ONE, under which this phase and Phase 9

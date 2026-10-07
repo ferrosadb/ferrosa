@@ -219,6 +219,31 @@ impl SelfHealController {
         self
     }
 
+    /// One control-loop pass, moved to the blocking pool.
+    ///
+    /// The tick is synchronous on purpose — the detector reads and CRC-checks
+    /// SSTable files, the quarantine action moves files, and the repair probe
+    /// blocks on a bulk-lane RPC — but running it inline on an async worker
+    /// parks that worker for the whole pass. On a CPU-scarce host a parked worker
+    /// timeshares away from the runtime's other tasks (the CQL runtime's liveness
+    /// task misses its 100 ms tick). `tokio::task::spawn_blocking` runs the tick
+    /// on a dedicated pool thread, so the async worker keeps scheduling. This
+    /// mirrors the `finalize_compactions` offload (`StorageEngine::offload_blocking`).
+    ///
+    /// Takes the controller by value because the blocking closure needs an owned
+    /// `'static` value; it is returned with the tick's ledger and clock advanced.
+    /// `None` means the blocking task was cancelled (the host runtime is shutting
+    /// down), in which case the loop stops — there is no runtime left to serve.
+    async fn offload_one_tick(controller: Self) -> Option<Self> {
+        tokio::task::spawn_blocking(move || {
+            let mut controller = controller;
+            controller.run_one_tick_guarded();
+            controller
+        })
+        .await
+        .ok()
+    }
+
     /// Spawn the controller on its own tokio task, gated by the master switch.
     /// Returns the join handle (or `None` if disabled at spawn). Cheap when
     /// idle: it sleeps `tick_interval` between passes and only scans
@@ -261,7 +286,12 @@ impl SelfHealController {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                controller.run_one_tick_guarded();
+                controller = match Self::offload_one_tick(controller).await {
+                    Some(next) => next,
+                    // The blocking task was cancelled (the host runtime is
+                    // shutting down mid-tick); stop.
+                    None => break,
+                };
             }
         }))
     }
@@ -952,6 +982,109 @@ mod controller_tests {
         assert_eq!(
             metrics::self_heal_metrics().quarantined_generations_total,
             0
+        );
+    }
+
+    /// A cluster whose `owners` blocks synchronously — a stand-in for the real
+    /// tick's blocking work (filesystem digest reads, the quarantine file move,
+    /// the bulk-lane repair probe). Everything else about the tick is unchanged.
+    struct SlowCluster {
+        delay: std::time::Duration,
+    }
+    impl ClusterView for SlowCluster {
+        fn this_host(&self) -> u64 {
+            0
+        }
+        fn owners(&self, _t: &TableKey) -> Option<Vec<u64>> {
+            std::thread::sleep(self.delay);
+            None
+        }
+        fn replica_posture(&self, _t: &TableKey) -> ReplicaPosture {
+            ReplicaPosture::SingleNode
+        }
+    }
+
+    /// The offload must keep a co-resident runtime task live while a tick does
+    /// its blocking work.
+    ///
+    /// An explicit **current-thread** runtime is the strongest, least ambiguous
+    /// form of the invariant: exactly one thread executes tasks, so an inline
+    /// tick parks it for the whole pass and a co-resident liveness task cannot
+    /// wake at all. The tick is driven as a *spawned task* — the shape of the
+    /// production loop (`tokio::spawn(async move { ... run_one_tick ... })`).
+    /// The liveness task measures its **worst wake gap**, the same measure
+    /// `ferrosa-sched/runtime_monitor.rs` records, so tokio replaying missed
+    /// timer ticks in a burst cannot mask a stall.
+    ///
+    /// Measured (macOS 18-core dev host; the 20 ms cadence and 500 ms blocking
+    /// tick make the result host-independent):
+    /// * inline tick (the pre-fix shape): worst wake gap **~500 ms** — the whole
+    ///   blocking pass. RED.
+    /// * offloaded tick (this revision): worst wake gap **~20–30 ms** — one
+    ///   cadence. GREEN.
+    /// The bound below sits between the two.
+    #[test]
+    #[serial]
+    fn offloaded_tick_does_not_starve_a_coresident_liveness_task() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (baseline_gap, worst_gap, elapsed) = rt.block_on(async {
+            let engine = table_dir_with_n_generations_engine(2);
+            let cluster = Arc::new(SlowCluster {
+                delay: std::time::Duration::from_millis(500),
+            });
+            let controller = SelfHealController::new(engine, cluster, SelfHealConfig::default());
+
+            // A liveness task on the one executor thread, measuring its worst
+            // wake gap — the same shape as the CQL runtime's stall monitor.
+            let worst_gap_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let observed = worst_gap_ms.clone();
+            let monitor = tokio::spawn(async move {
+                let mut last = tokio::time::Instant::now();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    let now = tokio::time::Instant::now();
+                    let gap = now.duration_since(last).as_millis() as u64;
+                    observed.fetch_max(gap, std::sync::atomic::Ordering::Relaxed);
+                    last = now;
+                }
+            });
+
+            // Let the monitor establish its cadence before the tick starts.
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let baseline_gap = worst_gap_ms.load(std::sync::atomic::Ordering::Relaxed);
+
+            // Drive one tick as a spawned task, mirroring the production loop,
+            // and await its JoinHandle so this future never blocks the executor.
+            let started = tokio::time::Instant::now();
+            tokio::spawn(async move {
+                let _ = SelfHealController::offload_one_tick(controller).await;
+            })
+            .await
+            .expect("tick task joins");
+            let elapsed = started.elapsed();
+            let worst_gap = worst_gap_ms.load(std::sync::atomic::Ordering::Relaxed);
+            monitor.abort();
+            (baseline_gap, worst_gap, elapsed)
+        });
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(450),
+            "the tick must actually have blocked ~500 ms so the check is meaningful; \
+             elapsed was {elapsed:?}"
+        );
+        assert!(
+            baseline_gap <= 100,
+            "the baseline cadence must be tight for this check to mean anything; \
+             baseline worst gap was {baseline_gap} ms"
+        );
+        assert!(
+            worst_gap < 300,
+            "a tick that blocks {elapsed:?} must not starve a co-resident liveness task: \
+             its worst wake gap was {worst_gap} ms (baseline {baseline_gap} ms); an inline \
+             tick would delay the wake by the whole ~500 ms block"
         );
     }
 }
