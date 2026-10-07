@@ -164,6 +164,15 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   ferrosa-memory's entity streams into 500s across `main` and every open PR
   (t_12457d3e). Once the index is current, an empty global lookup is a real miss
   and never falls back to a scan.
+  **The scan WARN is once per plan (DT-16):** a `FullScan` states itself at WARN
+  the first time its `(keyspace, table, predicate column, operator)` plan is seen
+  on this node, and at DEBUG after that (`FullScanTracker::scan_warn_is_first`).
+  A recurring scan used to write a near-identical line every time — 93 lines from
+  one legitimate multi-scan workload — which buried every other WARN. This
+  demotes the **log line only**: `FullScanTracker::record` still runs on every
+  scan, so `system_observability.full_scan_reasons` (and the
+  `/api/observability/full_scan_reasons` endpoint) still counts each occurrence
+  and remains the surface to alert on.
   Virtual `system_schema` reads share one projection/aggregate encoder: ordinary
   projections expose exactly the requested metadata, and `count(*)` returns one
   `bigint` row instead of a zero-column frame that standard drivers cannot

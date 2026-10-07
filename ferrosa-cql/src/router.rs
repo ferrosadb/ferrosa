@@ -2673,6 +2673,9 @@ pub struct SharedState {
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
     /// Records full-scan occurrences for `system_observability.full_scan_reasons`.
+    /// Also owns the scan-WARN dedup (DT-16): its `scan_warn_is_first` tells the
+    /// router whether a scan is the first of its plan on this node, which chooses
+    /// WARN vs DEBUG for the log line — while `record` keeps counting every scan.
     pub full_scan_tracker: Arc<crate::virtual_tables::FullScanTracker>,
     /// Records secondary-index usage for `system_observability.index_usage`.
     pub index_usage_tracker: Arc<crate::virtual_tables::IndexUsageTracker>,
@@ -6665,12 +6668,53 @@ async fn route_select_user_table_inner(
         // plan names the index serving it, at DEBUG, so "is my index being
         // used?" has an affirmative answer in the log rather than only the
         // absence of a complaint.
+        //
+        // The scan WARN is emitted ONCE PER PLAN, then DEMOTED to DEBUG —
+        // "once" meaning once per (keyspace, table, predicate column, operator)
+        // on this node since startup. It used to fire on every execution, so a
+        // legitimate workload that scans the same table 93 times wrote 93
+        // near-identical lines that buried every other warning in the file. A
+        // warning that repeats is one people learn to ignore; the shape that
+        // matters — "this table is being scanned" — is identical across the
+        // repeats, so it is stated once and the rest are DEBUG.
+        //
+        // This demotes only the LOG LINE, never the SIGNAL: every scan still
+        // increments the full_scan_tracker above, so
+        // `system_observability.full_scan_reasons` (and the
+        // `/api/observability/full_scan_reasons` endpoint) still counts every
+        // occurrence and stays the surface to alert on. See
+        // [`crate::virtual_tables::FullScanTracker::scan_warn_is_first`].
         if matches!(scan_plan, ScanPlan::FullScan) {
-            tracing::warn!(
-                keyspace = ks,
-                table = %s.table,
-                "executing query with ALLOW FILTERING — full table scan with post-filter"
-            );
+            // The predicate the tracker keys on, named in the warning so an
+            // operator reading ONE line still knows which column to index.
+            let (pred_col, pred_op) = s
+                .where_clauses
+                .iter()
+                .find(|wc| !wc.token_fn)
+                .map(|wc| (wc.column.as_str(), comparison_op_str(&wc.op)))
+                .unwrap_or(("", ""));
+            if state
+                .full_scan_tracker
+                .scan_warn_is_first(ks, &s.table, pred_col, pred_op)
+            {
+                tracing::warn!(
+                    keyspace = ks,
+                    table = %s.table,
+                    predicate = pred_col,
+                    operator = pred_op,
+                    "executing query with ALLOW FILTERING — full table scan with post-filter \
+                     (reported once per plan; further scans of this predicate log at DEBUG)"
+                );
+            } else {
+                tracing::debug!(
+                    keyspace = ks,
+                    table = %s.table,
+                    predicate = pred_col,
+                    operator = pred_op,
+                    "executing query with ALLOW FILTERING — full table scan with post-filter \
+                     (repeat; the first scan of this predicate logged at WARN)"
+                );
+            }
         } else {
             tracing::debug!(
                 keyspace = ks,
@@ -35031,6 +35075,113 @@ mod tests {
              this is the expensive-query signal, and silencing it would be a \
              worse regression than the noise it replaced.\n\
              --- captured warnings ---\n{captured}"
+        );
+    }
+
+    /// DT-16: the ALLOW FILTERING scan WARN is emitted ONCE PER PLAN, not once
+    /// per execution.
+    ///
+    /// One legitimate multi-scan workload wrote 93 near-identical lines, which
+    /// buries every other warning in the file. The plan that matters — this
+    /// table is being read by full scan, this predicate — is identical across
+    /// the repeats, so the first states it at WARN and the rest are DEBUG.
+    ///
+    /// The second half of the test is the part that could quietly be lost: the
+    /// full_scan_tracker must still count EVERY scan. The log line is demoted;
+    /// the signal is not. If a future change deduplicates by dropping the
+    /// tracker write too, the repeated-warn count would read 1 and the
+    /// virtual-table count would read 1 — an operator watching
+    /// `system_observability.full_scan_reasons` instead of the log would lose
+    /// the whole trend, silently.
+    #[test]
+    fn repeated_scans_of_one_plan_warn_once_and_still_count_every_scan() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let (warns, tracked) = tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (state, _dir) = setup();
+                let auth = dev_auth();
+                let ctx = RequestContext {
+                    auth: &auth,
+                    current_keyspace: &None,
+                    consistency: ConsistencyLevel::One,
+                    serial_consistency: None,
+                    paging: crate::paging::PagingParams::default(),
+                    client_address: String::new(),
+                    protocol_version: 4,
+                };
+
+                for cql in [
+                    "CREATE KEYSPACE afl_rate WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                    // No index on `body`: a predicate on it can only scan.
+                    "CREATE TABLE afl_rate.events (id int PRIMARY KEY, body text)",
+                ] {
+                    route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                        .await
+                        .unwrap();
+                }
+                for id in 0..6 {
+                    route(
+                        &state,
+                        &ctx,
+                        crate::parser::parse(&format!(
+                            "INSERT INTO afl_rate.events (id, body) VALUES ({id}, 'row-{id}')"
+                        ))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                let tracked_before = state.full_scan_tracker.total_full_scans();
+                // The SAME scanning query, many times — the shape the 93-line
+                // workload had.
+                let select = crate::parser::parse(
+                    "SELECT id FROM afl_rate.events WHERE body = 'row-3' ALLOW FILTERING",
+                )
+                .unwrap();
+                for _ in 0..25 {
+                    match route(&state, &ctx, select.clone()).await.unwrap() {
+                        RouteResult::Result(b) => {
+                            assert_eq!(extract_row_count(&b), 1, "each scan finds its row");
+                        }
+                        _ => panic!("expected rows from the scanning read"),
+                    }
+                }
+                (
+                    // Count only the scan WARNs: the CREATE/INSERT lines above
+                    // are not warnings, and `warn` appears in the message text.
+                    logs.text()
+                        .lines()
+                        .filter(|l| l.contains("ALLOW FILTERING") && l.contains("WARN"))
+                        .count(),
+                    state.full_scan_tracker.total_full_scans() - tracked_before,
+                )
+            })
+        });
+
+        assert_eq!(
+            tracked, 25,
+            "every scan must still be counted by the tracker: the log line is \
+             demoted to DEBUG, the signal is not. A monitor on \
+             system_observability.full_scan_reasons must not under-count."
+        );
+        assert_eq!(
+            warns,
+            1,
+            "25 executions of one scanning plan must write ONE WARN, not 25. \
+             The repeated line is the noise DT-16 is about.\n\
+             --- captured warnings ---\n{}",
+            logs.text()
         );
     }
 
