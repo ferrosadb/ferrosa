@@ -288,7 +288,7 @@ pub async fn reconcile_once_with(
         // Each entry is a read and a write at ALL: two network round trips.
         // Up to RECONCILE_ENTRIES_IN_FLIGHT of them run together; one at a
         // time, a memory-cluster heal outlasted every client for 30+ minutes.
-        let mut in_flight = futures::stream::FuturesUnordered::new();
+        let mut in_flight = InFlight::new();
         let mut failed = FailedEntries::default();
         let progress_started = std::time::Instant::now();
         while let Some(partition) = partitions.next().await {
@@ -310,21 +310,21 @@ pub async fn reconcile_once_with(
 
             let expected = expected_entries(schema, edge_tid, &partition, &mut metrics);
             for (_, entry) in expected {
-                if in_flight.len() >= RECONCILE_ENTRIES_IN_FLIGHT {
-                    if let Some(result) = in_flight.next().await {
-                        failed.keep(metrics.record(result), &mut metrics);
-                    }
+                let freed = in_flight
+                    .start(reconcile_entry(
+                        write_path,
+                        &index,
+                        &edge_table_fqn,
+                        entry,
+                        Pass {
+                            started_at: pass_started_at,
+                            mode,
+                        },
+                    ))
+                    .await;
+                if let Some(result) = freed {
+                    failed.keep(metrics.record(result), &mut metrics);
                 }
-                in_flight.push(reconcile_entry(
-                    write_path,
-                    &index,
-                    &edge_table_fqn,
-                    entry,
-                    Pass {
-                        started_at: pass_started_at,
-                        mode,
-                    },
-                ));
                 entries_processed += 1;
                 if entries_processed.is_multiple_of(RECONCILE_PROGRESS_EVERY_ENTRIES) {
                     tracing::info!(
@@ -818,6 +818,37 @@ impl ReconcileMetrics {
             EntryResult::Failed(entry) => return Some(entry),
         }
         None
+    }
+}
+
+/// Entry repairs in flight, never more than [`RECONCILE_ENTRIES_IN_FLIGHT`]:
+/// the bound is enforced by `start`, not left to its callers.
+struct InFlight<F: std::future::Future> {
+    running: futures::stream::FuturesUnordered<F>,
+}
+
+impl<F: std::future::Future> InFlight<F> {
+    fn new() -> Self {
+        Self {
+            running: futures::stream::FuturesUnordered::new(),
+        }
+    }
+
+    /// Start `work`, first waiting for a slot when the set is full. Returns the
+    /// result of the repair that freed the slot, if one had to finish.
+    async fn start(&mut self, work: F) -> Option<F::Output> {
+        let freed = if self.running.len() >= RECONCILE_ENTRIES_IN_FLIGHT {
+            self.running.next().await
+        } else {
+            None
+        };
+        self.running.push(work);
+        freed
+    }
+
+    /// The next repair to finish, or `None` once all have.
+    async fn next(&mut self) -> Option<F::Output> {
+        self.running.next().await
     }
 }
 
