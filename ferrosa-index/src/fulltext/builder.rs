@@ -25,8 +25,29 @@
 //! │     dl:        u32 LE (4 bytes)  doc length      │
 //! ├── Corpus stats (8 bytes) ────────────────────────┤
 //! │ total_doc_len: u64 LE (8 bytes)  sum of all dl   │
+//! ├── Term index (optional) ─────────────────────────┤
+//! │ Every FTI_TERM_INDEX_INTERVAL-th term, in order: │
+//! │   term_len:  u16 LE, term_bytes: [u8]            │
+//! │   ordinal:   u32 LE  (its position in the dict)  │
+//! │   offset:    u64 LE  (where its term_len starts) │
+//! ├── Term index footer (20 bytes) ──────────────────┤
+//! │ index_offset: u64 LE  (where the index starts)   │
+//! │ entry_count:  u32 LE                             │
+//! │ magic:        b"FTITIDX1" (8 bytes)              │
+//! ├── Corpus stats again (8 bytes) ──────────────────┤
+//! │ total_doc_len: u64 LE                            │
 //! └──────────────────────────────────────────────────┘
 //! ```
+//!
+//! The term index lets a lookup seek to within FTI_TERM_INDEX_INTERVAL terms
+//! of its target instead of walking the dictionary from the start. It is
+//! appended after the original layout, which the file still opens with byte
+//! for byte, and `total_doc_len` is repeated as the last 8 bytes. So a build
+//! that predates the index reads these files unchanged (its whole-file reader
+//! stops at the first `total_doc_len`, its streaming reader takes the last 8
+//! bytes and walks the dictionary), and a sidecar written before the index is
+//! upgraded by appending to it. The version byte stays 1 for that reason: an
+//! older build rejects any other version.
 
 use std::collections::HashMap;
 
@@ -36,6 +57,13 @@ use super::analyzer::{default_analyzer, Analyzer};
 pub const FTI_MAGIC: &[u8; 4] = b"FTIX";
 /// Current FTI format version.
 pub const FTI_VERSION: u8 = 1;
+/// Terms between consecutive term-index entries: a lookup walks at most this
+/// many dictionary terms after its seek.
+pub const FTI_TERM_INDEX_INTERVAL: usize = 64;
+/// Marks a sidecar that carries a term index (see the layout above).
+pub const FTI_TERM_INDEX_MAGIC: &[u8; 8] = b"FTITIDX1";
+/// `index_offset` + `entry_count` + magic.
+pub const FTI_TERM_INDEX_FOOTER_LEN: u64 = 8 + 4 + 8;
 
 /// A single posting in the inverted index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,8 +220,57 @@ impl Default for FullTextIndexBuilder {
 
 // ── Serialization ─────────────────────────────────────────────────────────────
 
-/// Serialize a [`FullTextIndex`] to the FTI byte format.
+/// Serialize a [`FullTextIndex`] to the FTI byte format, with a term index.
 pub fn serialize_fti(fti: &FullTextIndex) -> Result<Vec<u8>, String> {
+    let mut entries: Vec<(&str, u32, u64)> = Vec::new();
+    let mut buf = serialize_body(fti, |ordinal, term, offset| {
+        if ordinal as usize % FTI_TERM_INDEX_INTERVAL == 0 {
+            entries.push((term, ordinal, offset));
+        }
+    })?;
+    append_term_index(&mut buf, &entries, fti.total_doc_len)?;
+    Ok(buf)
+}
+
+/// The FTI layout written before the term index: no index section, no footer.
+pub fn serialize_fti_without_term_index(fti: &FullTextIndex) -> Result<Vec<u8>, String> {
+    serialize_body(fti, |_, _, _| {})
+}
+
+/// Append the term index, its footer, and `total_doc_len` to a sidecar that
+/// ends with the original layout. `entries` are (term, ordinal, offset) of
+/// every [`FTI_TERM_INDEX_INTERVAL`]-th term, in dictionary order.
+pub fn append_term_index(
+    buf: &mut Vec<u8>,
+    entries: &[(&str, u32, u64)],
+    total_doc_len: u64,
+) -> Result<(), String> {
+    let index_offset = buf.len() as u64;
+    for (term, ordinal, offset) in entries {
+        buf.extend_from_slice(&term_len_u16(term)?.to_le_bytes());
+        buf.extend_from_slice(term.as_bytes());
+        buf.extend_from_slice(&ordinal.to_le_bytes());
+        buf.extend_from_slice(&offset.to_le_bytes());
+    }
+    let entry_count = u32::try_from(entries.len())
+        .map_err(|_| format!("FTI term index has too many entries: {}", entries.len()))?;
+    buf.extend_from_slice(&index_offset.to_le_bytes());
+    buf.extend_from_slice(&entry_count.to_le_bytes());
+    buf.extend_from_slice(FTI_TERM_INDEX_MAGIC);
+    buf.extend_from_slice(&total_doc_len.to_le_bytes());
+    Ok(())
+}
+
+fn term_len_u16(term: &str) -> Result<u16, String> {
+    u16::try_from(term.len()).map_err(|_| format!("FTI term is {} bytes, over 65535", term.len()))
+}
+
+/// The original layout, calling `on_term(ordinal, term, offset)` for each
+/// term with the offset its record starts at.
+fn serialize_body<'a>(
+    fti: &'a FullTextIndex,
+    mut on_term: impl FnMut(u32, &'a str, u64),
+) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
 
     // Header: magic + version + doc_count
@@ -209,10 +286,10 @@ pub fn serialize_fti(fti: &FullTextIndex) -> Result<Vec<u8>, String> {
     let term_count = sorted_terms.len() as u32;
     buf.extend_from_slice(&term_count.to_le_bytes());
 
-    for (term, entry) in &sorted_terms {
+    for (ordinal, (term, entry)) in sorted_terms.iter().enumerate() {
+        on_term(ordinal as u32, term.as_str(), buf.len() as u64);
         let term_bytes = term.as_bytes();
-        let term_len = term_bytes.len() as u16;
-        buf.extend_from_slice(&term_len.to_le_bytes());
+        buf.extend_from_slice(&term_len_u16(term)?.to_le_bytes());
         buf.extend_from_slice(term_bytes);
         buf.extend_from_slice(&entry.doc_freq.to_le_bytes());
 
