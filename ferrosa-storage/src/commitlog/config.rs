@@ -87,6 +87,97 @@ impl Default for SyncStrategyConfig {
     }
 }
 
+/// Which system call makes a commit-log segment durable.
+///
+/// This only matters on macOS. There, `fsync(2)` hands data to the drive but
+/// does not flush the drive's volatile cache, so it survives a process crash
+/// and a kernel panic (the controller keeps power and drains its cache) but
+/// not a power loss. On Linux `fdatasync(2)` already flushes the device cache,
+/// so every mode runs `fdatasync` there: a mode never makes Linux weaker.
+///
+/// | Mode | macOS call | Process crash | Kernel panic | Power loss |
+/// |------|------------|---------------|--------------|------------|
+/// | `Full` (default) | `fcntl(F_FULLFSYNC)` | survives | survives | survives |
+/// | `Barrier` | `fcntl(F_BARRIERFSYNC)` | survives | survives | may lose the tail since the last full flush; never reorders it |
+/// | `Fsync` | `fsync(2)` | survives | survives | may lose or reorder recent writes |
+///
+/// Note that Rust's `File::sync_all` and `File::sync_data` are both
+/// `F_FULLFSYNC` on Apple targets, so `Fsync` has to call `libc::fsync`
+/// itself. Selected at startup by `FERROSA_COMMITLOG_SYNC_MODE`, logged then,
+/// and exported as `ferrosa_commitlog_sync_mode`; never a build-time choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommitLogSyncMode {
+    /// Flush the drive cache on every sync. Power-loss durable.
+    #[default]
+    Full,
+    /// fsync plus a drive write barrier: ordered, not power-loss durable.
+    Barrier,
+    /// Plain fsync: neither ordered nor durable across power loss.
+    Fsync,
+}
+
+impl CommitLogSyncMode {
+    /// The environment variable that selects the mode.
+    pub const ENV: &'static str = "FERROSA_COMMITLOG_SYNC_MODE";
+
+    const ALL: [Self; 3] = [Self::Full, Self::Barrier, Self::Fsync];
+
+    /// The name accepted by [`parse`](Self::parse).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Barrier => "barrier",
+            Self::Fsync => "fsync",
+        }
+    }
+
+    /// Parses a mode name, ignoring case and surrounding whitespace.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let wanted = raw.trim();
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.name().eq_ignore_ascii_case(wanted))
+            .ok_or_else(|| {
+                format!(
+                    "unknown commit-log sync mode {raw:?}; expected one of full, barrier, fsync"
+                )
+            })
+    }
+
+    /// Reads [`ENV`](Self::ENV). Unset means `Full`. A set but unknown value
+    /// is an error, not the default: a durability setting that was asked for
+    /// and silently not applied is the failure this type exists to prevent.
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var(Self::ENV) {
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(e) => Err(format!("{}: {e}", Self::ENV)),
+            Ok(raw) => Self::parse(&raw).map_err(|e| format!("{}: {e}", Self::ENV)),
+        }
+    }
+
+    /// Whether an acknowledged, synced write survives sudden power loss.
+    pub fn survives_power_loss(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// One line, for the startup log, saying what this mode guarantees.
+    pub fn durability(self) -> &'static str {
+        match self {
+            Self::Full => {
+                "F_FULLFSYNC: synced writes survive process crash, kernel panic and power loss"
+            }
+            Self::Barrier => {
+                "F_BARRIERFSYNC: synced writes survive process crash and kernel panic; on power loss \
+                 the tail since the drive last flushed its cache can be lost, in order"
+            }
+            Self::Fsync => {
+                "fsync(2): synced writes survive process crash and kernel panic; on power loss \
+                 recent writes can be lost or reordered"
+            }
+        }
+    }
+}
+
 /// Adaptive commit-log sync batching tunables.
 ///
 /// The sync strategy opens a batch when the first dirty write arrives. Under
@@ -102,6 +193,8 @@ pub struct CommitLogBatchConfig {
     /// commit log refuses new writes (Periodic) or fails the waiting writer
     /// (Group). This bounds the ack-before-fsync window; see `sync`.
     pub sync_stall_deadline: Duration,
+    /// The system call each sync issues. See [`CommitLogSyncMode`].
+    pub sync_mode: CommitLogSyncMode,
 }
 
 impl CommitLogBatchConfig {
@@ -117,6 +210,7 @@ impl CommitLogBatchConfig {
             target_bytes: Self::DEFAULT_TARGET_BYTES,
             max_delay,
             sync_stall_deadline: Self::DEFAULT_SYNC_STALL_DEADLINE,
+            sync_mode: CommitLogSyncMode::default(),
         }
     }
 
@@ -135,10 +229,13 @@ impl CommitLogBatchConfig {
             .filter(|v| *v > 0)
             .map(Duration::from_millis)
             .unwrap_or(default.sync_stall_deadline);
+        // `sync_mode` is not read here: an unusable mode must stop startup
+        // rather than fall back, so it comes from `CommitLogSyncMode::from_env`.
         Self {
             target_bytes,
             max_delay,
             sync_stall_deadline,
+            sync_mode: default.sync_mode,
         }
     }
 }
@@ -368,6 +465,68 @@ mod tests {
     fn commit_log_config_archive_none_by_default() {
         let config = CommitLogConfig::default();
         assert!(config.archive.is_none());
+    }
+
+    #[test]
+    fn every_sync_mode_name_parses_and_round_trips() {
+        for mode in [
+            CommitLogSyncMode::Full,
+            CommitLogSyncMode::Barrier,
+            CommitLogSyncMode::Fsync,
+        ] {
+            assert_eq!(CommitLogSyncMode::parse(mode.name()), Ok(mode));
+        }
+        assert_eq!(
+            CommitLogSyncMode::parse(" Barrier "),
+            Ok(CommitLogSyncMode::Barrier)
+        );
+    }
+
+    #[test]
+    fn an_unknown_sync_mode_is_refused_naming_the_accepted_values() {
+        let err = CommitLogSyncMode::parse("fullfsync").unwrap_err();
+        assert!(err.contains("fullfsync"), "{err}");
+        for accepted in ["full", "barrier", "fsync"] {
+            assert!(err.contains(accepted), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_default_sync_mode_is_the_power_loss_durable_one() {
+        assert_eq!(CommitLogSyncMode::default(), CommitLogSyncMode::Full);
+        assert_eq!(
+            CommitLogBatchConfig::default().sync_mode,
+            CommitLogSyncMode::Full
+        );
+        assert!(CommitLogSyncMode::Full.survives_power_loss());
+    }
+
+    #[test]
+    fn weaker_sync_modes_say_they_do_not_survive_power_loss() {
+        for mode in [CommitLogSyncMode::Barrier, CommitLogSyncMode::Fsync] {
+            assert!(!mode.survives_power_loss(), "{mode:?}");
+            assert!(
+                mode.durability().contains("power loss"),
+                "{mode:?}: {}",
+                mode.durability()
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(env)]
+    fn sync_mode_from_env_defaults_when_unset_and_refuses_garbage() {
+        unsafe { std::env::remove_var("FERROSA_COMMITLOG_SYNC_MODE") };
+        assert_eq!(CommitLogSyncMode::from_env(), Ok(CommitLogSyncMode::Full));
+
+        unsafe { std::env::set_var("FERROSA_COMMITLOG_SYNC_MODE", "fsync") };
+        assert_eq!(CommitLogSyncMode::from_env(), Ok(CommitLogSyncMode::Fsync));
+
+        unsafe { std::env::set_var("FERROSA_COMMITLOG_SYNC_MODE", "fast") };
+        let err = CommitLogSyncMode::from_env().unwrap_err();
+        assert!(err.contains("FERROSA_COMMITLOG_SYNC_MODE"), "{err}");
+
+        unsafe { std::env::remove_var("FERROSA_COMMITLOG_SYNC_MODE") };
     }
 
     #[test]

@@ -36,8 +36,8 @@ pub(crate) mod segment;
 pub(crate) mod sync;
 
 pub use config::{
-    ArchiveConfig, CommitLogBatchConfig, CommitLogConfig, CommitLogPosition, SyncStrategyConfig,
-    TableId,
+    ArchiveConfig, CommitLogBatchConfig, CommitLogConfig, CommitLogPosition, CommitLogSyncMode,
+    SyncStrategyConfig, TableId,
 };
 pub use mutation::{Mutation, CELL_REBIND_LIST_PATH_FLAG};
 
@@ -132,6 +132,19 @@ pub fn render_prometheus() -> String {
     let flush = segment::flush_metrics();
     let sync_batch = sync::sync_batch_metrics();
     let mut out = String::new();
+    out.push_str("# HELP ferrosa_commitlog_syncs_by_mode_total Commit-log file and directory syncs by the system call issued (full = F_FULLFSYNC, barrier = F_BARRIERFSYNC, fsync = fsync(2)); only full survives power loss on macOS.\n");
+    out.push_str("# TYPE ferrosa_commitlog_syncs_by_mode_total counter\n");
+    for mode in [
+        config::CommitLogSyncMode::Full,
+        config::CommitLogSyncMode::Barrier,
+        config::CommitLogSyncMode::Fsync,
+    ] {
+        out.push_str(&format!(
+            "ferrosa_commitlog_syncs_by_mode_total{{mode=\"{}\"}} {}\n",
+            mode.name(),
+            segment::syncs_issued(mode)
+        ));
+    }
     out.push_str("# HELP ferrosa_commitlog_appends_total Total commit-log appends.\n");
     out.push_str("# TYPE ferrosa_commitlog_appends_total counter\n");
     out.push_str(&format!(
@@ -485,10 +498,27 @@ impl CommitLog {
         fs::create_dir_all(&config.log_dir)?;
         fs::create_dir_all(&config.checkpoint_dir)?;
 
-        let first_segment = Arc::new(Segment::new(
+        let mode = config.batch.sync_mode;
+        if mode.survives_power_loss() {
+            tracing::info!(
+                sync_mode = mode.name(),
+                durability = mode.durability(),
+                "commit log: sync mode"
+            );
+        } else {
+            tracing::warn!(
+                sync_mode = mode.name(),
+                durability = mode.durability(),
+                env = config::CommitLogSyncMode::ENV,
+                "commit log: sync mode is NOT power-loss durable on macOS; chosen explicitly"
+            );
+        }
+
+        let first_segment = Arc::new(Segment::with_sync_mode(
             first_segment_id,
             config.segment_size,
             &config.log_dir,
+            config.batch.sync_mode,
         ));
         let active = Arc::new(ArcSwap::from(first_segment));
 
@@ -1212,10 +1242,11 @@ impl CommitLog {
     /// `Arc<Segment>` paired with its CAS-allocated offset (see `append()`).
     pub fn force_rotate(&self) -> ferrosa_common::Result<()> {
         let new_id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
-        let new_segment = Arc::new(Segment::new(
+        let new_segment = Arc::new(Segment::with_sync_mode(
             new_id,
             self.config.segment_size,
             &self.config.log_dir,
+            self.config.batch.sync_mode,
         ));
 
         // Swap the new segment in and get the old one.
@@ -1476,6 +1507,40 @@ mod tests {
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             }],
             timestamp: 42_000,
+        }
+    }
+
+    #[test]
+    fn the_configured_sync_mode_reaches_every_segment_including_rotated_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::test_config(dir.path());
+        config.batch.sync_mode = config::CommitLogSyncMode::Barrier;
+        let log = CommitLog::new(config).unwrap();
+        assert_eq!(
+            log.active.load().sync_mode(),
+            config::CommitLogSyncMode::Barrier
+        );
+
+        log.append(&simple_mutation()).unwrap();
+        log.force_rotate().unwrap();
+
+        assert_eq!(
+            log.active.load().sync_mode(),
+            config::CommitLogSyncMode::Barrier
+        );
+        log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn prometheus_exports_syncs_issued_per_mode() {
+        let text = render_prometheus();
+        for mode in ["full", "barrier", "fsync"] {
+            assert!(
+                text.contains(&format!(
+                    "ferrosa_commitlog_syncs_by_mode_total{{mode=\"{mode}\"}} "
+                )),
+                "missing {mode} series"
+            );
         }
     }
 

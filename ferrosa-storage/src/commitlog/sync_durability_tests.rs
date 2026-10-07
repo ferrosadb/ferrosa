@@ -63,6 +63,7 @@ fn batch_with_deadline(deadline: Duration) -> CommitLogBatchConfig {
         target_bytes: CommitLogBatchConfig::DEFAULT_TARGET_BYTES,
         max_delay: Duration::from_millis(1),
         sync_stall_deadline: deadline,
+        ..CommitLogBatchConfig::default()
     }
 }
 

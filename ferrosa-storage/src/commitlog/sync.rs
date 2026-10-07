@@ -1641,6 +1641,7 @@ mod tests {
                 target_bytes: 4096,
                 max_delay: Duration::from_secs(3600),
                 sync_stall_deadline: CommitLogBatchConfig::DEFAULT_SYNC_STALL_DEADLINE,
+                ..CommitLogBatchConfig::default()
             },
             flush_cb,
         );

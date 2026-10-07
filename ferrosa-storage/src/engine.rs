@@ -866,6 +866,8 @@ impl StorageEngineConfig {
         };
         commit_log.batch =
             crate::commitlog::config::CommitLogBatchConfig::from_env(commit_log.batch.clone());
+        commit_log.batch.sync_mode = crate::commitlog::config::CommitLogSyncMode::from_env()
+            .map_err(ferrosa_common::Error::InvalidFormat)?;
 
         let compaction = CompactionConfig::from_env(data_dir.join("compaction"));
 
