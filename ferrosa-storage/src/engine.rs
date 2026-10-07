@@ -28311,26 +28311,63 @@ mod tests {
             })
             .collect();
 
-        let rename_idx = relevant
+        // The promote rename is the one that moves the staged output into its
+        // bare-numeric generation name. Scoping to it matters: the earliest
+        // `Rename` in the timeline is the T-022 intent record
+        // (`.compaction-<id>.intent`), not the promote, so a bare "first
+        // Rename" assertion proves nothing about window E'.
+        let is_promote_rename = |e: &Event| match e {
+            Event::Rename(p) => {
+                p.parent() == Some(sstable_dir.as_path())
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.parse::<u64>().is_ok())
+            }
+            _ => false,
+        };
+        let promote_rename_pos = relevant
             .iter()
-            .find_map(|(i, e)| matches!(e, Event::Rename(_)).then_some(*i))
-            .expect("promote should rename the staged output into sstables/<table>/");
-        let dir_fsync_idx = relevant
+            .position(|(_, e)| is_promote_rename(e))
+            .expect("promote should rename the staged output into sstables/<table>/<gen>");
+        // The first directory fsync AFTER the promote rename -- not the first
+        // DirFsync overall, which belongs to the T-022 intent-record write
+        // that happens *before* promotion.
+        let dir_fsync_pos = relevant
             .iter()
-            .find_map(|(i, e)| matches!(e, Event::DirFsync(_)).then_some(*i))
+            .position(|(i, e)| *i > relevant[promote_rename_pos].0 && matches!(e, Event::DirFsync(_)))
             .expect("promote should fsync sstables/<table>/ after the rename");
-        let unlink_idx = relevant
+        let unlink_pos = relevant
             .iter()
-            .find_map(|(i, e)| matches!(e, Event::Unlink(_)).then_some(*i))
+            .position(|(_, e)| matches!(e, Event::Unlink(_)))
             .expect("a successful promote should be followed by input eviction");
 
         assert!(
-            rename_idx < dir_fsync_idx,
+            promote_rename_pos < dir_fsync_pos,
             "the promote rename must be recorded before the directory fsync: {relevant:?}"
         );
         assert!(
-            dir_fsync_idx < unlink_idx,
+            dir_fsync_pos < unlink_pos,
             "the directory fsync must be recorded before any input is unlinked: {relevant:?}"
+        );
+
+        // Window E' boundary contract (T-001): the promote rename must be made
+        // durable BEFORE any other metadata operation touches
+        // `sstables/<table>/`. A *later* fsync of the same directory does NOT
+        // satisfy this and does not close window E' at this boundary: the T-022
+        // intent-record advance and the T-024 durable retire both fsync
+        // `sstables/<table>/` further down the path, so the two assertions
+        // above stay green even with this fix reverted (measured: reverting the
+        // `fsync_promoted_directory` call leaves them passing, because the
+        // Swapped intent write supplies the dir fsync before the first unlink).
+        // The contract is therefore that the directory fsync is the very next
+        // directory operation after the promote rename -- before the intent
+        // record is advanced, before any input is retired.
+        let next_after_promote = relevant.get(promote_rename_pos + 1).copied();
+        assert!(
+            matches!(next_after_promote, Some((_, Event::DirFsync(p))) if p == &sstable_dir),
+            "the promote rename must be immediately followed by the directory fsync of \
+             sstables/<table>/ (window E'): a later fsync (intent advance / durable retire) \
+             does not cover the promote. Timeline: {relevant:?}"
         );
     }
 
