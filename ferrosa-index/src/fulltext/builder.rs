@@ -224,7 +224,7 @@ impl Default for FullTextIndexBuilder {
 pub fn serialize_fti(fti: &FullTextIndex) -> Result<Vec<u8>, String> {
     let mut entries: Vec<(&str, u32, u64)> = Vec::new();
     let mut buf = serialize_body(fti, |ordinal, term, offset| {
-        if ordinal as usize % FTI_TERM_INDEX_INTERVAL == 0 {
+        if (ordinal as usize).is_multiple_of(FTI_TERM_INDEX_INTERVAL) {
             entries.push((term, ordinal, offset));
         }
     })?;

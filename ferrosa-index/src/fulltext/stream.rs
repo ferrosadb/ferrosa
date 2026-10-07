@@ -495,7 +495,7 @@ pub(crate) fn term_index_tail_for<R: Read + Seek>(
                 .seek_relative(pk_len + 8)
                 .map_err(|e| format!("skip posting: {e}"))?;
         }
-        if ordinal as usize % FTI_TERM_INDEX_INTERVAL == 0 {
+        if (ordinal as usize).is_multiple_of(FTI_TERM_INDEX_INTERVAL) {
             let term = String::from_utf8(term_buf.clone())
                 .map_err(|e| format!("invalid UTF-8 in term: {e}"))?;
             kept.push((term, ordinal, offset));
