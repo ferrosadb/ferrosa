@@ -314,7 +314,21 @@ jobs:
               --skip fly_multi_node_streaming_scan_stays_under_2gib \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
-          if [ "$status" = "124" ] || [ "$status" = "137" ]; then
+          # A budget exit (124/137) means the WALL CLOCK ran out — it does NOT
+          # mean the suite passed. The log still carries the verdict: any
+          # `test result: FAILED` summary or `... FAILED` per-test marker is a
+          # real failure and must stay red even when the outer `timeout` also
+          # fired. (Found in run 37662732591: `--no-fail-fast` records every
+          # failure, then keeps running the remaining binaries until the 3 h
+          # budget expires, so the exit was 124 with 3 real failures already in
+          # the log — the old code called that success. Verified against the
+          # `test-output` artifact of that run.)
+          if grep -qE 'test result: FAILED|\.\.\. FAILED' test-output.log; then
+            echo "::error::test-output.log records failing tests; the budget exit ($status) does not clear them"
+            if [ "$status" = "0" ] || [ "$status" = "124" ] || [ "$status" = "137" ]; then
+              status=1
+            fi
+          elif [ "$status" = "124" ] || [ "$status" = "137" ]; then
             echo "::notice::test budget (${FUZZ_BUDGET_SECS}s) elapsed with no failing case — treating as success"
             status=0
           fi
