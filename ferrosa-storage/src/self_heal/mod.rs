@@ -1012,20 +1012,40 @@ mod controller_tests {
     /// tick parks it for the whole pass and a co-resident liveness task cannot
     /// wake at all. The tick is driven as a *spawned task* — the shape of the
     /// production loop (`tokio::spawn(async move { ... run_one_tick ... })`).
-    /// The liveness task measures its **worst wake gap**, the same measure
-    /// `ferrosa-sched/runtime_monitor.rs` records, so tokio replaying missed
-    /// timer ticks in a burst cannot mask a stall.
     ///
-    /// Measured (macOS 18-core dev host; the 20 ms cadence and 500 ms blocking
-    /// tick make the result host-independent):
-    /// * inline tick (the pre-fix shape): worst wake gap **~500 ms** — the whole
-    ///   blocking pass. RED.
-    /// * offloaded tick (this revision): worst wake gap **~20–30 ms** — one
-    ///   cadence. GREEN.
-    /// The bound below sits between the two.
+    /// ## Why the wake gap is sampled from a separate thread
+    ///
+    /// A liveness task that measures its *own* worst wake gap cannot see a stall
+    /// it is inside of: while the single executor thread is parked by an inline
+    /// tick, the task cannot run, so the worst gap it can record is the one from
+    /// *before* the block. Reading that gap on the executor after the block
+    /// measured **44 ms** and therefore **passed on the inline (pre-fix) shape**
+    /// — it did not discriminate at all.
+    ///
+    /// The wake gaps are therefore sampled by a dedicated observer thread that
+    /// is not the executor: the liveness task stamps its last-wake `Instant` as
+    /// its first action after each wake (under a std mutex), and the observer
+    /// samples `now - last_wake` every 5 ms with `try_lock`, so a gap that spans
+    /// a parked executor is still measured. The worst gap is read after the
+    /// executor resumes. This is the same observable
+    /// `ferrosa-sched/runtime_monitor.rs` records.
+    ///
+    /// ## Measured numbers (this machine, 18-vCPU macOS)
+    ///
+    /// Identical test body; only the tick shape differs. `SlowCluster::owners`
+    /// blocks 500 ms and the liveness task wakes every 20 ms:
+    /// * inline tick (the pre-fix production shape): worst wake gap **~510 ms** —
+    ///   the whole blocking pass. **RED** (`worst_gap < 300` fails).
+    /// * offloaded tick (this revision): worst wake gap **~25 ms** — one cadence
+    ///   plus observer-thread scheduling jitter. **GREEN**.
+    /// The 300 ms bound sits between the two: well below the block, several
+    /// times above the cadence.
     #[test]
     #[serial]
     fn offloaded_tick_does_not_starve_a_coresident_liveness_task() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Mutex;
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1037,24 +1057,45 @@ mod controller_tests {
             });
             let controller = SelfHealController::new(engine, cluster, SelfHealConfig::default());
 
-            // A liveness task on the one executor thread, measuring its worst
-            // wake gap — the same shape as the CQL runtime's stall monitor.
-            let worst_gap_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let observed = worst_gap_ms.clone();
-            let monitor = tokio::spawn(async move {
-                let mut last = tokio::time::Instant::now();
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    let now = tokio::time::Instant::now();
-                    let gap = now.duration_since(last).as_millis() as u64;
-                    observed.fetch_max(gap, std::sync::atomic::Ordering::Relaxed);
-                    last = now;
+            // Last-wake stamp: written by the liveness task on the executor,
+            // read by the observer on its own thread.
+            let last_wake = Arc::new(Mutex::new(tokio::time::Instant::now()));
+            let worst_ms = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            // Observer: samples the executor's wake gaps from outside, so a gap
+            // that spans a parked executor is measured rather than missed.
+            let observer_last = last_wake.clone();
+            let observer_worst = worst_ms.clone();
+            let observer_stop = stop.clone();
+            let observer = std::thread::spawn(move || {
+                while !observer_stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    if let Ok(stamp) = observer_last.try_lock() {
+                        let gap = tokio::time::Instant::now()
+                            .duration_since(*stamp)
+                            .as_millis() as u64;
+                        observer_worst.fetch_max(gap, Ordering::Relaxed);
+                    }
                 }
             });
 
-            // Let the monitor establish its cadence before the tick starts.
+            // Liveness task on the executor: wake every 20 ms, stamp, sleep.
+            // While the executor is parked (an inline tick) it cannot stamp, so
+            // the observer sees the gap grow.
+            let task_last = last_wake.clone();
+            let monitor = tokio::spawn(async move {
+                let mut next = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+                loop {
+                    tokio::time::sleep_until(next).await;
+                    *task_last.lock().unwrap() = tokio::time::Instant::now();
+                    next += std::time::Duration::from_millis(20);
+                }
+            });
+
+            // Let the cadence establish before the tick starts.
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-            let baseline_gap = worst_gap_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let baseline_gap = worst_ms.load(Ordering::Relaxed);
 
             // Drive one tick as a spawned task, mirroring the production loop,
             // and await its JoinHandle so this future never blocks the executor.
@@ -1065,11 +1106,22 @@ mod controller_tests {
             .await
             .expect("tick task joins");
             let elapsed = started.elapsed();
-            let worst_gap = worst_gap_ms.load(std::sync::atomic::Ordering::Relaxed);
+
+            // The executor is running again; the observer has already sampled
+            // the worst gap during the block.
+            stop.store(true, Ordering::Relaxed);
+            observer.join().expect("observer thread joins");
+            let worst_gap = worst_ms.load(Ordering::Relaxed);
             monitor.abort();
             (baseline_gap, worst_gap, elapsed)
         });
 
+        println!(
+            "OFFLOAD_MEASURED elapsed_ms={} baseline_gap_ms={} worst_gap_ms={}",
+            elapsed.as_millis(),
+            baseline_gap,
+            worst_gap
+        );
         assert!(
             elapsed >= std::time::Duration::from_millis(450),
             "the tick must actually have blocked ~500 ms so the check is meaningful; \
@@ -1084,7 +1136,7 @@ mod controller_tests {
             worst_gap < 300,
             "a tick that blocks {elapsed:?} must not starve a co-resident liveness task: \
              its worst wake gap was {worst_gap} ms (baseline {baseline_gap} ms); an inline \
-             tick would delay the wake by the whole ~500 ms block"
+             tick parks the executor for the whole ~500 ms block"
         );
     }
 }
