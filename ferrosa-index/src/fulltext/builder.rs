@@ -245,7 +245,19 @@ pub fn append_term_index(
     entries: &[(&str, u32, u64)],
     total_doc_len: u64,
 ) -> Result<(), String> {
-    let index_offset = buf.len() as u64;
+    let tail = term_index_tail(buf.len() as u64, entries, total_doc_len)?;
+    buf.extend_from_slice(&tail);
+    Ok(())
+}
+
+/// The bytes [`append_term_index`] appends to a sidecar whose original layout
+/// ends at `index_offset`: the index, its footer, and `total_doc_len`.
+pub fn term_index_tail(
+    index_offset: u64,
+    entries: &[(&str, u32, u64)],
+    total_doc_len: u64,
+) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
     for (term, ordinal, offset) in entries {
         buf.extend_from_slice(&term_len_u16(term)?.to_le_bytes());
         buf.extend_from_slice(term.as_bytes());
@@ -258,7 +270,7 @@ pub fn append_term_index(
     buf.extend_from_slice(&entry_count.to_le_bytes());
     buf.extend_from_slice(FTI_TERM_INDEX_MAGIC);
     buf.extend_from_slice(&total_doc_len.to_le_bytes());
-    Ok(())
+    Ok(buf)
 }
 
 fn term_len_u16(term: &str) -> Result<u16, String> {

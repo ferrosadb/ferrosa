@@ -308,6 +308,12 @@ impl SelfHealController {
             if let Some(issue) = self.detect_invalid_vector_indexes(&table) {
                 issues.push(issue);
             }
+            // Not an issue to decide on: a local, lossless rewrite with its
+            // own claim and logging (TableStore::upgrade_legacy_fulltext_sidecars).
+            self.engine.upgrade_legacy_fulltext_sidecars(
+                &TableId::new(&table.keyspace, &table.table),
+                self.config.fulltext_upgrade_budget,
+            );
             // Extension point: detector::detect_bloat / detect_divergence here.
         }
 

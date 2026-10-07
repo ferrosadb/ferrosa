@@ -10268,6 +10268,17 @@ impl StorageEngine {
         Ok(results.into_iter().map(|(pk, _)| pk).collect())
     }
 
+    /// Give up to `budget` of `table_id`'s legacy FTI sidecars a term index
+    /// (see `TableStore::upgrade_legacy_fulltext_sidecars`); returns how many.
+    /// Holds nothing engine-wide. 0 for an unregistered table.
+    pub fn upgrade_legacy_fulltext_sidecars(&self, table_id: &TableId, budget: usize) -> usize {
+        // A snapshot of the table map, not a guard held across file I/O.
+        let tables = self.tables.load_full();
+        tables
+            .get(table_id)
+            .map_or(0, |t| t.store.upgrade_legacy_fulltext_sidecars(budget))
+    }
+
     /// The FTI sidecars a query against `table_id`'s `index_name` reads, and
     /// the generations they cover. `None` if the table is not registered.
     ///
@@ -35458,6 +35469,72 @@ mod tests {
 
         let hits = reader.search_str("rust").unwrap();
         assert!(!hits.is_empty(), "search for 'rust' must return results");
+    }
+
+    /// A sidecar written before the term index is given one in place, and
+    /// answers the same afterwards. Live nodes carry such sidecars (184 MB of
+    /// them on one node's entity_store); until one is rewritten, every lookup
+    /// in it walks its whole dictionary.
+    #[test]
+    fn a_legacy_fts_sidecar_is_given_a_term_index_in_place() {
+        use ferrosa_index::fulltext::builder::{serialize_fti, serialize_fti_without_term_index};
+        use ferrosa_index::fulltext::reader::deserialize_fti;
+        use ferrosa_index::fulltext::stream::term_index_tail_for_path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+        for (key, text) in [
+            ("r1", "rust distributed database"),
+            ("r2", "cassandra storage"),
+            ("r3", "rust hello world"),
+        ] {
+            engine
+                .write(&tid, &make_key(key), make_row(text.as_bytes(), 1000), 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        let before = engine
+            .fulltext_search(&tid, "idx_body", "rust", None)
+            .unwrap();
+        assert_eq!(before.len(), 2);
+
+        // Rewrite the sidecar as a build before the term index wrote it.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let path = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with("-FTI-idx_body.db"))
+            .expect("the flush wrote a sidecar");
+        let fti = deserialize_fti(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::write(&path, serialize_fti_without_term_index(&fti).unwrap()).unwrap();
+        assert!(
+            term_index_tail_for_path(&path).unwrap().is_some(),
+            "now legacy"
+        );
+
+        assert_eq!(engine.upgrade_legacy_fulltext_sidecars(&tid, 8), 1);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serialize_fti(&fti).unwrap(),
+            "upgraded in place to exactly what the current writer produces"
+        );
+        assert_eq!(
+            engine.upgrade_legacy_fulltext_sidecars(&tid, 8),
+            0,
+            "nothing left"
+        );
+        let mut after = engine
+            .fulltext_search(&tid, "idx_body", "rust", None)
+            .unwrap();
+        let mut before = before;
+        after.sort();
+        before.sort();
+        assert_eq!(after, before, "same answer after the upgrade");
     }
 
     /// TDD repro for the post-restart fts_match-empty bug: flush an FTI sidecar,

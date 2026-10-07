@@ -35,8 +35,8 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::builder::{
-    FTI_MAGIC, FTI_TERM_INDEX_FOOTER_LEN, FTI_TERM_INDEX_INTERVAL, FTI_TERM_INDEX_MAGIC,
-    FTI_VERSION,
+    term_index_tail, FTI_MAGIC, FTI_TERM_INDEX_FOOTER_LEN, FTI_TERM_INDEX_INTERVAL,
+    FTI_TERM_INDEX_MAGIC, FTI_VERSION,
 };
 use super::reader::FtsHit;
 use super::scoring::{bm25_score, Bm25Params};
@@ -413,6 +413,112 @@ fn parse_term_index(
     Ok(entries)
 }
 
+/// The bytes to append to the legacy sidecar at `path` to give it a term
+/// index, or `None` if it already has one. See [`term_index_tail_for`].
+///
+/// # Errors
+///
+/// Returns `Err` on I/O failure or a malformed/truncated FTI file.
+pub fn term_index_tail_for_path(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    term_index_tail_for(BufReader::new(file), file_len)
+}
+
+/// The bytes that turn a legacy sidecar into one with a term index when
+/// appended to it, or `None` if it already has one.
+///
+/// One pass over the dictionary, skipping postings; holds one term in every
+/// [`FTI_TERM_INDEX_INTERVAL`], not the index. The file must be the legacy
+/// layout exactly (its dictionary ends at the 8-byte trailer), so a damaged
+/// sidecar is refused rather than given an index over bytes that are not its
+/// dictionary.
+pub(crate) fn term_index_tail_for<R: Read + Seek>(
+    mut reader: R,
+    file_len: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let tail = FTI_TERM_INDEX_FOOTER_LEN + 8;
+    if file_len < HEADER_LEN + 8 {
+        return Err(format!("FTI too short: {file_len} bytes"));
+    }
+    if file_len >= HEADER_LEN + 8 + tail {
+        reader
+            .seek(SeekFrom::End(-(FTI_TERM_INDEX_MAGIC.len() as i64 + 8)))
+            .map_err(|e| format!("seek term index magic: {e}"))?;
+        let mut magic = [0u8; 8];
+        reader
+            .read_exact(&mut magic)
+            .map_err(|e| format!("read term index magic: {e}"))?;
+        if &magic == FTI_TERM_INDEX_MAGIC {
+            return Ok(None);
+        }
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek start: {e}"))?;
+    let mut magic = [0u8; 4];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|e| format!("read magic: {e}"))?;
+    if &magic != FTI_MAGIC {
+        return Err(format!("invalid FTI magic: {magic:?}"));
+    }
+    let version = read_u8(&mut reader)?;
+    if version != FTI_VERSION {
+        return Err(format!(
+            "unsupported FTI version {version} (expected {FTI_VERSION})"
+        ));
+    }
+    let _doc_count = read_u32(&mut reader)?;
+    let term_count = read_u32(&mut reader)?;
+
+    let mut kept: Vec<(String, u32, u64)> = Vec::new();
+    let mut term_buf: Vec<u8> = Vec::new();
+    for ordinal in 0..term_count {
+        let offset = reader
+            .stream_position()
+            .map_err(|e| format!("term offset: {e}"))?;
+        let term_len = read_u16(&mut reader)? as usize;
+        term_buf.clear();
+        term_buf.resize(term_len, 0);
+        reader
+            .read_exact(&mut term_buf)
+            .map_err(|e| format!("read term: {e}"))?;
+        let _doc_freq = read_u32(&mut reader)?;
+        let posting_count = read_u32(&mut reader)?;
+        for _ in 0..posting_count {
+            let pk_len = read_u16(&mut reader)? as i64;
+            reader
+                .seek_relative(pk_len + 8)
+                .map_err(|e| format!("skip posting: {e}"))?;
+        }
+        if ordinal as usize % FTI_TERM_INDEX_INTERVAL == 0 {
+            let term = String::from_utf8(term_buf.clone())
+                .map_err(|e| format!("invalid UTF-8 in term: {e}"))?;
+            kept.push((term, ordinal, offset));
+        }
+    }
+    let body_end = reader
+        .stream_position()
+        .map_err(|e| format!("dictionary end: {e}"))?;
+    if body_end + 8 != file_len {
+        return Err(format!(
+            "FTI has no term index and {} bytes where its 8-byte trailer belongs: \
+             truncated or corrupt",
+            file_len.saturating_sub(body_end)
+        ));
+    }
+    let total_doc_len = read_u64(&mut reader)?;
+    let entries: Vec<(&str, u32, u64)> = kept
+        .iter()
+        .map(|(term, ordinal, offset)| (term.as_str(), *ordinal, *offset))
+        .collect();
+    term_index_tail(file_len, &entries, total_doc_len).map(Some)
+}
+
 fn read_u8(r: &mut impl Read) -> Result<u8, String> {
     let mut b = [0u8; 1];
     r.read_exact(&mut b).map_err(|e| format!("read u8: {e}"))?;
@@ -772,6 +878,33 @@ mod term_index_tests {
             );
             assert!(result.is_err(), "cut {cut} bytes: must be refused");
         }
+    }
+
+    /// A legacy sidecar is upgraded by appending: the result is byte for byte
+    /// what the current writer produces, and an upgraded or new sidecar has
+    /// nothing to append.
+    #[test]
+    fn upgrading_a_legacy_sidecar_appends_exactly_the_current_term_index() {
+        let current = sidecar(1_000);
+        let legacy = serialize_fti_without_term_index(&deserialize_fti(&current).unwrap()).unwrap();
+        let tail = term_index_tail_for(
+            BufReader::new(Cursor::new(legacy.clone())),
+            legacy.len() as u64,
+        )
+        .unwrap()
+        .expect("a legacy sidecar has a tail to append");
+        let mut upgraded = legacy;
+        upgraded.extend_from_slice(&tail);
+        assert_eq!(upgraded, current);
+        assert!(
+            term_index_tail_for(
+                BufReader::new(Cursor::new(current.clone())),
+                current.len() as u64
+            )
+            .unwrap()
+            .is_none(),
+            "an indexed sidecar needs no upgrade"
+        );
     }
 
     /// A rollback to a build without the index still reads new sidecars: the

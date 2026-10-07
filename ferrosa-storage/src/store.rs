@@ -962,6 +962,44 @@ impl<T: std::fmt::Debug> std::fmt::Debug for CatalogSlice<T> {
 }
 
 /// File name of generation `gen`'s FTI sidecar for `index_name`.
+/// Append a term index to the legacy FTI sidecar at `path`, atomically.
+/// `Ok(false)`: it already had one.
+fn upgrade_fti_sidecar(path: &std::path::Path, gen: &str, index_name: &str) -> Result<bool> {
+    use std::io::Write;
+
+    let Some(tail) = ferrosa_index::fulltext::stream::term_index_tail_for_path(path)
+        .map_err(|e| ferrosa_common::Error::InvalidFormat(format!("FTI term index: {e}")))?
+    else {
+        return Ok(false);
+    };
+    let dir = path.parent().ok_or_else(|| {
+        ferrosa_common::Error::InvalidFormat(format!(
+            "FTI sidecar {} has no directory",
+            path.display()
+        ))
+    })?;
+    // `.tmp`, not `{gen}-` prefixed: startup cleanup removes one a crash left,
+    // and nothing enumerating a generation's components picks it up.
+    let tmp = dir.join(format!(
+        ".fti-{gen}-{index_name}.{}.upgrade.tmp",
+        std::process::id()
+    ));
+    let written = std::fs::copy(path, &tmp).and_then(|_| {
+        let mut file = std::fs::OpenOptions::new().append(true).open(&tmp)?;
+        file.write_all(&tail)?;
+        file.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        if let Err(cleanup) = std::fs::remove_file(&tmp) {
+            if cleanup.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %tmp.display(), %cleanup, "fts: could not remove temp FTI sidecar");
+            }
+        }
+        return Err(e.into());
+    }
+    Ok(true)
+}
+
 pub(crate) fn fti_sidecar_file_name(gen: &str, index_name: &str) -> String {
     format!("{gen}-FTI-{index_name}.db")
 }
@@ -9335,6 +9373,66 @@ impl<F: FlushTarget> TableStore<F> {
             })
             .collect();
         plan
+    }
+
+    /// Give up to `budget` live FTI sidecars written before the term index one,
+    /// in place; returns how many were upgraded. Run with the engine's table
+    /// lock RELEASED.
+    ///
+    /// Until upgraded, every lookup in such a sidecar walks its whole term
+    /// dictionary (`legacy_sidecar_walks_total`). The upgrade appends to a copy
+    /// (a clone on APFS), fsyncs it, and renames it over the original, so a
+    /// query sees the old file or the new one, never a partial one; an open
+    /// reader keeps the inode it opened. It holds the same per-sidecar claim
+    /// as the backfill build. A sidecar already uploaded keeps its legacy copy
+    /// in the object store, which is valid and is upgraded again if restored.
+    /// Failures are logged per sidecar and leave it as it was.
+    pub fn upgrade_legacy_fulltext_sidecars(&self, budget: usize) -> usize {
+        if budget == 0 || !self.flush_target.persists_fti_sidecars() {
+            return 0;
+        }
+        let mut upgraded = 0;
+        let indexes: Vec<String> = self
+            .catalog()
+            .fulltext_indexes
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        for index_name in &indexes {
+            for (gen, path) in self.fulltext_live_sidecars(index_name) {
+                if upgraded >= budget {
+                    return upgraded;
+                }
+                let Some(_claim) = SidecarClaim::take(
+                    &self.fulltext_sidecars_in_flight,
+                    format!("{gen}/{index_name}"),
+                ) else {
+                    continue; // being built or upgraded now; next pass.
+                };
+                match upgrade_fti_sidecar(&path, &gen, index_name) {
+                    Ok(true) => {
+                        upgraded += 1;
+                        tracing::info!(
+                            %gen,
+                            index = %index_name,
+                            path = %path.display(),
+                            "fts: gave a legacy FTI sidecar a term index; lookups in it seek \
+                             instead of walking its dictionary"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::error!(
+                        %e,
+                        %gen,
+                        index = %index_name,
+                        path = %path.display(),
+                        "fts: legacy FTI sidecar upgrade failed; lookups in it keep walking \
+                         its whole dictionary"
+                    ),
+                }
+            }
+        }
+        upgraded
     }
 
     fn empty_fulltext_sidecar_build(&self) -> FulltextSidecarBuild<F> {
