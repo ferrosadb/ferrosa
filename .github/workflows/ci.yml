@@ -239,8 +239,13 @@ jobs:
           # `--skip ::slow::` excludes the tests under the `slow-tests` feature
           # (compiled here under --all-features, but too slow for per-PR CI);
           # they run nightly in nightly-slow-tests.yml.
-          # LazyFS crash harness is unimplemented (T-070); in-process durability
-          # probes cover ordering until the crash harness exists.
+          # (No LazyFS skip.) The LazyFS crash harness was retracted: LazyFS
+          # defers file content, not directory metadata, so it cannot express
+          # window E' and any such test would pass on the pre-fix revision.
+          # Window E' is closed by the T-022 intent protocol and asserted by the
+          # in-process ordering timeline test; see
+          # `ferrosa-storage/src/engine.rs` `promote_dir_fsync_*` and
+          # `ferrosa-storage/specs/fmea.md` ST-30.
           # nextest, not libtest: it runs one process per test and schedules
           # across every core. libtest runs each test *binary* serially, so the
           # suite's wall clock was the sum of every binary's slowest test and
@@ -274,8 +279,7 @@ jobs:
                --skip fly_multi_node_streaming_scan \
                --skip replicated_jsonb_index_builds_on_every_node \
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
-               --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
-               --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
+               --skip count_range_metadata_merger_dedups_real_typed_edges_sstables
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no

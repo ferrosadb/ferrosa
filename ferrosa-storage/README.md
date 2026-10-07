@@ -282,6 +282,19 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `evict_local_input_sstable_files` no longer silently discards unlink errors:
   unexpected failures are WARN-logged (a missing file is not an error). Full
   atomic, fsynced retirement of the whole input generation is T-024.
+  **No crash-replay harness stands on this (T-070, retracted):** the earlier
+  plan to prove window E' under LazyFS was dropped after T4 ran it — LazyFS's
+  cache defers file *content* only and passes directory metadata straight
+  through (`lfs_rename` → real `rename()`, `lfs_unlink` → real `unlink()`), so
+  window E' is unreachable under it and any such test passes on the pre-fix
+  revision (vacuous). Window E' is in any case already closed independently of
+  T-001 by the T-022 intent protocol — `poll_compactions` durably writes and
+  fsyncs `sstables/<table>/.compaction-<gen>.intent` and advances it to
+  `Swapped` before the first input unlink — so no block-level replay has a
+  reachable "neither copy" counterexample to demonstrate either. The ordering
+  is asserted by the in-process timeline test
+  `promote_dir_fsync_order_is_rename_then_dir_fsync_then_unlink`, which is RED
+  with `fsync_promoted_directory` reverted and GREEN on main.
   **Cancellable compaction (T-021, `compaction-cancel-safety.md` C1):**
   `try_submit` creates one `ferrosa_common::CancelToken` per task, checked
   (unconditionally — in every build, not only tests) at every input open, the
