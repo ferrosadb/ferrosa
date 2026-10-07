@@ -155,26 +155,39 @@ impl CommitLogSyncMode {
         }
     }
 
-    /// Whether an acknowledged, synced write survives sudden power loss.
+    /// Whether an acknowledged, synced write survives sudden power loss. Off
+    /// Apple targets every mode is `fdatasync(2)`, which flushes the device cache.
     pub fn survives_power_loss(self) -> bool {
-        matches!(self, Self::Full)
+        !cfg!(target_vendor = "apple") || matches!(self, Self::Full)
     }
 
-    /// One line, for the startup log, saying what this mode guarantees.
+    /// One line, for the startup log, saying what this mode guarantees on
+    /// this platform. It never says "panic": the install smoke fails any
+    /// startup log that does (see `no_durability_line_mentions_a_panic`).
+    #[cfg(target_vendor = "apple")]
     pub fn durability(self) -> &'static str {
         match self {
             Self::Full => {
-                "F_FULLFSYNC: synced writes survive process crash, kernel panic and power loss"
+                "F_FULLFSYNC: synced writes survive process crash, OS crash and power loss"
             }
             Self::Barrier => {
-                "F_BARRIERFSYNC: synced writes survive process crash and kernel panic; on power loss \
+                "F_BARRIERFSYNC: synced writes survive process crash and OS crash; on power loss \
                  the tail since the drive last flushed its cache can be lost, in order"
             }
             Self::Fsync => {
-                "fsync(2): synced writes survive process crash and kernel panic; on power loss \
+                "fsync(2): synced writes survive process crash and OS crash; on power loss \
                  recent writes can be lost or reordered"
             }
         }
+    }
+
+    /// One line, for the startup log, saying what this mode guarantees on
+    /// this platform. It never says "panic": the install smoke fails any
+    /// startup log that does (see `no_durability_line_mentions_a_panic`).
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn durability(self) -> &'static str {
+        "fdatasync(2): synced writes survive process crash, OS crash and power loss \
+         (the mode chooses the sync call only on Apple targets)"
     }
 }
 
@@ -501,6 +514,34 @@ mod tests {
         assert!(CommitLogSyncMode::Full.survives_power_loss());
     }
 
+    /// The install smoke fails a startup log that mentions a panic
+    /// (`grep -qiE "panic"`, tests/install_smoke.sh), and this line is logged
+    /// at every start: "kernel panic" in it failed every install-smoke job on
+    /// ferrosa#526.
+    #[test]
+    fn no_durability_line_mentions_a_panic() {
+        for mode in CommitLogSyncMode::ALL {
+            assert!(
+                !mode.durability().to_ascii_lowercase().contains("panic"),
+                "{mode:?}: {}",
+                mode.durability()
+            );
+        }
+    }
+
+    /// Off Apple targets every mode runs fdatasync(2) (`segment::sync_file`), which flushes the device cache,
+    /// so every mode survives power loss and the startup line says so rather
+    /// than naming an Apple call this platform does not have.
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn off_apple_every_mode_is_fdatasync_and_survives_power_loss() {
+        for mode in CommitLogSyncMode::ALL {
+            assert!(mode.survives_power_loss(), "{mode:?}");
+            assert!(mode.durability().starts_with("fdatasync(2)"), "{mode:?}");
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn weaker_sync_modes_say_they_do_not_survive_power_loss() {
         for mode in [CommitLogSyncMode::Barrier, CommitLogSyncMode::Fsync] {
