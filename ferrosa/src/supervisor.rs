@@ -49,6 +49,23 @@
 //! memtables. Abort rather than `exit(1)`: launchd's `KeepAlive { Crashed }`
 //! restarts a crash, not a clean non-zero exit. A deterministic flush panic
 //! will crash again after replay; that crash loop is loud by design.
+//!
+//! ## The commit-log sync supervisor does NOT abort
+//!
+//! The commit log refuses writes on its own while its sync thread is stalled
+//! (`SyncHealthSnapshot::impaired()`: dead, failing, or past the stall
+//! deadline), so a stalled node is already acknowledging nothing — the
+//! "up without a flusher" state the abort exists to prevent cannot arise here.
+//! Aborting such a node only replays the commit log to rejoin and then aborts
+//! again on the next stall, so [`CommitLogSyncSupervisor`] counts and logs every
+//! deadline and keeps refusing writes instead. It stays loud (one ERROR per
+//! deadline on `/readyz`, the metrics and the log) and recovers on its own the
+//! moment an fsync completes. A dead or wedged *thread* is still restarted, and
+//! `storage_flush` still aborts, because nothing gates CQL writes on flush health.
+//!
+//! Last revised: 2026-10-06
+//! Last changed: the commit-log sync supervisor no longer aborts on a stall;
+//!   it counts and logs every deadline, keeps refusing writes, and recovers.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -822,6 +839,10 @@ pub struct CommitLogSyncSupervisor<T: CommitLogSyncTarget + ?Sized> {
     seen_sync_failures: u64,
     /// Stall deadlines already recorded for the current stall episode.
     stalls_recorded: u64,
+    /// `attempts_completed` at the previous sample. A completion since then
+    /// means the sync thread is alive and making progress, so the backlog
+    /// behind it is age, not the death this supervisor aborts on.
+    seen_sync_completions: u64,
 }
 
 impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
@@ -842,6 +863,7 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
             seen_panics: baseline.panics,
             seen_sync_failures: baseline.sync_failures,
             stalls_recorded: 0,
+            seen_sync_completions: baseline.attempts_completed,
         }
     }
 
@@ -945,6 +967,14 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
             );
             return;
         };
+        // `unsynced_for` is the age of the *oldest unsynced write*, not the
+        // duration of one in-flight fsync. On a node under continuous write the
+        // backlog never empties, so the episode below never ends even though the
+        // thread is completing fsyncs the whole time. An fsync completed since
+        // the previous sample is definitive proof of a live thread, so this
+        // sample is backlog age rather than the death this aborts on.
+        let made_progress = health.attempts_completed > self.seen_sync_completions;
+        self.seen_sync_completions = health.attempts_completed;
         let due =
             (waited.as_nanos() / health.stall_deadline.as_nanos()).min(u128::from(u64::MAX)) as u64;
         let first_new = self.stalls_recorded + 1;
@@ -955,15 +985,39 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
             waited.as_millis(),
             health.stall_deadline.as_millis()
         );
+        if made_progress {
+            // The thread completed an fsync since the previous sample, so the
+            // backlog is age rather than a dead thread. Count the episode once
+            // and never escalate: a slow disk is not a crash.
+            if first_new == 1
+                && self
+                    .status
+                    .record_failure(Child::CommitLogSync, FailureKind::Stall, &detail)
+            {
+                self.status.record_stall_cause(cause);
+                tracing::error!(
+                    task = Child::CommitLogSync.label(),
+                    %detail,
+                    "commit-log fsync backlog is past the stall deadline while the sync thread \
+                     keeps completing fsyncs; writes are refused and the node reports not ready \
+                     until the backlog clears"
+                );
+            }
+            return;
+        }
+
+        // No fsync completed since the previous sample: the thread is genuinely
+        // stuck. Count and log every deadline so the stall stays loud and
+        // alertable, but do NOT abort. The commit log refuses writes on its own
+        // while stalled (`SyncHealthSnapshot::impaired()`), so the node is
+        // acknowledging nothing and has no unflushed work to lose; aborting
+        // would only replay the commit log to rejoin and then abort again on the
+        // next stall. Staying up keeps the node observable and lets the stall
+        // heal on its own when an fsync finally completes.
         for deadline in
             (first_new..).take(newly_due.min(u64::from(self.intensity.max_restarts) + 2) as usize)
         {
             if deadline == 1 {
-                // The first deadline of an episode: writes are refused and the
-                // node is not ready, but a slow disk is not a dead thread, so
-                // an episode that ends in a completed fsync never counts toward
-                // the restart intensity. Only a stall that outlives further
-                // deadlines (an fsync that does not return) does.
                 if self
                     .status
                     .record_failure(Child::CommitLogSync, FailureKind::Stall, &detail)
@@ -977,7 +1031,15 @@ impl<T: CommitLogSyncTarget + ?Sized> CommitLogSyncSupervisor<T> {
                     );
                 }
             } else {
-                self.record_crash(FailureKind::Stall, detail.clone());
+                self.status
+                    .record_failure(Child::CommitLogSync, FailureKind::Stall, &detail);
+                tracing::error!(
+                    task = Child::CommitLogSync.label(),
+                    %detail,
+                    "commit-log fsync has still not completed; writes stay refused and the node \
+                     stays not ready. Not aborting: a stalled commit log refuses writes, so \
+                     staying up loses nothing and avoids a replay"
+                );
             }
         }
     }
