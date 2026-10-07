@@ -285,6 +285,11 @@ pub async fn reconcile_once_with(
 
         let mut edge_partitions_scanned = 0usize;
         let mut entries_processed = 0usize;
+        // Each entry is a read and a write at ALL: two network round trips.
+        // Up to RECONCILE_ENTRIES_IN_FLIGHT of them run together; one at a
+        // time, a memory-cluster heal outlasted every client for 30+ minutes.
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+        let progress_started = std::time::Instant::now();
         while let Some(partition) = partitions.next().await {
             let partition = match partition {
                 Ok(partition) => partition,
@@ -304,7 +309,12 @@ pub async fn reconcile_once_with(
 
             let expected = expected_entries(schema, edge_tid, &partition, &mut metrics);
             for (_, entry) in expected {
-                reconcile_entry(
+                if in_flight.len() >= RECONCILE_ENTRIES_IN_FLIGHT {
+                    if let Some(result) = in_flight.next().await {
+                        metrics.record(result);
+                    }
+                }
+                in_flight.push(reconcile_entry(
                     write_path,
                     &index,
                     &edge_table_fqn,
@@ -313,10 +323,18 @@ pub async fn reconcile_once_with(
                         started_at: pass_started_at,
                         mode,
                     },
-                    &mut metrics,
-                )
-                .await;
+                ));
                 entries_processed += 1;
+                if entries_processed.is_multiple_of(RECONCILE_PROGRESS_EVERY_ENTRIES) {
+                    tracing::info!(
+                        table = %edge_table_fqn,
+                        entries_processed,
+                        partitions_scanned = edge_partitions_scanned,
+                        errors = metrics.errors,
+                        elapsed_s = progress_started.elapsed().as_secs(),
+                        "adjacency reconcile: in progress"
+                    );
+                }
                 if should_yield_during_reconciliation(
                     entries_processed,
                     RECONCILE_YIELD_EVERY_CHECKED_ENTRIES,
@@ -331,6 +349,9 @@ pub async fn reconcile_once_with(
             ) {
                 tokio::task::yield_now().await;
             }
+        }
+        while let Some(result) = in_flight.next().await {
+            metrics.record(result);
         }
     }
 
@@ -615,6 +636,14 @@ struct AdjacencyIndex {
     strategy: ferrosa_cluster::ring::strategy::ReplicationStrategy,
 }
 
+/// Entry repairs a reconcile pass keeps in flight at once. Each holds one
+/// adjacency partition read or one row write; this bounds both the memory and
+/// the request load a pass puts on the cluster.
+const RECONCILE_ENTRIES_IN_FLIGHT: usize = 32;
+
+/// A reconcile pass logs its progress every this many entries.
+const RECONCILE_PROGRESS_EVERY_ENTRIES: usize = 10_000;
+
 const INDEX_CONSISTENCY: ferrosa_cluster::consistency::ConsistencyLevel =
     ferrosa_cluster::consistency::ConsistencyLevel::All;
 
@@ -741,6 +770,30 @@ enum Outcome {
     Rewritten,
 }
 
+/// What reconciling one entry did, folded into the pass's metrics by the
+/// caller (entries are reconciled concurrently, so none of them holds the
+/// metrics).
+#[derive(Debug, Clone, Copy)]
+enum EntryResult {
+    /// Already right, or left for the next pass (a concurrent write).
+    Unchanged,
+    Written(Outcome),
+    /// A read or write failed (logged); the pass is incomplete.
+    Failed,
+}
+
+impl ReconcileMetrics {
+    fn record(&mut self, result: EntryResult) {
+        match result {
+            EntryResult::Unchanged => {}
+            EntryResult::Written(Outcome::Repaired) => self.entries_repaired += 1,
+            EntryResult::Written(Outcome::Removed) => self.orphans_removed += 1,
+            EntryResult::Written(Outcome::Rewritten) => self.entries_rewritten += 1,
+            EntryResult::Failed => self.errors += 1,
+        }
+    }
+}
+
 /// Check one expected entry against the index and repair it.
 async fn reconcile_entry(
     write_path: &WritePath,
@@ -748,24 +801,22 @@ async fn reconcile_entry(
     edge_table_fqn: &str,
     entry: ExpectedEntry,
     pass: Pass,
-    metrics: &mut ReconcileMetrics,
-) {
+) -> EntryResult {
     let state =
         match read_entry_state(write_path, index, &entry.vertex_key, &entry.clustering).await {
             Ok(state) => state,
             Err(e) => {
-                metrics.errors += 1;
                 tracing::warn!(
                     table = %edge_table_fqn,
                     error = %e,
                     "adjacency reconcile: could not read an adjacency partition; \
                      skipping its repair for this pass"
                 );
-                return;
+                return EntryResult::Failed;
             }
         };
     let Some((row, at, outcome)) = entry_repair(&entry, &state, pass) else {
-        return;
+        return EntryResult::Unchanged;
     };
     let repair = Mutation::new(
         index.table_id.keyspace.clone(),
@@ -775,19 +826,15 @@ async fn reconcile_entry(
         at,
     );
     match write_mutation(write_path, index, repair).await {
-        Ok(()) => match outcome {
-            Outcome::Repaired => metrics.entries_repaired += 1,
-            Outcome::Removed => metrics.orphans_removed += 1,
-            Outcome::Rewritten => metrics.entries_rewritten += 1,
-        },
+        Ok(()) => EntryResult::Written(outcome),
         Err(e) => {
-            metrics.errors += 1;
             tracing::warn!(
                 table = %edge_table_fqn,
                 error = %e,
                 "adjacency reconcile: could not write an adjacency repair; \
                  the next pass retries"
             );
+            EntryResult::Failed
         }
     }
 }
