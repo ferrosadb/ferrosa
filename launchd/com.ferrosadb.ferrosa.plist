@@ -18,8 +18,14 @@
       which { Crashed = true } alone ignored, so a node stayed down until
       someone noticed. `launchctl bootout` / `unload` still stop ferrosa:
       they remove the job whatever KeepAlive says.
+      tests/ci/test_launchd_template.py pins this.
     * ThrottleInterval spaces restarts 10 s apart, so a node that fails at
       every start logs each failure instead of spinning.
+    * ProcessType is Interactive, never Background. Background is darwinbg
+      QoS: priority 4, efficiency cores only, ~100 ms timer leeway and
+      throttled I/O. Under host load that turned 4 ms commit-log syncs into
+      multi-second stalls, during which the node refuses writes.
+      ferrosa-storage/tests/launchd_template_qos.rs pins this.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -56,7 +62,7 @@
     <integer>10</integer>
 
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
 
     <key>StandardOutPath</key>
     <string>__HOME__/.ferrosa/logs/ferrosa.out.log</string>
