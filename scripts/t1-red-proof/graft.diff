@@ -1,0 +1,255 @@
+diff --git a/ferrosa-storage/src/self_heal/mod.rs b/ferrosa-storage/src/self_heal/mod.rs
+index a4cdcd43..2be1bf54 100644
+--- a/ferrosa-storage/src/self_heal/mod.rs
++++ b/ferrosa-storage/src/self_heal/mod.rs
+@@ -954,4 +954,109 @@ mod controller_tests {
+             0
+         );
+     }
++
++    /// A cluster whose `owners` blocks synchronously — a stand-in for the real
++    /// tick's blocking work (filesystem digest reads, the quarantine file move,
++    /// the bulk-lane repair probe). Copied verbatim from the fix so both
++    /// revisions measure identically.
++    struct SlowCluster {
++        delay: std::time::Duration,
++    }
++    impl ClusterView for SlowCluster {
++        fn this_host(&self) -> u64 {
++            0
++        }
++        fn owners(&self, _t: &TableKey) -> Option<Vec<u64>> {
++            std::thread::sleep(self.delay);
++            None
++        }
++        fn replica_posture(&self, _t: &TableKey) -> ReplicaPosture {
++            ReplicaPosture::SingleNode
++        }
++    }
++
++    /// Pre-fix RED proof for the isolation invariant. Identical test body to the
++    /// fix's `offloaded_tick_does_not_starve_a_coresident_liveness_task` — same
++    /// `SlowCluster` (500 ms block), same 20 ms liveness cadence, same
++    /// observer-thread wake-gap sampler — but the tick is driven **inline**, the
++    /// pre-fix production shape (`tokio::spawn(async move { controller.run_one_tick_guarded(); })`).
++    ///
++    /// On a current-thread runtime the inline tick parks the single executor
++    /// thread for the whole 500 ms blocking pass, so the observer measures a
++    /// worst wake gap of the whole block and `worst_gap < 300` fails.
++    #[test]
++    #[serial]
++    fn inline_tick_starves_a_coresident_liveness_task_prefix() {
++        use std::sync::Mutex;
++        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++
++        let rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .expect("current-thread runtime");
++        let (baseline_gap, worst_gap, elapsed) = rt.block_on(async {
++            let engine = table_dir_with_n_generations_engine(2);
++            let cluster = Arc::new(SlowCluster {
++                delay: std::time::Duration::from_millis(500),
++            });
++            let mut controller = SelfHealController::new(engine, cluster, SelfHealConfig::default());
++
++            let last_wake = Arc::new(Mutex::new(tokio::time::Instant::now()));
++            let worst_ms = Arc::new(AtomicU64::new(0));
++            let stop = Arc::new(AtomicBool::new(false));
++
++            let observer_last = last_wake.clone();
++            let observer_worst = worst_ms.clone();
++            let observer_stop = stop.clone();
++            let observer = std::thread::spawn(move || {
++                while !observer_stop.load(Ordering::Relaxed) {
++                    std::thread::sleep(std::time::Duration::from_millis(5));
++                    if let Ok(stamp) = observer_last.try_lock() {
++                        let gap =
++                            tokio::time::Instant::now().duration_since(*stamp).as_millis() as u64;
++                        observer_worst.fetch_max(gap, Ordering::Relaxed);
++                    }
++                }
++            });
++
++            let task_last = last_wake.clone();
++            let monitor = tokio::spawn(async move {
++                let mut next = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
++                loop {
++                    tokio::time::sleep_until(next).await;
++                    *task_last.lock().unwrap() = tokio::time::Instant::now();
++                    next += std::time::Duration::from_millis(20);
++                }
++            });
++
++            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
++            let baseline_gap = worst_ms.load(Ordering::Relaxed);
++
++            let started = tokio::time::Instant::now();
++            tokio::spawn(async move {
++                controller.run_one_tick_guarded();
++            })
++            .await
++            .expect("tick task joins");
++            let elapsed = started.elapsed();
++
++            stop.store(true, Ordering::Relaxed);
++            observer.join().expect("observer thread joins");
++            let worst_gap = worst_ms.load(Ordering::Relaxed);
++            monitor.abort();
++            (baseline_gap, worst_gap, elapsed)
++        });
++
++        println!(
++            "PREFIX_MEASURED elapsed_ms={} baseline_gap_ms={} worst_gap_ms={}",
++            elapsed.as_millis(),
++            baseline_gap,
++            worst_gap
++        );
++        assert!(
++            worst_gap < 300,
++            "a tick that blocks {elapsed:?} must not starve a co-resident liveness task: \
++             its worst wake gap was {worst_gap} ms (baseline {baseline_gap} ms)"
++        );
++    }
+ }
+diff --git a/ferrosa/src/runtime.rs b/ferrosa/src/runtime.rs
+index 9f6c853c..fbb7312e 100644
+--- a/ferrosa/src/runtime.rs
++++ b/ferrosa/src/runtime.rs
+@@ -479,4 +479,136 @@ mod tests {
+         std::env::remove_var("FERROSA_CQL_RUNTIME_THREADS");
+         std::env::remove_var("FERROSA_BACKGROUND_RUNTIME_THREADS");
+     }
++
++    use serial_test::serial;
++
++    /// Pre-fix RED proof for the T1 runtime-oversubscription fix.
++    ///
++    /// This is the *identical* measurement the fixed revision asserts: the live
++    /// OS-thread count immediately after building the real `RuntimeManager` in a
++    /// child process, against the *identical* forced expectation that the four
++    /// subsystem runtimes fit a 4-worker budget (+ a small slack). Same child,
++    /// same input; only the runtime plan differs.
++    ///
++    /// On this pre-fix revision `FERROSA_RUNTIME_WORKER_BUDGET` does not exist,
++    /// so `RuntimeManager::new()` spawns the historical raft=8/data=8/cql=8/
++    /// background=2 = **26** workers (measured 28 total OS threads on this
++    /// 18-vCPU host) and the bound is violated -> RED on the stated mechanism
++    /// (thread oversubscription), not on "some runtime is blocked".
++    #[test]
++    #[serial]
++    fn subsystem_worker_threads_stay_within_the_host_budget() {
++        const CHILD_ENV: &str = "FERROSA_TEST_RT_BUDGET_CHILD";
++        const MEASURED_TAG: &str = "RT_BUDGET_MEASURED";
++        const EXPECTED_BUDGET: usize = 4;
++        const NON_WORKER_SLACK: usize = 8;
++
++        if std::env::var_os(CHILD_ENV).is_some() {
++            let rm = RuntimeManager::new();
++            let measured = proc_threads::live_thread_count()
++                .expect("os thread census must be available on this platform");
++            println!(
++                "{MEASURED_TAG} budget={EXPECTED_BUDGET} measured={measured} cores={}",
++                detected_cores()
++            );
++            drop(rm);
++            return;
++        }
++
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "runtime::tests::subsystem_worker_threads_stay_within_the_host_budget",
++                "--nocapture",
++            ])
++            .env(CHILD_ENV, "1")
++            .env("FERROSA_RUNTIME_WORKER_BUDGET", EXPECTED_BUDGET.to_string())
++            .env_remove("FERROSA_RAFT_RUNTIME_THREADS")
++            .env_remove("FERROSA_DATA_RUNTIME_THREADS")
++            .env_remove("FERROSA_CQL_RUNTIME_THREADS")
++            .env_remove("FERROSA_BACKGROUND_RUNTIME_THREADS")
++            .output()
++            .expect("launch isolated thread-census test process");
++        let stdout = String::from_utf8_lossy(&output.stdout);
++        let line = stdout
++            .lines()
++            .find(|l| l.contains(MEASURED_TAG))
++            .unwrap_or_else(|| {
++                panic!(
++                    "child did not report a thread census; stdout=\n{stdout}\nstderr=\n{}",
++                    String::from_utf8_lossy(&output.stderr)
++                )
++            });
++        let measured = line
++            .split_whitespace()
++            .find_map(|kv| kv.strip_prefix("measured="))
++            .and_then(|v| v.parse::<usize>().ok())
++            .unwrap_or_else(|| panic!("missing `measured=` in census line: {line}"));
++        let bound = EXPECTED_BUDGET + NON_WORKER_SLACK;
++        assert!(
++            measured <= bound,
++            "subsystem runtimes spawned {measured} OS threads but the budget is \
++             {EXPECTED_BUDGET} (+{NON_WORKER_SLACK} slack) = {bound}; the four runtimes \
++             are oversubscribing the host ({line})"
++        );
++    }
++}
++
++/// Portable live-thread census (pre-fix RED proof harness). Mirrors the fixed
++/// revision's `proc_threads` module so both revisions measure identically.
++mod proc_threads {
++    /// Number of live OS threads in this process, or `None` when the platform
++    /// probe is unavailable.
++    pub fn live_thread_count() -> Option<usize> {
++        #[cfg(target_os = "linux")]
++        {
++            std::fs::read_dir("/proc/self/task")
++                .ok()
++                .map(|entries| entries.filter_map(|e| e.ok()).count())
++        }
++        #[cfg(target_os = "macos")]
++        {
++            macos::task_thread_count()
++        }
++        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
++        {
++            None
++        }
++    }
++
++    #[cfg(target_os = "macos")]
++    mod macos {
++        use std::os::raw::{c_int, c_uint};
++
++        type MachPortT = c_uint;
++
++        extern "C" {
++            static mach_task_self_: MachPortT;
++            fn task_threads(
++                task: MachPortT,
++                act_list: *mut *mut MachPortT,
++                act_list_cnt: *mut c_uint,
++            ) -> c_int;
++            fn vm_deallocate(target_task: MachPortT, address: usize, size: usize) -> c_int;
++        }
++
++        /// Count this task's threads via `task_threads`, releasing the returned
++        /// port array (the mach API does not free it).
++        pub fn task_thread_count() -> Option<usize> {
++            let mut list: *mut MachPortT = std::ptr::null_mut();
++            let mut count: c_uint = 0;
++            // SAFETY: `mach_task_self_` is the current task port; `task_threads`
++            // writes a freshly allocated array of `count` thread ports into
++            // `list`, which we free with `vm_deallocate` before returning.
++            unsafe {
++                let task = mach_task_self_;
++                if task_threads(task, &mut list, &mut count) != 0 {
++                    return None;
++                }
++                let bytes = (count as usize) * std::mem::size_of::<MachPortT>();
++                vm_deallocate(task, list as usize, bytes);
++            }
++            (count > 0).then_some(count as usize)
++        }
++    }
+ }
