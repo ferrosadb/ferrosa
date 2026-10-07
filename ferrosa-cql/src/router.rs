@@ -2842,7 +2842,7 @@ fn build_lwt_mutation(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     stmt: &Statement,
-) -> Result<(Vec<u8>, Vec<u8>), CqlError> {
+) -> Result<LwtWrite, CqlError> {
     use ferrosa_storage::Mutation;
 
     let now_micros = || -> Result<i64, CqlError> {
@@ -2874,6 +2874,7 @@ fn build_lwt_mutation(
     flag_accord_list_append_cells(&mut row, &list_append_cols);
 
     let key_bytes = key.key.as_bytes().to_vec();
+    let clustering = row.clustering.clone();
 
     let mutation = Mutation::new(
         table_id.keyspace.clone(),
@@ -2885,7 +2886,66 @@ fn build_lwt_mutation(
     let mut mutation_bytes = vec![0u8; mutation.serialized_size()];
     mutation.serialize_into(&mut mutation_bytes);
 
-    Ok((key_bytes, mutation_bytes))
+    Ok(LwtWrite {
+        key: key_bytes,
+        clustering,
+        mutation: mutation_bytes,
+    })
+}
+
+/// One LWT statement encoded for the Accord coordinator.
+#[derive(Debug)]
+struct LwtWrite {
+    /// Partition-key bytes: the Accord conflict-ordering key.
+    key: Vec<u8>,
+    /// Serialized clustering of the row the statement writes; empty for a
+    /// table without clustering columns. The IF condition is evaluated
+    /// against exactly this row of the partition.
+    clustering: Vec<u8>,
+    /// The encoded commit-log mutation each replica applies.
+    mutation: Vec<u8>,
+}
+
+/// The read-vote predicate for an LWT statement on `ks.table`.
+///
+/// Every conditional statement, `IF NOT EXISTS` included, reads its partition
+/// of `ks.table` from storage at `t`, and the coordinator evaluates the
+/// condition. `NotExists` is not used for them: the replica answers it from the
+/// Accord conflict index, which is keyed by partition-key bytes with no table
+/// or clustering, so an earlier Accord write to the same key in another table,
+/// or to another row of the partition, read as "exists" (t_7a0acbc8). It also
+/// never saw a row written without Accord.
+fn accord_read_predicate(
+    stmt: &Statement,
+    ks: &str,
+    table: &str,
+) -> ferrosa_cluster::accord::ReadPredicate {
+    use ferrosa_cluster::accord::ReadPredicate;
+    match crate::accord_router::classify_lwt(stmt) {
+        Some(_) => ReadPredicate::ReadRow {
+            keyspace: ks.to_string(),
+            table: table.to_string(),
+        },
+        // Not an LWT (serial consistency on an unconditional statement): keep
+        // the existence semantics this path has always had.
+        None => ReadPredicate::NotExists,
+    }
+}
+
+/// Whether `stmt`'s IF condition holds against the F+1-agreed partition read at
+/// `t`, evaluated on the row at `clustering`.
+///
+/// A statement that is not an LWT never applies through the gate.
+fn lwt_gate_verdict(
+    schema: &Schema,
+    ks: &str,
+    table: &str,
+    stmt: &Statement,
+    clustering: &[u8],
+    agreed_row: Option<&[u8]>,
+) -> Result<bool, CqlError> {
+    let agreed = decode_agreed_row_to_map(schema, ks, table, clustering, agreed_row)?;
+    Ok(crate::accord_router::eval_lwt_for_statement(stmt, agreed).is_some_and(|r| r.applied))
 }
 
 /// Encode a DML statement as a buffered [`TransactionWrite`] for a CQL
@@ -3226,11 +3286,15 @@ fn stage_dml(
 /// evaluation, using the SAME positional decode the local read path uses
 /// ([`bridge::partition_to_rows_with_storage_mapping`]).
 ///
-/// Returns `Ok(None)` when there is no agreed row (row absent at `t`).
+/// The replica returns every live row of the partition; only the row at
+/// `clustering` (the statement's own row) is decoded.
+///
+/// Returns `Ok(None)` when that row is absent at `t`.
 fn decode_agreed_row_to_map(
     schema: &Schema,
     ks: &str,
     table: &str,
+    clustering: &[u8],
     agreed_row: Option<&[u8]>,
 ) -> Result<Option<HashMap<String, Option<CqlValue>>>, CqlError> {
     use ferrosa_storage::Mutation;
@@ -3267,11 +3331,19 @@ fn decode_agreed_row_to_map(
         .collect();
     let storage_to_table = storage_to_table_indices(table_meta);
 
+    let rows: Vec<_> = mutation
+        .rows
+        .into_iter()
+        .filter(|row| row.clustering == clustering)
+        .collect();
+    if rows.is_empty() {
+        return Ok(None);
+    }
     let partition = ferrosa_sstable::types::Partition {
         key: mutation.key.clone(),
         deletion: ferrosa_sstable::types::DeletionTime::LIVE,
         static_row: None,
-        rows: mutation.rows.clone(),
+        rows,
     };
 
     let rows = bridge::partition_to_rows_with_storage_mapping(
@@ -3504,7 +3576,11 @@ async fn route_lwt_via_accord(
     // is the encoded commit-log Mutation that each replica decodes and writes in
     // the Apply phase. This replaces the former `b"lwt-placeholder-key"` stub
     // that persisted nothing (the phantom-write bug).
-    let (key, mutation) = build_lwt_mutation(state, ctx, stmt)?;
+    let LwtWrite {
+        key,
+        clustering,
+        mutation,
+    } = build_lwt_mutation(state, ctx, stmt)?;
 
     // Resolve the target keyspace/table for the generic-IF read-vote so replicas
     // (and the coordinator's own local reader) can target the read-at-`t`.
@@ -3529,20 +3605,10 @@ async fn route_lwt_via_accord(
         fallback_replicas,
     )?;
 
-    // Classify the IF predicate. `NotExists` uses the replica existence path;
-    // `Generic` reads the row at `t` so the coordinator evaluates `IF col=val`.
-    use crate::accord_router::{classify_lwt, LwtPredicateKind};
-    use ferrosa_cluster::accord::ReadPredicate;
-    let predicate_kind = classify_lwt(stmt);
-    let read_predicate = match predicate_kind {
-        Some(LwtPredicateKind::Generic) => ReadPredicate::ReadRow {
-            keyspace: ks.clone(),
-            table: table.clone(),
-        },
-        // NotExists, or a non-LWT statement reaching here (defensive): keep the
-        // existence semantics.
-        _ => ReadPredicate::NotExists,
-    };
+    // Every conditional statement reads its row of `ks.table` at `t` and the
+    // coordinator evaluates the IF clause; see `accord_read_predicate`.
+    let is_lwt = crate::accord_router::classify_lwt(stmt).is_some();
+    let read_predicate = accord_read_predicate(stmt, &ks, &table);
 
     // A replica-coordinator must cast and persist its own protocol votes against
     // the SAME state machine served by its inbound handlers. A node is absent
@@ -3562,16 +3628,16 @@ async fn route_lwt_via_accord(
 
     // Give the coordinator a local applier so its OWN replica persists the
     // mutation it coordinates (its self-send Apply RPC is unreachable). Without
-    // this the coordinator node silently lacks its own LWT writes. For the
-    // generic path also wire a local reader so its read-at-`t` counts toward the
-    // F+1 row agreement and matches the replicas that applied.
+    // this the coordinator node silently lacks its own LWT writes. For an LWT
+    // also wire a local reader so its read-at-`t` counts toward the F+1 row
+    // agreement and matches the replicas that applied.
     {
         let applier = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
             state.engine.clone(),
         ));
         driver = driver.with_local_applier(applier);
     }
-    if matches!(predicate_kind, Some(LwtPredicateKind::Generic)) {
+    if is_lwt {
         let reader = Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
             state.engine.clone(),
         ));
@@ -3596,18 +3662,20 @@ async fn route_lwt_via_accord(
         let gate_ks = ks.clone();
         let gate_table = table.clone();
         let gate_stmt = stmt.clone();
+        let gate_clustering = clustering.clone();
         let gate_err: Arc<std::sync::Mutex<Option<CqlError>>> =
             Arc::new(std::sync::Mutex::new(None));
         let gate_err_w = gate_err.clone();
         let gate = Box::new(move |row: Option<&[u8]>| -> bool {
-            match decode_agreed_row_to_map(&schema, &gate_ks, &gate_table, row) {
-                Ok(agreed) => {
-                    crate::accord_router::eval_lwt_for_statement(&gate_stmt, agreed)
-                        .map(|r| r.applied)
-                        // Not an LWT reaching the gate (defensive): never silently apply
-                        // — treat as condition-not-met so the write does not persist.
-                        .unwrap_or(false)
-                }
+            match lwt_gate_verdict(
+                &schema,
+                &gate_ks,
+                &gate_table,
+                &gate_stmt,
+                &gate_clustering,
+                row,
+            ) {
+                Ok(applied) => applied,
                 Err(e) => {
                     *gate_err_w.lock().expect("gate_err mutex poisoned") = Some(e);
                     // Refuse to apply on a decode error (fail closed); the real
@@ -3619,10 +3687,11 @@ async fn route_lwt_via_accord(
         driver = driver.with_condition_gate(gate);
         // Stash the error cell so the post-run match can surface a decode failure
         // rather than reporting a bogus [applied]=false.
-        return finish_lwt_via_accord(state, &ks, &table, driver, Some(gate_err)).await;
+        return finish_lwt_via_accord(state, &ks, &table, &clustering, driver, Some(gate_err))
+            .await;
     }
 
-    finish_lwt_via_accord(state, &ks, &table, driver, None).await
+    finish_lwt_via_accord(state, &ks, &table, &clustering, driver, None).await
 }
 
 /// Select the Accord participant replicas for a single-key LWT.
@@ -3672,6 +3741,7 @@ async fn finish_lwt_via_accord(
     state: &SharedState,
     ks: &str,
     table: &str,
+    clustering: &[u8],
     mut driver: ferrosa_cluster::accord::AccordCoordinatorDriver,
     gate_err: Option<Arc<std::sync::Mutex<Option<CqlError>>>>,
 ) -> Result<RouteResult, CqlError> {
@@ -3709,7 +3779,8 @@ async fn finish_lwt_via_accord(
             } else {
                 Some(current_row.as_slice())
             };
-            let agreed = decode_agreed_row_to_map(&state.schema, ks, table, agreed_bytes)?;
+            let agreed =
+                decode_agreed_row_to_map(&state.schema, ks, table, clustering, agreed_bytes)?;
             let lwt = crate::accord_router::LwtResult {
                 applied: false,
                 current_values: agreed.unwrap_or_default(),
@@ -34343,8 +34414,11 @@ mod tests {
 
         // PRODUCER: the router builds the (key, mutation) wire payload exactly
         // as the Accord coordinator would ship it in the Apply phase.
-        let (key_bytes, mutation_bytes) =
-            build_lwt_mutation(&state, &ctx, &stmt).expect("router must build the LWT mutation");
+        let LwtWrite {
+            key: key_bytes,
+            mutation: mutation_bytes,
+            ..
+        } = build_lwt_mutation(&state, &ctx, &stmt).expect("router must build the LWT mutation");
 
         // The conflict-ordering key must be the real partition-key bytes —
         // proving real key extraction (not the old `b"lwt-placeholder-key"`).
@@ -34392,6 +34466,188 @@ mod tests {
         assert_eq!(
             balance_cell.timestamp, 777,
             "persisted cell timestamp must be the Accord-agreed t, not the coordinator wall clock"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Accord LWT condition evaluation is per table and per clustering row
+    // (t_7a0acbc8).
+    //
+    // The replica used to answer IF NOT EXISTS from the Accord conflict index,
+    // keyed by partition-key bytes alone: any earlier applied Accord write with
+    // the same key bytes, in ANY table or ANY clustering row, made the row
+    // "exist". fmem's revision append (by_id then head, both keyed by
+    // (tenant_id, application_id)) was refused on every new application.
+    //
+    // These tests drive the production pieces in order: the router's mutation,
+    // the replica's applier and storage reader, and the coordinator's verdict.
+    // -----------------------------------------------------------------------
+
+    /// Apply one statement's Accord mutation at `t`, as a replica would.
+    async fn apply_accord_lwt(state: &SharedState, ctx: &RequestContext<'_>, cql: &str, t: u64) {
+        use ferrosa_cluster::accord::apply::{ApplyMutation, EngineStorageApplier, StorageApplier};
+        use ferrosa_common::accord::{Timestamp, TxnId};
+
+        let stmt = crate::parser::parse(cql).unwrap();
+        let write = build_lwt_mutation(state, ctx, &stmt).expect("build the LWT mutation");
+        let agreed = Timestamp::synthetic(t);
+        EngineStorageApplier::new(state.engine.clone())
+            .apply(
+                TxnId::new(t, agreed),
+                ApplyMutation {
+                    data: write.mutation,
+                    t: agreed,
+                    deps: vec![],
+                },
+            )
+            .expect("apply the LWT mutation");
+    }
+
+    /// The coordinator's verdict for `cql`, from the row a replica reads at `t`
+    /// with the predicate the router sends.
+    fn accord_lwt_verdict(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        cql: &str,
+        t: u64,
+    ) -> bool {
+        use ferrosa_cluster::accord::apply::{EngineStorageReader, StorageReader};
+        use ferrosa_cluster::accord::ReadPredicate;
+        use ferrosa_common::accord::Timestamp;
+
+        let stmt = crate::parser::parse(cql).unwrap();
+        let (ks, table) = lwt_keyspace_table(ctx, &stmt).unwrap();
+        let write = build_lwt_mutation(state, ctx, &stmt).expect("build the LWT mutation");
+        let ReadPredicate::ReadRow {
+            keyspace: read_ks,
+            table: read_table,
+        } = accord_read_predicate(&stmt, &ks, &table)
+        else {
+            panic!("a conditional statement must read its own row at t");
+        };
+        assert_eq!(
+            (read_ks.as_str(), read_table.as_str()),
+            (ks.as_str(), table.as_str())
+        );
+        let row = EngineStorageReader::new(state.engine.clone())
+            .read_row_at(&read_ks, &read_table, &write.key, Timestamp::synthetic(t))
+            .expect("replica read at t");
+        lwt_gate_verdict(
+            &state.schema,
+            &ks,
+            &table,
+            &stmt,
+            &write.clustering,
+            row.as_deref(),
+        )
+        .expect("decode the agreed row")
+    }
+
+    async fn lwt_tables(state: &SharedState, ctx: &RequestContext<'_>) {
+        for ddl in [
+            "CREATE KEYSPACE lwt_x WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE lwt_x.by_id (tenant text, app text, rev text, d text, \
+             PRIMARY KEY ((tenant, app), rev))",
+            "CREATE TABLE lwt_x.head (tenant text, app text, rev text, PRIMARY KEY ((tenant, app)))",
+        ] {
+            route(state, ctx, crate::parser::parse(ddl).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_if_not_exists_ignores_a_row_with_the_same_key_in_another_table() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        lwt_tables(&state, &ctx).await;
+
+        apply_accord_lwt(
+            &state,
+            &ctx,
+            "INSERT INTO lwt_x.by_id (tenant, app, rev, d) VALUES ('t', 'a', 'r1', 'x') IF NOT EXISTS",
+            100,
+        )
+        .await;
+
+        assert!(
+            accord_lwt_verdict(
+                &state,
+                &ctx,
+                "INSERT INTO lwt_x.head (tenant, app, rev) VALUES ('t', 'a', 'r1') IF NOT EXISTS",
+                200,
+            ),
+            "a by_id row must not make the head row exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_if_not_exists_is_decided_by_the_clustering_row_not_the_partition() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        lwt_tables(&state, &ctx).await;
+
+        apply_accord_lwt(
+            &state,
+            &ctx,
+            "INSERT INTO lwt_x.by_id (tenant, app, rev, d) VALUES ('t', 'a', 'r1', 'x') IF NOT EXISTS",
+            100,
+        )
+        .await;
+
+        assert!(
+            accord_lwt_verdict(
+                &state,
+                &ctx,
+                "INSERT INTO lwt_x.by_id (tenant, app, rev, d) VALUES ('t', 'a', 'r2', 'y') IF NOT EXISTS",
+                200,
+            ),
+            "revision r2 is a different row of the same partition and does not exist"
+        );
+        assert!(
+            !accord_lwt_verdict(
+                &state,
+                &ctx,
+                "INSERT INTO lwt_x.by_id (tenant, app, rev, d) VALUES ('t', 'a', 'r1', 'z') IF NOT EXISTS",
+                200,
+            ),
+            "revision r1 exists, so a second insert of it must not apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conditional_update_compares_its_own_clustering_row() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = test_ctx(&auth, &no_ks);
+        lwt_tables(&state, &ctx).await;
+
+        for (rev, d, t) in [("r1", "first", 100), ("r2", "second", 110)] {
+            apply_accord_lwt(
+                &state,
+                &ctx,
+                &format!(
+                    "INSERT INTO lwt_x.by_id (tenant, app, rev, d) VALUES ('t', 'a', '{rev}', '{d}') IF NOT EXISTS"
+                ),
+                t,
+            )
+            .await;
+        }
+
+        assert!(
+            accord_lwt_verdict(
+                &state,
+                &ctx,
+                "UPDATE lwt_x.by_id SET d = 'next' WHERE tenant = 't' AND app = 'a' AND rev = 'r2' IF d = 'second'",
+                200,
+            ),
+            "the condition must be read from row r2, not the partition's first row r1"
         );
     }
 
