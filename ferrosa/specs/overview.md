@@ -1,7 +1,7 @@
 ---
 crate: ferrosa
 status: implemented
-last_updated: 2026-08-07
+last_updated: 2026-10-07
 executive_summary: >
   The top-level binary and composition root. It constructs one StorageEngine,
   one Schema, one ModeController, one PeerManager, and one CdcBus, then wires
@@ -33,7 +33,7 @@ off the bulk-write path.
 | Module | Responsibility |
 |--------|----------------|
 | `main.rs` (~2.8k LoC) | The full startup sequence + the maintenance loop + graceful shutdown; pure config/host_id helpers are unit-tested here |
-| `runtime.rs` | `RuntimeManager` — dedicated `raft` / `data` / `cql` / `background` tokio runtimes |
+| `runtime.rs` | `RuntimeManager` — dedicated `raft` / `data` / `cql` / `background` tokio runtimes. The four subsystem runtimes share one worker budget derived from `available_parallelism()` (`FERROSA_RUNTIME_WORKER_BUDGET` overrides the total; the per-runtime `FERROSA_*_RUNTIME_THREADS` vars become relative weights), so their combined async workers stay within the host's parallelism instead of the historical fixed raft=8/data=8/cql=8/background=2 = 26 (which oversubscribed a 4-vCPU runner and let the CQL runtime's 100 ms liveness tick miss by seconds). The cql blocking pool is also capped (`cores*8`, min 8) rather than left at tokio's uncapped 512 default; the raft runtime is deliberately not capped. Plan is pure (`plan_threads`/`partition_worker_budget`) and unit-tested; `subsystem_worker_threads_stay_within_the_host_budget` measures the real OS-thread count in a child process |
 | `repair_wiring.rs` | `BinaryRepairContext`, `build_repair_executor` — binds self-heal + anti-entropy repair to the live ring/peer manager |
 | `cql_broadcast.rs` | `parse_cql_broadcast` — externally-advertised CQL address for `system.local` |
 | `web/` | Axum console: `api`, `auth`, `debug`, `observability`, `readiness`, `snapshots`, `static_files`, `ws` |

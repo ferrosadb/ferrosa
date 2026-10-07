@@ -26,7 +26,7 @@ It is the only crate in the workspace that depends on all the front-ends at once
 | `main.rs` (~2.8k LoC) | The whole startup sequence: config → host_id → storage → schema → cluster → listeners → maintenance loop → graceful shutdown |
 | `maintenance.rs` | The storage maintenance loop (periodic + urgent flush, compaction polling, commit-log GC, schema persist, S3 sync), run under `supervisor` |
 | `supervisor.rs` | OTP-style supervision of the maintenance loop and its flusher: restart within an intensity (`FERROSA_SUPERVISOR_MAX_RESTARTS`, default 3, per `FERROSA_SUPERVISOR_PERIOD_SECS`, default 3600), stall detection (`FERROSA_FLUSH_STALL_DEADLINE_SECS`, default 300), `/readyz` + `ferrosa_supervised_task_*` metrics, and escalation (commit-log sync, then abort) |
-| `runtime.rs` | `RuntimeManager` — dedicated tokio runtimes (raft, data, cql, background) so subsystems don't contend on one shared pool |
+| `runtime.rs` | `RuntimeManager` — dedicated tokio runtimes (raft, data, cql, background) so subsystems don't contend on one shared pool; the four runtimes share a single worker budget derived from `available_parallelism()` (`FERROSA_RUNTIME_WORKER_BUDGET` overrides the total; the per-runtime `FERROSA_*_RUNTIME_THREADS` vars become relative weights), so they cannot oversubscribe a CPU-scarce host |
 | `repair_wiring.rs` | `BinaryRepairContext` / `build_repair_executor` — binds the self-heal + anti-entropy repair scheduler to the live ring |
 | `cql_broadcast.rs` | `parse_cql_broadcast` — resolves the externally-advertised CQL address/port for `system.local` |
 | `web/` | Axum observability console + cluster REST API + auth middleware + readiness probe + WebSocket + embedded UI + PITR snapshot/restore endpoints |

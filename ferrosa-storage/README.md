@@ -742,7 +742,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `FERROSA_VECTOR_REPAIR_CONCURRENCY` (default 1) rebuilds at once; ANN over
   the index refuses (retryable) meanwhile, `/readyz` stays ready with
   `degraded_recall`, and `ferrosa_index_repairs_total{index,reason}` /
-  `ferrosa_index_invalid{table,index}` report it.
+  `ferrosa_index_invalid{table,index}` report it. Each tick (the digest reads
+  that detect corruption, the quarantine file move, the bulk-lane repair probe)
+  runs on the blocking pool via `spawn_blocking`, not inline on an async worker,
+  so a slow pass cannot park a runtime worker and starve a co-resident liveness
+  task (ST-87).
 - **Replay without a schema degrades instead of exiting** (`replay_set_aside.rs`,
   FMEA ST-52) — when no `schema.json`/`storage-schema.json` is usable, replay
   buffers up to `FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA` mutations in memory

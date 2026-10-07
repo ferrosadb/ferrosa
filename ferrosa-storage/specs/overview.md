@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-10-03
+last_updated: 2026-10-07
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -60,7 +60,7 @@ without changing the process environment. Digest verification is unconditional.
 | `cache`, `pin_config` | `LocalCache` LRU + pinning; NVMe `PinMode` |
 | `index/` | Index state tracker (registered/pending/current completeness; compaction swaps retire inputs, failed/stalled backfills healed by `StorageEngine::heal_secondary_index_backfills`, ST-85), build scheduler, local/remote/off backends, artifact manifest, virtual table; `LocalBackend` resolves flat and engine table-dir SSTable layouts and writes sidecars beside table SSTables |
 | `snapshot/`, `restore/` | S3 snapshot manager + restore manager + validation (PITR); `restore/intent.rs` carries the restore-on-boot intent (`FERROSA_RESTORE_*`) and the apply-once marker that keeps a reboot-surviving env var from re-restoring on every start |
-| `quarantine`, `self_heal/` | Malformed-row quarantine sidecar; deterministic self-heal control loop + corrupt-SSTable detector |
+| `quarantine`, `self_heal/` | Malformed-row quarantine sidecar; deterministic self-heal control loop + corrupt-SSTable detector. The controller's tick (filesystem digest reads, the quarantine file move, the bulk-lane repair probe) runs off the async worker via `spawn_blocking` (`offload_one_tick`), so a slow pass does not park a runtime worker and starve a co-resident liveness task |
 | `accord/` | Per-shard conflict index + protocol log for Accord transactions |
 | `timeseries/` | Ring aggregation, late-data, WASM aggregates, materialization |
 | `data_store` | `DataStore` trait + `LocalDataStore` |
