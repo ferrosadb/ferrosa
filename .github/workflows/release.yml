@@ -457,28 +457,37 @@ jobs:
           set -euo pipefail
           unwind_prefix="$RUNNER_TEMP/musl-libunwind"
 
-          # TWO libunwinds are genuinely needed, and neither may go on the
-          # LIBRARY SEARCH PATH, because `-lunwind` binds to the first match and
-          # one would displace the other:
+          # THREE things must hold for jemalloc's heap profiler to work on musl.
+          # Each is a distinct failure mode; all three were previously wrong.
           #
-          #   * the sysroot archive supplies the C++ ABI symbols the Rust link
-          #     needs -- _Unwind_Resume, __register_frame, __deregister_frame.
-          #     Nothing else defines them: this link runs with -nodefaultlibs,
-          #     so libgcc is never pulled in.
-          #   * the hand-built archive supplies the libunwind C API jemalloc's
-          #     heap profiler calls -- unw_backtrace, unw_flush_cache,
-          #     unw_set_caching_policy. The sysroot archive does NOT have those.
+          # 1. jemalloc's configure must FIND libunwind, or it silently falls
+          #    back to the JEMALLOC_PROF_GCC frame-pointer walker and the first
+          #    sampled allocation segfaults in an optimized (frameless) build:
+          #      prof_backtrace_impl (prof_sys.c, BT_FRAME(4)) -> SIGSEGV
+          #    configure gates libunwind on
+          #      AC_CHECK_HEADERS([libunwind.h])          # satisfied by CPPFLAGS
+          #      AC_CHECK_LIB([unwind],[unw_backtrace])   # needs -L, not headers
+          #    so LDFLAGS must expose the library path. That -L is consumed only
+          #    by jemalloc-sys's configure; it is NOT a Rust link search path.
           #
-          # This is why `-L $unwind_prefix/lib` must not be used. With it, the
-          # hand-built archive shadowed the sysroot one and the link died with
-          # ~47 `undefined reference to _Unwind_Resume`. Measured both ways on a
-          # crate using tikv-jemallocator/profiling_libunwind:
+          # 2. BOTH libunwinds are needed, linked by explicit path (a Rust `-L`
+          #    search path would let `-lunwind` bind to whichever comes first):
+          #      * the sysroot archive supplies the C++ ABI symbols the Rust link
+          #        needs -- _Unwind_Resume, __register_frame, __deregister_frame.
+          #        Nothing else defines them: the link runs with -nodefaultlibs,
+          #        so libgcc is never pulled in.
+          #      * the hand-built archive supplies the libunwind C API jemalloc's
+          #        profiler calls -- unw_backtrace, unw_flush_cache,
+          #        unw_set_caching_policy. The sysroot archive lacks those.
           #
-          #   -L <custom>/lib                        -> exit 101, 47 undefined
-          #   -C link-arg=<custom>/lib/libunwind.a   -> exit 0, static-pie, no INTERP
-          #
-          # So both are linked by explicit path. See
-          # tests/ci/test_profiling_libunwind_link.py.
+          # 3. Both archives and the musl libc must sit in ONE ld --start-group.
+          #    Pulling the hand-built archive's objects in makes ld need musl
+          #    libc (`strcat`, `sigprocmask`), which under -nodefaultlibs is only
+          #    in scope inside the group. Measured on x86_64 musl:
+          #      group(custom, sysroot)          -> exit 101, sigprocmask undefined
+          #      group(custom, sysroot, libc.a)  -> exit 0, unw_backtrace linked,
+          #                                         --version ok, .heap written
+          # See tests/ci/test_profiling_libunwind_link.py.
           sysroot_libunwind=""
           for candidate in "$(rustc --print target-libdir --target "${{ matrix.target }}")/self-contained/libunwind.a" \
                            "$(rustc --print sysroot)/lib/rustlib/${{ matrix.target }}/lib/self-contained/libunwind.a"; do
@@ -488,12 +497,24 @@ jobs:
             echo "::error::no sysroot libunwind for ${{ matrix.target }}; it is what defines _Unwind_Resume under -nodefaultlibs" >&2
             exit 1
           fi
+          sysroot_libc=""
+          for candidate in "$(rustc --print target-libdir --target "${{ matrix.target }}")/self-contained/libc.a" \
+                           "$(rustc --print sysroot)/lib/rustlib/${{ matrix.target }}/lib/self-contained/libc.a"; do
+            if [ -f "$candidate" ]; then sysroot_libc="$candidate"; break; fi
+          done
+          if [ -z "$sysroot_libc" ]; then
+            echo "::error::no sysroot libc.a for ${{ matrix.target }}; the hand-built libunwind needs musl libc (strcat, sigprocmask) inside the ld --start-group" >&2
+            exit 1
+          fi
           echo "custom  libunwind: $unwind_prefix/lib/libunwind.a"
           echo "sysroot libunwind: $sysroot_libunwind"
+          echo "sysroot libc     : $sysroot_libc"
 
           export CPPFLAGS="-I$unwind_prefix/include"
-          # Deliberately NO -L and NO -Lnative for unwind_prefix.
-          export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=$unwind_prefix/lib/libunwind.a -C link-arg=$sysroot_libunwind"
+          # Consumed by jemalloc-sys's configure only (see 1.); not a Rust search path.
+          export LDFLAGS="-L$unwind_prefix/lib"
+          # Both archives plus musl libc in one group, by explicit path (2. and 3.).
+          export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--start-group -C link-arg=$unwind_prefix/lib/libunwind.a -C link-arg=$sysroot_libunwind -C link-arg=$sysroot_libc -C link-arg=-Wl,--end-group"
           cargo build --locked --profile profiling \
             --target "${{ matrix.target }}" \
             -p ferrosa --bin ferrosa --features ferrosa/full,ferrosa/profiling

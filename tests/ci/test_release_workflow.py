@@ -178,15 +178,27 @@ class ReleaseWorkflowTest(unittest.TestCase):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn('bash .github/scripts/build-musl-libunwind.sh "${{ matrix.target }}" "$unwind_prefix"', workflow)
         self.assertIn('CPPFLAGS="-I$unwind_prefix/include"', workflow)
-        # Both libunwinds are passed as explicit link args, never as search
-        # directories. `-L`/`-Lnative` for the hand-built archive shadowed
-        # Rust's sysroot libunwind, so `-lunwind` stopped resolving
-        # _Unwind_Resume and the musl link died with ~47 undefined references.
-        self.assertNotIn('LDFLAGS="-L$unwind_prefix/lib"', workflow)
+        # jemalloc's configure must FIND libunwind: AC_CHECK_HEADERS is satisfied
+        # by CPPFLAGS, but AC_CHECK_LIB([unwind],[unw_backtrace]) needs -L. With
+        # headers and no library path the check fails, enable_prof_libunwind
+        # silently reverts, and jemalloc uses the JEMALLOC_PROF_GCC
+        # frame-pointer walker, which segfaults on the first sampled allocation.
+        # This LDFLAGS is consumed only by jemalloc-sys's configure; it is not a
+        # Rust link search path.
+        self.assertIn('LDFLAGS="-L$unwind_prefix/lib"', workflow)
+        # For the RUST link, both libunwinds (and musl libc) go in one
+        # --start-group, by explicit path. `-Lnative`/`-L` on the Rust side
+        # shadowed Rust's sysroot libunwind, so `-lunwind` stopped resolving
+        # _Unwind_Resume; and without libc.a in the group the hand-built
+        # archive's musl-libc references (strcat, sigprocmask) go unresolved.
         self.assertNotIn("Lnative=$unwind_prefix/lib", workflow)
+        self.assertIn("-Wl,--start-group", workflow)
+        self.assertIn("-Wl,--end-group", workflow)
         self.assertIn('link-arg=$unwind_prefix/lib/libunwind.a', workflow)
         self.assertIn('link-arg=$sysroot_libunwind', workflow)
+        self.assertIn('link-arg=$sysroot_libc', workflow)
         self.assertIn("self-contained/libunwind.a", workflow)
+        self.assertIn("self-contained/libc.a", workflow)
         self.assertIn("if readelf --program-headers \"$profiling_binary\" | grep 'INTERP'; then", workflow)
 
         build_script = ROOT / ".github" / "scripts" / "build-musl-libunwind.sh"
