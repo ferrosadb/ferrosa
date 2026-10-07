@@ -1148,10 +1148,25 @@ mod cluster {
         }
     }
 
-    /// A production handler behind a fixed network delay.
+    /// Requests a replica is serving at once, and the most it ever served.
+    #[derive(Default)]
+    struct Concurrency {
+        now: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Concurrency {
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A production handler behind a fixed network delay, counting how many
+    /// requests it serves at once.
     struct Delayed<H> {
         inner: H,
         delay: std::time::Duration,
+        concurrency: Arc<Concurrency>,
     }
 
     #[async_trait::async_trait]
@@ -1163,8 +1178,13 @@ mod cluster {
             from: PeerId,
             msg: ferrosa_net::message::Message,
         ) -> Option<ferrosa_net::message::Message> {
+            use std::sync::atomic::Ordering;
+            let now = self.concurrency.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.concurrency.peak.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
-            self.inner.handle(from, msg).await
+            let reply = self.inner.handle(from, msg).await;
+            self.concurrency.now.fetch_sub(1, Ordering::SeqCst);
+            reply
         }
     }
 
@@ -1200,26 +1220,31 @@ mod cluster {
     /// A remote replica: its own storage, served by the production write and
     /// read handlers.
     async fn start_replica(storage: Arc<StorageEngine>) -> (Arc<RpcServer>, String, Uuid) {
-        start_replica_with_latency(storage, std::time::Duration::ZERO).await
+        let (server, addr, host, _) =
+            start_replica_with_latency(storage, std::time::Duration::ZERO).await;
+        (server, addr, host)
     }
 
     /// [`start_replica`], with every request answered after `delay`.
     async fn start_replica_with_latency(
         storage: Arc<StorageEngine>,
         delay: std::time::Duration,
-    ) -> (Arc<RpcServer>, String, Uuid) {
+    ) -> (Arc<RpcServer>, String, Uuid, Arc<Concurrency>) {
+        let concurrency = Arc::new(Concurrency::default());
         let registry = Arc::new(HandlerRegistry::new());
         registry.register(
             MsgType::MutationForward,
             Arc::new(Delayed {
                 inner: MutationForwardHandler::new(Arc::clone(&storage)),
                 delay,
+                concurrency: Arc::clone(&concurrency),
             }),
         );
         // As `controller::cluster` registers it in production.
         let read_handler = Arc::new(Delayed {
             inner: ReadRequestHandler::new(Arc::clone(&storage)),
             delay,
+            concurrency: Arc::clone(&concurrency),
         });
         registry.register(MsgType::ReadRequest, read_handler.clone());
         registry.register(MsgType::PartitionSuffixReadRequest, read_handler);
@@ -1230,7 +1255,7 @@ mod cluster {
         };
         let server = Arc::new(RpcServer::new(config, host_id, registry));
         let addr = server.start_and_get_addr().await.unwrap();
-        (server, addr.to_string(), host_id)
+        (server, addr.to_string(), host_id, concurrency)
     }
 
     /// Tombstone `edges`' OUT and IN entries in `storage`, as a node's own
@@ -1447,7 +1472,7 @@ mod cluster {
             )
             .unwrap();
         tombstone_entries(&remote, &live, now_micros());
-        let (server, remote_addr, remote_host) =
+        let (server, remote_addr, remote_host, concurrency) =
             start_replica_with_latency(Arc::clone(&remote), delay).await;
 
         let local_host = Uuid::new_v4();
@@ -1478,19 +1503,23 @@ mod cluster {
             std::time::Duration::from_secs(300),
         );
 
-        // Every expected entry (two per live edge, plus the deleted edges'
-        // entries) is one read and one write to the remote replica.
+        // Every expected entry (two per live edge, plus the deleted edges')
+        // is one read and one write to the remote replica. One entry at a
+        // time, the replica never serves more than one heal request at once.
+        // Measured overlap, not wall-clock time: a time bound (a quarter of
+        // the sequential cost) passed locally and missed by 2% on a slow CI
+        // runner (1.10 s against 1.08 s), with the repairs plainly in flight
+        // together.
         let entries = 2 * all.len();
-        let sequential = delay * 2 * entries as u32;
-        let started = std::time::Instant::now();
         fresh
             .ensure_adjacency_ready_for_test(KEYSPACE)
             .await
             .expect("the heal completes against both replicas");
-        let took = started.elapsed();
         assert!(
-            took * 4 < sequential,
-            "the heal of {entries} entries took {took:?}; one entry at a time costs {sequential:?}"
+            concurrency.peak() >= 8,
+            "the heal of {entries} entries never had more than {} requests at the replica \
+             at once; one entry at a time is 1",
+            concurrency.peak()
         );
         // And it is still a complete heal.
         assert_clean(
