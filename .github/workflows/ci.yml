@@ -63,6 +63,10 @@ jobs:
       # quietly weakened is not a control.
       - name: Check OOM-audit daily workflow contract
         run: python3 -m unittest tests.ci.test_oom_audit_daily_workflow
+      # A node that fails loud (exit 1) must be restarted by launchd, not left
+      # down until someone notices (node3, 35 h on 2026-10-06).
+      - name: Check the LaunchAgent restarts a failed node
+        run: python3 -m unittest tests.ci.test_launchd_template
 
   no-memory-public:
     name: memory-public is NOT TO BE USED

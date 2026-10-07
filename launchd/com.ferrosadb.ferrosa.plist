@@ -12,8 +12,14 @@
     * This is a per-user LaunchAgent, NOT a system-wide LaunchDaemon.
     * Ferrosa does not accept CLI flags; the config path is provided via
       the FERROSA_CONFIG environment variable (see EnvironmentVariables).
-    * KeepAlive { Crashed = true } restarts on crash but NOT on clean exit,
-      so `launchctl bootout` / `launchctl unload` stop ferrosa as expected.
+    * KeepAlive { SuccessfulExit = false } restarts ferrosa whenever it exits
+      non-zero or dies on a signal, and never after a clean exit (status 0).
+      Ferrosa fails loud: an unrecoverable startup error exits with status 1,
+      which { Crashed = true } alone ignored, so a node stayed down until
+      someone noticed. `launchctl bootout` / `unload` still stop ferrosa:
+      they remove the job whatever KeepAlive says.
+    * ThrottleInterval spaces restarts 10 s apart, so a node that fails at
+      every start logs each failure instead of spinning.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -42,9 +48,12 @@
 
     <key>KeepAlive</key>
     <dict>
-        <key>Crashed</key>
-        <true/>
+        <key>SuccessfulExit</key>
+        <false/>
     </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
 
     <key>ProcessType</key>
     <string>Background</string>
