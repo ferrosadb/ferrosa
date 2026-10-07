@@ -5876,6 +5876,10 @@ thread_local! {
     /// point-reading every matched partition. `#[tokio::test]` uses a
     /// current-thread runtime, so the arm's increments land on the test thread.
     static FTS_MATCH_PARTITION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only: rows the `fts_match` arm fetched from storage, before it
+    /// keeps the matched ones. A hit in a wide partition must not fetch the
+    /// whole partition.
+    static FTS_MATCH_ROWS_FETCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -5956,6 +5960,54 @@ async fn route_select_user_table(
         .await
         .map_err(|e| e.in_table(&format!("{ks}.{}", s.table)))
 }
+
+/// A matched partition's rows that an `fts_match` hit can need: each matched
+/// row by its full primary key, at the request's consistency. The whole
+/// partition is read instead when the table has no clustering columns (the
+/// partition is the row) or when more than [`FTS_ROW_READS_PER_PARTITION`]
+/// rows matched (one read beats that many). The caller keeps only the rows
+/// whose full key matched either way.
+async fn fts_read_matched_rows(
+    state: &SharedState,
+    table_id: &ferrosa_storage::TableId,
+    key: &ferrosa_common::DecoratedKey,
+    clusterings: &[&[u8]],
+    consistency: ConsistencyLevel,
+    strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
+) -> Result<Option<ferrosa_sstable::types::Partition>, CqlError> {
+    let write_path = state.write_path.load();
+    let by_row = !clusterings.is_empty()
+        && clusterings.len() <= FTS_ROW_READS_PER_PARTITION
+        && clusterings.iter().all(|ck| !ck.is_empty());
+    if !by_row {
+        return write_path
+            .read(table_id, key)
+            .await
+            .map_err(|e| CqlError::ServerError(format!("{e}")));
+    }
+    let mut rows = Vec::with_capacity(clusterings.len());
+    for clustering in clusterings {
+        if let Some(partition) = write_path
+            .pk_read_clustering_row(table_id, key, clustering, consistency, strategy)
+            .await
+            .map_err(|e| CqlError::ServerError(format!("{e}")))?
+        {
+            rows.extend(partition.rows);
+        }
+    }
+    Ok(
+        (!rows.is_empty()).then(|| ferrosa_sstable::types::Partition {
+            key: key.clone(),
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        }),
+    )
+}
+
+/// Matched rows in one partition above which an `fts_match` reads the
+/// partition once instead of each row.
+const FTS_ROW_READS_PER_PARTITION: usize = 16;
 
 async fn route_select_user_table_inner(
     state: &SharedState,
@@ -6171,6 +6223,20 @@ async fn route_select_user_table_inner(
                 })
                 .collect();
 
+            // Each matched partition's matched clustering keys, so a hit in a
+            // wide partition (entity_store keeps a whole session in one) reads
+            // its own rows rather than the partition.
+            let mut matched_rows: std::collections::HashMap<&[u8], Vec<&[u8]>> =
+                std::collections::HashMap::new();
+            for doc_key in &matched {
+                if let (Some(pk), Some(ck)) = (
+                    ferrosa_index::fulltext::keys::doc_key_partition(doc_key),
+                    ferrosa_index::fulltext::keys::doc_key_clustering(doc_key),
+                ) {
+                    matched_rows.entry(pk).or_default().push(ck);
+                }
+            }
+
             let mut fts_rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
             let mut fts_paging_state: Option<Vec<u8>> = None;
             for (idx, pk) in pending.iter().enumerate() {
@@ -6179,13 +6245,22 @@ async fn route_select_user_table_inner(
                 let decorated = ferrosa_common::DecoratedKey::new(
                     ferrosa_common::PartitionKey::new(pk.to_vec()),
                 );
-                if let Some(mut partition) = state
-                    .write_path
-                    .load()
-                    .read(&table_id, &decorated)
-                    .await
-                    .map_err(|e| CqlError::ServerError(format!("{e}")))?
-                {
+                let clusterings = matched_rows
+                    .get(pk.as_slice())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let fetched = fts_read_matched_rows(
+                    state,
+                    &table_id,
+                    &decorated,
+                    clusterings,
+                    ctx.consistency,
+                    &table_strategy,
+                )
+                .await?;
+                if let Some(mut partition) = fetched {
+                    #[cfg(test)]
+                    FTS_MATCH_ROWS_FETCHED.with(|c| c.set(c.get() + partition.rows.len()));
                     // Keep only the rows whose full key is in the FTS match set.
                     partition.rows.retain(|row| {
                         matched.contains(&ferrosa_index::fulltext::keys::encode_doc_key(
@@ -25722,6 +25797,62 @@ mod tests {
                 other => panic!("expected int id cell, got {other:?}"),
             })
             .collect()
+    }
+
+    /// A hit in a wide partition fetches the matched row, not the partition.
+    ///
+    /// agent_memory's entity_store is partitioned by (tenant_id, session_id),
+    /// so one partition is a whole session's entities. Live on 2026-10-07 the
+    /// entity-name search (`entity_name = fts_match(..) LIMIT n`) still took
+    /// 7.3 s after the sidecar term index fixed the lookup itself: each hit
+    /// read its whole session partition at the coordinator.
+    #[tokio::test]
+    async fn fts_match_in_a_wide_partition_fetches_only_the_matched_rows() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE fts_wide WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}".to_string(),
+            "CREATE TABLE fts_wide.docs (tenant int, sid int, id int, body text, PRIMARY KEY ((tenant, sid), id))".to_string(),
+            "CREATE INDEX docs_fts ON fts_wide.docs (body) USING 'fulltext'".to_string(),
+        ]
+        .into_iter()
+        .chain((1..=500).map(|id| {
+            let body = if id == 250 { "the needle entity" } else { "ordinary filler entity" };
+            format!("INSERT INTO fts_wide.docs (tenant, sid, id, body) VALUES (1, 1, {id}, '{body}')")
+        })) {
+            let stmt = crate::parser::parse(&cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("fts_wide", "docs"))
+            .unwrap();
+
+        FTS_MATCH_ROWS_FETCHED.with(|c| c.set(0));
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_wide",
+            "SELECT id FROM fts_wide.docs WHERE body = fts_match('needle') LIMIT 10",
+        )
+        .await;
+        let fetched = FTS_MATCH_ROWS_FETCHED.with(|c| c.get());
+
+        assert_eq!(fts_row_ids(&raw), vec![250]);
+        assert_eq!(
+            fetched, 1,
+            "one matching row in a 500-row partition fetched {fetched} rows"
+        );
     }
 
     /// Coordinator memory bound for `fts_match` (t_ee98faa0): with a LIMIT, the
