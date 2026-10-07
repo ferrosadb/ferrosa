@@ -414,7 +414,10 @@ fn parse_term_index(
 }
 
 /// The bytes to append to the legacy sidecar at `path` to give it a term
-/// index, or `None` if it already has one. See [`term_index_tail_for`].
+/// index, or `None` if it already has one. One pass over the dictionary,
+/// skipping postings and holding one term in every
+/// [`FTI_TERM_INDEX_INTERVAL`]; a file that is not exactly the legacy layout is
+/// refused rather than given an index over bytes that are not its dictionary.
 ///
 /// # Errors
 ///
