@@ -24,25 +24,104 @@ permissions:
   issues: write
 
 jobs:
-  fuzz:
-    name: Property Test Fuzzing (bounded)
+  # Release-shaped build (default features), same as PR CI's build-node-image:
+  # the image is the binary the cluster runs, not the test build. It must exist
+  # BEFORE the comprehensive job's compose tests, and `cargo test` cannot
+  # produce it (it is `--all-features`, and the cluster runs a release binary) —
+  # so it is its own job, exactly as nightly-slow-tests.yml does it.
+  build-node-image:
+    name: Build node image
     runs-on: ubuntu-latest
-    # Sized so the WHOLE job (setup + both bounded fuzz steps + verdict) fits
-    # under the cap and the run completes instead of being cancelled. Each fuzz
-    # step is bounded by an inner `timeout` (wall-clock budget) BELOW its step
-    # timeout, so it exits cleanly and the verdict step always runs.
-    timeout-minutes: 45
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: node-image
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Build the node image
+        run: |
+          set -euo pipefail
+          cargo build --release -p ferrosa -p ferrosa-ctl
+          mkdir -p node-bin
+          cp target/release/ferrosa target/release/ferrosa-ctl node-bin/
+          cat > node-bin/Dockerfile <<'DEOF'
+          FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                  ca-certificates gdb procps \
+              && rm -rf /var/lib/apt/lists/*
+          COPY ferrosa /usr/local/bin/ferrosa
+          COPY ferrosa-ctl /usr/local/bin/ferrosa-ctl
+          EXPOSE 9042 7000 9090 7474 7687
+          ENV FERROSA_DATA_DIR=/var/lib/ferrosa
+          CMD ["ferrosa"]
+          DEOF
+          for attempt in 1 2 3 4; do
+            docker build -t ferrosa-test-node:latest node-bin && break
+            [ "$attempt" = 4 ] && { echo "docker build failed after 4 attempts"; exit 1; }
+            echo "docker build attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          docker save ferrosa-test-node:latest | gzip > ferrosa-node-image.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferrosa-node-image
+          path: ferrosa-node-image.tar.gz
+          retention-days: 1
+
+  fuzz:
+    name: Comprehensive workspace test (no skips)
+    runs-on: ubuntu-latest
+    needs: build-node-image
+    # The nightly is the most thorough run there is: everything PR CI runs, plus
+    # everything PR CI skips, with the cluster / container / PostgreSQL
+    # prerequisites provisioned so the live-infra tests RUN instead of panicking
+    # on a missing prerequisite. That is far longer than the old bounded fuzz
+    # session, so the cap covers the whole job (setup + node image + cluster +
+    # suite + verdict). The run step is bounded by an inner `timeout` BELOW its
+    # step timeout so it exits cleanly and the verdict step always runs.
+    timeout-minutes: 210
     env:
       # Line-tables debuginfo, the same as ci.yml `test` and `integration`, so
-      # this job restores their dependency cache instead of compiling cold
-      # inside its fuzz budget. Backtraces keep file:line; nothing here runs a
-      # debugger. Job-level so rust-cache hashes it into the key.
+      # this job restores their dependency cache instead of compiling cold.
+      # Job-level so rust-cache hashes it into the key.
       CARGO_PROFILE_DEV_DEBUG: "1"
+      # Container/cluster prerequisites, job-level so every step that needs one
+      # (the PostgreSQL pre-pull, the comprehensive test run) sees it.
+      # FERROSA_TEST_CLUSTER_NODES is exported by the "Bring up the 3-node
+      # test cluster" step via $GITHUB_ENV, not set here.
+      FERROSA_TEST_CONTAINERS: "1"
+      # Pin the runtime: the harness prefers podman when it is on PATH, but here
+      # we verify and drive everything with docker. Hosted runners ship both and
+      # their podman setup is not guaranteed to work.
+      FERROSA_CONTAINER_RUNTIME: docker
+      # Our digest-pinned mirror, not Docker Hub — the SAME reference the
+      # pre-pull warms. Copied from ci.yml's `postgres-oracle` job env; a
+      # pre-pull that warms a different refs looks like coverage while still
+      # depending on the upstream registry.
+      FERROSA_POSTGRES_IMAGE: downloads.ferrosa.ai/postgres@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+
+      - name: Free disk space
+        # The --all-features debug test build exceeds 30GB of target artifacts;
+        # the node image + containers + cluster-gated test builds exhaust a
+        # hosted runner further (SIGBUS-in-ld / ENOSPC, t_9291a8dd). Same
+        # reclaim as ci.yml's `test` / `integration`; df before/after for
+        # diagnosability.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost \
+            /usr/share/swift || true
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
 
       - name: Install Cap'n Proto compiler
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto libunwind-dev
@@ -52,22 +131,71 @@ jobs:
           shared-key: workspace-test-all-features-debug1
           save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
 
+      - name: Download prebuilt node image
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ferrosa-node-image
+          path: .
+
+      - name: Load node image into Docker
+        # `test-cluster-up-ci.sh` uses a preloaded ferrosa-test-node:latest when
+        # one is present, and only falls back to a cold `docker build` (of the
+        # whole workspace) otherwise. Loading the artifact is what keeps the
+        # cluster bring-up bounded inside this job.
+        run: docker load < ferrosa-node-image.tar.gz
+
+      - name: Pre-pull the PostgreSQL image
+        # The differential-oracle tests start a real PostgreSQL container via
+        # the runner's docker. Warm the digest-pinned mirror first, exactly as
+        # ci.yml's `postgres-oracle` job does, so the run step's budget is not
+        # spent on a registry pull.
+        run: scripts/pull-images.sh "$FERROSA_POSTGRES_IMAGE"
+
       - name: Build AssemblyScript UDF toolchain bundle
         # --all-features enables `asc-udf` + `live-infra-tests`, which run the
         # inline-AssemblyScript UDF tests for real against this bundle. Build it
         # (pinned asc version) so those tests run and pass rather than fail.
         run: bash ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs
 
-      - name: Run property tests (bounded 20-minute fuzz session)
-        # Inner `timeout` (20 min) is the real bound; this step timeout is a
-        # cushion above it so the step exits cleanly rather than being cancelled.
-        timeout-minutes: 24
+      - name: Bring up the 3-node test cluster
+        # Same bring-up PR CI's `integration` job uses. It emits
+        # FERROSA_TEST_CLUSTER_NODES=127.0.0.1:9042,9043,9044 on stdout; append
+        # that to $GITHUB_ENV so the live-infra cluster tests find it.
+        run: |
+          ./scripts/test-cluster-up-ci.sh > /tmp/cluster-env
+          cat /tmp/cluster-env >> "$GITHUB_ENV"
+
+      - name: Put cqlsh on PATH (docker, no host install)
+        # The live cluster test shells out to `cqlsh <host> <port> -e <stmt>`.
+        # This wrapper forwards to the same cassandra image the PostgreSQL
+        # Jepsen job uses; --network host reaches the published 9042-9044.
+        run: |
+          docker pull cassandra:5.0
+          printf '#!/bin/sh\nexec docker run --rm --network host cassandra:5.0 cqlsh "$@"\n' > cqlsh
+          sudo install -m 0755 cqlsh /usr/local/bin/cqlsh
+          rm cqlsh
+
+      - name: Run the comprehensive workspace test suite
+        # The whole point of this job: NO --skip and NO --exclude of a test for
+        # convenience. --all-features turns on live-infra-tests / slow-tests /
+        # fuzz-fileio / perf-tests, and the cluster + containers + PostgreSQL
+        # provisioned above are what turn those gated tests from panics into
+        # passing tests. The only tests this job cannot run are the
+        # physically-blocked ones named in the spec's environment-blocked set;
+        # they are NOT skipped here — they are reported as failures, and T3
+        # asserts the permitted exclusion set rather than a silent --skip.
+        #
+        # --no-fail-fast so the whole run reports every failure, not just the
+        # first failing binary. Inner `timeout` is the real wall-clock bound and
+        # sits BELOW this step's timeout so the run COMPLETES (exit 0) instead of
+        # being cancelled by the GH step/job cap; a cancelled run is an absence
+        # of evidence, not a green. `timeout` returns 124 (SIGTERM at the budget)
+        # or 137 (SIGKILL after grace) — both mean "ran the full budget without a
+        # failing case" = success. Any other non-zero is a real failure.
+        timeout-minutes: 195
         env:
-          # 5k cases is sized to finish within the 20-min budget on the runner
-          # (so the session reports "all cases passed" rather than relying on the
-          # timeout cutoff); the inner `timeout` below is the hard safety bound.
           PROPTEST_CASES: 5000
-          FUZZ_BUDGET_SECS: 1200 # 20 min wall-clock fuzz budget (safety cap)
+          FUZZ_BUDGET_SECS: 10800 # 3 h wall-clock budget (safety cap)
           FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
           # Enables libtest's `--report-time` on the stable toolchain so the
           # uploaded test-output.log ranks every test by wall-clock duration
@@ -79,92 +207,31 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "env RUSTC_BOOTSTRAP=1"
         run: |
           set +e
-          # --all-features so feature-gated property tests (e.g. the whole
-          # `repair_fuzz` harness behind `test-generators`) are actually fuzzed
-          # — without it they were silently skipped here. The trailing skips
-          # mirror ci.yml's heavy/live-infra exclusions (they would never finish
-          # at 50000 cases) and exclude the file-IO-heavy repair fuzz
-          # (`fuzz-fileio`), which gets its own bounded step below.
-          # `--skip accord::perf` (matches accord::perf_regression too) keeps the
-          # absolute wall-clock bounds out of this debug-profile fuzz session,
-          # as ci.yml does; they ran here and failed at 56.7 ms on 2026-09-30.
-          # The `perf-regression` job below enforces them unchanged.
-          # Crate excludes + skip list mirror ci.yml's proven --all-features run
-          # (jepsen/loadgen excluded; live-infra + heavy tests skipped by name);
-          # the file-IO repair fuzz is skipped here and run in the step below.
-          # Bound the fuzz to a wall-clock budget so the run COMPLETES (exit 0)
-          # instead of being cancelled by the GH step/job timeout. `timeout`
-          # returns 124 (SIGTERM at the budget) or 137 (SIGKILL after grace) —
-          # both mean "fuzzed the full budget without a failing case" = success.
-          # Any other non-zero is a real proptest failure and is surfaced.
           timeout --kill-after=30s "${FUZZ_BUDGET_SECS}" \
-            cargo test --all-features --workspace --lib --tests \
+            cargo test --all-features --workspace --all-targets --no-fail-fast \
               --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
               -- -Z unstable-options --report-time \
-                 --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
-                 --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
-                 --skip dep_wait_ordering --skip disk_fail_no_phantom \
-                 --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
-                 --skip clock_skew_large_preaccept \
-                 --skip binary_ \
-                 --skip concurrent_write --skip many_flushes \
-                 --skip flush_2000 --skip single_writer --skip write_flush_compact \
-                 --skip reads_never_panic_on_arbitrary_content \
-                 --skip corrupt_sstable_bytes_never_panic_never_oom \
-                 --skip peak_resident_readers_within_cap --skip streaming_equals_single_pass \
-                 --skip bounded_fetch_reassembles_to_single_pass \
-                 --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
-                 --skip differential_oracle_dml_agrees \
-                 --skip differential_oracle_corpus_agrees \
-                 --skip differential_oracle_jsonb \
-                 --skip differential_oracle_rejects_unsupported_queries \
-                 --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
-                 --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
-                 --skip fly_multi_node_streaming_scan \
-                 --skip orchestrator_cluster_teardown \
-                 --skip orchestrator_docker_cluster_provision \
-                 --skip provision_single_vm \
-                 --skip provision_t1_cluster \
-                 --skip rust_driver_connects_to_cluster \
-                 --skip ssh_execute_command \
-                 --skip ssh_upload_file \
-                 --skip accord::perf \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           if [ "$status" = "124" ] || [ "$status" = "137" ]; then
-            echo "::notice::fuzz budget (${FUZZ_BUDGET_SECS}s) elapsed with no failing case — treating as success"
+            echo "::notice::test budget (${FUZZ_BUDGET_SECS}s) elapsed with no failing case — treating as success"
             status=0
           fi
           echo "$status" > cargo-test-status
           exit 0
         continue-on-error: true
 
-      - name: Run file-IO repair fuzz (bounded cases)
-        # Inner `timeout` (5 min) is the real bound; this step timeout is a
-        # cushion so the whole job stays under the job cap and the verdict runs.
-        timeout-minutes: 8
-        env:
-          # Each case flushes many real on-disk SSTables, so this harness is
-          # filesystem-bound — run it at a moderate case count, not 50000.
-          PROPTEST_CASES: 256
-          FILEIO_FUZZ_BUDGET_SECS: 300 # 5 min wall-clock budget
+      - name: Collect cluster logs on failure
+        if: failure()
         run: |
-          set +e
-          timeout --kill-after=30s "${FILEIO_FUZZ_BUDGET_SECS}" \
-            cargo test -p ferrosa-storage --all-features --test repair_fuzz \
-            2>&1 | tee -a test-output.log
-          status=${PIPESTATUS[0]}
-          # Budget elapsed (124/137) = fuzzed without a failing case → success.
-          if [ "$status" = "124" ] || [ "$status" = "137" ]; then
-            echo "::notice::file-IO fuzz budget (${FILEIO_FUZZ_BUDGET_SECS}s) elapsed with no failing case — treating as success"
-            status=0
-          fi
-          # Fold this run's status into the aggregate so a file-IO regression is
-          # not lost; non-zero from either fuzz step marks the session failed.
-          prev=$(cat cargo-test-status 2>/dev/null || echo 0)
-          if [ "$status" != "0" ]; then echo "$status" > cargo-test-status; else echo "$prev" > cargo-test-status; fi
-          exit 0
-        continue-on-error: true
+          docker compose \
+            -f tests/docker-compose.cluster.yml \
+            --project-name ferrosa-test-ci \
+            logs --no-color 2>/dev/null | tail -500 || true
+
+      - name: Tear down the test cluster
+        if: always()
+        run: ./scripts/test-cluster-down.sh --ci
 
       - name: Check for regression files
         id: regressions
