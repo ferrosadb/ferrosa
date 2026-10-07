@@ -996,6 +996,50 @@ async fn incomplete_heal_fails_retryably_and_the_next_query_heals() {
     );
 }
 
+/// A client that gives up on the first traversal does not cancel the heal.
+///
+/// Live on 2026-10-06/07 (ferrosa main 220aff3c and c603a488, the memory
+/// cluster): the heal ran inside the first query's future. ferrosa-memory's
+/// graph client gives up after 10 s, the heal on that cluster takes longer, and
+/// dropping the request dropped the heal half done. The next query started it
+/// again from the beginning, so it never finished and every edge query timed
+/// out — including a MATCH whose anchor does not exist.
+#[tokio::test]
+async fn a_cancelled_first_traversal_does_not_cancel_the_heal() {
+    let (node, all, live) = damaged_node(2, 1, 40).await;
+    let reference = Reference::new(&all, &live);
+    let fresh = node.start_engine();
+    let some = *live.iter().next().expect("a live edge");
+
+    // Poll the first traversal once, then drop it: a client timeout. ~500
+    // entries is past the heal's yield interval, so the poll leaves it half
+    // done — asserted, or this test would prove nothing.
+    let query = related_query(some.tenant, some.session, some.src);
+    {
+        let first = run(&fresh, &query);
+        futures::pin_mut!(first);
+        assert!(
+            futures::poll!(first.as_mut()).is_pending(),
+            "the first traversal must still be healing after one poll"
+        );
+    }
+
+    // No query drives it now. The heal must finish on its own.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !fresh.adjacency_heal_completed_for_test(KEYSPACE) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the heal was cancelled with the query that started it: \
+             30 s later it has not completed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_clean(
+        "traversals after a heal whose first query was cancelled",
+        &check_all(&fresh, &reference).await,
+    );
+}
+
 /// The heal is not skipped when the first adjacency query is a FOREACH.
 #[tokio::test]
 async fn first_query_through_foreach_still_heals_before_traversals() {

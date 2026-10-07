@@ -475,6 +475,93 @@ impl crate::executor::spill::SpillReserver for StorageEngineSpill {
     }
 }
 
+/// One keyspace's first-use adjacency heal, shared by every query that needs
+/// it. The first poll spawns the heal as its own task, so a caller that stops
+/// waiting — a client timeout drops the request's future — leaves the heal
+/// running to completion instead of cancelling it half done. The error is the
+/// retryable reason the heal did not complete.
+type HealGate =
+    futures::future::Shared<futures::future::BoxFuture<'static, std::result::Result<(), String>>>;
+
+/// A heal for `keyspace` that runs in its own task once first polled.
+fn spawn_on_first_poll_heal(
+    schema: Arc<Schema>,
+    write_path: Arc<ArcSwap<WritePath>>,
+    keyspace: String,
+) -> HealGate {
+    use futures::FutureExt;
+    async move {
+        let heal = tokio::spawn(heal_adjacency(schema, write_path.load_full(), keyspace));
+        match heal.await {
+            Ok(outcome) => outcome,
+            Err(join_error) => {
+                tracing::error!(
+                    error = %join_error,
+                    "graph engine: adjacency heal task died; the next query starts another"
+                );
+                Err(format!(
+                    "graph adjacency heal task died: {join_error}; retry"
+                ))
+            }
+        }
+    }
+    .boxed()
+    .shared()
+}
+
+/// One complete reconcile of `keyspace` before it serves traversals, in
+/// [`ReconcileMode::Rewrite`]: every entry is written to every replica,
+/// because another replica's damage is invisible to this node's reads.
+async fn heal_adjacency(
+    schema: Arc<Schema>,
+    wp: Arc<WritePath>,
+    keyspace: String,
+) -> std::result::Result<(), String> {
+    let keyspace = keyspace.as_str();
+    let started = std::time::Instant::now();
+    let metrics = reconcile_once_with(&schema, &wp, keyspace, ReconcileMode::Rewrite).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    record_heal(metrics.is_complete());
+    if !metrics.is_complete() {
+        tracing::warn!(
+            keyspace,
+            errors = metrics.errors,
+            entries_checked = metrics.entries_checked,
+            entries_repaired = metrics.entries_repaired,
+            entries_removed = metrics.orphans_removed,
+            elapsed_ms,
+            "graph engine: adjacency heal incomplete; traversals on this keyspace \
+             fail retryably until a heal completes"
+        );
+        return Err(format!(
+            "graph adjacency index for keyspace {keyspace} is being repaired \
+             ({} reconcile errors); retry",
+            metrics.errors
+        ));
+    }
+    if metrics.entries_repaired > 0 || metrics.orphans_removed > 0 {
+        tracing::warn!(
+            keyspace,
+            entries_checked = metrics.entries_checked,
+            entries_repaired = metrics.entries_repaired,
+            entries_removed = metrics.orphans_removed,
+            entries_rewritten = metrics.entries_rewritten,
+            elapsed_ms,
+            "graph engine: adjacency heal repaired the index before serving traversals"
+        );
+    } else {
+        tracing::info!(
+            keyspace,
+            entries_checked = metrics.entries_checked,
+            entries_rewritten = metrics.entries_rewritten,
+            elapsed_ms,
+            "graph engine: adjacency index consistent here; rewrote it to every replica; \
+             serving traversals"
+        );
+    }
+    Ok(())
+}
+
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
     schema: Arc<Schema>,
@@ -487,11 +574,13 @@ pub struct GraphEngine {
     reconciliation_cancel: CancellationToken,
     subscription_registry: Arc<SubscriptionRegistry>,
     registered_adjacency_keyspaces: Mutex<HashSet<String>>,
-    /// Per-keyspace first-use heal gate (see `ensure_adjacency_ready`). A cell
-    /// is set once that keyspace's index has been reconciled completely in
-    /// this process; until then every adjacency query on it awaits the cell.
-    /// Copy-on-write map: a keyspace is added once, read on every query.
-    adjacency_heals: ArcSwap<HashMap<String, Arc<tokio::sync::OnceCell<()>>>>,
+    /// Per-keyspace first-use heal (see `ensure_adjacency_ready`). The entry is
+    /// the heal's shared outcome; it resolves `Ok` once that keyspace's index
+    /// has been reconciled completely in this process, and until then every
+    /// adjacency query on it awaits the same heal. A failed heal's entry is
+    /// removed so the next query starts another. Copy-on-write map: a
+    /// keyspace is added once, read on every query.
+    adjacency_heals: ArcSwap<HashMap<String, HealGate>>,
     /// Routes adjacency-keyspace and adjacency-table DDL through the
     /// cluster's replication path. Defaults to a local-only coordinator
     /// (`LocalGraphSchemaCoordinator`) when `GraphEngine::new` is used.
@@ -619,6 +708,19 @@ impl GraphEngine {
         self.ensure_adjacency_ready(keyspace).await
     }
 
+    /// Whether `keyspace`'s first-use heal has completed in this process.
+    #[doc(hidden)]
+    pub fn adjacency_heal_completed_for_test(&self, keyspace: &str) -> bool {
+        self.adjacency_heals
+            .load()
+            .get(keyspace)
+            // Poll once: `peek` only sees an outcome some caller has already
+            // polled out of the heal task, and none may have since it ended.
+            .is_some_and(|gate| {
+                matches!(futures::FutureExt::now_or_never(gate.clone()), Some(Ok(())))
+            })
+    }
+
     async fn ensure_adjacency_storage_for_keyspace(&self, keyspace: &str) -> Result<bool> {
         let snap = self.schema.snapshot();
         let has_edge_table = snap.tables.iter().any(|((ks, _), meta)| {
@@ -738,7 +840,11 @@ impl GraphEngine {
     /// deleted. Traversals now honour tombstones, so an unhealed index answers
     /// with edges missing. Every adjacency query on the keyspace awaits the
     /// same heal: concurrent first queries wait for it rather than read a
-    /// half-repaired index. A heal that hit any error is not marked done; the
+    /// half-repaired index. The heal runs in its own task, so a query that
+    /// stops waiting (its client timed out) does not cancel it; on a large
+    /// index the heal outlasts a client's deadline, and a heal tied to the
+    /// request restarted from nothing on every query and never finished.
+    /// A heal that hit any error is not marked done; the
     /// query fails with a retryable [`GraphError::Unavailable`] and the next
     /// query runs the heal again. Repairs are logged at WARN and counted in
     /// `ferrosa_graph_adjacency_entries_{repaired,removed}_total`.
@@ -752,83 +858,58 @@ impl GraphEngine {
             // first query after it exists.
             return Ok(());
         }
-        let cell = self.adjacency_heal_cell(keyspace);
-        cell.get_or_try_init(|| self.heal_adjacency(keyspace))
-            .await
-            .map(|_| ())
+        // Register first (idempotent, and fast once done), so the heal and
+        // the traversal after it see the adjacency table.
+        self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
+        let gate = self.adjacency_heal_gate(keyspace);
+        if let Some(Ok(())) = gate.peek() {
+            return Ok(());
+        }
+        match gate.clone().await {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                self.forget_failed_heal(keyspace, &gate);
+                Err(GraphError::Unavailable(reason))
+            }
+        }
     }
 
-    /// The heal cell for `keyspace`, created on first use.
-    fn adjacency_heal_cell(&self, keyspace: &str) -> Arc<tokio::sync::OnceCell<()>> {
+    /// The heal for `keyspace`: the one in progress or completed, else a new
+    /// one. Only the gate published to the map is ever polled, so a gate built
+    /// by a losing concurrent caller is dropped unpolled and never spawns.
+    fn adjacency_heal_gate(&self, keyspace: &str) -> HealGate {
         if let Some(gate) = self.adjacency_heals.load().get(keyspace) {
-            return Arc::clone(gate);
+            return gate.clone();
         }
-        let mut created = None;
+        let candidate = spawn_on_first_poll_heal(
+            Arc::clone(&self.schema),
+            Arc::clone(&self.write_path),
+            keyspace.to_string(),
+        );
+        let mut published = None;
         self.adjacency_heals.rcu(|gates| {
             // Copy-on-write of the small keyspace -> gate map (one entry per
             // graph keyspace), not of any row data.
-            let mut next: HashMap<String, Arc<tokio::sync::OnceCell<()>>> = gates
-                .iter()
-                .map(|(ks, gate)| (ks.clone(), Arc::clone(gate)))
-                .collect();
+            let mut next = HashMap::clone(gates);
             let gate = next
                 .entry(keyspace.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()));
-            created = Some(Arc::clone(gate));
+                .or_insert_with(|| candidate.clone());
+            published = Some(gate.clone());
             next
         });
-        created.expect("rcu runs its closure at least once")
+        published.expect("rcu runs its closure at least once")
     }
 
-    /// One complete reconcile of `keyspace` before it serves traversals, in
-    /// [`ReconcileMode::Rewrite`]: every entry is written to every replica,
-    /// because another replica's damage is invisible to this node's reads.
-    async fn heal_adjacency(&self, keyspace: &str) -> Result<()> {
-        self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
-        let started = std::time::Instant::now();
-        let wp = self.write_path.load_full();
-        let metrics =
-            reconcile_once_with(&self.schema, &wp, keyspace, ReconcileMode::Rewrite).await;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        record_heal(metrics.is_complete());
-        if !metrics.is_complete() {
-            tracing::warn!(
-                keyspace,
-                errors = metrics.errors,
-                entries_checked = metrics.entries_checked,
-                entries_repaired = metrics.entries_repaired,
-                entries_removed = metrics.orphans_removed,
-                elapsed_ms,
-                "graph engine: adjacency heal incomplete; traversals on this keyspace \
-                 fail retryably until a heal completes"
-            );
-            return Err(GraphError::Unavailable(format!(
-                "graph adjacency index for keyspace {keyspace} is being repaired \
-                 ({} reconcile errors); retry",
-                metrics.errors
-            )));
-        }
-        if metrics.entries_repaired > 0 || metrics.orphans_removed > 0 {
-            tracing::warn!(
-                keyspace,
-                entries_checked = metrics.entries_checked,
-                entries_repaired = metrics.entries_repaired,
-                entries_removed = metrics.orphans_removed,
-                entries_rewritten = metrics.entries_rewritten,
-                elapsed_ms,
-                "graph engine: adjacency heal repaired the index before serving traversals"
-            );
-        } else {
-            tracing::info!(
-                keyspace,
-                entries_checked = metrics.entries_checked,
-                entries_rewritten = metrics.entries_rewritten,
-                elapsed_ms,
-                "graph engine: adjacency index consistent here; rewrote it to every replica; \
-                 serving traversals"
-            );
-        }
-        Ok(())
+    /// Drop `failed` from the map so the next query starts a fresh heal. A
+    /// newer gate another caller already published is left alone.
+    fn forget_failed_heal(&self, keyspace: &str, failed: &HealGate) {
+        self.adjacency_heals.rcu(|gates| {
+            let mut next = HashMap::clone(gates);
+            if next.get(keyspace).is_some_and(|g| g.ptr_eq(failed)) {
+                next.remove(keyspace);
+            }
+            next
+        });
     }
 
     /// Execute a Cypher query: parse -> validate -> plan -> execute.
