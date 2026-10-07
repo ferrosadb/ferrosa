@@ -22035,6 +22035,98 @@ mod tests {
         );
     }
 
+    /// A streamed range scan survives a compaction that retires its inputs
+    /// mid-stream: it resumes on the new view and yields every key once.
+    ///
+    /// Live on 2026-10-07 (node1, the memory cluster): the adjacency heal's
+    /// orphan scan streamed `system_graph_agent_memory.adjacency`, a
+    /// compaction swapped out 16 of its inputs at 19:28:35.437, and 860 ms
+    /// later the stream failed with `I/O error: No such file or directory`. A
+    /// stream pins its readers, but `Data.db` is held by path: once the fd
+    /// cache drops a descriptor, the next read re-opens a path compaction has
+    /// already retired. The 236,409-entry heal then ended incomplete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_scan_resumes_when_compaction_retires_its_inputs_mid_stream() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 2;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // Two SSTables big enough that each Data.db spans many read chunks.
+        let value = vec![b'v'; 200];
+        let mut expected = std::collections::BTreeSet::new();
+        for batch in 0..2 {
+            for i in 0..2_000 {
+                let key = format!("k{batch}-{i:05}");
+                engine
+                    .write(&tid, &make_key(&key), make_row(&value, 1_000), 1_000)
+                    .unwrap();
+                expected.insert(make_key(&key));
+            }
+            engine.flush(&tid).unwrap();
+        }
+        assert!(
+            engine.sstable_count(&tid) >= 2,
+            "the scan has several SSTables to read"
+        );
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let inputs: Vec<std::path::PathBuf> = StorageEngine::list_generations_in_dir(&table_dir)
+            .iter()
+            .map(|gen| {
+                StorageEngine::generation_component_path_for_test(&table_dir, *gen, "Data.db")
+                    .expect("input Data.db path")
+            })
+            .collect();
+
+        // Start the stream; its producer opens the readers and pauses on the
+        // small channel.
+        let mut stream = engine.range_iter_fragmented(&tid, None, None);
+        let mut seen = Vec::new();
+        let first = stream
+            .next()
+            .await
+            .expect("an item")
+            .expect("the first item reads");
+        seen.push(first.key.clone());
+
+        // Compact both inputs away while the stream is mid-scan.
+        let resumes_before = crate::store::range_scan_compaction_resumes_total();
+        engine.force_compact_all();
+        engine
+            .drive_compactions_until_idle(&tid, std::time::Duration::from_secs(60))
+            .await;
+        for data in &inputs {
+            assert!(!data.exists(), "compaction retired {}", data.display());
+            // As the shared fd cache does under load: the next read re-opens
+            // the path.
+            ferrosa_sstable::io::evict_global_fd_for_test(data);
+        }
+
+        while let Some(item) = stream.next().await {
+            let partition = item.unwrap_or_else(|e| {
+                panic!(
+                    "the scan failed after {} partitions instead of resuming on the \
+                     compacted view: {e}",
+                    seen.len()
+                )
+            });
+            if seen.last() != Some(&partition.key) {
+                seen.push(partition.key.clone());
+            }
+        }
+        let got: std::collections::BTreeSet<_> = seen.iter().cloned().collect();
+        assert_eq!(got.len(), seen.len(), "no key is yielded twice");
+        assert_eq!(got, expected, "every key is yielded");
+        assert!(
+            crate::store::range_scan_compaction_resumes_total() > resumes_before,
+            "the scan resumed on the compacted view (the path under test ran)"
+        );
+    }
+
     /// Window (3): the same read-vs-compaction data-loss race, but exercised
     /// through `read_clustering_row` — the production full-primary-key point-read
     /// hot path (write_path.rs routes CQL `=` point reads here). Before the fix

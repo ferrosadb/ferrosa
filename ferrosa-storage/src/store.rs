@@ -615,7 +615,9 @@ pub struct TableStore<F: FlushTarget> {
     /// COLUMN` left the schema stale and the flush path produced silently
     /// corrupt SSTables (bug-sstable-writer-produces-zero-byte-rows-db.md).
     schema: ArcSwap<TableSchema>,
-    view: ArcSwap<StoreView>,
+    /// Shared so a streamed scan can re-read it after compaction retires one
+    /// of its inputs (see `RangeScan::resume_after_retired_input`).
+    view: Arc<ArcSwap<StoreView>>,
     /// Engine-wide bounded reader pool, shared across all tables. Opens
     /// `SSTableReader<F::Reader>` on demand keyed by `(table, gen)`.
     reader_pool: SharedReaderPool<F::Reader>,
@@ -1958,6 +1960,94 @@ struct RangeScan<F: FlushTarget> {
     /// cannot pull an input out from under a paused scan.
     merger: Option<OwnedMerger<F::Reader>>,
     emitted: usize,
+    /// The store's live view, read again when compaction retires an input
+    /// under the scan (`resume_after_retired_input`).
+    live_view: Arc<ArcSwap<StoreView>>,
+    /// How far the scan has delivered, so a resumed merger skips it.
+    delivered: Option<Delivered>,
+    /// Set while a resumed merger re-reads the partition it stopped in.
+    skip: Option<Delivered>,
+    /// Resumes so far; bounded by [`RANGE_SCAN_MAX_RESUMES`].
+    resumes: u32,
+}
+
+/// The last partition a scan delivered (some or all of), for resuming it.
+#[derive(Clone, Debug)]
+struct Delivered {
+    key: DecoratedKey,
+    /// The last row delivered from `key`, by clustering bytes (the merger's
+    /// row order). `None`: only its header, or no rows, went out.
+    last_clustering: Option<Vec<u8>>,
+    /// Every fragment of `key` went out.
+    complete: bool,
+}
+
+/// Resumes a single scan may make before its error is delivered. Each is a
+/// compaction retiring an input under it; more than this in one scan means
+/// something other than compaction is removing files.
+const RANGE_SCAN_MAX_RESUMES: u32 = 8;
+
+static RANGE_SCAN_COMPACTION_RESUMES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Times a streamed range scan re-opened on a fresh view because compaction
+/// retired one of its inputs mid-scan.
+pub fn range_scan_compaction_resumes_total() -> u64 {
+    RANGE_SCAN_COMPACTION_RESUMES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A read that failed because a file is gone: the error a retired input gives.
+fn is_missing_file(error: &ferrosa_common::Error) -> bool {
+    matches!(error, ferrosa_common::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Whether `later` no longer has some SSTable `earlier` had: compaction (or
+/// eviction) took an input away.
+fn view_dropped_an_sstable(earlier: &StoreView, later: &StoreView) -> bool {
+    let live: std::collections::HashSet<&str> =
+        later.sstables.iter().map(|d| d.gen.as_str()).collect();
+    earlier
+        .sstables
+        .iter()
+        .any(|d| !live.contains(d.gen.as_str()))
+}
+
+impl Delivered {
+    /// What of `partition` has not been delivered yet. A key already passed
+    /// whole is dropped; the rest of a key stopped mid-way keeps only rows
+    /// past `last_clustering`, without the header the first fragment carried.
+    fn remainder(&self, mut partition: Partition) -> Option<Partition> {
+        if partition.key != self.key {
+            return Some(partition);
+        }
+        if self.complete {
+            return None;
+        }
+        if let Some(last) = &self.last_clustering {
+            partition
+                .rows
+                .retain(|row| row.clustering.as_slice() > last.as_slice());
+        }
+        partition.deletion = ferrosa_sstable::types::DeletionTime::LIVE;
+        partition.static_row = None;
+        (!partition.rows.is_empty()).then_some(partition)
+    }
+
+    /// Record that `partition` went out; `complete` when its key is done.
+    fn advance(previous: Option<Delivered>, partition: &Partition, complete: bool) -> Delivered {
+        let carried = previous
+            .filter(|p| p.key == partition.key)
+            .and_then(|p| p.last_clustering);
+        Delivered {
+            key: partition.key.clone(),
+            last_clustering: partition
+                .rows
+                .last()
+                .map(|row| row.clustering.clone())
+                .or(carried),
+            complete,
+        }
+    }
 }
 
 impl<F: FlushTarget> RangeScan<F>
@@ -1984,6 +2074,39 @@ where
             self.end.clone(),
         )
     }
+
+    /// After a mid-scan read failed on a missing file: if compaction has
+    /// since retired one of the scan's inputs, re-open the merger on the
+    /// current view, starting at the partition the scan stopped in, and
+    /// return `true`. The rows already delivered are skipped as they come
+    /// back (`Delivered::remainder`), so no key is yielded twice and none is
+    /// missed. `false`: the file is missing for some other reason, or the
+    /// scan has resumed too often; the caller delivers the error.
+    fn resume_after_retired_input(&mut self, error: &ferrosa_common::Error) -> bool {
+        if !is_missing_file(error) || self.resumes >= RANGE_SCAN_MAX_RESUMES {
+            return false;
+        }
+        let current = self.live_view.load_full();
+        if !view_dropped_an_sstable(&self.view, &current) {
+            return false;
+        }
+        self.resumes += 1;
+        RANGE_SCAN_COMPACTION_RESUMES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            %error,
+            resume = self.resumes,
+            from = ?self.delivered.as_ref().map(|d| &d.key),
+            "range scan: an input was retired under the scan (compaction); resuming on the \
+             current view after the last partition delivered"
+        );
+        self.view = current;
+        self.merger = None;
+        if let Some(delivered) = &self.delivered {
+            self.start = Some(delivered.key.clone());
+        }
+        self.skip = self.delivered.clone();
+        true
+    }
 }
 
 impl<F: FlushTarget> PausableScan for RangeScan<F>
@@ -1997,32 +2120,55 @@ where
         slot: &mut ferrosa_sched::ScanSlot,
         tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
     ) -> ScanRun {
-        if self.merger.is_none() {
-            match self.open_merger() {
-                Ok(merger) => self.merger = Some(merger),
-                Err(e) => return deliver_failure(slot, tx, e),
-            }
-        }
         let cap = self.partition_limit.unwrap_or(usize::MAX);
-        let Some(owned) = self.merger.as_mut() else {
-            unreachable!("the merger is opened above");
-        };
         loop {
+            if self.merger.is_none() {
+                match self.open_merger() {
+                    Ok(merger) => self.merger = Some(merger),
+                    Err(e) if self.resume_after_retired_input(&e) => continue,
+                    Err(e) => return deliver_failure(slot, tx, e),
+                }
+            }
             if self.emitted >= cap {
                 return ScanRun::Finished;
             }
-            let next = match self.fragment_rows {
-                Some(k) => owned
-                    .merger
-                    .next_fragment(k)
-                    .map(|fragment| fragment.map(|f| f.into_partition())),
-                None => owned.merger.next_merged_partition(),
+            let Some(owned) = self.merger.as_mut() else {
+                unreachable!("the merger is opened above");
             };
-            let partition = match next {
-                Ok(Some(partition)) => partition,
+            let next = match self.fragment_rows {
+                Some(k) => owned.merger.next_fragment(k).map(|fragment| {
+                    fragment.map(|f| {
+                        let complete = f.last;
+                        (f.into_partition(), complete)
+                    })
+                }),
+                None => owned
+                    .merger
+                    .next_merged_partition()
+                    .map(|partition| partition.map(|p| (p, true))),
+            };
+            let (partition, complete) = match next {
+                Ok(Some(item)) => item,
                 Ok(None) => return ScanRun::Finished,
+                Err(e) if self.resume_after_retired_input(&e) => continue,
                 Err(e) => return deliver_failure(slot, tx, e),
             };
+            let partition = match &self.skip {
+                Some(skip) if skip.key == partition.key => match skip.remainder(partition) {
+                    Some(rest) => rest,
+                    None => continue,
+                },
+                Some(_) => {
+                    self.skip = None;
+                    partition
+                }
+                None => partition,
+            };
+            self.delivered = Some(Delivered::advance(
+                self.delivered.take(),
+                &partition,
+                complete,
+            ));
             match deliver_or_pause(slot, tx, Ok(partition)) {
                 Delivery::Sent => {
                     if self.fragment_rows.is_none() {
@@ -3038,7 +3184,7 @@ impl<F: FlushTarget> TableStore<F> {
         initial_view.check_invariants("new:empty");
         Self {
             schema: ArcSwap::new(schema),
-            view: ArcSwap::from_pointee(initial_view),
+            view: Arc::new(ArcSwap::from_pointee(initial_view)),
             rotation_tx,
             rotation_rx,
             rotating: std::sync::atomic::AtomicBool::new(false),
@@ -3255,7 +3401,7 @@ impl<F: FlushTarget> TableStore<F> {
         initial_view.check_invariants("new_with_sstables");
         Self {
             schema: ArcSwap::new(schema),
-            view: ArcSwap::from_pointee(initial_view),
+            view: Arc::new(ArcSwap::from_pointee(initial_view)),
             rotation_tx,
             rotation_rx,
             rotating: std::sync::atomic::AtomicBool::new(false),
@@ -3351,7 +3497,7 @@ impl<F: FlushTarget> TableStore<F> {
         initial_view.check_invariants("new_with_descriptors");
         Self {
             schema: ArcSwap::new(schema),
-            view: ArcSwap::from_pointee(initial_view),
+            view: Arc::new(ArcSwap::from_pointee(initial_view)),
             rotation_tx,
             rotation_rx,
             rotating: std::sync::atomic::AtomicBool::new(false),
@@ -6128,6 +6274,10 @@ impl<F: FlushTarget> TableStore<F> {
             end: end.cloned(),
             merger: None,
             emitted: 0,
+            live_view: Arc::clone(&self.view),
+            delivered: None,
+            skip: None,
+            resumes: 0,
         };
         spawn_resumable_range_scan(tx, scan);
 
@@ -18493,5 +18643,93 @@ mod tests {
             missing.is_empty(),
             "partitions dropped by the pauses: {missing:?}"
         );
+    }
+}
+
+/// What a streamed scan resumed after a retired input skips (see
+/// `RangeScan::resume_after_retired_input`).
+#[cfg(test)]
+mod scan_resume_tests {
+    use super::*;
+    use ferrosa_common::PartitionKey;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+    fn key(k: &str) -> DecoratedKey {
+        DecoratedKey::new(PartitionKey::new(k.as_bytes().to_vec()))
+    }
+
+    fn row(c: u8) -> Row {
+        Row {
+            clustering: vec![c],
+            cells: vec![],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1),
+        }
+    }
+
+    fn partition(k: &str, rows: &[u8]) -> Partition {
+        Partition {
+            key: key(k),
+            deletion: DeletionTime::new(5, 5),
+            static_row: Some(row(0)),
+            rows: rows.iter().map(|c| row(*c)).collect(),
+        }
+    }
+
+    #[test]
+    fn a_partition_delivered_whole_is_not_delivered_again() {
+        let done = Delivered::advance(None, &partition("a", &[1, 2]), true);
+        assert!(done.remainder(partition("a", &[1, 2])).is_none());
+    }
+
+    #[test]
+    fn a_partition_stopped_mid_way_resumes_after_its_last_row_without_its_header() {
+        let mid = Delivered::advance(None, &partition("a", &[1, 2, 3]), false);
+        let rest = mid
+            .remainder(partition("a", &[1, 2, 3, 4, 5]))
+            .expect("rows 4 and 5 are still owed");
+        let clustering: Vec<u8> = rest.rows.iter().map(|r| r.clustering[0]).collect();
+        assert_eq!(clustering, vec![4, 5]);
+        assert_eq!(
+            rest.deletion,
+            DeletionTime::LIVE,
+            "the header went out with the first fragment"
+        );
+        assert!(rest.static_row.is_none());
+        assert!(
+            mid.remainder(partition("a", &[2, 3])).is_none(),
+            "a re-read fragment holding only delivered rows is dropped"
+        );
+    }
+
+    #[test]
+    fn a_later_partition_passes_through_unchanged() {
+        let mid = Delivered::advance(None, &partition("a", &[1]), false);
+        assert_eq!(
+            mid.remainder(partition("b", &[1])),
+            Some(partition("b", &[1]))
+        );
+    }
+
+    #[test]
+    fn a_fragment_without_rows_keeps_the_last_row_already_delivered() {
+        let first = Delivered::advance(None, &partition("a", &[7]), false);
+        let after_empty = Delivered::advance(Some(first), &partition("a", &[]), false);
+        assert_eq!(after_empty.last_clustering, Some(vec![7]));
+        let next_key = Delivered::advance(Some(after_empty), &partition("b", &[]), false);
+        assert_eq!(
+            next_key.last_clustering, None,
+            "a new key starts with nothing delivered"
+        );
+    }
+
+    #[test]
+    fn only_a_missing_file_is_treated_as_a_retired_input() {
+        let not_found =
+            ferrosa_common::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let denied =
+            ferrosa_common::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(is_missing_file(&not_found));
+        assert!(!is_missing_file(&denied));
     }
 }
