@@ -1105,6 +1105,8 @@ default. Values are process-wide for the lifetime of the engine.
 | `FERROSA_DIGEST_READ_CHUNK_BYTES` | 1 MiB | 1 byte–64 MiB | Reused buffer size for staged SSTable digest verification. |
 | `FERROSA_COMPACTION_TASK_QUEUE_CAPACITY_PER_WORKER` | 1 | 1–32 | Bounded queued tasks per compaction worker. |
 | `FERROSA_COMPACTION_RESULT_QUEUE_CAPACITY_PER_WORKER` | 2 | 1–32 | Bounded completed results and failures per compaction worker. |
+| `FERROSA_SSTABLE_COMPRESSION` | `lz4` | `lz4`, `zstd`, `none` | Default SSTable codec for tables whose schema selects none. Set-but-empty is treated as unset. |
+| `FERROSA_SSTABLE_ZSTD_LEVEL` | 3 | −7–22 | Zstd level for that codec and for the zstd schema fallback. |
 
 Values outside their documented ranges, including unreadable environment
 values, log at `ERROR` and use the corresponding default. These practical
@@ -1119,6 +1121,13 @@ error instead of panicking.
 The age-flush floor trades earlier WAL retention relief for the risk of creating
 more small SSTables. Digest chunk size changes verification read granularity;
 digest calculation and staged-output verification remain mandatory.
+
+The compression codec knob trades CPU against on-disk size: a host with more CPU
+than storage bandwidth can raise `FERROSA_SSTABLE_COMPRESSION` to `zstd` (and
+`FERROSA_SSTABLE_ZSTD_LEVEL` with it) to write smaller SSTables and move fewer
+bytes to object storage, at the cost of extra CPU per flush and per compaction
+output. A per-table `compression.class` schema extension still wins over it; the
+knob only supplies the default for tables that select none.
 
 ## Specs
 

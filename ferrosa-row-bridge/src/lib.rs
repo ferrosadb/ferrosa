@@ -220,10 +220,11 @@ impl std::error::Error for RowDecodeError {}
 
 pub use codec::{decode_value, encode_value, parse_cql_type, parse_cql_type_in_keyspace};
 pub use row::{
-    build_decorated_key, build_delete_row, build_row, consume_partition_rows_with_clustering,
-    decode_clustering, decode_pk, encode_clustering, partition_to_rows,
-    partition_to_rows_with_clustering, partition_to_rows_with_storage_mapping,
-    visit_partition_rows_with_clustering, write_partition_raw_rows_with_storage_mapping,
+    build_decorated_key, build_delete_row, build_row, column_projection,
+    consume_partition_rows_with_clustering, decode_clustering, decode_pk, encode_clustering,
+    partition_to_rows, partition_to_rows_with_clustering, partition_to_rows_with_storage_mapping,
+    projected_column_raw_encodable, visit_partition_rows_with_clustering,
+    write_partition_raw_rows_projected, write_partition_raw_rows_with_storage_mapping,
 };
 
 // Liveness helpers are re-exported for `ferrosa-cql`'s remaining metadata

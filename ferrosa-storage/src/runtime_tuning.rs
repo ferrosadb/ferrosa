@@ -45,6 +45,18 @@ const MAX_DIGEST_READ_CHUNK_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 const MAX_TASK_QUEUE_CAPACITY_PER_WORKER: usize = 32;
 const MAX_RESULT_QUEUE_CAPACITY_PER_WORKER: usize = 32;
 
+/// SSTable compression codec applied when a table schema does not select one
+/// and `FERROSA_SSTABLE_COMPRESSION` is unset. Historical behaviour: LZ4.
+const DEFAULT_SSTABLE_COMPRESSION_KIND: SstableCompressionKind = SstableCompressionKind::Lz4;
+/// Zstd level used when zstd is selected and no level is configured. Matches
+/// the level `compression_from_schema` previously hardcoded.
+const DEFAULT_SSTABLE_ZSTD_LEVEL: i32 = 3;
+/// Zstd's own supported level range (`ZSTD_minCLevel`..`ZSTD_maxCLevel`). Values
+/// outside it are rejected rather than clamped, so an operator typo cannot
+/// silently pick a different ratio.
+const MIN_SSTABLE_ZSTD_LEVEL: i32 = -7;
+const MAX_SSTABLE_ZSTD_LEVEL: i32 = 22;
+
 /// Validated knobs that affect flush/compaction throughput and bounded memory.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StorageRuntimeTuning {
@@ -59,6 +71,35 @@ pub(crate) struct StorageRuntimeTuning {
     pub digest_read_chunk_bytes: usize,
     /// Compaction pipeline depth and the planner backpressure threshold.
     pub compaction_pipeline: CompactionPipelineTuning,
+    /// SSTable compression codec/level applied when a table schema does not
+    /// select one. External knob for a host whose CPU/IOPS balance differs from
+    /// the built-in LZ4 default — compress harder where CPU is plentiful and
+    /// bandwidth is not (`FERROSA_SSTABLE_COMPRESSION`, `FERROSA_SSTABLE_ZSTD_LEVEL`).
+    pub sstable_compression: SstableCompressionTuning,
+}
+
+/// SSTable compression defaults applied when a table schema does not select a
+/// codec or a zstd level.
+///
+/// Grouped into their own `Copy` type so `StorageRuntimeTuning` stays under the
+/// p0-oom-audit `copy-derive-large-type` field-count threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SstableCompressionTuning {
+    pub kind: SstableCompressionKind,
+    pub zstd_level: i32,
+}
+
+/// Codec selected by `FERROSA_SSTABLE_COMPRESSION` when a table schema does not
+/// name one.
+///
+/// Deliberately carries **no** level: the zstd level comes from
+/// [`SstableCompressionTuning::zstd_level`], so one setting cannot embed a level
+/// the other setting cannot override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SstableCompressionKind {
+    None,
+    Lz4,
+    Zstd,
 }
 
 /// Compaction pipeline queue depths and the planner backpressure threshold.
@@ -156,6 +197,20 @@ impl StorageRuntimeTuning {
                     MAX_COMPACTION_BACKPRESSURE_PRESSURE,
                 ),
             },
+            sstable_compression: SstableCompressionTuning {
+                kind: parse_sstable_compression_env(
+                    "FERROSA_SSTABLE_COMPRESSION",
+                    env::var("FERROSA_SSTABLE_COMPRESSION"),
+                    defaults.sstable_compression.kind,
+                ),
+                zstd_level: parse_i32_env(
+                    "FERROSA_SSTABLE_ZSTD_LEVEL",
+                    env::var("FERROSA_SSTABLE_ZSTD_LEVEL"),
+                    defaults.sstable_compression.zstd_level,
+                    MIN_SSTABLE_ZSTD_LEVEL,
+                    MAX_SSTABLE_ZSTD_LEVEL,
+                ),
+            },
         }
     }
 }
@@ -176,6 +231,10 @@ impl Default for StorageRuntimeTuning {
                 task_queue_capacity_per_worker: DEFAULT_TASK_QUEUE_CAPACITY_PER_WORKER,
                 result_queue_capacity_per_worker: DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER,
                 backpressure_pressure: DEFAULT_COMPACTION_BACKPRESSURE_PRESSURE,
+            },
+            sstable_compression: SstableCompressionTuning {
+                kind: DEFAULT_SSTABLE_COMPRESSION_KIND,
+                zstd_level: DEFAULT_SSTABLE_ZSTD_LEVEL,
             },
         }
     }
@@ -269,6 +328,68 @@ fn parse_f64_env(
     }
 }
 
+fn parse_i32_env(
+    name: &str,
+    value: Result<String, env::VarError>,
+    default: i32,
+    min: i32,
+    max: i32,
+) -> i32 {
+    match value {
+        Err(env::VarError::NotPresent) => default,
+        Err(error @ env::VarError::NotUnicode(_)) => {
+            tracing::error!(setting = name, %error, default, "invalid storage runtime setting; using default");
+            default
+        }
+        Ok(raw) => match raw.trim().parse::<i32>() {
+            Ok(parsed) if (min..=max).contains(&parsed) => parsed,
+            _ => {
+                tracing::error!(setting = name, value = %raw, min, max, default, "invalid storage runtime setting; using default");
+                default
+            }
+        },
+    }
+}
+
+/// Parse the default SSTable codec selector.
+///
+/// A value that is *set but empty* is treated as unset and falls back to
+/// `default`: `fly machine update --env KEY=` is the only way to clear a Fly
+/// variable, so rejecting the empty string would make the knob impossible to
+/// remove once set. Only genuinely unrecognized values are rejected loudly.
+fn parse_sstable_compression_env(
+    name: &str,
+    value: Result<String, env::VarError>,
+    default: SstableCompressionKind,
+) -> SstableCompressionKind {
+    match value {
+        Err(env::VarError::NotPresent) => default,
+        Err(error @ env::VarError::NotUnicode(_)) => {
+            tracing::error!(setting = name, %error, "invalid storage runtime setting; using default");
+            default
+        }
+        Ok(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return default;
+            }
+            match raw.to_ascii_lowercase().as_str() {
+                "lz4" => SstableCompressionKind::Lz4,
+                "zstd" => SstableCompressionKind::Zstd,
+                "none" | "off" | "uncompressed" => SstableCompressionKind::None,
+                _ => {
+                    tracing::error!(
+                        setting = name,
+                        value = %raw,
+                        "invalid storage runtime setting; expected lz4|zstd|none; using default"
+                    );
+                    default
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +474,78 @@ mod tests {
             tuning.compaction_pipeline.result_queue_capacity_per_worker,
             DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER
         );
+        assert_eq!(
+            tuning.sstable_compression.kind,
+            DEFAULT_SSTABLE_COMPRESSION_KIND
+        );
+        assert_eq!(
+            tuning.sstable_compression.zstd_level,
+            DEFAULT_SSTABLE_ZSTD_LEVEL
+        );
+    }
+
+    #[test]
+    fn sstable_compression_kind_parses_case_insensitively_and_treats_empty_as_unset() {
+        use SstableCompressionKind::*;
+        let def = Lz4;
+        assert_eq!(
+            parse_sstable_compression_env("TEST", Err(env::VarError::NotPresent), def),
+            def
+        );
+        // Empty is "unset", not an error: `fly machine update --env KEY=` is
+        // the only way to clear a Fly variable, so empty must fall back.
+        for raw in ["", "   "] {
+            assert_eq!(
+                parse_sstable_compression_env("TEST", Ok(raw.into()), def),
+                def
+            );
+        }
+        assert_eq!(
+            parse_sstable_compression_env("TEST", Ok("LZ4".into()), def),
+            Lz4
+        );
+        assert_eq!(
+            parse_sstable_compression_env("TEST", Ok(" Zstd ".into()), def),
+            Zstd
+        );
+        assert_eq!(
+            parse_sstable_compression_env("TEST", Ok("NONE".into()), def),
+            SstableCompressionKind::None
+        );
+        assert_eq!(
+            parse_sstable_compression_env("TEST", Ok("off".into()), def),
+            SstableCompressionKind::None
+        );
+    }
+
+    #[test]
+    fn sstable_compression_kind_rejects_unknown_values() {
+        // An unrecognized codec must not silently become LZ4.
+        for raw in ["snappy", "true", "lz4:9"] {
+            assert_eq!(
+                parse_sstable_compression_env("TEST", Ok(raw.into()), SstableCompressionKind::Zstd),
+                SstableCompressionKind::Zstd,
+                "{raw} is not a codec name; expected the default"
+            );
+        }
+    }
+
+    #[test]
+    fn zstd_level_accepts_the_supported_range_and_rejects_outside_it() {
+        assert_eq!(
+            parse_i32_env("TEST", Err(env::VarError::NotPresent), 3, -7, 22),
+            3
+        );
+        assert_eq!(parse_i32_env("TEST", Ok(" 9 ".into()), 3, -7, 22), 9);
+        assert_eq!(parse_i32_env("TEST", Ok("-7".into()), 3, -7, 22), -7);
+        assert_eq!(parse_i32_env("TEST", Ok("22".into()), 3, -7, 22), 22);
+        for raw in ["23", "-8", "999", "fast", "", "3.5"] {
+            assert_eq!(
+                parse_i32_env("TEST", Ok(raw.into()), 3, -7, 22),
+                3,
+                "{raw} is outside the zstd range and must fall back"
+            );
+        }
     }
 
     #[test]

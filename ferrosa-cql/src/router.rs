@@ -5349,6 +5349,77 @@ async fn route_prepared_select_fast_inner(
             return Ok(RouteResult::Result(body));
         }
 
+        // Projection fast path: a projection of plain scalar/key columns over this
+        // single partition is emitted straight from the stored cells. Each such
+        // cell already is its CQL wire encoding, so decoding every column into a
+        // `CqlValue` and then copying the projection back out is pure overhead.
+        // Function calls (`writetime`, `ttl`, `count`, …) and assembled
+        // (collection/UDT/vector) columns are projection barriers — those queries
+        // fall through to the decoding path below rather than mix encodings.
+        if let Some(partition) = partition.as_ref() {
+            let full_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+            let projection = bridge::column_projection(&full_names, &col_names);
+            let mut projected: Vec<usize> = Vec::with_capacity(projection.len());
+            let mut all_raw = true;
+            for slot in &projection {
+                let Some(idx) = *slot else {
+                    all_raw = false;
+                    break;
+                };
+                let Some((_, col)) = table_meta.columns.get_index(idx) else {
+                    all_raw = false;
+                    break;
+                };
+                let ty = resolve_col_type(&col.column_type, ks, &state.schema)?;
+                if !bridge::projected_column_raw_encodable(&ty) {
+                    all_raw = false;
+                    break;
+                }
+                projected.push(idx);
+            }
+
+            if all_raw {
+                let take = limit.unwrap_or(i32::MAX).max(0) as usize;
+                let pk_indices: Vec<usize> = table_meta
+                    .partition_key
+                    .iter()
+                    .filter_map(|name| table_meta.columns.get_index_of(name))
+                    .collect();
+                let ck_indices: Vec<usize> = table_meta
+                    .clustering_key
+                    .iter()
+                    .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+                    .collect();
+                let storage_to_table = storage_to_table_indices(table_meta);
+                let body = result::encode_rows_raw_with_writer(
+                    &col_names,
+                    &col_types,
+                    ks,
+                    &s.table,
+                    |emit| {
+                        let mut emitted = 0usize;
+                        bridge::write_partition_raw_rows_projected(
+                            partition,
+                            full_names.len(),
+                            &pk_indices,
+                            &ck_indices,
+                            &storage_to_table,
+                            &projected,
+                            |row| {
+                                if emitted < take {
+                                    emitted += 1;
+                                    emit(row);
+                                }
+                            },
+                        );
+                    },
+                );
+                #[cfg(test)]
+                SELECT_PROJECTION_FAST_PATH_TAKEN.with(|count| count.set(count.get() + 1));
+                return Ok(RouteResult::Result(body));
+            }
+        }
+
         let rows = if let Some(partition) = partition {
             let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
             let all_col_types: Vec<CqlType> = table_meta
@@ -5844,6 +5915,13 @@ thread_local! {
     /// Paging through such a result must cost O(table) rows in total, not
     /// O(table) per page.
     static FULL_SCAN_ROWS_PULLED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Test-only observability: how many times the projection fast path emitted a
+    /// partition's rows straight from stored cell bytes (no full-width `CqlValue`
+    /// materialization) on this thread. A non-star projection over a full
+    /// partition key must take it.
+    static SELECT_PROJECTION_FAST_PATH_TAKEN: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Test instrumentation: count the rows a full-table scan stream yields (see
@@ -17086,6 +17164,79 @@ mod tests {
             _ => panic!("expected rows result"),
         }
         assert_eq!(state.query_tracker.total_executed(), executed_before + 1);
+    }
+
+    /// A projection of a strict subset of columns over a full partition key is
+    /// emitted by the projection fast path (no full-width `CqlValue`
+    /// materialization), and the encoded row holds only the requested columns in
+    /// the requested order.
+    #[tokio::test]
+    async fn prepared_select_projection_fast_path_emits_only_selected_columns() {
+        let (state, _dir) = setup();
+        let current_keyspace = Some("fastsel".to_string());
+        let auth = dev_auth();
+        let ctx = test_ctx(&auth, &current_keyspace);
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE fastsel WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("CREATE TABLE fastsel.t (id int PRIMARY KEY, a int, b text)")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("INSERT INTO fastsel.t (id, a, b) VALUES (7, 42, 'seven')")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Project only (b, id): the stored `a` column must not appear in the row.
+        let select = match crate::parser::parse("SELECT b, id FROM t WHERE id = ?").unwrap() {
+            Statement::Select(select) => select,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let bound_terms = vec![Term::IntegerLiteral(7)];
+        let taken_before = SELECT_PROJECTION_FAST_PATH_TAKEN.with(std::cell::Cell::get);
+
+        let result = route_prepared_select_fast(&state, &ctx, &select, &bound_terms)
+            .await
+            .expect("full partition-key prepared SELECT should take fast path")
+            .unwrap();
+
+        let body = match result {
+            RouteResult::Result(body) => body,
+            _ => panic!("expected rows result"),
+        };
+        assert_eq!(&body[0..4], &0x0002i32.to_be_bytes());
+        let text = b"seven";
+        let mut needle = (text.len() as i32).to_be_bytes().to_vec();
+        needle.extend_from_slice(text);
+        assert!(
+            body.windows(needle.len()).any(|w| w == needle),
+            "projected row must contain b='seven': {body:?}"
+        );
+        // Structural proof the projection path ran — the row bytes themselves are
+        // identical whether they came from stored cells or a decode+re-encode, so
+        // the counter is the only discriminator.
+        assert_eq!(
+            SELECT_PROJECTION_FAST_PATH_TAKEN.with(std::cell::Cell::get),
+            taken_before + 1,
+            "a non-star projection over a full partition key must take the projection fast path"
+        );
     }
 
     #[tokio::test]

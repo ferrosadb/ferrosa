@@ -1037,10 +1037,11 @@ fn resolve_builtin_type(name: &str) -> Option<CqlType> {
 // `decode_value` (used internally below) maps RowBridgeError back to CqlError
 // via the `crate::types::decode_value` wrapper.
 pub use ferrosa_row_bridge::{
-    build_decorated_key, build_delete_row, build_row, consume_partition_rows_with_clustering,
-    decode_clustering, decode_pk, encode_clustering, partition_to_rows,
-    partition_to_rows_with_clustering, partition_to_rows_with_storage_mapping,
-    visit_partition_rows_with_clustering, write_partition_raw_rows_with_storage_mapping,
+    build_decorated_key, build_delete_row, build_row, column_projection,
+    consume_partition_rows_with_clustering, decode_clustering, decode_pk, encode_clustering,
+    partition_to_rows, partition_to_rows_with_clustering, partition_to_rows_with_storage_mapping,
+    projected_column_raw_encodable, visit_partition_rows_with_clustering,
+    write_partition_raw_rows_projected, write_partition_raw_rows_with_storage_mapping,
     RowDecodeError,
 };
 
