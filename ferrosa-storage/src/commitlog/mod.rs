@@ -457,8 +457,15 @@ pub struct ReplayRelog<'a> {
 impl ReplayRelog<'_> {
     /// Re-logs `mutation` (same id, timestamp and rows) into the new
     /// generation and returns its new position.
+    ///
+    /// Not refused by sync health: nothing is acknowledged on its return.
+    /// Replay's own barrier (`force_sync` before each old segment is deleted,
+    /// `force_rotate` for rotated ones) is what makes the copy durable, and
+    /// until it does, the old segment still holds the mutation. Refusing here
+    /// turned a late background sync during startup into a node that exited
+    /// instead of starting.
     pub fn retain(&self, mutation: &Mutation) -> ferrosa_common::Result<CommitLogPosition> {
-        self.log.append(mutation)
+        self.log.append_for_explicit_sync(mutation)
     }
 }
 
@@ -2109,6 +2116,59 @@ mod tests {
         );
         assert_eq!(replayed[0].mutation_id, written.mutation_id);
         assert_eq!(replayed[0].timestamp, written.timestamp);
+    }
+
+    /// Replay's re-log is made durable by replay's own barrier (`force_sync`
+    /// before each old segment is deleted), so sync health must not refuse
+    /// it. It did: on 2026-10-06 and 2026-10-07 a node restarting under disk
+    /// load re-logged into a commit log whose background sync was late,
+    /// `append` refused with `CommitLogNotDurable`, and the node exited
+    /// during startup instead of starting (node3 stayed down 35 h).
+    #[test]
+    fn replay_relog_is_not_refused_by_an_unhealthy_sync_thread_and_survives_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: Duration::from_millis(10),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config.clone()).unwrap();
+        cl.inject_sync_panic();
+        // Wake the thread into its panic, then wait for it to be dead.
+        cl.append(&mutation_for_table("ks", "wake")).unwrap();
+        let started = Instant::now();
+        while !cl.sync_health().dead {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the sync thread never died"
+            );
+            std::thread::yield_now();
+        }
+        // The client-write gate is unchanged: an ordinary append is refused.
+        assert!(
+            matches!(
+                cl.append(&mutation_for_table("ks", "client")),
+                Err(ferrosa_common::Error::CommitLogNotDurable { .. })
+            ),
+            "an acknowledged write must still be refused while the sync thread is dead"
+        );
+
+        let replayed = mutation_for_table("ks", "replayed");
+        ReplayRelog { log: &cl }
+            .retain(&replayed)
+            .expect("a replay re-log is made durable by replay's barrier, not refused");
+        cl.force_sync().unwrap(); // replay's barrier before deleting the old segment
+        std::mem::forget(cl); // kill -9: nothing else gets to flush
+
+        let (_reopened, recovered) = CommitLog::open_and_replay(config).unwrap();
+        assert!(
+            recovered
+                .iter()
+                .any(|m| m.mutation_id == replayed.mutation_id),
+            "the re-logged mutation is durable after the barrier: {:?}",
+            recovered.iter().map(|m| &m.table).collect::<Vec<_>>()
+        );
     }
 
     /// The re-logged copy is an ordinary entry of the new generation: once
