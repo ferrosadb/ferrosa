@@ -74,12 +74,11 @@ compaction-validator = []
 # the production write path instead of hand-rolling files that could drift from
 # the real format. Off by default; pulled in only as a dev-dependency.
 test-support = ["dep:tempfile"]
-# macOS does not treat ordinary fsync/fdatasync as a hardware-cache flush.
-# Local macOS builds default to F_FULLFSYNC for correctness. Enable
-# macos-standard-sync only for explicit fast/dev runs that accept weaker
-# durability semantics.
-macos-fullfsync = []
-macos-standard-sync = []
+# The macOS commit-log sync call is no longer a cargo feature. It is the
+# runtime setting FERROSA_COMMITLOG_SYNC_MODE (full | barrier | fsync, default
+# full), logged at startup; see `CommitLogSyncMode`. The old
+# `macos-standard-sync` feature switched to `File::sync_data`, which is
+# F_FULLFSYNC on Apple targets, so it never weakened anything.
 # Shared proptest generators + test-support fixtures for the repair/storage
 # fuzz harness (`arb_partition`, `arb_table_content`, `arb_replica_set`,
 # `arb_sstable_layout`, `arb_corruption`, `arb_config`). Off by default; enabled

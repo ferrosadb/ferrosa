@@ -866,6 +866,8 @@ impl StorageEngineConfig {
         };
         commit_log.batch =
             crate::commitlog::config::CommitLogBatchConfig::from_env(commit_log.batch.clone());
+        commit_log.batch.sync_mode = crate::commitlog::config::CommitLogSyncMode::from_env()
+            .map_err(ferrosa_common::Error::InvalidFormat)?;
 
         let compaction = CompactionConfig::from_env(data_dir.join("compaction"));
 
@@ -10266,6 +10268,17 @@ impl StorageEngine {
             results.truncate(k);
         }
         Ok(results.into_iter().map(|(pk, _)| pk).collect())
+    }
+
+    /// Give up to `budget` of `table_id`'s legacy FTI sidecars a term index
+    /// (see `TableStore::upgrade_legacy_fulltext_sidecars`); returns how many.
+    /// Holds nothing engine-wide. 0 for an unregistered table.
+    pub fn upgrade_legacy_fulltext_sidecars(&self, table_id: &TableId, budget: usize) -> usize {
+        // A snapshot of the table map, not a guard held across file I/O.
+        let tables = self.tables.load_full();
+        tables
+            .get(table_id)
+            .map_or(0, |t| t.store.upgrade_legacy_fulltext_sidecars(budget))
     }
 
     /// The FTI sidecars a query against `table_id`'s `index_name` reads, and
@@ -22019,6 +22032,98 @@ mod tests {
             "t2 must remain readable when a pooled (cache-hit) gen2 reader's Data.db was \
              deleted mid-read by a concurrent compaction — the mid-read ENOENT must drive a \
              view retry to the merged SSTable, never a spurious Ok(None) (silent data loss)"
+        );
+    }
+
+    /// A streamed range scan survives a compaction that retires its inputs
+    /// mid-stream: it resumes on the new view and yields every key once.
+    ///
+    /// Live on 2026-10-07 (node1, the memory cluster): the adjacency heal's
+    /// orphan scan streamed `system_graph_agent_memory.adjacency`, a
+    /// compaction swapped out 16 of its inputs at 19:28:35.437, and 860 ms
+    /// later the stream failed with `I/O error: No such file or directory`. A
+    /// stream pins its readers, but `Data.db` is held by path: once the fd
+    /// cache drops a descriptor, the next read re-opens a path compaction has
+    /// already retired. The 236,409-entry heal then ended incomplete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_scan_resumes_when_compaction_retires_its_inputs_mid_stream() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 2;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // Two SSTables big enough that each Data.db spans many read chunks.
+        let value = vec![b'v'; 200];
+        let mut expected = std::collections::BTreeSet::new();
+        for batch in 0..2 {
+            for i in 0..2_000 {
+                let key = format!("k{batch}-{i:05}");
+                engine
+                    .write(&tid, &make_key(&key), make_row(&value, 1_000), 1_000)
+                    .unwrap();
+                expected.insert(make_key(&key));
+            }
+            engine.flush(&tid).unwrap();
+        }
+        assert!(
+            engine.sstable_count(&tid) >= 2,
+            "the scan has several SSTables to read"
+        );
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let inputs: Vec<std::path::PathBuf> = StorageEngine::list_generations_in_dir(&table_dir)
+            .iter()
+            .map(|gen| {
+                StorageEngine::generation_component_path_for_test(&table_dir, *gen, "Data.db")
+                    .expect("input Data.db path")
+            })
+            .collect();
+
+        // Start the stream; its producer opens the readers and pauses on the
+        // small channel.
+        let mut stream = engine.range_iter_fragmented(&tid, None, None);
+        let mut seen = Vec::new();
+        let first = stream
+            .next()
+            .await
+            .expect("an item")
+            .expect("the first item reads");
+        seen.push(first.key.clone());
+
+        // Compact both inputs away while the stream is mid-scan.
+        let resumes_before = crate::store::range_scan_compaction_resumes_total();
+        engine.force_compact_all();
+        engine
+            .drive_compactions_until_idle(&tid, std::time::Duration::from_secs(60))
+            .await;
+        for data in &inputs {
+            assert!(!data.exists(), "compaction retired {}", data.display());
+            // As the shared fd cache does under load: the next read re-opens
+            // the path.
+            ferrosa_sstable::io::evict_global_fd_for_test(data);
+        }
+
+        while let Some(item) = stream.next().await {
+            let partition = item.unwrap_or_else(|e| {
+                panic!(
+                    "the scan failed after {} partitions instead of resuming on the \
+                     compacted view: {e}",
+                    seen.len()
+                )
+            });
+            if seen.last() != Some(&partition.key) {
+                seen.push(partition.key.clone());
+            }
+        }
+        let got: std::collections::BTreeSet<_> = seen.iter().cloned().collect();
+        assert_eq!(got.len(), seen.len(), "no key is yielded twice");
+        assert_eq!(got, expected, "every key is yielded");
+        assert!(
+            crate::store::range_scan_compaction_resumes_total() > resumes_before,
+            "the scan resumed on the compacted view (the path under test ran)"
         );
     }
 
@@ -35458,6 +35563,72 @@ mod tests {
 
         let hits = reader.search_str("rust").unwrap();
         assert!(!hits.is_empty(), "search for 'rust' must return results");
+    }
+
+    /// A sidecar written before the term index is given one in place, and
+    /// answers the same afterwards. Live nodes carry such sidecars (184 MB of
+    /// them on one node's entity_store); until one is rewritten, every lookup
+    /// in it walks its whole dictionary.
+    #[test]
+    fn a_legacy_fts_sidecar_is_given_a_term_index_in_place() {
+        use ferrosa_index::fulltext::builder::{serialize_fti, serialize_fti_without_term_index};
+        use ferrosa_index::fulltext::reader::deserialize_fti;
+        use ferrosa_index::fulltext::stream::term_index_tail_for_path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+        for (key, text) in [
+            ("r1", "rust distributed database"),
+            ("r2", "cassandra storage"),
+            ("r3", "rust hello world"),
+        ] {
+            engine
+                .write(&tid, &make_key(key), make_row(text.as_bytes(), 1000), 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        let before = engine
+            .fulltext_search(&tid, "idx_body", "rust", None)
+            .unwrap();
+        assert_eq!(before.len(), 2);
+
+        // Rewrite the sidecar as a build before the term index wrote it.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let path = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with("-FTI-idx_body.db"))
+            .expect("the flush wrote a sidecar");
+        let fti = deserialize_fti(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::write(&path, serialize_fti_without_term_index(&fti).unwrap()).unwrap();
+        assert!(
+            term_index_tail_for_path(&path).unwrap().is_some(),
+            "now legacy"
+        );
+
+        assert_eq!(engine.upgrade_legacy_fulltext_sidecars(&tid, 8), 1);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serialize_fti(&fti).unwrap(),
+            "upgraded in place to exactly what the current writer produces"
+        );
+        assert_eq!(
+            engine.upgrade_legacy_fulltext_sidecars(&tid, 8),
+            0,
+            "nothing left"
+        );
+        let mut after = engine
+            .fulltext_search(&tid, "idx_body", "rust", None)
+            .unwrap();
+        let mut before = before;
+        after.sort();
+        before.sort();
+        assert_eq!(after, before, "same answer after the upgrade");
     }
 
     /// TDD repro for the post-restart fts_match-empty bug: flush an FTI sidecar,

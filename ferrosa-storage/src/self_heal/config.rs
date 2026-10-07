@@ -18,6 +18,8 @@ pub const ENV_MAX_ATTEMPTS: &str = "FERROSA_SELFHEAL_MAX_ATTEMPTS";
 pub const ENV_COOLDOWN_TICKS: &str = "FERROSA_SELFHEAL_COOLDOWN_TICKS";
 /// Vector-index generations decoded and checked per index per tick.
 pub const ENV_VECTOR_DECODE_BUDGET: &str = "FERROSA_SELFHEAL_VECTOR_DECODE_BUDGET";
+/// Legacy full-text sidecars given a term index per table per tick.
+pub const ENV_FULLTEXT_UPGRADE_BUDGET: &str = "FERROSA_SELFHEAL_FULLTEXT_UPGRADE_BUDGET";
 
 /// Deterministic, fixed configuration for the self-heal control loop.
 ///
@@ -43,6 +45,10 @@ pub struct SelfHealConfig {
     /// and checked per index per tick. Bounds the read cost of verification;
     /// cheap metadata checks run on every generation every tick regardless.
     pub vector_decode_budget: usize,
+    /// Legacy full-text sidecars (written before the term index) given one
+    /// per table per tick. Each upgrade reads its sidecar's dictionary once
+    /// and writes a copy; until upgraded, every lookup walks the whole file.
+    pub fulltext_upgrade_budget: usize,
 }
 
 impl Default for SelfHealConfig {
@@ -55,6 +61,7 @@ impl Default for SelfHealConfig {
             max_attempts: 3,
             cooldown_ticks: 4,
             vector_decode_budget: 8,
+            fulltext_upgrade_budget: 4,
         }
     }
 }
@@ -74,6 +81,10 @@ impl SelfHealConfig {
         let cooldown_ticks = parse_u64(ENV_COOLDOWN_TICKS, d.cooldown_ticks);
         let vector_decode_budget =
             parse_u64(ENV_VECTOR_DECODE_BUDGET, d.vector_decode_budget as u64).max(1) as usize;
+        let fulltext_upgrade_budget = parse_u64(
+            ENV_FULLTEXT_UPGRADE_BUDGET,
+            d.fulltext_upgrade_budget as u64,
+        ) as usize;
 
         let cfg = Self {
             enabled,
@@ -81,6 +92,7 @@ impl SelfHealConfig {
             max_attempts,
             cooldown_ticks,
             vector_decode_budget,
+            fulltext_upgrade_budget,
         };
         tracing::info!(
             enabled = cfg.enabled,
@@ -88,6 +100,7 @@ impl SelfHealConfig {
             max_attempts = cfg.max_attempts,
             cooldown_ticks = cfg.cooldown_ticks,
             vector_decode_budget = cfg.vector_decode_budget,
+            fulltext_upgrade_budget = cfg.fulltext_upgrade_budget,
             "self-heal: controller configuration resolved"
         );
         cfg

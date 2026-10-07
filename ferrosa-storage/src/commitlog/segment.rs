@@ -56,7 +56,7 @@ use ferrosa_common::key::DecoratedKey;
 use ferrosa_sstable::types::Row;
 use parking_lot::Mutex;
 
-use super::config::{CommitLogPosition, TableId};
+use super::config::{CommitLogPosition, CommitLogSyncMode, TableId};
 use super::descriptor::{SegmentDescriptor, HEADER_SIZE};
 use super::mutation::Mutation;
 
@@ -161,42 +161,66 @@ fn observe_phase(total: &AtomicU64, max: &AtomicU64, duration: Duration) {
     update_max_u64(max, micros);
 }
 
-#[cfg(all(
-    target_os = "macos",
-    any(feature = "macos-fullfsync", not(feature = "macos-standard-sync"))
-))]
-fn full_sync_file(file: &fs::File) -> ferrosa_common::Result<()> {
-    use std::os::fd::AsRawFd;
+/// Syncs issued, indexed by [`mode_index`]. Exported per mode so a dashboard
+/// shows which call the node is really making, not only which it was told to.
+static SYNCS_BY_MODE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
-    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
-    if rc == -1 {
-        Err(std::io::Error::last_os_error().into())
-    } else {
-        Ok(())
+fn mode_index(mode: CommitLogSyncMode) -> usize {
+    match mode {
+        CommitLogSyncMode::Full => 0,
+        CommitLogSyncMode::Barrier => 1,
+        CommitLogSyncMode::Fsync => 2,
     }
 }
 
-fn sync_commitlog_file(file: &fs::File) -> ferrosa_common::Result<()> {
-    #[cfg(all(
-        target_os = "macos",
-        any(feature = "macos-fullfsync", not(feature = "macos-standard-sync"))
-    ))]
-    {
-        full_sync_file(file)
-    }
+/// Commit-log and directory syncs issued in `mode` since the process started.
+pub(crate) fn syncs_issued(mode: CommitLogSyncMode) -> u64 {
+    SYNCS_BY_MODE[mode_index(mode)].load(Ordering::Relaxed)
+}
 
-    #[cfg(any(
-        not(target_os = "macos"),
-        all(
-            target_os = "macos",
-            feature = "macos-standard-sync",
-            not(feature = "macos-fullfsync")
-        )
-    ))]
-    {
-        file.sync_data()?;
-        Ok(())
+/// An interrupted sync is reissued, as `std` does for `sync_all`. The bound
+/// only stops a signal storm from spinning forever; it then fails loudly.
+#[cfg(target_vendor = "apple")]
+const MAX_EINTR_RETRIES: usize = 64;
+
+#[cfg(target_vendor = "apple")]
+fn apple_sync(file: &fs::File, mode: CommitLogSyncMode) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    for _ in 0..MAX_EINTR_RETRIES {
+        // SAFETY: `fd` is owned by `file`, which outlives the call; none of
+        // these calls reads or writes memory through a pointer.
+        let rc = unsafe {
+            match mode {
+                CommitLogSyncMode::Full => libc::fcntl(fd, libc::F_FULLFSYNC),
+                CommitLogSyncMode::Barrier => libc::fcntl(fd, libc::F_BARRIERFSYNC),
+                // `File::sync_data` would be F_FULLFSYNC on Apple targets.
+                CommitLogSyncMode::Fsync => libc::fsync(fd),
+            }
+        };
+        if rc != -1 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
+    Err(std::io::Error::other(format!(
+        "commit-log {} sync interrupted {MAX_EINTR_RETRIES} times in a row",
+        mode.name()
+    )))
+}
+
+/// Makes `file` durable in `mode`. On non-Apple targets every mode is
+/// `fdatasync`, which already flushes the device cache there.
+fn sync_file(file: &fs::File, mode: CommitLogSyncMode) -> ferrosa_common::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    apple_sync(file, mode)?;
+    #[cfg(not(target_vendor = "apple"))]
+    file.sync_data()?;
+    SYNCS_BY_MODE[mode_index(mode)].fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Rewrites, in place, the sync marker that a forward flush skipped.
@@ -222,29 +246,16 @@ fn repair_marker_in_place(
     Ok(end - start)
 }
 
-fn sync_parent_dir(path: &Path) -> ferrosa_common::Result<()> {
+/// Makes a new segment's directory entry durable in `mode`.
+///
+/// A failure is returned, never retried another way. This used to fall back
+/// from `F_FULLFSYNC` to `sync_all` on error, but `sync_all` is itself
+/// `F_FULLFSYNC` on Apple targets: the fallback reissued the same call and
+/// discarded the first error without a trace.
+fn sync_parent_dir(path: &Path, mode: CommitLogSyncMode) -> ferrosa_common::Result<()> {
     if let Some(parent) = path.parent() {
         let dir = fs::File::open(parent)?;
-        #[cfg(all(
-            target_os = "macos",
-            any(feature = "macos-fullfsync", not(feature = "macos-standard-sync"))
-        ))]
-        {
-            if full_sync_file(&dir).is_err() {
-                dir.sync_all()?;
-            }
-        }
-        #[cfg(any(
-            not(target_os = "macos"),
-            all(
-                target_os = "macos",
-                feature = "macos-standard-sync",
-                not(feature = "macos-fullfsync")
-            )
-        ))]
-        {
-            dir.sync_all()?;
-        }
+        sync_file(&dir, mode)?;
     }
     Ok(())
 }
@@ -327,6 +338,9 @@ pub struct Segment {
     /// It guards the eight-byte buffer writes only, not the flush, so
     /// concurrent `force_sync` callers still fsync in parallel.
     marker_link: Mutex<()>,
+
+    /// The system call every sync of this segment issues.
+    sync_mode: CommitLogSyncMode,
 }
 
 #[derive(Default)]
@@ -383,7 +397,13 @@ impl Segment {
     ///
     /// The buffer is pre-allocated and zeroed. The 17-byte header is written
     /// immediately, followed by an 8-byte sync marker (all zeros = EOF marker).
+    /// Syncs use the default, power-loss durable [`CommitLogSyncMode::Full`].
     pub fn new(id: u64, size: usize, dir: &Path) -> Self {
+        Self::with_sync_mode(id, size, dir, CommitLogSyncMode::default())
+    }
+
+    /// Like [`new`](Self::new), syncing in `sync_mode`.
+    pub fn with_sync_mode(id: u64, size: usize, dir: &Path, sync_mode: CommitLogSyncMode) -> Self {
         assert!(
             size >= INITIAL_POSITION as usize + ENTRY_OVERHEAD,
             "segment size too small: need at least {} bytes",
@@ -416,7 +436,13 @@ impl Segment {
             last_flushed: AtomicU64::new(INITIAL_POSITION),
             last_sync_marker_offset: AtomicU64::new(HEADER_SIZE as u64),
             marker_link: Mutex::new(()),
+            sync_mode,
         }
+    }
+
+    /// The system call this segment's syncs issue.
+    pub fn sync_mode(&self) -> CommitLogSyncMode {
+        self.sync_mode
     }
 
     /// Atomically allocates `entry_total_size` bytes from the segment buffer.
@@ -812,7 +838,7 @@ impl Segment {
                     phases.write,
                 );
                 let sync_data_start = Instant::now();
-                sync_commitlog_file(file)?;
+                sync_file(file, self.sync_mode)?;
                 phases.sync_data = sync_data_start.elapsed();
                 observe_phase(
                     &SYNC_DATA_MICROS_TOTAL,
@@ -821,7 +847,7 @@ impl Segment {
                 );
                 if created {
                     let parent_sync_start = Instant::now();
-                    sync_parent_dir(&self.path)?;
+                    sync_parent_dir(&self.path, self.sync_mode)?;
                     phases.parent_dir_sync = parent_sync_start.elapsed();
                     observe_phase(
                         &SYNC_PARENT_DIR_MICROS_TOTAL,
@@ -856,7 +882,7 @@ impl Segment {
                     phases.write,
                 );
                 let sync_data_start = Instant::now();
-                sync_commitlog_file(file)?;
+                sync_file(file, self.sync_mode)?;
                 phases.sync_data = sync_data_start.elapsed();
                 observe_phase(
                     &SYNC_DATA_MICROS_TOTAL,
@@ -888,7 +914,7 @@ impl Segment {
                     phases.write,
                 );
                 let sync_data_start = Instant::now();
-                sync_commitlog_file(file)?;
+                sync_file(file, self.sync_mode)?;
                 phases.sync_data = sync_data_start.elapsed();
                 observe_phase(
                     &SYNC_DATA_MICROS_TOTAL,
@@ -957,7 +983,7 @@ impl Segment {
             phases.write,
         );
         let sync_data_start = Instant::now();
-        sync_commitlog_file(file)?;
+        sync_file(file, self.sync_mode)?;
         phases.sync_data = sync_data_start.elapsed();
         observe_phase(
             &SYNC_DATA_MICROS_TOTAL,
@@ -966,7 +992,7 @@ impl Segment {
         );
         if created {
             let parent_sync_start = Instant::now();
-            sync_parent_dir(&self.path)?;
+            sync_parent_dir(&self.path, self.sync_mode)?;
             phases.parent_dir_sync = parent_sync_start.elapsed();
             observe_phase(
                 &SYNC_PARENT_DIR_MICROS_TOTAL,
@@ -1189,6 +1215,50 @@ mod tests {
             }],
             timestamp: 42_000,
         }
+    }
+
+    /// Flushes one entry through `mode` and checks the bytes reached the file
+    /// and that the sync was issued, and counted, under that mode.
+    fn flush_one_entry_in(mode: CommitLogSyncMode) {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::with_sync_mode(1, 4096, dir.path(), mode);
+        assert_eq!(segment.sync_mode(), mode);
+        let m = simple_mutation();
+        let offset = segment.allocate(Segment::entry_total_size(&m)).unwrap();
+        segment.write_entry(offset, &m);
+        let before = syncs_issued(mode);
+
+        segment.flush_to_disk().unwrap();
+
+        assert!(syncs_issued(mode) > before, "{mode:?} sync was not counted");
+        let on_disk = fs::read(segment.path()).unwrap();
+        let buf = unsafe { &*segment.buffer.get() };
+        let end = segment.current_position() as usize;
+        assert_eq!(&on_disk[..], &buf[..end]);
+    }
+
+    #[test]
+    fn a_full_mode_segment_flushes_and_counts_a_full_sync() {
+        flush_one_entry_in(CommitLogSyncMode::Full);
+    }
+
+    #[test]
+    fn a_barrier_mode_segment_flushes_and_counts_a_barrier_sync() {
+        flush_one_entry_in(CommitLogSyncMode::Barrier);
+    }
+
+    #[test]
+    fn an_fsync_mode_segment_flushes_and_counts_a_plain_fsync() {
+        flush_one_entry_in(CommitLogSyncMode::Fsync);
+    }
+
+    #[test]
+    fn a_segment_made_without_a_mode_uses_the_durable_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            Segment::new(1, 4096, dir.path()).sync_mode(),
+            CommitLogSyncMode::Full
+        );
     }
 
     #[test]

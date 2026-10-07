@@ -36,8 +36,8 @@ pub(crate) mod segment;
 pub(crate) mod sync;
 
 pub use config::{
-    ArchiveConfig, CommitLogBatchConfig, CommitLogConfig, CommitLogPosition, SyncStrategyConfig,
-    TableId,
+    ArchiveConfig, CommitLogBatchConfig, CommitLogConfig, CommitLogPosition, CommitLogSyncMode,
+    SyncStrategyConfig, TableId,
 };
 pub use mutation::{Mutation, CELL_REBIND_LIST_PATH_FLAG};
 
@@ -132,6 +132,19 @@ pub fn render_prometheus() -> String {
     let flush = segment::flush_metrics();
     let sync_batch = sync::sync_batch_metrics();
     let mut out = String::new();
+    out.push_str("# HELP ferrosa_commitlog_syncs_by_mode_total Commit-log file and directory syncs by the system call issued (full = F_FULLFSYNC, barrier = F_BARRIERFSYNC, fsync = fsync(2)); only full survives power loss on macOS.\n");
+    out.push_str("# TYPE ferrosa_commitlog_syncs_by_mode_total counter\n");
+    for mode in [
+        config::CommitLogSyncMode::Full,
+        config::CommitLogSyncMode::Barrier,
+        config::CommitLogSyncMode::Fsync,
+    ] {
+        out.push_str(&format!(
+            "ferrosa_commitlog_syncs_by_mode_total{{mode=\"{}\"}} {}\n",
+            mode.name(),
+            segment::syncs_issued(mode)
+        ));
+    }
     out.push_str("# HELP ferrosa_commitlog_appends_total Total commit-log appends.\n");
     out.push_str("# TYPE ferrosa_commitlog_appends_total counter\n");
     out.push_str(&format!(
@@ -457,8 +470,15 @@ pub struct ReplayRelog<'a> {
 impl ReplayRelog<'_> {
     /// Re-logs `mutation` (same id, timestamp and rows) into the new
     /// generation and returns its new position.
+    ///
+    /// Not refused by sync health: nothing is acknowledged on its return.
+    /// Replay's own barrier (`force_sync` before each old segment is deleted,
+    /// `force_rotate` for rotated ones) is what makes the copy durable, and
+    /// until it does, the old segment still holds the mutation. Refusing here
+    /// turned a late background sync during startup into a node that exited
+    /// instead of starting.
     pub fn retain(&self, mutation: &Mutation) -> ferrosa_common::Result<CommitLogPosition> {
-        self.log.append(mutation)
+        self.log.append_for_explicit_sync(mutation)
     }
 }
 
@@ -478,10 +498,27 @@ impl CommitLog {
         fs::create_dir_all(&config.log_dir)?;
         fs::create_dir_all(&config.checkpoint_dir)?;
 
-        let first_segment = Arc::new(Segment::new(
+        let mode = config.batch.sync_mode;
+        if mode.survives_power_loss() {
+            tracing::info!(
+                sync_mode = mode.name(),
+                durability = mode.durability(),
+                "commit log: sync mode"
+            );
+        } else {
+            tracing::warn!(
+                sync_mode = mode.name(),
+                durability = mode.durability(),
+                env = config::CommitLogSyncMode::ENV,
+                "commit log: sync mode is NOT power-loss durable on macOS; chosen explicitly"
+            );
+        }
+
+        let first_segment = Arc::new(Segment::with_sync_mode(
             first_segment_id,
             config.segment_size,
             &config.log_dir,
+            config.batch.sync_mode,
         ));
         let active = Arc::new(ArcSwap::from(first_segment));
 
@@ -1205,10 +1242,11 @@ impl CommitLog {
     /// `Arc<Segment>` paired with its CAS-allocated offset (see `append()`).
     pub fn force_rotate(&self) -> ferrosa_common::Result<()> {
         let new_id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
-        let new_segment = Arc::new(Segment::new(
+        let new_segment = Arc::new(Segment::with_sync_mode(
             new_id,
             self.config.segment_size,
             &self.config.log_dir,
+            self.config.batch.sync_mode,
         ));
 
         // Swap the new segment in and get the old one.
@@ -1469,6 +1507,40 @@ mod tests {
                 primary_key_liveness: LivenessInfo::with_timestamp(1000),
             }],
             timestamp: 42_000,
+        }
+    }
+
+    #[test]
+    fn the_configured_sync_mode_reaches_every_segment_including_rotated_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::test_config(dir.path());
+        config.batch.sync_mode = config::CommitLogSyncMode::Barrier;
+        let log = CommitLog::new(config).unwrap();
+        assert_eq!(
+            log.active.load().sync_mode(),
+            config::CommitLogSyncMode::Barrier
+        );
+
+        log.append(&simple_mutation()).unwrap();
+        log.force_rotate().unwrap();
+
+        assert_eq!(
+            log.active.load().sync_mode(),
+            config::CommitLogSyncMode::Barrier
+        );
+        log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn prometheus_exports_syncs_issued_per_mode() {
+        let text = render_prometheus();
+        for mode in ["full", "barrier", "fsync"] {
+            assert!(
+                text.contains(&format!(
+                    "ferrosa_commitlog_syncs_by_mode_total{{mode=\"{mode}\"}} "
+                )),
+                "missing {mode} series"
+            );
         }
     }
 
@@ -2109,6 +2181,59 @@ mod tests {
         );
         assert_eq!(replayed[0].mutation_id, written.mutation_id);
         assert_eq!(replayed[0].timestamp, written.timestamp);
+    }
+
+    /// Replay's re-log is made durable by replay's own barrier (`force_sync`
+    /// before each old segment is deleted), so sync health must not refuse
+    /// it. It did: on 2026-10-06 and 2026-10-07 a node restarting under disk
+    /// load re-logged into a commit log whose background sync was late,
+    /// `append` refused with `CommitLogNotDurable`, and the node exited
+    /// during startup instead of starting (node3 stayed down 35 h).
+    #[test]
+    fn replay_relog_is_not_refused_by_an_unhealthy_sync_thread_and_survives_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: Duration::from_millis(10),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config.clone()).unwrap();
+        cl.inject_sync_panic();
+        // Wake the thread into its panic, then wait for it to be dead.
+        cl.append(&mutation_for_table("ks", "wake")).unwrap();
+        let started = Instant::now();
+        while !cl.sync_health().dead {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the sync thread never died"
+            );
+            std::thread::yield_now();
+        }
+        // The client-write gate is unchanged: an ordinary append is refused.
+        assert!(
+            matches!(
+                cl.append(&mutation_for_table("ks", "client")),
+                Err(ferrosa_common::Error::CommitLogNotDurable { .. })
+            ),
+            "an acknowledged write must still be refused while the sync thread is dead"
+        );
+
+        let replayed = mutation_for_table("ks", "replayed");
+        ReplayRelog { log: &cl }
+            .retain(&replayed)
+            .expect("a replay re-log is made durable by replay's barrier, not refused");
+        cl.force_sync().unwrap(); // replay's barrier before deleting the old segment
+        std::mem::forget(cl); // kill -9: nothing else gets to flush
+
+        let (_reopened, recovered) = CommitLog::open_and_replay(config).unwrap();
+        assert!(
+            recovered
+                .iter()
+                .any(|m| m.mutation_id == replayed.mutation_id),
+            "the re-logged mutation is durable after the barrier: {:?}",
+            recovered.iter().map(|m| &m.table).collect::<Vec<_>>()
+        );
     }
 
     /// The re-logged copy is an ordinary entry of the new generation: once

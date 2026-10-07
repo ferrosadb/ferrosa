@@ -71,6 +71,18 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   durable or the stall deadline passes, so a node the supervisor restarted
   acknowledges writes again instead of refusing them for as long as
   scheduling takes.
+  **The sync call is a runtime setting** (FMEA ST-87):
+  `FERROSA_COMMITLOG_SYNC_MODE` = `full` (default, `F_FULLFSYNC`, power-loss
+  durable) | `barrier` (`F_BARRIERFSYNC`) | `fsync` (`fsync(2)`). The weaker
+  two survive a process crash and a kernel panic but not a power loss on
+  macOS; on Linux every mode is `fdatasync`. An unknown value stops startup;
+  the mode is logged when the commit log opens (a weaker one at WARN) and
+  `ferrosa_commitlog_syncs_by_mode_total{mode}` counts the calls actually
+  issued. The old `macos-standard-sync` cargo feature is gone: it used
+  `File::sync_data`, which Rust implements as `F_FULLFSYNC` on Apple targets,
+  so it never changed anything. For the same reason every other
+  `sync_all`/`sync_data` in this crate (flush, checkpoint, compaction intent,
+  eviction marker) is already `F_FULLFSYNC` on macOS.
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
   memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`, and
   every view change is a compare-and-swap derived from the current view.

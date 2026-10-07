@@ -280,6 +280,23 @@ where
 /// any voter is fine.  Returns `None` when no other voter exists
 /// (e.g. single-node cluster trying to remove its sole member —
 /// callers must reject that earlier).
+/// Whether removing `node_id` as a voter must first hand leadership to
+/// another voter: when `node_id` is the leader, or when this changer runs on
+/// `node_id` itself.
+///
+/// The second case does not trust the metrics. Right after `node_id` wins an
+/// election the cluster can already see it as leader while its own snapshot
+/// does not, and the change then removes the leader in place. Only a leader
+/// can change membership, so a changer on `node_id` that gets as far as
+/// `change_membership` is always the leader removing itself. If `node_id` is
+/// not the leader, the hand-off reports the one that is.
+pub(crate) fn must_hand_off_leadership_first(
+    metrics: &openraft::RaftMetrics<u64, openraft::BasicNode>,
+    node_id: u64,
+) -> bool {
+    metrics.id == node_id || metrics.current_leader == Some(node_id)
+}
+
 pub(crate) fn pick_transfer_target(
     metrics: &openraft::RaftMetrics<u64, openraft::BasicNode>,
     self_node_id: u64,
@@ -711,7 +728,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
 
         // Step 1 — leader-self transfer if needed.
         let metrics = self.raft.metrics().borrow().clone();
-        if metrics.current_leader == Some(node_id) {
+        if must_hand_off_leadership_first(&metrics, node_id) {
             let target = pick_transfer_target(&metrics, node_id).ok_or_else(|| {
                 MembershipError::RaftError(
                     "demote_voter_to_learner: no eligible voter for leadership transfer".into(),
@@ -842,7 +859,7 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
         // of target is the lowest-numbered other voter — deterministic
         // for tests, harmless in production where any voter is fine.
         let metrics = self.raft.metrics().borrow().clone();
-        if metrics.current_leader == Some(node_id) {
+        if must_hand_off_leadership_first(&metrics, node_id) {
             let target = pick_transfer_target(&metrics, node_id).ok_or_else(|| {
                 MembershipError::RaftError(
                     "decommission_leader_transfers_first: no eligible voter for leadership transfer"
@@ -1014,6 +1031,31 @@ mod tests {
                 .any(|(id, _)| *id == node_id)
                 && !self.unregistered.lock().unwrap().contains(&node_id)
         }
+    }
+
+    /// A node removing itself hands leadership off first, even when its own
+    /// metrics do not yet name it leader.
+    ///
+    /// CI on ferrosa#526 (learner_lifecycle::
+    /// demote_voter_to_learner_transfers_leader_first_if_needed): the cluster
+    /// saw the new voter as leader, but its own snapshot did not, so the
+    /// demote skipped the hand-off and the leader removed itself in place
+    /// (`Ok(())` instead of `NotLeader`). Only a leader can change
+    /// membership, so a changer running on the node it removes always hands
+    /// off first; if that node is not the leader, the hand-off reports the
+    /// real one.
+    #[test]
+    fn a_node_removing_itself_hands_off_leadership_whatever_its_metrics_say() {
+        let mut lagging = openraft::RaftMetrics::<u64, openraft::BasicNode>::new_initial(7);
+        lagging.state = openraft::ServerState::Candidate;
+        lagging.current_leader = None;
+        assert!(must_hand_off_leadership_first(&lagging, 7));
+
+        // Removing another node: only if that node is the leader.
+        let mut follower = openraft::RaftMetrics::<u64, openraft::BasicNode>::new_initial(7);
+        follower.current_leader = Some(8);
+        assert!(must_hand_off_leadership_first(&follower, 8));
+        assert!(!must_hand_off_leadership_first(&follower, 9));
     }
 
     #[test]

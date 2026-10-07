@@ -44,6 +44,13 @@ pub fn doc_key_partition(doc_key: &[u8]) -> Option<&[u8]> {
     Some(&doc_key[start..end])
 }
 
+/// Extract the clustering portion of a row-granular doc key (empty for a table
+/// without clustering columns), or `None` if the bytes are not row-granular.
+pub fn doc_key_clustering(doc_key: &[u8]) -> Option<&[u8]> {
+    let partition = doc_key_partition(doc_key)?;
+    Some(&doc_key[5 + partition.len()..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,6 +61,7 @@ mod tests {
         let ck = b"sid=1,id=1".to_vec();
         let key = encode_doc_key(&pk, &ck);
         assert_eq!(doc_key_partition(&key), Some(pk.as_slice()));
+        assert_eq!(doc_key_clustering(&key), Some(ck.as_slice()));
     }
 
     #[test]
@@ -80,6 +88,7 @@ mod tests {
     fn legacy_partition_key_id_is_rejected() {
         // A bare partition key (no tag) from a stale sidecar must not misparse.
         assert_eq!(doc_key_partition(b"raw-partition-key"), None);
+        assert_eq!(doc_key_clustering(b"raw-partition-key"), None);
         assert_eq!(doc_key_partition(&[]), None);
     }
 }

@@ -63,6 +63,7 @@ fn batch_with_deadline(deadline: Duration) -> CommitLogBatchConfig {
         target_bytes: CommitLogBatchConfig::DEFAULT_TARGET_BYTES,
         max_delay: Duration::from_millis(1),
         sync_stall_deadline: deadline,
+        ..CommitLogBatchConfig::default()
     }
 }
 
@@ -247,8 +248,16 @@ fn a_failing_periodic_fsync_refuses_writes_until_one_succeeds() {
         }),
     );
     sync.start().unwrap();
-    sync.on_write(&segment, offset, 128, AckPolicy::Durable)
-        .unwrap();
+    // `on_write` wakes the sync thread before it checks `admit`, so this
+    // write's own fsync can fail first, and then it is refused: correctly,
+    // since it is not durable. Either outcome is right here; it raced on a
+    // loaded machine (2026-10-07) when this asserted the ack.
+    match sync.on_write(&segment, offset, 128, AckPolicy::Durable) {
+        Ok(()) => {}
+        Err(ferrosa_common::Error::CommitLogNotDurable { reason })
+            if reason.contains("fsync failed: I/O error: EIO") => {}
+        other => panic!("the first write is acked, or refused by its own failed fsync: {other:?}"),
+    }
     wait_until("an fsync to fail", Duration::from_secs(10), || {
         sync.health().failing
     });

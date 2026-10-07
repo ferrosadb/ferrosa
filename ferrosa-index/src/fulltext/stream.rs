@@ -34,7 +34,10 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use super::builder::{FTI_MAGIC, FTI_VERSION};
+use super::builder::{
+    term_index_tail, FTI_MAGIC, FTI_TERM_INDEX_FOOTER_LEN, FTI_TERM_INDEX_INTERVAL,
+    FTI_TERM_INDEX_MAGIC, FTI_VERSION,
+};
 use super::reader::FtsHit;
 use super::scoring::{bm25_score, Bm25Params};
 use super::topk::TopK;
@@ -100,7 +103,7 @@ pub fn scan_term_top_k(
 /// # Errors
 ///
 /// Returns `Err` on I/O failure or a malformed/truncated FTI file.
-pub fn scan_term_each<F>(path: &Path, term: &str, mut on_hit: F) -> Result<(), String>
+pub fn scan_term_each<F>(path: &Path, term: &str, on_hit: F) -> Result<(), String>
 where
     F: FnMut(FtsHit) -> std::ops::ControlFlow<()>,
 {
@@ -109,8 +112,20 @@ where
         .metadata()
         .map_err(|e| format!("stat {}: {e}", path.display()))?
         .len();
-    let mut reader = BufReader::new(file);
+    scan_term_each_in(BufReader::new(file), file_len, term, on_hit)
+}
 
+/// [`scan_term_each`] over any seekable source of `file_len` bytes.
+pub(crate) fn scan_term_each_in<R, F>(
+    mut reader: R,
+    file_len: u64,
+    term: &str,
+    mut on_hit: F,
+) -> Result<(), String>
+where
+    R: Read + Seek,
+    F: FnMut(FtsHit) -> std::ops::ControlFlow<()>,
+{
     // Trailer first: `total_doc_len` (u64 LE) is the last 8 bytes, and BM25
     // needs avgdl before the first posting is scored.
     if file_len < 8 + 9 {
@@ -148,9 +163,15 @@ where
     };
     let params = Bm25Params::default();
     let target = term.as_bytes();
+    let Some(walk) = locate_term(&mut reader, file_len, target, term_count)? else {
+        return Ok(()); // sorts before the first term: absent.
+    };
+    reader
+        .seek(SeekFrom::Start(walk.offset))
+        .map_err(|e| format!("seek to term: {e}"))?;
     let mut term_buf: Vec<u8> = Vec::new();
 
-    for _ in 0..term_count {
+    for _ in 0..walk.terms {
         let term_len = read_u16(&mut reader)? as usize;
         term_buf.clear();
         term_buf.resize(term_len, 0);
@@ -203,6 +224,302 @@ where
     }
 
     Ok(())
+}
+
+/// Where a lookup starts walking the dictionary, and how many terms it may
+/// walk from there.
+struct Walk {
+    offset: u64,
+    terms: u32,
+}
+
+/// Header: magic(4) + version(1) + doc_count(4) + term_count(4).
+const HEADER_LEN: u64 = 13;
+
+/// Sidecars searched by walking their whole dictionary because they predate
+/// the term index (see [`legacy_sidecar_walks_total`]).
+static LEGACY_SIDECAR_WALKS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static LEGACY_SIDECAR_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// How many lookups walked a whole sidecar dictionary because the sidecar
+/// predates the term index. Each such sidecar costs O(index size) per query
+/// term until compaction or a rebuild rewrites it.
+pub fn legacy_sidecar_walks_total() -> u64 {
+    LEGACY_SIDECAR_WALKS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Find where `target` would be in the dictionary. `None` means it sorts
+/// before the first term, so it is absent. A sidecar without a term index is
+/// walked from the first term, and counted and reported as such.
+fn locate_term<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    target: &[u8],
+    term_count: u32,
+) -> Result<Option<Walk>, String> {
+    let whole = Walk {
+        offset: HEADER_LEN,
+        terms: term_count,
+    };
+    let tail = FTI_TERM_INDEX_FOOTER_LEN + 8;
+    if file_len < HEADER_LEN + 8 + tail {
+        // Too short to hold a footer.
+        return verified_legacy(reader, file_len, term_count, whole).map(Some);
+    }
+    reader
+        .seek(SeekFrom::End(-(tail as i64)))
+        .map_err(|e| format!("seek term index footer: {e}"))?;
+    let index_offset = read_u64(reader)?;
+    let entry_count = read_u32(reader)?;
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|e| format!("read term index magic: {e}"))?;
+    if &magic != FTI_TERM_INDEX_MAGIC {
+        return verified_legacy(reader, file_len, term_count, whole).map(Some);
+    }
+    let index_end = file_len - tail;
+    if index_offset < HEADER_LEN + 8 || index_offset > index_end {
+        return Err(format!(
+            "FTI term index footer points at {index_offset}, outside {}..={index_end}",
+            HEADER_LEN + 8
+        ));
+    }
+    let mut section = vec![0u8; (index_end - index_offset) as usize];
+    reader
+        .seek(SeekFrom::Start(index_offset))
+        .map_err(|e| format!("seek term index: {e}"))?;
+    reader
+        .read_exact(&mut section)
+        .map_err(|e| format!("read term index: {e}"))?;
+    let entries = parse_term_index(&section, entry_count, index_offset, term_count)?;
+    // The last indexed term at or before the target; the target, if present,
+    // is within the next FTI_TERM_INDEX_INTERVAL terms.
+    let at = entries.partition_point(|e| e.term <= target);
+    let Some(entry) = at.checked_sub(1).map(|i| &entries[i]) else {
+        return Ok(None);
+    };
+    Ok(Some(Walk {
+        offset: entry.offset,
+        terms: (term_count - entry.ordinal).min(FTI_TERM_INDEX_INTERVAL as u32),
+    }))
+}
+
+/// `whole`, once the file is confirmed to be the legacy layout: its
+/// dictionary ends exactly at the 8-byte trailer. A file with an index that
+/// lost its tail has no footer either, and walking it would score with
+/// whatever bytes now sit where `total_doc_len` was.
+fn verified_legacy<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    term_count: u32,
+    whole: Walk,
+) -> Result<Walk, String> {
+    let body_end = legacy_dictionary_end(reader, term_count)?;
+    if body_end + 8 != file_len {
+        return Err(format!(
+            "FTI has no term index and {} bytes where its 8-byte trailer belongs: \
+             truncated or corrupt",
+            file_len.saturating_sub(body_end)
+        ));
+    }
+    Ok(legacy(whole))
+}
+
+/// Walk the whole dictionary, skipping postings, and return where it ends.
+fn legacy_dictionary_end<R: Read + Seek>(reader: &mut R, term_count: u32) -> Result<u64, String> {
+    reader
+        .seek(SeekFrom::Start(HEADER_LEN))
+        .map_err(|e| format!("seek dictionary: {e}"))?;
+    for _ in 0..term_count {
+        let term_len = read_u16(reader)? as i64;
+        reader
+            .seek_relative(term_len + 4)
+            .map_err(|e| format!("skip term: {e}"))?;
+        let posting_count = read_u32(reader)?;
+        for _ in 0..posting_count {
+            let pk_len = read_u16(reader)? as i64;
+            reader
+                .seek_relative(pk_len + 8)
+                .map_err(|e| format!("skip posting: {e}"))?;
+        }
+    }
+    reader
+        .stream_position()
+        .map_err(|e| format!("dictionary end: {e}"))
+}
+
+fn legacy(whole: Walk) -> Walk {
+    LEGACY_SIDECAR_WALKS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LEGACY_SIDECAR_WARNED.call_once(|| {
+        tracing::warn!(
+            "full-text sidecar predates the term index: lookups walk its whole term \
+             dictionary until compaction or a rebuild rewrites it; counted in \
+             legacy_sidecar_walks_total"
+        );
+    });
+    whole
+}
+
+struct IndexEntry<'a> {
+    term: &'a [u8],
+    ordinal: u32,
+    offset: u64,
+}
+
+/// Decode the term index, checking it is exactly `entry_count` entries in
+/// dictionary order that point inside the term section.
+fn parse_term_index(
+    section: &[u8],
+    entry_count: u32,
+    index_offset: u64,
+    term_count: u32,
+) -> Result<Vec<IndexEntry<'_>>, String> {
+    let corrupt = |why: &str| format!("corrupt FTI term index: {why}");
+    let mut entries: Vec<IndexEntry<'_>> = Vec::with_capacity(entry_count as usize);
+    let mut rest = section;
+    for _ in 0..entry_count {
+        let (len, after) = rest
+            .split_at_checked(2)
+            .ok_or_else(|| corrupt("truncated"))?;
+        let len = u16::from_le_bytes([len[0], len[1]]) as usize;
+        let (term, after) = after
+            .split_at_checked(len)
+            .ok_or_else(|| corrupt("truncated"))?;
+        let (fixed, after) = after
+            .split_at_checked(12)
+            .ok_or_else(|| corrupt("truncated"))?;
+        let ordinal = u32::from_le_bytes(fixed[..4].try_into().expect("4 bytes"));
+        let offset = u64::from_le_bytes(fixed[4..].try_into().expect("8 bytes"));
+        if ordinal >= term_count || offset < HEADER_LEN || offset >= index_offset {
+            return Err(corrupt("entry points outside the dictionary"));
+        }
+        if entries.last().is_some_and(|prev| {
+            prev.term >= term || prev.ordinal >= ordinal || prev.offset >= offset
+        }) {
+            return Err(corrupt("entries out of order"));
+        }
+        entries.push(IndexEntry {
+            term,
+            ordinal,
+            offset,
+        });
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return Err(corrupt("bytes left after the last entry"));
+    }
+    Ok(entries)
+}
+
+/// The bytes to append to the legacy sidecar at `path` to give it a term
+/// index, or `None` if it already has one. One pass over the dictionary,
+/// skipping postings and holding one term in every
+/// [`FTI_TERM_INDEX_INTERVAL`]; a file that is not exactly the legacy layout is
+/// refused rather than given an index over bytes that are not its dictionary.
+///
+/// # Errors
+///
+/// Returns `Err` on I/O failure or a malformed/truncated FTI file.
+pub fn term_index_tail_for_path(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    term_index_tail_for(BufReader::new(file), file_len)
+}
+
+/// The bytes that turn a legacy sidecar into one with a term index when
+/// appended to it, or `None` if it already has one.
+///
+/// One pass over the dictionary, skipping postings; holds one term in every
+/// [`FTI_TERM_INDEX_INTERVAL`], not the index. The file must be the legacy
+/// layout exactly (its dictionary ends at the 8-byte trailer), so a damaged
+/// sidecar is refused rather than given an index over bytes that are not its
+/// dictionary.
+pub(crate) fn term_index_tail_for<R: Read + Seek>(
+    mut reader: R,
+    file_len: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let tail = FTI_TERM_INDEX_FOOTER_LEN + 8;
+    if file_len < HEADER_LEN + 8 {
+        return Err(format!("FTI too short: {file_len} bytes"));
+    }
+    if file_len >= HEADER_LEN + 8 + tail {
+        reader
+            .seek(SeekFrom::End(-(FTI_TERM_INDEX_MAGIC.len() as i64 + 8)))
+            .map_err(|e| format!("seek term index magic: {e}"))?;
+        let mut magic = [0u8; 8];
+        reader
+            .read_exact(&mut magic)
+            .map_err(|e| format!("read term index magic: {e}"))?;
+        if &magic == FTI_TERM_INDEX_MAGIC {
+            return Ok(None);
+        }
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek start: {e}"))?;
+    let mut magic = [0u8; 4];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|e| format!("read magic: {e}"))?;
+    if &magic != FTI_MAGIC {
+        return Err(format!("invalid FTI magic: {magic:?}"));
+    }
+    let version = read_u8(&mut reader)?;
+    if version != FTI_VERSION {
+        return Err(format!(
+            "unsupported FTI version {version} (expected {FTI_VERSION})"
+        ));
+    }
+    let _doc_count = read_u32(&mut reader)?;
+    let term_count = read_u32(&mut reader)?;
+
+    let mut kept: Vec<(String, u32, u64)> = Vec::new();
+    let mut term_buf: Vec<u8> = Vec::new();
+    for ordinal in 0..term_count {
+        let offset = reader
+            .stream_position()
+            .map_err(|e| format!("term offset: {e}"))?;
+        let term_len = read_u16(&mut reader)? as usize;
+        term_buf.clear();
+        term_buf.resize(term_len, 0);
+        reader
+            .read_exact(&mut term_buf)
+            .map_err(|e| format!("read term: {e}"))?;
+        let _doc_freq = read_u32(&mut reader)?;
+        let posting_count = read_u32(&mut reader)?;
+        for _ in 0..posting_count {
+            let pk_len = read_u16(&mut reader)? as i64;
+            reader
+                .seek_relative(pk_len + 8)
+                .map_err(|e| format!("skip posting: {e}"))?;
+        }
+        if (ordinal as usize).is_multiple_of(FTI_TERM_INDEX_INTERVAL) {
+            let term = String::from_utf8(term_buf.clone())
+                .map_err(|e| format!("invalid UTF-8 in term: {e}"))?;
+            kept.push((term, ordinal, offset));
+        }
+    }
+    let body_end = reader
+        .stream_position()
+        .map_err(|e| format!("dictionary end: {e}"))?;
+    if body_end + 8 != file_len {
+        return Err(format!(
+            "FTI has no term index and {} bytes where its 8-byte trailer belongs: \
+             truncated or corrupt",
+            file_len.saturating_sub(body_end)
+        ));
+    }
+    let total_doc_len = read_u64(&mut reader)?;
+    let entries: Vec<(&str, u32, u64)> = kept
+        .iter()
+        .map(|(term, ordinal, offset)| (term.as_str(), *ordinal, *offset))
+        .collect();
+    term_index_tail(file_len, &entries, total_doc_len).map(Some)
 }
 
 fn read_u8(r: &mut impl Read) -> Result<u8, String> {
@@ -424,6 +741,187 @@ mod conjunction_tests {
             "intersecting per-term top-1 would have dropped the only real match"
         );
         assert!((out[0].score - 10.0).abs() < f64::EPSILON);
+    }
+}
+
+/// A sidecar's term dictionary is reachable by seek, not by walking it.
+///
+/// Live on 2026-10-07: node1's `entity_store` had 16 name-index sidecars
+/// totalling 184 MB. Every query term walked every one of them from byte 0, so
+/// a five-word `fts_match` read ~900 MB per node and took 18.7 s.
+#[cfg(test)]
+mod term_index_tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::ops::ControlFlow;
+
+    use crate::fulltext::builder::{serialize_fti_without_term_index, FullTextIndexBuilder};
+    use crate::fulltext::reader::deserialize_fti;
+
+    /// Counts the bytes pulled from the underlying source; seeks are free.
+    struct Counting<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for Counting<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// `n` distinct alphabetic words, so each document adds one term.
+    fn word(i: usize) -> String {
+        let mut s = String::from("t");
+        let mut x = i;
+        for _ in 0..4 {
+            s.push((b'a' + (x % 26) as u8) as char);
+            x /= 26;
+        }
+        s
+    }
+
+    fn sidecar(n: usize) -> Vec<u8> {
+        let mut builder = FullTextIndexBuilder::new();
+        for i in 0..n {
+            builder.add_document(format!("pk{i:06}").into_bytes(), &word(i));
+        }
+        builder.finish().unwrap()
+    }
+
+    /// The terms as stored (after analysis), sorted as the dictionary is.
+    fn stored_terms(bytes: &[u8]) -> Vec<String> {
+        let mut terms: Vec<String> = deserialize_fti(bytes).unwrap().terms.into_keys().collect();
+        terms.sort();
+        terms
+    }
+
+    /// Search `bytes` for `term`, returning the hit keys and the bytes read.
+    fn search(bytes: &[u8], term: &str) -> (Vec<Vec<u8>>, u64) {
+        let read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let source = Counting {
+            inner: Cursor::new(bytes.to_vec()),
+            read: std::rc::Rc::clone(&read),
+        };
+        let mut keys = Vec::new();
+        scan_term_each_in(BufReader::new(source), bytes.len() as u64, term, |hit| {
+            keys.push(hit.partition_key);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        keys.sort();
+        (keys, read.get())
+    }
+
+    #[test]
+    fn a_term_lookup_reads_a_bounded_slice_of_the_sidecar_not_all_of_it() {
+        let bytes = sidecar(20_000);
+        let terms = stored_terms(&bytes);
+        // The last term is the linear walk's worst case: every earlier term
+        // and posting is read to reach it.
+        let last = terms.last().unwrap();
+        let (keys, read) = search(&bytes, last);
+        assert_eq!(keys.len(), 1, "the last term's one document is found");
+        assert!(
+            read * 20 < bytes.len() as u64,
+            "looking up one term read {read} of {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn an_indexed_lookup_finds_every_term_and_nothing_else() {
+        let bytes = sidecar(1_000);
+        let legacy = serialize_fti_without_term_index(&deserialize_fti(&bytes).unwrap()).unwrap();
+        let terms = stored_terms(&bytes);
+        for term in &terms {
+            let (indexed, _) = search(&bytes, term);
+            let (linear, _) = search(&legacy, term);
+            assert_eq!(indexed.len(), 1, "{term} is found");
+            assert_eq!(indexed, linear, "{term}: same answer as the linear walk");
+        }
+        // Absent terms: before the first, between two, after the last.
+        for absent in ["a", &format!("{}a", terms[500]), "zzzzzz"] {
+            assert!(search(&bytes, absent).0.is_empty(), "{absent} is absent");
+        }
+    }
+
+    #[test]
+    fn a_sidecar_written_before_the_term_index_is_still_searched() {
+        let bytes = sidecar(300);
+        let legacy = serialize_fti_without_term_index(&deserialize_fti(&bytes).unwrap()).unwrap();
+        assert!(legacy.len() < bytes.len(), "the legacy layout has no index");
+        for term in stored_terms(&legacy) {
+            assert_eq!(search(&legacy, &term).0.len(), 1, "{term} is found");
+        }
+    }
+
+    /// Losing the footer makes a file look like the legacy layout, with
+    /// index bytes where `total_doc_len` belongs. Scoring it would be wrong
+    /// without a sign; it is refused.
+    #[test]
+    fn an_indexed_sidecar_that_lost_its_tail_is_refused_not_scored() {
+        let bytes = sidecar(300);
+        let term = stored_terms(&bytes)[0].clone();
+        for cut in [1, 10, 27, 28, 40] {
+            let truncated = &bytes[..bytes.len() - cut];
+            let result = scan_term_each_in(
+                BufReader::new(Cursor::new(truncated.to_vec())),
+                truncated.len() as u64,
+                &term,
+                |_| ControlFlow::Continue(()),
+            );
+            assert!(result.is_err(), "cut {cut} bytes: must be refused");
+        }
+    }
+
+    /// A legacy sidecar is upgraded by appending: the result is byte for byte
+    /// what the current writer produces, and an upgraded or new sidecar has
+    /// nothing to append.
+    #[test]
+    fn upgrading_a_legacy_sidecar_appends_exactly_the_current_term_index() {
+        let current = sidecar(1_000);
+        let legacy = serialize_fti_without_term_index(&deserialize_fti(&current).unwrap()).unwrap();
+        let tail = term_index_tail_for(
+            BufReader::new(Cursor::new(legacy.clone())),
+            legacy.len() as u64,
+        )
+        .unwrap()
+        .expect("a legacy sidecar has a tail to append");
+        let mut upgraded = legacy;
+        upgraded.extend_from_slice(&tail);
+        assert_eq!(upgraded, current);
+        assert!(
+            term_index_tail_for(
+                BufReader::new(Cursor::new(current.clone())),
+                current.len() as u64
+            )
+            .unwrap()
+            .is_none(),
+            "an indexed sidecar needs no upgrade"
+        );
+    }
+
+    /// A rollback to a build without the index still reads new sidecars: the
+    /// file opens with exactly the old layout.
+    #[test]
+    fn a_sidecar_with_a_term_index_starts_with_the_old_layout() {
+        let bytes = sidecar(300);
+        let legacy = serialize_fti_without_term_index(&deserialize_fti(&bytes).unwrap()).unwrap();
+        assert_eq!(&bytes[..legacy.len()], legacy.as_slice());
+        assert_eq!(
+            bytes[bytes.len() - 8..],
+            legacy[legacy.len() - 8..],
+            "the last 8 bytes are still total_doc_len"
+        );
     }
 }
 
