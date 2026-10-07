@@ -1168,6 +1168,35 @@ mod cluster {
         }
     }
 
+    /// A production write handler that does not acknowledge its first
+    /// `unacked` writes, as a replica whose write failed does not (the
+    /// coordinator times the write out).
+    struct DropsFirstWrites<H> {
+        inner: H,
+        unacked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl<H: ferrosa_net::rpc::handler::RpcHandler> ferrosa_net::rpc::handler::RpcHandler
+        for DropsFirstWrites<H>
+    {
+        async fn handle(
+            &self,
+            from: PeerId,
+            msg: ferrosa_net::message::Message,
+        ) -> Option<ferrosa_net::message::Message> {
+            use std::sync::atomic::Ordering;
+            let dropped = self
+                .unacked
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if dropped {
+                return None;
+            }
+            self.inner.handle(from, msg).await
+        }
+    }
+
     /// A remote replica: its own storage, served by the production write and
     /// read handlers.
     async fn start_replica(storage: Arc<StorageEngine>) -> (Arc<RpcServer>, String, Uuid) {
@@ -1303,6 +1332,96 @@ mod cluster {
             live_entries_in(&remote, &live),
             want,
             "every live edge's entries are live on the remote replica"
+        );
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// A few writes that time out do not make the whole heal start over.
+    ///
+    /// Live on 2026-10-07, 50,000 entries into the memory cluster's heal, three
+    /// repairs timed out (`CL=ALL, received=2, required=3`). Any error marked
+    /// the heal incomplete, and the next query ran it again from the start:
+    /// over half an hour of work thrown away for three entries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_heal_completes_through_a_few_transiently_failed_writes() {
+        let (node, all, live) = damage(Node::with_replication_factor(2), 1, 1, 24).await;
+        let reference = Reference::new(&all, &live);
+        let remote_dir = TempDir::new().unwrap();
+        let remote = Arc::new(StorageEngine::new(storage_config(&remote_dir), None).unwrap());
+        register_storage_tables(&remote);
+        remote
+            .register_table(
+                ferrosa_graph::adjacency::adjacency_table_metadata(KEYSPACE).to_storage_schema(),
+            )
+            .unwrap();
+        tombstone_entries(&remote, &live, now_micros());
+
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(
+            MsgType::MutationForward,
+            Arc::new(DropsFirstWrites {
+                inner: MutationForwardHandler::new(Arc::clone(&remote)),
+                unacked: std::sync::atomic::AtomicUsize::new(3),
+            }),
+        );
+        let read_handler = Arc::new(ReadRequestHandler::new(Arc::clone(&remote)));
+        registry.register(MsgType::ReadRequest, read_handler.clone());
+        registry.register(MsgType::PartitionSuffixReadRequest, read_handler);
+        let remote_host = Uuid::new_v4();
+        let server = Arc::new(RpcServer::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                ..NetConfig::default()
+            },
+            remote_host,
+            registry,
+        ));
+        let remote_addr = server.start_and_get_addr().await.unwrap().to_string();
+
+        let local_host = Uuid::new_v4();
+        let mut ring = TokenRing::new();
+        ring.add_node(1, node_info("127.0.0.1:7000", local_host));
+        ring.add_node(2, node_info(&remote_addr, remote_host));
+        ring.assign_tokens(1, &[0]);
+        ring.assign_tokens(2, &[i64::MIN / 2]);
+        let coordinator = Arc::new(ClusterCoordinator::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                // An unacknowledged write fails after this, not the 10 s default.
+                Arc::new(NetConfig {
+                    data_lane_timeout: std::time::Duration::from_millis(300),
+                    ..NetConfig::default()
+                }),
+                local_host,
+                Arc::new(NoopPeers),
+            )),
+            1,
+            Arc::clone(&node.storage),
+            2,
+            ConsistencyLevel::One,
+        ));
+        let fresh = GraphEngine::new(
+            Arc::clone(&node.schema),
+            Arc::clone(&node.storage),
+            Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::cluster(
+                coordinator,
+            ))),
+            GraphEngineConfig::default(),
+            std::time::Duration::from_secs(300),
+        );
+
+        fresh
+            .ensure_adjacency_ready_for_test(KEYSPACE)
+            .await
+            .expect("three dropped writes are retried, not a failed heal");
+        assert_clean(
+            "traversals after a heal that retried its failed writes",
+            &check_all(&node.start_engine(), &reference).await,
+        );
+        assert_eq!(
+            live_entries_in(&remote, &live),
+            2 * live.len(),
+            "the retried repairs reached the remote replica"
         );
         server.shutdown(std::time::Duration::from_millis(50)).await;
     }

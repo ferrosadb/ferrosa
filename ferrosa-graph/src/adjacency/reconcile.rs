@@ -289,6 +289,7 @@ pub async fn reconcile_once_with(
         // Up to RECONCILE_ENTRIES_IN_FLIGHT of them run together; one at a
         // time, a memory-cluster heal outlasted every client for 30+ minutes.
         let mut in_flight = futures::stream::FuturesUnordered::new();
+        let mut failed = FailedEntries::default();
         let progress_started = std::time::Instant::now();
         while let Some(partition) = partitions.next().await {
             let partition = match partition {
@@ -311,7 +312,7 @@ pub async fn reconcile_once_with(
             for (_, entry) in expected {
                 if in_flight.len() >= RECONCILE_ENTRIES_IN_FLIGHT {
                     if let Some(result) = in_flight.next().await {
-                        metrics.record(result);
+                        failed.keep(metrics.record(result), &mut metrics);
                     }
                 }
                 in_flight.push(reconcile_entry(
@@ -351,8 +352,20 @@ pub async fn reconcile_once_with(
             }
         }
         while let Some(result) = in_flight.next().await {
-            metrics.record(result);
+            failed.keep(metrics.record(result), &mut metrics);
         }
+        retry_failed_entries(
+            write_path,
+            &index,
+            &edge_table_fqn,
+            failed,
+            Pass {
+                started_at: pass_started_at,
+                mode,
+            },
+            &mut metrics,
+        )
+        .await;
     }
 
     // Phase 2: Scan adjacency index for orphans.
@@ -641,6 +654,18 @@ struct AdjacencyIndex {
 /// the request load a pass puts on the cluster.
 const RECONCILE_ENTRIES_IN_FLIGHT: usize = 32;
 
+/// Retries of an entry whose repair failed, within the same pass. A failed
+/// entry used to fail the whole pass, so a heal 50,000 entries in restarted
+/// from nothing for three transient write timeouts.
+const RECONCILE_ENTRY_RETRIES: u32 = 3;
+
+/// Wait before retry `n` is `n` times this.
+const RECONCILE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Failed entries a pass holds for retry. Past this many the cluster is not
+/// failing transiently, and the rest count as errors at once.
+const RECONCILE_RETRY_CAPACITY: usize = 10_000;
+
 /// A reconcile pass logs its progress every this many entries.
 const RECONCILE_PROGRESS_EVERY_ENTRIES: usize = 10_000;
 
@@ -773,24 +798,89 @@ enum Outcome {
 /// What reconciling one entry did, folded into the pass's metrics by the
 /// caller (entries are reconciled concurrently, so none of them holds the
 /// metrics).
-#[derive(Debug, Clone, Copy)]
 enum EntryResult {
     /// Already right, or left for the next pass (a concurrent write).
     Unchanged,
     Written(Outcome),
-    /// A read or write failed (logged); the pass is incomplete.
-    Failed,
+    /// A read or write failed (logged). The entry comes back so the pass can
+    /// retry it; only an entry that still fails makes the pass incomplete.
+    Failed(ExpectedEntry),
 }
 
 impl ReconcileMetrics {
-    fn record(&mut self, result: EntryResult) {
+    /// Count `result`; a failed entry is handed back for a retry, not counted.
+    fn record(&mut self, result: EntryResult) -> Option<ExpectedEntry> {
         match result {
             EntryResult::Unchanged => {}
             EntryResult::Written(Outcome::Repaired) => self.entries_repaired += 1,
             EntryResult::Written(Outcome::Removed) => self.orphans_removed += 1,
             EntryResult::Written(Outcome::Rewritten) => self.entries_rewritten += 1,
-            EntryResult::Failed => self.errors += 1,
+            EntryResult::Failed(entry) => return Some(entry),
         }
+        None
+    }
+}
+
+/// Entries whose repair failed, held for a retry later in the pass.
+#[derive(Default)]
+struct FailedEntries(Vec<ExpectedEntry>);
+
+impl FailedEntries {
+    /// Hold `entry` for a retry, or count it as an error once the retry list
+    /// is full.
+    fn keep(&mut self, entry: Option<ExpectedEntry>, metrics: &mut ReconcileMetrics) {
+        let Some(entry) = entry else {
+            return;
+        };
+        if self.0.len() < RECONCILE_RETRY_CAPACITY {
+            self.0.push(entry);
+        } else {
+            metrics.errors += 1;
+        }
+    }
+}
+
+/// Retry `failed` up to [`RECONCILE_ENTRY_RETRIES`] times with backoff; an
+/// entry that still fails is an error and the pass is incomplete. Each retry
+/// reads the entry's state again, so a write the failed attempt did land is
+/// seen, and it is stamped by the same `pass` as the first attempt.
+async fn retry_failed_entries(
+    write_path: &WritePath,
+    index: &AdjacencyIndex,
+    edge_table_fqn: &str,
+    mut failed: FailedEntries,
+    pass: Pass,
+    metrics: &mut ReconcileMetrics,
+) {
+    for attempt in 1..=RECONCILE_ENTRY_RETRIES {
+        if failed.0.is_empty() {
+            return;
+        }
+        tracing::info!(
+            table = %edge_table_fqn,
+            entries = failed.0.len(),
+            attempt,
+            "adjacency reconcile: retrying entries whose repair failed"
+        );
+        tokio::time::sleep(RECONCILE_RETRY_BACKOFF * attempt).await;
+        let results: Vec<EntryResult> = futures::stream::iter(std::mem::take(&mut failed.0))
+            .map(|entry| reconcile_entry(write_path, index, edge_table_fqn, entry, pass))
+            .buffer_unordered(RECONCILE_ENTRIES_IN_FLIGHT)
+            .collect()
+            .await;
+        for result in results {
+            failed.keep(metrics.record(result), metrics);
+        }
+    }
+    if !failed.0.is_empty() {
+        metrics.errors += failed.0.len();
+        tracing::warn!(
+            table = %edge_table_fqn,
+            entries = failed.0.len(),
+            retries = RECONCILE_ENTRY_RETRIES,
+            "adjacency reconcile: entries still failed after their retries; the pass is \
+             incomplete"
+        );
     }
 }
 
@@ -810,9 +900,9 @@ async fn reconcile_entry(
                     table = %edge_table_fqn,
                     error = %e,
                     "adjacency reconcile: could not read an adjacency partition; \
-                     skipping its repair for this pass"
+                     retrying it later in this pass"
                 );
-                return EntryResult::Failed;
+                return EntryResult::Failed(entry);
             }
         };
     let Some((row, at, outcome)) = entry_repair(&entry, &state, pass) else {
@@ -821,7 +911,7 @@ async fn reconcile_entry(
     let repair = Mutation::new(
         index.table_id.keyspace.clone(),
         index.table_id.table.clone(),
-        entry.vertex_key,
+        entry.vertex_key.clone(),
         vec![row],
         at,
     );
@@ -832,9 +922,9 @@ async fn reconcile_entry(
                 table = %edge_table_fqn,
                 error = %e,
                 "adjacency reconcile: could not write an adjacency repair; \
-                 the next pass retries"
+                 retrying it later in this pass"
             );
-            EntryResult::Failed
+            EntryResult::Failed(entry)
         }
     }
 }
