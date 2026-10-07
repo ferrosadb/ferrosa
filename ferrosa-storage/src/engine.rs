@@ -387,6 +387,12 @@ fn compression_from_schema(
     let short_name = class.rsplit('.').next().unwrap_or(class);
     match short_name {
         "LZ4Compressor" | "LZ4" | "lz4" => Ok(Some(ferrosa_sstable::Compression::Lz4)),
+        // `NoCompressor` is the class a Cassandra `ALTER TABLE ... WITH
+        // compression = {...}` writes to turn compression off, so a table
+        // created uncompressed elsewhere must not fail to open here. Matched on
+        // the last dotted segment like the other names, so both the bare form
+        // and `org.apache.cassandra.io.compress.NoCompressor` resolve.
+        "NoCompressor" | "NoopCompressor" => Ok(None),
         "ZstdCompressor" | "Zstd" | "zstd" | "ZSTD" => {
             let level = schema
                 .extensions
@@ -17122,6 +17128,28 @@ mod tests {
         );
         assert_eq!(options.chunk_size, 32 * 1024);
         assert!(!options.verify_output);
+    }
+
+    /// `org.apache.cassandra.io.compress.NoCompressor` is what a Cassandra
+    /// `ALTER TABLE ... WITH compression = {...}` writes to disable compression.
+    /// Only the last dotted segment is matched, so the class name reaching the
+    /// match is the bare `NoCompressor` and it must resolve to no compression —
+    /// before the alias existed it fell through to `UnsupportedCompression`,
+    /// making a table that a real Cassandra client had created uncompressed
+    /// impossible to open here.
+    #[test]
+    fn write_options_treat_no_compressor_as_no_compression() {
+        for class in [
+            "org.apache.cassandra.io.compress.NoCompressor",
+            "NoCompressor",
+        ] {
+            let mut schema = test_schema();
+            schema
+                .extensions
+                .insert("compression.class".to_string(), class.to_string());
+            let options = write_options_for_schema(&schema, true).unwrap();
+            assert_eq!(options.compression, None, "class={class}");
+        }
     }
 
     /// With no per-table codec selected, the write options carry the process-wide

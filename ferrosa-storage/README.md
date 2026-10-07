@@ -1129,6 +1129,23 @@ bytes to object storage, at the cost of extra CPU per flush and per compaction
 output. A per-table `compression.class` schema extension still wins over it; the
 knob only supplies the default for tables that select none.
 
+The per-table `compression.class` value is matched on its **last dotted
+segment**, so a fully-qualified class name and its bare short form are
+equivalent. Recognized names:
+
+| `compression.class` | Codec |
+|---|---|
+| `LZ4Compressor`, `LZ4`, `lz4` | LZ4 |
+| `ZstdCompressor`, `Zstd`, `zstd`, `ZSTD` | Zstd (level from `compression.compression_level`/`compression.level`, else `FERROSA_SSTABLE_ZSTD_LEVEL`) |
+| `NoCompressor`, `NoopCompressor` | none |
+| empty, `none`, `null`, `false` | none |
+| `compression.enabled` = `false`/`0` | none (checked first, wins over `compression.class`) |
+
+`NoCompressor` is the class a Cassandra `ALTER TABLE ... WITH compression =
+{...}` writes to turn compression off, so a table created uncompressed by a real
+Cassandra client is read/written here uncompressed rather than failing with
+`UnsupportedCompression`. Any other unrecognized name is still rejected loudly.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position
