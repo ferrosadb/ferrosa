@@ -533,6 +533,14 @@ jobs:
                --skip ssh_upload_file
           # Workflow shape assertions live in the integration tests.
           cargo test -p ferrosa-jepsen --all-features --test ci_workflow
+      - name: Assert the nightly's permitted exclusions (T3)
+        # The nightly run step may `--skip` only the tests that are physically
+        # blocked on a GitHub-hosted runner (or, for the multi-DC workload, a
+        # structural defect). This runs the guard on every PR so a `--skip` that
+        # drifts in — the exact defect that made the nightly red for 8 nights —
+        # is caught before it lands, and a *stale* exclusion (its test deleted or
+        # its blocker fixed) fails too.
+        run: cargo test -p ferrosa-jepsen --all-features --test nightly_full_suite
 
   # Reuses the node image artifact from build-node-image so this live
   # PostgreSQL fault schedule does not compile a second server binary.
