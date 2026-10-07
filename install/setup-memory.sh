@@ -469,6 +469,8 @@ render_launch_agent_plist() {
   <true/>
   <key>ThrottleInterval</key>
   <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>StandardOutPath</key>
   <string>${LAUNCH_AGENT_LOG}</string>
   <key>StandardErrorPath</key>

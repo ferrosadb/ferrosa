@@ -25,6 +25,15 @@ class LaunchdTemplateTest(unittest.TestCase):
         # on exit 0. `launchctl bootout` removes the job whatever KeepAlive says.
         self.assertIs(keep_alive.get("SuccessfulExit"), False, keep_alive)
 
+    def test_the_inline_memory_server_plist_is_an_interactive_job(self):
+        # setup-memory.sh writes this plist itself when the tarball has no
+        # template. Without ProcessType launchd applies its throttling
+        # defaults (throttled CPU and I/O).
+        script = (TEMPLATE.parents[1] / "install" / "setup-memory.sh").read_text()
+        start = script.index("cat > \"$out\" <<PLIST")
+        inline = script[start : script.index("\nPLIST\n", start)]
+        self.assertIn("<key>ProcessType</key>\n  <string>Interactive</string>", inline)
+
     def test_restarts_are_throttled(self):
         # A node that fails at every start must not spin: launchd waits at
         # least this long between launches.
