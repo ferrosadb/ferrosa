@@ -30,8 +30,7 @@ SKIP=(--skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_re
       --skip digest_walk_is_deterministic --skip differential_oracle
       --skip fly_multi_node_streaming_scan
       --skip real_typed_edges_paged_scan_delivers_every_distinct_row
-      --skip count_range_metadata_merger_dedups_real_typed_edges_sstables
-      --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy)
+      --skip count_range_metadata_merger_dedups_real_typed_edges_sstables)
 
 echo "=== warming the build (shared target dir) ==="
 cargo build --all-features --workspace --lib --tests \

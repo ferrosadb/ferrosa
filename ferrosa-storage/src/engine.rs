@@ -28293,7 +28293,9 @@ mod tests {
         // that happens *before* promotion.
         let dir_fsync_pos = relevant
             .iter()
-            .position(|(i, e)| *i > relevant[promote_rename_pos].0 && matches!(e, Event::DirFsync(_)))
+            .position(|(i, e)| {
+                *i > relevant[promote_rename_pos].0 && matches!(e, Event::DirFsync(_))
+            })
             .expect("promote should fsync sstables/<table>/ after the rename");
         let unlink_pos = relevant
             .iter()
@@ -28406,52 +28408,60 @@ mod tests {
         }
     }
 
-    /// CS13-style crash test (T-001): after promoting a compaction output,
-    /// drop un-fsynced directory-entry writes for `sstables/<table>/` (as if
-    /// the filesystem crashed before the promote rename's directory entry
-    /// reached disk), then restart. The invariant this proves: with the fix
-    /// in this packet, either the promoted output's directory entry survived
-    /// the simulated crash, or the inputs were never unlinked -- never
-    /// neither.
-    ///
-    /// LazyFS setup (this harness is not implemented yet -- see below):
-    ///   1. Build/install LazyFS: <https://github.com/dsrhaslab/lazyfs>.
-    ///   2. Mount a LazyFS-backed directory with a fault config that can drop
-    ///      un-fsynced writes on trigger (LazyFS's crash-simulation fault).
-    ///   3. Point a `StorageEngine`'s `data_dir` at that mountpoint.
-    ///   4. Run a flush + compact cycle, trigger the LazyFS crash fault right
-    ///      after the directory fsync in `fsync_promoted_directory` but
-    ///      before `evict_local_input_sstable_files`, then remount clean and
-    ///      reopen the engine.
-    ///   5. Assert exactly one of {inputs, promoted output} is discoverable.
-    ///
-    /// Set `FERROSA_TEST_LAZYFS=1` to opt in once that harness exists. It
-    /// does not exist yet: this packet proves the ordering and failure-path
-    /// invariants with the in-process `fsync_probe` seam instead (the two
-    /// tests above). A real crash-consistency proof under LazyFS needs a
-    /// Linux host, which the project plan does not provision until T-070
-    /// (`specs/sstable-write-pump/compiled-project-plan.md`).
-    #[cfg(feature = "live-infra-tests")]
-    #[test]
-    fn promote_dir_fsync_lazyfs_crash_loses_neither_copy() {
-        if std::env::var("FERROSA_TEST_LAZYFS").is_err() {
-            panic!(
-                "FERROSA_TEST_LAZYFS not set -- install LazyFS \
-                 (https://github.com/dsrhaslab/lazyfs), mount a LazyFS-backed \
-                 directory with a fault config that can drop un-fsynced \
-                 writes, point a StorageEngine's data_dir at it, and re-run \
-                 with FERROSA_TEST_LAZYFS=1. See this test's doc comment for \
-                 the mount + fault-injection steps this harness still needs \
-                 (tracked for T-070, the first point with a Linux host)."
-            );
-        }
-        panic!(
-            "FERROSA_TEST_LAZYFS is set but the LazyFS mount / fault-injection \
-             harness is not implemented in this crate yet -- refusing to fake \
-             a pass. Implement the steps in this test's doc comment (T-070) \
-             before removing this panic."
-        );
-    }
+    // ── Window E' crash replay (T-070): why no LazyFS / dm-log-writes test
+    // stands here ─────────────────────────────────────────────────────────
+    //
+    // This slot used to hold `promote_dir_fsync_lazyfs_crash_loses_neither_copy`,
+    // a `#[cfg(feature = "live-infra-tests")]` test whose body only ever
+    // `panic!`d: it named a LazyFS harness that was never built, so it was a
+    // permanently-red nightly entry that proved nothing. T4 (t_a556ed27) built
+    // and ran that harness and disproved its spec (evidence:
+    // `ferrosa-suite` `specs/t-070-crash-harness/T4-lazyfs-findings.md`):
+    //
+    //   1. LazyFS runs on `ubuntu-latest` -- `/dev/fuse` is present, an
+    //      unprivileged process mounts via setuid `fusermount3`, LazyFS 0.3.1
+    //      builds from source, and the clear-cache fault drops un-fsynced *file
+    //      content*. The old "needs a Linux host until T-070" premise was
+    //      factually false (probe run 37653286768).
+    //   2. LazyFS cannot express window E': it defers file content only and
+    //      passes directory metadata straight through (`lfs_rename` -> real
+    //      `rename()`, `lfs_unlink` -> real `unlink()`; only `lfs_write`/
+    //      `lfs_read`/`lfs_fsync` touch its cache). It can never drop an
+    //      un-fsynced rename while keeping an un-fsynced unlink, so the
+    //      "rename lost but unlink persisted" shape is unreachable -- measured,
+    //      an un-fsynced rename always survived (run 37655212551), and its
+    //      negative control is identical fixed vs unpatched (run 37655917600).
+    //      A LazyFS harness would therefore pass on the pre-fix revision: a
+    //      guard that cannot fail, exactly what the acceptance rejects.
+    //   3. Window E' is *closed on current main by the T-022 intent protocol*,
+    //      independently of T-001. `poll_compactions` durably writes the
+    //      replacement record to `sstables/<table>/.compaction-<gen>.intent`
+    //      and fsyncs `sstables/<table>/` before it promotes, then advances it
+    //      to `Swapped` (another `table_dir` fsync) right after the swap --
+    //      both *before* the first input is unlinked (`CompactionIntentRecord::
+    //      write`; `finalize_compactions`). A crash between the promote rename
+    //      and the input unlinks therefore always finds the intent record,
+    //      which rolls the compaction forward at startup, so the inputs are
+    //      never dropped without the output's directory entry already durable.
+    //      T-001's `fsync_promoted_directory` is defense-in-depth: it makes the
+    //      promoted entry durable the moment promotion returns, rather than
+    //      relying on the later intent write to flush it.
+    //
+    // Because of (3), no block-level (dm-log-writes / dm-flakey) replay has a
+    // reachable "neither copy" counterexample to demonstrate either: with T-001
+    // reverted, the Swapped-intent fsync still lands before the first unlink,
+    // so such a replay would pass on the reverted revision too -- vacuous for
+    // exactly the reason the LazyFS harness was rejected. It is deliberately
+    // NOT built. The ordering invariant is instead asserted by the
+    // discriminating in-process timeline test
+    // `promote_dir_fsync_order_is_rename_then_dir_fsync_then_unlink` above
+    // (RED with T-001 reverted, measured 3/3; GREEN on main, 5/5), which
+    // requires the promote rename to be directory-fsynced before any other
+    // metadata operation touches the table directory, and by
+    // `promote_dir_fsync_failure_prevents_input_unlink`.
+    //
+    // `FERROSA_TEST_LAZYFS` is gone with the body: there is no LazyFS harness
+    // to opt into, and leaving the token would imply one exists.
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancel_source_ddl_abandoned_waiter_does_not_abandon_owned_results() {
