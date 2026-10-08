@@ -158,7 +158,7 @@ impl Config {
     /// argv belongs to the libtest/nextest runner (`--exact`, a filter string,
     /// `--nocapture`, ...), not to this program. Parsing argv here made every
     /// unit test of this function fail on the runner's own arguments. Argument
-    /// parsing lives in [`apply_args`], which only [`main`] calls.
+    /// parsing lives in `apply_args`, which only `main` calls.
     fn from_env() -> Result<Self, String> {
         let cfg = Config {
             iterations: env_u64("PGO_WORKLOAD_ITERATIONS", DEFAULT_ITERATIONS)?,
