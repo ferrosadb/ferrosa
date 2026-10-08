@@ -326,6 +326,15 @@ in-crate callers see no behavioural change. The rule: **there is exactly one row
 encoder, and it lives in `ferrosa-row-bridge`** — a divergent copy is the top
 SQL-front-end FMEA risk.
 
+## USING TIMESTAMP range (t_cf637b6e)
+
+`USING TIMESTAMP` (INSERT, UPDATE, DELETE, BATCH) at or above 1e18 is refused
+with an invalid-request error: storage reads that range as legacy nanosecond
+Accord stamps and divides it by 1000. This is a deliberate Cassandra
+incompatibility (Cassandra accepts any `long`); 1e18 microseconds is the year
+33658. `SELECT writetime()`/`TTL()` are not wired to cell metadata yet and
+return null (t_7987e84c).
+
 ## Public API (key entry points)
 
 | Area | Entry points |
