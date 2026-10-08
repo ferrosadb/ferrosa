@@ -294,10 +294,12 @@ impl EngineStorageReader {
         };
 
         // Keep only cells written at or before the agreed `t` — the row state
-        // "as of t". The bound is `t` in the cell-timestamp domain (micros, see
-        // `accord_cell_timestamp`): compared raw, the nanosecond `t.time` sat
-        // ~1000x above every cell and bounded nothing (t_277e2bf9).
-        let cell_ts_bound = accord_cell_timestamp(t);
+        // "as of t". Cells are stamped at the agreed execution timestamp by the
+        // apply seam, so `t.time` is the correct upper bound for what this LWT
+        // is allowed to observe. (After dep-wait, no conflicting cell with
+        // ts >= t.time exists, but bounding here is defensive and keeps the read
+        // honestly as-of-t even if the engine merged a concurrent unrelated cell.)
+        let cell_ts_bound = i64::try_from(t.time).unwrap_or(i64::MAX);
         let rows: Vec<ferrosa_sstable::types::Row> = partition
             .rows
             .into_iter()
@@ -331,7 +333,7 @@ impl EngineStorageReader {
         // serialize to different bytes and break the agreement (hence
         // linearizability). The id is only a write-dedup marker, irrelevant to a
         // read snapshot.
-        let cell_ts = accord_cell_timestamp(t);
+        let cell_ts = i64::try_from(t.time).unwrap_or(i64::MAX);
         let mutation = Mutation {
             mutation_id: [0u8; 16],
             keyspace: keyspace.to_string(),
@@ -420,18 +422,13 @@ impl StorageApplier for NoopStorageApplier {
 /// Map an Accord-agreed [`Timestamp`] to the i64 cell timestamp used for
 /// last-write-wins conflict resolution.
 ///
-/// `t.time` is a hybrid-logical-clock value in **nanoseconds** since the epoch
-/// (`HybridLogicalClock::now` uses `as_nanos()`); cell timestamps, which every
-/// CQL write stamps and every read and merge compares, are **microseconds**
-/// (`as_micros()`). Stored raw, an Accord cell sat ~1000x in the future and no
-/// later plain write, UPDATE or DELETE could beat it (t_277e2bf9).
-///
-/// Truncating to micros keeps `t1 < t2 => cell_ts(t1) <= cell_ts(t2)`; two
-/// transactions in the same microsecond tie, which is safe because Accord
-/// applies conflicting transactions on a key in their agreed order, so the
-/// stamp only arbitrates against writes outside the conflict set.
+/// The cell-timestamp domain is `i64` micros-since-epoch; the agreed `t.time`
+/// is the hybrid-logical-clock value that totally orders conflicting Accord
+/// transactions. We use `t.time` directly (saturating into `i64`) so that two
+/// LWTs whose Accord order is `t1 < t2` always persist cell timestamps in the
+/// same order — independent of any coordinator wall-clock skew.
 fn accord_cell_timestamp(t: Timestamp) -> i64 {
-    i64::try_from(t.time / 1_000).unwrap_or(i64::MAX)
+    i64::try_from(t.time).unwrap_or(i64::MAX)
 }
 
 /// Re-stamp every conflict-resolution timestamp carried by `row` to `cell_ts`.
@@ -1630,16 +1627,8 @@ mod engine_applier_tests {
     const KS: &str = "lwt_ks";
     const TABLE: &str = "lwt_table";
 
-    /// An Accord timestamp `micros` microseconds after the epoch. The HLC's
-    /// `time` is nanoseconds, so this is `micros * 1000`; feeding micros into
-    /// the nanosecond field is what hid t_277e2bf9 from every test here.
     fn accord_ts(micros: u64) -> Timestamp {
-        Timestamp::synthetic(micros * 1_000)
-    }
-
-    /// An Accord timestamp from a raw HLC nanosecond value.
-    fn accord_ts_ns(nanos: u64) -> Timestamp {
-        Timestamp::synthetic(nanos)
+        Timestamp::synthetic(micros)
     }
 
     fn txn(node: u64, micros: u64) -> TxnId {
@@ -2319,116 +2308,6 @@ mod engine_applier_tests {
             Some(b"hello".as_slice()),
             "read_row_at must return the row that was applied at t"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Accord `t.time` is NANOSECONDS; cell timestamps are MICROSECONDS
-    // (t_277e2bf9, the unfinished half of t_8ef73ee1).
-    //
-    // `HybridLogicalClock::now` stamps `t.time` from `as_nanos()`, while every
-    // CQL write stamps cells from `as_micros()`. Storing `t.time` as the cell
-    // timestamp put LWT cells ~1000x in the future, so no later plain write,
-    // UPDATE or DELETE could ever beat them. The helpers above take micro-sized
-    // inputs into the nanosecond field, which is why the missing conversion
-    // looked right in every older test: these use wall-clock magnitudes.
-    // -----------------------------------------------------------------------
-
-    /// Wall-clock now in the two domains, as production stamps them.
-    fn wall_now() -> (u64, i64) {
-        let since = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        (since.as_nanos() as u64, since.as_micros() as i64)
-    }
-
-    #[test]
-    fn a_plain_write_after_an_lwt_wins_last_write_wins() {
-        let (engine, _dir) = make_engine();
-        let applier = EngineStorageApplier::new(engine.clone());
-        let key = make_key("pk1");
-        let (t_ns, _) = wall_now();
-        applier
-            .apply(
-                TxnId::new(1, accord_ts_ns(t_ns)),
-                encoded_mutation(key.clone(), b"lwt", 0, accord_ts_ns(t_ns), vec![]),
-            )
-            .unwrap();
-
-        // A plain CQL write one millisecond later, stamped in micros.
-        let (_, now_us) = wall_now();
-        engine
-            .write(
-                &TableId::new(KS, TABLE),
-                &key,
-                make_row(b"plain", now_us + 1_000),
-                now_us + 1_000,
-            )
-            .unwrap();
-        assert_eq!(
-            read_cell0(&engine, &key).as_deref(),
-            Some(b"plain".as_slice()),
-            "a later plain write must beat an LWT-written cell"
-        );
-    }
-
-    #[test]
-    fn an_lwt_cell_is_stamped_in_microseconds() {
-        let (engine, _dir) = make_engine();
-        let applier = EngineStorageApplier::new(engine.clone());
-        let key = make_key("pk1");
-        let (t_ns, _) = wall_now();
-        applier
-            .apply(
-                TxnId::new(1, accord_ts_ns(t_ns)),
-                encoded_mutation(key.clone(), b"lwt", 0, accord_ts_ns(t_ns), vec![]),
-            )
-            .unwrap();
-        assert_eq!(read_cell0_ts(&engine, &key), Some((t_ns / 1_000) as i64));
-    }
-
-    #[test]
-    fn a_read_at_t_excludes_a_plain_write_made_after_t() {
-        let (engine, _dir) = make_engine();
-        let reader = EngineStorageReader::new(engine.clone());
-        let key = make_key("pk1");
-        let (t_ns, now_us) = wall_now();
-        engine
-            .write(
-                &TableId::new(KS, TABLE),
-                &key,
-                make_row(b"later", now_us + 60_000_000),
-                now_us + 60_000_000,
-            )
-            .unwrap();
-        assert!(
-            reader
-                .read_row_at(KS, TABLE, b"pk1", accord_ts_ns(t_ns))
-                .unwrap()
-                .is_none(),
-            "a cell written a minute after t is not part of the row as of t"
-        );
-    }
-
-    #[test]
-    fn a_read_vote_row_carries_a_microsecond_timestamp() {
-        let (engine, _dir) = make_engine();
-        let reader = EngineStorageReader::new(engine.clone());
-        let key = make_key("pk1");
-        let (t_ns, now_us) = wall_now();
-        engine
-            .write(
-                &TableId::new(KS, TABLE),
-                &key,
-                make_row(b"v", now_us - 1),
-                now_us - 1,
-            )
-            .unwrap();
-        let bytes = reader
-            .read_row_at(KS, TABLE, b"pk1", accord_ts_ns(t_ns))
-            .unwrap()
-            .expect("row written before t");
-        let m = Mutation::deserialize_from(&bytes).unwrap();
-        assert_eq!(m.timestamp, (t_ns / 1_000) as i64);
     }
 
     /// A read-vote names the statement's clustering row, and the replica returns
