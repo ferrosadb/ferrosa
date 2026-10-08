@@ -47,6 +47,16 @@ capture.
 3. All percentages are of the profile total (543 045 038 916 samples ≈ 1515 s CPU
    over 3 nodes).
 
+> **Corrected in a later revision.** The first version reported `memcpy` as 8.20 %
+> by summing frames named *exactly* `memcpy`, and quoted the 4.54 % node as if it
+> were a self-cost. Both were wrong: Linux symbolises the same function as
+> `memcpy`/`__memcpy`/`memmove`/`memset`, and the 4.54 % node is *inclusive*
+> (1.37 % self, with 2.71 % of its children being page faults). The memory-ops
+> totals are re-derived in the companion
+> [`cql-rt-memory-ops-analysis.md`](cql-rt-memory-ops-analysis.md):
+> **allocator 7.84 % + memcpy family 8.85 % = 16.7 % disjoint**, with a further
+> 3.79 % of kernel page-fault/alloc/zeroing layered inside them.
+
 ## Findings
 
 ### Where the copies sit (write + read hot paths)
