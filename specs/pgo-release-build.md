@@ -246,6 +246,11 @@ PGO grew the binary (+3.86 %, consistent with aggressive inlining); here it
 shrank it (−3.74 %). Both prove the compiler did something; neither proves it
 helped. The end-to-end A/B is the only thing that does.
 
+**The run reproduces.** A second `--baseline --verify` run on the same
+revision produced a size delta of −3.74 % (97,841,320 B vs 101,645,368 B) and a
+merged profile of the same shape — the determinism the workload is built for
+holds end to end, not only in the unit test.
+
 ## Roadmap
 
 **Now.** Pipeline landed, in-process workload, script + Dockerfile wiring.
