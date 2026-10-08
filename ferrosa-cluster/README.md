@@ -485,6 +485,17 @@ early acknowledgement.
   and are readable via `AutoRepairScheduler::last_outcome`; the round-robin
   cursor retries them.
 
+### Accord cell timestamps (t_277e2bf9, t_cf637b6e)
+
+`accord_cell_timestamp(t)` is `t.time / 1000`: the HLC is nanoseconds, cell
+timestamps are microseconds. It is the write stamp, the read-at-`t` bound and
+the read-vote stamp. Rows an older build stamped in nanoseconds are normalised
+at decode (see ferrosa-storage), which is what keeps CAS on them working; the
+two changes ship together. `agreed_row` compares read votes in canonical form
+(decoded and re-encoded), so replicas on different builds agree on the same
+row during a rolling upgrade (t_b986c335). `tests/accord_legacy_ns_compat.rs`
+runs real two-node LWTs over data the old build wrote.
+
 ## Dependencies
 
 **Calls** (ferrosa crates this depends on):
