@@ -183,7 +183,7 @@ pub trait StorageReader: Send + Sync + 'static {
         }
     }
 
-    /// Dispatch a read-vote's [`RowRead`](crate::accord::wire::RowRead).
+    /// Dispatch a read-vote's [`RowRead`](crate::accord::RowRead).
     fn read_for(
         &self,
         read: crate::accord::wire::RowRead<'_>,
