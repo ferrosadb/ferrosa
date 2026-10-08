@@ -47,6 +47,32 @@ pub struct RuntimeManager {
     pub background: Arc<tokio::runtime::Runtime>,
 }
 
+/// Build the CQL client-protocol runtime.
+///
+/// Extracted so the blocking-pool ceiling — the fix that keeps a burst of
+/// cost-12 bcrypt logins from admitting hundreds of CPU-bound threads — is
+/// functionally verifiable rather than only observable at process start.
+///
+/// Worker threads serve the accept loop, per-connection handlers and request
+/// dispatch. The *blocking* pool is what CQL login offloads bcrypt onto via
+/// `ferrosa-cql`'s `authenticate_off_runtime`; left unbounded it admits up to
+/// tokio's default 512 threads, so `max_blocking` caps it and `keep_alive`
+/// tunes how long an idle thread is reused before it exits.
+fn build_cql_runtime(
+    worker_threads: usize,
+    max_blocking: usize,
+    keep_alive: std::time::Duration,
+) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking)
+        .thread_keep_alive(keep_alive)
+        .thread_name("cql-rt")
+        .enable_all()
+        .build()
+        .expect("cql runtime")
+}
+
 impl RuntimeManager {
     /// Build all subsystem runtimes.
     pub fn new() -> Self {
@@ -64,11 +90,32 @@ impl RuntimeManager {
         // are a cores-derived BACKSTOP; the tight per-scan CPU bound is the
         // ferrosa-sched pool (cores - reserved), which scan producers route
         // through (T0.3). The raft runtime is intentionally NOT capped — consensus
-        // must never be throttled. cql keeps the default (client handlers are not
-        // the scan-blocking offenders).
+        // must never be throttled.
+        //
+        // cql IS capped now. It was left at the default on the grounds that
+        // "client handlers are not the scan-blocking offenders" — true for scans,
+        // but CQL login offloads cost-12 bcrypt (~200 ms of pure CPU) to this
+        // pool via `connection.rs::authenticate_off_runtime`, so a burst of
+        // concurrent logins would otherwise admit up to 512 CPU-bound threads
+        // that oversubscribe the cores and starve the very workers serving them.
         let cores = detected_cores();
         let data_max_blocking = (cores * 8).max(8);
         let background_max_blocking = (cores * 2).max(4);
+        let cql_max_blocking = (cores * 2).max(4);
+
+        /// How long an idle CQL blocking-pool thread is kept before it exits.
+        ///
+        /// Tokio's default is 10 s, so the default here is a no-op unless the
+        /// knob is set — but it makes the reuse window tunable. A bursty blocking
+        /// workload (CQL auth's bcrypt) reuses its threads across a shorter gap
+        /// instead of re-creating them after every one.
+        fn cql_blocking_keep_alive() -> std::time::Duration {
+            let secs = resolve_positive_usize(
+                std::env::var("FERROSA_CQL_BLOCKING_KEEP_ALIVE_SECS").ok(),
+                10,
+            );
+            std::time::Duration::from_secs(secs as u64)
+        }
 
         let raft = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -89,14 +136,11 @@ impl RuntimeManager {
                 .expect("data runtime"),
         );
 
-        let cql = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(worker_threads("FERROSA_CQL_RUNTIME_THREADS", 8))
-                .thread_name("cql-rt")
-                .enable_all()
-                .build()
-                .expect("cql runtime"),
-        );
+        let cql = Arc::new(build_cql_runtime(
+            worker_threads("FERROSA_CQL_RUNTIME_THREADS", 8),
+            max_blocking("FERROSA_CQL_MAX_BLOCKING", cql_max_blocking),
+            cql_blocking_keep_alive(),
+        ));
 
         let background = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -478,5 +522,49 @@ mod tests {
         std::env::remove_var("FERROSA_DATA_RUNTIME_THREADS");
         std::env::remove_var("FERROSA_CQL_RUNTIME_THREADS");
         std::env::remove_var("FERROSA_BACKGROUND_RUNTIME_THREADS");
+    }
+
+    /// The CQL blocking pool honors its ceiling. CQL login runs cost-12 bcrypt
+    /// on it (`authenticate_off_runtime`); uncapped, a burst of concurrent logins
+    /// admits up to tokio's default 512 CPU-bound threads. With a ceiling of 2,
+    /// 32 blocking jobs must never run more than 2 concurrently.
+    #[test]
+    fn cql_blocking_pool_respects_its_ceiling() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let rt = build_cql_runtime(2, 2, std::time::Duration::from_secs(1));
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let concurrent = Arc::clone(&concurrent);
+                let peak = Arc::clone(&peak);
+                rt.spawn_blocking(move || {
+                    let now = concurrent.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    concurrent.fetch_sub(1, Ordering::AcqRel);
+                })
+            })
+            .collect();
+
+        rt.block_on(async {
+            for h in handles {
+                h.await.expect("blocking job panicked");
+            }
+        });
+
+        let observed = peak.load(Ordering::Acquire);
+        assert!(
+            observed <= 2,
+            "CQL blocking pool exceeded its ceiling of 2 (observed peak {observed})"
+        );
+        assert!(
+            observed == 2,
+            "expected the pool to actually reach its ceiling (observed peak {observed}) — \
+             the test may not be exercising real concurrency"
+        );
     }
 }
