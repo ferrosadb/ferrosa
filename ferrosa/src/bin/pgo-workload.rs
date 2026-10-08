@@ -151,8 +151,16 @@ fn env_f64(name: &str, default: f64) -> Result<f64, String> {
 }
 
 impl Config {
+    /// Read only the environment knobs, then validate them.
+    ///
+    /// Deliberately does *not* touch `std::env::args()`. Under `cargo test`
+    /// and `cargo nextest run` this code is linked into the test binary, whose
+    /// argv belongs to the libtest/nextest runner (`--exact`, a filter string,
+    /// `--nocapture`, ...), not to this program. Parsing argv here made every
+    /// unit test of this function fail on the runner's own arguments. Argument
+    /// parsing lives in [`apply_args`], which only [`main`] calls.
     fn from_env() -> Result<Self, String> {
-        let mut cfg = Config {
+        let cfg = Config {
             iterations: env_u64("PGO_WORKLOAD_ITERATIONS", DEFAULT_ITERATIONS)?,
             seed: env_u64("PGO_WORKLOAD_SEED", DEFAULT_SEED)?,
             num_keys: env_u64("PGO_WORKLOAD_NUM_KEYS", DEFAULT_NUM_KEYS)?,
@@ -163,10 +171,20 @@ impl Config {
             data_dir: std::env::temp_dir()
                 .join(format!("ferrosa-pgo-workload-{}", std::process::id())),
         };
-        for arg in std::env::args().skip(1) {
+        cfg.validate()
+    }
+
+    /// Parse *this program's* own flags. Called from [`main`] with
+    /// `std::env::args().skip(1)`, never from a test: a test binary's argv is
+    /// the runner's. An argument this program does not define is a hard error
+    /// — silently ignoring `--exact` or a stray path would hide a
+    /// mis-invocation (the profile would train with the wrong knobs and still
+    /// exit 0).
+    fn apply_args(&mut self, args: impl IntoIterator<Item = String>) -> Result<(), String> {
+        for arg in args {
             match arg.as_str() {
-                "--check-hits" => cfg.check_hits = true,
-                "--json" => cfg.json = true,
+                "--check-hits" => self.check_hits = true,
+                "--json" => self.json = true,
                 "-h" | "--help" => {
                     println!(
                         "pgo-workload [--json] [--check-hits]\n\n\
@@ -179,16 +197,21 @@ impl Config {
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
-        if cfg.iterations == 0 {
+        Ok(())
+    }
+
+    /// Reject knobs that would silently train the wrong profile.
+    fn validate(self) -> Result<Self, String> {
+        if self.iterations == 0 {
             return Err("PGO_WORKLOAD_ITERATIONS must be > 0".into());
         }
-        if cfg.num_keys == 0 {
+        if self.num_keys == 0 {
             return Err("PGO_WORKLOAD_NUM_KEYS must be > 0".into());
         }
-        if !(0.0..=1.0).contains(&cfg.min_ok_rate) {
+        if !(0.0..=1.0).contains(&self.min_ok_rate) {
             return Err("PGO_WORKLOAD_MIN_OK_RATE must be in [0, 1]".into());
         }
-        Ok(cfg)
+        Ok(self)
     }
 }
 
@@ -252,13 +275,17 @@ impl Outcome {
 }
 
 fn main() -> ExitCode {
-    let cfg = match Config::from_env() {
+    let mut cfg = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("pgo-workload: {e}");
             return ExitCode::from(2);
         }
     };
+    if let Err(e) = cfg.apply_args(std::env::args().skip(1)) {
+        eprintln!("pgo-workload: {e}");
+        return ExitCode::from(2);
+    }
 
     if std::fs::remove_dir_all(&cfg.data_dir).is_ok() {
         // Fresh profile every run: a stale commit log would add startup work
@@ -482,6 +509,13 @@ fn run(
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate process-global environment variables.
+    /// `cargo nextest` isolates every test in its own process, but plain
+    /// `cargo test` runs them on threads, where a concurrent `set_var` /
+    /// `remove_var` against a reader is a data race. The lock makes the
+    /// env-mutating tests correct under both runners.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Two runs of one revision must produce the same operation sequence, or
     /// every profile is a different experiment and no A/B is meaningful.
     #[test]
@@ -531,12 +565,38 @@ mod tests {
         }
     }
 
+    /// REGRESSION: `from_env` must not read `std::env::args()`.
+    ///
+    /// This test is linked into a libtest/nextest binary whose argv is the
+    /// runner's — `--exact`, this test's own name, `--nocapture`, ... . When
+    /// `from_env` parsed argv it returned `unknown argument "--exact"`, which
+    /// took the whole `Test + Coverage` job red. `from_env` reads only the
+    /// environment; if it ever starts reading argv again, this fails here.
+    #[test]
+    fn from_env_ignores_test_runner_argv() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for k in [
+            "PGO_WORKLOAD_ITERATIONS",
+            "PGO_WORKLOAD_SEED",
+            "PGO_WORKLOAD_NUM_KEYS",
+            "PGO_WORKLOAD_VALUE_LEN",
+            "PGO_WORKLOAD_MIN_OK_RATE",
+        ] {
+            std::env::remove_var(k);
+        }
+        // The test binary's argv contains flags this program does not define.
+        // A clean environment must still parse.
+        let cfg = Config::from_env().expect("from_env must ignore the runner's argv");
+        assert_eq!(cfg.iterations, DEFAULT_ITERATIONS);
+        assert!(!cfg.json && !cfg.check_hits);
+    }
+
     /// A malformed knob is a hard error, never a silent fallback: a profile
     /// gathered at the wrong iteration count is worse than no profile.
     #[test]
     fn malformed_env_is_an_error() {
-        // This binary's only env reader is `Config::from_env`, called here, so
-        // mutating the process environment from the test thread is contained.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::set_var("PGO_WORKLOAD_ITERATIONS", "not-a-number");
         let err = Config::from_env().unwrap_err();
         std::env::remove_var("PGO_WORKLOAD_ITERATIONS");
@@ -546,6 +606,37 @@ mod tests {
         let err = Config::from_env().unwrap_err();
         std::env::remove_var("PGO_WORKLOAD_ITERATIONS");
         assert!(err.contains("> 0"), "got: {err}");
+    }
+
+    /// `apply_args` is the only argv reader. The documented flags set their
+    /// fields, and anything else is a hard error — silently ignoring `--exact`
+    /// or a stray path would train a profile with the wrong knobs and exit 0.
+    #[test]
+    fn apply_args_parses_flags_and_rejects_the_rest() {
+        // Build the config directly: this test must not read the environment,
+        // so it cannot race the env-mutating tests under plain `cargo test`.
+        let base = || Config {
+            iterations: DEFAULT_ITERATIONS,
+            seed: DEFAULT_SEED,
+            num_keys: DEFAULT_NUM_KEYS,
+            value_len: DEFAULT_VALUE_LEN,
+            min_ok_rate: DEFAULT_MIN_OK_RATE,
+            check_hits: false,
+            json: false,
+            data_dir: std::env::temp_dir(),
+        };
+
+        let mut cfg = base();
+        cfg.apply_args(["--json".to_string(), "--check-hits".to_string()])
+            .expect("documented flags are accepted");
+        assert!(cfg.json, "--json must set `json`");
+        assert!(cfg.check_hits, "--check-hits must set `check_hits`");
+
+        let mut cfg = base();
+        let err = cfg
+            .apply_args(["--exact".to_string()])
+            .expect_err("an unknown argument must be rejected, not ignored");
+        assert!(err.contains("--exact"), "got: {err}");
     }
 
     /// The documented defaults are the defaults in the code. If a constant

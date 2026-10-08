@@ -123,6 +123,7 @@ the reason the guards exist:
 | 8 | Hermetic profile applied to network/I-O paths | Optimizes the wrong thing; no correctness risk | Documented limitation; live-cluster pass is the fix |
 | 9 | PGO silently becomes the default | Doubled build time for no measured gain | `ARG PGO=0`; opt-in only |
 | 10 | Profiling harness ships in a released binary | Dead code in production | `pgo-bench` is non-default and `required-features`-gated; the release path never enables it |
+| 11 | `from_env` parses `std::env::args()` while linked into a test binary | The runner's argv (`--exact`, the filter, `--nocapture`) is read as the trainer's own; every unit test fails on `unknown argument "--exact"` and the test job goes red | `from_env` reads only the environment; argv lives in `apply_args`, called from `main` alone; `from_env_ignores_test_runner_argv` pins it |
 
 The zero-count measurement, for the record: an instrumented process killed in
 continuous mode writes a profraw whose header looks correct and whose
