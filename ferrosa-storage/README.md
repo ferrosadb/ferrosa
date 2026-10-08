@@ -159,7 +159,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `quarantine/`/removed, before generation discovery runs
   (`StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode` calls
   `flush::sweep_stale_flush_staging`; `FileFlushTarget::new`/`new_starting_at`
-  call it too, as a safety net for callers outside table startup).
+  call it too, as a safety net for callers outside table startup). Because it
+  runs while writers are live, it removes only staging entries another process
+  left (`{pid}-…` names not this process's) and never a dir this process is
+  still staging into (FMEA ST-89).
 
   **Digest verification on published bytes, unconditional (`publication-safety.md`
   M2 step 4 / M3, T-012, FMEA ST-32):** between the `.tmp` fsync and the
