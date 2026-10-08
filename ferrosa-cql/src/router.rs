@@ -2910,11 +2910,11 @@ struct LwtWrite {
 ///
 /// Every conditional statement, `IF NOT EXISTS` included, reads its partition
 /// of `ks.table` from storage at `t`, and the coordinator evaluates the
-/// condition. `NotExists` is not used for them: the replica answers it from the
-/// Accord conflict index, which is keyed by partition-key bytes with no table
+/// condition. The router never sends `NotExists`: replicas used to answer it
+/// from the Accord conflict index, keyed by partition-key bytes with no table
 /// or clustering, so an earlier Accord write to the same key in another table,
-/// or to another row of the partition, read as "exists" (t_7a0acbc8). It also
-/// never saw a row written without Accord.
+/// or to another row of the partition, read as "exists" (t_7a0acbc8), and a
+/// row written without Accord was never seen.
 fn accord_read_predicate(
     stmt: &Statement,
     ks: &str,
@@ -2926,9 +2926,9 @@ fn accord_read_predicate(
             keyspace: ks.to_string(),
             table: table.to_string(),
         },
-        // Not an LWT (serial consistency on an unconditional statement): keep
-        // the existence semantics this path has always had.
-        None => ReadPredicate::NotExists,
+        // An unconditional statement that asked for SERIAL consistency: Accord
+        // orders it, and with no condition it always applies.
+        None => ReadPredicate::Always,
     }
 }
 
@@ -34617,6 +34617,22 @@ mod tests {
                 200,
             ),
             "revision r1 exists, so a second insert of it must not apply"
+        );
+    }
+
+    /// An unconditional write that asked for SERIAL consistency routes through
+    /// Accord for ordering only. It has no condition, so it must apply: sending
+    /// `NotExists` dropped it as `[applied]=false` whenever an earlier Accord
+    /// write used the same key bytes (t_fe2426bb).
+    #[test]
+    fn an_unconditional_serial_write_is_never_gated() {
+        let stmt = crate::parser::parse(
+            "INSERT INTO lwt_x.head (tenant, app, rev) VALUES ('t', 'a', 'r1')",
+        )
+        .unwrap();
+        assert_eq!(
+            accord_read_predicate(&stmt, "lwt_x", "head"),
+            ferrosa_cluster::accord::ReadPredicate::Always
         );
     }
 

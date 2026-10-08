@@ -377,8 +377,13 @@ early acknowledgement.
   after PreAccept and return that effective set in AcceptOK; the coordinator
   unions the accepted quorum's dependencies before Commit. This prevents a
   delayed Accept from dropping a conflict discovered during the first round.
-  The read-vote phase is the LWT `IF`-condition gate (`ReadPredicate::NotExists`
-  for `INSERT IF NOT EXISTS`, `ReadRow` for generic `IF`); a general multi-key
+  The read-vote phase is the LWT `IF`-condition gate: every conditional
+  statement, `INSERT IF NOT EXISTS` included, sends `ReadRow`, the replicas read
+  that table's row at `t`, and the coordinator gates on it. `NotExists` is
+  retired: it was answered from the conflict index (partition-key bytes, no
+  table), so replicas and the coordinator now refuse it and the transaction
+  fails loud (t_7a0acbc8, t_fe2426bb). An unconditional write at SERIAL
+  consistency sends `Always`; a general multi-key
   SQL transaction uses `ReadPredicate::Always`, which **skips the read-vote
   entirely** and always applies after commit (there is no `IF` to evaluate). The
   vote collector stops once F+1 matching votes decide the predicate, without

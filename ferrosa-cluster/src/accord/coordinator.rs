@@ -2011,33 +2011,15 @@ impl AccordCoordinatorDriver {
                         }
                     }
                 }
-            } else if let (false, true, Some(local_sm)) =
-                (is_generic, self_is_replica, &self.local_accord_state)
-            {
-                // The coordinator's own replica casts the same bounded,
-                // dependency-aware existence vote as a remote handler. It was
-                // durably committed above, so this is a real vote rather than an
-                // optimistic implicit ack.
-                if crate::accord::handlers::await_conflicting_deps_applied(local_sm, &key, commit_t)
-                    .await
-                {
-                    let k = key.clone();
-                    let holds = crate::accord::handlers::on_state_machine(local_sm, move |sm| {
-                        sm.read_condition_holds_at(&k, &commit_t)
-                    })
-                    .await;
-                    // `None` is a cancelled read (logged): abstain.
-                    match holds {
-                        Some(true) => votes_true += 1,
-                        Some(false) => votes_false += 1,
-                        None => {}
-                    }
-                } else {
-                    tracing::error!(
-                        txn_id = ?txn_id,
-                        "accord: coordinator local existence read-vote dep-wait timed out — abstaining"
-                    );
-                }
+            } else if !is_generic {
+                // `NotExists`: no table or clustering to read, and the replicas
+                // refuse it too (t_fe2426bb). The local replica abstains, so the
+                // vote cannot reach F+1 and the transaction fails loud.
+                tracing::error!(
+                    txn_id = ?txn_id,
+                    "accord: NotExists read predicate has no row to read — the coordinator \
+                     must send ReadRow; abstaining"
+                );
             }
 
             let remote_read_futs: Vec<_> = if is_snapshot_barrier {
@@ -4222,7 +4204,8 @@ mod tests {
             vec![(b"k".to_vec(), b"m".to_vec())],
         )
         .with_local_accord_state(local_state)
-        .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()));
+        .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()))
+        .with_read_predicate(crate::accord::wire::ReadPredicate::Always);
 
         let result = driver.run_transaction().await;
         assert!(

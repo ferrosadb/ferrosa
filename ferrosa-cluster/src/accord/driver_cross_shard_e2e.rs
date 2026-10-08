@@ -204,7 +204,7 @@ mod tests {
             b"acct_b",
             b"row_b",
             HashSet::new(),
-            ReadPredicate::NotExists,
+            ReadPredicate::Always,
         );
 
         let result = driver.run_transaction().await;
@@ -268,7 +268,7 @@ mod tests {
             b"acct_b",
             b"row_b",
             down,
-            ReadPredicate::NotExists,
+            ReadPredicate::Always,
         );
 
         let result = driver.run_transaction().await;

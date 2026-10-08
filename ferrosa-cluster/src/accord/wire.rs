@@ -185,8 +185,20 @@ pub(crate) struct ReadVotePayload {
 /// with the canonical `eval_if_conditions`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ReadPredicate {
-    /// `INSERT IF NOT EXISTS`: condition holds iff the row does NOT exist at `t`.
-    /// Evaluated on the replica via the existence path (no schema needed).
+    /// Retired, kept only so its wire tag decodes. Replicas and the
+    /// coordinator's own replica REFUSE it (abstain), so a transaction carrying
+    /// it cannot reach F+1 and fails loud.
+    ///
+    /// It used to be answered from the Accord conflict index, keyed by
+    /// partition-key bytes with no table or clustering: an earlier Accord write
+    /// with the same key bytes in another table, or to another row, read as
+    /// "exists" (t_7a0acbc8), and a row written without Accord was never seen.
+    /// `INSERT IF NOT EXISTS` now sends [`ReadPredicate::ReadRow`] and the
+    /// coordinator gates on the row it reads (t_fe2426bb).
+    ///
+    /// It stays the default so a driver built without an explicit predicate,
+    /// or a pre-upgrade peer that omits the field, fails closed instead of
+    /// applying unconditionally.
     #[default]
     NotExists,
     /// Generic `IF <conditions>`: the replica reads the row at `t` and returns

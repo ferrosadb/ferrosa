@@ -75,6 +75,77 @@ struct TestNode {
     #[allow(dead_code)]
     sync_writer: Arc<MockSyncWriter>,
     local_addr: std::net::SocketAddr,
+    /// The node's storage: its Accord applier writes here and its read-votes
+    /// read here, so a conditional race is decided against stored rows.
+    engine: Arc<ferrosa_storage::StorageEngine>,
+    #[allow(dead_code)]
+    dir: Arc<tempfile::TempDir>,
+}
+
+const NEMESIS_KS: &str = "nemesis_ks";
+const NEMESIS_TABLE: &str = "nemesis_t";
+
+fn nemesis_schema() -> ferrosa_common::schema::TableSchema {
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    TableSchema {
+        keyspace: NEMESIS_KS.to_string(),
+        table: NEMESIS_TABLE.to_string(),
+        key_type: "org.apache.cassandra.db.marshal.BytesType".to_string(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        regular_columns: vec![ColumnDefinition {
+            name: "v".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+        }],
+        extensions: Default::default(),
+    }
+}
+
+/// A single-row mutation of `nemesis_ks.nemesis_t` setting `v = value` under `key`.
+fn nemesis_mutation(key: &[u8], value: i32) -> Vec<u8> {
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use ferrosa_storage::Mutation;
+
+    let row = Row {
+        clustering: vec![],
+        cells: vec![(0, CellValue::live(value.to_be_bytes().to_vec(), 1))],
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: LivenessInfo::with_timestamp(1),
+    };
+    let m = Mutation::new(
+        NEMESIS_KS.to_string(),
+        NEMESIS_TABLE.to_string(),
+        DecoratedKey::new(PartitionKey::new(key.to_vec())),
+        vec![row],
+        1,
+    );
+    let mut buf = vec![0u8; m.serialized_size()];
+    m.serialize_into(&mut buf);
+    buf
+}
+
+/// The stored `v` for `key` on `engine`, or `None` when the row is absent.
+fn stored_v(engine: &Arc<ferrosa_storage::StorageEngine>, key: &[u8]) -> Option<i32> {
+    use ferrosa_cluster::accord::apply::StorageReader;
+    let bytes = ferrosa_cluster::accord::EngineStorageReader::new(engine.clone())
+        .read_row_at(
+            NEMESIS_KS,
+            NEMESIS_TABLE,
+            key,
+            ferrosa_common::accord::Timestamp::synthetic(u64::MAX),
+        )
+        .expect("engine read")?;
+    let m = ferrosa_storage::Mutation::deserialize_from(&bytes).expect("decode stored row");
+    let cell = &m.rows.first()?.cells.first()?.1;
+    let raw: [u8; 4] = cell.value.as_deref()?.try_into().expect("v is an Int32");
+    Some(i32::from_be_bytes(raw))
+}
+
+/// The `INSERT ... IF NOT EXISTS` gate the CQL layer supplies: apply iff the
+/// F+1-agreed row at `t` is absent.
+fn if_not_exists_gate() -> ferrosa_cluster::accord::ConditionGate {
+    Box::new(|row: Option<&[u8]>| !matches!(row, Some(bytes) if !bytes.is_empty()))
 }
 
 fn uuid_to_node_id(id: uuid::Uuid) -> u64 {
@@ -87,11 +158,28 @@ fn uuid_to_node_id(id: uuid::Uuid) -> u64 {
 async fn start_test_node(host_id: uuid::Uuid) -> TestNode {
     let node_id = uuid_to_node_id(host_id);
 
+    let dir = Arc::new(tempfile::tempdir().unwrap());
+    let engine = Arc::new(
+        ferrosa_storage::StorageEngine::new(
+            ferrosa_storage::StorageEngineConfig::test_config(dir.path()),
+            None,
+        )
+        .unwrap(),
+    );
+    engine.register_table(nemesis_schema()).unwrap();
     let sync_writer = Arc::new(MockSyncWriter::new());
-    let accord_state: AccordState = Arc::new(parking_lot::Mutex::new(AccordStateMachine::new(
-        node_id,
-        sync_writer.clone(),
-    )));
+    let accord_state: AccordState = Arc::new(parking_lot::Mutex::new(
+        AccordStateMachine::with_applier_and_reader(
+            node_id,
+            sync_writer.clone(),
+            Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+                engine.clone(),
+            )),
+            Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+                engine.clone(),
+            )),
+        ),
+    ));
 
     let registry = Arc::new(HandlerRegistry::new());
     let accord_handler = Arc::new(AccordHandler::new(accord_state.clone(), node_id));
@@ -126,6 +214,8 @@ async fn start_test_node(host_id: uuid::Uuid) -> TestNode {
         accord_state,
         sync_writer,
         local_addr,
+        engine,
+        dir,
     }
 }
 
@@ -419,18 +509,40 @@ async fn packet_reorder_linearizability() {
             transport_a,
             false,
             &clock_a,
-            vec![(key_round.clone(), b"value-a".to_vec())],
+            vec![(key_round.clone(), nemesis_mutation(&key_round, 1))],
         )
-        .with_local_accord_state(node_a.accord_state.clone());
+        .with_local_accord_state(node_a.accord_state.clone())
+        .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
+            keyspace: NEMESIS_KS.to_string(),
+            table: NEMESIS_TABLE.to_string(),
+        })
+        .with_local_applier(Arc::new(
+            ferrosa_cluster::accord::EngineStorageApplier::new(node_a.engine.clone()),
+        ))
+        .with_local_reader(Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+            node_a.engine.clone(),
+        )))
+        .with_condition_gate(if_not_exists_gate());
         let mut driver_b = AccordCoordinatorDriver::new_multi_with_transport(
             node_b.node_id,
             replica_ids.clone(),
             transport_b,
             false,
             &clock_b,
-            vec![(key_round.clone(), b"value-b".to_vec())],
+            vec![(key_round.clone(), nemesis_mutation(&key_round, 2))],
         )
-        .with_local_accord_state(node_b.accord_state.clone());
+        .with_local_accord_state(node_b.accord_state.clone())
+        .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
+            keyspace: NEMESIS_KS.to_string(),
+            table: NEMESIS_TABLE.to_string(),
+        })
+        .with_local_applier(Arc::new(
+            ferrosa_cluster::accord::EngineStorageApplier::new(node_b.engine.clone()),
+        ))
+        .with_local_reader(Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+            node_b.engine.clone(),
+        )))
+        .with_condition_gate(if_not_exists_gate());
 
         // Start the message-faulted transaction FIRST. If its delayed edge is
         // needed to reach quorum, prove it remains in flight before starting the
@@ -508,6 +620,21 @@ async fn packet_reorder_linearizability() {
             "round {round}: at most one conditional write may apply under {nemesis_desc}; \
              result_a={result_a:?} result_b={result_b:?}"
         );
+        // The stored row agrees: every replica that holds it holds the winner's
+        // value, and a round with no winner stored nothing.
+        let winner = match (&result_a, &result_b) {
+            (Ok(_), _) => Some(1),
+            (_, Ok(_)) => Some(2),
+            _ => None,
+        };
+        for (name, node) in [("a", &node_a), ("b", &node_b), ("c", &node_c)] {
+            let v = stored_v(&node.engine, &key_round);
+            assert!(
+                v.is_none() || v == winner,
+                "round {round}: node_{name} stored v={v:?} but the winner was {winner:?} \
+                 under {nemesis_desc}"
+            );
+        }
         applied_counts[round] = applied_this_round;
         tracing::info!(
             round,
@@ -649,7 +776,8 @@ async fn run_batch_atomicity_round(nemesis_name: &str) {
             &clock_a,
             key_a,
             Vec::new(), // protocol-only test: no mutation payload
-        );
+        )
+        .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::Always);
 
         // For partition-halves: skip node_b's driver entirely (it would panic on empty replicas).
         let result_a = BatchAtomicityResult::from_driver_result(driver_a.run_transaction().await);
@@ -666,7 +794,8 @@ async fn run_batch_atomicity_round(nemesis_name: &str) {
                 &clock_b,
                 key_b,
                 Vec::new(), // protocol-only test: no mutation payload
-            );
+            )
+            .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::Always);
             BatchAtomicityResult::from_driver_result(driver_b.run_transaction().await)
         };
 
@@ -744,7 +873,8 @@ async fn a_replica_coordinator_without_local_state_refuses_to_commit() {
         &clock,
         b"unwired-key".to_vec(),
         Vec::new(),
-    );
+    )
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::Always);
     let err = tokio::time::timeout(TXN_TIMEOUT, unwired.run_transaction())
         .await
         .expect("must fail fast, not hang")
@@ -764,7 +894,8 @@ async fn a_replica_coordinator_without_local_state_refuses_to_commit() {
         b"wired-key".to_vec(),
         Vec::new(),
     )
-    .with_local_accord_state(node_a.accord_state.clone());
+    .with_local_accord_state(node_a.accord_state.clone())
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::Always);
     let result = tokio::time::timeout(TXN_TIMEOUT, wired.run_transaction())
         .await
         .expect("must not hang");
@@ -865,7 +996,9 @@ async fn disk_fail_no_phantom_commits() {
     // driver refuses to commit (an unpublished state is a hard wiring error, since
     // an implicit self-ack that does not update local state leaves the replica
     // blind to its own transaction).
-    .with_local_accord_state(node_a.accord_state.clone());
+    .with_local_accord_state(node_a.accord_state.clone())
+    // Protocol-only: this test is about fsync-before-ack, not a condition.
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::Always);
 
     let failed_result = tokio::time::timeout(TXN_TIMEOUT, driver.run_transaction())
         .await
@@ -912,6 +1045,10 @@ async fn disk_fail_no_phantom_commits() {
             sm.committed_count()
         );
         // The failing replicas must not have advanced the txn to Committed/Applied.
+        // No Committed/Applied phase and no committed txn is the whole proof
+        // that no row became durable: the conflict-index existence check that
+        // also asserted it here was removed with ReadPredicate::NotExists
+        // (t_fe2426bb).
         if let Some(state) = sm.get_state(&failed_txn) {
             assert!(
                 state.phase != TxnPhase::Committed && state.phase != TxnPhase::Applied,
@@ -919,11 +1056,6 @@ async fn disk_fail_no_phantom_commits() {
                 state.phase
             );
         }
-        assert!(
-            sm.read_condition_holds_at(&key, &failed_txn.0),
-            "PHANTOM ROW: node_{name} shows a durable row for the key under disk \
-             failure (INSERT IF NOT EXISTS condition no longer holds)"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -946,7 +1078,8 @@ async fn disk_fail_no_phantom_commits() {
         key.clone(),
         Vec::new(), // protocol-only test: no mutation payload
     )
-    .with_local_accord_state(node_a.accord_state.clone());
+    .with_local_accord_state(node_a.accord_state.clone())
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::Always);
 
     let healed_result = tokio::time::timeout(TXN_TIMEOUT, driver2.run_transaction())
         .await

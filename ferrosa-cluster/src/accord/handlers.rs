@@ -525,6 +525,19 @@ impl RpcHandler for AccordHandler {
                     // an `.await` — handle_apply needs the same lock to make
                     // progress (and to fire the notify that unblocks us), so
                     // holding it across the wait would deadlock.
+                    // `NotExists` names no table or clustering, so there is no row
+                    // to read. Answering it from the conflict index (partition-key
+                    // bytes only) reported other tables' rows as existing
+                    // (t_7a0acbc8). Abstain: the coordinator's F+1 agreement then
+                    // fails loud. Current coordinators send `ReadRow` (t_fe2426bb).
+                    if matches!(vote_req.predicate, ReadPredicate::NotExists) {
+                        tracing::error!(
+                            txn_id = ?vote_req.txn_id,
+                            "accord: refusing a NotExists read-vote (no table to read; \
+                             the coordinator predates t_fe2426bb) — abstaining"
+                        );
+                        return Some(Message::AccordReadOK(Bytes::new()));
+                    }
                     if !await_conflicting_deps_applied(&self.state, &vote_req.key, vote_req.t).await
                     {
                         // Empty ReadOK is the wire-level abstention already
@@ -536,12 +549,9 @@ impl RpcHandler for AccordHandler {
                     let txn_id = vote_req.txn_id;
                     let (condition_holds, current_row) =
                         on_state_machine(&self.state, move |sm| match &vote_req.predicate {
-                            // INSERT IF NOT EXISTS: existence path (no schema needed).
-                            // condition holds iff the row does NOT exist at `t`.
-                            ReadPredicate::NotExists => (
-                                sm.read_condition_holds_at(&vote_req.key, &vote_req.t),
-                                vec![],
-                            ),
+                            // Refused above; unreachable here. Answer "does not
+                            // hold" rather than panic on the serving path.
+                            ReadPredicate::NotExists => (false, vec![]),
                             // Unconditional transaction: no IF to evaluate, always
                             // holds. Defensive — the coordinator skips the read-vote
                             // for `Always`, so this arm is not normally reached.
@@ -878,7 +888,10 @@ mod tests {
                         txn_id: TxnId::new(3, ts(2000 + i)),
                         t: ts(2000 + i),
                         key: format!("read-key-{i}").into_bytes(),
-                        predicate: crate::accord::wire::ReadPredicate::NotExists,
+                        predicate: crate::accord::wire::ReadPredicate::ReadRow {
+                            keyspace: "ks".into(),
+                            table: "t".into(),
+                        },
                     };
                     let bytes = bincode::serialize(&payload).unwrap();
                     let peer: PeerId = (
@@ -911,6 +924,39 @@ mod tests {
             worst < std::time::Duration::from_millis(250),
             "a 20 ms ticker on the handler's runtime stalled for {worst:?} while \
              PreAccepts fsynced: the fsync is blocking runtime workers"
+        );
+    }
+
+    /// `NotExists` names no table or clustering, so a replica cannot answer it
+    /// from storage. It used to answer from the conflict index (partition-key
+    /// bytes only), which reported rows of other tables as existing
+    /// (t_7a0acbc8). The replica now abstains, so a coordinator that still
+    /// sends it (a pre-upgrade node) fails loud instead of being told a wrong
+    /// answer (t_fe2426bb).
+    #[tokio::test]
+    async fn a_not_exists_read_vote_abstains() {
+        let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let handler = AccordHandler::new(state, 1);
+        let payload = ReadVotePayload {
+            txn_id: TxnId::new(3, ts(2000)),
+            t: ts(2000),
+            key: b"fresh-key".to_vec(),
+            predicate: crate::accord::wire::ReadPredicate::NotExists,
+        };
+        let peer: PeerId = (
+            uuid::Uuid::from_u128(3),
+            "127.0.0.1:0".parse().expect("valid socket addr"),
+        );
+        let resp = handler
+            .handle(
+                peer,
+                Message::AccordRead(Bytes::from(bincode::serialize(&payload).unwrap())),
+            )
+            .await;
+        assert!(
+            matches!(&resp, Some(Message::AccordReadOK(b)) if b.is_empty()),
+            "a NotExists read-vote must abstain, got {resp:?}"
         );
     }
 }
