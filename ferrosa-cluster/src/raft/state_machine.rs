@@ -192,9 +192,10 @@ pub struct RaftState {
     /// monotonically; never regresses. (W7.1 / I-27.)
     #[serde(default)]
     pub hlc_watermark: AccordTimestamp,
-    /// Maximum HLC skew observed at apply time relative to the local
-    /// wall-clock estimate. Recorded for operator visibility (W7.1
-    /// REFACTOR / RAFT_ACCORD_MAX_SKEW gauge).
+    /// Maximum HLC skew observed at apply time relative to the
+    /// watermark, in microseconds (the HLC itself is nanoseconds).
+    /// Recorded for operator visibility (W7.1 REFACTOR /
+    /// RAFT_ACCORD_MAX_SKEW gauge).
     #[serde(default)]
     pub max_observed_skew_us: u64,
     /// Idempotent-apply ledger keyed by Accord transaction id. Replayed
@@ -998,8 +999,9 @@ impl FerrosStateMachine {
         }
 
         // Track the max skew observed against the current watermark
-        // (W7.1 REFACTOR / RAFT_ACCORD_MAX_SKEW gauge).
-        let skew_us = hlc.time.saturating_sub(self.state.hlc_watermark.time);
+        // (W7.1 REFACTOR / RAFT_ACCORD_MAX_SKEW gauge). `time` is HLC
+        // nanoseconds; the gauge is microseconds (t_2b57a6e4).
+        let skew_us = hlc.time.saturating_sub(self.state.hlc_watermark.time) / 1_000;
         if skew_us > self.state.max_observed_skew_us {
             self.state.max_observed_skew_us = skew_us;
         }
@@ -2472,6 +2474,30 @@ mod tests {
             sm.state().hlc_watermark >= t1,
             "watermark must be monotonic w.r.t. earlier applies"
         );
+    }
+
+    /// t_2b57a6e4: `AccordTimestamp::time` is HLC nanoseconds
+    /// (`HybridLogicalClock::now`), so the skew gauge must divide by 1000
+    /// to report microseconds. It read 1000x high before.
+    #[tokio::test]
+    async fn accord_skew_gauge_reports_microseconds_from_nanosecond_hlcs() {
+        let mut sm = FerrosStateMachine::new();
+        let watermark_ns: u64 = 1_791_400_000_000_000_000;
+        sm.advance_accord_watermark(AccordTimestamp::new(1, watermark_ns, 1));
+        let ahead_ns = 2_500_000; // 2.5 ms ahead of the watermark
+        let hlc = AccordTimestamp::new(1, watermark_ns + ahead_ns, 1);
+        sm.apply(vec![make_entry(
+            1,
+            1,
+            RaftOp::AccordApply {
+                txn_id: TxnId::new(1, hlc),
+                hlc,
+                mutation: Vec::new(),
+            },
+        )])
+        .await
+        .unwrap();
+        assert_eq!(sm.state().max_observed_skew_us, 2_500);
     }
 
     /// W7.5 RED → GREEN. Applying the same `RaftOp::AccordApply` twice
