@@ -81,7 +81,12 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
 - **System keyspaces** ([`system/`](src/system)) — query builders for
   `system.local`, `system.peers(_v2)`, `system_schema.{keyspaces,tables,columns,
   aggregates}`, `system_auth.*`, plus `persistence.rs` (column-index contract +
-  `SystemTableMutation` bridging DDL to storage writes).
+  `SystemTableMutation` bridging DDL to storage writes). `system_schema.tables`
+  rows carry Cassandra's `flags` (`compound`, plus `counter`/`dense`/`super`
+  where they apply) and `system_schema.columns` reports `position = -1` for
+  regular and static columns, as Cassandra does (t_cd650102). Without `flags`
+  the python driver read every table as compact static and dropped its
+  clustering key.
 - **Audit** ([`audit/`](src/audit)) — `AuditSink` trait, `LogAuditSink`,
   `SystemTableAuditSink`, `CompositeSink` fan-out, `TestAuditSink`, and a typed
   `AuditEventKind` enum.

@@ -4607,6 +4607,10 @@ async fn route_select(
                 "cdc".into(),
                 "allow_auto_snapshot".into(),
                 "incremental_backups".into(),
+                // Drivers derive compact storage from `flags`. Without it the
+                // python driver reads every table as compact static and drops
+                // its clustering key (t_cd650102).
+                "flags".into(),
             ];
             let col_types = vec![
                 CqlType::Varchar,
@@ -4615,6 +4619,7 @@ async fn route_select(
                 CqlType::Boolean,
                 CqlType::Boolean,
                 CqlType::Boolean,
+                CqlType::Set(Box::new(CqlType::Varchar)),
             ];
             // Apply WHERE equality filters.
             let filtered: Vec<_> = table_rows
@@ -4647,6 +4652,9 @@ async fn route_select(
                         // Cassandra returns NULL for these on most tables — match.
                         None,
                         None,
+                        Some(CqlValue::Set(
+                            t.flags.iter().cloned().map(CqlValue::Text).collect(),
+                        )),
                     ]
                 })
                 .collect();
@@ -32620,6 +32628,44 @@ mod tests {
             panic!("expected Rows result");
         };
         assert_eq!(extract_first_bigint_value(&body), 1);
+    }
+
+    /// Drivers derive compact storage from `system_schema.tables.flags`. With
+    /// the column missing, the python driver treats every table as a compact
+    /// static table and drops its clustering key: all 90 clustered tables of
+    /// ferrosa-memory's keyspace came back with `clustering_key == []`
+    /// (t_cd650102). Cassandra reports `{'compound'}` for every CQL table.
+    #[tokio::test]
+    async fn system_schema_tables_reports_compound_flags() {
+        let (state, _dir) = setup();
+        let dev = dev_auth();
+        let current_keyspace: Option<String> = None;
+        let ctx = test_ctx(&dev, &current_keyspace);
+        for cql in [
+            "CREATE KEYSPACE flags_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE flags_ks.t (pk text, ck text, v text, PRIMARY KEY (pk, ck))",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let stmt = crate::parser::parse(
+            "SELECT flags FROM system_schema.tables WHERE keyspace_name = 'flags_ks'",
+        )
+        .unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(extract_column_names(&body), vec!["flags".to_string()]);
+        assert_eq!(
+            extract_column_type_ids(&body),
+            vec![0x0022],
+            "flags is a set"
+        );
+        let mut compound = vec![0, 0, 0, 1, 0, 0, 0, 8];
+        compound.extend_from_slice(b"compound");
+        assert_eq!(extract_single_row_cells(&body, 1), vec![Some(compound)]);
     }
 
     #[tokio::test]
