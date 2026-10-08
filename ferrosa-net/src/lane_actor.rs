@@ -176,12 +176,6 @@ pub enum LaneStatusReport {
 // LaneHandle
 // ---------------------------------------------------------------------------
 
-/// Cancel-safe handle for sending commands to a lane actor.
-///
-/// `Clone` is cheap (just an `mpsc::Sender` clone + a `Lane` copy).
-/// All methods use `reserve().await` + `permit.send()` for cancel safety:
-/// if a caller is cancelled between reserving a slot and sending the command,
-/// the permit is simply dropped — no half-sent state.
 // ---------------------------------------------------------------------------
 // Thread reaping
 // ---------------------------------------------------------------------------
@@ -235,7 +229,7 @@ impl ThreadReaper {
         self.notify.notified().await;
     }
 
-    #[cfg(test)]
+    /// Whether the thread has been asked to exit.
     pub(crate) fn is_woken(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
@@ -255,15 +249,17 @@ impl Drop for HandleGuard {
     }
 }
 
-/// A cloneable handle to a lane actor.
+/// Cancel-safe handle for sending commands to a lane actor.
 ///
-/// The [`HandleGuard`] is shared by `Arc` across every clone, so it drops
-/// exactly once — when the last `LaneHandle` goes away — and that is what wakes
-/// the actor thread. The actor's own `ActorReconnectContext` holds a handle
-/// clone (through its `ActorReconnectContext`), so it is the *last* holder, and
-/// the thread therefore parks it. The thread is reaped when the pool — and
-/// therefore the context — drops, which is why this backstops the
-/// created-but-never-installed path.
+/// `Clone` is cheap (just an `mpsc::Sender` clone + a `Lane` copy).
+/// All methods use `reserve().await` + `permit.send()` for cancel safety:
+/// if a caller is cancelled between reserving a slot and sending the command,
+/// the permit is simply dropped — no half-sent state.
+///
+/// For a dedicated-thread (Raft lane) actor the handle also carries a shared
+/// [`HandleGuard`], which drops exactly once — when the last handle goes away —
+/// and wakes the actor thread. The actor's own `ActorReconnectContext` clone
+/// deliberately carries **no** guard, so it does not hold the count open.
 #[derive(Clone)]
 pub struct LaneHandle {
     tx: mpsc::Sender<LaneCommand>,
@@ -283,6 +279,13 @@ impl LaneHandle {
     }
     pub fn cancel_token(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancelled)
+    }
+
+    /// The thread reaper this actor is registered with, if it is a
+    /// dedicated-thread (Raft lane) actor. Test-only accessor.
+    #[cfg(test)]
+    pub(crate) fn reaper(&self) -> Option<Arc<ThreadReaper>> {
+        self._guard.as_ref().map(|guard| Arc::clone(&guard.reaper))
     }
 
     /// Send a request/response message through the lane actor.
@@ -520,7 +523,7 @@ pub fn spawn_lane_actor_with_timeout(
     };
     let ctx = ctx_builder(handle.clone());
     ctx.task_pool
-        .spawn(lane_actor_loop(lane, initial_state, rx, ctx.clone()));
+        .spawn(lane_actor_loop(lane, initial_state, rx, ctx.clone(), None));
     handle
 }
 
@@ -540,7 +543,7 @@ pub(crate) fn spawn_lane_actor_on_pool_with_timeout(
         _guard: None,
     };
     let ctx = ctx_builder(handle.clone());
-    task_pool.spawn(lane_actor_loop(lane, initial_state, rx, ctx));
+    task_pool.spawn(lane_actor_loop(lane, initial_state, rx, ctx, None));
     handle
 }
 
@@ -598,7 +601,7 @@ pub(crate) fn spawn_raft_lane_actor_with_timeout(
 
             rt.block_on(async move {
                 tokio::select! {
-                    _ = lane_actor_loop(lane, initial_state, rx, ctx) => {}
+                    _ = lane_actor_loop(lane, initial_state, rx, ctx, Some(Arc::clone(&reaper))) => {}
                     // Last handle dropped: no external holder remains, so the
                     // actor has nothing left to serve. Without this the thread —
                     // and its private runtime — outlives its pool for the life of
@@ -621,6 +624,7 @@ async fn lane_actor_loop(
     mut state: LaneState,
     mut rx: mpsc::Receiver<LaneCommand>,
     ctx: ActorReconnectContext,
+    reaper: Option<Arc<ThreadReaper>>,
 ) {
     let stream_limit = ctx.config.max_streams_per_lane.max(1);
     let pending_stream_capacity = lane_pending_stream_capacity();
@@ -651,7 +655,32 @@ async fn lane_actor_loop(
         );
     }
 
-    while let Some(cmd) = rx.recv().await {
+    loop {
+        // Exit as soon as every external handle is gone. The reaper's flag is
+        // *polled*, not awaited: `Notify::notified()` only registers a waiter
+        // when it is first polled, and this thread's runtime may not poll it
+        // promptly, so a release that lands before the first poll could be
+        // missed and the thread stranded — exactly what the reaper exists to
+        // prevent. One wake per 50 ms at idle, on the raft lane only.
+        let cmd = tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(cmd) => cmd,
+                // All senders gone. The raft actor's context holds one, so this
+                // is the pooled/plain actors' exit path, unchanged.
+                None => break,
+            },
+            _ = async {
+                match &reaper {
+                    Some(reaper) => loop {
+                        if reaper.is_woken() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    },
+                    None => std::future::pending::<()>().await,
+                }
+            } => break,
+        };
         match cmd {
             LaneCommand::Send {
                 msg,
@@ -1126,28 +1155,17 @@ mod tests {
         );
     }
 
-    /// Dropping the last handle must actually terminate the dedicated OS thread,
-    /// not merely flip a flag.
+    /// Dropping the last handle must actually tear the actor thread down — not
+    /// merely flip a flag.
     ///
-    /// Linux-only: it observes the thread directly through `/proc/self/task`.
-    /// This is the backstop for a pool created but never installed — the thread
-    /// it spawned used to live for the life of the process.
-    #[cfg(target_os = "linux")]
+    /// Portable: it observes the reaper's own `Arc` (the thread holds one clone
+    /// for its whole life, the spawn's `select!` holds another). When the thread
+    /// stops, its clone is released and the count falls to exactly what the
+    /// spawn scope still holds. `/proc/self/task` is the tempting instrument but
+    /// is Linux-only and cannot run in the macOS dev loop, which is how this test
+    /// went un-compiled until Linux CI caught the missing `handle` field.
     #[tokio::test]
     async fn dropping_the_last_handle_reaps_the_raft_lane_thread() {
-        fn live_thread_named(needle: &str) -> bool {
-            match std::fs::read_dir("/proc/self/task") {
-                Ok(dir) => dir.flatten().any(|entry| {
-                    std::fs::read_to_string(entry.path().join("comm"))
-                        .map(|name| name.trim() == needle)
-                        .unwrap_or(false)
-                }),
-                Err(_) => false,
-            }
-        }
-
-        // `label` names the thread `raft-lane-reapx` (14 chars — under the
-        // 15-char truncation limit).
         let handle = spawn_raft_lane_actor_with_timeout(
             Lane::Raft,
             LaneState::Reconnecting {
@@ -1163,34 +1181,33 @@ mod tests {
                 peer_host: "127.0.0.1:1".to_owned(),
                 tls_connector: None,
                 cancelled: h.cancel_token(),
+                // The context holds a handle clone WITHOUT a counting guard, so
+                // it does not keep the actor alive; dropping the returned
+                // `handle` below is therefore the last release.
+                handle: h,
                 task_pool: TaskPool::current("reap-test"),
-                // Deliberately NOT retaining `h`: in production the actor's
-                // context holds a clone, which is what makes the count
-                // unreachable; here we want the returned handle to be the last.
             },
         );
 
-        // Let the thread actually start before we drop the only handle.
-        for _ in 0..200 {
-            if live_thread_named("raft-lane-reapx") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let weak = Arc::downgrade(&handle.reaper().expect("raft actor carries a reaper"));
         assert!(
-            live_thread_named("raft-lane-reapx"),
-            "the dedicated raft lane thread must be running before the drop"
+            weak.upgrade().is_some(),
+            "the raft actor's reaper must be reachable before the drop"
         );
 
         drop(handle);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while live_thread_named("raft-lane-reapx") {
-            if Instant::now() > deadline {
-                panic!("raft lane thread was not reaped after the last handle dropped");
+        // The actor's poll interval is 50 ms; give it a generous number of them.
+        for _ in 0..100 {
+            if weak.upgrade().is_none() {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        panic!(
+            "the raft actor thread was not reaped after the last handle dropped: \
+             its reaper is still alive"
+        );
     }
 
     #[test]
