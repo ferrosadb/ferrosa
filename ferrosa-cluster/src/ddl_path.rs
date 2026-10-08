@@ -952,7 +952,7 @@ impl ClusterDdlForwardHandler {
 impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
     async fn handle(
         &self,
-        _from: ferrosa_net::rpc::handler::PeerId,
+        from: ferrosa_net::rpc::handler::PeerId,
         msg: Message,
     ) -> Option<Message> {
         let body = match msg {
@@ -1131,11 +1131,48 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
                     }
                 }
             }
+            Err(e) if is_election_window_rejection(&e) => {
+                // This node stepped down and no successor is elected yet:
+                // expected for a moment around every leader change. The
+                // forwarder sees no ack and retries (t_0b4e9b99).
+                tracing::warn!(
+                    from_host = %from.0,
+                    from_addr = %from.1,
+                    op = ddl_op_kind(&op),
+                    "ClusterDdlForwardHandler: refused a forwarded DDL during a leader election \
+                     (this node is no longer leader and no leader is known yet); the forwarder \
+                     must retry: {e}"
+                );
+                None
+            }
             Err(e) => {
-                tracing::error!("ClusterDdlForwardHandler: execute_via_raft failed: {e}");
+                tracing::error!(
+                    from_host = %from.0,
+                    op = ddl_op_kind(&op),
+                    "ClusterDdlForwardHandler: execute_via_raft failed: {e}"
+                );
                 None
             }
         }
+    }
+}
+
+/// True for the refusal a node gives while no leader is known: it has just
+/// stepped down (or never led) and the election has not finished.
+pub(crate) fn is_election_window_rejection(error: &ClusterError) -> bool {
+    matches!(error, ClusterError::NotLeader { leader_id: None })
+}
+
+/// Variant name of a DDL operation, for logs (no schema payload).
+fn ddl_op_kind(op: &DdlOperation) -> &'static str {
+    match op {
+        DdlOperation::CreateKeyspace(_) => "CreateKeyspace",
+        DdlOperation::DropKeyspace(_) => "DropKeyspace",
+        DdlOperation::CreateTable(_) => "CreateTable",
+        DdlOperation::DropTable { .. } => "DropTable",
+        DdlOperation::AlterKeyspace { .. } => "AlterKeyspace",
+        DdlOperation::AlterTable { .. } => "AlterTable",
+        _ => "other",
     }
 }
 
@@ -1157,6 +1194,22 @@ mod tests {
     use ferrosa_net::rpc::server::RpcServer;
     use ferrosa_net::rpc::HandlerRegistry;
     use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+
+    /// t_0b4e9b99: the refusal a just-stepped-down leader gives before the
+    /// next election is expected (WARN), unlike a refusal naming a leader or
+    /// any other Raft failure (ERROR).
+    #[test]
+    fn only_a_leaderless_refusal_is_an_election_window_rejection() {
+        assert!(is_election_window_rejection(&ClusterError::NotLeader {
+            leader_id: None
+        }));
+        assert!(!is_election_window_rejection(&ClusterError::NotLeader {
+            leader_id: Some(3)
+        }));
+        assert!(!is_election_window_rejection(&ClusterError::RaftError(
+            "fatal".into()
+        )));
+    }
     use ferrosa_schema::metadata::table::{TableMetadata, TableParams};
     use ferrosa_schema::Schema;
     use ferrosa_storage::engine::StorageEngine;
