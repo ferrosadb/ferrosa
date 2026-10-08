@@ -160,7 +160,9 @@ fn local_range_stream(
     row_limit: usize,
 ) -> PartitionResultStream {
     let stream = engine.range_iter(table_id, None, None).map(move |item| {
-        let mut partition = item.map_err(crate::error::ClusterError::Storage)?;
+        let mut partition = item
+            .map_err(crate::error::ClusterError::Storage)
+            .map(Arc::unwrap_or_clone)?;
         if row_limit > 0 {
             partition.rows.truncate(row_limit);
         }
@@ -182,7 +184,10 @@ fn local_range_stream_from(
 ) -> PartitionResultStream {
     let stream = engine
         .range_iter_fragmented(table_id, resume.map(|r| &r.key), None)
-        .map(|item| item.map_err(crate::error::ClusterError::Storage));
+        .map(|item| {
+            item.map_err(crate::error::ClusterError::Storage)
+                .map(Arc::unwrap_or_clone)
+        });
     resume_filtered_stream(Box::pin(stream), resume)
 }
 
@@ -194,7 +199,10 @@ fn local_projected_range_stream_from(
 ) -> PartitionResultStream {
     let stream = engine
         .range_iter_projected_fragmented(table_id, wanted, resume.map(|r| &r.key), None)
-        .map(|item| item.map_err(crate::error::ClusterError::Storage));
+        .map(|item| {
+            item.map_err(crate::error::ClusterError::Storage)
+                .map(Arc::unwrap_or_clone)
+        });
     resume_filtered_stream(Box::pin(stream), resume)
 }
 
@@ -206,7 +214,10 @@ fn local_projected_range_stream(
 ) -> PartitionResultStream {
     let stream = engine
         .range_iter_projected(table_id, wanted, partition_limit, None, None)
-        .map(|item| item.map_err(crate::error::ClusterError::Storage));
+        .map(|item| {
+            item.map_err(crate::error::ClusterError::Storage)
+                .map(Arc::unwrap_or_clone)
+        });
     Box::pin(stream)
 }
 

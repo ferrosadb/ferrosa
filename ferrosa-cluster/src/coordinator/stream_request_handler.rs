@@ -154,7 +154,9 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
                     wanted.to_vec(),
                     start,
                     None,
-                ),
+                )
+                .map(|r| r.map(Arc::unwrap_or_clone))
+                .boxed(),
             )
         } else {
             Ok(ferrosa_storage::StorageEngine::range_iter_fragmented(
@@ -162,7 +164,9 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
                 table_id,
                 start,
                 None,
-            ))
+            )
+            .map(|r| r.map(Arc::unwrap_or_clone))
+            .boxed())
         }
     }
 

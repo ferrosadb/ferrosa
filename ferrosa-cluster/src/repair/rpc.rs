@@ -237,7 +237,7 @@ impl RpcHandler for RepairFetchHandler {
         };
         let in_range: Vec<PartitionWire> = in_range_partitions
             .into_iter()
-            .map(partition_to_wire)
+            .map(|p| partition_to_wire(Arc::unwrap_or_clone(p)))
             .collect();
         let resp = RepairFetchResponsePayload {
             partitions: in_range,

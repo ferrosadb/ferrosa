@@ -24,6 +24,7 @@
 //! loud when rehydrate fails).
 
 use super::*;
+use std::sync::Arc;
 
 use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::PartitionKey;
@@ -374,7 +375,8 @@ impl Reader<'_> {
                 7,
                 usize::MAX,
             )?;
-            out.extend(rows_of(&parts));
+            let owned: Vec<Partition> = parts.iter().map(|p| (**p).clone()).collect();
+            out.extend(rows_of(&owned));
             match cursor {
                 Some(next) => start = next,
                 None => return Ok(out),

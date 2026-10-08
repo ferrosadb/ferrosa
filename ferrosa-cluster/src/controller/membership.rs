@@ -215,7 +215,13 @@ impl ModeController {
             .ok_or_else(|| ClusterError::Internal("peer_manager not set".into()))?;
         let tables = super::data_movement::replicated_tables(&self.schema.snapshot())?;
         let storage = self.storage.clone();
-        let scan = move |table: &ferrosa_storage::TableId| storage.range_iter(table, None, None);
+        let scan = move |table: &ferrosa_storage::TableId| {
+            use futures::StreamExt as _;
+            storage
+                .range_iter(table, None, None)
+                .map(|r| r.map(Arc::unwrap_or_clone))
+                .boxed()
+        };
         let streamer = super::data_movement::StreamSenderStreamer {
             peer_manager,
             ring: ring.clone(),
