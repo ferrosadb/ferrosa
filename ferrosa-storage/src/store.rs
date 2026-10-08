@@ -5788,35 +5788,43 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Step 5d: Drain late writers. Any writer that loaded the view before
         // step 1 may have written to old_active AFTER our snapshot. Those writes
-        // would be lost when we clear `flushing`. Re-snapshot the old memtable
-        // and replay any entries not in the original flush to the new active.
-        let late_partitions = old_active.snapshot();
-        if !late_partitions.is_empty() {
-            let current_view = self.view.load();
-            let schema = self.schema.load();
-            let flushed_by_key: std::collections::BTreeMap<_, _> =
-                partitions.iter().map(|p| (p.key.clone(), p)).collect();
-            for p in &late_partitions {
-                if late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
-                    // The sealed gate makes this impossible: a write after the
-                    // snapshot means admission is broken. Keep the rows (replay
-                    // them into the new memtable), and say so loudly — their
-                    // index postings are NOT carried over.
-                    self.late_writes_after_seal
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::error!(
-                        partition = ?p.key,
-                        "flush: a row reached a sealed memtable after its snapshot; replaying \
-                         it without its index postings"
-                    );
-                    for row in &p.rows {
-                        if let Err(e) = current_view.active.put(&p.key, row.clone(), &schema) {
-                            tracing::error!(%e, "flush: late-writer replay put failed");
-                        }
-                    }
+        // would be lost when we clear `flushing`. Re-scan the old memtable and
+        // replay any entries not in the original flush to the new active.
+        //
+        // STREAMING: this walks `range_iter` one partition at a time and never
+        // materializes the memtable. It only ever READS — comparing keys against
+        // `flushed_by_key` and cloning the surviving rows into the new memtable —
+        // so borrowing `Arc<Partition>`s (one refcount bump each) replaces the
+        // previous `snapshot()`, which deep-cloned every partition a second time
+        // and, in a healthy cluster, found nothing to replay.
+        // `snapshot()` stays for the flush's own use above, where the partition
+        // bodies must be owned to be mutated in place.
+        let flushed_by_key: std::collections::BTreeMap<_, _> =
+            partitions.iter().map(|p| (p.key.clone(), p)).collect();
+        // Loaded once, and only if something actually needs replaying.
+        let mut replay_ctx = None;
+        for p in old_active.range_iter(None, None) {
+            if !late_partition_needs_replay(&flushed_by_key, &expanded_keys, &p) {
+                continue;
+            }
+            // The sealed gate makes this impossible: a write after the snapshot
+            // means admission is broken. Keep the rows (replay them into the new
+            // memtable), and say so loudly — their index postings are NOT carried
+            // over.
+            let (current_view, schema) =
+                replay_ctx.get_or_insert_with(|| (self.view.load(), self.schema.load()));
+            self.late_writes_after_seal
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                partition = ?p.key,
+                "flush: a row reached a sealed memtable after its snapshot; replaying \
+                 it without its index postings"
+            );
+            for row in &p.rows {
+                if let Err(e) = current_view.active.put(&p.key, row.clone(), schema) {
+                    tracing::error!(%e, "flush: late-writer replay put failed");
                 }
             }
-            drop(current_view);
         }
 
         // Step 6: Prepend new SSTable and sidecar, clear flushing.
@@ -6030,26 +6038,28 @@ impl<F: FlushTarget> TableStore<F> {
             .flatten()
             .map(|p| (p.key.clone(), p))
             .collect();
-        let late_partitions = old_active.snapshot();
-        if !late_partitions.is_empty() {
-            let current_view = self.view.load();
-            for p in &late_partitions {
-                if late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
-                    // Impossible behind the sealed gate; see the unsharded path.
-                    self.late_writes_after_seal
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::error!(
-                        partition = ?p.key,
-                        "flush: a row reached a sealed memtable after its snapshot; replaying it"
-                    );
-                    for row in &p.rows {
-                        if let Err(e) = current_view.active.put(&p.key, row.clone(), &schema) {
-                            tracing::error!(%e, "flush(sharded): late-writer replay put failed");
-                        }
-                    }
+        // STREAMING: walk `range_iter` one partition at a time; never collect the
+        // memtable into a `Vec`. Read-only, so borrowing the stored
+        // `Arc<Partition>` replaces the previous `snapshot()` deep clone.
+        let mut replay_ctx = None;
+        for p in old_active.range_iter(None, None) {
+            if !late_partition_needs_replay(&flushed_by_key, &expanded_keys, &p) {
+                continue;
+            }
+            // Impossible behind the sealed gate; see the unsharded path.
+            let (current_view, schema) =
+                replay_ctx.get_or_insert_with(|| (self.view.load(), self.schema.load()));
+            self.late_writes_after_seal
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                partition = ?p.key,
+                "flush: a row reached a sealed memtable after its snapshot; replaying it"
+            );
+            for row in &p.rows {
+                if let Err(e) = current_view.active.put(&p.key, row.clone(), schema) {
+                    tracing::error!(%e, "flush(sharded): late-writer replay put failed");
                 }
             }
-            drop(current_view);
         }
 
         // Step 6 (publish) — prepend ALL shard SSTables to the view, clear
@@ -9266,35 +9276,41 @@ impl<F: FlushTarget> TableStore<F> {
 
         let guard = self.view.load();
         let mut builder = FullTextIndexBuilder::new();
-        let mut add_partitions = |partitions: Vec<Partition>| {
-            for partition in partitions {
-                let pk_bytes = partition.key.key.as_bytes();
-                // Per-row document keyed by the full primary key (t_da51e20c).
-                for row in &partition.rows {
-                    let mut text = String::new();
-                    for (col_idx, cell) in &row.cells {
-                        if *col_idx as usize == *col_pos {
-                            if let Some(ref val) = cell.value {
-                                if let Ok(s) = std::str::from_utf8(val) {
-                                    text.push_str(s);
-                                    text.push(' ');
-                                }
+        // STREAMING: scan each memtable one partition at a time through
+        // `range_iter` — never collect the table into a `Vec`. The builder
+        // accumulates only its own index entries, not the partitions, and the
+        // scan only ever READS (key, clustering and cell bytes), so borrowing
+        // `Arc<Partition>`s replaces the previous `snapshot()`, which deep-cloned
+        // every partition on this read path.
+        let mut add_partition = |partition: &Partition| {
+            let pk_bytes = partition.key.key.as_bytes();
+            // Per-row document keyed by the full primary key (t_da51e20c).
+            for row in &partition.rows {
+                let mut text = String::new();
+                for (col_idx, cell) in &row.cells {
+                    if *col_idx as usize == *col_pos {
+                        if let Some(ref val) = cell.value {
+                            if let Ok(s) = std::str::from_utf8(val) {
+                                text.push_str(s);
+                                text.push(' ');
                             }
                         }
                     }
-                    if !text.is_empty() {
-                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
-                            pk_bytes,
-                            &row.clustering,
-                        );
-                        builder.add_document(doc_key, text.trim());
-                    }
+                }
+                if !text.is_empty() {
+                    let doc_key =
+                        ferrosa_index::fulltext::keys::encode_doc_key(pk_bytes, &row.clustering);
+                    builder.add_document(doc_key, text.trim());
                 }
             }
         };
-        add_partitions(guard.active.snapshot());
+        for partition in guard.active.range_iter(None, None) {
+            add_partition(&partition);
+        }
         for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
-            add_partitions(flushing.snapshot());
+            for partition in flushing.range_iter(None, None) {
+                add_partition(&partition);
+            }
         }
         drop(guard);
 

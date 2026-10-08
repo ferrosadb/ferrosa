@@ -417,6 +417,36 @@ mod tests {
         );
     }
 
+    /// The read-path consumers that only *read* partitions (the fulltext index
+    /// build and the flush late-writer check) scan through `range_iter` rather
+    /// than `snapshot`. That substitution is only sound while the two agree
+    /// exactly, so pin it: same partitions, same order, same content. A
+    /// divergence would silently drop or reorder a user's partitions.
+    #[test]
+    fn range_iter_and_snapshot_agree_exactly() {
+        let mem = SkipListMemtable::new();
+        let schema = test_schema();
+        for i in 0..20 {
+            let key = make_key(&format!("key_{i:02}"));
+            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
+                .unwrap();
+        }
+
+        let snapshot = mem.snapshot();
+        let scanned: Vec<Arc<Partition>> = mem.range_iter(None, None).collect();
+        assert_eq!(snapshot.len(), scanned.len());
+        for (from_snapshot, from_scan) in snapshot.iter().zip(scanned.iter()) {
+            // Same key order...
+            assert_eq!(from_snapshot.key, from_scan.key);
+            // ...and the same bytes, so a reader cannot tell them apart.
+            assert_eq!(from_snapshot.rows.len(), from_scan.rows.len());
+            for (a, b) in from_snapshot.rows.iter().zip(from_scan.rows.iter()) {
+                assert_eq!(a.clustering, b.clustering);
+                assert_eq!(a.cells, b.cells);
+            }
+        }
+    }
+
     #[test]
     fn partition_count_and_size() {
         let mem = SkipListMemtable::new();
