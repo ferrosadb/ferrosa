@@ -9066,7 +9066,7 @@ impl StorageEngine {
     /// generation before its smoke test runs, and the test then fails because
     /// the files are gone, not because they are bad. Each failure is
     /// re-judged under the generation's guard (the lock retirement holds for
-    /// its whole duration, [`crate::generation_guard`]): a generation that is
+    /// its whole duration, `generation_guard`): a generation that is
     /// no longer on disk was retired and is reported as gone, never as
     /// corrupt. The on-disk listing, not the published view, is the reference
     /// because generations excluded as corrupt at load are on disk but not in
