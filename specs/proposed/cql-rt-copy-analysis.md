@@ -305,14 +305,39 @@ thing to instrument.
 
 - [ ] Which consumer holds the 4.54 % `handle_connection`-direct `memcpy`? (needs
       a TLS-off or better-symbolised capture)
-- [ ] Is `StorageEngine::flush`'s snapshot mutable at any stage that would forbid
-      a plain `Vec<Arc<Partition>>` return?
+- [x] Is `StorageEngine::flush`'s snapshot mutable at any stage that would forbid
+      a plain `Vec<Arc<Partition>>` return? — **Yes, four times.** Settled; see
+      § D. `snapshot()` stays owning.
 - [ ] What is the actual Arc refcount at each `write_path.rs` / `range_read_stream.rs`
       site under the 512-thread write load — 1 (free) or ≥ 2 (deep copy)?
 - [ ] Does the io_uring branch (`perf/levers-crc-lz4-io`, in flight) already
       rewrite the codec staging in lever B?
 - [ ] Crate doc obligation: `ferrosa-cql` and `ferrosa-storage` crate docs must be
       updated in the same change (per `CLAUDE.md` / `AGENTS.md` definition of done).
+
+## Scope: what the implementation PR does not do
+
+- **The CQL wire read path** (`frame.rs` decode staging) — see lever B above.
+- **`ShardedBTreeMemtable::range_iter` — DONE** (was listed here as open). It
+  pre-collected the whole in-range `Arc` set into one `Vec` per shard before
+  yielding anything, pinning `8 B` per partition for the scan's lifetime — a parked
+  paging cursor held it for the query's duration. It now lazily merges: one heap
+  entry per shard, re-seeking each shard under a short-lived read lock on advance,
+  so it retains `O(num_shards)` and never stalls a writer. This contradicted the
+  `Memtable::range_iter` doc contract ("must NOT pre-materialize … O(1) memory",
+  ADR-020) and was the last **production** finding in
+  `frg materialization-scan ferrosa-storage/src/memtable`. Measured before:
+  22 624 B retained over 2 000 partitions vs 295 008 B over 32 000. Guarded by
+  `memtable_scan_memory_bound.rs` — peak live bytes, not allocation count, because
+  `Arc::clone` does not allocate so a counter cannot see this — plus
+  exactly-once / bounded-range / empty / single-shard tests.
+- **`snapshot()` still materializes by design.** The flush mutates its partitions in
+  place; `k_way_merge` remains the materializing merge for that path. The
+  `frg materialization-scan` hits on `snapshot` / `snapshot_range_limited` /
+  `k_way_merge` are intentional and bounded by the memtable flush threshold.
+- **Per-request `resolve_col_type` / `build_request_context` recompute** (0.87 % +
+  1.11 %) is untouched — caching a parsed `CqlType` or a marshalled client address
+  needs a metadata decision, not a micro-fix.
 
 ## Related Specs / Prior Art
 
