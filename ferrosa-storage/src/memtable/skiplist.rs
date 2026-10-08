@@ -275,21 +275,28 @@ impl Memtable for SkipListMemtable {
             // `(**guard).clone()` — a DEEP `Partition` clone, deliberately not
             // `guard.clone()`. `entry.value()` is `RwLock<Arc<Partition>>`, so
             // `guard.clone()` would resolve through `Deref` to `Arc::clone`: a
-            // refcount bump, not a copy. That would leave the strong count at 2
-            // for the duration of `f`, so a concurrent `put` would find
-            // `Arc::make_mut` with refcount > 1 and copy-on-write the whole
-            // partition — re-introducing the very regression this exists to fix,
-            // and doing it silently (an Arc clone is correct-looking and cheap).
-            let owned = {
-                let guard = entry.value().read();
-                (**guard).clone()
-            };
+            // refcount bump, not a copy. That would leave an extra strong
+            // reference alive for the duration of `f`, so a concurrent `put`
+            // would find `Arc::make_mut` with refcount > 1 and copy-on-write the
+            // whole partition — re-introducing the very regression this exists to
+            // fix, and doing it silently (an Arc clone is correct-looking and
+            // cheap, and `f(&owned)` still compiles through `Deref`).
+            let guard = entry.value().read();
+            // Pin the shape: taking the clone must not add a reference. Compared
+            // against the count *with this guard held*, so any legitimate
+            // external holder (another reader's `get`) is included on both sides
+            // and does not produce a false positive.
+            #[cfg(debug_assertions)]
+            let refs_before = std::sync::Arc::strong_count(&guard);
+            let owned = (**guard).clone();
             debug_assert_eq!(
-                std::sync::Arc::strong_count(&entry.value().read()),
-                1,
-                "the memtable must remain the sole owner of a partition across a \
-                 read-only scan, or concurrent writes stop merging in place"
+                std::sync::Arc::strong_count(&guard),
+                refs_before,
+                "the cloned visit must deep-clone the partition, not bump the \
+                 memtable's Arc: the strong count rose by taking the clone, so a \
+                 concurrent write would copy-on-write instead of merging in place"
             );
+            drop(guard);
             f(&owned);
         }
     }

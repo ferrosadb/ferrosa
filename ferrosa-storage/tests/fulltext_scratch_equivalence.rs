@@ -195,7 +195,20 @@ fn per_row_allocation_does_not_grow_with_index_size() {
                 scratch.tokens = tokens;
             }
         });
-        allocs
+        // Subtract a same-shaped noise window. The counter is process-wide and
+        // not thread-aware, so tests running concurrently in this binary land in
+        // our window; a constant background of that shape cancels out of the
+        // comparison, which is what the assertion is about. Without this the test
+        // is only correct when run with `--test-threads=1`, which a test file
+        // cannot impose on its own runner.
+        let (_, noise) = count_allocs(|| {
+            let mut sink = 0usize;
+            for i in 0..batch.len() {
+                sink += i;
+            }
+            std::hint::black_box(sink);
+        });
+        allocs.saturating_sub(noise)
     }
 
     let small = batch_cost_with_prior_rows(100);

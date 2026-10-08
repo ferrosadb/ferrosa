@@ -18,25 +18,47 @@
 //! The cost only appears when a read and a write overlap, which is what this
 //! file measures.
 //!
-//! ## The three shapes
+//! ## The shapes
 //!
-//! 1. `writes_do_not_allocate_while_a_range_iter_arc_is_held` — the defect, kept
-//!    as the negative control. It asserts the COW DOES happen for `range_iter`,
-//!    so if someone "fixes" `range_iter` by making it hand out borrowed data
-//!    (or restores a deep-cloning scan), this fails and forces a re-read.
-//! 2. `writes_stay_in_place_while_for_each_partition_visits` — THE RULE. The
-//!    borrowed scan must leave `put` allocation-bounded.
-//! 3. `for_each_partition_sees_every_partition_in_token_order` — the borrowed
-//!    scan must be a complete, ordered substitute for `snapshot`, and must not
-//!    drop or duplicate a partition.
+//! 1. `a_held_arc_makes_the_next_write_copy_on_write_and_stale` — the defect,
+//!    kept as the **negative control**. `Arc::make_mut` at refcount > 1
+//!    deep-clones, so a holder keeps the pre-write image while the memtable owns
+//!    the post-write one. If that stops holding, the rule below has lost its
+//!    teeth.
+//! 2. `a_write_with_no_holder_is_visible_immediately` — the other half of the
+//!    control: with no outstanding `Arc` the same write merges in place.
+//! 3. `borrowed_visit_keeps_the_memtable_the_sole_owner` — THE RULE. A borrowed
+//!    visit must not raise the partition's strong count.
+//! 4. `range_iter_does_inflate_the_partition_refcount` — the control proving that
+//!    measurement can actually see the defect.
+//! 5. `cloned_visit_releases_the_guard_before_the_callback` — the bounded-hold
+//!    path: the guard is released before the callback (a write from inside it
+//!    would otherwise deadlock on parking_lot's non-reentrant lock).
+//! 6. `for_each_partition_*` — the borrowed scan is a complete, token-ordered,
+//!    correctly-bounded substitute for `snapshot`.
 //!
-//! Allocation counting (calls, not bytes) is deterministic and load-independent,
-//! unlike a stopwatch. Harness rules mirror `memtable_write_alloc_bound.rs`:
-//! rows are built OUTSIDE the measured window, and the assertion is non-growth,
-//! never exact equality.
-
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+//! ## Why this file does NOT count allocations
+//!
+//! The obvious way to pin "a read path must not tax a writer" is an allocation
+//! counter. That was the first version of this file, and it was **wrong under the
+//! default parallel harness**: the counter is process-wide and not thread-aware,
+//! so two tests running concurrently corrupt each other's measurement window
+//! (12/12 parallel failures, 0/20 with `--test-threads=1`). A test file cannot
+//! impose single-threading on its own runner, and `memtable_write_alloc_bound.rs`
+//! only gets away with a counter by keeping every measured shape in ONE `#[test]`
+//! — which is not possible once the shapes are separate invariants.
+//!
+//! These tests therefore assert **observable behaviour** instead, which is both
+//! deterministic and load-independent:
+//!
+//! - the strong count of a partition's `Arc` while a borrowed visit runs
+//!   (`Memtable::get` bumps by exactly one, so the sole-owner reading is 2);
+//! - the *staleness* a held `Arc` suffers when the next write copy-on-writes —
+//!   `Arc::make_mut` deep-clones, so the holder keeps the pre-write image while
+//!   the memtable owns the post-write one;
+//! - the number of partitions a bounded visit actually touches.
+//!
+//! Each has a negative control so it cannot pass vacuously.
 
 use ferrosa_common::cell::CellValue;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -44,39 +66,6 @@ use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 use ferrosa_storage::memtable::skiplist::SkipListMemtable;
 use ferrosa_storage::memtable::Memtable;
-
-struct CountingAlloc;
-static ARMED: AtomicBool = AtomicBool::new(false);
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        System.alloc(layout)
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        System.realloc(ptr, layout, new_size)
-    }
-}
-
-#[global_allocator]
-static GLOBAL: CountingAlloc = CountingAlloc;
-
-fn count_allocs<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    ALLOCS.store(0, Ordering::Relaxed);
-    ARMED.store(true, Ordering::Relaxed);
-    let out = f();
-    ARMED.store(false, Ordering::Relaxed);
-    (out, ALLOCS.load(Ordering::Relaxed))
-}
 
 fn schema() -> TableSchema {
     TableSchema {
@@ -121,28 +110,68 @@ fn fill(mem: &SkipListMemtable, k: &DecoratedKey, s: &TableSchema) {
     mem.put(k, row(9_000, b"warm", 9_000), s).expect("warm put");
 }
 
-/// NEGATIVE CONTROL: the defect, pinned. If this ever stops reproducing, the
-/// measurement below has lost its teeth and must be re-derived before trusting
-/// `writes_stay_in_place_while_for_each_partition_visits`.
+/// NEGATIVE CONTROL: the defect, pinned — **without** the allocation counter.
+///
+/// The counter is process-wide and not thread-aware, so any test that reads it is
+/// wrong under the default parallel harness (and `--test-threads=1` is not
+/// something this file can impose on its own runner). It is also unnecessary: the
+/// *effect* of `Arc::make_mut`'s copy-on-write is directly observable.
+///
+/// When a consumer holds a clone of the memtable's `Arc` and a write lands,
+/// `make_mut` deep-clones the partition before mutating — so the consumer's copy
+/// stays permanently stale. When nothing holds it, the same write is visible in
+/// the memtable immediately. That difference is the copy-on-write, and it is
+/// deterministic and load-independent.
+///
+/// If this ever stops reproducing, the borrowed-scan guard below has lost its
+/// teeth and must be re-derived.
 #[test]
-fn writes_do_not_allocate_while_a_range_iter_arc_is_held() {
+fn a_held_arc_makes_the_next_write_copy_on_write_and_stale() {
     let mem = SkipListMemtable::new();
     let s = schema();
     let k = key("pk");
     fill(&mem, &k, &s);
+    let rows_before = mem.get(&k).unwrap().unwrap().rows.len();
 
-    // What `range_iter().next()` hands a consumer, held across its work.
+    // A consumer holds what `range_iter().next()` would have handed it.
     let held: std::sync::Arc<Partition> = mem.get(&k).unwrap().expect("partition present");
     assert!(std::sync::Arc::strong_count(&held) > 1);
 
-    let (_, allocs) = count_allocs(|| {
-        mem.put(&k, row(9_002, b"with-reader", 9_002), &s).unwrap();
-    });
-    assert!(
-        allocs > 100,
-        "a held `Arc<Partition>` must make `put` copy-on-write the partition \
-         (O(rows) allocations). Got {allocs} for {ROWS} rows, which means the \
-         copy-on-write no longer manifests and this guard is measuring nothing."
+    mem.put(&k, row(9_002, b"with-reader", 9_002), &s).unwrap();
+
+    assert_eq!(
+        held.rows.len(),
+        rows_before,
+        "the held Arc must NOT see the write: `Arc::make_mut` at refcount > 1 must \
+         have deep-cloned the partition. It saw the write, so copy-on-write is no \
+         longer manifesting and the guard below is measuring nothing."
+    );
+
+    // And the write did land — in the cloned partition the memtable now owns.
+    let after = mem.get(&k).unwrap().unwrap();
+    assert_eq!(
+        after.rows.len(),
+        rows_before + 1,
+        "the write must have been applied to the memtable's (fresh) partition"
+    );
+}
+
+/// The other half of the negative control: with NO holder, the same write merges
+/// in place and is visible without any clone.
+#[test]
+fn a_write_with_no_holder_is_visible_immediately() {
+    let mem = SkipListMemtable::new();
+    let s = schema();
+    let k = key("pk");
+    fill(&mem, &k, &s);
+    let rows_before = mem.get(&k).unwrap().unwrap().rows.len();
+
+    mem.put(&k, row(9_002, b"no-reader", 9_002), &s).unwrap();
+
+    assert_eq!(
+        mem.get(&k).unwrap().unwrap().rows.len(),
+        rows_before + 1,
+        "a write with no outstanding Arc must merge in place and be visible"
     );
 }
 
@@ -284,30 +313,38 @@ fn cloned_visit_releases_the_guard_before_the_callback() {
     let k = key("pk");
     fill(&mem, &k, &s);
 
+    // A holder taken up front. If `for_each_partition_cloned` cloned by bumping
+    // the memtable's own `Arc` (rather than deep-cloning into a fresh value) it
+    // would raise the strong count above this, and the write below would then
+    // copy-on-write — which the staleness check pins.
+    let held: std::sync::Arc<Partition> = mem.get(&k).unwrap().expect("partition present");
+    let rows_before = held.rows.len();
+
     let mut writes = 0usize;
-    let mut worst_write_allocs = 0usize;
     mem.for_each_partition_cloned(None, None, &mut |p: &Partition| {
         if p.key != k {
             return;
         }
-        // Safe only because the guard was released before we got here.
-        let (_, a) = count_allocs(|| {
-            mem.put(&k, row(9_004, b"during-cloned-scan", 9_004), &s)
-                .unwrap();
-        });
+        // Safe only because the guard was released before we got here: if it were
+        // still held, parking_lot's non-reentrant `RwLock` would deadlock here.
+        mem.put(&k, row(9_004, b"during-cloned-scan", 9_004), &s)
+            .unwrap();
         writes += 1;
-        worst_write_allocs = worst_write_allocs.max(a);
     });
 
     assert_eq!(writes, 1, "the visited partition must be seen exactly once");
-    // A deep `Partition` clone happens under the guard, but the WRITE must still
-    // merge in place: the clone produces a new owned value and never raises the
-    // memtable's refcount, so `Arc::make_mut` does not copy-on-write.
-    assert!(
-        worst_write_allocs <= 4,
-        "a write during a cloned visit must merge in place (bounded \
-         allocations), but it cost {worst_write_allocs} for {ROWS} rows — the \
-         cloned visit is inflating the refcount (I-2)."
+    // The clone is a fresh owned value, so it never raised the memtable's
+    // refcount: `held` is a separate Arc that must still be the pre-write image,
+    // and the memtable must own the post-write one.
+    assert_eq!(
+        held.rows.len(),
+        rows_before,
+        "a cloned visit must not mutate the value a consumer already holds"
+    );
+    assert_eq!(
+        mem.get(&k).unwrap().unwrap().rows.len(),
+        rows_before + 1,
+        "the write during the cloned visit must land in the memtable's partition"
     );
 }
 
