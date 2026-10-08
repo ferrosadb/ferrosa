@@ -7,20 +7,21 @@
 
 ## Headline
 
-**Memory-management work is ~17–20 % of all CPU**, an order of magnitude more than the
-~1.5 % of application deep-copies that PR #541 targeted. If clones were the last round,
-this is the next.
+**Memory-management work is ~16.7 % of all CPU** (allocator ∪ memcpy, disjoint), an
+order of magnitude more than the ~1.5 % of application deep-copies that PR #541
+targeted. If clones were the last round, this is the next.
 
 | Bucket | Self-cost | Nature |
 |---|---|---|
 | Allocator (`malloc`/`realloc`/`free`, jemalloc + Rust `alloc`) | **7.84 %** | churn |
-| `memcpy` / `memmove` | **8.85 %** | bytes moved |
-| Kernel: page fault + page alloc + clear_page | **3.79 %** | **consequence** of the churn, not separable work |
+| `memcpy` / `memmove` / `memset` | **8.85 %** | bytes moved |
 | **Disjoint memory-management total** | **16.7 %** | allocator ∪ memcpy (verified 0-frame overlap) |
+| — of which: kernel page fault + page alloc + `clear_page` | (3.79 %) | **nested inside the two above — do NOT add** |
 
 The allocator and memcpy sets are **disjoint** (692 vs 147 frames, zero overlap), so
-16.7 % is not double-counted. The kernel 3.79 % is layered *inside* those frames
-(see below), so it is a consequence, not a fourth bucket.
+16.7 % is not double-counted. The kernel 3.79 % is *layered inside* those frames
+(children of allocator/memcpy calls), so it is a consequence of the churn and must
+not be added again — the memory-related total is 16.7 %, not 20.5 %.
 
 ## Correction to the earlier number (important)
 
