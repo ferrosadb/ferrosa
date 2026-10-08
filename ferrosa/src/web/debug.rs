@@ -946,6 +946,7 @@ mod tests {
             storage,
             host_id,
             auth_disabled: true,
+            auth_cache: std::sync::Arc::new(crate::web::auth_cache::AuthCache::default()),
             debug: Some(DebugState::new()),
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
             supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
