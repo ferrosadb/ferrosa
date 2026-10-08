@@ -286,7 +286,13 @@ impl Memtable for SkipListMemtable {
             // against the count *with this guard held*, so any legitimate
             // external holder (another reader's `get`) is included on both sides
             // and does not produce a false positive.
-            #[cfg(debug_assertions)]
+            //
+            // NOT `#[cfg(debug_assertions)]`-gated, even though the assertion is
+            // debug-only: `debug_assert_eq!` expands to
+            // `if cfg!(debug_assertions) { assert_eq!(..) }` — a *runtime* `if`
+            // — so its arguments are still name-resolved in a release build. Gating
+            // the binding away makes release compilation fail with E0425. The cost
+            // of keeping it is one relaxed atomic load per cloned partition.
             let refs_before = std::sync::Arc::strong_count(&guard);
             let owned = (**guard).clone();
             debug_assert_eq!(
