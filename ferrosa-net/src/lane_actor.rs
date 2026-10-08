@@ -547,9 +547,17 @@ pub(crate) fn spawn_lane_actor_on_pool_with_timeout(
     handle
 }
 
-/// Spawns a lane actor on a **dedicated OS thread** with its own single-threaded
-/// tokio runtime. Used for the Raft lane to guarantee heartbeat processing cannot
-/// be starved by data-path saturation on the shared runtime.
+/// Spawns a lane actor for the Raft lane, **assigned** to the fixed-width
+/// [`crate::lane_thread_pool::LaneThreadPool`] rather than given a dedicated OS
+/// thread per dial.
+///
+/// The isolation that motivated the dedicated thread (`0af43df8`: Raft
+/// heartbeats must not be starved by data-path saturation) is preserved — the
+/// pool threads run nothing but Raft lane actors, so a saturated `data-rt` still
+/// cannot delay a heartbeat. What changes is the *shape*: the thread count is
+/// now a tunable constant (`FERROSA_RAFT_LANE_POOL_THREADS`, default 2) instead
+/// of one thread per dial that leaks whenever a pool is created and dropped
+/// before `add_peer`.
 ///
 /// The actor loop logic is identical to [`spawn_lane_actor`]; only the execution
 /// context differs.
@@ -567,7 +575,7 @@ pub(crate) fn spawn_raft_lane_actor_with_timeout(
     lane: Lane,
     initial_state: LaneState,
     default_timeout: Duration,
-    peer_label: String,
+    _peer_label: String,
     ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext + Send + 'static,
 ) -> LaneHandle {
     let (tx, rx) = mpsc::channel(lane_channel_capacity());
@@ -591,26 +599,16 @@ pub(crate) fn spawn_raft_lane_actor_with_timeout(
     ctx_handle._guard = None;
     let ctx = ctx_builder(ctx_handle);
 
-    std::thread::Builder::new()
-        .name(format!("raft-lane-{peer_label}"))
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("raft lane runtime");
-
-            rt.block_on(async move {
-                tokio::select! {
-                    _ = lane_actor_loop(lane, initial_state, rx, ctx, Some(Arc::clone(&reaper))) => {}
-                    // Last handle dropped: no external holder remains, so the
-                    // actor has nothing left to serve. Without this the thread —
-                    // and its private runtime — outlives its pool for the life of
-                    // the process (a created-but-never-installed pool leaks it).
-                    _ = reaper.wait() => {}
-                }
-            });
-        })
-        .expect("spawn raft lane thread");
+    // Assign the actor to the pool instead of spawning a thread. A worker hosts
+    // several actors concurrently (they are network-wait dominated), so the pool
+    // may be narrower than the peer count. The reaper still races the loop so a
+    // pool dropped before `add_peer` releases its actor slot promptly.
+    crate::lane_thread_pool::lane_thread_pool().assign(async move {
+        tokio::select! {
+            _ = lane_actor_loop(lane, initial_state, rx, ctx, Some(Arc::clone(&reaper))) => {}
+            _ = reaper.wait() => {}
+        }
+    });
 
     handle
 }

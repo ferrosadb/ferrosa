@@ -11,6 +11,7 @@ pub mod error;
 pub mod handshake;
 pub mod idle_timeout;
 pub mod lane_actor;
+pub mod lane_thread_pool;
 pub mod message;
 pub mod metrics;
 pub mod peer;
