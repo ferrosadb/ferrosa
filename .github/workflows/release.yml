@@ -513,8 +513,15 @@ jobs:
           export CPPFLAGS="-I$unwind_prefix/include"
           # Consumed by jemalloc-sys's configure only (see 1.); not a Rust search path.
           export LDFLAGS="-L$unwind_prefix/lib"
-          # Both archives plus musl libc in one group, by explicit path (2. and 3.).
-          export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--start-group -C link-arg=$unwind_prefix/lib/libunwind.a -C link-arg=$sysroot_libunwind -C link-arg=$sysroot_libc -C link-arg=-Wl,--end-group"
+          # Frame pointers so a sampled CPU profile can unwind THROUGH assembly leaves.
+          # The musl `memcpy`/`memmove` fast paths are hand-written asm with no CFI, so
+          # --call-graph dwarf stops dead at them: measured on a loaded node, 12,506 of
+          # 16,285 memcpy samples (77 %) had a 2-frame stack (`cql-rt;memcpy`) and 6.5 % of
+          # total CPU was un-attributable. Ordinary Rust frames unwind fine without this
+          # (79.8 % of samples reach depth >= 5), so the flag is narrow: it fixes the leaf.
+          # PROFILING IMAGE ONLY -- never release; frame pointers cost a register there.
+          # Pair with `perf record --call-graph fp`.
+          export RUSTFLAGS="${RUSTFLAGS:-} -C force-frame-pointers=yes -C link-arg=-Wl,--start-group -C link-arg=$unwind_prefix/lib/libunwind.a -C link-arg=$sysroot_libunwind -C link-arg=$sysroot_libc -C link-arg=-Wl,--end-group"
           cargo build --locked --profile profiling \
             --target "${{ matrix.target }}" \
             -p ferrosa --bin ferrosa --features ferrosa/full,ferrosa/profiling
