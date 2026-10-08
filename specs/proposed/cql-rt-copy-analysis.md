@@ -25,14 +25,16 @@ sit in the same "recompute what could be looked up once" family.
 | Lever | Kind | ~CPU (of total) | Risk | Status |
 |---|---|---|---|---|
 | A. Per-request schema recompute (`storage_column_is_multicell`, `resolve_col_type`, `build_request_context`) | redundant work, no data copy | **3.32 %** | low | open — **best first win** |
-| B. CQL wire codec: read buffer double-copy + response double-copy (in-process, no TLS) | bytes moved | **~2–4 %** | low | partly landed (io_uring work in flight) |
+| B. CQL wire codec: response double-copy (fixed here) + bound-value `Term` copy | bytes moved | response **~2 %**; read-path bound values **~0.5 %** | low | response half landed; read half open |
 | C. Coordinator → client deep copy (`Arc::unwrap_or_clone` on a shared `Arc<Partition>`) | shared→owned data copy | **0.68 %** + 1.21 % storage clone | medium | partially addressed by PR #537 |
-| D. Memtable flush `snapshot()` still deep-clones every partition | shared→owned data copy | **~0.63 %** clone self (+ 6.3 % flush tree) | low | **gap left by PR #537** |
+| D. Read-only memtable re-scans deep-cloning (`snapshot()` on read paths) | shared→owned data copy | **~0.63 %** clone self (+ 6.3 % flush tree) | low | **fixed (this PR)** |
 | F. CQL hot-path `Vec` alloc/grow + `drop_glue` (unprofiled by name) | allocator churn | 2.5 % combined | medium | needs attribution |
 
 **Recommendation:** start with **A** (pure compute, no ownership risk), then **D**
-(same pattern PR #537 already proved out, one more call site), then **B** (the
-largest copy mass, but the region the io_uring branch is already rewriting).
+(same pattern PR #537 already proved out, one more call site), then **B**. Note the
+4.54 % memcpy under `handle_connection` is **unattributed** — musl's `memcpy` asm
+has no CFI, so it cannot be blamed on the codec without an instruction-level
+capture.
 
 ## Method (so the numbers are reproducible)
 
@@ -124,41 +126,58 @@ connection and can be stored on the connection state once. Expected recovery:
 **most of 3.3 %**, with no change to data ownership and therefore no risk of the
 data-loss class.
 
-### B. CQL wire codec — the largest copy mass (~2–4 % in-process, more with TLS)
+### B. CQL wire codec — corrected: the body is NOT copied on the common path
 
 Inside `handle_connection`'s read/send loop (16.60 % inclusive):
 
 | Frame | CPU |
 |---|---|
-| `memcpy` directly under `handle_connection` | 4.54 % |
-| `futures_util::sink::send::Send<Framed<..>>::poll` | 4.00 % |
-| `CqlCodec::decode` | 2.98 % |
+| `memcpy` directly under `handle_connection` | 4.54 % (callee unsymbolised) |
+| `futures_util::sink::send::Send<Framed<..>>::poll` | 4.00 % (write side) |
+| `CqlCodec::decode` | 2.98 % (mostly CRC32 framing verify, required) |
 | `poll_read_buf::<TlsStream, BytesMut>` | 2.85 % |
 
-Two concrete copies are visible in source:
+**Correction to the first version of this spec.** It claimed the read path copies
+every request payload twice. Checking the source and the profile, that is wrong on
+the common path:
 
-1. **Read path** (`frame.rs:374–379`): the decoded payload is copied once into
-   `self.v5_segment_buf` and then `.split().freeze()`d, producing **two copies of
-   every request payload**. The common single-envelope case (`v5_segment_buf`
-   empty → `payload.freeze()`) avoids the second copy, but any accumulation path
-   pays it.
-2. **Response path** (`frame.rs:800–851`): `encode_v5_frame` builds a fresh
-   `BytesMut` envelope (`envelope_header.encode(&mut envelope); envelope.put_slice(body)`),
-   and `put_v5_frame` then **copies that envelope again** into `dst`. A response
-   body is therefore written twice before it reaches the socket.
+- Self-contained v5 frame (`v5_segment_buf` empty) takes `payload.freeze()` —
+  **zero copies** — and `emit_envelopes` then hands out `Bytes` slices via
+  `envelope_data.slice(...)`, also zero-copy.
+- The v4 path does a single `split_to(..).freeze()` — one buffer, no copy.
+- The profiler agrees: **zero `v5_segment_buf` frames**. The
+  `extend_from_slice` accumulation branch at `frame.rs:349/377` is a genuine second
+  copy, but it only runs when a peer sends an envelope **> 128 KiB**
+  (`V5_MAX_PAYLOAD`) split across slices — a segmented *write*, not this workload.
 
-**Caveat (must be stated):** the dominant 4.54 % memcpy sits directly under
-`handle_connection`, but the profiler could not symbolise the callee, so its
-allocation between TLS record buffering, codec staging, and the response path is
-**unattributed**. A TLS-off capture, or a `perf` run with the crypto/ring frames
-symbolised, is required before claiming a number for this lever. This is the one
-region where a wrong premise would misdirect the work.
+**What is actually still copied on the read path** (measured):
 
-**Remedy.** Decode with `split_to(payload_len)` semantics that hand out a view or
-an `Arc`-backed `Bytes`, and encode in place into `dst` (write the 3-byte header
-and CRC fields, then `put_slice(body)` once) instead of staging. This is exactly
-the buffer discipline the in-flight `perf/levers-crc-lz4-io` io_uring branch is
-touching — coordinate with it rather than opening a competing change.
+| Site | Copy | CPU |
+|---|---|---|
+| `raw_bytes_to_term` / `cql_value_to_term` (`connection.rs:2814/2817/2871/2896`) | each bound value's bytes copied into an owned `Term` — `s.clone()`, `b.clone()`, `bytes.to_vec()` — although the source `Bytes` outlives the whole request | **0.46 %** memcpy (0.21 + 0.25) under `decode_query_params` 1.79 % |
+
+So the removable read-path copy is **~0.5 %**, not 2–4 %. The response-path
+double copy described below was real and is fixed in this PR.
+
+**Remedy (remaining).** Make the bound-value path `Bytes`-backed instead of
+`Vec<u8>`-owned: a `Term::BlobLiteral(Bytes)` (or `Arc<[u8]>`) variant plus a
+borrowing term view for scalar text. Note this only pays if the round trip is also
+changed — `cql_value_to_term` converts a decoded value back into a `Term`, which the
+router then re-decodes through `bridge::term_to_cql_value`, so a `Bytes` term must
+survive that second step to be a saving rather than a wash.
+
+**Still unattributed.** The 4.54 % memcpy directly under `handle_connection` has no
+symbolised callee. This is **not** fixable by a "TLS-off capture": the musl
+`memcpy`/`memmove` fast paths are hand-written asm with no CFI, so `--call-graph fp`
+stops dead at them (`.github/workflows/release.yml`: 12 506 of 16 285 memcpy samples
+had a 2-frame `cql-rt;memcpy` stack; 6.5 % of total CPU un-attributable).
+Attributing it needs an **instruction-level** capture (dwarf unwinding past asm, or
+an allocator/`ltrace`-style probe), not another frame-pointer run.
+
+**Do not confuse the two copy classes.** A copy of the request body on the way *in*
+(whether the payload bytes are duplicated) is a different bug from `Bytes` being
+re-sliced or the TLS record layer buffering — and from the memcpy being in the write
+path the whole time. The 4.54 % is unattributed; do not assume it is the codec.
 
 ### C. Coordinator → client deep copy — `Arc::unwrap_or_clone` (0.68 % + 1.21 %)
 
