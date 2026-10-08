@@ -264,6 +264,24 @@ were doing an unnecessary second full deep clone:
 
 Both now walk `range_iter` one partition at a time (never collecting into a `Vec`)
 and borrow the stored `Arc<Partition>`. The correct framing of lever D is therefore
+
+> **CORRECTION (post-benchmark, important).** This substitution is **not a win on the
+> shipped configuration** and it is the likely source of the t512 regression.
+> `ferrosa-storage/Cargo.toml` sets `default = ["skiplist-memtable"]`, so
+> `SkipListMemtable` is the live backend and `sharded.rs` is not instantiated at all
+> (0 frames in the profile). On the *live* path the change swapped a
+> `snapshot()` that **drains to an owned `Vec`** (lock traffic in one short burst,
+> then a lock-free scan) for a **lazy `range_iter` that holds each partition's value
+> `read()` while the consumer walks**, interleaved with writer `put`s — a longer
+> contention window against 512 writers. `parking_lot::RwLock` is 2.43 % self in
+> the profile. The fulltext build also now walks the table **twice while holding the
+> store guard** (`store.rs:9307-9311`). See
+> [`cql-rt-memory-ops-analysis.md`](cql-rt-memory-ops-analysis.md) § "Regression
+> report" for the measurement and the two candidate fixes (per-value `ArcSwap`
+> instead of `RwLock`, and point lookups instead of a full scan for the
+> late-writer drains). Note `sharded.rs`'s lazy rewrite is inert either way: it
+> neither caused the regression nor delivered the memory win claimed below.
+
 **"stop re-snapshotting for reads"**, not "make `snapshot()` return Arcs".
 
 ### E. Non-actionable (recorded so it is not chased)

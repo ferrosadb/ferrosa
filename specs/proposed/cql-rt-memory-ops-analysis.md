@@ -129,6 +129,107 @@ Top exact sites:
 5. **`rustls DeframerVecBuffer::read` 0.26 %** — the TLS read buffer growing. Check
    whether tokio-rustls reuses a connection buffer or grows one per record.
 
+## Regression report: #541 vs #537 at t512
+
+**Verdict: the regression is real, it is mine, and my first explanation for it was
+wrong.** Two separate things had to be untangled.
+
+### 1. The sharded BTree memtable is NOT the live backend
+
+The first diagnosis blamed the per-element `RwLock` + `BTreeMap::range` seek I added
+to `ShardedRangeIter`. That cannot be the t512 regression, because **that code is not
+in the profile at all**:
+
+```
+ShardedBTreeMemtable   0 frames      seek_shard     0 frames
+ShardedRangeIter       0 frames      shard_data     0 frames
+BTreeMap               5 frames, 0.181 %
+```
+
+`ferrosa-storage/Cargo.toml` has `default = ["skiplist-memtable"]`, and the comment
+there says it outright: *"The production write path should avoid the sharded BTree
+memtable's parking_lot::RwLock hot path by default."* `store.rs:1281` constructs
+`Arc::new(SkipListMemtable::new())`. So `sharded.rs` is only live under
+`--no-default-features` / Miri. My `range_iter` rewrite (commit `573ced85`) touched a
+structure the shipped binary never instantiates. **It also cannot be the regression**
+— and equally, it never delivered its memory win in production either.
+
+The live backend is **`SkipListMemtable`** — `SkipMap<DecoratedKey, RwLock<Arc<Partition>>>`.
+
+### 2. The lock site the user identified is real: `parking_lot::RwLock` at 2.43 %
+
+Per-scan cost of **my** change (commit `654eae6d`), on the live path. The three
+read-only scans moved from `snapshot()` to `range_iter`:
+
+| | `snapshot()` (before) | `range_iter` (mine) |
+|---|---|---|
+| iteration | `map.iter()` | `map.iter()` (.iter().filter()) |
+| clone | **deep-clone every partition** (`(**entry.value().read()).clone()`) → `.collect::<Vec<Partition>>()` → **all value `read()`s dropped when the Vec is built** | `Arc::clone(&entry.value().read())` — **value `read()` held for the whole scan** |
+
+Same per-entry **read-lock acquisition**, same traversal. The difference is
+**tenure and shape**:
+
+- `snapshot()` **drains to an owned `Vec`** — the lock traffic is a short burst inside
+  one call, then the scan proceeds lock-free over the copy.
+- `range_iter()` is **lazy** — the `read()` guard is held *while the consumer walks*,
+  which on the read path is *interleaved with writer `put`s*. So a reader now holds
+  partition value locks across far more wall-clock time, against 512 writer threads
+  that write-lock the same per-partition `RwLock` (SkipMap `insert` is lock-free, but
+  the value merge is a write lock).
+
+Add: `filter()` on every entry (two bound comparisons) and `start`/`end` **clones**
+(`skiplist.rs:184-185`) — the pre-change path filtered inside the collect.
+
+That is a **contention-window** regression, not an extra-lock-per-element one, and it
+is on exactly the hot path 512 writers touch. It also explains the p99 jump: writer
+p99 rises when locks are held longer by readers.
+
+### 3. The fulltext build walks the table TWICE
+
+`store.rs:9307-9311` (introduced by my change):
+
+```rust
+for partition in guard.active.range_iter(None, None)     { add_partition(&partition); }
+for flushing in guard.flushing.iter() {
+    for partition in flushing.range_iter(None, None)     { add_partition(&partition); }
+}
+```
+
+Both walks happen **while `guard` (the whole-store guard) is held**, and the outer
+`guard.active` / `guard.flushing` accessors are themselves lock acquisitions. The old
+code snapshotted into owned data and could drop locks before building. So the hold
+window here is longer than before in the worst place.
+
+### 4. What the fix must NOT be
+
+- **Do not revert to `snapshot()`** — it deep-clones the entire table to serve a
+  mostly-empty check (the late-writer drains replay nothing on a healthy cluster). The
+  user's rule stands: read paths must not materialize the table.
+- **Do not "fix" `sharded.rs`** — it is not live. My rewrite there is inert; the honest
+  move is to keep it (it is a correct lazy iterator with tests) but stop citing it as
+  the regression cause, and stop counting its memory win as a production gain.
+
+### 5. The lock-free direction (user's point, and it is the real lever)
+
+`ferrosa-storage/Cargo.toml` says the skiplist "uses crossbeam's concurrent map plus
+per-partition CAS updates instead". It does **not** — the value is a
+`parking_lot::RwLock<Arc<Partition>>` (2.43 % self in the profile), and `arc_swap`
+is already in the dependency tree (31 frames, 2.08 %). Two credible shapes:
+
+1. **`ArcSwap<Partition>` per value** instead of `RwLock<Arc<Partition>>`: read locks
+   disappear entirely (`load()` is a lock-free atomic load), so a scan holds **zero
+   locks**. The write merge becomes `rcu`-style load → modify → `store`, retried on
+   CAS failure. This is the standard read-optimized/copy-on-write memtable shape and
+   directly removes the 2.43 % and the contention window above.
+2. **Drop `range_iter` as the read-path scan** for the late-writer drains: those
+   checks are *identity comparisons of already-known keys* — they do not need to walk
+   the table at all. Ask the bounded question (does key X exist, and is it later than
+   the seal?) via point lookups instead of a full unordered scan.
+
+Both preserve streaming (no materialization) and both are invariant-testable: value
+visibility must obey the same rules, and no row may be lost or reordered.
+
+
 ## Design: reusable response buffer (proposal)
 
 Answering: *"can't we pre-allocate a buffer and reuse it, since it's streaming — and
