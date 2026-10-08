@@ -295,6 +295,44 @@ pub(crate) struct SstableDescriptor {
     pub legacy_format: bool,
 }
 
+/// Normalise every last-write-wins timestamp `row` carries (cells, primary-key
+/// liveness, row deletion) from legacy nanoseconds to microseconds, and count
+/// them under `legacy_ns_timestamps_normalised_total{source="memtable_write"}`.
+/// TTL and local deletion times are seconds and untouched (t_cf637b6e).
+fn normalise_legacy_ns_row(row: &mut Row) {
+    use ferrosa_common::{is_legacy_ns, normalize_cell_ts};
+    let mut count = 0u64;
+    let mut normalise = |ts: &mut i64| {
+        if is_legacy_ns(*ts) {
+            count += 1;
+            *ts = normalize_cell_ts(*ts);
+        }
+    };
+    normalise(&mut row.primary_key_liveness.timestamp);
+    normalise(&mut row.deletion.marked_for_delete_at);
+    for (_, cell) in &mut row.cells {
+        normalise(&mut cell.timestamp);
+    }
+    if count > 0 {
+        ferrosa_common::cell_ts::record_legacy_ns_normalised(
+            ferrosa_common::cell_ts::LegacyNsSource::MemtableWrite,
+            count,
+        );
+        if !LEGACY_NS_WRITE_SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                normalised = count,
+                "a write carried legacy nanosecond timestamps; stored as microseconds \
+                 (t_cf637b6e). Further ones are counted in \
+                 legacy_ns_timestamps_normalised_total{{source=\"memtable_write\"}}, not logged"
+            );
+        }
+    }
+}
+
+/// Set once the first legacy-stamped write of this process has been logged.
+static LEGACY_NS_WRITE_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl SstableDescriptor {
     /// Build a descriptor from a live reader, capturing key/token bounds from
     /// the index footer. The bounds use the same decode precedent as compaction
@@ -318,6 +356,21 @@ impl SstableDescriptor {
             .map(|key| key.token.0)
             .unwrap_or_else(|_| Token::from_key(&max_key).0);
         let header = reader.header();
+        if reader.may_hold_legacy_ns_timestamps() {
+            // Once per SSTable, not per cell: the cells are normalised at decode
+            // and the count lands in legacy_ns_timestamps_normalised_total.
+            let stored = reader.stored_header();
+            tracing::warn!(
+                generation = %gen,
+                dir = %dir.display(),
+                stored_min_timestamp = stored.min_timestamp,
+                stored_max_timestamp = stored.max_timestamp,
+                min_timestamp = header.min_timestamp,
+                max_timestamp = header.max_timestamp,
+                "SSTable holds legacy nanosecond cell timestamps; they are read as microseconds \
+                 and compaction rewrites them (t_cf637b6e)"
+            );
+        }
         Self {
             gen,
             dir,
@@ -3604,7 +3657,12 @@ impl<F: FlushTarget> TableStore<F> {
     /// memtable's flush will not write sidecars for. A writer that meets a
     /// sealed gate reloads the view and writes to the new memtable; no writer
     /// ever waits for a flush.
-    pub fn write(&self, key: &DecoratedKey, row: Row) -> Result<()> {
+    ///
+    /// Legacy nanosecond timestamps are normalised to microseconds before the
+    /// row reaches the indexes or the memtable (t_cf637b6e), so no producer can
+    /// put one where a comparison would see it.
+    pub fn write(&self, key: &DecoratedKey, mut row: Row) -> Result<()> {
+        normalise_legacy_ns_row(&mut row);
         for _ in 0..MAX_SEALED_MEMTABLE_RETRIES {
             let guard = self.view.load();
             if let Some(_admitted) = guard.indexes.gate.try_enter() {

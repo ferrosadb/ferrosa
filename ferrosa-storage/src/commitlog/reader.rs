@@ -54,6 +54,9 @@ pub struct SegmentReader {
     next_marker_offset: u64,
     section_active: bool,
     finished: bool,
+    /// Whether this segment's legacy nanosecond timestamps were already
+    /// logged (once per segment, t_cf637b6e).
+    legacy_ns_reported: bool,
 }
 
 impl SegmentReader {
@@ -84,6 +87,7 @@ impl SegmentReader {
             next_marker_offset: 0,
             section_active: false,
             finished: false,
+            legacy_ns_reported: false,
         })
     }
 
@@ -173,6 +177,13 @@ impl SegmentReader {
             let stored_size_crc =
                 u32::from_be_bytes(entry_header[4..8].try_into().expect("fixed slice"));
             if stored_size_crc != crc32fast::hash(&entry_size_bytes) {
+                // A torn tail is expected after a crash; the rest of this
+                // section is unreadable, so skip to the next sync marker.
+                tracing::warn!(
+                    segment_id = self.descriptor.segment_id,
+                    offset = self.entry_offset,
+                    "commit-log entry size CRC mismatch; skipping to the next sync marker"
+                );
                 self.advance_section();
                 continue;
             }
@@ -206,13 +217,44 @@ impl SegmentReader {
             self.entry_offset = entry_end;
 
             if u32::from_be_bytes(payload_crc) != crc32fast::hash(&payload) {
+                tracing::warn!(
+                    segment_id = self.descriptor.segment_id,
+                    offset = payload_start - 8,
+                    bytes = payload_len,
+                    "commit-log entry payload CRC mismatch; skipping to the next sync marker"
+                );
                 self.advance_section();
                 continue;
             }
 
-            let mutation = match Mutation::deserialize_from(&payload) {
-                Ok(mutation) => mutation,
-                Err(_) => continue,
+            let mutation = match Mutation::deserialize_from_counting_legacy_ns(&payload) {
+                Ok((mutation, legacy_ns)) => {
+                    if legacy_ns > 0 && !self.legacy_ns_reported {
+                        // Once per segment: a pre-fix segment is full of these.
+                        self.legacy_ns_reported = true;
+                        tracing::warn!(
+                            segment_id = self.descriptor.segment_id,
+                            offset = payload_start - 8,
+                            "commit-log segment holds mutations with legacy nanosecond \
+                             timestamps; replay reads them as microseconds (t_cf637b6e)"
+                        );
+                    }
+                    mutation
+                }
+                Err(e) => {
+                    // The CRC matched, so these are the bytes that were written:
+                    // a decode failure is a format problem, not torn I/O. The
+                    // entry is skipped like a corrupt one, but never silently.
+                    tracing::error!(
+                        segment_id = self.descriptor.segment_id,
+                        offset = payload_start - 8,
+                        bytes = payload_len,
+                        error = %e,
+                        "commit-log entry passed its CRC but does not decode as a mutation; \
+                         skipping it during replay"
+                    );
+                    continue;
+                }
             };
             return Ok(Some(SegmentEntryRead::Mutation(
                 CommitLogPosition {
