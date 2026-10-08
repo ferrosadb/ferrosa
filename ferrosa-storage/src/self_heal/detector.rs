@@ -39,6 +39,31 @@ pub fn detect_corrupt_sstables(
     replica_posture: impl FnOnce() -> ReplicaPosture,
 ) -> Option<TableIssue> {
     let corrupt = StorageEngine::scan_table_dir_for_corrupt(table_dir, verified);
+    issue_from_corrupt(table, corrupt, replica_posture)
+}
+
+/// Like [`detect_corrupt_sstables`], but smoke-tests `gens`, a listing of
+/// `table_dir` taken earlier. A generation a compaction retired since the
+/// listing is gone, not corrupt (see
+/// [`StorageEngine::scan_generations_for_corrupt`]). Lets a test pin the
+/// listing on one side of a compaction swap and the smoke tests on the other.
+#[cfg(test)]
+fn detect_corrupt_in_generations(
+    table: &TableKey,
+    table_dir: &Path,
+    gens: &[u64],
+    verified: &mut std::collections::BTreeSet<u64>,
+    replica_posture: impl FnOnce() -> ReplicaPosture,
+) -> Option<TableIssue> {
+    let corrupt = StorageEngine::scan_generations_for_corrupt(table_dir, gens, verified);
+    issue_from_corrupt(table, corrupt, replica_posture)
+}
+
+fn issue_from_corrupt(
+    table: &TableKey,
+    corrupt: Vec<(u64, String)>,
+    replica_posture: impl FnOnce() -> ReplicaPosture,
+) -> Option<TableIssue> {
     if corrupt.is_empty() {
         return None;
     }
@@ -122,6 +147,106 @@ mod tests {
             metrics::self_heal_metrics().corrupt_sstable_detected_total,
             1
         );
+    }
+
+    /// t_4c655232: a generation a compaction swap retires between the
+    /// detector's listing and its smoke test is gone, not corrupt. Before the
+    /// fix the failed open of the retired files was reported as corruption,
+    /// and on a node with no reachable peer the controller escalated the
+    /// table to degraded and stopped healing it.
+    #[test]
+    #[serial]
+    fn generation_retired_after_the_listing_is_not_reported_corrupt() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(3);
+        let table = TableKey::new("test_ks", "test_table");
+        let listing = StorageEngine::list_generations_in_dir(&table_dir);
+        assert_eq!(listing.len(), 3, "fixture must flush three generations");
+
+        // The compaction swap: retire two listed inputs through the real
+        // retirement path, after the listing was taken.
+        for gen in &listing[..2] {
+            assert!(crate::compaction::retire::retire(
+                &table_dir,
+                &gen.to_string()
+            ));
+        }
+
+        let mut verified = std::collections::BTreeSet::new();
+        let issue =
+            detect_corrupt_in_generations(&table, &table_dir, &listing, &mut verified, || {
+                ReplicaPosture::SingleNode
+            });
+        assert!(
+            issue.is_none(),
+            "retired generations must not be reported corrupt: {issue:?}"
+        );
+        assert_eq!(
+            metrics::self_heal_metrics().corrupt_sstable_detected_total,
+            0
+        );
+        assert_eq!(
+            verified,
+            std::collections::BTreeSet::from([listing[2]]),
+            "only the surviving generation was verified"
+        );
+    }
+
+    /// Control for the test above: with the same stale listing, a corrupt
+    /// generation that is still on disk is reported, alongside a retired one
+    /// that is not.
+    #[test]
+    #[serial]
+    fn stale_listing_still_reports_a_live_corrupt_generation() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(3);
+        let table = TableKey::new("test_ks", "test_table");
+        let listing = StorageEngine::list_generations_in_dir(&table_dir);
+        let corrupted = corrupt_one_generation(&table_dir);
+        let retired = *listing.last().expect("three generations");
+        assert_ne!(corrupted, retired);
+        assert!(crate::compaction::retire::retire(
+            &table_dir,
+            &retired.to_string()
+        ));
+
+        let issue = detect_corrupt_in_generations(
+            &table,
+            &table_dir,
+            &listing,
+            &mut std::collections::BTreeSet::new(),
+            || ReplicaPosture::SingleNode,
+        )
+        .expect("a live corrupt generation must surface an issue");
+        let gens: Vec<u64> = issue
+            .corrupt_sstables
+            .iter()
+            .map(|c| c.generation)
+            .collect();
+        assert_eq!(gens, vec![corrupted]);
+    }
+
+    /// The verified cache holds only generations still on disk, so retired
+    /// ones do not accumulate in it for the life of the process.
+    #[test]
+    #[serial]
+    fn scan_drops_retired_generations_from_the_verified_cache() {
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
+        let mut verified = std::collections::BTreeSet::new();
+        assert!(StorageEngine::scan_table_dir_for_corrupt(&table_dir, &mut verified).is_empty());
+        assert_eq!(verified.len(), 2);
+        let gone = *verified.iter().next().expect("two verified");
+        assert!(crate::compaction::retire::retire(
+            &table_dir,
+            &gone.to_string()
+        ));
+
+        assert!(StorageEngine::scan_table_dir_for_corrupt(&table_dir, &mut verified).is_empty());
+        assert!(
+            !verified.contains(&gone),
+            "retired generation left the cache"
+        );
+        assert_eq!(verified.len(), 1);
     }
 
     /// SSTable generations are immutable: once smoke-tested OK they are cached
