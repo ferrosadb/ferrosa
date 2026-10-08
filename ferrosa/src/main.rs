@@ -547,10 +547,14 @@ fn resolve_postgres_bind(file_config: &toml::Value) -> std::net::SocketAddr {
 /// Precedence is **TOML wins** over env (see [`config_val`]): the base
 /// `NetConfig::from_env()` seeds each field from `FERROSA_INTERNODE_*`, then
 /// this helper overwrites any field the config file sets, so a committed TOML
-/// is authoritative. A malformed `[internode].bind`/`broadcast` is logged at
-/// WARN and leaves the env/default value in place. A malformed
-/// `[internode].require_tls` is an `Err`: a typo must never quietly turn the
-/// TLS requirement off (t_d5d122ba).
+/// is authoritative.
+///
+/// A malformed `[internode].bind`, `.broadcast`, or `.require_tls` is an `Err`
+/// naming the offending value: the caller exits non-zero rather than starting on
+/// a different port/endpoint than the operator wrote. Silently falling back to
+/// the env/default port (the historical behaviour) let a one-character typo in
+/// `ferrosa.toml` bring the node up on the wrong internode port — the cluster
+/// never formed and the only signal was a single WARN in the boot log.
 ///
 /// TLS keys: `tls_cert`, `tls_key`, `tls_ca`, `require_tls` (env fallback
 /// `FERROSA_INTERNODE_TLS_CERT` / `_TLS_KEY` / `_TLS_CA` / `_REQUIRE_TLS`).
@@ -564,19 +568,17 @@ fn apply_internode_toml_overrides(
     };
 
     if let Some(v) = internode.get("bind").and_then(|v| v.as_str()) {
-        match v.parse() {
-            Ok(addr) => cfg.bind_addr = addr,
-            Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].bind"),
-        }
+        let addr = v
+            .parse()
+            .map_err(|e| format!("invalid [internode].bind {v:?}: {e}"))?;
+        cfg.bind_addr = addr;
     }
     if let Some(v) = internode.get("broadcast").and_then(|v| v.as_str()) {
-        match v.parse() {
-            Ok(addr) => {
-                cfg.broadcast_addr = addr;
-                cfg.internode_broadcast = Some(v.to_string());
-            }
-            Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].broadcast"),
-        }
+        let addr = v
+            .parse()
+            .map_err(|e| format!("invalid [internode].broadcast {v:?}: {e}"))?;
+        cfg.broadcast_addr = addr;
+        cfg.internode_broadcast = Some(v.to_string());
     }
     if let Some(v) = internode.get("cluster_name").and_then(|v| v.as_str()) {
         cfg.cluster_name = v.to_string();
@@ -4122,14 +4124,54 @@ mod tests {
         assert_eq!(cfg.psk.as_deref(), Some("abc"));
     }
 
-    /// Invalid bind format in TOML must NOT panic — log and move on.
+    /// A malformed `[internode].bind` in the config file must be FATAL, not
+    /// silently ignored.
+    ///
+    /// The env path already refuses to start on a typo (`from_env_checked`),
+    /// and a `[internode] require_tls` typo is fatal; the TOML bind path must
+    /// match, or an operator who edits the port in `ferrosa.toml` and gets it
+    /// slightly wrong has the node come up on a DIFFERENT port than they wrote —
+    /// the cluster never forms and the only signal is one WARN in the boot log.
     #[test]
-    fn apply_internode_toml_overrides_invalid_bind_is_ignored() {
+    fn apply_internode_toml_overrides_invalid_bind_is_fatal() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let toml: toml::Value = toml::from_str("[internode]\nbind = \"not-an-addr\"\n").unwrap();
+        let err = apply_internode_toml_overrides(&mut cfg, &toml)
+            .expect_err("a malformed [internode].bind must refuse startup");
+        assert!(
+            err.contains("not-an-addr"),
+            "the error must name the offending value so an operator can fix it: {err}"
+        );
+    }
+
+    /// A malformed `[internode].broadcast` must also be fatal for the same
+    /// reason: a silently-ignored broadcast leaves the node advertising the
+    /// wrong internode endpoint, so peers dial a port that is not listening.
+    #[test]
+    fn apply_internode_toml_overrides_invalid_broadcast_is_fatal() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let toml: toml::Value =
+            toml::from_str("[internode]\nbroadcast = \"not-an-addr\"\n").unwrap();
+        let err = apply_internode_toml_overrides(&mut cfg, &toml)
+            .expect_err("a malformed [internode].broadcast must refuse startup");
+        assert!(
+            err.contains("not-an-addr"),
+            "the error must name the offending value: {err}"
+        );
+    }
+
+    /// An ABSENT `[internode]` section (or absent bind/broadcast keys) is not an
+    /// error — the env/default value stands.
+    #[test]
+    fn apply_internode_toml_overrides_absent_keys_are_ok() {
         let mut cfg = ferrosa_net::config::NetConfig::default();
         let default_bind = cfg.bind_addr;
-        let toml: toml::Value = toml::from_str("[internode]\nbind = \"not-an-addr\"\n").unwrap();
-        apply_internode_toml_overrides(&mut cfg, &toml).unwrap();
+        let toml: toml::Value =
+            toml::from_str("[internode]\ncluster_name = \"only-this\"\n").unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml)
+            .expect("absent bind/broadcast must not be an error");
         assert_eq!(cfg.bind_addr, default_bind);
+        assert_eq!(cfg.cluster_name, "only-this");
     }
 
     /// A seed *list* in TOML must parse to every entry.
