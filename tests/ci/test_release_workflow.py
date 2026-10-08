@@ -200,6 +200,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("self-contained/libunwind.a", workflow)
         self.assertIn("self-contained/libc.a", workflow)
         self.assertIn("if readelf --program-headers \"$profiling_binary\" | grep 'INTERP'; then", workflow)
+        # Frame pointers, so `perf record --call-graph fp` can unwind through the
+        # musl assembly `memcpy`/`memmove` leaves, which carry no CFI. Without it the
+        # DWARF unwinder stops at those leaves: measured 12,506/16,285 (77 %) of memcpy
+        # samples were 2-frame (`cql-rt;memcpy`) and 6.5 % of CPU was un-attributable.
+        # Profiling image ONLY -- the release build must not pay the register cost.
+        self.assertIn("-C force-frame-pointers=yes", workflow)
 
         build_script = ROOT / ".github" / "scripts" / "build-musl-libunwind.sh"
         script = build_script.read_text(encoding="utf-8")
