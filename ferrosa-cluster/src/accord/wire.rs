@@ -220,6 +220,57 @@ pub enum ReadPredicate {
     /// entirely (no `AccordRead` fan-out). This is the path for a general
     /// multi-key SQL transaction (`BEGIN`/`COMMIT`), which has no LWT condition.
     Always,
+    /// A conditional statement on one row: as [`ReadPredicate::ReadRow`], but
+    /// the replica returns only the row at `clustering` (empty for a table
+    /// without clustering columns), so a wide partition does not cross the
+    /// wire and a write to another row of the partition cannot make the
+    /// replicas' answers differ (t_5504f601).
+    ///
+    /// Appended last so the earlier variants keep their wire tags. A replica
+    /// that predates it cannot decode the vote and does not answer, so the
+    /// coordinator's F+1 agreement fails loud during a rolling upgrade.
+    ReadClusteringRow {
+        /// Keyspace of the target table.
+        keyspace: String,
+        /// Target table name.
+        table: String,
+        /// Serialized clustering of the row the statement writes.
+        clustering: Vec<u8>,
+    },
+}
+
+/// The storage read a row-reading read-vote performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowRead<'a> {
+    /// Keyspace of the target table.
+    pub keyspace: &'a str,
+    /// Target table name.
+    pub table: &'a str,
+    /// The one row to return, or `None` for the whole partition.
+    pub clustering: Option<&'a [u8]>,
+}
+
+impl ReadPredicate {
+    /// The row read this predicate asks replicas for, if it reads one.
+    pub fn row_read(&self) -> Option<RowRead<'_>> {
+        match self {
+            Self::ReadRow { keyspace, table } => Some(RowRead {
+                keyspace,
+                table,
+                clustering: None,
+            }),
+            Self::ReadClusteringRow {
+                keyspace,
+                table,
+                clustering,
+            } => Some(RowRead {
+                keyspace,
+                table,
+                clustering: Some(clustering),
+            }),
+            Self::NotExists | Self::SnapshotBarrier | Self::Always => None,
+        }
+    }
 }
 
 /// Read-vote response from a replica.

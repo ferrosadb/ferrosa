@@ -163,6 +163,61 @@ pub trait StorageReader: Send + Sync + 'static {
         key: &[u8],
         t: Timestamp,
     ) -> Result<Option<Vec<u8>>, RowReadError>;
+
+    /// Read only the row at `clustering` of `(keyspace, table, key)` as of `t`.
+    ///
+    /// Returns the same single-partition [`Mutation`] encoding as
+    /// [`Self::read_row_at`] holding just that row, or `Ok(None)` when the
+    /// row is absent at `t`.
+    fn read_clustering_row_at(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key: &[u8],
+        clustering: &[u8],
+        t: Timestamp,
+    ) -> Result<Option<Vec<u8>>, RowReadError> {
+        match self.read_row_at(keyspace, table, key, t)? {
+            None => Ok(None),
+            Some(partition) => retain_clustering_row(&partition, clustering),
+        }
+    }
+
+    /// Dispatch a read-vote's [`RowRead`](crate::accord::wire::RowRead).
+    fn read_for(
+        &self,
+        read: crate::accord::wire::RowRead<'_>,
+        key: &[u8],
+        t: Timestamp,
+    ) -> Result<Option<Vec<u8>>, RowReadError> {
+        match read.clustering {
+            None => self.read_row_at(read.keyspace, read.table, key, t),
+            Some(clustering) => {
+                self.read_clustering_row_at(read.keyspace, read.table, key, clustering, t)
+            }
+        }
+    }
+}
+
+/// Keep only the row at `clustering` of an encoded single-partition read.
+///
+/// Returns `Ok(None)` when the partition holds no such row. The other fields,
+/// including the zero `mutation_id`, are kept so equal row state still encodes
+/// to equal bytes across replicas.
+pub fn retain_clustering_row(
+    partition: &[u8],
+    clustering: &[u8],
+) -> Result<Option<Vec<u8>>, RowReadError> {
+    let mut mutation = Mutation::deserialize_from(partition).map_err(|e| RowReadError {
+        reason: format!("decode partition read: {e}"),
+    })?;
+    mutation.rows.retain(|row| row.clustering == clustering);
+    if mutation.rows.is_empty() {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; mutation.serialized_size()];
+    mutation.serialize_into(&mut buf);
+    Ok(Some(buf))
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +249,32 @@ impl StorageReader for EngineStorageReader {
         key: &[u8],
         t: Timestamp,
     ) -> Result<Option<Vec<u8>>, RowReadError> {
+        self.read_rows_at(keyspace, table, key, None, t)
+    }
+
+    fn read_clustering_row_at(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key: &[u8],
+        clustering: &[u8],
+        t: Timestamp,
+    ) -> Result<Option<Vec<u8>>, RowReadError> {
+        self.read_rows_at(keyspace, table, key, Some(clustering), t)
+    }
+}
+
+impl EngineStorageReader {
+    /// The live rows of the partition as of `t`, optionally only the row at
+    /// `clustering`, encoded as a single-partition [`Mutation`].
+    fn read_rows_at(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key: &[u8],
+        clustering: Option<&[u8]>,
+        t: Timestamp,
+    ) -> Result<Option<Vec<u8>>, RowReadError> {
         use ferrosa_common::{DecoratedKey, PartitionKey};
         use ferrosa_storage::TableId;
 
@@ -222,6 +303,7 @@ impl StorageReader for EngineStorageReader {
         let rows: Vec<ferrosa_sstable::types::Row> = partition
             .rows
             .into_iter()
+            .filter(|row| clustering.is_none_or(|ck| row.clustering == ck))
             .filter_map(|mut row| {
                 row.cells
                     .retain(|(_, cell)| cell.timestamp <= cell_ts_bound);
@@ -2225,6 +2307,58 @@ mod engine_applier_tests {
             decode_cell0(&bytes).as_deref(),
             Some(b"hello".as_slice()),
             "read_row_at must return the row that was applied at t"
+        );
+    }
+
+    /// A read-vote names the statement's clustering row, and the replica returns
+    /// only that row, so a wide partition does not cross the wire and an
+    /// unrelated row cannot make replicas disagree (t_5504f601).
+    #[test]
+    fn read_clustering_row_at_returns_only_that_row() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+        let reader = EngineStorageReader::new(engine.clone());
+
+        let t = accord_ts(1000);
+        for (n, ck, value) in [(1u64, 1u8, b"first"), (2, 2, b"other")] {
+            let mut row = make_row(value, 1000);
+            row.clustering = vec![0, 0, 0, ck];
+            let m = Mutation::new(
+                KS.to_string(),
+                TABLE.to_string(),
+                make_key("pk1"),
+                vec![row],
+                1000,
+            );
+            let mut buf = vec![0u8; m.serialized_size()];
+            m.serialize_into(&mut buf);
+            applier
+                .apply(
+                    txn(n, 1000),
+                    ApplyMutation {
+                        data: buf,
+                        t,
+                        deps: vec![],
+                    },
+                )
+                .unwrap();
+        }
+
+        let bytes = reader
+            .read_clustering_row_at(KS, TABLE, b"pk1", &[0, 0, 0, 2], t)
+            .expect("read must succeed")
+            .expect("row 2 exists");
+        let m = Mutation::deserialize_from(&bytes).expect("decode");
+        assert_eq!(m.rows.len(), 1, "only the named row is returned");
+        assert_eq!(m.rows[0].clustering, vec![0, 0, 0, 2]);
+        assert_eq!(decode_cell0(&bytes).as_deref(), Some(b"other".as_slice()));
+
+        assert!(
+            reader
+                .read_clustering_row_at(KS, TABLE, b"pk1", &[0, 0, 0, 3], t)
+                .expect("read must succeed")
+                .is_none(),
+            "a row the partition does not hold reads as absent"
         );
     }
 

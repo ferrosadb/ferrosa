@@ -1924,10 +1924,7 @@ impl AccordCoordinatorDriver {
             // coordinator evaluates the IF predicate. Disagreement is a correctness
             // failure (non-linearizable read) and must abort, never silently pick one.
             let mut read_rows: Vec<Vec<u8>> = Vec::new();
-            let is_generic = matches!(
-                self.read_predicate,
-                crate::accord::wire::ReadPredicate::ReadRow { .. }
-            );
+            let is_generic = self.read_predicate.row_read().is_some();
             let is_snapshot_barrier = matches!(
                 self.read_predicate,
                 crate::accord::wire::ReadPredicate::SnapshotBarrier
@@ -1964,9 +1961,7 @@ impl AccordCoordinatorDriver {
                     }
                 }
             } else if is_generic && self_is_replica {
-                if let crate::accord::wire::ReadPredicate::ReadRow { keyspace, table } =
-                    &self.read_predicate
-                {
+                if let Some(read) = self.read_predicate.row_read() {
                     // Prefer the local state machine when wired: it performs the SAME
                     // dep-wait the remote handler does (block until every conflicting
                     // `t0 < t` has Applied locally) before reading at `t`. This is what
@@ -1982,10 +1977,14 @@ impl AccordCoordinatorDriver {
                         )
                         .await
                         {
-                            let (ks, tb, k) = (keyspace.clone(), table.clone(), key.clone());
+                            let predicate = self.read_predicate.clone();
+                            let k = key.clone();
                             let row =
                                 crate::accord::handlers::on_state_machine(local_sm, move |sm| {
-                                    sm.read_row_bytes_at(&ks, &tb, &k, commit_t)
+                                    let read = predicate
+                                        .row_read()
+                                        .expect("a row-reading predicate names its row");
+                                    sm.read_row_bytes_at(read, &k, commit_t)
                                 })
                                 .await;
                             // `None` is a cancelled read (logged): abstain.
@@ -2001,7 +2000,7 @@ impl AccordCoordinatorDriver {
                             // fails loud below rather than treating a stale read as truth.
                         }
                     } else if let Some(reader) = &self.local_reader {
-                        match reader.read_row_at(keyspace, table, &key, commit_t) {
+                        match reader.read_for(read, &key, commit_t) {
                             Ok(bytes) => read_rows.push(bytes.unwrap_or_default()),
                             Err(e) => {
                                 return Err(AccordDriverError::Network(format!(

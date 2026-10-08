@@ -304,13 +304,13 @@ impl AccordStateMachine {
     /// coordinator to decode and evaluate the IF predicate against.
     pub fn read_row_bytes_at(
         &self,
-        keyspace: &str,
-        table: &str,
+        read: crate::accord::wire::RowRead<'_>,
         key: &[u8],
         t: Timestamp,
     ) -> Option<Vec<u8>> {
         let reader = self.reader.as_ref()?;
-        match reader.read_row_at(keyspace, table, key, t) {
+        let (keyspace, table) = (read.keyspace, read.table);
+        match reader.read_for(read, key, t) {
             Ok(bytes) => bytes,
             Err(e) => {
                 // Fail loud in logs; the coordinator treats a missing row-vote as

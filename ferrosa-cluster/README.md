@@ -378,8 +378,15 @@ early acknowledgement.
   unions the accepted quorum's dependencies before Commit. This prevents a
   delayed Accept from dropping a conflict discovered during the first round.
   The read-vote phase is the LWT `IF`-condition gate: every conditional
-  statement, `INSERT IF NOT EXISTS` included, sends `ReadRow`, the replicas read
-  that table's row at `t`, and the coordinator gates on it. `NotExists` is
+  statement, `INSERT IF NOT EXISTS` included, sends `ReadClusteringRow`, the
+  replicas read only that table's row at `t` (`StorageReader::
+  read_clustering_row_at`, t_5504f601), and the coordinator gates on it.
+  `ReadRow` (whole partition) is still answered for older coordinators; the
+  new variant is appended last, so existing wire tags are unchanged. A replica
+  that cannot decode a read-vote now abstains with an error log; one that
+  predates this change echoes the request instead, which the coordinator
+  logs as a malformed vote and does not count, so the round fails with
+  QuorumUnavailable rather than deciding on it. `NotExists` is
   retired: it was answered from the conflict index (partition-key bytes, no
   table), so replicas and the coordinator now refuse it and the transaction
   fails loud (t_7a0acbc8, t_fe2426bb). An unconditional write at SERIAL

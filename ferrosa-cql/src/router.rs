@@ -2919,12 +2919,15 @@ fn accord_read_predicate(
     stmt: &Statement,
     ks: &str,
     table: &str,
+    clustering: &[u8],
 ) -> ferrosa_cluster::accord::ReadPredicate {
     use ferrosa_cluster::accord::ReadPredicate;
     match crate::accord_router::classify_lwt(stmt) {
-        Some(_) => ReadPredicate::ReadRow {
+        // Replicas return only the statement's row (t_5504f601).
+        Some(_) => ReadPredicate::ReadClusteringRow {
             keyspace: ks.to_string(),
             table: table.to_string(),
+            clustering: clustering.to_vec(),
         },
         // An unconditional statement that asked for SERIAL consistency: Accord
         // orders it, and with no condition it always applies.
@@ -3608,7 +3611,7 @@ async fn route_lwt_via_accord(
     // Every conditional statement reads its row of `ks.table` at `t` and the
     // coordinator evaluates the IF clause; see `accord_read_predicate`.
     let is_lwt = crate::accord_router::classify_lwt(stmt).is_some();
-    let read_predicate = accord_read_predicate(stmt, &ks, &table);
+    let read_predicate = accord_read_predicate(stmt, &ks, &table, &clustering);
 
     // A replica-coordinator must cast and persist its own protocol votes against
     // the SAME state machine served by its inbound handlers. A node is absent
@@ -34518,19 +34521,26 @@ mod tests {
         let stmt = crate::parser::parse(cql).unwrap();
         let (ks, table) = lwt_keyspace_table(ctx, &stmt).unwrap();
         let write = build_lwt_mutation(state, ctx, &stmt).expect("build the LWT mutation");
-        let ReadPredicate::ReadRow {
+        let ReadPredicate::ReadClusteringRow {
             keyspace: read_ks,
             table: read_table,
-        } = accord_read_predicate(&stmt, &ks, &table)
+            clustering: read_clustering,
+        } = accord_read_predicate(&stmt, &ks, &table, &write.clustering)
         else {
             panic!("a conditional statement must read its own row at t");
         };
         assert_eq!(
-            (read_ks.as_str(), read_table.as_str()),
-            (ks.as_str(), table.as_str())
+            (read_ks.as_str(), read_table.as_str(), &read_clustering),
+            (ks.as_str(), table.as_str(), &write.clustering)
         );
         let row = EngineStorageReader::new(state.engine.clone())
-            .read_row_at(&read_ks, &read_table, &write.key, Timestamp::synthetic(t))
+            .read_clustering_row_at(
+                &read_ks,
+                &read_table,
+                &write.key,
+                &read_clustering,
+                Timestamp::synthetic(t),
+            )
             .expect("replica read at t");
         lwt_gate_verdict(
             &state.schema,
@@ -34631,7 +34641,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            accord_read_predicate(&stmt, "lwt_x", "head"),
+            accord_read_predicate(&stmt, "lwt_x", "head", &[]),
             ferrosa_cluster::accord::ReadPredicate::Always
         );
     }

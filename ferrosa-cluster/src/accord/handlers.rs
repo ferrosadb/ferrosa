@@ -575,13 +575,13 @@ impl RpcHandler for AccordHandler {
                             //     never taken on a non-quorum / skewed read; and
                             // (3) `EngineStorageReader::read_row_at` bounds cells to
                             //     `ts <= t.time` (as-of-`t`).
-                            ReadPredicate::ReadRow { keyspace, table } => {
-                                let row = sm.read_row_bytes_at(
-                                    keyspace,
-                                    table,
-                                    &vote_req.key,
-                                    vote_req.t,
-                                );
+                            ReadPredicate::ReadRow { .. }
+                            | ReadPredicate::ReadClusteringRow { .. } => {
+                                let read = vote_req
+                                    .predicate
+                                    .row_read()
+                                    .expect("a row-reading predicate names its row");
+                                let row = sm.read_row_bytes_at(read, &vote_req.key, vote_req.t);
                                 (true, row.unwrap_or_default())
                             }
                         })
@@ -595,8 +595,15 @@ impl RpcHandler for AccordHandler {
                     let resp_bytes = bincode::serialize(&ok).ok()?;
                     Some(Message::AccordReadOK(Bytes::from(resp_bytes)))
                 } else {
-                    // Fallback: echo request bytes (backward compat).
-                    Some(Message::AccordReadOK(b))
+                    // An undecodable vote (a predicate from a newer coordinator,
+                    // or corruption) abstains. Echoing the request back, as this
+                    // used to, handed the coordinator bytes it then tried to
+                    // decode as a vote.
+                    tracing::error!(
+                        bytes = b.len(),
+                        "accord: could not decode a ReadVote request — abstaining"
+                    );
+                    Some(Message::AccordReadOK(Bytes::new()))
                 }
             }
 
@@ -933,6 +940,31 @@ mod tests {
     /// (t_7a0acbc8). The replica now abstains, so a coordinator that still
     /// sends it (a pre-upgrade node) fails loud instead of being told a wrong
     /// answer (t_fe2426bb).
+    /// A read-vote this replica cannot decode (a predicate from a newer
+    /// coordinator, or corruption) must abstain. It used to echo the request
+    /// bytes back as the vote, which the coordinator then tried to decode as
+    /// one.
+    #[tokio::test]
+    async fn an_undecodable_read_vote_abstains() {
+        let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let handler = AccordHandler::new(state, 1);
+        let peer: PeerId = (
+            uuid::Uuid::from_u128(3),
+            "127.0.0.1:0".parse().expect("valid socket addr"),
+        );
+        let resp = handler
+            .handle(
+                peer,
+                Message::AccordRead(Bytes::from_static(b"\xff\xfe not a vote")),
+            )
+            .await;
+        assert!(
+            matches!(&resp, Some(Message::AccordReadOK(b)) if b.is_empty()),
+            "an undecodable read-vote must abstain, got {resp:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_not_exists_read_vote_abstains() {
         let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
