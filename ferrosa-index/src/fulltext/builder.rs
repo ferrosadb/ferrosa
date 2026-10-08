@@ -134,6 +134,73 @@ impl FullTextIndexBuilder {
         }
     }
 
+    /// Create a builder whose term map is pre-sized for `terms` distinct terms,
+    /// using the shared [`default_analyzer`].
+    ///
+    /// The term map is the largest allocation on a memtable index build and it
+    /// otherwise grows by rehashing as terms accumulate — each rehash reallocates
+    /// and rehashes every entry. A caller that knows the shape of the data (the
+    /// memtable build estimates from its partition count) can size it once.
+    pub fn with_capacity(terms: usize) -> Self {
+        Self::with_analyzer_and_capacity(default_analyzer(), terms)
+    }
+
+    /// Create a builder with a custom analyzer and a pre-sized term map.
+    pub fn with_analyzer_and_capacity(analyzer: Box<dyn Analyzer>, terms: usize) -> Self {
+        Self {
+            analyzer,
+            index: HashMap::with_capacity(terms),
+            doc_count: 0,
+            total_doc_len: 0,
+        }
+    }
+
+    /// Add a document whose tokens have already been produced, reusing the
+    /// caller's buffers.
+    ///
+    /// Equivalent to [`FullTextIndexBuilder::add_document`] but allocation-free
+    /// for the caller's per-row loop: `tokens` and `tf` are **cleared on entry**
+    /// (they need not be empty) and the analyzer appends into `tokens` via
+    /// [`Analyzer::analyze_into`] rather than returning a fresh `Vec`. On return
+    /// they hold this document's tokens and counts, and are left with their
+    /// capacity intact so the caller can pass the same buffers to the next row.
+    ///
+    /// A scan over N rows therefore does not allocate N token vectors and N maps.
+    pub fn add_document_with_tf(
+        &mut self,
+        partition_key: Vec<u8>,
+        text: &str,
+        tf: &mut HashMap<String, u32>,
+        tokens: &mut Vec<String>,
+    ) {
+        tokens.clear();
+        self.analyzer.analyze_into(text, tokens);
+        if tokens.is_empty() {
+            return;
+        }
+
+        let dl = tokens.len() as u32;
+        self.doc_count += 1;
+        self.total_doc_len += dl as u64;
+
+        tf.clear();
+        for token in tokens.iter() {
+            *tf.entry(token.clone()).or_insert(0) += 1;
+        }
+
+        // Deliberately the SAME shape as `add_document`: push one posting per
+        // (term, document) and let `build()` sort-and-fold repeated keys. Folding
+        // here instead would be a second implementation of the same rule, free to
+        // drift from the one `build()` applies — and `build()`'s fold is what the
+        // readers depend on.
+        for (term, count) in tf.iter() {
+            self.index
+                .entry(term.clone())
+                .or_default()
+                .push((partition_key.clone(), *count, dl));
+        }
+    }
+
     /// Add a document to the index.
     ///
     /// # Arguments

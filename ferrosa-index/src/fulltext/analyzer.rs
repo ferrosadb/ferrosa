@@ -16,6 +16,22 @@ use std::collections::{HashMap, HashSet};
 pub trait Analyzer: Send + Sync {
     /// Analyze `text` and return the resulting tokens.
     fn analyze(&self, text: &str) -> Vec<String>;
+
+    /// Analyze `text`, appending tokens to `out` instead of allocating a fresh
+    /// `Vec` per call.
+    ///
+    /// The index build analyzes one row at a time and only needs the tokens
+    /// long enough to fold them into a term-frequency map, so a caller that
+    /// loops over rows must not pay an allocation per row. `out` is cleared and
+    /// reused. Term strings are still owned (`Vec<String>`), so this removes the
+    /// container allocation, not the per-token one — a full borrowed-token API
+    /// would need `Cow<'_, str>` and is a larger change.
+    ///
+    /// Default: fall back to [`Analyzer::analyze`], so an implementation that
+    /// does not override this stays correct (it just keeps the old allocation).
+    fn analyze_into(&self, text: &str, out: &mut Vec<String>) {
+        out.extend(self.analyze(text));
+    }
 }
 
 // ── StandardAnalyzer ─────────────────────────────────────────────────────────
@@ -63,6 +79,19 @@ impl Analyzer for StandardAnalyzer {
             .filter(|t| !self.stop_words.contains(*t))
             .map(|t| t.to_string())
             .collect()
+    }
+
+    /// Native buffer-reusing form: same tokens, same order, same filtering as
+    /// [`StandardAnalyzer::analyze`], but the caller's `Vec` is reused across
+    /// calls instead of a fresh one per row.
+    fn analyze_into(&self, text: &str, out: &mut Vec<String>) {
+        let lowered = text.to_lowercase();
+        for token in lowered.split(|c: char| !c.is_alphanumeric()) {
+            if token.is_empty() || self.stop_words.contains(token) {
+                continue;
+            }
+            out.push(token.to_string());
+        }
     }
 }
 

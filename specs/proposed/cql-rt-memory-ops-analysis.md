@@ -156,78 +156,137 @@ structure the shipped binary never instantiates. **It also cannot be the regress
 
 The live backend is **`SkipListMemtable`** — `SkipMap<DecoratedKey, RwLock<Arc<Partition>>>`.
 
-### 2. The lock site the user identified is real: `parking_lot::RwLock` at 2.43 %
+### 2. The live mechanism: refcount inflation → `Arc::make_mut` copy-on-write
 
-Per-scan cost of **my** change (commit `654eae6d`), on the live path. The three
-read-only scans moved from `snapshot()` to `range_iter`:
-
-| | `snapshot()` (before) | `range_iter` (mine) |
-|---|---|---|
-| iteration | `map.iter()` | `map.iter()` (.iter().filter()) |
-| clone | **deep-clone every partition** (`(**entry.value().read()).clone()`) → `.collect::<Vec<Partition>>()` → **all value `read()`s dropped when the Vec is built** | `Arc::clone(&entry.value().read())` — **value `read()` held for the whole scan** |
-
-Same per-entry **read-lock acquisition**, same traversal. The difference is
-**tenure and shape**:
-
-- `snapshot()` **drains to an owned `Vec`** — the lock traffic is a short burst inside
-  one call, then the scan proceeds lock-free over the copy.
-- `range_iter()` is **lazy** — the `read()` guard is held *while the consumer walks*,
-  which on the read path is *interleaved with writer `put`s*. So a reader now holds
-  partition value locks across far more wall-clock time, against 512 writer threads
-  that write-lock the same per-partition `RwLock` (SkipMap `insert` is lock-free, but
-  the value merge is a write lock).
-
-Add: `filter()` on every entry (two bound comparisons) and `start`/`end` **clones**
-(`skiplist.rs:184-185`) — the pre-change path filtered inside the collect.
-
-That is a **contention-window** regression, not an extra-lock-per-element one, and it
-is on exactly the hot path 512 writers touch. It also explains the p99 jump: writer
-p99 rises when locks are held longer by readers.
-
-### 3. The fulltext build walks the table TWICE
-
-`store.rs:9307-9311` (introduced by my change):
+**Correction (second pass).** The first explanation blamed "lock tenure" — the claim
+that `range_iter` holds each partition's value `read()` guard across the consumer's
+walk. That is **wrong**, and the code says so:
 
 ```rust
-for partition in guard.active.range_iter(None, None)     { add_partition(&partition); }
-for flushing in guard.flushing.iter() {
-    for partition in flushing.range_iter(None, None)     { add_partition(&partition); }
-}
+.map(|entry| Arc::clone(&entry.value().read()))   // skiplist.rs:195
 ```
 
-Both walks happen **while `guard` (the whole-store guard) is held**, and the outer
-`guard.active` / `guard.flushing` accessors are themselves lock acquisitions. The old
-code snapshotted into owned data and could drop locks before building. So the hold
-window here is longer than before in the worst place.
+The `read()` guard is a **temporary inside the `map` closure**: acquired, the `Arc`
+cloned, **released** — per element. `snapshot()` did exactly the same per-element
+acquire/release (`(**entry.value().read()).clone()`). So per-entry lock acquisition
+AND tenure are both unchanged. Readers never held a lock across a scan, and readers
+blocking readers is not the issue.
+
+What actually changed is which of two things the guard's critical section produces:
+
+| | `snapshot()` (pre-#541) | `range_iter` (#541) |
+|---|---|---|
+| guard | temporary per element | temporary per element — **same** |
+| what is cloned | `Partition` (deep) → owned `Vec<Partition>` | `Arc<Partition>` → handed to the consumer |
+| **strong count after the guard drops** | **1** — nothing holds it | **2** — the consumer holds it |
+| writer cost when a `put` collides | in place — 3 allocations | **1210 allocations for a 400-row partition** |
+
+`SkipListMemtable::put` merges through `Arc::make_mut(&mut guard)`, which is
+**copy-on-write**: at refcount > 1 it deep-clones the whole partition before
+mutating. `snapshot()` deep-cloned on the *reader's* side and left the count at 1,
+so it never charged the writer. `range_iter` hands the consumer a refcounted clone,
+so **every write landing while a scan holds partitions pays an O(rows-in-partition)
+clone** — the O(N^2) fill pathology `e440b60f` removed, i.e. the fix for this exact
+regression. This is why the t512 throughput drops while CPU per request falls: the
+writer is doing allocator/drop work on a slower path rather than useful work.
+
+**Measured, not inferred** (`ferrosa-storage/tests/refcount_cow_probe.rs`):
+
+```
+baseline (no reader holding Arc):        3 allocs
+with reader holding Arc (400 rows):  1,210 allocs   ← COW deep clone
+```
+
+`filter()` + per-entry bound comparisons and the `start`/`end` clones are real but
+secondary — a few comparisons against an O(rows) clone.
+
+### 3. The fulltext build scans the writable tier on the query path
+
+**Correction.** Pre-#541 already walked the table twice
+(`git show origin/main:ferrosa-storage/src/store.rs` → `add_partitions(guard.active.snapshot())`
+then `for flushing in guard.flushing...`), so the double walk is **pre-existing, not
+introduced here**. Two things about it are still wrong:
+
+1. It scans the **active** memtable — the tier writers are filling — on a query
+   path, so the read/write overlap above is at its worst here.
+2. The index is rebuilt **from scratch on every query**: `FullTextIndexBuilder::new()`
+   → analyze every row of active + flushing → `build()` → search → drop. There is no
+   cache (`fti_cache`/`LazyLock` in `store.rs`: nothing). A query against an N-row
+   memtable re-analyzes N rows, and `analyze()` allocates per row
+   (`to_lowercase()` + 1 `String` per token + `Vec` + `HashMap` + per-term key clones).
+
+(3) is the dominant cost on this path and needs cache invalidation or an incremental
+memtable index — out of scope here, recorded as follow-up.
 
 ### 4. What the fix must NOT be
 
 - **Do not revert to `snapshot()`** — it deep-clones the entire table to serve a
-  mostly-empty check (the late-writer drains replay nothing on a healthy cluster). The
-  user's rule stands: read paths must not materialize the table.
-- **Do not "fix" `sharded.rs`** — it is not live. My rewrite there is inert; the honest
-  move is to keep it (it is a correct lazy iterator with tests) but stop citing it as
-  the regression cause, and stop counting its memory win as a production gain.
+  mostly-empty check (the late-writer drains replay nothing on a healthy cluster),
+  and materializing on a read path breaks the streaming rule.
+- **Do not "fix" `sharded.rs`** — it is not live (see §1). The rewrite there is inert.
+- **Do not use `ArcSwap<Partition>` on the value.** This was already implemented and
+  reverted (`e440b60f`): `arc_swap` has no `DerefMut`, so publishing a changed value
+  requires building a new one → O(rows) per write → O(N^2) fill, 2,109,500 allocations
+  for 1000 writes, 52% wall time in `drop_slow`, ~95% CPU for 18 minutes with no CQL
+  listener. The earlier draft of this section proposed it; that was wrong.
 
-### 5. The lock-free direction (user's point, and it is the real lever)
+### 5. The fix that landed (this PR)
 
-`ferrosa-storage/Cargo.toml` says the skiplist "uses crossbeam's concurrent map plus
-per-partition CAS updates instead". It does **not** — the value is a
-`parking_lot::RwLock<Arc<Partition>>` (2.43 % self in the profile), and `arc_swap`
-is already in the dependency tree (31 frames, 2.08 %). Two credible shapes:
+Read paths must **borrow** rather than hand out a refcounted `Arc`:
 
-1. **`ArcSwap<Partition>` per value** instead of `RwLock<Arc<Partition>>`: read locks
-   disappear entirely (`load()` is a lock-free atomic load), so a scan holds **zero
-   locks**. The write merge becomes `rcu`-style load → modify → `store`, retried on
-   CAS failure. This is the standard read-optimized/copy-on-write memtable shape and
-   directly removes the 2.43 % and the contention window above.
-2. **Drop `range_iter` as the read-path scan** for the late-writer drains: those
-   checks are *identity comparisons of already-known keys* — they do not need to walk
-   the table at all. Ask the bounded question (does key X exist, and is it later than
-   the seal?) via point lookups instead of a full unordered scan.
+- **`Memtable::for_each_partition(start, end, &mut FnMut(&Partition))`** — borrows each
+  partition for the callback and never clones the `Arc`, so the memtable stays the sole
+  owner and concurrent writes keep merging in place (I-2). The read guard IS held across
+  the callback, which is sound (readers don't block readers) and required: without it
+  `Arc::make_mut` would mutate the partition under a reader. Callbacks must be short.
+- **`Memtable::for_each_partition_cloned(..)`** — for callbacks that do real work per
+  row (the fulltext build). Deep-clones under the guard, **releases it**, then calls back.
+  A writer waits for one memcpy, not for the whole analysis (I-5). Deliberately
+  `(**guard).clone()`, never `guard.clone()`: the latter resolves through `Deref` to
+  `Arc::clone` and would silently re-introduce the refcount inflation this exists to
+  remove. A `debug_assert_eq!(strong_count, 1)` pins it.
+- **`Memtable::write_epoch()`** — O(1) "did anything land after the snapshot?", so the
+  late-writer drains skip their whole-table walk on a healthy cluster. `UNTRACKED_WRITE_EPOCH`
+  means "rescan", so an implementation that forgets to track it stays safe (I-1).
+- **All three read-only sites** moved off `range_iter` (both late-writer drains + the
+  fulltext build), and the fulltext build now reuses hoisted scratch
+  (`RowScratch` + `Analyzer::analyze_into` + `add_document_with_tf` +
+  `FullTextIndexBuilder::with_capacity`), removing the per-row allocations.
 
-Both preserve streaming (no materialization) and both are invariant-testable: value
-visibility must obey the same rules, and no row may be lost or reordered.
+Why not "just make `range_iter` lazy-but-bulk-drain" as originally suggested: that
+restores the deep clone of every partition on every scan — a CPU-for-memory trade in
+the wrong direction, and it violates the no-materialization rule.
+
+### 6. Invariants pinned by this PR
+
+- **I-1 no data loss** — the late-writer drain still catches every write after the
+  snapshot; `write_epoch` may only skip the walk when provably unchanged.
+- **I-2 no refcount inflation on read paths** — a borrowed scan leaves the memtable the
+  sole owner, so concurrent writes merge in place.
+- **I-3 complete and ordered** — visits match `snapshot` on count, order and content.
+- **I-4 no materialization** — one partition live at a time, never the table.
+- **I-5 bounded blocking** — the cloned visit releases the guard before the callback.
+- **I-6 identical index** — the reused-scratch fulltext build is byte-identical to the
+  old per-row-allocating path.
+- **I-8 no per-row allocation growth** — the fulltext build's per-row cost does not
+  grow with how much is already indexed.
+
+Tests: `ferrosa-storage/tests/memtable_read_does_not_block_writes.rs` (8 tests, incl.
+two negative controls that fail if the guard loses its teeth),
+`ferrosa-storage/tests/fulltext_scratch_equivalence.rs` (4 tests),
+`ferrosa-storage/tests/refcount_cow_probe.rs` (the measurement behind §2).
+
+### 7. Follow-ups (not in this PR)
+
+- **The transient memtable FTI is rebuilt per query.** Cache it (invalidate on write /
+  memtable rotation) or build it incrementally. This is the dominant cost on the
+  fulltext path — larger than everything above.
+- **`ArcSwap`-style lock-free reads** are *not* the answer (see §4), but a memtable
+  that publishes immutable partitions (build a new `Partition`, then swap) would let
+  reads be lock-free *and* keep writes O(1) — the opposite of the reverted design. Worth
+  evaluating separately, with the O(N^2) write test as the gate.
+- **`analyze()` still allocates a `String` per token.** Removing it needs `Cow<'_, str>`
+  tokens; measured only after the per-query rebuild is addressed.
 
 
 ## Design: reusable response buffer (proposal)

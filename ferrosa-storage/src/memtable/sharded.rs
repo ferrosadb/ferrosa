@@ -80,6 +80,9 @@ pub struct ShardedBTreeMemtable {
     /// Smallest timestamp of anything accepted by `put` (`i64::MAX` when empty).
     /// Lowered BEFORE the row is stored, so it never reads higher than the data.
     min_ts: AtomicI64,
+    /// Every accepted `put`, so a reader can tell in O(1) whether anything was
+    /// written since it looked (see [`Memtable::write_epoch`]).
+    write_epoch: AtomicUsize,
 }
 
 impl ShardedBTreeMemtable {
@@ -96,6 +99,7 @@ impl ShardedBTreeMemtable {
             count: AtomicUsize::new(0),
             write_contention_count: AtomicUsize::new(0),
             min_ts: AtomicI64::new(i64::MAX),
+            write_epoch: AtomicUsize::new(0),
         }
     }
 
@@ -262,6 +266,10 @@ impl Memtable for ShardedBTreeMemtable {
             self.size.fetch_add(size, Ordering::Relaxed);
         }
 
+        // Record the write only after it is in the partition, so a rejected row
+        // cannot make a reader believe something landed (I-1: the epoch must be
+        // exact in the conservative direction — never skip a real late write).
+        self.write_epoch.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -351,6 +359,73 @@ impl Memtable for ShardedBTreeMemtable {
 
     fn partition_count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    /// Borrowed read-only scan; see [`Memtable::for_each_partition`] for why
+    /// handing out an owned `Arc` is a write-path regression. Holds one shard's
+    /// read lock per shard (not per partition), so a writer to a *different*
+    /// shard never waits and a writer to the same shard waits at most for the
+    /// shard to drain.
+    ///
+    /// Not token-ordered across shards: this backend shards by `token % n`, so
+    /// adjacent tokens scatter. Callers that need global order must use
+    /// `range_iter`; the read-only consumers of this method (fulltext build,
+    /// late-writer drain) do not.
+    fn for_each_partition(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        f: &mut dyn FnMut(&Partition),
+    ) {
+        let in_range =
+            |key: &DecoratedKey| start.is_none_or(|s| key >= s) && end.is_none_or(|e| key <= e);
+        for shard in &self.shards {
+            let guard = shard.read();
+            for (key, arc) in guard.iter() {
+                if in_range(key) {
+                    // Borrowed: never `Arc::clone`, so a concurrent writer keeps
+                    // merging in place instead of hitting `Arc::make_mut`'s COW.
+                    f(arc);
+                }
+            }
+        }
+    }
+
+    /// Every accepted `put` on this memtable; see [`Memtable::write_epoch`].
+    fn write_epoch(&self) -> u64 {
+        self.write_epoch.load(Ordering::Acquire) as u64
+    }
+
+    /// Bounded-hold variant; see [`Memtable::for_each_partition_cloned`].
+    ///
+    /// Takes ONE shard read lock, clones the in-range partitions, drops the
+    /// lock, then runs the callbacks against the clones. A writer therefore
+    /// contends for at most one shard-wide clone, never for the consumer's work.
+    /// Cloning into a local Vec here does not materialize the memtable for the
+    /// consumer — the consumer still sees one partition at a time, and only one
+    /// shard's worth of clones is live at once.
+    fn for_each_partition_cloned(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        f: &mut dyn FnMut(&Partition),
+    ) {
+        let in_range =
+            |key: &DecoratedKey| start.is_none_or(|s| key >= s) && end.is_none_or(|e| key <= e);
+        for shard in &self.shards {
+            let staged: Vec<Partition> = {
+                let guard = shard.read();
+                guard
+                    .iter()
+                    .filter(|(key, _)| in_range(key))
+                    .map(|(_, arc)| (**arc).clone())
+                    .collect()
+            };
+            // Guard released here; consumers run against owned clones.
+            for partition in &staged {
+                f(partition);
+            }
+        }
     }
 
     fn min_timestamp(&self) -> i64 {
