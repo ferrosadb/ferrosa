@@ -278,15 +278,22 @@ two negative controls that fail if the guard loses its teeth),
 
 ### 7. Follow-ups (not in this PR)
 
-- **Same defect class, PRE-EXISTING, at three more sites.** `store.rs` builds
-  `Vec<Arc<Partition>>` from `guard.active.range_iter(..)` at three read-only scan
-  points (the token-range vector/`walk_token_range` helpers, ~6440 / 6650 / 7112 /
-  7462 region) — collecting owned `Arc`s, so the same refcount inflation taxes
-  concurrent writes during a vector or digest scan. These are on `origin/main`
-  already (3 occurrences of the `Vec<Arc<Partition>> = guard` shape there), i.e. not
-  introduced by #541, and they are bounded scans so the fix is the same
-  `for_each_partition`/borrowed sweep. Out of scope here to keep the regression fix
-  reviewable — recorded so it is not lost.
+- **Same defect class, same-class sweep DONE.** `store.rs` had four more read-only
+  scans of the **active** memtable through `range_iter(..)` — `read_token_range_once`,
+  the token-range vector producer, `walk_token_range_for_digest`, and the
+  vector-search source builder. All converted to the borrowed scan with a fresh
+  `Arc::new(p.clone())` for the consumer, so the memtable keeps sole ownership.
+  They were on `origin/main` already (pre-existing, not from #541) and are cold in
+  the write profile (`read_token_range` 0 frames, `walk_token_range` 0.075 %,
+  digest 0.182 %), so that sweep is ownership correctness rather than a benchmark
+  win.
+  **Key scoping rule:** only the **active** tier carries this tax. Sealed/flushing
+  memtables accept no writes, so consumers may hold their `Arc`s freely — do not
+  "fix" those.
+  `for_each_partition` now takes `-> bool` (return `false` to stop): the borrowed
+  scan walks the whole table otherwise, so converting a bounded `range_iter` loop
+  into it would turn an O(matches) read into an O(table) walk *and* an O(table)
+  lock sweep.
 - **The transient memtable FTI is rebuilt per query.** Cache it (invalidate on write /
   memtable rotation) or build it incrementally. This is the dominant cost on the
   fulltext path — larger than everything above.
