@@ -2791,6 +2791,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage: storage.clone(),
         host_id,
         auth_disabled,
+        // Reuse successful console credential checks (bcrypt cost=12 per request
+        // otherwise). Bound to the schema snapshot, so a password/role change
+        // invalidates it at once; `FERROSA_WEB_AUTH_CACHE_TTL_SECS=0` disables it.
+        auth_cache: std::sync::Arc::new(web::auth_cache::AuthCache::from_env()),
         debug: Some(web::debug::DebugState::new()),
         listeners: listener_status.clone(),
         supervision: supervision_status.clone(),
