@@ -255,6 +255,13 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   Conditions inside `BEGIN TRANSACTION` blocks and inside any `BATCH`
   (logged/unlogged/counter) are rejected with the typed
   `CqlError::ConditionalUnsupported` (code 0x2200) before anything is written.
+  **In cluster mode every condition, `IF NOT EXISTS` included, is evaluated on
+  the statement's own row (t_7a0acbc8).** Replicas read the statement's row of
+  the target table at the agreed `t` (`ReadPredicate::ReadClusteringRow`, which
+  returns that one row, t_5504f601); the coordinator evaluates the condition on
+  the row at the statement's clustering and gates the write with
+  `eval_lwt_for_statement`. A row with the same key in another table, or another
+  row of the partition, does not satisfy or fail the condition.
 - **SUBSCRIBE / CDC** (`subscribe.rs`, `event.rs`) — per-connection streaming
   subscriptions that re-run an inner SELECT on an interval and push delta frames;
   dual-timestamp (Accord ts + apply ts) events; CQL `EVENT` push via a broadcast

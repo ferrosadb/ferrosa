@@ -36,6 +36,9 @@ pub struct TableRow {
     /// implement CDC.  Default `false`.
     /// See ferrosa-nosqlbench/docs/initial-gaps-found.md (Gap 7).
     pub cdc: bool,
+    /// Table flags as Cassandra reports them (`compound`, `counter`, ...),
+    /// sorted. Drivers derive compact storage from this set (t_cd650102).
+    pub flags: Vec<String>,
 }
 
 /// A row from `system_schema.columns`.
@@ -179,8 +182,37 @@ pub fn query_tables(snap: &SchemaSnapshot) -> Vec<TableRow> {
         table_name: t.name.clone(),
         id: t.id,
         cdc: false,
+        flags: table_flags(t),
     }));
     rows
+}
+
+/// The `flags` Cassandra reports for a CQL table: `compound` always, `counter`
+/// when it has a counter column, and any stored legacy `dense`/`super` flag.
+fn table_flags(t: &crate::metadata::table::TableMetadata) -> Vec<String> {
+    use crate::metadata::table::TableFlag;
+    let mut flags = vec!["compound".to_string()];
+    let has_counter = t.columns.values().any(|c| c.column_type == "counter");
+    if has_counter || t.flags.contains(&TableFlag::Counter) {
+        flags.push("counter".to_string());
+    }
+    if t.flags.contains(&TableFlag::Dense) {
+        flags.push("dense".to_string());
+    }
+    if t.flags.contains(&TableFlag::Super) {
+        flags.push("super".to_string());
+    }
+    flags.sort();
+    flags
+}
+
+/// Cassandra gives only key columns an ordinal; regular and static columns
+/// report `-1`.
+fn reported_position(c: &crate::metadata::column::ColumnMetadata) -> i32 {
+    match c.kind {
+        ColumnKind::PartitionKey | ColumnKind::Clustering => c.position,
+        ColumnKind::Regular | ColumnKind::Static => -1,
+    }
 }
 
 /// Query `system_schema.columns` from a snapshot.
@@ -199,7 +231,7 @@ pub fn query_columns(snap: &SchemaSnapshot) -> Vec<ColumnRow> {
                 ColumnKind::Regular => "regular".to_string(),
                 ColumnKind::Static => "static".to_string(),
             },
-            position: c.position,
+            position: reported_position(c),
             // p1-37: scylla 0.15 driver's CQL type parser doesn't recognize
             // `vector<...>` types and rejects the whole metadata fetch.
             // Advertise vectors as `blob` to drivers — the on-disk
@@ -274,6 +306,7 @@ fn system_table_rows() -> Vec<TableRow> {
             table_name: tbl.to_string(),
             id: Uuid::new_v4(),
             cdc: false,
+            flags: vec!["compound".to_string()],
         })
         .collect()
 }
@@ -756,6 +789,77 @@ mod tests {
         assert_eq!(user_rows[0].table_name, "t1");
         // Should also include system tables
         assert!(rows.len() > 1);
+    }
+
+    /// Drivers derive compact storage from `flags`; an empty or missing set
+    /// reads as a compact static table and the clustering key is dropped
+    /// (t_cd650102). Cassandra reports `compound` for every CQL table and adds
+    /// `counter` for a counter table.
+    #[test]
+    fn query_tables_reports_cassandra_flags() {
+        let mut snap = SchemaSnapshot::new();
+        snap.tables.insert(
+            ("ks1".to_string(), "plain".to_string()),
+            test_table_meta("ks1", "plain"),
+        );
+        let mut counters = test_table_meta("ks1", "counts");
+        let mut hits = test_column("hits", ColumnKind::Regular);
+        hits.column_type = "counter".to_string();
+        counters.columns.insert("hits".to_string(), hits);
+        snap.tables
+            .insert(("ks1".to_string(), "counts".to_string()), counters);
+
+        let rows = query_tables(&snap);
+        let flags_of = |name: &str| {
+            rows.iter()
+                .find(|r| r.keyspace_name == "ks1" && r.table_name == name)
+                .map(|r| r.flags.clone())
+                .expect("table row")
+        };
+        assert_eq!(flags_of("plain"), vec!["compound".to_string()]);
+        assert_eq!(
+            flags_of("counts"),
+            vec!["compound".to_string(), "counter".to_string()]
+        );
+        assert!(
+            rows.iter()
+                .filter(|r| r.keyspace_name == "system_schema")
+                .all(|r| r.flags.contains(&"compound".to_string())),
+            "system tables are CQL tables too"
+        );
+    }
+
+    /// Cassandra reports `position = -1` for regular and static columns; only
+    /// key columns have an ordinal (t_cd650102).
+    #[test]
+    fn query_columns_reports_minus_one_for_non_key_positions() {
+        let mut snap = SchemaSnapshot::new();
+        let mut table = test_table_meta("ks1", "t1");
+        let mut ck = test_column("ck", ColumnKind::Clustering);
+        ck.position = 0;
+        table.columns.insert(
+            "pk".to_string(),
+            test_column("pk", ColumnKind::PartitionKey),
+        );
+        table.columns.insert("ck".to_string(), ck);
+        table
+            .columns
+            .insert("v".to_string(), test_column("v", ColumnKind::Regular));
+        table
+            .columns
+            .insert("s".to_string(), test_column("s", ColumnKind::Static));
+        snap.tables
+            .insert(("ks1".to_string(), "t1".to_string()), table);
+
+        let positions: HashMap<String, i32> = query_columns(&snap)
+            .into_iter()
+            .filter(|r| r.keyspace_name == "ks1")
+            .map(|r| (r.column_name, r.position))
+            .collect();
+        assert_eq!(positions["pk"], 0);
+        assert_eq!(positions["ck"], 0);
+        assert_eq!(positions["v"], -1);
+        assert_eq!(positions["s"], -1);
     }
 
     #[test]

@@ -185,8 +185,20 @@ pub(crate) struct ReadVotePayload {
 /// with the canonical `eval_if_conditions`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ReadPredicate {
-    /// `INSERT IF NOT EXISTS`: condition holds iff the row does NOT exist at `t`.
-    /// Evaluated on the replica via the existence path (no schema needed).
+    /// Retired, kept only so its wire tag decodes. Replicas and the
+    /// coordinator's own replica REFUSE it (abstain), so a transaction carrying
+    /// it cannot reach F+1 and fails loud.
+    ///
+    /// It used to be answered from the Accord conflict index, keyed by
+    /// partition-key bytes with no table or clustering: an earlier Accord write
+    /// with the same key bytes in another table, or to another row, read as
+    /// "exists" (t_7a0acbc8), and a row written without Accord was never seen.
+    /// `INSERT IF NOT EXISTS` now sends [`ReadPredicate::ReadRow`] and the
+    /// coordinator gates on the row it reads (t_fe2426bb).
+    ///
+    /// It stays the default so a driver built without an explicit predicate,
+    /// or a pre-upgrade peer that omits the field, fails closed instead of
+    /// applying unconditionally.
     #[default]
     NotExists,
     /// Generic `IF <conditions>`: the replica reads the row at `t` and returns
@@ -208,6 +220,57 @@ pub enum ReadPredicate {
     /// entirely (no `AccordRead` fan-out). This is the path for a general
     /// multi-key SQL transaction (`BEGIN`/`COMMIT`), which has no LWT condition.
     Always,
+    /// A conditional statement on one row: as [`ReadPredicate::ReadRow`], but
+    /// the replica returns only the row at `clustering` (empty for a table
+    /// without clustering columns), so a wide partition does not cross the
+    /// wire and a write to another row of the partition cannot make the
+    /// replicas' answers differ (t_5504f601).
+    ///
+    /// Appended last so the earlier variants keep their wire tags. A replica
+    /// that predates it cannot decode the vote and does not answer, so the
+    /// coordinator's F+1 agreement fails loud during a rolling upgrade.
+    ReadClusteringRow {
+        /// Keyspace of the target table.
+        keyspace: String,
+        /// Target table name.
+        table: String,
+        /// Serialized clustering of the row the statement writes.
+        clustering: Vec<u8>,
+    },
+}
+
+/// The storage read a row-reading read-vote performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowRead<'a> {
+    /// Keyspace of the target table.
+    pub keyspace: &'a str,
+    /// Target table name.
+    pub table: &'a str,
+    /// The one row to return, or `None` for the whole partition.
+    pub clustering: Option<&'a [u8]>,
+}
+
+impl ReadPredicate {
+    /// The row read this predicate asks replicas for, if it reads one.
+    pub fn row_read(&self) -> Option<RowRead<'_>> {
+        match self {
+            Self::ReadRow { keyspace, table } => Some(RowRead {
+                keyspace,
+                table,
+                clustering: None,
+            }),
+            Self::ReadClusteringRow {
+                keyspace,
+                table,
+                clustering,
+            } => Some(RowRead {
+                keyspace,
+                table,
+                clustering: Some(clustering),
+            }),
+            Self::NotExists | Self::SnapshotBarrier | Self::Always => None,
+        }
+    }
 }
 
 /// Read-vote response from a replica.

@@ -48,7 +48,9 @@ sequenceDiagram
 LWT variants (`IF NOT EXISTS` / `IF <cond>` with serial consistency) branch at
 `route()` into `accord_router::route_lwt_via_accord` when `peer_manager` and
 `accord_clock` are present; in standalone/pair mode that path fails loud with a
-`ServerError` (FMEA CQL-1).
+`ServerError` (FMEA CQL-1). In the read-vote, each replica reads the target
+table's partition at `t`, and the coordinator evaluates the IF clause on the
+row at the statement's clustering (FMEA CQL-T7a0acbc8).
 
 ## SELECT path (read)
 
