@@ -156,13 +156,13 @@ pub(crate) mod inflight {
 /// only its (range-filtered) match count. In production builds the gauge
 /// compiles away and this is a plain peekable iterator.
 struct PartitionSource {
-    inner: std::iter::Peekable<std::vec::IntoIter<Partition>>,
+    inner: std::iter::Peekable<std::vec::IntoIter<Arc<Partition>>>,
     #[cfg(test)]
     _guard: inflight::Guard,
 }
 
 impl PartitionSource {
-    fn new(partitions: Vec<Partition>) -> Self {
+    fn new(partitions: Vec<Arc<Partition>>) -> Self {
         #[cfg(test)]
         let _guard = inflight::Guard::new(partitions.len());
         Self {
@@ -172,11 +172,11 @@ impl PartitionSource {
         }
     }
 
-    fn peek(&mut self) -> Option<&Partition> {
+    fn peek(&mut self) -> Option<&Arc<Partition>> {
         self.inner.peek()
     }
 
-    fn next(&mut self) -> Option<Partition> {
+    fn next(&mut self) -> Option<Arc<Partition>> {
         self.inner.next()
     }
 }
@@ -1841,7 +1841,7 @@ enum Delivery {
     Gone,
     /// The channel was full. The item comes back so the scan can pause
     /// holding it.
-    Stalled(Result<Partition>),
+    Stalled(Result<Arc<Partition>>),
 }
 
 /// Hand `item` to the consumer. When the channel is full, give up the pool
@@ -1861,8 +1861,8 @@ enum Delivery {
 /// cheap.
 fn deliver_or_pause(
     slot: &mut ferrosa_sched::ScanSlot,
-    tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
-    item: Result<Partition>,
+    tx: &tokio::sync::mpsc::Sender<Result<Arc<Partition>>>,
+    item: Result<Arc<Partition>>,
 ) -> Delivery {
     use tokio::sync::mpsc::error::TrySendError;
     match tx.try_send(item) {
@@ -1883,7 +1883,7 @@ trait PausableScan: Send + 'static {
     fn run(
         &mut self,
         slot: &mut ferrosa_sched::ScanSlot,
-        tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+        tx: &tokio::sync::mpsc::Sender<Result<Arc<Partition>>>,
     ) -> ScanRun;
 }
 
@@ -1894,7 +1894,7 @@ enum ScanRun {
     Finished,
     /// The consumer stopped reading. The item it would not take is handed to
     /// the supervisor, which delivers it when there is room and then resumes.
-    Paused(Result<Partition>),
+    Paused(Result<Arc<Partition>>),
     /// A more deserving scan waited at a budget boundary; the slot is given
     /// up and the supervisor re-admits the scan at once.
     Yielded,
@@ -2069,21 +2069,24 @@ impl Delivered {
     /// What of `partition` has not been delivered yet. A key already passed
     /// whole is dropped; the rest of a key stopped mid-way keeps only rows
     /// past `last_clustering`, without the header the first fragment carried.
-    fn remainder(&self, mut partition: Partition) -> Option<Partition> {
+    fn remainder(&self, partition: Arc<Partition>) -> Option<Arc<Partition>> {
         if partition.key != self.key {
             return Some(partition);
         }
         if self.complete {
             return None;
         }
+        // Copy-on-write: only the resume path (rare — a compaction retired an
+        // input mid-scan) materialises an owned partition to trim rows.
+        let mut owned = Arc::unwrap_or_clone(partition);
         if let Some(last) = &self.last_clustering {
-            partition
+            owned
                 .rows
                 .retain(|row| row.clustering.as_slice() > last.as_slice());
         }
-        partition.deletion = ferrosa_sstable::types::DeletionTime::LIVE;
-        partition.static_row = None;
-        (!partition.rows.is_empty()).then_some(partition)
+        owned.deletion = ferrosa_sstable::types::DeletionTime::LIVE;
+        owned.static_row = None;
+        (!owned.rows.is_empty()).then_some(Arc::new(owned))
     }
 
     /// Record that `partition` went out; `complete` when its key is done.
@@ -2171,7 +2174,7 @@ where
     fn run(
         &mut self,
         slot: &mut ferrosa_sched::ScanSlot,
-        tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+        tx: &tokio::sync::mpsc::Sender<Result<Arc<Partition>>>,
     ) -> ScanRun {
         let cap = self.partition_limit.unwrap_or(usize::MAX);
         loop {
@@ -2192,7 +2195,7 @@ where
                 Some(k) => owned.merger.next_fragment(k).map(|fragment| {
                     fragment.map(|f| {
                         let complete = f.last;
-                        (f.into_partition(), complete)
+                        (Arc::new(f.into_partition()), complete)
                     })
                 }),
                 None => owned
@@ -2252,7 +2255,7 @@ where
 /// is logged (designed fallback).
 fn deliver_failure(
     slot: &mut ferrosa_sched::ScanSlot,
-    tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+    tx: &tokio::sync::mpsc::Sender<Result<Arc<Partition>>>,
     error: ferrosa_common::Error,
 ) -> ScanRun {
     let message = error.to_string();
@@ -2286,7 +2289,7 @@ pub fn range_scan_resumes_total() -> u64 {
 /// queued (the consumer dropped the stream) and fail-loud overload. A producer
 /// panic is delivered as an error, never as a short stream.
 fn spawn_resumable_range_scan<S: PausableScan>(
-    tx: tokio::sync::mpsc::Sender<Result<Partition>>,
+    tx: tokio::sync::mpsc::Sender<Result<Arc<Partition>>>,
     scan: S,
 ) {
     tokio::spawn(async move {
@@ -2377,7 +2380,7 @@ fn spawn_resumable_range_scan<S: PausableScan>(
 
 /// End a range scan's stream with an error, so its consumer sees a failure
 /// rather than a short result. A consumer that has gone is logged.
-async fn fail_range_scan(tx: &tokio::sync::mpsc::Sender<Result<Partition>>, message: String) {
+async fn fail_range_scan(tx: &tokio::sync::mpsc::Sender<Result<Arc<Partition>>>, message: String) {
     tracing::warn!(error = %message, "range scan ended with an error");
     if tx
         .send(Err(ferrosa_common::Error::InvalidData(message)))
@@ -6263,7 +6266,7 @@ impl<F: FlushTarget> TableStore<F> {
         partition_limit: Option<usize>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Arc<Partition>>> + Send>>
     where
         F: Send + Sync + 'static,
     {
@@ -6279,7 +6282,7 @@ impl<F: FlushTarget> TableStore<F> {
         partition_limit: Option<usize>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Arc<Partition>>> + Send>>
     where
         F: Send + Sync + 'static,
     {
@@ -6296,7 +6299,7 @@ impl<F: FlushTarget> TableStore<F> {
         fragment_rows: Option<usize>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Arc<Partition>>> + Send>>
     where
         F: Send + Sync + 'static,
     {
@@ -6309,7 +6312,7 @@ impl<F: FlushTarget> TableStore<F> {
         // buffer=64. With buffer=4 *and* `partition_limit` pushed into the
         // producer loop, the producer stops cleanly after N emissions.
         const STREAM_BUFFER: usize = 4;
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Arc<Partition>>>(STREAM_BUFFER);
 
         // The scan opens its SSTable readers only once admitted (t_6d0553ee):
         // a cancelled or overloaded scan never opens readers. Everything it
@@ -6358,7 +6361,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Arc<Partition>>> + Send>>
     where
         F: Send + Sync + 'static,
     {
@@ -6384,7 +6387,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Arc<Partition>>> + Send>>
     where
         F: Send + Sync + 'static,
     {
@@ -6406,7 +6409,7 @@ impl<F: FlushTarget> TableStore<F> {
         wanted: Vec<u16>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Arc<Partition>>> + Send>>
     where
         F: Send + Sync + 'static,
     {
@@ -6466,14 +6469,14 @@ impl<F: FlushTarget> TableStore<F> {
         let in_range = |t: i64| t >= start_token && t < end_token;
         let mut matched: Vec<Partition> = Vec::new();
 
-        // Active memtable: lazy iter. Per-partition deep clone happens
-        // only when we advance the iterator, and only matches survive.
+        // Active memtable: lazy iter. The memtable hands out `Arc<Partition>`
+        // (no deep clone on the scan); we take the owned value on match.
         for p in guard.active.range_iter(None, None) {
             if matched.len() >= limit {
                 break;
             }
             if in_range(p.key.token.0) {
-                matched.push(p);
+                matched.push(Arc::unwrap_or_clone(p));
             }
         }
 
@@ -6485,7 +6488,7 @@ impl<F: FlushTarget> TableStore<F> {
                         break;
                     }
                     if in_range(p.key.token.0) {
-                        matched.push(p);
+                        matched.push(Arc::unwrap_or_clone(p));
                     }
                 }
             }
@@ -6628,7 +6631,7 @@ impl<F: FlushTarget> TableStore<F> {
         end_token: i64,
         max_partitions: usize,
         max_bytes: usize,
-    ) -> Result<(Vec<Partition>, Option<i64>)> {
+    ) -> Result<(Vec<Arc<Partition>>, Option<i64>)> {
         if start_token >= end_token || max_partitions == 0 {
             return Ok((Vec::new(), None));
         }
@@ -6643,7 +6646,7 @@ impl<F: FlushTarget> TableStore<F> {
         end_token: i64,
         max_partitions: usize,
         max_bytes: usize,
-    ) -> Result<(Vec<Partition>, Option<i64>)> {
+    ) -> Result<(Vec<Arc<Partition>>, Option<i64>)> {
         let guard = self.view.load();
         let schema = self.schema.load();
         let in_range = |t: i64| t >= start_token && t < end_token;
@@ -6665,20 +6668,20 @@ impl<F: FlushTarget> TableStore<F> {
         // of scope. The token-ordered prefix and resume cursor are preserved.
         let mut vec_sources: Vec<PartitionSource> = Vec::new();
 
-        let mut mem_active: Vec<Partition> = guard
+        let mut mem_active: Vec<Arc<Partition>> = guard
             .active
             .range_iter(None, None)
-            .filter(|p: &Partition| in_range(p.key.token.0))
+            .filter(|p: &Arc<Partition>| in_range(p.key.token.0))
             .collect();
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
         // One source per sealed memtable: two of them can hold the same key.
         for sealed in guard.flushing.iter() {
-            let mut mem_flushing: Vec<Partition> = sealed
+            let mut mem_flushing: Vec<Arc<Partition>> = sealed
                 .memtable
                 .range_iter(None, None)
-                .filter(|p: &Partition| in_range(p.key.token.0))
+                .filter(|p: &Arc<Partition>| in_range(p.key.token.0))
                 .collect();
             mem_flushing.sort_by(|a, b| a.key.cmp(&b.key));
             vec_sources.push(PartitionSource::new(mem_flushing));
@@ -6719,7 +6722,7 @@ impl<F: FlushTarget> TableStore<F> {
             sst_mappings.push(ColumnOrdinalMapping::for_header(&schema, sstable.header()));
         }
 
-        let mut out: Vec<Partition> = Vec::new();
+        let mut out: Vec<Arc<Partition>> = Vec::new();
         let mut out_bytes: usize = 0;
         let pick = |cur: &Option<DecoratedKey>, candidate: &DecoratedKey| -> bool {
             cur.as_ref().map(|k| candidate < k).unwrap_or(true)
@@ -6759,7 +6762,9 @@ impl<F: FlushTarget> TableStore<F> {
             }
 
             // Gather every source that holds this key, cell-merge, dedup.
-            let mut sources: Vec<Partition> = Vec::new();
+            // Memtable sources hand out `Arc<Partition>` — no deep clone on the
+            // read path; only a genuine multi-source group materialises.
+            let mut sources: Vec<Arc<Partition>> = Vec::new();
             for src in vec_sources.iter_mut() {
                 if src.peek().map(|p| p.key == key) == Some(true) {
                     sources.push(src.next().expect("peeked key must exist"));
@@ -6776,16 +6781,26 @@ impl<F: FlushTarget> TableStore<F> {
                     })?;
                     if let Some(mut p) = next {
                         sst_mappings[i].remap_partition(&mut p);
-                        sources.push(p);
+                        sources.push(Arc::new(p));
                     }
                 }
             }
-            let mut merged = if sources.len() == 1 {
-                sources.pop().expect("len checked")
+            let is_multi = sources.len() > 1;
+            let merged = if !is_multi {
+                // Single source: serve the `Arc` straight through unless a
+                // tombstone means deletion suppression would rewrite it.
+                let only = sources.pop().expect("len checked");
+                if crate::range_merger::partition_needs_deletion_suppression(&only) {
+                    let mut owned = Arc::unwrap_or_clone(only);
+                    merge::apply_deletions(&mut owned);
+                    Arc::new(owned)
+                } else {
+                    only
+                }
             } else {
-                merge::merge_partitions(sources)
+                let owned: Vec<Partition> = sources.into_iter().map(Arc::unwrap_or_clone).collect();
+                Arc::new(merge::merge_partitions(owned))
             };
-            merge::apply_deletions(&mut merged);
             out_bytes += Self::partition_heap_bytes(&merged);
             out.push(merged);
         };
@@ -7115,20 +7130,22 @@ impl<F: FlushTarget> TableStore<F> {
         // source whose resident length feeds the in-flight gauge (test builds).
         let mut vec_sources: Vec<PartitionSource> = Vec::new();
 
-        let mut mem_active: Vec<Partition> = guard
+        let mut mem_active: Vec<Arc<Partition>> = guard
             .active
             .range_iter(None, None)
-            .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
+            .filter(|p: &Arc<Partition>| p.key.token.0 >= start_token && p.key.token.0 < end_token)
             .collect();
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
         // One source per sealed memtable: two of them can hold the same key.
         for sealed in guard.flushing.iter() {
-            let mut mem_flushing_vec: Vec<Partition> = sealed
+            let mut mem_flushing_vec: Vec<Arc<Partition>> = sealed
                 .memtable
                 .range_iter(None, None)
-                .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
+                .filter(|p: &Arc<Partition>| {
+                    p.key.token.0 >= start_token && p.key.token.0 < end_token
+                })
                 .collect();
             mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
             vec_sources.push(PartitionSource::new(mem_flushing_vec));
@@ -7286,7 +7303,10 @@ impl<F: FlushTarget> TableStore<F> {
                 )> = Vec::with_capacity(total_sources);
 
                 for &vi in &vec_match_indices {
-                    let p = vec_sources[vi].next().expect("peeked");
+                    // Fragment/streaming path materialises owned rows anyway
+                    // (it sorts and consumes them), so unwrap the memtable's
+                    // `Arc` here rather than widening the merge signature.
+                    let p = Arc::unwrap_or_clone(vec_sources[vi].next().expect("peeked"));
                     let key_p = p.key.clone();
                     let deletion = p.deletion;
                     let static_row = p.static_row;
@@ -7460,20 +7480,22 @@ impl<F: FlushTarget> TableStore<F> {
         // rationale.
         let mut vec_sources: Vec<PartitionSource> = Vec::new();
 
-        let mut mem_active: Vec<Partition> = guard
+        let mut mem_active: Vec<Arc<Partition>> = guard
             .active
             .range_iter(None, None)
-            .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
+            .filter(|p: &Arc<Partition>| p.key.token.0 >= start_token && p.key.token.0 < end_token)
             .collect();
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
         // One source per sealed memtable: two of them can hold the same key.
         for sealed in guard.flushing.iter() {
-            let mut mem_flushing_vec: Vec<Partition> = sealed
+            let mut mem_flushing_vec: Vec<Arc<Partition>> = sealed
                 .memtable
                 .range_iter(None, None)
-                .filter(|p: &Partition| p.key.token.0 >= start_token && p.key.token.0 < end_token)
+                .filter(|p: &Arc<Partition>| {
+                    p.key.token.0 >= start_token && p.key.token.0 < end_token
+                })
                 .collect();
             mem_flushing_vec.sort_by(|a, b| a.key.cmp(&b.key));
             vec_sources.push(PartitionSource::new(mem_flushing_vec));
@@ -7555,7 +7577,7 @@ impl<F: FlushTarget> TableStore<F> {
             let mut group: Vec<Partition> = Vec::new();
             for src in vec_sources.iter_mut() {
                 if src.peek().map(|p| p.key == key) == Some(true) {
-                    group.push(src.next().expect("peeked"));
+                    group.push(Arc::unwrap_or_clone(src.next().expect("peeked")));
                 }
             }
             for (idx, iter) in sst_iters.iter_mut().enumerate() {
@@ -12107,14 +12129,14 @@ mod tests {
         let mut whole_stream = store.range_iter(None, None);
         let mut whole: Vec<Partition> = Vec::new();
         while let Some(p) = futures::StreamExt::next(&mut whole_stream).await {
-            whole.push(p.unwrap());
+            whole.push(Arc::unwrap_or_clone(p.unwrap()));
         }
 
         // Fragmented.
         let mut frag_stream = store.range_iter_fragmented(None, None);
         let mut frags: Vec<Partition> = Vec::new();
         while let Some(p) = futures::StreamExt::next(&mut frag_stream).await {
-            let p = p.unwrap();
+            let p = Arc::unwrap_or_clone(p.unwrap());
             assert!(
                 p.rows.len() <= 16,
                 "fragment {} exceeded K=16",
@@ -12153,16 +12175,20 @@ mod tests {
             fn run(
                 &mut self,
                 _slot: &mut ferrosa_sched::ScanSlot,
-                tx: &tokio::sync::mpsc::Sender<Result<Partition>>,
+                tx: &tokio::sync::mpsc::Sender<Result<Arc<Partition>>>,
             ) -> super::ScanRun {
                 for i in 0..4 {
-                    tx.try_send(Ok(make_partition(&format!("before-panic-{i}"), b"v", 1)))
-                        .expect("the channel has room for four");
+                    tx.try_send(Ok(Arc::new(make_partition(
+                        &format!("before-panic-{i}"),
+                        b"v",
+                        1,
+                    ))))
+                    .expect("the channel has room for four");
                 }
                 panic!("simulated producer bug mid-scan");
             }
         }
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Partition>>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Arc<Partition>>>(4);
         // Fill the channel to capacity before panicking, so the error has to
         // wait behind buffered partitions rather than find a free slot.
         super::spawn_resumable_range_scan(tx, PanicsMidScan);
@@ -17639,7 +17665,7 @@ mod tests {
                     if let Some(prev) = collected.last() {
                         assert!(chunk[0].key >= prev.key, "chunk boundary broke token order");
                     }
-                    collected.extend(chunk);
+                    collected.extend(chunk.into_iter().map(Arc::unwrap_or_clone));
                 }
                 match next {
                     Some(c) => cursor = c,
@@ -18443,7 +18469,7 @@ mod tests {
     /// running forever.
     async fn drain_slowly(
         mut stream: std::pin::Pin<
-            Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>,
+            Box<dyn futures::stream::Stream<Item = Result<Arc<Partition>>> + Send>,
         >,
         pace: std::time::Duration,
         cap: usize,
@@ -18454,7 +18480,7 @@ mod tests {
             let Some(item) = futures::StreamExt::next(&mut stream).await else {
                 break;
             };
-            keys.push(item.expect("the scan must not fail").key);
+            keys.push(item.expect("the scan must not fail").key.clone());
             between(keys.len());
             tokio::time::sleep(pace).await;
         }
@@ -18505,7 +18531,7 @@ mod tests {
         let reference: Vec<DecoratedKey> = {
             let mut owned = owned_merger_over(&store);
             std::iter::from_fn(|| owned.merger.next_merged_partition().unwrap())
-                .map(|p| p.key)
+                .map(|p| p.key.clone())
                 .collect()
         };
         assert_eq!(reference.len(), 24);
@@ -18519,7 +18545,7 @@ mod tests {
                 let mut chunk = Vec::new();
                 for _ in 0..5 {
                     match owned.merger.next_merged_partition().unwrap() {
-                        Some(p) => chunk.push(p.key),
+                        Some(p) => chunk.push(p.key.clone()),
                         None => return (owned, chunk, true),
                     }
                 }
@@ -18560,7 +18586,7 @@ mod tests {
         let keys = std::thread::spawn(move || {
             let mut keys = Vec::new();
             while let Some(p) = owned.merger.next_merged_partition().unwrap() {
-                keys.push(p.key);
+                keys.push(p.key.clone());
             }
             keys
         })
@@ -18599,7 +18625,7 @@ mod tests {
             let mut stream = store.range_iter(None, None);
             let mut keys = Vec::new();
             while let Some(item) = futures::StreamExt::next(&mut stream).await {
-                keys.push(item.unwrap().key);
+                keys.push(item.unwrap().key.clone());
             }
             keys
         };
@@ -18645,7 +18671,7 @@ mod tests {
             let mut stream = store.range_iter(None, None);
             let mut keys = Vec::new();
             while let Some(item) = futures::StreamExt::next(&mut stream).await {
-                keys.push(item.unwrap().key);
+                keys.push(item.unwrap().key.clone());
             }
             keys
         };
@@ -18737,14 +18763,14 @@ mod scan_resume_tests {
     #[test]
     fn a_partition_delivered_whole_is_not_delivered_again() {
         let done = Delivered::advance(None, &partition("a", &[1, 2]), true);
-        assert!(done.remainder(partition("a", &[1, 2])).is_none());
+        assert!(done.remainder(Arc::new(partition("a", &[1, 2]))).is_none());
     }
 
     #[test]
     fn a_partition_stopped_mid_way_resumes_after_its_last_row_without_its_header() {
         let mid = Delivered::advance(None, &partition("a", &[1, 2, 3]), false);
         let rest = mid
-            .remainder(partition("a", &[1, 2, 3, 4, 5]))
+            .remainder(Arc::new(partition("a", &[1, 2, 3, 4, 5])))
             .expect("rows 4 and 5 are still owed");
         let clustering: Vec<u8> = rest.rows.iter().map(|r| r.clustering[0]).collect();
         assert_eq!(clustering, vec![4, 5]);
@@ -18755,7 +18781,7 @@ mod scan_resume_tests {
         );
         assert!(rest.static_row.is_none());
         assert!(
-            mid.remainder(partition("a", &[2, 3])).is_none(),
+            mid.remainder(Arc::new(partition("a", &[2, 3]))).is_none(),
             "a re-read fragment holding only delivered rows is dropped"
         );
     }
@@ -18764,8 +18790,8 @@ mod scan_resume_tests {
     fn a_later_partition_passes_through_unchanged() {
         let mid = Delivered::advance(None, &partition("a", &[1]), false);
         assert_eq!(
-            mid.remainder(partition("b", &[1])),
-            Some(partition("b", &[1]))
+            mid.remainder(Arc::new(partition("b", &[1]))),
+            Some(Arc::new(partition("b", &[1])))
         );
     }
 

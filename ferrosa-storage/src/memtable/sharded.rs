@@ -270,7 +270,7 @@ impl Memtable for ShardedBTreeMemtable {
         &'a self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> Box<dyn Iterator<Item = Partition> + Send + 'a> {
+    ) -> Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a> {
         // Per-shard: collect the Arc<Partition> values within the
         // range bound. The clones are cheap (one Arc bump per entry,
         // ~8 bytes), not Partition deep-clones. The per-shard guard
@@ -279,8 +279,9 @@ impl Memtable for ShardedBTreeMemtable {
         // iterator lifetime.
         //
         // K-way merge across the Vec<Arc<Partition>> yields one
-        // Arc at a time in global token order; the Partition deep
-        // clone happens only when the consumer pulls.
+        // Arc at a time in global token order — no deep clone ever
+        // happens on the read path (copy-on-write is the consumer's
+        // choice).
         let start = start.cloned();
         let end = end.cloned();
         let mut per_shard: Vec<Vec<Arc<Partition>>> = Vec::with_capacity(self.shards.len());
@@ -571,9 +572,9 @@ impl ShardedRangeIter {
 }
 
 impl Iterator for ShardedRangeIter {
-    type Item = Partition;
+    type Item = Arc<Partition>;
 
-    fn next(&mut self) -> Option<Partition> {
+    fn next(&mut self) -> Option<Arc<Partition>> {
         let entry = self.heap.pop()?;
         let src = entry.src;
         let cursor = self.cursors[src];
@@ -587,7 +588,7 @@ impl Iterator for ShardedRangeIter {
                 src,
             });
         }
-        Some(Partition::clone(&arc))
+        Some(arc)
     }
 }
 

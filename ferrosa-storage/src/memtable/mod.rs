@@ -701,9 +701,11 @@ pub trait Memtable: Send + Sync {
     /// Lazy iterator yielding every partition in token order within
     /// the optional `[start, end]` bounds. The iterator must NOT
     /// pre-materialize partitions — `next()` should produce exactly
-    /// one clone at a time so memtable scans contribute O(1) memory
-    /// to upstream consumers like the streaming range-read handler
-    /// (ADR-020).
+    /// one `Arc<Partition>` at a time so memtable scans contribute O(1)
+    /// memory to upstream consumers like the streaming range-read handler
+    /// (ADR-020). It must NOT deep-clone the partition either: the backing
+    /// stores `ArcSwap<Partition>`, so a scan hands out a cheap `Arc` clone
+    /// and the consumer copies only if it must mutate (copy-on-write).
     ///
     /// The default impl falls back to `snapshot_range_limited` for
     /// backings that haven't been upgraded yet; production backings
@@ -712,10 +714,11 @@ pub trait Memtable: Send + Sync {
         &'a self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> Box<dyn Iterator<Item = Partition> + Send + 'a> {
+    ) -> Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a> {
         Box::new(
             self.snapshot_range_limited(start, end, usize::MAX)
-                .into_iter(),
+                .into_iter()
+                .map(Arc::new),
         )
     }
 

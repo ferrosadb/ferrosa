@@ -775,14 +775,16 @@ async fn merge_local_and_single_remote_whole(
         Box::pin(
             storage
                 .range_iter_projected(&table_id, wanted, None, None, None)
-                .map(|item| item.map_err(ClusterError::Storage)),
+                .map(|item| {
+                    item.map_err(ClusterError::Storage)
+                        .map(Arc::unwrap_or_clone)
+                }),
         )
     } else {
-        Box::pin(
-            storage
-                .range_iter(&table_id, None, None)
-                .map(|item| item.map_err(ClusterError::Storage)),
-        )
+        Box::pin(storage.range_iter(&table_id, None, None).map(|item| {
+            item.map_err(ClusterError::Storage)
+                .map(Arc::unwrap_or_clone)
+        }))
     };
     merge_local_and_single_remote_whole_streams(local_stream, remote_stream, row_limit, out_tx)
         .await;
@@ -1087,13 +1089,19 @@ async fn merge_local_and_single_remote_fragmented(
         Box::pin(
             storage
                 .range_iter_projected_fragmented(&table_id, wanted, None, None)
-                .map(|item| item.map_err(ClusterError::Storage)),
+                .map(|item| {
+                    item.map_err(ClusterError::Storage)
+                        .map(Arc::unwrap_or_clone)
+                }),
         )
     } else {
         Box::pin(
             storage
                 .range_iter_fragmented(&table_id, None, None)
-                .map(|item| item.map_err(ClusterError::Storage)),
+                .map(|item| {
+                    item.map_err(ClusterError::Storage)
+                        .map(Arc::unwrap_or_clone)
+                }),
         )
     };
     let local = FragmentCursor::new(local_stream);
@@ -1809,13 +1817,19 @@ async fn merge_local_and_remotes_fragmented(
         Box::pin(
             storage
                 .range_iter_projected_fragmented(&table_id, wanted, start.as_ref(), None)
-                .map(|item| item.map_err(ClusterError::Storage)),
+                .map(|item| {
+                    item.map_err(ClusterError::Storage)
+                        .map(Arc::unwrap_or_clone)
+                }),
         )
     } else {
         Box::pin(
             storage
                 .range_iter_fragmented(&table_id, start.as_ref(), None)
-                .map(|item| item.map_err(ClusterError::Storage)),
+                .map(|item| {
+                    item.map_err(ClusterError::Storage)
+                        .map(Arc::unwrap_or_clone)
+                }),
         )
     };
     let local_stream = crate::write_path::resume_filtered_stream(local_stream, resume.as_ref());
@@ -2035,7 +2049,10 @@ impl ClusterCoordinator {
             let stream: ClusterPartitionStream = Box::pin(
                 self.storage
                     .range_iter_fragmented(table_id, resume.map(|r| &r.key), None)
-                    .map(|item| item.map_err(ClusterError::Storage)),
+                    .map(|item| {
+                        item.map_err(ClusterError::Storage)
+                            .map(Arc::unwrap_or_clone)
+                    }),
             );
             return Ok(crate::write_path::resume_filtered_stream(stream, resume));
         }
@@ -2062,7 +2079,10 @@ impl ClusterCoordinator {
             let stream: ClusterPartitionStream = Box::pin(
                 self.storage
                     .range_iter_projected_fragmented(table_id, wanted, resume.map(|r| &r.key), None)
-                    .map(|item| item.map_err(ClusterError::Storage)),
+                    .map(|item| {
+                        item.map_err(ClusterError::Storage)
+                            .map(Arc::unwrap_or_clone)
+                    }),
             );
             return Ok(crate::write_path::resume_filtered_stream(stream, resume));
         }
@@ -2275,24 +2295,34 @@ impl ClusterCoordinator {
                 (Some(wanted), 0) => Box::pin(
                     self.storage
                         .range_iter_projected_fragmented(table_id, wanted, None, None)
-                        .map(|item| item.map_err(ClusterError::Storage)),
+                        .map(|item| {
+                            item.map_err(ClusterError::Storage)
+                                .map(Arc::unwrap_or_clone)
+                        }),
                 ),
                 (None, 0) => Box::pin(
                     self.storage
                         .range_iter_fragmented(table_id, None, None)
-                        .map(|item| item.map_err(ClusterError::Storage)),
+                        .map(|item| {
+                            item.map_err(ClusterError::Storage)
+                                .map(Arc::unwrap_or_clone)
+                        }),
                 ),
                 (Some(wanted), _) => Box::pin(
                     self.storage
                         .range_iter_projected(table_id, wanted, None, None, None)
                         .map(move |item| {
-                            let partition = item.map_err(ClusterError::Storage)?;
+                            let partition = item
+                                .map_err(ClusterError::Storage)
+                                .map(Arc::unwrap_or_clone)?;
                             Ok(apply_row_limit(partition, row_limit))
                         }),
                 ),
                 (None, _) => Box::pin(self.storage.range_iter(table_id, None, None).map(
                     move |item| {
-                        let partition = item.map_err(ClusterError::Storage)?;
+                        let partition = item
+                            .map_err(ClusterError::Storage)
+                            .map(Arc::unwrap_or_clone)?;
                         Ok(apply_row_limit(partition, row_limit))
                     },
                 )),

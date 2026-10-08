@@ -205,6 +205,15 @@ impl RepairStore for StorageEngineRepairStore {
             })
             .await
             .map_err(|e| format!("read_range_chunked join: {e}"))?
+            .map(|(chunk, next)| {
+                (
+                    chunk
+                        .into_iter()
+                        .map(Arc::unwrap_or_clone)
+                        .collect::<Vec<Partition>>(),
+                    next,
+                )
+            })
     }
 
     async fn apply_partitions(

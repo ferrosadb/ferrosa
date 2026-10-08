@@ -177,7 +177,7 @@ impl Memtable for SkipListMemtable {
         &'a self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> Box<dyn Iterator<Item = Partition> + Send + 'a> {
+    ) -> Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a> {
         // Clone the bounds so the returned iterator owns its filter
         // predicate state — `&DecoratedKey` doesn't live long enough
         // for the iterator's lifetime.
@@ -190,7 +190,9 @@ impl Memtable for SkipListMemtable {
                     let key = entry.key();
                     start.as_ref().is_none_or(|s| key >= s) && end.as_ref().is_none_or(|e| key <= e)
                 })
-                .map(|entry| (**entry.value().read()).clone()),
+                // Hand out the stored `Arc<Partition>` (one atomic refcount
+                // bump per entry) — never deep-clone on a read-only scan.
+                .map(|entry| Arc::clone(&entry.value().read())),
         )
     }
 
@@ -367,6 +369,52 @@ mod tests {
         // after the consumer is done (laziness in action).
         let first_5: Vec<_> = mem.range_iter(None, None).take(5).collect();
         assert_eq!(first_5.len(), 5);
+    }
+
+    /// The read path must NOT deep-clone live row data out of the memtable on a
+    /// scan. `range_iter` hands out the *stored* `Arc<Partition>` (one atomic
+    /// refcount bump); it never allocates a fresh `Arc` wrapping a cloned
+    /// `Partition`. Regression guard for the #1 read-path lever: the memtable
+    /// `Partition`/`Vec<Row>` clone measured ~7.5 % of read-path CPU.
+    ///
+    /// Negative control: if `range_iter` goes back to yielding `Partition` by
+    /// value (deep clone), the addresses in `second` differ from `first` and the
+    /// assertion fails.
+    #[test]
+    fn range_iter_does_not_deep_clone_partition_bodies() {
+        let mem = SkipListMemtable::new();
+        let schema = test_schema();
+        for i in 0..20 {
+            let key = make_key(&format!("key_{i:02}"));
+            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
+                .unwrap();
+        }
+
+        // `Arc::as_ptr` is the address of the shared allocation. If the scan
+        // yields the stored Arc, two independent scans observe the SAME
+        // addresses; a deep-clone-and-rewrap allocates fresh ones each scan.
+        // Both scans' `Arc`s are held alive, so the allocator cannot hand the
+        // second scan the addresses the first dropped (which would make a
+        // deep-cloning implementation pass spuriously).
+        let first_arcs: Vec<Arc<Partition>> = mem.range_iter(None, None).collect();
+        let second_arcs: Vec<Arc<Partition>> = mem.range_iter(None, None).collect();
+        let first: Vec<*const Partition> = first_arcs.iter().map(Arc::as_ptr).collect();
+        let second: Vec<*const Partition> = second_arcs.iter().map(Arc::as_ptr).collect();
+
+        assert_eq!(first.len(), 20);
+        assert_eq!(
+            first, second,
+            "range_iter allocated a fresh Arc per item (addresses changed between \
+             scans): it deep-cloned the partition body instead of handing out the \
+             stored Arc<Partition>"
+        );
+        // And both scans really point INTO the memtable's shared storage: the
+        // refcount of every entry is >= 2 while both scans hold it.
+        assert!(
+            second_arcs.iter().all(|p| Arc::strong_count(p) >= 2),
+            "a scanned Arc had refcount 1 while two scans held it — it was not \
+             the stored Arc"
+        );
     }
 
     #[test]
