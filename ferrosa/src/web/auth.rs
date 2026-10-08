@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -80,11 +81,44 @@ pub async fn auth_middleware(
         return unauthorized("invalid credentials format");
     };
 
-    // Authenticate against the schema.
-    let auth_ctx = match state.schema.authenticate(username, password) {
-        Ok(ctx) => ctx,
-        Err(_) => {
-            return unauthorized("authentication failed");
+    // Authenticate against the schema — but reuse a recent successful
+    // verification when the schema has not moved on since it was made.
+    //
+    // The credential check is a bcrypt `cost=12` comparison (~0.18 s). It runs
+    // on the blocking pool, never on a tokio worker: `Schema::authenticate` is
+    // synchronous, and the CQL login path offloads it the same way
+    // (`authenticate_off_runtime`, `ferrosa-cql/src/connection.rs`).
+    //
+    // Only a *successful* verification is cached, so a wrong password always
+    // pays a full bcrypt and guessing costs are unchanged. A hit additionally
+    // requires the schema snapshot the credential was verified against to still
+    // be the live one (`Arc::ptr_eq` inside `AuthCache::get`), so any password,
+    // role or grant change invalidates the entry immediately — authorization is
+    // never cached. Capture the snapshot *before* verifying and bind the entry
+    // to it: if the schema mutates during the bcrypt, the entry is simply not
+    // served again rather than trusted against the newer snapshot.
+    let live = state.schema.snapshot();
+    let auth_ctx = match state
+        .auth_cache
+        .get(username, password, &live, Instant::now())
+    {
+        Some(ctx) => ctx,
+        None => {
+            let schema = state.schema.clone();
+            let user = username.to_string();
+            let pass = password.to_string();
+            let verified = match tokio::task::spawn_blocking(move || {
+                schema.authenticate(&user, &pass)
+            })
+            .await
+            {
+                Ok(Ok(ctx)) => ctx,
+                _ => return unauthorized("authentication failed"),
+            };
+            state
+                .auth_cache
+                .insert(username, password, live, verified.clone(), Instant::now());
+            verified
         }
     };
 
@@ -207,8 +241,12 @@ mod tests {
         schema
     }
 
-    /// Build a test router wrapped with auth middleware.
-    fn test_router(auth_disabled: bool) -> (Router, Arc<Schema>) {
+    /// Build a `WebAppState` with the auth middleware's cache injected, so a
+    /// test can observe how many credentials were actually re-verified.
+    fn test_state_with_cache(
+        auth_disabled: bool,
+        cache: Arc<crate::web::auth_cache::AuthCache>,
+    ) -> (WebAppState, Arc<Schema>) {
         let schema = Arc::new(test_schema());
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -255,20 +293,42 @@ mod tests {
             storage,
             host_id,
             auth_disabled,
+            auth_cache: cache,
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
             supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
         };
 
-        let router = Router::new()
+        (state, schema)
+    }
+
+    /// Build a test router wrapped with auth middleware (default cache).
+    fn test_router(auth_disabled: bool) -> (Router, Arc<Schema>) {
+        let cache = Arc::new(crate::web::auth_cache::AuthCache::default());
+        let (state, schema) = test_state_with_cache(auth_disabled, cache);
+        (router_with_auth(state), schema)
+    }
+
+    /// Build a test router with a caller-supplied cache, so a test can assert on
+    /// `AuthCache::misses()` after driving requests through the middleware.
+    fn test_router_with_cache(
+        auth_disabled: bool,
+        cache: Arc<crate::web::auth_cache::AuthCache>,
+    ) -> (Router, Arc<Schema>) {
+        let (state, schema) = test_state_with_cache(auth_disabled, cache);
+        (router_with_auth(state), schema)
+    }
+
+    /// Wrap `state` in a minimal router whose only route sits behind
+    /// `auth_middleware`.
+    fn router_with_auth(state: WebAppState) -> Router {
+        Router::new()
             .route("/test", get(ok_handler))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             ))
-            .with_state(state);
-
-        (router, schema)
+            .with_state(state)
     }
 
     /// Encode credentials as a Basic auth header value.
@@ -434,6 +494,7 @@ mod tests {
             storage,
             host_id,
             auth_disabled,
+            auth_cache: std::sync::Arc::new(crate::web::auth_cache::AuthCache::default()),
             debug: None,
             listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
             supervision: std::sync::Arc::new(crate::supervisor::SupervisionStatus::default()),
@@ -547,5 +608,178 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth-cache integration: the middleware must reuse a successful
+    // verification and offload the bcrypt, without changing observable
+    // behaviour (same 200/401/403, authorization still live).
+    // -----------------------------------------------------------------------
+
+    /// A successful verification is reused: two authenticated requests with the
+    /// same credentials cause exactly one `Schema::authenticate` (one miss).
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn successful_verification_is_reused_across_requests() {
+        let cache = Arc::new(crate::web::auth_cache::AuthCache::new(
+            std::time::Duration::from_secs(60),
+            16,
+        ));
+        let (router, _) = test_router_with_cache(false, cache.clone());
+
+        let request = || {
+            Request::builder()
+                .uri("/test")
+                .header(
+                    header::AUTHORIZATION,
+                    basic_auth_header("ferrosa_admin", "ferrosa_admin"),
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            cache.misses(),
+            1,
+            "the first request must verify the credential (one miss)"
+        );
+
+        let second = router.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            cache.misses(),
+            1,
+            "the second request must be served from the cache — no second bcrypt"
+        );
+    }
+
+    /// A failed verification is never cached: a wrong password pays a full
+    /// bcrypt every time and still returns 401.
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn failed_verification_is_never_cached() {
+        let cache = Arc::new(crate::web::auth_cache::AuthCache::new(
+            std::time::Duration::from_secs(60),
+            16,
+        ));
+        let (router, _) = test_router_with_cache(false, cache.clone());
+
+        let request = || {
+            Request::builder()
+                .uri("/test")
+                .header(
+                    header::AUTHORIZATION,
+                    basic_auth_header("cassandra", "wrongpass"),
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+        let second = router.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+
+        assert_eq!(
+            cache.misses(),
+            2,
+            "both wrong-password requests must re-verify; failures are never cached"
+        );
+        assert_eq!(cache.len(), 0, "a failed verification stores nothing");
+    }
+
+    /// A schema change invalidates: once a new snapshot is installed, the same
+    /// credentials miss and are re-verified against the live schema.
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn schema_change_invalidates_cached_verification() {
+        let cache = Arc::new(crate::web::auth_cache::AuthCache::new(
+            std::time::Duration::from_secs(3600),
+            16,
+        ));
+        let (router, schema) = test_router_with_cache(false, cache.clone());
+
+        let request = || {
+            Request::builder()
+                .uri("/test")
+                .header(
+                    header::AUTHORIZATION,
+                    basic_auth_header("ferrosa_admin", "ferrosa_admin"),
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(cache.misses(), 1, "the second request must have been a hit");
+
+        // Any mutation installs a fresh snapshot (`Arc`). The TTL is an hour, so
+        // only the snapshot change can explain the miss that follows.
+        let superuser_ctx = AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        };
+        schema
+            .create_role(
+                RoleMetadata {
+                    name: "viewer".to_string(),
+                    is_superuser: false,
+                    can_login: true,
+                    salted_hash: None,
+                    member_of: HashSet::new(),
+                    scram: None,
+                },
+                Some("viewerpass"),
+                &superuser_ctx,
+            )
+            .expect("create viewer role");
+
+        let third = router.oneshot(request()).await.unwrap();
+        assert_eq!(third.status(), StatusCode::OK);
+        assert_eq!(
+            cache.misses(),
+            2,
+            "after the schema moved on, the credential must be re-verified"
+        );
+    }
+
+    /// TTL `0` disables the cache: two requests verify twice.
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn zero_ttl_disables_the_cache() {
+        let cache = Arc::new(crate::web::auth_cache::AuthCache::new(
+            std::time::Duration::ZERO,
+            16,
+        ));
+        let (router, _) = test_router_with_cache(false, cache.clone());
+
+        let request = || {
+            Request::builder()
+                .uri("/test")
+                .header(
+                    header::AUTHORIZATION,
+                    basic_auth_header("ferrosa_admin", "ferrosa_admin"),
+                )
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        assert_eq!(
+            cache.misses(),
+            2,
+            "a disabled cache must verify on every request"
+        );
+        assert_eq!(cache.len(), 0, "a disabled cache stores nothing");
     }
 }

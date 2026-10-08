@@ -25,6 +25,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod auth_cache;
 mod compaction;
 pub mod debug;
 pub mod observability;
@@ -82,6 +83,14 @@ pub struct WebAppState {
     /// Host UUID — used as the `node_id` when creating snapshots.
     pub host_id: uuid::Uuid,
     pub auth_disabled: bool,
+    /// Reuse for successful Basic-auth credential verifications.
+    ///
+    /// Every protected request otherwise pays a bcrypt `cost=12` verification
+    /// (~0.18 s on a `performance-2x` core). Entries are bound to the schema
+    /// snapshot they were verified against, so any schema change invalidates
+    /// them immediately — see `auth_cache`. Set
+    /// `FERROSA_WEB_AUTH_CACHE_TTL_SECS=0` to disable.
+    pub auth_cache: Arc<auth_cache::AuthCache>,
     /// Debug profiler state (shared mutex for single-session profiling).
     pub debug: Option<debug::DebugState>,
     /// Health of the background client listeners (Postgres, SPARQL, graph, Bolt).
