@@ -375,7 +375,7 @@ impl Memtable for ShardedBTreeMemtable {
         &self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-        f: &mut dyn FnMut(&Partition),
+        f: &mut dyn FnMut(&Partition) -> bool,
     ) {
         let in_range =
             |key: &DecoratedKey| start.is_none_or(|s| key >= s) && end.is_none_or(|e| key <= e);
@@ -385,7 +385,9 @@ impl Memtable for ShardedBTreeMemtable {
                 if in_range(key) {
                     // Borrowed: never `Arc::clone`, so a concurrent writer keeps
                     // merging in place instead of hitting `Arc::make_mut`'s COW.
-                    f(arc);
+                    if !f(arc) {
+                        return;
+                    }
                 }
             }
         }

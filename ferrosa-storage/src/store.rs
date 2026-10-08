@@ -5817,7 +5817,7 @@ impl<F: FlushTarget> TableStore<F> {
         if late_writer_drain_needed(old_active.as_ref(), snapshot_epoch) {
             old_active.for_each_partition(None, None, &mut |p| {
                 if !late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
-                    return;
+                    return true;
                 }
                 // The sealed gate makes this impossible: a write after the
                 // snapshot means admission is broken. Keep the rows (replay them
@@ -5837,6 +5837,7 @@ impl<F: FlushTarget> TableStore<F> {
                         tracing::error!(%e, "flush: late-writer replay put failed");
                     }
                 }
+                true
             });
         }
 
@@ -6068,7 +6069,7 @@ impl<F: FlushTarget> TableStore<F> {
         if late_writer_drain_needed(old_active.as_ref(), snapshot_epoch) {
             old_active.for_each_partition(None, None, &mut |p| {
                 if !late_partition_needs_replay(&flushed_by_key, &expanded_keys, p) {
-                    return;
+                    return true;
                 }
                 // Impossible behind the sealed gate; see the unsharded path.
                 let (current_view, schema) =
@@ -6084,6 +6085,7 @@ impl<F: FlushTarget> TableStore<F> {
                         tracing::error!(%e, "flush(sharded): late-writer replay put failed");
                     }
                 }
+                true
             });
         }
 
@@ -6446,16 +6448,22 @@ impl<F: FlushTarget> TableStore<F> {
         let in_range = |t: i64| t >= start_token && t < end_token;
         let mut matched: Vec<Partition> = Vec::new();
 
-        // Active memtable: lazy iter. The memtable hands out `Arc<Partition>`
-        // (no deep clone on the scan); we take the owned value on match.
-        for p in guard.active.range_iter(None, None) {
-            if matched.len() >= limit {
-                break;
-            }
-            if in_range(p.key.token.0) {
-                matched.push(Arc::unwrap_or_clone(p));
-            }
-        }
+        // Active memtable: BORROWED scan. `range_iter` would share the memtable's
+        // `Arc`, so a concurrent `put` on any in-range partition would find
+        // `Arc::make_mut` at refcount > 1 and copy-on-write the whole partition
+        // while this scan holds it. Borrowing keeps the memtable sole owner; the
+        // clone we take is the one this function already needs to return.
+        guard
+            .active
+            .for_each_partition(None, None, &mut |p: &Partition| {
+                if matched.len() >= limit {
+                    return false;
+                }
+                if in_range(p.key.token.0) {
+                    matched.push(p.clone());
+                }
+                true
+            });
 
         // Flushing memtable (if any).
         if matched.len() < limit {
@@ -6645,11 +6653,24 @@ impl<F: FlushTarget> TableStore<F> {
         // of scope. The token-ordered prefix and resume cursor are preserved.
         let mut vec_sources: Vec<PartitionSource> = Vec::new();
 
-        let mut mem_active: Vec<Arc<Partition>> = guard
+        // Active memtable: BORROWED scan, one partition at a time. `range_iter`
+        // would hand out an `Arc` shared with the memtable, so every concurrent
+        // `put` on an in-range partition would find `Arc::make_mut` with a
+        // refcount > 1 and copy-on-write the whole partition for as long as this
+        // scan holds it. Borrowing keeps the memtable the sole owner, and the one
+        // clone we do take is wrapped in a FRESH `Arc` (refcount 1, not shared
+        // with the memtable) for `PartitionSource`. Only the active tier matters
+        // here: sealed/flushing memtables take no writes, so their `Arc`s are
+        // free and stay as they are below.
+        let mut mem_active: Vec<Arc<Partition>> = Vec::new();
+        guard
             .active
-            .range_iter(None, None)
-            .filter(|p: &Arc<Partition>| in_range(p.key.token.0))
-            .collect();
+            .for_each_partition(None, None, &mut |p: &Partition| {
+                if in_range(p.key.token.0) {
+                    mem_active.push(Arc::new(p.clone()));
+                }
+                true
+            });
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
@@ -7107,11 +7128,20 @@ impl<F: FlushTarget> TableStore<F> {
         // source whose resident length feeds the in-flight gauge (test builds).
         let mut vec_sources: Vec<PartitionSource> = Vec::new();
 
-        let mut mem_active: Vec<Arc<Partition>> = guard
+        // Active memtable: BORROWED scan (see the token-range producer's note) —
+        // `range_iter` shares the memtable's `Arc`, so every concurrent `put` on
+        // an in-range partition copy-on-writes. The one clone goes into a fresh,
+        // unshared `Arc`. Sealed memtables below take no writes, so their shared
+        // `Arc`s are free.
+        let mut mem_active: Vec<Arc<Partition>> = Vec::new();
+        guard
             .active
-            .range_iter(None, None)
-            .filter(|p: &Arc<Partition>| p.key.token.0 >= start_token && p.key.token.0 < end_token)
-            .collect();
+            .for_each_partition(None, None, &mut |p: &Partition| {
+                if p.key.token.0 >= start_token && p.key.token.0 < end_token {
+                    mem_active.push(Arc::new(p.clone()));
+                }
+                true
+            });
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 
@@ -7457,11 +7487,20 @@ impl<F: FlushTarget> TableStore<F> {
         // rationale.
         let mut vec_sources: Vec<PartitionSource> = Vec::new();
 
-        let mut mem_active: Vec<Arc<Partition>> = guard
+        // Active memtable: BORROWED scan (see the token-range producer's note) —
+        // `range_iter` shares the memtable's `Arc`, so every concurrent `put` on
+        // an in-range partition copy-on-writes. The one clone goes into a fresh,
+        // unshared `Arc`. Sealed memtables below take no writes, so their shared
+        // `Arc`s are free.
+        let mut mem_active: Vec<Arc<Partition>> = Vec::new();
+        guard
             .active
-            .range_iter(None, None)
-            .filter(|p: &Arc<Partition>| p.key.token.0 >= start_token && p.key.token.0 < end_token)
-            .collect();
+            .for_each_partition(None, None, &mut |p: &Partition| {
+                if p.key.token.0 >= start_token && p.key.token.0 < end_token {
+                    mem_active.push(Arc::new(p.clone()));
+                }
+                true
+            });
         mem_active.sort_by(|a, b| a.key.cmp(&b.key));
         vec_sources.push(PartitionSource::new(mem_active));
 

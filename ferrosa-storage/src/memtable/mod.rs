@@ -751,6 +751,9 @@ pub trait Memtable: Send + Sync {
     /// rows — the fulltext index build, the flush late-writer drain — must use
     /// this method, not `range_iter`.
     ///
+    /// The callback returns `true` to continue and `false` to stop, so a bounded
+    /// consumer (`LIMIT k`, a resume cursor) does not walk the rest of the table.
+    ///
     /// Still non-materializing: neither the whole table nor any partition is
     /// collected into a `Vec`, so this stays within the streaming rule (ADR-020).
     ///
@@ -762,14 +765,16 @@ pub trait Memtable: Send + Sync {
         &self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-        f: &mut dyn FnMut(&Partition),
+        f: &mut dyn FnMut(&Partition) -> bool,
     ) {
         // Default for backings that have not overridden: borrow each partition
         // in turn off the lazy iterator. Correct, but the yielded `Arc` raises
         // the refcount for the duration of `f`, so production backings override
         // this with an implementation that holds a read guard instead (I-2).
         for partition in self.range_iter(start, end) {
-            f(&partition);
+            if !f(&partition) {
+                break;
+            }
         }
     }
 
@@ -829,6 +834,7 @@ pub trait Memtable: Send + Sync {
         self.for_each_partition(start, end, &mut |p| {
             let owned = p.clone();
             f(&owned);
+            true
         });
     }
 

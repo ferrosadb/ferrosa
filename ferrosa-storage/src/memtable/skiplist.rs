@@ -230,7 +230,7 @@ impl Memtable for SkipListMemtable {
         &self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-        f: &mut dyn FnMut(&Partition),
+        f: &mut dyn FnMut(&Partition) -> bool,
     ) {
         // Bounds are compared, not cloned: `DecoratedKey`'s clone allocates.
         let in_range =
@@ -244,7 +244,9 @@ impl Memtable for SkipListMemtable {
             // concurrent writer (I-2). The lock is released when this iteration
             // step ends, so a writer waits at most one callback (I-5).
             let guard = entry.value().read();
-            f(&guard);
+            if !f(&guard) {
+                return;
+            }
         }
     }
 

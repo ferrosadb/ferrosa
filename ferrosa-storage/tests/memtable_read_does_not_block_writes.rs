@@ -176,7 +176,7 @@ fn borrowed_visit_keeps_the_memtable_the_sole_owner() {
     let mut worst = 0usize;
     mem.for_each_partition(None, None, &mut |p: &Partition| {
         if p.key != k {
-            return;
+            return true;
         }
         // `get` bumps by one, so 2 means the memtable is still the sole owner.
         // 3 would mean this visit is holding an owned `Arc` — which is exactly
@@ -184,6 +184,7 @@ fn borrowed_visit_keeps_the_memtable_the_sole_owner() {
         if let Some(probe) = mem.get(&k).unwrap() {
             worst = worst.max(std::sync::Arc::strong_count(&probe));
         }
+        true
     });
 
     assert_eq!(
@@ -221,6 +222,51 @@ fn range_iter_does_inflate_the_partition_refcount() {
         "range_iter must be seen to inflate the refcount for the measurement in \
          the sibling test to mean anything; observed {worst}"
     );
+}
+
+/// I-2 + I-3: `for_each_partition` stops when the callback says so, so a bounded
+/// consumer (`LIMIT k`, a resume cursor) does not walk — or lock — the rest of
+/// the table. Without the `bool` return, converting a bounded `range_iter` loop
+/// into this scan would silently turn an O(matches) read into an O(table) walk.
+#[test]
+fn for_each_partition_stops_a_bounded_consumer_early() {
+    let mem = SkipListMemtable::new();
+    let s = schema();
+    for i in 0..500 {
+        mem.put(&key(&format!("k_{i:04}")), row(0, b"v", 1000), &s)
+            .unwrap();
+    }
+
+    let mut seen = 0usize;
+    mem.for_each_partition(None, None, &mut |_p: &Partition| {
+        seen += 1;
+        // Stop after 10, as a LIMIT-10 read or a resume cursor would.
+        seen < 10
+    });
+
+    assert_eq!(
+        seen, 10,
+        "the visitor must stop when the callback returns false; it walked {seen} \
+         of 500 partitions, so a bounded consumer would pay the whole table (I-3)"
+    );
+}
+
+/// The negative control for the early stop: returning `true` visits everything,
+/// so the assertion above cannot pass by the visitor simply being broken.
+#[test]
+fn for_each_partition_visits_everything_when_never_stopped() {
+    let mem = SkipListMemtable::new();
+    let s = schema();
+    for i in 0..200 {
+        mem.put(&key(&format!("k_{i:04}")), row(0, b"v", 1000), &s)
+            .unwrap();
+    }
+    let mut seen = 0usize;
+    mem.for_each_partition(None, None, &mut |_p: &Partition| {
+        seen += 1;
+        true
+    });
+    assert_eq!(seen, 200, "an unstoppable visit must see every partition");
 }
 
 /// I-5: `for_each_partition_cloned` must release the read guard BEFORE the
@@ -303,7 +349,10 @@ fn for_each_partition_sees_every_partition_in_token_order() {
     }
 
     let mut visited: Vec<DecoratedKey> = Vec::new();
-    mem.for_each_partition(None, None, &mut |p: &Partition| visited.push(p.key.clone()));
+    mem.for_each_partition(None, None, &mut |p: &Partition| {
+        visited.push(p.key.clone());
+        true
+    });
 
     let expected: Vec<DecoratedKey> = mem
         .snapshot_range_limited(None, None, usize::MAX)
@@ -341,7 +390,8 @@ fn for_each_partition_honors_bounds() {
 
     let mut visited: Vec<DecoratedKey> = Vec::new();
     mem.for_each_partition(Some(&lo), Some(&hi), &mut |p: &Partition| {
-        visited.push(p.key.clone())
+        visited.push(p.key.clone());
+        true
     });
 
     assert_eq!(visited, all[5..=15].to_vec());
