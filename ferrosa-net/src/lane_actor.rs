@@ -256,9 +256,9 @@ impl Drop for HandleGuard {
 /// if a caller is cancelled between reserving a slot and sending the command,
 /// the permit is simply dropped — no half-sent state.
 ///
-/// For a dedicated-thread (Raft lane) actor the handle also carries a shared
-/// [`HandleGuard`], which drops exactly once — when the last handle goes away —
-/// and wakes the actor thread. The actor's own `ActorReconnectContext` clone
+/// For a pooled (Raft lane) actor the handle also carries a shared
+/// `HandleGuard`, which drops exactly once — when the last handle goes away —
+/// and wakes the actor's reaper. The actor's own `ActorReconnectContext` clone
 /// deliberately carries **no** guard, so it does not hold the count open.
 #[derive(Clone)]
 pub struct LaneHandle {
@@ -267,7 +267,7 @@ pub struct LaneHandle {
     default_timeout: Duration,
     cancelled: Arc<AtomicBool>,
     /// `None` for actors that run on a runtime owned elsewhere (a `TaskPool`);
-    /// only the dedicated-thread raft actor needs reaping.
+    /// only the pooled Raft lane actor needs reaping.
     _guard: Option<Arc<HandleGuard>>,
 }
 
