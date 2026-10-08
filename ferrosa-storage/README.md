@@ -745,7 +745,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Quarantine + self-heal** (`quarantine.rs`, `self_heal/`) — malformed rows
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
-  quarantines them under a safety rail. It also checks every vector index each
+  quarantines them under a safety rail. A generation that fails its smoke test
+  is re-checked under its generation guard, and one a concurrent compaction
+  retired is logged as gone, not reported corrupt (ST-88). It also checks every vector index each
   tick (`IssueKind::InvalidVectorIndex`, ST-81): a generation with missing
   sidecars, a sidecar that does not decode, a vector/scope count that
   disagrees with the manifest, a dimension that disagrees with the column, or

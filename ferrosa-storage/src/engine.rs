@@ -9051,19 +9051,81 @@ impl StorageEngine {
         table_dir: &std::path::Path,
         verified: &mut std::collections::BTreeSet<u64>,
     ) -> Vec<(u64, String)> {
+        let listed = Self::list_generations_in_dir(table_dir);
+        let corrupt = Self::scan_generations_for_corrupt(table_dir, &listed, verified);
+        // Generations compaction retired never come back, so their cache
+        // entries would otherwise accumulate for the life of the process.
+        verified.retain(|gen| listed.contains(gen));
+        corrupt
+    }
+
+    /// Smoke-test `gens`, a listing of `table_dir` taken at some earlier
+    /// instant, returning the ones that are corrupt *now*.
+    ///
+    /// The listing can be stale: a compaction swap may retire a listed
+    /// generation before its smoke test runs, and the test then fails because
+    /// the files are gone, not because they are bad. Each failure is
+    /// re-judged under the generation's guard (the lock retirement holds for
+    /// its whole duration, [`crate::generation_guard`]): a generation that is
+    /// no longer on disk was retired and is reported as gone, never as
+    /// corrupt. The on-disk listing, not the published view, is the reference
+    /// because generations excluded as corrupt at load are on disk but not in
+    /// the view, and those are exactly what this scan exists to find.
+    pub fn scan_generations_for_corrupt(
+        table_dir: &std::path::Path,
+        gens: &[u64],
+        verified: &mut std::collections::BTreeSet<u64>,
+    ) -> Vec<(u64, String)> {
         let mut corrupt = Vec::new();
-        for gen in Self::list_generations_in_dir(table_dir) {
+        for &gen in gens {
             if verified.contains(&gen) {
                 continue;
             }
-            match Self::smoke_test_generation(table_dir, gen) {
+            let reason = match Self::smoke_test_generation(table_dir, gen) {
                 Ok(_) => {
                     verified.insert(gen);
+                    continue;
                 }
-                Err(e) => corrupt.push((gen, e.to_string())),
+                Err(e) => e.to_string(),
+            };
+            let slot = crate::generation_guard::slot(table_dir, &gen.to_string());
+            let state = slot.lock();
+            if !Self::generation_is_on_disk(table_dir, gen) {
+                tracing::info!(
+                    dir = %table_dir.display(),
+                    generation = gen,
+                    retired_by_compaction = state.is_retired(),
+                    smoke_test_error = %reason,
+                    "self-heal: generation left the table during its smoke test \
+                     (a compaction retired it); not corrupt"
+                );
+                continue;
             }
+            corrupt.push((gen, reason));
         }
         corrupt
+    }
+
+    /// True while `gen`'s `Data.db`, the discovery key that retirement moves
+    /// first, is present in either the flat or the directory layout. A probe
+    /// that fails counts as present, so an unreadable directory can never
+    /// turn a corrupt generation into a "retired" one.
+    fn generation_is_on_disk(table_dir: &std::path::Path, gen: u64) -> bool {
+        let flat = table_dir.join(format!("{gen}-Data.db"));
+        let nested = table_dir
+            .join(gen.to_string())
+            .join(format!("{gen}-Data.db"));
+        [flat, nested].iter().any(|path| match path.try_exists() {
+            Ok(present) => present,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "self-heal: could not probe a generation's Data.db; treating it as present"
+                );
+                true
+            }
+        })
     }
 
     /// Move a corrupt generation's files into the table's `quarantine/`
