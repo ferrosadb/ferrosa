@@ -278,6 +278,15 @@ two negative controls that fail if the guard loses its teeth),
 
 ### 7. Follow-ups (not in this PR)
 
+- **Same defect class, PRE-EXISTING, at three more sites.** `store.rs` builds
+  `Vec<Arc<Partition>>` from `guard.active.range_iter(..)` at three read-only scan
+  points (the token-range vector/`walk_token_range` helpers, ~6440 / 6650 / 7112 /
+  7462 region) — collecting owned `Arc`s, so the same refcount inflation taxes
+  concurrent writes during a vector or digest scan. These are on `origin/main`
+  already (3 occurrences of the `Vec<Arc<Partition>> = guard` shape there), i.e. not
+  introduced by #541, and they are bounded scans so the fix is the same
+  `for_each_partition`/borrowed sweep. Out of scope here to keep the regression fix
+  reviewable — recorded so it is not lost.
 - **The transient memtable FTI is rebuilt per query.** Cache it (invalidate on write /
   memtable rotation) or build it incrementally. This is the dominant cost on the
   fulltext path — larger than everything above.
