@@ -30,6 +30,8 @@ pub mod data;
 pub mod dio_align;
 pub mod direct;
 pub mod io;
+#[cfg(test)]
+mod legacy_ns_tests;
 pub mod marshal;
 pub mod partition_index;
 pub mod pump;

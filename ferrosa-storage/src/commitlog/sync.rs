@@ -6,12 +6,13 @@
 //!   [`Error::CommitLogNotDurable`](ferrosa_common::Error::CommitLogNotDurable)
 //!   instead of an acknowledgement. No locks were added: durability state is
 //!   atomics ([`SyncHealth`]); the condvar mutexes predate this change.
-//! Last revised: 2026-10-03
-//! Last changed: P0-6 (t_88479cda). If the periodic sync thread died, writes
-//!   were still acknowledged and never fsynced; a Batch fsync error and a
-//!   Group flush error were logged and the write acknowledged anyway; a Group
-//!   stall panicked the writer. All three now refuse the write, and a dead
-//!   thread can be restarted by the node supervisor.
+//! Last revised: 2026-10-08
+//! Last changed: t_260afd25. The Periodic and Group sync threads checked the
+//!   stop flag outside their wake lock, so a `stop()` landing between that
+//!   check and the idle wait was lost and `stop()` blocked in `join()` for the
+//!   whole interval. Both now re-check it under the lock.
+//!   Before that, P0-6 (t_88479cda): a dead sync thread, a failed fsync, or a
+//!   Group stall now refuse the write instead of acknowledging it.
 //!
 //! Three strategies control when segment buffers are fsynced to disk:
 //!
@@ -710,6 +711,11 @@ struct PeriodicShared {
     /// at once, instead of treating it as a fresh batch and waiting out the
     /// batch window while every write is refused.
     sync_now: AtomicBool,
+
+    /// Test seam: hold the thread between its stop-flag check and taking the
+    /// wake lock until `stop()` has signalled (t_260afd25).
+    #[cfg(test)]
+    hold_before_wait: AtomicBool,
 }
 
 const PERIODIC_THREAD: &str = "commitlog-periodic-sync";
@@ -740,6 +746,8 @@ impl PeriodicSync {
                 batch,
                 health,
                 sync_now: AtomicBool::new(false),
+                #[cfg(test)]
+                hold_before_wait: AtomicBool::new(false),
             }),
             handle: Mutex::new(None),
         }
@@ -819,10 +827,38 @@ impl PeriodicShared {
         self.pending.load(Ordering::Acquire) == 0 && self.health.all_durable()
     }
 
+    /// Park until `stop_inner` has set `stopped` and notified, then return:
+    /// the notification has been sent and nobody was waiting for it.
+    #[cfg(test)]
+    fn hold_until_stop_signalled(&self) {
+        if !self.hold_before_wait.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !*self.wake.0.lock() {
+            assert!(
+                Instant::now() < deadline,
+                "stop() never signalled the periodic sync thread"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(not(test))]
+    fn hold_until_stop_signalled(&self) {}
+
     fn run(&self) {
         while !self.stop_flag.load(Ordering::Acquire) {
+            self.hold_until_stop_signalled();
             let (lock, cvar) = &self.wake;
             let mut stopped = lock.lock();
+            // Re-check under the lock. The `while` check ran without it, and a
+            // stop() that set the flag and notified between that check and
+            // here woke nobody: the idle wait below would then sleep the whole
+            // sync_interval while stop() blocks in join() (t_260afd25).
+            if self.stop_flag.load(Ordering::Acquire) {
+                break;
+            }
             // A restart's inherited backlog is synced at once: no idle wait,
             // no batch window.
             let urgent = self.sync_now.swap(false, Ordering::AcqRel);
@@ -1034,6 +1070,11 @@ struct GroupShared {
     flush_complete: (Mutex<()>, Condvar),
 
     health: Arc<SyncHealth>,
+
+    /// Test seam: hold the thread between its stop-flag check and taking the
+    /// writer-signal lock until `stop()` has signalled (t_260afd25).
+    #[cfg(test)]
+    hold_before_wait: AtomicBool,
 }
 
 const GROUP_THREAD: &str = "commitlog-group-sync";
@@ -1064,6 +1105,8 @@ impl GroupSync {
                 writer_signal: (Mutex::new(()), Condvar::new()),
                 flush_complete: (Mutex::new(()), Condvar::new()),
                 health,
+                #[cfg(test)]
+                hold_before_wait: AtomicBool::new(false),
             }),
             handle: Mutex::new(None),
         }
@@ -1114,13 +1157,43 @@ impl GroupShared {
         cvar.notify_all();
     }
 
+    /// Park until `stop_inner` has set the stop flag and notified (it does
+    /// both under `writer_signal`), then return.
+    #[cfg(test)]
+    fn hold_until_stop_signalled(&self) {
+        if !self.hold_before_wait.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !{
+            let _guard = self.writer_signal.0.lock();
+            self.stop_flag.load(Ordering::Acquire)
+        } {
+            assert!(
+                Instant::now() < deadline,
+                "stop() never signalled the group sync thread"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(not(test))]
+    fn hold_until_stop_signalled(&self) {}
+
     fn run(&self) {
         while !self.stop_flag.load(Ordering::Acquire) {
+            self.hold_until_stop_signalled();
             let opened_at;
             // Wait for a writer signal or max_wait timeout.
             {
                 let (lock, cvar) = &self.writer_signal;
                 let mut guard = lock.lock();
+                // stop_inner sets the flag and notifies under this lock, so a
+                // check here cannot miss it; the `while` check above can
+                // (t_260afd25).
+                if self.stop_flag.load(Ordering::Acquire) {
+                    break;
+                }
 
                 // Wait only if there is nothing to sync. A write left by a
                 // dead predecessor has no pending count but is not durable.
@@ -1664,6 +1737,50 @@ mod tests {
         );
         drop(flushed);
         sync.stop();
+    }
+
+    /// Run `stop()` on another thread and fail (never hang) if it does not
+    /// return within 5 s.
+    fn assert_stop_returns(sync: Arc<dyn SyncStrategy>, strategy: &str) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stopper = thread::spawn(move || {
+            sync.stop();
+            done_tx.send(()).expect("the test waits for stop()");
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{strategy} stop() did not return within 5s ({e}): the sync thread missed \
+                 the stop signal sent between its stop-flag check and its idle wait \
+                 (t_260afd25)"
+                )
+            });
+        stopper.join().expect("stopper thread");
+    }
+
+    /// t_260afd25: CI hung 600 s in `periodic_sync_flushes_when_target_bytes_reached`.
+    /// The sync thread checked `stop_flag` outside the wake lock; a `stop()`
+    /// whose notify landed between that check and the idle wait reached no
+    /// waiter, and the thread slept the whole `sync_interval` (3600 s) while
+    /// `stop()` sat in `join()`. The seam parks the thread in exactly that
+    /// window until `stop()` has notified.
+    #[test]
+    fn periodic_stop_between_flag_check_and_idle_wait_is_not_lost() {
+        let sync = PeriodicSync::new(Duration::from_secs(3600), Arc::new(|| Ok(())));
+        sync.shared.hold_before_wait.store(true, Ordering::SeqCst);
+        sync.start().expect("start the sync thread");
+        assert_stop_returns(Arc::new(sync), "periodic");
+    }
+
+    /// The same window in GroupSync, which `group_sync_stop_flushes_pending`
+    /// and every `Drop` can hit with a 3600 s `max_wait`.
+    #[test]
+    fn group_stop_between_flag_check_and_idle_wait_is_not_lost() {
+        let sync = GroupSync::new(Duration::from_secs(3600), Arc::new(|| Ok(())));
+        sync.shared.hold_before_wait.store(true, Ordering::SeqCst);
+        sync.start().expect("start the sync thread");
+        assert_stop_returns(Arc::new(sync), "group");
     }
 
     #[test]

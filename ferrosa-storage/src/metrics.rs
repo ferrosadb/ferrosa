@@ -1620,6 +1620,15 @@ pub fn render_prometheus() -> String {
         "ferrosa_storage_compaction_paused_tables {}\n",
         COMPACTION_PAUSED_TABLES.load(Ordering::Relaxed)
     ));
+    out.push_str("# HELP ferrosa_storage_legacy_ns_timestamps_normalised_total Legacy nanosecond cell timestamps (pre-t_cf637b6e Accord writes) read as microseconds, by where they were found. Zero on every node after compaction means the compatibility shim can be removed.\n");
+    out.push_str("# TYPE ferrosa_storage_legacy_ns_timestamps_normalised_total counter\n");
+    for source in ferrosa_common::cell_ts::LegacyNsSource::ALL {
+        out.push_str(&format!(
+            "ferrosa_storage_legacy_ns_timestamps_normalised_total{{source=\"{}\"}} {}\n",
+            source.label(),
+            ferrosa_common::cell_ts::legacy_ns_normalised_total(source)
+        ));
+    }
     out.push_str("# HELP ferrosa_storage_compaction_planning_deferred_total Planning rounds skipped because the compaction pipeline was already saturated (see FERROSA_COMPACTION_BACKPRESSURE_PRESSURE).\n");
     out.push_str("# TYPE ferrosa_storage_compaction_planning_deferred_total counter\n");
     out.push_str(&format!(
