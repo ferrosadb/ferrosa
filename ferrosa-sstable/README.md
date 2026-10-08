@@ -236,6 +236,24 @@ to a Data.db offset, then decodes the partition (decompressing chunks through a
 bounded LRU when compressed). Streaming reads walk Data.db directly with
 constant per-partition memory.
 
+## Legacy nanosecond timestamps (t_cf637b6e)
+
+SSTables written before t_cf637b6e can hold Accord timestamps in
+nanoseconds. `DataReader` normalises every decoded timestamp (cell, liveness,
+row, complex and partition deletion) with `ferrosa_common::normalize_cell_ts`,
+so readers only ever see microseconds. Two headers are kept:
+
+- `SSTableReader::stored_header()` is Statistics.db as written: its
+  `min_timestamp` is the delta base, and a `DataReader` must be built from it.
+- `SSTableReader::header()` has normalised bounds (exact for ns-only files,
+  widened for mixed or unknown-max files) and is what compaction, purge and
+  metadata use.
+
+`may_hold_legacy_ns_timestamps()` reports a file whose stored bounds show
+legacy values; `count_legacy_ns_timestamps()` decodes the file once and
+counts them. Each `DataReader` adds what it normalised to the
+`sstable` source of the counter when dropped.
+
 ## Public API (key entry points)
 
 | Area | Items |

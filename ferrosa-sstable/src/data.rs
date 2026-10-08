@@ -177,9 +177,24 @@ const DELETION_IS_LIVE: u8 = 0x80;
 /// decoding timestamps and TTLs.
 pub struct DataReader<'a, R: ReadAt> {
     reader: &'a R,
+    /// The header AS STORED: its `min_timestamp` is the delta base the writer
+    /// encoded against, so it must never be the normalised view.
     header: &'a SerializationHeader,
     pos: u64,
     legacy_fixed_value_lengths: bool,
+    /// Legacy nanosecond timestamps this reader normalised (t_cf637b6e),
+    /// added to `legacy_ns_timestamps_normalised_total{source="sstable"}` once,
+    /// on drop, so the per-cell cost is a local increment.
+    legacy_ns_normalised: u64,
+}
+
+impl<R: ReadAt> Drop for DataReader<'_, R> {
+    fn drop(&mut self) {
+        ferrosa_common::cell_ts::record_legacy_ns_normalised(
+            ferrosa_common::cell_ts::LegacyNsSource::Sstable,
+            self.legacy_ns_normalised,
+        );
+    }
 }
 
 impl<'a, R: ReadAt> DataReader<'a, R> {
@@ -188,13 +203,39 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// Whether non-frozen collection / UDT columns are read as per-element
     /// (complex) cells vs a legacy whole-value cell comes from
     /// `header.complex_collections`.
+    ///
+    /// `header` must be the header as stored in Statistics.db (the delta
+    /// base), not [`crate::reader::SSTableReader::header`]'s normalised view.
     pub fn new(reader: &'a R, header: &'a SerializationHeader, start_pos: u64) -> Self {
         Self {
             reader,
             header,
             pos: start_pos,
             legacy_fixed_value_lengths: false,
+            legacy_ns_normalised: 0,
         }
+    }
+
+    /// Legacy nanosecond timestamps normalised so far by this reader.
+    pub fn legacy_ns_normalised(&self) -> u64 {
+        self.legacy_ns_normalised
+    }
+
+    /// A delta-encoded timestamp (cell, liveness, row or complex deletion),
+    /// decoded against the stored header minimum and normalised to
+    /// microseconds (t_cf637b6e).
+    #[inline]
+    fn decode_timestamp(&mut self, delta: u64) -> i64 {
+        self.normalise_timestamp(self.header.min_timestamp.wrapping_add(delta as i64))
+    }
+
+    /// Normalise a decoded raw timestamp, counting a legacy nanosecond value.
+    #[inline]
+    fn normalise_timestamp(&mut self, raw: i64) -> i64 {
+        if ferrosa_common::is_legacy_ns(raw) {
+            self.legacy_ns_normalised += 1;
+        }
+        ferrosa_common::normalize_cell_ts(raw)
     }
 
     fn missing_partition_end_error() -> Error {
@@ -888,7 +929,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         if flags & HAS_TIMESTAMP != 0 {
             let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            liveness.timestamp = self.header.min_timestamp.wrapping_add(delta as i64);
+            liveness.timestamp = self.decode_timestamp(delta);
 
             if flags & HAS_TTL != 0 {
                 let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -910,7 +951,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             self.pos += n as u64;
             let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            let marked_for_delete_at = self.header.min_timestamp + ts_delta as i64;
+            let marked_for_delete_at = self.decode_timestamp(ts_delta);
             let local_deletion_time =
                 (self.header.min_local_deletion_time as i64).wrapping_add(ldt_delta as i64) as u32;
             DeletionTime::new(marked_for_delete_at, local_deletion_time)
@@ -977,7 +1018,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             let mut mfda_bytes = [0u8; 8];
             mfda_bytes[0] = first[0];
             mfda_bytes[1..8].copy_from_slice(&remaining[0..7]);
-            let marked_for_delete_at = i64::from_be_bytes(mfda_bytes);
+            let marked_for_delete_at = self.normalise_timestamp(i64::from_be_bytes(mfda_bytes));
 
             let local_deletion_time = u32::from_be_bytes(remaining[7..11].try_into().unwrap());
 
@@ -1282,7 +1323,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         if flags & HAS_TIMESTAMP != 0 {
             let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            liveness.timestamp = self.header.min_timestamp.wrapping_add(delta as i64);
+            liveness.timestamp = self.decode_timestamp(delta);
 
             if flags & HAS_TTL != 0 {
                 let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -1305,7 +1346,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
 
-            let marked_for_delete_at = self.header.min_timestamp + ts_delta as i64;
+            let marked_for_delete_at = self.decode_timestamp(ts_delta);
             let local_deletion_time =
                 (self.header.min_local_deletion_time as i64).wrapping_add(ldt_delta as i64) as u32;
             DeletionTime::new(marked_for_delete_at, local_deletion_time)
@@ -1389,7 +1430,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         self.pos += n as u64;
         let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
         self.pos += n as u64;
-        let marked_for_delete_at = self.header.min_timestamp.wrapping_add(ts_delta as i64);
+        let marked_for_delete_at = self.decode_timestamp(ts_delta);
         let local_deletion_time =
             (self.header.min_local_deletion_time as i64).wrapping_add(ldt_delta as i64) as u32;
         Ok(Some(DeletionTime::new(
@@ -1520,7 +1561,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         if flags & HAS_TIMESTAMP != 0 {
             let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            liveness.timestamp = self.header.min_timestamp.wrapping_add(delta as i64);
+            liveness.timestamp = self.decode_timestamp(delta);
 
             if flags & HAS_TTL != 0 {
                 let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -1542,7 +1583,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             self.pos += n as u64;
             let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            let marked_for_delete_at = self.header.min_timestamp + ts_delta as i64;
+            let marked_for_delete_at = self.decode_timestamp(ts_delta);
             let local_deletion_time =
                 (self.header.min_local_deletion_time as i64).wrapping_add(ldt_delta as i64) as u32;
             DeletionTime::new(marked_for_delete_at, local_deletion_time)
@@ -1918,7 +1959,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         } else {
             let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            self.header.min_timestamp.wrapping_add(delta as i64)
+            self.decode_timestamp(delta)
         };
 
         // Local deletion time (for tombstones and expiring cells)
