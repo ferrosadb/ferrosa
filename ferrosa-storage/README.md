@@ -71,6 +71,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   durable or the stall deadline passes, so a node the supervisor restarted
   acknowledges writes again instead of refusing them for as long as
   scheduling takes.
+  Both sync threads re-check the stop flag under their wake lock before an
+  idle wait, so a `stop()` that lands between the loop's own check and the
+  wait is never lost (FMEA ST-90; it used to leave `stop()` in `join()` for
+  the whole idle interval).
   **The sync call is a runtime setting** (FMEA ST-87):
   `FERROSA_COMMITLOG_SYNC_MODE` = `full` (default, `F_FULLFSYNC`, power-loss
   durable) | `barrier` (`F_BARRIERFSYNC`) | `fsync` (`fsync(2)`). The weaker
