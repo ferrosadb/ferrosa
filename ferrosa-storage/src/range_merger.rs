@@ -299,6 +299,19 @@ fn remap_cells(cells: &mut Vec<(u16, ferrosa_common::cell::CellValue)>, mapping:
     *cells = remapped;
 }
 
+/// True when `merge::apply_deletions` would actually rewrite this partition:
+/// a partition-level tombstone (suppresses old rows / static cells) or any
+/// row-level tombstone (suppresses that row's old cells). When false, a
+/// scanned `Arc<Partition>` can be served without copy-on-write, which is the
+/// common case for flushed data and the compaction rewrite path.
+pub(crate) fn partition_needs_deletion_suppression(p: &Partition) -> bool {
+    use ferrosa_sstable::types::DeletionTime;
+    if p.deletion.marked_for_delete_at != DeletionTime::LIVE.marked_for_delete_at {
+        return true;
+    }
+    p.rows.iter().any(|r| !r.deletion.is_live())
+}
+
 /// One source contributing partitions to the merge.
 ///
 /// Each variant supports a **peek/pop split**: `peek_key()` returns
@@ -333,8 +346,8 @@ pub enum MergeSource<'a, R: ReadAt> {
     /// (the full partition, since memtables yield owned partitions);
     /// `pop_partition` takes it.
     Memtable {
-        iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-        peeked: Option<Partition>,
+        iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
+        peeked: Option<Arc<Partition>>,
     },
     // NOTE: fragment-row streaming state for the Memtable variant lives
     // in `RangeMerger` (see `MemRowSource`) rather than here, so the
@@ -416,14 +429,12 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
     /// `Ok(Some(_))`). Clears the peek cache. Returns `Ok(None)` at
     /// EOS only if the source was exhausted between peek and pop
     /// (race-free here — we don't share sources across threads).
-    fn pop_partition(&mut self) -> Result<Option<Partition>> {
+    fn pop_partition(&mut self) -> Result<Option<Arc<Partition>>> {
         match self {
             Self::Memtable { iter, peeked } => {
-                if let Some(p) = peeked.take() {
-                    Ok(Some(p))
-                } else {
-                    Ok(iter.next())
-                }
+                // Memtable yields `Arc<Partition>` — hand it straight through
+                // (one refcount bump, never a deep clone).
+                Ok(peeked.take().or_else(|| iter.next()))
             }
             Self::SsTable {
                 iter,
@@ -462,11 +473,11 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
                 if let (Some(mapping), Some(partition)) = (mapping, partition.as_mut()) {
                     mapping.remap_partition(partition);
                 }
-                Ok(partition)
+                Ok(partition.map(Arc::new))
             }
             Self::SsTableRun { run, peeked_key } => {
                 peeked_key.take();
-                run.next_partition()
+                Ok(run.next_partition()?.map(Arc::new))
             }
         }
     }
@@ -489,10 +500,14 @@ impl<'a, R: ReadAt> MergeSource<'a, R> {
     fn pop_partition_header(&mut self) -> Result<Option<PoppedHeader>> {
         match self {
             Self::Memtable { iter, peeked } => {
+                // Clone-on-write: only deep-clone if the Arc is shared (the
+                // memtable still holds it). In the fragment path the whole-
+                // partition iterator has already been consumed, so this is
+                // usually a move.
                 let partition = match peeked.take() {
-                    Some(p) => p,
+                    Some(p) => Arc::unwrap_or_clone(p),
                     None => match iter.next() {
-                        Some(p) => p,
+                        Some(p) => Arc::unwrap_or_clone(p),
                         None => return Ok(None),
                     },
                 };
@@ -1050,8 +1065,8 @@ pub fn group_disjoint_runs(bounds: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<usize>> {
 /// `sstables` are the per-SSTable Arcs whose `partitions_iter()`
 /// will be consumed.
 pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
@@ -1069,8 +1084,8 @@ pub fn merger_for_sources<'a, R: ReadAt + Send + Sync + 'static>(
 /// Compatibility variant for tables whose current schema order may differ
 /// from one or more SSTable SerializationHeaders.
 pub fn merger_for_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mappings: &'a [ColumnOrdinalMapping],
     start: Option<DecoratedKey>,
@@ -1098,8 +1113,8 @@ pub fn merger_for_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
 /// key, not on the cell payload. Used by the CQL projection fast
 /// path.
 pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     wanted: &'a [u16],
     start: Option<DecoratedKey>,
@@ -1117,8 +1132,8 @@ pub fn merger_for_projected_sources<'a, R: ReadAt + Send + Sync + 'static>(
 
 /// Compatibility projection variant for mixed current/SSTable column order.
 pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mappings: &'a [ColumnOrdinalMapping],
     wanted: &'a [u16],
@@ -1154,8 +1169,8 @@ pub fn merger_for_projected_sources_with_mappings<'a, R: ReadAt + Send + Sync + 
 /// expected to read only `rows.len()` / `clustering` from the
 /// output). Used by the COUNT(*) fast path.
 pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     start: Option<DecoratedKey>,
     end: Option<DecoratedKey>,
@@ -1171,8 +1186,8 @@ pub fn merger_for_metadata_sources<'a, R: ReadAt + Send + Sync + 'static>(
 }
 
 fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mappings: Option<&'a [ColumnOrdinalMapping]>,
     mode: RunMode<'a>,
@@ -1226,8 +1241,8 @@ fn build_merger_without_runs<'a, R: ReadAt + Send + Sync + 'static>(
 /// dramatic for fragmented LSM states where the leader has 100+
 /// SSTables on a single table.
 fn build_merger_with_runs<'a, R: ReadAt + Send + Sync + 'static>(
-    active_iter: Box<dyn Iterator<Item = Partition> + Send + 'a>,
-    flushing_iters: Vec<Box<dyn Iterator<Item = Partition> + Send + 'a>>,
+    active_iter: Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>,
+    flushing_iters: Vec<Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a>>,
     sstables: &'a [Arc<SSTableReader<R>>],
     mode: RunMode<'a>,
     start: Option<DecoratedKey>,
@@ -1471,7 +1486,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
     /// partition (now warm — header was just paged in by peek), and
     /// repeats for every other source whose head matches the same
     /// key. Merges + applies deletion suppression before yielding.
-    pub fn next_merged_partition(&mut self) -> Result<Option<Partition>> {
+    pub fn next_merged_partition(&mut self) -> Result<Option<Arc<Partition>>> {
         if self.exhausted {
             return Ok(None);
         }
@@ -1495,7 +1510,7 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
             }
             Err(e) => return Err(e),
         };
-        let mut group: Vec<Partition> = vec![first_partition];
+        let mut group: Vec<Arc<Partition>> = vec![first_partition];
         let mut popped_srcs: Vec<usize> = vec![first_src];
 
         while let Some(top) = self.heap.peek() {
@@ -1518,12 +1533,31 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
             self.refill_source(src)?;
         }
 
-        let mut merged = if group.len() == 1 {
-            group.into_iter().next().unwrap()
+        // Single-source fast path: the `Arc` is handed straight out when
+        // no deletion suppression would change it (the common flushed /
+        // compaction case, where the group merges with nothing). Only
+        // materialise an owned partition when the source itself carries a
+        // tombstone that suppression would rewrite.
+        let is_multi = group.len() > 1;
+        let merged = if !is_multi {
+            let only = group.pop().expect("len == 1");
+            if partition_needs_deletion_suppression(&only) {
+                let mut owned = Arc::unwrap_or_clone(only);
+                merge::apply_deletions(&mut owned);
+                Arc::new(owned)
+            } else {
+                only
+            }
         } else {
-            merge::merge_partitions(group)
+            // A genuine multi-source merge must materialise one owned result;
+            // `merge_partitions` applies deletion suppression internally. The
+            // group is bounded (one entry per source that holds the SAME key),
+            // and `merge_partitions` takes an owned `Vec`, so the collect is
+            // inline and untyped rather than scan-shaped.
+            Arc::new(merge::merge_partitions(
+                group.into_iter().map(Arc::unwrap_or_clone).collect(),
+            ))
         };
-        merge::apply_deletions(&mut merged);
         Ok(Some(merged))
     }
 
@@ -2021,7 +2055,8 @@ mod tests {
         sstables: &[Arc<SSTableReader<Vec<u8>>>],
         k: usize,
     ) -> (Vec<Partition>, usize) {
-        let empty_active: Box<dyn Iterator<Item = Partition> + Send> = Box::new(std::iter::empty());
+        let empty_active: Box<dyn Iterator<Item = Arc<Partition>> + Send> =
+            Box::new(std::iter::empty());
         let mut merger =
             merger_for_sources(empty_active, Vec::new(), sstables, None, None).unwrap();
 
@@ -2082,12 +2117,13 @@ mod tests {
     /// completion. This is the byte-identical oracle the fragment path
     /// must reproduce.
     fn drain_whole(sstables: &[Arc<SSTableReader<Vec<u8>>>]) -> Vec<Partition> {
-        let empty_active: Box<dyn Iterator<Item = Partition> + Send> = Box::new(std::iter::empty());
+        let empty_active: Box<dyn Iterator<Item = Arc<Partition>> + Send> =
+            Box::new(std::iter::empty());
         let mut merger =
             merger_for_sources(empty_active, Vec::new(), sstables, None, None).unwrap();
         let mut out = Vec::new();
         while let Some(p) = merger.next_merged_partition().unwrap() {
-            out.push(p);
+            out.push(Arc::unwrap_or_clone(p));
         }
         out
     }

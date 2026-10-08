@@ -235,21 +235,27 @@ impl RpcHandler for RepairFetchHandler {
                 return None;
             }
         };
-        let in_range: Vec<PartitionWire> = in_range_partitions
-            .into_iter()
-            .map(partition_to_wire)
-            .collect();
-        let resp = RepairFetchResponsePayload {
-            partitions: in_range,
-            next_cursor,
-        };
-        match bincode::serialize(&resp) {
-            Ok(body) => Some(Message::RepairFetchResponse(Bytes::from(body))),
-            Err(e) => {
+        // Emit the response with the borrowed serializer: no `Vec<PartitionWire>`
+        // and no `Arc::unwrap_or_clone`, so the repair fetch stops deep-copying
+        // every cell value of every returned partition (~5.8 % of node CPU in
+        // `Partition::clone` + `Vec<Row>::clone` in the FP capture). The bytes
+        // are identical to `bincode::serialize(&RepairFetchResponsePayload{..})`
+        // — pinned by `repair_fetch_response_borrowed_emit_matches_legacy`.
+        let mut body: Vec<u8> = Vec::new();
+        let count = in_range_partitions.len() as u64;
+        bincode::serialize_into(&mut body, &count)
+            .expect("RepairFetchResponsePayload length serialization is infallible");
+        for partition in in_range_partitions.iter() {
+            if let Err(e) =
+                crate::raft::handlers::serialize_partition_to_wire_borrowed(&mut body, partition)
+            {
                 tracing::warn!(%e, "RepairFetchHandler: failed to serialize response");
-                None
+                return None;
             }
         }
+        bincode::serialize_into(&mut body, &next_cursor)
+            .expect("RepairFetchResponsePayload cursor serialization is infallible");
+        Some(Message::RepairFetchResponse(Bytes::from(body)))
     }
 }
 
@@ -498,6 +504,74 @@ impl RepairStore for RemoteRepairStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multi-row, multi-cell partition: exercises every layer of the wire
+    /// encoding so a byte-equivalence assertion below is not trivially true.
+    fn repair_fetch_fixture() -> Partition {
+        use ferrosa_common::cell::CellValue;
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        Partition {
+            key: DecoratedKey::new(PartitionKey::new(b"pk-bytes".to_vec())),
+            deletion: DeletionTime::new(7, 7),
+            static_row: Some(Row {
+                clustering: Vec::new(),
+                cells: vec![(9, CellValue::live(b"static".to_vec(), 999))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(999),
+            }),
+            rows: (0..3)
+                .map(|i| Row {
+                    clustering: vec![i as u8],
+                    cells: vec![
+                        (
+                            0,
+                            CellValue::live(format!("v-{i}").into_bytes(), 12_345 + i as i64),
+                        ),
+                        (
+                            1,
+                            CellValue::live(format!("w-{i}").into_bytes(), 77 + i as i64)
+                                .with_path(b"elem".to_vec()),
+                        ),
+                    ],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(12_345 + i as i64),
+                })
+                .collect(),
+        }
+    }
+
+    /// The repair Fetch response must emit the SAME bytes whether it is built
+    /// by materialising `Vec<PartitionWire>` (which clones every cell value) or
+    /// by streaming each partition through the borrowed serializer. The
+    /// borrowed path exists so the repair fetch stops deep-cloning ~5.8 % of
+    /// node CPU in `Partition::clone`; a byte mismatch would corrupt repair.
+    #[test]
+    fn repair_fetch_response_borrowed_emit_matches_legacy() {
+        let parts = vec![repair_fetch_fixture(), repair_fetch_fixture()];
+
+        // Legacy: clone each partition into `PartitionWire`, then serialize.
+        let legacy = bincode::serialize(&RepairFetchResponsePayload {
+            partitions: parts.iter().cloned().map(partition_to_wire).collect(),
+            next_cursor: Some(1234),
+        })
+        .unwrap();
+
+        // Borrowed: `partitions.len()` then each partition by reference,
+        // then `next_cursor` — byte-identical to the struct serialization.
+        let mut borrowed: Vec<u8> = Vec::new();
+        let count = parts.len() as u64;
+        bincode::serialize_into(&mut borrowed, &count).unwrap();
+        for p in &parts {
+            crate::raft::handlers::serialize_partition_to_wire_borrowed(&mut borrowed, p).unwrap();
+        }
+        bincode::serialize_into(&mut borrowed, &Some(1234i64)).unwrap();
+
+        assert_eq!(
+            borrowed, legacy,
+            "borrowed repair-fetch emission diverged from the legacy collect"
+        );
+    }
 
     /// Encode + decode the three payload structs to confirm bincode +
     /// serde round-trip cleanly. Catches breaking schema changes early.

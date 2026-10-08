@@ -9766,7 +9766,7 @@ impl StorageEngine {
         end_token: i64,
         max_partitions: usize,
         max_bytes: usize,
-    ) -> ferrosa_common::Result<(Vec<Partition>, Option<i64>)> {
+    ) -> ferrosa_common::Result<(Vec<Arc<Partition>>, Option<i64>)> {
         if start_token >= end_token || max_partitions == 0 {
             return Ok((Vec::new(), None));
         }
@@ -9905,7 +9905,7 @@ impl StorageEngine {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> std::pin::Pin<
-        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Arc<Partition>>> + Send>,
     > {
         match self.table_state(table_id) {
             Some(state) => {
@@ -9933,7 +9933,7 @@ impl StorageEngine {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> std::pin::Pin<
-        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Arc<Partition>>> + Send>,
     > {
         match self.table_state(table_id) {
             Some(state) => {
@@ -9955,7 +9955,7 @@ impl StorageEngine {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> std::pin::Pin<
-        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Arc<Partition>>> + Send>,
     > {
         match self.table_state(table_id) {
             Some(state) => {
@@ -9975,7 +9975,7 @@ impl StorageEngine {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> std::pin::Pin<
-        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Arc<Partition>>> + Send>,
     > {
         match self.table_state(table_id) {
             Some(state) => {

@@ -18325,10 +18325,15 @@ mod tests {
             .await
             .expect("one partition present")
             .expect("partition read ok");
-        let frame =
-            cdc_event_to_result_frame(&state.schema, "ks", &select, partition.key, partition.rows)
-                .unwrap()
-                .expect("table exists");
+        let frame = cdc_event_to_result_frame(
+            &state.schema,
+            "ks",
+            &select,
+            partition.key.clone(),
+            partition.rows.clone(),
+        )
+        .unwrap()
+        .expect("table exists");
 
         assert_eq!(
             frame, expected,
