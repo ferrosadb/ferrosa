@@ -402,7 +402,7 @@ proptest! {
                     cfg.max_partitions == usize::MAX || chunk.len() <= cfg.max_partitions,
                     "chunk exceeded count budget"
                 );
-                collected.extend(chunk);
+                collected.extend(chunk.into_iter().map(Arc::unwrap_or_clone));
             }
             match next { Some(c) => cursor = c, None => break }
         }
