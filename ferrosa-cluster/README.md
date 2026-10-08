@@ -264,7 +264,10 @@ early acknowledgement.
   `SingleNode` / `Pair` / `Raft` cluster state.
 - `controller/bootstrap/` — 8-phase formation pipeline (DeliverInvites →
   EstablishPools → CreateRaft → WaitLeader → ReplaySchema → BootstrapStream →
-  Promote → DrainQueue).
+  Promote → DrainQueue). ReplaySchema re-sends local user schema to the
+  current leader in bounded rounds (`replay_schema::after_round`): a forward
+  that fails during an election is retried, and the outage is logged once
+  when it starts and once when it recovers or gives up (FMEA CL-46).
 - `controller/peer_events.rs` — inbound handshakes prefer the peer's advertised
   internode endpoint when creating reverse pools and tracking invite targets;
   the observed IP plus local port is only a compatibility fallback. This keeps
