@@ -34486,8 +34486,7 @@ mod tests {
         // bytes and persists. The agreed `t` is deliberately a tiny value
         // (777), far below the wall-clock micros the router stamped cells with,
         // so a successful read at ts==777 proves the applier re-stamped to `t`.
-        // 777 µs after the epoch, as the HLC states it: in nanoseconds.
-        let agreed = Timestamp::synthetic(777_000);
+        let agreed = Timestamp::synthetic(777);
         let applier = EngineStorageApplier::new(state.engine.clone());
         applier
             .apply(
