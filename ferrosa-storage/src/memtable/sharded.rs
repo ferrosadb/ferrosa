@@ -6,6 +6,15 @@
 //! This is the initial implementation behind the `Memtable` trait. The trait
 //! enables swapping to a lock-free structure (crossbeam-skiplist, Okasaki-style
 //! persistent structures) without changing consumer code.
+//!
+//! Correctness: `range_iter` yields every in-range partition exactly once in
+//! global token order while retaining only `O(num_shards)` memory (it re-seeks
+//! each shard under a short-lived lock instead of materializing the range);
+//! `snapshot` returns the same partitions owned, for the flush, which mutates
+//! them in place. A bounded `range_iter` agrees with `snapshot` filtered to the
+//! same bounds, and an inverted bound yields empty rather than panicking.
+//! Last revised: 2026-10-08
+//! Last changed: Made `range_iter` lazy — it no longer pre-collects the range.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -100,6 +109,63 @@ impl ShardedBTreeMemtable {
     /// Determine which shard a key belongs to.
     fn shard_index(&self, key: &DecoratedKey) -> usize {
         (key.token.0 as u64 % self.num_shards as u64) as usize
+    }
+
+    /// Seek one shard's first entry at or after `start` (inclusive), bounded by
+    /// `end`. `None` bounds are unbounded. An inverted range (`start > end`)
+    /// yields `None` rather than panicking: `BTreeMap::range` panics on a
+    /// reversed range, and a caller that computes an empty token range must get
+    /// an empty scan, not a panic on the storage thread.
+    ///
+    /// Holds the shard's read lock only for the duration of the seek — a
+    /// `BTreeMap` range scan touching `O(log n)` nodes — never across the
+    /// consumer's processing. Used by [`ShardedRangeIter`] to keep a scan's
+    /// retained memory at `O(num_shards)` instead of materializing the range.
+    fn seek_shard_start(
+        &self,
+        src: usize,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+    ) -> Option<Arc<Partition>> {
+        use std::ops::Bound;
+        if let (Some(s), Some(e)) = (start, end) {
+            if s > e {
+                return None;
+            }
+        }
+        let shard = self.shards[src].read();
+        let lo = match start {
+            Some(s) => Bound::Included(s),
+            None => Bound::Unbounded,
+        };
+        let hi = match end {
+            Some(e) => Bound::Included(e),
+            None => Bound::Unbounded,
+        };
+        shard.range((lo, hi)).next().map(|(_, arc)| Arc::clone(arc))
+    }
+
+    /// Seek one shard's next entry strictly after `after`, bounded by `end` —
+    /// the resume step of a lazy merge. See [`Self::seek_shard_start`].
+    fn seek_shard(
+        &self,
+        src: usize,
+        after: &DecoratedKey,
+        end: Option<&DecoratedKey>,
+    ) -> Option<Arc<Partition>> {
+        use std::ops::Bound;
+        if end.is_some_and(|e| after > e) {
+            return None;
+        }
+        let shard = self.shards[src].read();
+        let hi = match end {
+            Some(e) => Bound::Included(e),
+            None => Bound::Unbounded,
+        };
+        shard
+            .range((Bound::Excluded(after), hi))
+            .next()
+            .map(|(_, arc)| Arc::clone(arc))
     }
 
     /// Estimate the in-memory size of a partition in bytes.
@@ -271,35 +337,12 @@ impl Memtable for ShardedBTreeMemtable {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> Box<dyn Iterator<Item = Arc<Partition>> + Send + 'a> {
-        // Per-shard: collect the Arc<Partition> values within the
-        // range bound. The clones are cheap (one Arc bump per entry,
-        // ~8 bytes), not Partition deep-clones. The per-shard guard
-        // is dropped immediately after each shard's range is
-        // snapshotted as Arcs so we don't hold locks for the
-        // iterator lifetime.
-        //
-        // K-way merge across the Vec<Arc<Partition>> yields one
-        // Arc at a time in global token order — no deep clone ever
-        // happens on the read path (copy-on-write is the consumer's
-        // choice).
-        let start = start.cloned();
-        let end = end.cloned();
-        let mut per_shard: Vec<Vec<Arc<Partition>>> = Vec::with_capacity(self.shards.len());
-        for shard in self.shards.iter() {
-            let guard = shard.read();
-            let mut v = Vec::new();
-            for (key, arc) in guard.iter() {
-                if start.as_ref().is_none_or(|s| key >= s) && end.as_ref().is_none_or(|e| key <= e)
-                {
-                    v.push(Arc::clone(arc));
-                }
-            }
-            per_shard.push(v);
-        }
-        // Each shard's Vec is already sorted by DecoratedKey
-        // (BTreeMap iteration order). The merger pops the
-        // current-smallest across shards.
-        Box::new(ShardedRangeIter::new(per_shard))
+        // Lazy k-way merge: one heap entry per shard, no per-partition collect.
+        // The iterator re-seeks each shard under a short-lived read lock when it
+        // needs that shard's next key. Materializing the in-range `Arc`s up front
+        // (one `Vec` per shard) retained `O(partitions_in_range)` pointers for the
+        // scan's whole lifetime; the trait contract is `O(num_shards)`.
+        Box::new(ShardedRangeIter::new(self, start.cloned(), end.cloned()))
     }
 
     fn size_bytes(&self) -> usize {
@@ -501,15 +544,22 @@ fn k_way_merge(mut sources: Vec<Vec<Partition>>) -> Vec<Partition> {
 }
 
 // ---------------------------------------------------------------------------
-// ShardedRangeIter: lazy k-way merge across pre-snapshotted shards
+// ShardedRangeIter: lazy k-way merge across shards
 // ---------------------------------------------------------------------------
 //
-// Each shard contributes a `Vec<Arc<Partition>>` already sorted by
-// DecoratedKey (BTreeMap iteration order). The iterator yields one
-// Partition at a time in global token order without ever materializing
-// the merged Vec — memory peaks at `num_shards * sizeof(Arc) + 1
-// Partition deep clone in flight`. Used by `ShardedBTreeMemtable::range_iter`
-// for ADR-020 streaming range reads.
+// Yields one `Arc<Partition>` at a time in global token order. Retains exactly
+// one heap entry per shard (`O(num_shards)`), never `O(partitions_in_range)`:
+// the previous form collected every in-range `Arc` into one `Vec` per shard and
+// handed the whole `Vec<Vec<…>>` to the iterator, which pinned `8 B per
+// partition` for the scan's entire lifetime — for a paging cursor that parks the
+// iterator across pages, tens of MB per open cursor.
+//
+// Instead of holding a shard's read guard for the iterator's lifetime (which
+// would block every write to that shard while a scan is parked), the iterator
+// keeps only the *key* it last consumed per shard and re-seeks the next entry
+// under a short-lived read lock when it advances that shard. A shard's read
+// guard is therefore held only for the duration of one `next()` seek, never
+// across the consumer's processing.
 
 /// Heap entry: (key, source_idx) where the heap is min-keyed.
 /// Wraps the comparison so `BinaryHeap` (which is a max-heap) becomes
@@ -541,53 +591,85 @@ impl Ord for ShardHeapEntry {
     }
 }
 
-pub(crate) struct ShardedRangeIter {
-    /// One pre-sorted Vec<Arc<Partition>> per shard.
-    shards: Vec<Vec<Arc<Partition>>>,
-    /// Next-unread cursor per shard.
-    cursors: Vec<usize>,
-    /// Min-heap of (current_key, src_idx) across shards that still
-    /// have unread entries.
+/// Lazily merge a sharded memtable's partitions in global token order.
+///
+/// Memory is `O(num_shards)`: one `ShardedRangeIterItem` (key + `Arc`) per shard
+/// plus the heap over those keys. Nothing is materialized for partitions that
+/// have not been asked for.
+///
+/// ## Snapshot consistency
+///
+/// The merge is consistent for a memtable that is being written: entries are
+/// yielded in token order, and an entry already handed to the consumer is never
+/// yielded twice — the advance step seeks strictly *after* the key just handed
+/// out, and that key is a shard's own BTreeMap order, so it cannot recur. A
+/// partition inserted *behind* an already-consumed key is not revisited by this
+/// iterator (range semantics do not promise it); a new partition ahead of the
+/// cursor is picked up normally.
+pub(crate) struct ShardedRangeIter<'a> {
+    mem: &'a ShardedBTreeMemtable,
+    end: Option<DecoratedKey>,
+    /// Per-shard head: the entry whose key currently sits in the heap, so
+    /// `next` can hand out the stored `Arc` without seeking twice.
+    heads: Vec<Option<Arc<Partition>>>,
+    /// Shard indices that still have a head, keyed by that head's key.
     heap: BinaryHeap<ShardHeapEntry>,
 }
 
-impl ShardedRangeIter {
-    pub(crate) fn new(shards: Vec<Vec<Arc<Partition>>>) -> Self {
-        let cursors = vec![0; shards.len()];
-        let mut heap = BinaryHeap::with_capacity(shards.len());
-        for (src, v) in shards.iter().enumerate() {
-            if let Some(first) = v.first() {
+impl<'a> ShardedRangeIter<'a> {
+    pub(crate) fn new(
+        mem: &'a ShardedBTreeMemtable,
+        start: Option<DecoratedKey>,
+        end: Option<DecoratedKey>,
+    ) -> Self {
+        let mut heads: Vec<Option<Arc<Partition>>> = vec![None; mem.shards.len()];
+        let mut heap = BinaryHeap::with_capacity(mem.shards.len());
+        for (src, slot) in heads.iter_mut().enumerate() {
+            if let Some(arc) = mem.seek_shard_start(src, start.as_ref(), end.as_ref()) {
                 heap.push(ShardHeapEntry {
-                    key: first.key.clone(),
+                    key: arc.key.clone(),
                     src,
                 });
+                *slot = Some(arc);
             }
         }
         Self {
-            shards,
-            cursors,
+            mem,
+            end,
+            heads,
             heap,
+        }
+    }
+
+    /// Advance shard `src` past `after` (the key just yielded) and queue its
+    /// new head, if any.
+    fn advance_shard(&mut self, src: usize, after: &DecoratedKey) {
+        match self.mem.seek_shard(src, after, self.end.as_ref()) {
+            Some(arc) => {
+                self.heap.push(ShardHeapEntry {
+                    key: arc.key.clone(),
+                    src,
+                });
+                self.heads[src] = Some(arc);
+            }
+            None => self.heads[src] = None,
         }
     }
 }
 
-impl Iterator for ShardedRangeIter {
+impl Iterator for ShardedRangeIter<'_> {
     type Item = Arc<Partition>;
 
     fn next(&mut self) -> Option<Arc<Partition>> {
+        // Pop the smallest head. The heap entry carries the key, so take the
+        // stored `Arc` and advance that shard strictly past it (exclusive, so a
+        // key can never be yielded twice).
         let entry = self.heap.pop()?;
         let src = entry.src;
-        let cursor = self.cursors[src];
-        let arc = Arc::clone(&self.shards[src][cursor]);
-        self.cursors[src] += 1;
-        // Push the shard's next key onto the heap (if any) so this
-        // source can be chosen again on the next call.
-        if let Some(next_arc) = self.shards[src].get(self.cursors[src]) {
-            self.heap.push(ShardHeapEntry {
-                key: next_arc.key.clone(),
-                src,
-            });
-        }
+        let arc = self.heads[src]
+            .take()
+            .expect("a shard with a heap entry always has a head");
+        self.advance_shard(src, &entry.key);
         Some(arc)
     }
 }
@@ -1105,6 +1187,90 @@ mod tests {
         assert_eq!(
             collected.iter().map(|p| p.key.clone()).collect::<Vec<_>>(),
             snapshot.iter().map(|p| p.key.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A bounded scan must agree with the eager snapshot path for the same
+    /// bounds. `range_iter` is lazy now (it re-seeks each shard as it advances
+    /// rather than collecting the range first), so the two implementations could
+    /// disagree on where the bounds land — half-open vs inclusive, or an
+    /// off-by-one at either end.
+    #[test]
+    fn range_iter_bounded_matches_snapshot_within_bounds() {
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = test_schema();
+        for i in 0..100 {
+            let key = make_key(&format!("k_{i:03}"));
+            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
+                .unwrap();
+        }
+        // Every (start, end) pair over a handful of keys, plus unbounded ends.
+        let bounds = [
+            None,
+            Some(make_key("k_000")),
+            Some(make_key("k_037")),
+            Some(make_key("k_099")),
+        ];
+        for start in bounds.iter() {
+            for end in bounds.iter() {
+                let got: Vec<_> = mem.range_iter(start.as_ref(), end.as_ref()).collect();
+                let want: Vec<_> = mem
+                    .snapshot()
+                    .into_iter()
+                    .filter(|p| {
+                        start.as_ref().is_none_or(|s| p.key >= *s)
+                            && end.as_ref().is_none_or(|e| p.key <= *e)
+                    })
+                    .collect();
+                assert_eq!(
+                    got.iter().map(|p| p.key.clone()).collect::<Vec<_>>(),
+                    want.iter().map(|p| p.key.clone()).collect::<Vec<_>>(),
+                    "range_iter disagreed with snapshot for start={start:?} end={end:?}"
+                );
+            }
+        }
+    }
+
+    /// Degenerate shapes: an empty memtable yields nothing, and a single shard
+    /// still merges (the heap has one entry, so `next` must not assume >= 2).
+    #[test]
+    fn range_iter_handles_empty_and_single_shard() {
+        let schema = test_schema();
+        let empty = ShardedBTreeMemtable::new(4);
+        assert_eq!(empty.range_iter(None, None).count(), 0);
+
+        let one = ShardedBTreeMemtable::new(1);
+        for i in 0..10 {
+            let key = make_key(&format!("k_{i:02}"));
+            one.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
+                .unwrap();
+        }
+        let keys: Vec<_> = one.range_iter(None, None).map(|p| p.key.clone()).collect();
+        assert_eq!(keys.len(), 10);
+        for w in keys.windows(2) {
+            assert!(w[0] <= w[1], "single-shard scan out of order");
+        }
+    }
+
+    /// The lazy merge must not yield the same partition twice, nor drop one that
+    /// sits strictly ahead of the cursor. This is the shape a pre-materialized
+    /// implementation gets for free and a re-seeking one can get wrong.
+    #[test]
+    fn range_iter_yields_each_partition_exactly_once() {
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = test_schema();
+        for i in 0..200 {
+            let key = make_key(&format!("k_{i:03}"));
+            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
+                .unwrap();
+        }
+        let scanned: Vec<_> = mem.range_iter(None, None).map(|p| p.key.clone()).collect();
+        assert_eq!(scanned.len(), 200, "every partition must be yielded once");
+        let unique: std::collections::BTreeSet<_> = scanned.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            200,
+            "a partition was yielded more than once (the merge re-served a key)"
         );
     }
 
