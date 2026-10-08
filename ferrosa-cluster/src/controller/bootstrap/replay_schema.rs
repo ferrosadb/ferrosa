@@ -141,15 +141,6 @@ impl RoundFailures {
             .map(|(ddl, e)| format!("{}: {e}", ddl.label))
             .unwrap_or_default()
     }
-
-    fn sample_labels(&self) -> Vec<&str> {
-        self.retryable
-            .iter()
-            .chain(&self.permanent)
-            .take(5)
-            .map(|(ddl, _)| ddl.label.as_str())
-            .collect()
-    }
 }
 
 /// Send each operation to the node that leads now: through Raft directly
@@ -249,11 +240,16 @@ pub fn report_round(
                 total,
                 pending = failures.pending(),
                 rounds = round,
-                sample = ?failures.sample_labels(),
                 first_error = %failures.first_error(),
-                "schema replay: gave up; these local schema objects are not in the cluster \
-                 schema unless another node already replicated them"
+                "schema replay: gave up; the local schema objects listed next are not in the \
+                 cluster schema unless another node already replicated them"
             );
+            // Terminal edge: name each missing object once, so an operator
+            // knows exactly what to re-create.
+            for (ddl, e) in failures.retryable.iter().chain(&failures.permanent) {
+                tracing::warn!(object = %ddl.label, error = %e,
+                    "schema replay: local schema object never reached the leader");
+            }
             None
         }
     }
