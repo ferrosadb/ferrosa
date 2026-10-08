@@ -2528,69 +2528,66 @@ impl ModeController {
                             .collect();
 
                         if !user_ks.is_empty() || !user_tables.is_empty() {
-                            if lid == local_node_id {
-                                tracing::info!(
-                                    ks_count = user_ks.len(),
-                                    table_count = user_tables.len(),
-                                    "leader: replaying local schema through Raft"
-                                );
-                                for (name, ks) in &user_ks {
-                                    let op = DdlOperation::CreateKeyspace((*ks).clone());
-                                    if let Err(e) = execute_via_raft(&raft_arc, op).await {
-                                        tracing::warn!(%e, ks = %name, "schema replay: CreateKeyspace failed (may already exist)");
-                                    }
-                                }
-                                for ((ks, _tbl), table) in &user_tables {
-                                    let op = DdlOperation::CreateTable(Box::new((*table).clone()));
-                                    if let Err(e) = execute_via_raft(&raft_arc, op).await {
-                                        tracing::warn!(%e, ks, "schema replay: CreateTable failed (may already exist)");
-                                    }
-                                }
-                            } else {
-                                // Resolve leader NodeId → Uuid for RPC.
-                                let leader_uuid = {
-                                    let map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner());
-                                    map.get(&lid).copied()
-                                };
-                                if let Some(leader_uuid) = leader_uuid {
-                                    tracing::info!(
-                                        ks_count = user_ks.len(),
-                                        table_count = user_tables.len(),
-                                        "non-leader: forwarding local schema to leader"
-                                    );
-                                    for (name, ks) in &user_ks {
-                                        let op = DdlOperation::CreateKeyspace((*ks).clone());
-                                        // Bootstrap schema hand-off, not a client
-                                        // DDL — no read-your-writes wait needed.
-                                        if let Err(e) = crate::ddl_path::forward_ddl_to_leader(
-                                            None,
-                                            &peer_manager_for_bootstrap,
-                                            leader_uuid,
-                                            op,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(%e, ks = %name, "schema forward: CreateKeyspace failed");
+                            use super::bootstrap::replay_schema::{
+                                replay_round, report_round, ForwardRetryPolicy, LabeledDdl,
+                                ReplayTarget,
+                            };
+                            tracing::info!(
+                                ks_count = user_ks.len(),
+                                table_count = user_tables.len(),
+                                is_leader = lid == local_node_id,
+                                "replaying local schema to the Raft leader"
+                            );
+                            // Keyspaces first: a table's keyspace must exist
+                            // when the table is applied.
+                            let ops: Vec<LabeledDdl> = user_ks
+                                .iter()
+                                .map(|(name, ks)| LabeledDdl {
+                                    label: (*name).clone(),
+                                    op: DdlOperation::CreateKeyspace((*ks).clone()),
+                                })
+                                .chain(user_tables.iter().map(|((ks, tbl), table)| LabeledDdl {
+                                    label: format!("{ks}.{tbl}"),
+                                    op: DdlOperation::CreateTable(Box::new((*table).clone())),
+                                }))
+                                .collect();
+                            let total = ops.len();
+                            let policy = ForwardRetryPolicy::default();
+                            let target = ReplayTarget {
+                                raft: &raft_arc,
+                                peer_manager: &peer_manager_for_bootstrap,
+                                node_map: &node_map_for_bootstrap,
+                                local_node_id,
+                            };
+                            // Round 1 inline, as before; retries run in the
+                            // background so bootstrap is not held up by an
+                            // election in progress (t_0b4e9b99).
+                            let failures = replay_round(&target, ops).await;
+                            if let Some((mut pending, mut delay)) =
+                                report_round(&policy, 1, total, failures)
+                            {
+                                let raft = raft_arc.clone();
+                                let peer_manager = peer_manager_for_bootstrap.clone();
+                                let node_map = node_map_for_bootstrap.clone();
+                                ferrosa_net::task_pool::TaskPool::current("schema-replay-retry").spawn(async move {
+                                    let target = ReplayTarget {
+                                        raft: &raft,
+                                        peer_manager: &peer_manager,
+                                        node_map: &node_map,
+                                        local_node_id,
+                                    };
+                                    for round in 2..=policy.max_rounds {
+                                        tokio::time::sleep(delay).await;
+                                        let failures = replay_round(&target, pending).await;
+                                        match report_round(&policy, round, total, failures) {
+                                            Some((next, next_delay)) => {
+                                                pending = next;
+                                                delay = next_delay;
+                                            }
+                                            None => break,
                                         }
                                     }
-                                    for ((ks, _tbl), table) in &user_tables {
-                                        let op = DdlOperation::CreateTable(Box::new((*table).clone()));
-                                        // Bootstrap schema hand-off, not a client
-                                        // DDL — no read-your-writes wait needed.
-                                        if let Err(e) = crate::ddl_path::forward_ddl_to_leader(
-                                            None,
-                                            &peer_manager_for_bootstrap,
-                                            leader_uuid,
-                                            op,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(%e, ks, "schema forward: CreateTable failed");
-                                        }
-                                    }
-                                } else {
-                                    tracing::warn!("cannot forward schema: leader UUID not in node_map");
-                                }
+                                });
                             }
                         }
                     }

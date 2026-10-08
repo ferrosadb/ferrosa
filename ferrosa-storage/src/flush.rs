@@ -1021,8 +1021,10 @@ pub(crate) mod fsync_probe {
 /// live name yet. Like the compaction output directory
 /// (`StorageEngine::cleanup_stale_compaction_staging`), they are only ever
 /// live while a flush or merge-read is running in this process; there is
-/// nothing at startup to resume one, so they are pure debris and are removed
-/// outright rather than quarantined. Legacy `Data.raw` scratch files directly
+/// nothing at startup to resume one, so entries left by an earlier process
+/// are pure debris and are removed outright rather than quarantined. Entries
+/// this process owns are left alone, because this sweep runs while writers
+/// are live (see [`sweep_staging_root`]). Legacy `Data.raw` scratch files directly
 /// in the component directory are also removed; they are never live components.
 ///
 /// Called from `StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode`
@@ -1054,14 +1056,7 @@ pub(crate) fn sweep_stale_flush_staging(dir: &Path) {
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
 
         if is_dir && (name_str == ".sstable-staging" || name_str == ".merge-spill") {
-            match std::fs::remove_dir_all(entry.path()) {
-                Ok(()) => removed_staging_dirs += 1,
-                Err(e) => tracing::error!(
-                    %e,
-                    dir = %entry.path().display(),
-                    "flush: could not remove stale flush staging dir"
-                ),
-            }
+            removed_staging_dirs += sweep_staging_root(&entry.path());
             continue;
         }
 
@@ -1109,6 +1104,111 @@ pub(crate) fn sweep_stale_flush_staging(dir: &Path) {
             "flush: swept stale staged output left by an earlier crash"
         );
     }
+}
+
+/// Whether a `.sstable-staging/` or `.merge-spill/` entry named `name` is
+/// debris rather than staging a writer of process `pid` may still be using.
+///
+/// Writers name each staging dir `{pid}-{nanos}-{attempt}`
+/// (`FileFlushTarget::file_output_staging_dir`, `open_ephemeral_reader`) and
+/// remove it themselves when done, so an entry carrying this process's pid is
+/// live or about to be removed by its owner. Anything else was left by an
+/// earlier process: there is nothing in this one to resume it.
+fn staging_entry_is_stale(name: &str, pid: u32) -> bool {
+    match name.split_once('-') {
+        Some((owner, _)) => owner.parse::<u32>() != Ok(pid),
+        None => true,
+    }
+}
+
+/// Remove the stale entries of one staging root, then the root itself if it
+/// is left empty. Returns how many entries were removed.
+///
+/// Staging owned by this process is never touched: the sweep also runs while
+/// the engine is live (each table's startup load, and every
+/// `FileFlushTarget` constructor, which a compaction calls on its output
+/// dir), and a recursive delete there unlinks an in-flight compaction's
+/// staged SSTable (t_8d9629df). A PID reused from a crashed process makes its
+/// debris look live; that leaves bytes on disk until the next restart, the
+/// safe direction.
+fn sweep_staging_root(root: &Path) -> usize {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(%e, dir = %root.display(), "flush: could not scan staging root");
+            return 0;
+        }
+    };
+    let pid = std::process::id();
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(%e, dir = %root.display(), "flush: could not read staging entry");
+                continue;
+            }
+        };
+        if !staging_entry_is_stale(&entry.file_name().to_string_lossy(), pid) {
+            continue;
+        }
+        let path = entry.path();
+        let result = if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::error!(
+                %e,
+                dir = %path.display(),
+                "flush: could not remove stale flush staging left by an earlier process"
+            ),
+        }
+    }
+    // Non-recursive: fails harmlessly if a writer has staged since the scan.
+    match std::fs::remove_dir(root) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(e) => {
+            tracing::warn!(%e, dir = %root.display(), "flush: could not remove empty staging root")
+        }
+    }
+    removed
+}
+
+/// Create a fresh, uniquely named staging dir `{pid}-{nanos}-{attempt}`
+/// under `root`. Recreates `root` when a concurrent sweep removed it as
+/// empty between creating it and creating the entry.
+fn allocate_staging_dir(root: &Path, what: &str) -> Result<PathBuf> {
+    for attempt in 0..32u32 {
+        std::fs::create_dir_all(root)?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = root.join(format!("{}-{}-{attempt}", std::process::id(), ts));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ferrosa_common::Error::InvalidFormat(format!(
+        "failed to allocate unique {what} directory"
+    )))
 }
 
 impl FileFlushTarget {
@@ -2220,27 +2320,7 @@ impl FlushTarget for FileFlushTarget {
         // directory is never scanned by `scan_max_generation`. The returned
         // PathBuf is the unique run directory; the caller removes it when the
         // reader is dropped.
-        let spill_root = self.base_dir.join(".merge-spill");
-        std::fs::create_dir_all(&spill_root)?;
-        let run_dir = (0..32u32)
-            .find_map(|attempt| {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                let path = spill_root.join(format!("{}-{}-{attempt}", std::process::id(), ts));
-                match std::fs::create_dir(&path) {
-                    Ok(()) => Some(Ok(path)),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .transpose()?
-            .ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(
-                    "failed to allocate unique merge-spill directory".into(),
-                )
-            })?;
+        let run_dir = allocate_staging_dir(&self.base_dir.join(".merge-spill"), "merge-spill")?;
 
         let has_compression_info = output.compression_info.is_some();
         let paths = FileComponentPaths {
@@ -2285,23 +2365,7 @@ impl FlushTarget for FileFlushTarget {
     }
 
     fn file_output_staging_dir(&self) -> Result<Option<PathBuf>> {
-        let staging_root = self.base_dir.join(".sstable-staging");
-        std::fs::create_dir_all(&staging_root)?;
-        for attempt in 0..32u32 {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let path = staging_root.join(format!("{}-{}-{attempt}", std::process::id(), ts));
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Some(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(ferrosa_common::Error::InvalidFormat(
-            "failed to allocate unique SSTable staging directory".into(),
-        ))
+        allocate_staging_dir(&self.base_dir.join(".sstable-staging"), "SSTable staging").map(Some)
     }
 
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<FileReadAt>> {
@@ -3360,6 +3424,103 @@ mod tests {
             std::fs::read(dir.path().join("1-Data.db")).unwrap(),
             b"live component"
         );
+    }
+
+    /// t_8d9629df: a staging sweep run while a writer of THIS process is
+    /// staging into the same directory (a table's startup load, or a second
+    /// compaction of the table constructing its flush target) must leave the
+    /// in-flight staging alone and log no ERROR. Before the fix the sweep
+    /// `remove_dir_all`ed `.sstable-staging/` wholesale: it unlinked the
+    /// staged files, then failed with "Directory not empty" when the writer
+    /// created its next one.
+    #[test]
+    fn sweep_leaves_staging_owned_by_this_process_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let in_flight = target.file_output_staging_dir().unwrap().unwrap();
+        std::fs::write(in_flight.join("Data.db"), b"staged, not yet promoted").unwrap();
+        // Debris from an earlier process: another pid, and a legacy name.
+        let staging_root = dir.path().join(".sstable-staging");
+        let stale = staging_root.join(format!("{}-1-0", std::process::id() + 1));
+        let legacy = staging_root.join("old-writer");
+        for debris in [&stale, &legacy] {
+            std::fs::create_dir_all(debris).unwrap();
+            std::fs::write(debris.join("Data.db"), b"abandoned").unwrap();
+        }
+
+        let logs = SweepLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            sweep_stale_flush_staging(dir.path());
+        });
+
+        assert_eq!(
+            std::fs::read(in_flight.join("Data.db")).unwrap(),
+            b"staged, not yet promoted",
+            "an in-flight staging dir of this process must survive the sweep"
+        );
+        assert!(!stale.exists(), "another process's staging is debris");
+        assert!(
+            !legacy.exists(),
+            "a staging dir with no owner pid is debris"
+        );
+        let text = logs.text();
+        assert!(
+            !text.contains("ERROR"),
+            "no ERROR for a live staging dir: {text}"
+        );
+    }
+
+    /// Once nothing is staged, the sweep also removes the empty root, and a
+    /// writer that allocates a staging dir right after still gets one.
+    #[test]
+    fn sweep_removes_an_empty_staging_root_and_staging_still_allocates() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_root = dir.path().join(".sstable-staging");
+        std::fs::create_dir_all(staging_root.join("old-writer")).unwrap();
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        assert!(!staging_root.exists(), "empty staging root is removed");
+        let staged = target.file_output_staging_dir().unwrap().unwrap();
+        assert!(staged.is_dir());
+        assert!(staged.starts_with(&staging_root));
+    }
+
+    #[test]
+    fn staging_entries_are_stale_unless_this_process_owns_them() {
+        assert!(!staging_entry_is_stale("4242-1789-0", 4242));
+        assert!(staging_entry_is_stale("4243-1789-0", 4242));
+        assert!(staging_entry_is_stale("42420-1789-0", 4242));
+        assert!(staging_entry_is_stale("old-writer", 4242));
+        assert!(staging_entry_is_stale("4242", 4242));
+    }
+
+    #[derive(Clone, Default)]
+    struct SweepLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SweepLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for SweepLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SweepLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     #[test]

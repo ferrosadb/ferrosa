@@ -159,7 +159,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `quarantine/`/removed, before generation discovery runs
   (`StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode` calls
   `flush::sweep_stale_flush_staging`; `FileFlushTarget::new`/`new_starting_at`
-  call it too, as a safety net for callers outside table startup).
+  call it too, as a safety net for callers outside table startup). Because it
+  runs while writers are live, it removes only staging entries another process
+  left (`{pid}-…` names not this process's) and never a dir this process is
+  still staging into (FMEA ST-89).
 
   **Digest verification on published bytes, unconditional (`publication-safety.md`
   M2 step 4 / M3, T-012, FMEA ST-32):** between the `.tmp` fsync and the
@@ -745,7 +748,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Quarantine + self-heal** (`quarantine.rs`, `self_heal/`) — malformed rows
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
-  quarantines them under a safety rail. It also checks every vector index each
+  quarantines them under a safety rail. A generation that fails its smoke test
+  is re-checked under its generation guard, and one a concurrent compaction
+  retired is logged as gone, not reported corrupt (ST-88). It also checks every vector index each
   tick (`IssueKind::InvalidVectorIndex`, ST-81): a generation with missing
   sidecars, a sidecar that does not decode, a vector/scope count that
   disagrees with the manifest, a dimension that disagrees with the column, or
