@@ -1568,6 +1568,10 @@ pub(crate) async fn execute_insert(
         result_formats,
     } = returning_opts;
 
+    // Re-borrowed per row below: each row is its own mutation, buffered into the
+    // open transaction when there is one.
+    let mut txn = txn;
+
     let ks = ins.table.schema.as_deref().unwrap_or(default_schema);
     let snap = schema.snapshot();
     let meta = match snap.tables.get(&(ks.to_string(), ins.table.table.clone())) {
@@ -1586,116 +1590,126 @@ pub(crate) async fn execute_insert(
     let mut col_values: HashMap<String, CqlValue> = HashMap::new();
     let mut sql_values: HashMap<String, SqlValue> = HashMap::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    // Multi-row INSERT is parsed but not yet executed. Fail loud rather than
-    // silently writing only the first row — dropping writes is exactly the
-    // failure mode this repo treats as unacceptable.
-    if ins.rows.len() != 1 {
-        return vec![error_response(
-            "0A000",
-            &format!(
-                "multi-row INSERT is not implemented yet ({} rows)",
-                ins.rows.len()
-            ),
-        )];
-    }
-    for (i, col_name) in ins.columns.iter().enumerate() {
-        let (col_meta, sql_value, value) = match resolve_dml_value(
-            meta,
-            schema,
-            ks,
-            &ins.table.table,
-            col_name,
-            &ins.rows[0][i],
-            ParamCtx {
-                params,
-                jsonb_limits,
-            },
-        ) {
-            Ok(r) => r,
-            Err(msg) => return vec![msg],
+    // Multi-row INSERT: every row must be written, and the statement announces
+    // ONE result. A partial implementation that wrote row 1 and dropped rows 2..N
+    // would be worse than failing, which is why this was a hard `0A000` guard
+    // until the loop below existed.
+    // The statement's own tag: one INSERT of N rows, not N INSERTs of one.
+    let tag = format!("INSERT 0 {}", ins.rows.len());
+    let mut combined_returning: Option<QueryResult> = None;
+    let mut last_write: Vec<BackendMessage> = Vec::new();
+    for row_index in 0..ins.rows.len() {
+        for (i, col_name) in ins.columns.iter().enumerate() {
+            let (col_meta, sql_value, value) = match resolve_dml_value(
+                meta,
+                schema,
+                ks,
+                &ins.table.table,
+                col_name,
+                &ins.rows[row_index][i],
+                ParamCtx {
+                    params,
+                    jsonb_limits,
+                },
+            ) {
+                Ok(r) => r,
+                Err(msg) => return vec![msg],
+            };
+            if matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
+                if let Some(idx) = meta.storage_column_index(col_name) {
+                    regular_cells.push((idx, value.clone()));
+                }
+            }
+            col_values.insert(col_name.clone(), value);
+            sql_values.insert(col_name.clone(), sql_value);
+        }
+
+        // Partition-key and clustering values in key order — all required for INSERT.
+        let mut pk_values = Vec::with_capacity(meta.partition_key.len());
+        for name in &meta.partition_key {
+            match col_values.get(name) {
+                Some(v) => pk_values.push(v.clone()),
+                None => {
+                    return vec![error_response(
+                        "23502",
+                        &format!("partition key column \"{name}\" must be specified in INSERT"),
+                    )]
+                }
+            }
+        }
+        let mut ck_values = Vec::new();
+        for (name, _order) in &meta.clustering_key {
+            match col_values.get(name) {
+                Some(v) => ck_values.push(v.clone()),
+                None => {
+                    return vec![error_response(
+                        "23502",
+                        &format!("clustering column \"{name}\" must be specified in INSERT"),
+                    )]
+                }
+            }
+        }
+
+        // Build the RETURNING result BEFORE the write, from the in-memory values, so
+        // a missing RETURNING column fails loud without a half-applied side effect.
+        let returning = match ins.returning.as_ref() {
+            Some(r) => {
+                match build_insert_returning(meta, schema, ks, &ins.table.table, r, &sql_values) {
+                    Ok(rows) => Some(rows),
+                    Err(msg) => return vec![msg],
+                }
+            }
+            None => None,
         };
-        if matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
-            if let Some(idx) = meta.storage_column_index(col_name) {
-                regular_cells.push((idx, value.clone()));
-            }
-        }
-        col_values.insert(col_name.clone(), value);
-        sql_values.insert(col_name.clone(), sql_value);
-    }
 
-    // Partition-key and clustering values in key order — all required for INSERT.
-    let mut pk_values = Vec::with_capacity(meta.partition_key.len());
-    for name in &meta.partition_key {
-        match col_values.get(name) {
-            Some(v) => pk_values.push(v.clone()),
-            None => {
-                return vec![error_response(
-                    "23502",
-                    &format!("partition key column \"{name}\" must be specified in INSERT"),
-                )]
-            }
-        }
-    }
-    let mut ck_values = Vec::new();
-    for (name, _order) in &meta.clustering_key {
-        match col_values.get(name) {
-            Some(v) => ck_values.push(v.clone()),
-            None => {
-                return vec![error_response(
-                    "23502",
-                    &format!("clustering column \"{name}\" must be specified in INSERT"),
-                )]
-            }
-        }
-    }
-
-    // Build the RETURNING result BEFORE the write, from the in-memory values, so
-    // a missing RETURNING column fails loud without a half-applied side effect.
-    let returning = match ins.returning.as_ref() {
-        Some(r) => match build_insert_returning(meta, schema, ks, &ins.table.table, r, &sql_values)
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
+            Ok(k) => k,
+            Err(e) => return vec![error_response("22000", &e.to_string())],
+        };
+        let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
+        let mutation = Mutation::new(
+            ks.to_string(),
+            ins.table.table.clone(),
+            key.clone(),
+            vec![row],
+            timestamp,
+        );
+        // Write (or buffer into the open transaction) via the shared seam. On any
+        // error — including the write-set cap — `apply_or_buffer` returns an
+        // `ErrorResponse`; propagate it untouched (the RETURNING rows are never
+        // emitted for a failed write). On success it returns `CommandComplete`
+        // carrying `tag`, which is the STATEMENT's count (`INSERT 0 N`) rather than
+        // this row's, so N rows produce one announcement of N. When RETURNING is
+        // present the DataRows are accumulated across rows and rendered once, from
+        // the in-memory values resolved above (no storage read-back). A buffered
+        // write still returns its RETURNING rows now and commits at COMMIT.
+        last_write =
+            apply_or_buffer(engine, schema, mvcc, txn.as_deref_mut(), mutation, &tag).await;
+        // A failed row kills the whole statement. Report it untouched rather than
+        // announcing a count for rows that were not all written.
+        if last_write
+            .iter()
+            .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
         {
-            Ok(rows) => Some(rows),
-            Err(msg) => return vec![msg],
-        },
-        None => None,
-    };
+            return last_write;
+        }
+        if let Some(result) = returning {
+            match &mut combined_returning {
+                Some(acc) => acc.rows.extend(result.rows),
+                None => combined_returning = Some(result),
+            }
+        }
+    }
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
-        Ok(k) => k,
-        Err(e) => return vec![error_response("22000", &e.to_string())],
-    };
-    let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
-    let mutation = Mutation::new(
-        ks.to_string(),
-        ins.table.table.clone(),
-        key.clone(),
-        vec![row],
-        timestamp,
-    );
-    // Write (or buffer into the open transaction) via the shared seam. On any
-    // error — including the write-set cap — `apply_or_buffer` returns an
-    // `ErrorResponse`; propagate it untouched (the RETURNING rows are never
-    // emitted for a failed write). On success it returns `CommandComplete
-    // "INSERT 0 1"`; when RETURNING is present we replace that with the
-    // RETURNING DataRow(s) + the same CommandComplete tag, built from the
-    // in-memory values resolved above (no storage read-back). A buffered write
-    // still returns its RETURNING rows now and commits at COMMIT.
-    let write_result = apply_or_buffer(engine, schema, mvcc, txn, mutation, "INSERT 0 1").await;
-    let errored = write_result
-        .iter()
-        .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }));
-    match returning {
-        Some(result) if !errored => render_dml_returning(
-            result,
-            with_row_description,
-            result_formats,
-            "INSERT 0 1".to_string(),
-        ),
-        _ => write_result,
+    // ONE result for the whole statement: a single RowDescription, one DataRow per
+    // inserted row, and a single `INSERT 0 N` tag — never N concatenated results.
+    match combined_returning {
+        Some(result) => render_dml_returning(result, with_row_description, result_formats, tag),
+        None => last_write,
     }
 }
 
@@ -3632,6 +3646,49 @@ mod txn_buffer_tests {
             1,
             "an autocommit write IS applied immediately"
         );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// A multi-row INSERT must write EVERY row and report `INSERT 0 N`.
+    ///
+    /// pgbench uses multi-row VALUES. The parser has accepted it (with a per-row
+    /// arity check) since the parser half landed, but execution was single-row and
+    /// failed loud. A partial implementation that wrote row 1 and silently dropped
+    /// rows 2..N would be worse than failing — which is why the guard existed, and
+    /// this test is what lets the guard be replaced.
+    #[tokio::test]
+    async fn multi_row_insert_writes_every_row_and_reports_the_count() {
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO kv (k, v) VALUES ('m1', 'one'), ('m2', 'two'), ('m3', 'three')",
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            None,
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "multi-row INSERT must not error: {msgs:?}"
+        );
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 3"),
+            "a 3-row INSERT must report ONE CommandComplete tagged INSERT 0 3, not N \
+             concatenated result sets: {msgs:?}"
+        );
+
+        for key in ["m1", "m2", "m3"] {
+            assert_eq!(
+                row_count(&engine, &schema, key).await,
+                1,
+                "row {key} must actually be written — no row may be dropped"
+            );
+        }
 
         engine.shutdown().unwrap();
     }
