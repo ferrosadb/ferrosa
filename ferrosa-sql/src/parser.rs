@@ -1927,11 +1927,11 @@ mod tests {
                 assert_eq!(ins.table.table, "t");
                 assert_eq!(ins.columns, vec!["id".to_string(), "v".to_string()]);
                 assert_eq!(
-                    ins.values,
-                    vec![
+                    ins.rows,
+                    vec![vec![
                         ScalarValue::Literal(Value::Int(1)),
                         ScalarValue::Literal(Value::Text("x".into())),
-                    ]
+                    ]]
                 );
             }
             other => panic!("expected Insert, got {other:?}"),
@@ -1945,10 +1945,7 @@ mod tests {
             Statement::Insert(ins) => {
                 assert_eq!(ins.table.schema, None);
                 assert_eq!(ins.table.table, "t");
-                assert_eq!(
-                    ins.values,
-                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
-                );
+                assert_eq!(ins.rows, vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]);
             }
             other => panic!("expected Insert, got {other:?}"),
         }
@@ -2029,10 +2026,7 @@ mod tests {
             parse_statement("INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, v").unwrap();
         match stmt {
             Statement::Insert(ins) => {
-                assert_eq!(
-                    ins.values,
-                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
-                );
+                assert_eq!(ins.rows, vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]);
                 assert_eq!(
                     ins.returning,
                     Some(Returning::Columns(vec!["id".to_string(), "v".to_string()]))
