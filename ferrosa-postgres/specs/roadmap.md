@@ -55,9 +55,36 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   `INSERT … RETURNING` is wired.
 - **`ON CONFLICT` (upsert)** — today a parse error; the common ORM upsert idiom.
 - **`= ANY($N)` / IN-list parameter expansion** — Ecto `where: x in ^ids`.
-- **Multi-row `INSERT ... VALUES`** and richer `UPDATE`/`DELETE` `WHERE`
-  (range/non-key predicates), which today are restricted to single-row, full-PK
-  equality.
+- **Multi-row `INSERT ... VALUES`** — *parsed but refused at execution* (`0A000`).
+  The parser accepts nested row values and the SQL layer executes them correctly
+  in-process (autocommit and buffered), but on the live cluster the same statement
+  reports `INSERT 0 3` and persists only row 1, reproduced twice on a fresh table.
+  Root cause is open and is **below** `ferrosa-postgres` — four in-process multi-row
+  tests across the SQL/MVCC/server layers are green with the defect present, so a
+  single-process test cannot reproduce it. The guard stays until it can be reproduced
+  with real clustered processes; a silent row-drop announced as a successful count is
+  worse than an error. Do not add an in-process "regression test" for this — it would
+  pass and prove nothing.
+- **Richer `UPDATE`/`DELETE` `WHERE`** (range/non-key predicates), which today are
+  restricted to single-row, full-PK equality.
+- **`CREATE TABLE` without a `PRIMARY KEY`** — today refused (`MissingPrimaryKey` ->
+  `0A000`), which is what stops `pgbench -i`
+  (`pgbench_accounts (aid, bid, abalance, filler char(84))` is declared with no key).
+  **Decided:** the table gets a synthetic **`_sys_ck_`** column — a v1 TimeUUID
+  (`ferrosa_common::timeuuid::v1_timeuuid`) — as its partition key, so every row is
+  unique by construction. Keying on the user's *first* column was implemented and then
+  reverted: it assumes that column is unique and silently loses writes where it is not.
+  The column is invisible to `SELECT *` and discoverable exactly the way Postgres's own
+  system columns are: `pg_catalog.pg_attribute` lists it with a **negative `attnum`**
+  (Postgres's marking for a system column) and it can be selected by name, as
+  `SELECT ctid FROM t` works in Postgres. `_sys_` is reserved in any casing
+  (`ferrosa_common::timeuuid::is_reserved_column_name`), so a future system column
+  cannot collide with a user's table.
+  Not yet wired: synthesis, per-row assignment on `INSERT`/`COPY`, the `SELECT *`
+  filter, and `ALTER TABLE ... ADD PRIMARY KEY` (not parsed at all today — a later
+  `ADD PRIMARY KEY` naming some other column should become a secondary index; naming
+  the synthetic key is a no-op). The mint and the reserved-name rule landed in
+  `ferrosa-common`; see its README section "Reserved `_sys_` columns".
 - **Binary `numeric`** result/param encoding (FMEA PG-7), removing the
   text-bytes fallback.
 - **Real query cancellation** (FMEA PG-8) — mint a real `BackendKeyData`

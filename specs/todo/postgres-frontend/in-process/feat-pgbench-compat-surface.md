@@ -179,7 +179,15 @@ name. That gives discoverability and explicit access with *no new concept* — e
 Postgres user already knows how `ctid` behaves, which is the least-surprise outcome by
 construction.
 
-**The options table is the alternative, and it is a real fork, not a detail.** A
+**DECIDED (owner): the `pg_attribute` route. No options table.** The system column is
+invisible to `SELECT *`, listed in `pg_attribute` with a negative `attnum`, and selectable
+by name. `SELECT *` stays clean. Documentation is part of the definition of done: the
+behaviour is written up in `ferrosa-common/README.md` ("Reserved `_sys_` columns") and
+`ferrosa-common/specs/overview.md`, and tracked in `ferrosa-postgres/specs/roadmap.md`
+"Next" — which is also where `pg_attribute`'s negative-`attnum` convention for system
+columns is recorded for the front-end. Keep those in sync when the wiring lands.
+
+**Rejected: the options table.** A
 `_sys_*` relation the user `UPDATE`s to toggle visibility would let `SELECT *` include the
 system columns. Costs: a writable system relation (the existing virtual tables —
 `ferrosa-postgres/src/catalog.rs` projections, `ferrosa-cql/src/virtual_tables/` including
