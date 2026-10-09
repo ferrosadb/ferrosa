@@ -2256,10 +2256,30 @@ impl AccordCoordinatorDriver {
 
     /// Phase 5 of [`Self::run_transaction`]: apply the committed transaction
     /// locally and on the remote replicas, and wait for the Apply quorum.
+    /// Apply phase with the operator-tunable bound (see [`configured_txn_timeout`]).
     async fn apply_phase(
         &mut self,
         commit_t: Timestamp,
         commit_deps: HashSet<TxnId>,
+    ) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
+        self.apply_phase_within(
+            commit_t,
+            commit_deps,
+            crate::accord::state_machine::configured_txn_timeout(),
+        )
+        .await
+    }
+
+    /// Apply phase with an explicit dependency-wait bound.
+    ///
+    /// The bound is a parameter so the abandon path is testable:
+    /// `configured_txn_timeout` resolves the environment once and caches it
+    /// process-wide, so a test cannot move the production 10 s bound.
+    async fn apply_phase_within(
+        &mut self,
+        commit_t: Timestamp,
+        commit_deps: HashSet<TxnId>,
+        bound: std::time::Duration,
     ) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
         use crate::accord::wire::ApplyOkPayload;
 
@@ -2335,7 +2355,9 @@ impl AccordCoordinatorDriver {
         };
         let local_apply_wait = async move {
             match local_state {
-                Some(state) => crate::accord::handlers::await_txn_applied(&state, txn_id).await,
+                Some(state) => {
+                    crate::accord::handlers::await_txn_applied_within(&state, txn_id, bound).await
+                }
                 None => true,
             }
         };
@@ -2404,7 +2426,7 @@ impl AccordCoordinatorDriver {
             } else {
                 None
             };
-            let timeout = crate::accord::state_machine::configured_txn_timeout();
+            let timeout = bound;
             tracing::error!(
                 txn_id = ?txn_id,
                 ?state,
@@ -2438,7 +2460,7 @@ impl AccordCoordinatorDriver {
             // successor parked behind it, so one slow apply can never poison the
             // key the way an un-finalized Committed entry did. The client is told
             // it did not commit and may retry.
-            let timeout = crate::accord::state_machine::configured_txn_timeout();
+            let timeout = bound;
             tracing::error!(
                 txn_id = ?txn_id,
                 unmet = ?participant.shards.len(),
@@ -4361,6 +4383,71 @@ mod tests {
         .await
         .expect("state machine lock available");
         assert_eq!(local_phase, TxnPhase::Applied);
+    }
+
+    /// A local Apply that cannot resolve its dependencies inside the bound must
+    /// ABANDON the transaction — not fail with an opaque network error.
+    ///
+    /// This branch returned a bare `AccordDriverError::Network(..)`, which the
+    /// PostgreSQL front end reports as a generic storage fault (58000). A
+    /// transaction that had never been applied was therefore presented to the
+    /// client as "something is broken" instead of "not committed, safe to
+    /// retry" — and the Jepsen strict-serializability workload, which retries
+    /// only on 40001, failed on the 58000 this produced.
+    ///
+    /// The bound is passed explicitly: `configured_txn_timeout` caches the
+    /// environment once per process, so the production bound is out of reach here.
+    #[tokio::test]
+    async fn a_local_apply_that_never_resolves_abandons_the_transaction() {
+        let self_id = uuid::Uuid::from_u128(1u128 << 64);
+        let remote_id = uuid::Uuid::from_u128(2u128 << 64);
+        let (apply_sent, mut apply_received) = tokio::sync::mpsc::unbounded_channel();
+        let transport = Arc::new(ApplyObservedTransport { apply_sent });
+        let clock = HybridLogicalClock::new(1, 0);
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            crate::accord::state_machine::AccordStateMachine::new(
+                1,
+                Arc::new(ferrosa_storage::accord::sync_writer::MockSyncWriter::new()),
+            ),
+        ));
+        let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+            1,
+            vec![self_id, remote_id],
+            transport,
+            false,
+            &clock,
+            vec![(b"key".to_vec(), b"mutation".to_vec())],
+        )
+        .with_local_accord_state(local_state.clone());
+
+        let txn_id = driver.txn_id();
+        let dependency = TxnId::new(3, Timestamp::synthetic(1));
+        let commit_t = Timestamp::synthetic(2);
+        crate::accord::handlers::on_state_machine(&local_state, move |sm| {
+            sm.handle_preaccept(txn_id, txn_id.0, b"key", BallotNumber(0), 0);
+            sm.handle_commit(txn_id, txn_id.0, commit_t, vec![dependency]);
+        })
+        .await;
+
+        // The dependency is never resolved, so the local wait must expire.
+        let result = driver
+            .apply_phase_within(
+                commit_t,
+                std::collections::HashSet::from([dependency]),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+
+        assert_eq!(
+            apply_received.try_recv(),
+            Ok(()),
+            "the local wait must not suppress Apply propagation to the other replicas"
+        );
+        assert!(
+            matches!(result, Err(AccordDriverError::TxnAbandoned { .. })),
+            "a local apply that cannot resolve its dependencies must abandon the transaction \
+             (retryable 40001), not report an opaque failure; got {result:?}"
+        );
     }
 
     #[tokio::test]
