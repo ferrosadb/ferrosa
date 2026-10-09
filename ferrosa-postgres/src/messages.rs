@@ -103,6 +103,13 @@ pub enum BackendMessage {
     /// `D` — one data row; each column is `Some(bytes)` (text format) or `None`
     /// for SQL NULL.
     DataRow { columns: Vec<Option<Vec<u8>>> },
+    /// `G` — the server is ready to receive a `COPY ... FROM STDIN` payload. `format` is 0 for
+    /// text and 1 for binary; `column_formats` is per *column*, and must be empty when every
+    /// column is text.
+    CopyInResponse {
+        format: u8,
+        column_formats: Vec<i16>,
+    },
     /// `C` — command completion, carrying the command tag (e.g. `"SELECT 2"`).
     CommandComplete { tag: String },
     /// `1` — Parse completed (extended protocol; empty body).
@@ -137,6 +144,7 @@ impl BackendMessage {
             BackendMessage::ErrorResponse { .. } => b'E',
             BackendMessage::RowDescription { .. } => b'T',
             BackendMessage::DataRow { .. } => b'D',
+            BackendMessage::CopyInResponse { .. } => b'G',
             BackendMessage::CommandComplete { .. } => b'C',
             BackendMessage::ParseComplete => b'1',
             BackendMessage::BindComplete => b'2',
@@ -210,6 +218,16 @@ impl BackendMessage {
                     }
                 }
             }
+            BackendMessage::CopyInResponse {
+                format,
+                column_formats,
+            } => {
+                body.put_u8(*format);
+                body.put_i16(column_formats.len() as i16);
+                for f in column_formats {
+                    body.put_i16(*f);
+                }
+            }
             BackendMessage::CommandComplete { tag } => put_cstring(body, tag),
             // Empty-body extended-protocol acknowledgements.
             BackendMessage::ParseComplete
@@ -280,6 +298,16 @@ pub enum FrontendMessage {
     /// `p` — a SASL message (SASLInitialResponse or SASLResponse). The body is
     /// returned verbatim; the handshake state machine interprets it by phase.
     SaslResponse { data: Vec<u8> },
+    /// `d` — one chunk of a `COPY ... FROM STDIN` payload.
+    ///
+    /// The bytes are deliberately NOT decoded here: how a payload splits into rows depends on
+    /// the COPY format (text, csv) and options, which the server knows from the statement that
+    /// opened the COPY, not from the frame.
+    CopyData { data: Vec<u8> },
+    /// `c` — the client has sent the whole COPY payload; the statement may now complete.
+    CopyDone,
+    /// `f` — the client aborted the COPY. `message` is its own text, reported back.
+    CopyFail { message: String },
     /// Any other tagged message, preserved verbatim for later handling.
     Unknown { tag: u8, body: Vec<u8> },
 }

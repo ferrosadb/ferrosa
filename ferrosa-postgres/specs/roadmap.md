@@ -97,6 +97,12 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   key — plus `ADD COLUMN` and `DROP COLUMN`. The remaining ALTER forms (RENAME, ALTER COLUMN
   TYPE/DEFAULT, non-key constraints) are refused by name, because `TableUpdates` cannot express
   them and approximating one would leave a client believing a change took effect.
+  **COPY FROM STDIN — wire layer only.** The frames exist and are tested
+  (`FrontendMessage::{CopyData, CopyDone, CopyFail}`, `BackendMessage::CopyInResponse`), so a COPY
+  can be built on them. NOT done: the server state machine that answers a `COPY ... FROM STDIN`
+  with `CopyInResponse` and streams `CopyData` into rows, the row decoder (text and csv), and the
+  per-row inserts. Until then a `CopyData` arriving with no COPY in progress is refused `08P01`
+  rather than ignored — swallowing the payload would let a client's data be reinterpreted as SQL.
   **Not yet done:** minting on `COPY`, and any projection that *reads* `pg_key` — psql's
   describe-table wants `pg_index` (`indisprimary`) plus index rows in `pg_class`, neither of
   which exists yet, so the recorded key is written but not yet visible to a client. See

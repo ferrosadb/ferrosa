@@ -453,6 +453,16 @@ where
             BackendMessage::ReadyForQuery(session.txn_status()).encode(&mut out);
         }
         FrontendMessage::Terminate => return Ok(true),
+        // COPY data with no COPY in progress. The wire layer understands these frames so a COPY
+        // can be implemented, but the server does not open one yet — so any of them arriving here
+        // means the client and we disagree about what is in flight. That is reported rather than
+        // ignored: swallowing the payload would let a client's data be reinterpreted as SQL.
+        FrontendMessage::CopyData { .. }
+        | FrontendMessage::CopyDone
+        | FrontendMessage::CopyFail { .. } => {
+            crate::query::error_response("08P01", "COPY data received outside a COPY operation")
+                .encode(&mut out);
+        }
         // SASL after auth, or any other unexpected message: ignore.
         FrontendMessage::SaslResponse { .. } | FrontendMessage::Unknown { .. } => {}
     }
