@@ -454,7 +454,7 @@ impl SstableStreamSession {
     }
 
     /// Validate `SstableStreamEnd` and write all component files to disk.
-    pub fn finish(self, end: SstableStreamEndPayload) -> Result<SstableStreamResult> {
+    pub fn finish(mut self, end: SstableStreamEndPayload) -> Result<SstableStreamResult> {
         if end.session_id != self.start.session_id {
             return Err(ClusterError::Internal(format!(
                 "sstable_stream: session_id mismatch in end: expected {}, got {}",
@@ -496,6 +496,29 @@ impl SstableStreamSession {
                 written_files: existing_files,
                 total_bytes: self.bytes_received,
             });
+        }
+
+        // A zero-byte component (e.g. `Rows.db` for a generation with no clustered
+
+        // rows) sends no chunks, so it is absent from staging unless we materialise
+        // it from the manifest here. Without this the promoted generation silently
+        // loses that component and becomes corrupt/unopenable on this replica while
+        // the source keeps it — the byte-sum and CRC32 checks both pass, because an
+        // absent empty file contributes 0. See `sstable_transfer.rs`.
+        let materialised = self
+            .assembler
+            .ensure_declared_empty_components(&self.start.components)
+            .map_err(|e| {
+                ClusterError::Internal(format!(
+                    "sstable_stream: could not materialise declared zero-byte components: {e}"
+                ))
+            })?;
+        if !materialised.is_empty() {
+            tracing::info!(
+                session_id = self.start.session_id,
+                components = ?materialised,
+                "sstable_stream: materialised zero-byte components declared by the manifest"
+            );
         }
 
         // Write files to staging, then promote atomically.
@@ -1574,6 +1597,83 @@ mod tests {
 
         let written_index = std::fs::read(dest_path.join("Index.db")).unwrap();
         assert_eq!(written_index, index_content);
+    }
+
+    // -----------------------------------------------------------------------
+    // 8b. SSTable stream must materialise a declared ZERO-BYTE component
+    // -----------------------------------------------------------------------
+    /// A zero-byte component (e.g. `Rows.db` for a generation with no clustered
+    /// rows) produces no chunks on the wire, so before this fix the receiver
+    /// promoted a generation missing it — silently, because an absent empty file
+    /// contributes 0 to both the byte-sum and the CRC32. That is how a replicated
+    /// generation ended up with every component EXCEPT `Rows.db` on the peer while
+    /// the source kept it: corruption on one replica only. This is the regression.
+    #[test]
+    fn sstable_stream_materialises_a_declared_zero_byte_component() {
+        use super::{
+            SstableStreamChunkPayload, SstableStreamEndPayload, SstableStreamStartPayload,
+        };
+        use crate::streaming::sstable_transfer::SSTableComponent;
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dest_path = dst_dir.path().join("received-sstable");
+
+        let data_content = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        // `Rows.db` is declared, and is legitimately EMPTY (size 0).
+        let components = vec![
+            SSTableComponent {
+                name: "Data.db".to_string(),
+                size: data_content.len() as u64,
+            },
+            SSTableComponent {
+                name: "Rows.db".to_string(),
+                size: 0,
+            },
+        ];
+        let start = SstableStreamStartPayload {
+            session_id: 200,
+            source_node: 1,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "mc-002".to_string(),
+            components: components.clone(),
+            total_bytes: data_content.len() as u64,
+        };
+
+        // Only Data.db has bytes, so only Data.db produces a chunk.
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&data_content);
+        let chunks = vec![SstableStreamChunkPayload {
+            session_id: 200,
+            component: "Data.db".to_string(),
+            offset: 0,
+            data: data_content.clone(),
+        }];
+        let end = SstableStreamEndPayload {
+            session_id: 200,
+            total_bytes: data_content.len() as u64,
+            checksum: hasher.finalize(),
+        };
+
+        let result =
+            SstableStreamReceiver::receive_and_write(start, chunks, end, dest_path.clone())
+                .unwrap();
+
+        // THEN the empty Rows.db must exist on the receiving replica, byte-for-byte
+        // empty — not be silently absent.
+        let rows = dest_path.join("Rows.db");
+        assert!(
+            rows.exists(),
+            "a declared zero-byte component must be materialised, not dropped: {:?}",
+            std::fs::read_dir(&dest_path)
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        assert_eq!(
+            std::fs::metadata(&rows).unwrap().len(),
+            0,
+            "the materialised Rows.db must be empty"
+        );
+        assert_eq!(result.written_files.len(), components.len());
     }
 
     // -----------------------------------------------------------------------
