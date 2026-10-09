@@ -50,6 +50,18 @@ pub enum Statement {
     /// only: execution and schema creation are later packets. Boxed for size
     /// parity with `Select`.
     CreateTable(Box<CreateTableStmt>),
+    /// `DROP TABLE [IF EXISTS] a [, b, ...]`. pgbench's initializer and any
+    /// client-side schema reset drop several tables in one statement; each
+    /// named table is dropped by the front-end. Boxed for size parity.
+    DropTable(Box<DropTableStatement>),
+}
+
+/// `DROP TABLE [IF EXISTS] a [, b, ...]`. `tables` is non-empty; every entry
+/// names a table (optionally schema-qualified) to drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTableStatement {
+    pub if_exists: bool,
+    pub tables: Vec<TableRef>,
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] [public.]name (col type [NOT NULL]..., PRIMARY KEY (...))`.
@@ -173,7 +185,10 @@ impl UnsupportedClause {
 pub struct InsertStmt {
     pub table: TableRef,
     pub columns: Vec<String>,
-    pub values: Vec<ScalarValue>,
+    /// One entry per `VALUES (…)` tuple; every inner vec has one value per
+    /// column in `columns` (checked at parse time). A single-row INSERT is a
+    /// one-element `rows`.
+    pub rows: Vec<Vec<ScalarValue>>,
     pub returning: Option<Returning>,
 }
 

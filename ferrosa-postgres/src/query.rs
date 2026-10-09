@@ -1134,6 +1134,19 @@ async fn execute_statement(
             )
             .await
         }
+        // DROP TABLE: pgbench -i's reset step. Same schema-change path.
+        Statement::DropTable(drop) => {
+            crate::ddl::execute_drop_table(
+                crate::ddl::DdlEnv {
+                    executor: ddl,
+                    schema,
+                    default_schema,
+                    in_txn: txn.is_some(),
+                },
+                &drop,
+            )
+            .await
+        }
         // DML: single-row INSERT / UPDATE / DELETE. The simple-query path has no
         // bound parameters (`&[]`); a `$N` in simple SQL is therefore a fail-loud
         // error (no value to bind). With `txn = Some(buffer)` (an open

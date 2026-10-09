@@ -84,6 +84,14 @@ pub(crate) fn statement_permissions(
                     .unwrap_or_else(|| default_schema.to_string()),
             ),
         )],
+        // DROP TABLE drops one or more tables, so it needs DROP on EACH table.
+        // Checked per table here (before the executor looks at the schema) so a
+        // denial reveals nothing about whether a given table exists.
+        Statement::DropTable(drop) => drop
+            .tables
+            .iter()
+            .map(|t| (Permission::Drop, table(t, default_schema)))
+            .collect(),
         Statement::SelectExprs(_)
         | Statement::Begin { .. }
         | Statement::Commit

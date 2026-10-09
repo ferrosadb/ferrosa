@@ -9,7 +9,7 @@
 //! Every loop here iterates over the token vector once; there is no recursion.
 
 use super::{ParseError, Parser, Tok};
-use crate::ast::{ColumnDef, CreateTableStmt, PgType, Statement, TableRef, UnsupportedClause};
+use crate::ast::{ColumnDef, CreateTableStmt, DropTableStatement, PgType, Statement, TableRef, UnsupportedClause};
 
 /// The one schema a table may be qualified with. Other schemas are refused
 /// (`UnsupportedClause::ForeignSchema`) until schema-to-keyspace mapping exists.
@@ -174,6 +174,52 @@ impl Parser {
 
     fn peek_is_kw(&self, kw: &str) -> bool {
         matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case(kw))
+    }
+
+    /// `DROP TABLE [IF EXISTS] name [, name]*`. The leading `DROP` token has not
+    /// been consumed yet. pgbench's initializer drops all four of its tables in
+    /// one statement, so the multi-table list is the common case, not the exotic
+    /// one. Each name is kept verbatim (with any schema qualifier); the executor
+    /// resolves and drops them one at a time.
+    pub(super) fn parse_drop(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("DROP")?;
+        if !self.peek_is_kw("TABLE") {
+            return Err(ParseError::Unexpected {
+                expected: "TABLE",
+                found: match self.peek() {
+                    Some(t) => format!("{t:?}"),
+                    None => "end of statement".into(),
+                },
+            });
+        }
+        self.next(); // TABLE
+        let if_exists = self.parse_if_exists_kw()?;
+
+        let mut tables = Vec::new();
+        loop {
+            tables.push(self.parse_qualified_table()?);
+            match self.peek() {
+                Some(Tok::Comma) => {
+                    self.next();
+                }
+                _ => break,
+            }
+        }
+        self.expect_end()?;
+        Ok(Statement::DropTable(Box::new(DropTableStatement {
+            if_exists,
+            tables,
+        })))
+    }
+
+    /// `IF EXISTS`. Only valid immediately before a name; a bare `IF` is an error.
+    fn parse_if_exists_kw(&mut self) -> Result<bool, ParseError> {
+        if !self.peek_is_kw("IF") {
+            return Ok(false);
+        }
+        self.next();
+        self.expect_ident_kw("EXISTS")?;
+        Ok(true)
     }
 
     /// `( n )` after a type name, or nothing. Returns the modifiers in order.
