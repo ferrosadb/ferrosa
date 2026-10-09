@@ -48,6 +48,7 @@ use crate::mvcc::{
 use crate::result_stream::{open_stream, ResultStream};
 use crate::storage_provider::{load_table_with_overlay, LoadError, ScanFailure, SCAN_BUFFER_ROWS};
 use crate::synthetic_key::next_synthetic_key;
+use ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN;
 
 /// Build an `ErrorResponse` with the standard severity/code/message trio
 /// (`S=ERROR`, `C=<sqlstate>`, `M=<message>`).
@@ -3530,6 +3531,74 @@ mod txn_buffer_tests {
         schema
     }
 
+    /// `new_engine_and_schema` for a table whose partition key is the synthetic `_sys_ck_`
+    /// column — the shape `ddl::plan_create_table` now produces for a `CREATE TABLE` that
+    /// declared no PRIMARY KEY. Key type `uuid` because Postgres has no separate timeuuid
+    /// type; the bytes are the v1 TimeUUID `synthetic_key` mints.
+    async fn new_engine_with_synthetic_key() -> (tempfile::TempDir, Arc<StorageEngine>, Schema) {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine
+            .register_table(TableSchema {
+                keyspace: "public".to_string(),
+                table: "sk".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "v".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                }],
+                extensions: Default::default(),
+            })
+            .unwrap();
+
+        let schema = Schema::new(schema_config()).expect("schema bootstraps");
+        let auth = superuser();
+        schema
+            .create_keyspace(
+                KeyspaceMetadata {
+                    name: "public".to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: {
+                            let mut o = HashMap::new();
+                            o.insert("replication_factor".to_string(), "1".to_string());
+                            o
+                        },
+                    },
+                },
+                &auth,
+            )
+            .expect("create keyspace public");
+        let mut cols = IndexMap::new();
+        cols.insert(
+            SYNTHETIC_KEY_COLUMN.to_string(),
+            column(SYNTHETIC_KEY_COLUMN, ColumnKind::PartitionKey, "uuid"),
+        );
+        cols.insert("v".to_string(), column("v", ColumnKind::Regular, "text"));
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "sk".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: cols,
+                    partition_key: vec![SYNTHETIC_KEY_COLUMN.to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .expect("create table sk");
+        (dir, engine, schema)
+    }
+
     fn engine_config(dir: &Path) -> StorageEngineConfig {
         StorageEngineConfig {
             commit_log: CommitLogConfig {
@@ -3623,6 +3692,84 @@ mod txn_buffer_tests {
         engine.register_table(kv_storage_schema()).unwrap();
         let schema = schema_with_kv();
         (dir, engine, schema)
+    }
+
+    /// The client never supplies the synthetic key — it cannot see the column — so the
+    /// front-end must mint one per row. Before the mint existed this INSERT failed `23502`,
+    /// naming a column the user has no way to know about.
+    #[tokio::test]
+    async fn inserting_into_a_table_with_a_synthetic_key_mints_a_key_per_row() {
+        let (_dir, engine, schema) = new_engine_with_synthetic_key().await;
+        let limits = crate::jsonb_wire::test_limits();
+
+        for v in ["hello", "world"] {
+            let msgs = execute_query(
+                &engine,
+                &schema,
+                &format!("INSERT INTO sk (v) VALUES ('{v}')"),
+                "public",
+                &limits,
+                None,
+            )
+            .await;
+            assert!(
+                !msgs
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+                "an INSERT omitting the invisible key column must succeed: {msgs:?}"
+            );
+        }
+
+        // Both rows landed...
+        let read = execute_query(
+            &engine,
+            &schema,
+            "SELECT v FROM sk",
+            "public",
+            &limits,
+            None,
+        )
+        .await;
+        let values: Vec<String> = read
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(
+                    String::from_utf8_lossy(columns[0].as_deref().unwrap_or_default()).into_owned(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values.len(), 2, "both rows must be readable: {read:?}");
+
+        // ...and each got its OWN key. This is the property that made keying on the user's
+        // first column unacceptable: two rows sharing a key are one row and a write is lost.
+        let keyed = execute_query(
+            &engine,
+            &schema,
+            "SELECT _sys_ck_ FROM sk",
+            "public",
+            &limits,
+            None,
+        )
+        .await;
+        let keys: Vec<String> = keyed
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(
+                    String::from_utf8_lossy(columns[0].as_deref().unwrap_or_default()).into_owned(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2, "one key per row: {keyed:?}");
+        let unique: HashSet<&String> = keys.iter().collect();
+        assert_eq!(unique.len(), 2, "the two keys must differ: {keys:?}");
+        // Reachable by naming the column — the discoverability story — and a real uuid.
+        for key in &keys {
+            Uuid::parse_str(key).unwrap_or_else(|e| panic!("{key} is not a uuid: {e}"));
+        }
+
+        engine.shutdown().unwrap();
     }
 
     #[tokio::test]
