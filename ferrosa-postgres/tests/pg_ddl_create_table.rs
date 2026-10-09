@@ -143,6 +143,7 @@ async fn start_with(with_public: bool) -> Fixture {
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
         ddl: Some(Arc::new(ClusterDdl::new(path))),
+        truncate: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
         portals: Default::default(),
     });

@@ -50,6 +50,12 @@ pub struct QueryContext {
     /// front-end has no DDL authority (unit-test contexts): DDL is then refused
     /// with `0A000` rather than reported as done.
     pub ddl: Option<Arc<dyn crate::ddl::DdlExecutor>>,
+    /// Replicated write path for PostgreSQL `TRUNCATE`. `None` means the
+    /// front-end has no cluster write path (unit-test contexts): `TRUNCATE` is
+    /// then refused with `0A000` rather than reported as done with a node-local
+    /// truncate that would leave the cluster's replicas disagreeing. Populated
+    /// in production from the SAME `WritePath` the CQL router truncates through.
+    pub truncate: Option<Arc<dyn crate::truncate::TruncateExecutor>>,
     /// Tunable jsonb ingest limits (D14b), resolved once at startup by the
     /// binary from `[jsonb]` / env and passed in here. There is no default:
     /// every constructor must supply the resolved value. They gate INSERT and
@@ -691,6 +697,7 @@ fn read_env<'a>(
         mvcc: Some(&ctx.mvcc),
         snapshot: Some(snapshot),
         ddl: ctx.ddl.as_deref(),
+        truncate: ctx.truncate.as_deref(),
         jsonb_limits: &ctx.jsonb_limits,
     }
 }
@@ -1861,6 +1868,7 @@ mod txn_atomicity_tests {
             mvcc: Arc::new(MvccManager::default()),
             accord: AccordAccess::disabled(),
             ddl: None,
+            truncate: None,
             jsonb_limits: crate::jsonb_wire::test_limits(),
             portals: Default::default(),
         }
@@ -1911,6 +1919,133 @@ mod txn_atomicity_tests {
         msgs.iter()
             .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
             .count()
+    }
+
+    /// A `TruncateExecutor` that records every call, so a test can assert the
+    /// REPLICATED path was taken — and that the local engine was left untouched.
+    #[derive(Default)]
+    struct RecordingTruncate {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::truncate::TruncateExecutor for RecordingTruncate {
+        async fn truncate(&self, keyspace: &str, table: &str) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((keyspace.to_string(), table.to_string()));
+            Ok(())
+        }
+    }
+
+    /// The SQLSTATE of the sole `ErrorResponse` in a reply, if any.
+    fn error_sqlstate(messages: &[BackendMessage]) -> Option<String> {
+        messages.iter().find_map(|m| match m {
+            BackendMessage::ErrorResponse { fields } => fields
+                .iter()
+                .find(|(k, _)| *k == b'C')
+                .map(|(_, v)| v.to_string()),
+            _ => None,
+        })
+    }
+
+    fn command_tag(messages: &[BackendMessage]) -> Option<String> {
+        messages.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        })
+    }
+
+    /// `TRUNCATE` must go through the REPLICATED write path, never the local
+    /// `StorageEngine::truncate`. The injected executor records the call without
+    /// touching local storage, so a still-present row proves no local truncate ran.
+    #[tokio::test]
+    async fn truncate_routes_through_the_replicated_path_not_a_local_truncate() {
+        let (_dir, mut ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+        assert_eq!(row_count(&ctx, "k1").await, 1);
+
+        let recorder = Arc::new(RecordingTruncate::default());
+        ctx.truncate = Some(recorder.clone());
+
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
+        assert_eq!(command_tag(&messages).as_deref(), Some("TRUNCATE TABLE"));
+        assert_eq!(
+            recorder.calls.lock().unwrap().clone(),
+            vec![("public".to_string(), "kv".to_string())]
+        );
+        assert_eq!(
+            row_count(&ctx, "k1").await,
+            1,
+            "a local StorageEngine::truncate would have emptied this node's replica"
+        );
+    }
+
+    /// With no replicated write path the statement is refused `0A000`, and the
+    /// local replica is untouched — a local truncate is never a fallback.
+    #[tokio::test]
+    async fn truncate_without_a_replicated_path_is_refused_0a000() {
+        let (_dir, ctx) = make_ctx().await; // ddl: None, truncate: None
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
+        assert_eq!(error_sqlstate(&messages).as_deref(), Some("0A000"));
+        assert_eq!(row_count(&ctx, "k1").await, 1, "a refusal applies nothing");
+    }
+
+    /// `TRUNCATE` inside a transaction block is `25001`: ferrosa applies it
+    /// immediately and cannot roll it back.
+    #[tokio::test]
+    async fn truncate_inside_a_transaction_block_is_refused() {
+        let (_dir, mut ctx) = make_ctx().await;
+        ctx.truncate = Some(Arc::new(RecordingTruncate::default()));
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
+        assert_eq!(error_sqlstate(&messages).as_deref(), Some("25001"));
+        execute_simple(&ctx, &mut session, "ROLLBACK").await;
+    }
+
+    /// VACUUM / VACUUM FULL / VACUUM ANALYZE / ANALYZE are accepted and answered
+    /// with the tag a client expects, changing nothing.
+    #[tokio::test]
+    async fn vacuum_and_analyze_are_accepted_as_successful_noops() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+        for (sql, tag) in [
+            ("VACUUM", "VACUUM"),
+            ("VACUUM FULL", "VACUUM"),
+            ("VACUUM FULL ANALYZE", "VACUUM"),
+            ("VACUUM ANALYZE kv", "VACUUM"),
+            ("ANALYZE kv", "ANALYZE"),
+        ] {
+            let messages = execute_simple(&ctx, &mut session, sql).await;
+            assert_eq!(
+                error_sqlstate(&messages),
+                None,
+                "`{sql}` must succeed, got {messages:?}"
+            );
+            assert_eq!(command_tag(&messages).as_deref(), Some(tag), "`{sql}` tag");
+        }
+        assert_eq!(row_count(&ctx, "k1").await, 1, "the no-op changed nothing");
     }
 
     /// At the suspended-portal limit, a fresh portal executed with `max_rows`

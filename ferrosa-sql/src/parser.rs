@@ -198,6 +198,9 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "COPY" => p.parse_copy(),
             "ALTER" => p.parse_alter_table(),
             "DROP" => p.parse_drop(),
+            "TRUNCATE" => p.parse_truncate(),
+            "VACUUM" => p.parse_vacuum(),
+            "ANALYZE" | "ANALYSE" => p.parse_analyze(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),
@@ -2650,6 +2653,107 @@ mod tests {
                 "must reject `{sql}` rather than silently dropping nothing"
             );
         }
+    }
+
+    // ---- TRUNCATE / VACUUM / ANALYZE (pgbench reset + routine maintenance) ----
+
+    /// The table names a `TRUNCATE` names, in order.
+    fn truncate_tables(sql: &str) -> Vec<String> {
+        match parse_statement(sql) {
+            Ok(Statement::Truncate(t)) => t.tables.iter().map(|t| t.table.clone()).collect(),
+            other => panic!("expected TRUNCATE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_truncate_with_and_without_the_table_keyword() {
+        assert_eq!(
+            truncate_tables("TRUNCATE pgbench_accounts"),
+            ["pgbench_accounts"]
+        );
+        assert_eq!(truncate_tables("TRUNCATE TABLE t"), ["t"]);
+    }
+
+    #[test]
+    fn parses_truncate_of_several_tables_and_keeps_the_schema_qualifier() {
+        assert_eq!(truncate_tables("TRUNCATE TABLE public.a, b"), ["a", "b"]);
+        match parse_statement("TRUNCATE public.t") {
+            Ok(Statement::Truncate(t)) => {
+                assert_eq!(t.tables[0].schema.as_deref(), Some("public"));
+                assert_eq!(t.tables[0].table, "t");
+            }
+            other => panic!("expected TRUNCATE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_with_no_table_is_a_parse_error() {
+        for sql in ["TRUNCATE", "TRUNCATE TABLE", "TRUNCATE a,"] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "must reject `{sql}` rather than silently truncating nothing"
+            );
+        }
+    }
+
+    /// `TRUNCATE ... CASCADE` / `... RESTART IDENTITY` carry no meaning here
+    /// (no foreign keys, no sequences), so a stray token is refused, not ignored.
+    #[test]
+    fn truncate_cascade_and_restart_identity_are_refused_by_name() {
+        for sql in [
+            "TRUNCATE t CASCADE",
+            "TRUNCATE t RESTART IDENTITY",
+            "TRUNCATE t CONTINUE IDENTITY",
+            "TRUNCATE t RESTRICT",
+        ] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "`{sql}` would silently ignore a modifier ferrosa cannot honour"
+            );
+        }
+    }
+
+    /// The `(full, analyze, table)` an accepted `VACUUM` parsed to.
+    fn vacuum_parts(sql: &str) -> (bool, bool, Option<String>) {
+        match parse_statement(sql) {
+            Ok(Statement::Vacuum(v)) => (v.full, v.analyze, v.table.map(|t| t.table)),
+            other => panic!("expected VACUUM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_vacuum_full_and_analyze_in_any_order() {
+        assert_eq!(vacuum_parts("VACUUM"), (false, false, None));
+        assert_eq!(vacuum_parts("VACUUM FULL"), (true, false, None));
+        assert_eq!(vacuum_parts("VACUUM ANALYZE"), (false, true, None));
+        assert_eq!(vacuum_parts("VACUUM FULL ANALYZE"), (true, true, None));
+        assert_eq!(vacuum_parts("VACUUM ANALYZE FULL"), (true, true, None));
+        assert_eq!(vacuum_parts("VACUUM ANALYSE"), (false, true, None));
+        assert_eq!(
+            vacuum_parts("VACUUM ANALYZE pgbench_accounts"),
+            (false, true, Some("pgbench_accounts".into()))
+        );
+    }
+
+    #[test]
+    fn parses_standalone_analyze() {
+        assert_eq!(
+            parse_statement("ANALYZE").unwrap(),
+            Statement::Analyze(crate::ast::AnalyzeStmt { table: None })
+        );
+        match parse_statement("ANALYSE t") {
+            Ok(Statement::Analyze(a)) => {
+                assert_eq!(a.table.as_ref().map(|t| t.table.as_str()), Some("t"));
+            }
+            other => panic!("expected ANALYZE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vacuum_parenthesised_option_list_is_refused() {
+        // `VACUUM (VERBOSE) t` is out of the parsed subset: the `(` would be read
+        // as a table name and the following ident is then a stray token.
+        assert!(parse_statement("VACUUM (VERBOSE) t").is_err());
     }
 
     // ---- multi-row INSERT + value functions (pg_dump / pgbench history) ----

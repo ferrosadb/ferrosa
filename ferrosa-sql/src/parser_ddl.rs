@@ -10,8 +10,9 @@
 
 use super::{ParseError, Parser, Tok};
 use crate::ast::{
-    AlterOperation, AlterTableStmt, ColumnDef, CopyFormatKind, CopyFromStdinStmt, CreateTableStmt,
-    DropTableStatement, PgType, Statement, TableRef, UnsupportedClause,
+    AlterOperation, AlterTableStmt, AnalyzeStmt, ColumnDef, CopyFormatKind, CopyFromStdinStmt,
+    CreateTableStmt, DropTableStatement, PgType, Statement, TableRef, TruncateStatement,
+    UnsupportedClause, VacuumStmt,
 };
 
 /// The one schema a table may be qualified with. Other schemas are refused
@@ -448,6 +449,96 @@ impl Parser {
         self.next();
         self.expect_ident_kw("EXISTS")?;
         Ok(true)
+    }
+
+    /// `TRUNCATE [TABLE] name [, name]*`. The leading `TRUNCATE` token has not
+    /// been consumed yet.
+    ///
+    /// `TABLE` is an optional noise word in PostgreSQL; both `TRUNCATE t` and
+    /// `TRUNCATE TABLE t` are accepted. Each name is kept verbatim (with any
+    /// schema qualifier); the executor resolves and truncates them one at a
+    /// time through the replicated write path. `TRUNCATE ... CASCADE` /
+    /// `RESTART IDENTITY` are **not** parsed: they would silently mean nothing
+    /// here (ferrosa has no foreign keys and no sequences), so a stray token
+    /// after the table list is a fail-loud `ParseError::Unexpected`.
+    pub(super) fn parse_truncate(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("TRUNCATE")?;
+        if self.peek_is_kw("TABLE") {
+            self.next();
+        }
+        let mut tables = Vec::new();
+        loop {
+            tables.push(self.parse_qualified_table()?);
+            match self.peek() {
+                Some(Tok::Comma) => {
+                    self.next();
+                }
+                _ => break,
+            }
+        }
+        self.expect_end()?;
+        Ok(Statement::Truncate(Box::new(TruncateStatement { tables })))
+    }
+
+    /// `VACUUM [FULL] [ANALYZE|ANALYSE] [name]`. The leading `VACUUM` token has
+    /// not been consumed yet.
+    ///
+    /// `FULL` and `ANALYZE` are legacy noise words in PostgreSQL's grammar, so
+    /// they are accepted in either order without parentheses; a parenthesised
+    /// option list (`VACUUM (VERBOSE)`) is not parsed — a stray token after the
+    /// modifiers is a fail-loud `ParseError::Unexpected`. At most one table name
+    /// is accepted. All forms parse; the front-end answers each as a successful
+    /// no-op regardless of what was asked for.
+    pub(super) fn parse_vacuum(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("VACUUM")?;
+        let mut full = false;
+        if self.peek_is_kw("FULL") {
+            self.next();
+            full = true;
+        }
+        let analyze = self.parse_analyze_kw()?;
+        // `FULL` may also follow the `ANALYZE` noise word (`VACUUM ANALYZE FULL t`).
+        if !full && self.peek_is_kw("FULL") {
+            self.next();
+            full = true;
+        }
+        let table = if self.peek().is_some() {
+            Some(self.parse_qualified_table()?)
+        } else {
+            None
+        };
+        self.expect_end()?;
+        Ok(Statement::Vacuum(VacuumStmt {
+            full,
+            analyze,
+            table,
+        }))
+    }
+
+    /// `ANALYZE [name]` / `ANALYSE [name]`. The leading keyword has not been
+    /// consumed yet (either spelling is accepted). At most one table name is
+    /// accepted; the front-end answers it as a successful no-op.
+    pub(super) fn parse_analyze(&mut self) -> Result<Statement, ParseError> {
+        // The dispatcher matched `ANALYZE`/`ANALYSE`; consume it verbatim.
+        self.next();
+        let table = if self.peek().is_some() {
+            Some(self.parse_qualified_table()?)
+        } else {
+            None
+        };
+        self.expect_end()?;
+        Ok(Statement::Analyze(AnalyzeStmt { table }))
+    }
+
+    /// Consume an optional `ANALYZE`/`ANALYSE` noise word; report whether it was
+    /// present.
+    fn parse_analyze_kw(&mut self) -> Result<bool, ParseError> {
+        if self.peek_is_kw("ANALYZE") || self.peek_is_kw("ANALYSE") {
+            self.next();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// `( n )` after a type name, or nothing. Returns the modifiers in order.

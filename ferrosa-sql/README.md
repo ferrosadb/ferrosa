@@ -44,6 +44,11 @@ in-memory table in tests and by Ferrosa storage in production.
   `jsonb`, D11). Double-quoted identifiers are supported. Refused by name with
   `ParseError::UnsupportedClause`: `FOREIGN KEY`/`REFERENCES`, `CHECK`,
   `SERIAL` types, `DEFAULT`, a schema other than `public`, `UNIQUE`.
+- Maintenance statements **parsed** (executed by the Postgres front end):
+  `TRUNCATE [TABLE] t [, …]` into `Statement::Truncate`; `VACUUM [FULL]
+  [ANALYZE|ANALYSE] [t]` into `Statement::Vacuum`; `ANALYZE|ANALYSE [t]` into
+  `Statement::Analyze`. `TRUNCATE … CASCADE` / `… RESTART IDENTITY` are refused
+  by name (no foreign keys, no sequences to honour).
 - jsonb values (T-160): `Value::Jsonb(ferrosa_jsonb::JsonbValue)`, plus
   `Value::JsonPath(String)` (text until the path parser, T-162) and
   `Value::TextArray`; `ColumnType` gains `Jsonb`, `Json`, `JsonPath`, `TextArray`.
@@ -141,7 +146,7 @@ an owned, `Send` iterator, and `RowStream`/`TryRowStream` are `Send`.
 | Area | Items |
 |------|-------|
 | Parse | `parse`, `parse_statement`, `ParseError` |
-| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `Expr`, `Operand`, `Term`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
+| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `CreateTableStmt`, `DropTableStatement`, `TruncateStatement`, `VacuumStmt`, `AnalyzeStmt`, `Expr`, `Operand`, `Term`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
 | Plan | `execute_streaming`, `RowSink`, `open_cursor`, `RowCursor`, `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
 | Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `dedup`, `limit_offset`, `fallible`, `try_filter`, `try_project`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream`, `TryRowStream` |
 | Spill | `SpillCtx`, `SpillReserver`, `DirReserver`, `SpillStats`, `SpillError`, `default_temp_root`, `sweep_orphaned_temp_dirs` |
@@ -172,9 +177,10 @@ operators and serves results over the Postgres wire.
 ## Tests
 
 In-crate unit tests (no `#[ignore]`, no live-infra): `exec.rs`, `parser.rs`,
-`plan.rs`, `types.rs`, `catalog.rs`, `spill.rs` — 144 total. They cover
+`plan.rs`, `types.rs`, `catalog.rs`, `spill.rs` — 186 total. They cover
 NULL/Kleene logic, sort NULL placement, aggregate edge cases, numeric
-normalization, join key resolution, binder fail-loud paths, and the spill
+normalization, join key resolution, binder fail-loud paths, the `TRUNCATE` /
+`VACUUM` / `ANALYZE` grammar (including the named refusals), and the spill
 module's orders, replay buffer and orphan sweep.
 
 `tests/spill_operators.rs` (11 tests, including a negative control that proves

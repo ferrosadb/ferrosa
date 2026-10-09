@@ -881,6 +881,7 @@ pub async fn execute_query(
         mvcc: None,
         snapshot: None,
         ddl: None,
+        truncate: None,
         jsonb_limits,
     };
     execute_query_with_mvcc(env, sql, txn).await
@@ -981,6 +982,9 @@ pub(crate) struct ReadEnv<'a> {
     pub(crate) mvcc: Option<&'a MvccManager>,
     pub(crate) snapshot: Option<&'a MvccSnapshot>,
     pub(crate) ddl: Option<&'a dyn crate::ddl::DdlExecutor>,
+    /// Replicated write path for `TRUNCATE`; `None` refuses the statement with
+    /// `0A000` rather than truncating only this node's replica.
+    pub(crate) truncate: Option<&'a dyn crate::truncate::TruncateExecutor>,
     /// Tunable jsonb ingest limits (D14b), for text coerced into jsonb columns.
     pub(crate) jsonb_limits: &'a ferrosa_jsonb::Limits,
 }
@@ -1095,6 +1099,7 @@ async fn execute_statement(
         default_schema,
         mvcc,
         ddl,
+        truncate,
         jsonb_limits,
         ..
     } = env;
@@ -1173,6 +1178,34 @@ async fn execute_statement(
             )
             .await
         }
+        // TRUNCATE [TABLE] t [, ...]: rows are removed through the **replicated**
+        // cluster write path (the same one CQL `TRUNCATE` uses), never a node-local
+        // truncate — which would empty one replica and leave the others holding the
+        // old data. Refused `0A000` when this front-end has no write path and
+        // `25001` inside a transaction block (it cannot be rolled back).
+        Statement::Truncate(table_list) => {
+            crate::truncate::execute_truncate(
+                crate::truncate::TruncateEnv {
+                    executor: truncate,
+                    schema,
+                    default_schema,
+                    in_txn: txn.is_some(),
+                },
+                &table_list,
+            )
+            .await
+        }
+        // VACUUM [FULL] [ANALYZE]: DELIBERATELY accepted and answered as a successful
+        // no-op. ferrosa stores rows in an LSM tree with no dead-tuple heap to reclaim
+        // and collects no statistics, so nothing is freed and nothing is measured; the
+        // `VACUUM` tag is the completion a client (e.g. `pgbench -i`) expects.
+        Statement::Vacuum(_) => vec![BackendMessage::CommandComplete {
+            tag: "VACUUM".to_string(),
+        }],
+        // ANALYZE: likewise a deliberate successful no-op — no statistics are collected.
+        Statement::Analyze(_) => vec![BackendMessage::CommandComplete {
+            tag: "ANALYZE".to_string(),
+        }],
         // DML: single-row INSERT / UPDATE / DELETE. The simple-query path has no
         // bound parameters (`&[]`); a `$N` in simple SQL is therefore a fail-loud
         // error (no value to bind). With `txn = Some(buffer)` (an open
@@ -4425,6 +4458,7 @@ mod txn_buffer_tests {
                 mvcc: Some(&mvcc),
                 snapshot: None,
                 ddl: None,
+                truncate: None,
                 jsonb_limits: &limits,
             };
             // txn = None: autocommit, but through the MVCC commit path.
@@ -4470,6 +4504,7 @@ mod txn_buffer_tests {
             mvcc: Some(&mvcc),
             snapshot: None,
             ddl: None,
+            truncate: None,
             jsonb_limits: &limits,
         };
         let msgs = execute_query_with_mvcc(

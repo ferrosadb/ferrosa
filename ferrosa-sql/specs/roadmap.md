@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sql
 doc: roadmap
-last_updated: 2026-09-15
+last_updated: 2026-10-09
 ---
 
 # ferrosa-sql — Roadmap
@@ -12,6 +12,12 @@ the `ferrosa-postgres` consumer needs. The engine is intentionally an M1 slice
 toward the Postgres queries real clients send.
 
 ## Now (highest value)
+
+- **(done) Parse the maintenance statements** (pgbench `-i`/reset). `TRUNCATE
+  [TABLE] t [, …]`, `VACUUM [FULL] [ANALYZE|ANALYSE] [t]` and `ANALYZE|ANALYSE
+  [t]` now parse to `Statement::{Truncate,Vacuum,Analyze}`; the Postgres front
+  end executes them (replicated `TRUNCATE`; `VACUUM`/`ANALYZE` accepted no-ops).
+  `TRUNCATE … CASCADE` / `… RESTART IDENTITY` are refused by name.
 
 - **(done) Stream the result to the wire** (FMEA SQL-12, `t_f348ba0b`).
   `execute_streaming` + `RowSink` deliver rows as the pipeline yields them and

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 doc: roadmap
-last_updated: 2026-09-27
+last_updated: 2026-10-09
 ---
 
 # ferrosa-postgres — Roadmap
@@ -12,6 +12,18 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 `feature_not_supported` paths and documented lossy fallbacks instead.
 
 ## Done (recent)
+
+- **`TRUNCATE` (replicated) + `VACUUM`/`ANALYZE` (accepted no-ops)** (pgbench
+  `-i`/reset and routine maintenance). `TRUNCATE [TABLE] t [, …]` routes through
+  `truncate::TruncateExecutor` — `ClusterTruncate` over the SAME
+  `ferrosa_cluster::WritePath` the CQL router's `route_truncate` uses — so the
+  truncation is replicated to every node, never a node-local
+  `StorageEngine::truncate` that would leave the replicas disagreeing. No write
+  path → `0A000`; in a transaction block → `25001`; missing table → `42P01`.
+  `VACUUM [FULL] [ANALYZE|ANALYSE]` and `ANALYZE|ANALYSE` answer `CommandComplete`
+  `"VACUUM"`/`"ANALYZE"` and change nothing (no heap to vacuum, no statistics
+  collected) — a deliberate accept-and-report so `pgbench -i` succeeds.
+  `QueryContext` carries the executor in `ReadEnv` beside `ddl`.
 
 - **PK-less `CREATE TABLE` end to end.** A table that declares no `PRIMARY KEY` gets a
   synthetic `_sys_ck_` column (a v1 TimeUUID, reported as `uuid`) as its partition key, so
