@@ -111,6 +111,46 @@ multi-mutation batch before suspecting the SQL layer again.
 assert one `CommandComplete` tagged `INSERT 0 3`, three rows landed, each carrying its
 own value.
 
+### PK-less CREATE TABLE: use a synthetic incrementing-id column at position 0
+
+`CREATE TABLE` with no PRIMARY KEY is refused (`MissingPrimaryKey` -> 0A000), and that is
+what stops `pgbench -i` — it dies at
+`pgbench_accounts (aid, bid, abalance, filler char(84))`.
+
+**A shadow key on the user's first column is WRONG** and was implemented, then reverted
+(`e347f3eb` -> `b91a232a`). It assumes the first column is unique; where it is not, rows
+collide and the write is lost. Do not reintroduce it.
+
+Instead the table gets a **synthetic column at position 0 carrying a globally unique
+incrementing id**, and the partition key is that column. Every row is then unique by
+construction, with no assumption about the user's data.
+
+Two constraints drive the design:
+
+1. **The column must be invisible to PostgreSQL clients.** pgbench's
+   `COPY pgbench_accounts FROM STDIN` sends exactly the four declared columns; a visible
+   fifth column makes COPY and `INSERT ... VALUES` (no column list) fail. It must also be
+   excluded from `SELECT *`.
+2. **The id must be globally unique, not a per-node counter.** Three nodes each counting
+   from zero would collide on the shared key exactly as a non-unique first column would —
+   the same bug, relabelled. Use a time-ordered v1 timeuuid (ordered *and* unique) or, if
+   v1 is unavailable, `uuid::Uuid::new_v4()` (already a dependency; unique, unordered),
+   or the Accord HLC in `ferrosa-common/src/accord.rs` (carries a node id).
+
+**Cheapest correct route — avoid a 151-site refactor.** Adding `hidden: bool` to
+`ColumnMetadata` (`ferrosa-schema/src/metadata/column.rs`) touches **151** construction
+sites across the workspace and the type derives no `Default`. Prefer instead:
+keep the synthetic column in `columns` (so storage indexes and row encoding work
+unchanged) and carry its hidden-ness **in the Postgres front end by a reserved name**
+(e.g. `ferrosa_row_id`), rejecting that name in user DDL. Then `SELECT *`, COPY and
+INSERT arity all filter it in one place, and no schema-metadata change is needed.
+Only if CQL clients must also not see it does the metadata field become necessary.
+
+Still to build: the column synthesis, server-side per-row assignment on INSERT and COPY,
+the wire exclusions, and `ALTER TABLE ... ADD PRIMARY KEY` (not parsed at all today — a
+new statement type; where it names a column other than the synthetic key it becomes a
+secondary index, where it names nothing new it is a no-op).
+
 ### What execution needs
 
 `execute_insert` (`ferrosa-postgres/src/query.rs`) resolves, per row: the column values,
