@@ -224,8 +224,9 @@ key and one write being lost; the `node` field is a random 48-bit value chosen
 once per process (RFC 4122 permits this — it is what v1 does with MAC
 addresses), so no cluster identity has to be plumbed to the Postgres front-end.
 
-> Not yet wired end to end: the Postgres front-end does not yet synthesise the
-> column, assign it on INSERT/COPY, or filter it from `SELECT *`. Tracked in
+> The Postgres front-end synthesises the column on a PK-less `CREATE TABLE` and mints a
+> key per row on `INSERT` (`ferrosa-postgres/src/synthetic_key.rs`). Still open: minting on
+> `COPY`, the `SELECT *` filter, and `ALTER TABLE ... ADD PRIMARY KEY`. Tracked in
 > [ferrosa-postgres/specs/roadmap.md](../ferrosa-postgres/specs/roadmap.md).
 
 ## Specs

@@ -49,3 +49,4 @@ pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
 pub use server::{PgTls, QueryContext};
 
 pub use accord_access::AccordAccess;
+mod synthetic_key;

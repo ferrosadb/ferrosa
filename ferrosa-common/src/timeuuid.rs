@@ -67,6 +67,16 @@ pub const V1_VERSION: u8 = 1;
 /// one thing. See [`is_reserved_column_name`].
 pub const SYNTHETIC_KEY_COLUMN: &str = "_sys_ck_";
 
+/// True when `name` is the synthetic key column ferrosa mints for a table whose
+/// `CREATE TABLE` declared no `PRIMARY KEY`.
+///
+/// Case-insensitive, because it decides whether an `INSERT` that did not name the column
+/// gets one minted for it: a client writing `_SYS_CK_` must not be treated as having
+/// supplied the key, nor as having omitted some ordinary column.
+pub fn is_synthetic_key_column(name: &str) -> bool {
+    name.eq_ignore_ascii_case(SYNTHETIC_KEY_COLUMN)
+}
+
 /// True when `name` is reserved for ferrosa's own use and a user may not declare it.
 ///
 /// Matches the whole `_sys_` prefix rather than the one column we mint today, so a future
@@ -166,6 +176,16 @@ mod tests {
                 "node {node:#x} must round-trip through bytes 10..16"
             );
         }
+    }
+
+    /// The synthetic key column is recognised however it is spelled, so an INSERT that
+    /// names it in the wrong case is neither given a minted key nor refused for a missing one.
+    #[test]
+    fn the_synthetic_key_column_is_recognised_case_insensitively() {
+        assert!(is_synthetic_key_column("_sys_ck_"));
+        assert!(is_synthetic_key_column("_SYS_CK_"));
+        assert!(!is_synthetic_key_column("_sys_ck"));
+        assert!(!is_synthetic_key_column("ck_"));
     }
 
     /// The reserved prefix is refused however it is typed, and ordinary names are not.

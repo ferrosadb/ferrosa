@@ -32,6 +32,7 @@
 
 use std::sync::Arc;
 
+use ferrosa_common::timeuuid::is_synthetic_key_column;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
@@ -46,6 +47,7 @@ use crate::mvcc::{
 };
 use crate::result_stream::{open_stream, ResultStream};
 use crate::storage_provider::{load_table_with_overlay, LoadError, ScanFailure, SCAN_BUFFER_ROWS};
+use crate::synthetic_key::next_synthetic_key;
 
 /// Build an `ErrorResponse` with the standard severity/code/message trio
 /// (`S=ERROR`, `C=<sqlstate>`, `M=<message>`).
@@ -1652,6 +1654,12 @@ pub(crate) async fn execute_insert(
         for name in &meta.partition_key {
             match col_values.get(name) {
                 Some(v) => pk_values.push(v.clone()),
+                // The synthetic key is ferrosa's own: the client never supplies it, because
+                // it is filtered out of `SELECT *` and of the column list it was given. Mint
+                // one for this row instead of demanding a column the user cannot see.
+                None if is_synthetic_key_column(name) => {
+                    pk_values.push(CqlValue::Uuid(uuid::Uuid::from_bytes(next_synthetic_key())));
+                }
                 None => {
                     return vec![error_response(
                         "23502",
