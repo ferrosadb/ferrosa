@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use ferrosa_cluster::ddl_path::DdlPath;
 use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_common::cql_type::CqlType;
+use ferrosa_common::timeuuid::{is_reserved_column_name, SYNTHETIC_KEY_COLUMN};
 use ferrosa_schema::{
     ClusteringOrder, ColumnKind, ColumnMetadata, Schema, TableMetadata, TableParams,
 };
@@ -222,15 +223,53 @@ pub(crate) fn plan_create_table(
     stmt: &CreateTableStmt,
     keyspace: &str,
 ) -> Result<TableMetadata, BackendMessage> {
-    let Some((partition, clustering)) = stmt.primary_key.split_first() else {
+    // The `_sys_` prefix is ferrosa's own. The front end recognises it by name to filter
+    // the column out of `SELECT *` and to give it a negative `attnum` in `pg_attribute`,
+    // so accepting a user column in that namespace would make both those rules lie.
+    for def in &stmt.columns {
+        if is_reserved_column_name(&def.name) {
+            return Err(error_response(
+                "42P16",
+                &format!(
+                    "column name \"{}\" is reserved: the `_sys_` prefix belongs to ferrosa",
+                    def.name
+                ),
+            ));
+        }
+    }
+
+    // PostgreSQL allows a table with no PRIMARY KEY; ferrosa's storage needs a partition
+    // key. Synthesize one on a fresh v1-TimeUUID column at position 0 rather than keying on
+    // the user's first column: that assumed the first column is unique and silently lost
+    // writes wherever it was not. A UUID key is unique by construction.
+    //
+    // Postgres has no separate timeuuid type, so the column is reported as `uuid` — the
+    // same 16 bytes, and what a PG driver can actually decode.
+    let mut declared_columns: Vec<ColumnDef> = stmt.columns.clone();
+    let mut primary_key: Vec<String> = stmt.primary_key.clone();
+    if primary_key.is_empty() {
+        declared_columns.insert(
+            0,
+            ColumnDef {
+                name: SYNTHETIC_KEY_COLUMN.to_string(),
+                ty: PgType::Uuid,
+                not_null: true,
+                primary_key: true,
+            },
+        );
+        primary_key = vec![SYNTHETIC_KEY_COLUMN.to_string()];
+    }
+
+    let Some((partition, clustering)) = primary_key.split_first() else {
+        // Unreachable: a table that declared no key just gained the synthetic one above.
         return Err(error_response(
-            "0A000",
-            "CREATE TABLE without a PRIMARY KEY is not supported",
+            "XX000",
+            "internal: CREATE TABLE planned with no key column",
         ));
     };
-    refuse_jsonb_primary_key(stmt)?;
+    refuse_jsonb_primary_key(&declared_columns, &primary_key)?;
     let mut columns = IndexMap::new();
-    for def in &stmt.columns {
+    for def in &declared_columns {
         let column_type = cql_type_string(def)?;
         let (kind, position, clustering_order) = if def.name == *partition {
             (ColumnKind::PartitionKey, 0, ClusteringOrder::None)
@@ -272,9 +311,12 @@ pub(crate) fn plan_create_table(
 /// `doc jsonb PRIMARY KEY`; ferrosa keeps jsonb out of key bytes, so the plan
 /// is refused with `42P16` naming the column, before the general jsonb refusal
 /// (which lifts with T-300) can answer a less specific `0A000`.
-fn refuse_jsonb_primary_key(stmt: &CreateTableStmt) -> Result<(), BackendMessage> {
-    let key_jsonb = stmt.columns.iter().find(|def| {
-        matches!(def.ty, PgType::Json | PgType::Jsonb) && stmt.primary_key.contains(&def.name)
+fn refuse_jsonb_primary_key(
+    columns: &[ColumnDef],
+    primary_key: &[String],
+) -> Result<(), BackendMessage> {
+    let key_jsonb = columns.iter().find(|def| {
+        matches!(def.ty, PgType::Json | PgType::Jsonb) && primary_key.contains(&def.name)
     });
     match key_jsonb {
         Some(def) => Err(error_response(
@@ -393,5 +435,96 @@ fn cql_type_name(ty: &CqlType) -> Option<&'static str> {
         | CqlType::Tuple(_)
         | CqlType::Udt { .. }
         | CqlType::Vector(_, _) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrosa_common::timeuuid::{is_reserved_column_name, SYNTHETIC_KEY_COLUMN};
+    use ferrosa_sql::{parse_statement, Statement};
+
+    fn plan(sql: &str) -> Result<TableMetadata, BackendMessage> {
+        let Statement::CreateTable(stmt) = parse_statement(sql).expect("must parse") else {
+            panic!("expected a CreateTable");
+        };
+        plan_create_table(&stmt, "public")
+    }
+
+    fn plan_err(sql: &str) -> String {
+        format!("{:?}", plan(sql).expect_err("must be refused"))
+    }
+
+    /// PostgreSQL allows a table with no PRIMARY KEY. ferrosa's storage needs a partition
+    /// key, so the table gets a synthetic `_sys_ck_` column as its key. pgbench's own
+    /// `pgbench_accounts (aid, bid, abalance, filler char(84))` is exactly this shape, and
+    /// refusing it is what stops `pgbench -i`.
+    #[test]
+    fn a_pk_less_create_table_gets_a_synthetic_key_column() {
+        let meta =
+            plan("CREATE TABLE pgbench_accounts (aid int, bid int, abalance int, filler char(84))")
+                .expect("a PK-less CREATE TABLE must plan");
+
+        assert_eq!(
+            meta.partition_key,
+            vec![SYNTHETIC_KEY_COLUMN.to_string()],
+            "the synthetic column carries the key"
+        );
+        assert!(
+            meta.clustering_key.is_empty(),
+            "nothing was declared as a clustering key"
+        );
+        let key = meta
+            .columns
+            .get(SYNTHETIC_KEY_COLUMN)
+            .expect("the synthetic column must exist");
+        assert_eq!(key.kind, ColumnKind::PartitionKey);
+        assert_eq!(
+            key.column_type, "uuid",
+            "the key is a v1 TimeUUID; Postgres has no separate timeuuid type so it is \
+             stored and reported as uuid (same 16-byte layout)"
+        );
+        let names: Vec<&str> = meta.columns.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            vec![SYNTHETIC_KEY_COLUMN, "aid", "bid", "abalance", "filler"],
+            "the synthetic column goes first, then the declared columns in order"
+        );
+        for name in ["aid", "bid", "abalance", "filler"] {
+            assert_eq!(
+                meta.columns.get(name).map(|c| c.kind),
+                Some(ColumnKind::Regular)
+            );
+        }
+    }
+
+    /// A declared key is honoured exactly, and nothing is synthesized.
+    #[test]
+    fn a_declared_primary_key_is_not_shadowed() {
+        let meta = plan("CREATE TABLE t (a int PRIMARY KEY, b int)").expect("must plan");
+        assert_eq!(meta.partition_key, vec!["a".to_string()]);
+        assert!(
+            !meta.columns.contains_key(SYNTHETIC_KEY_COLUMN),
+            "a table that declared a key must not gain a synthetic one"
+        );
+    }
+
+    /// The `_sys_` prefix is ferrosa's. A user who could declare a column in it would make
+    /// the front-end rules that recognise the prefix by name lie — it is filtered from
+    /// `SELECT *` and carries a negative `attnum` in `pg_attribute`.
+    #[test]
+    fn a_user_column_in_the_reserved_prefix_is_refused() {
+        for sql in [
+            "CREATE TABLE t (_sys_ck_ int, b int)",
+            "CREATE TABLE t (b int, _SYS_anything int)",
+            "CREATE TABLE t (_Sys_X int, b int, PRIMARY KEY (_Sys_X))",
+        ] {
+            let text = plan_err(sql);
+            assert!(
+                text.contains("reserved"),
+                "{sql} must be refused as reserved: {text}"
+            );
+        }
+        assert!(is_reserved_column_name(SYNTHETIC_KEY_COLUMN));
     }
 }

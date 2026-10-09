@@ -380,7 +380,11 @@ fn finish_create_table(
         .collect();
     let primary_key = match (inline.len(), table_pk) {
         (0, Some(cols)) => cols,
-        (0, None) => return Err(ParseError::MissingPrimaryKey),
+        // PostgreSQL allows a table with no PRIMARY KEY. The parser reports that
+        // faithfully as an empty key rather than refusing; supplying a synthetic key
+        // (and rejecting the reserved `_sys_` prefix) is the Postgres front-end's job,
+        // where `is_reserved_column_name` lives.
+        (0, None) => Vec::new(),
         (1, None) => inline,
         _ => return Err(ParseError::MultiplePrimaryKeys),
     };

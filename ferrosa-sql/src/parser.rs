@@ -2122,6 +2122,24 @@ mod tests {
 
     // ---- T-130: PG CREATE TABLE subset -------------------------------------
 
+    /// PostgreSQL allows a table with no PRIMARY KEY. The parser reports that as an
+    /// empty key rather than refusing the statement: supplying a synthetic key is the
+    /// Postgres front-end's job, and refusing here is what stops `pgbench -i`.
+    #[test]
+    fn create_table_without_a_primary_key_reports_none_declared() {
+        let stmt = create("CREATE TABLE pgbench_accounts (aid int, bid int, filler char(84))");
+        assert!(
+            stmt.primary_key.is_empty(),
+            "none declared must be reported as none, not silently invented: {:?}",
+            stmt.primary_key
+        );
+        assert_eq!(stmt.columns.len(), 3, "the user's own columns, untouched");
+        assert!(
+            stmt.columns.iter().all(|c| !c.primary_key),
+            "no column is marked as a key when none was declared"
+        );
+    }
+
     fn create(sql: &str) -> crate::ast::CreateTableStmt {
         match parse_statement(sql) {
             Ok(Statement::CreateTable(c)) => *c,
@@ -2334,8 +2352,7 @@ mod tests {
 
     #[test]
     fn create_table_structural_errors_are_typed() {
-        let cases: [(&str, ParseError); 7] = [
-            ("CREATE TABLE t (a int)", ParseError::MissingPrimaryKey),
+        let cases: [(&str, ParseError); 6] = [
             (
                 "CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)",
                 ParseError::MultiplePrimaryKeys,

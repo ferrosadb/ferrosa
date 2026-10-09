@@ -74,6 +74,10 @@ pub struct CreateTableStmt {
     pub if_not_exists: bool,
     pub name: TableRef,
     pub columns: Vec<ColumnDef>,
+    /// The declared primary key, in key order. **Empty means the statement declared
+    /// none** — PostgreSQL allows that, and the Postgres front-end supplies a synthetic
+    /// key (see `ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN`) rather than the parser
+    /// refusing the statement.
     pub primary_key: Vec<String>,
 }
 
