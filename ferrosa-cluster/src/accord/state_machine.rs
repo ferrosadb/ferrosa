@@ -388,6 +388,39 @@ impl AccordStateMachine {
         pending
     }
 
+    /// Diagnostic detail for every conflicting transaction a read at `t` is
+    /// still waiting on: `(t0, node, phase, deps, agreed t)`.
+    ///
+    /// Names the poison. The live symptom of the barrier stall is only the
+    /// message "dependencies were not applied locally"; a dependency that is
+    /// `PreAccepted` or `Accepted` with its coordinator gone is the one that
+    /// never clears, and `Committed` with an earlier `t` is the one that should
+    /// have applied. Without the phase and the agreed timestamp the two are
+    /// indistinguishable from the log.
+    pub fn pending_conflicts_detail(
+        &self,
+        key: &[u8],
+        t: &Timestamp,
+    ) -> Vec<(u64, u64, &'static str, usize, u64)> {
+        self.unapplied_conflicts_before(key, t)
+            .into_iter()
+            .map(|dep_id| {
+                let (phase, deps, agreed_t) = self
+                    .txn_states
+                    .get(&dep_id)
+                    .map(|state| (state.phase, state.deps.len(), state.t.time))
+                    .unwrap_or((TxnPhase::PreAccepted, 0, 0));
+                let phase = match phase {
+                    TxnPhase::PreAccepted => "PreAccepted",
+                    TxnPhase::Accepted => "Accepted",
+                    TxnPhase::Committed => "Committed",
+                    TxnPhase::Applied => "Applied",
+                };
+                (dep_id.0.time, dep_id.0.node, phase, deps, agreed_t)
+            })
+            .collect()
+    }
+
     /// Get the current state for a transaction (if any).
     pub fn get_state(&self, txn_id: &TxnId) -> Option<&TxnState> {
         self.txn_states.get(txn_id)
@@ -1123,68 +1156,133 @@ impl AccordStateMachine {
 /// (`bug-accord-lwt-acks-phantom-write.md`), where a replica recorded
 /// `(txn_id, t)` and returned `ApplyOK` while nothing was persisted.
 ///
-/// Environment variable an operator sets to tune the Accord transaction
-/// dependency-wait bound, in seconds (see
-/// [`DEFAULT_TXN_TIMEOUT`](crate::accord::handlers::DEFAULT_TXN_TIMEOUT)).
+/// Environment variable tuning the **apply** bound: how long a transaction may
+/// wait for its ordered dependencies to reach `Applied` before the coordinator
+/// abandons it — rolls it back, never commits it — and tells the client to retry.
+///
+/// This is the knob an operator raises for a slow mutator: a client updating many
+/// rows in one transaction legitimately needs a larger window than a benchmark
+/// burst.
 pub const TXN_TIMEOUT_ENV: &str = "FERROSA_ACCORD_TXN_TIMEOUT_SECS";
 
-/// Sentinel meaning "not yet resolved".
-const TXN_TIMEOUT_UNRESOLVED: u64 = u64::MAX;
-
-/// The operator-configured bound, cached as nanoseconds.
+/// Environment variable tuning the **barrier** bound: how long the PostgreSQL
+/// snapshot-barrier read-vote (and every inbound `ReadVote`) waits for its
+/// conflicting transactions to reach `Applied` before it ABSTAINS.
 ///
-/// Read on the hot path — every inbound Apply/ReadVote and every abandoned
-/// transaction — so it is a single relaxed atomic load: no lock, no allocation,
-/// no `spawn_blocking` hop, no repeated `getenv`. An operator setting is
+/// A separate knob, and deliberately tighter than the apply bound, because the
+/// two waits have opposite costs. Raising the apply bound buys a slow
+/// transaction time to finish; raising the barrier bound only makes a *failing*
+/// transaction slower — an abstain is fail-loud and the client retries, so there
+/// is nothing to wait longer for.
+pub const BARRIER_TIMEOUT_ENV: &str = "FERROSA_ACCORD_BARRIER_TIMEOUT_SECS";
+
+/// Default **apply** bound.
+///
+/// Single-sourced from [`crate::accord::epoch_drain::DEFAULT_TXN_TIMEOUT`] on
+/// purpose: the epoch drain period is sized as `SkewMax + DEFAULT_TXN_TIMEOUT`,
+/// so an in-flight transaction is never cut off by a drain shorter than the
+/// transaction bound. An operator who raises this must raise the drain with it.
+pub const DEFAULT_TXN_TIMEOUT: std::time::Duration =
+    crate::accord::epoch_drain::DEFAULT_TXN_TIMEOUT;
+
+/// Default **barrier** abstain bound — the historical dependency-wait value.
+pub const DEFAULT_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Sentinel meaning "not yet resolved".
+const TIMEOUT_UNRESOLVED: u64 = u64::MAX;
+
+/// The resolved apply bound, cached as nanoseconds.
+///
+/// Read on the hot path — every inbound Apply and every abandoned transaction —
+/// so it is a single relaxed atomic load: no lock, no allocation, no
+/// `spawn_blocking` hop, no repeated `getenv`. An operator setting is
 /// process-wide by nature (it comes from the environment at startup), so one
 /// atomic is the whole store; there is deliberately no per-instance copy to
 /// drift out of sync.
 static TXN_TIMEOUT_NANOS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(TXN_TIMEOUT_UNRESOLVED);
+    std::sync::atomic::AtomicU64::new(TIMEOUT_UNRESOLVED);
 
-/// Parse the operator setting into a bound.
+/// The resolved barrier abstain bound, cached as nanoseconds (same rationale).
+static BARRIER_TIMEOUT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(TIMEOUT_UNRESOLVED);
+
+/// Parse an operator setting into a bound.
 ///
 /// Pure, so it is testable without touching the process environment — `set_var`
-/// is process-global and racy under parallel tests. A non-numeric, non-positive,
-/// or non-finite value is reported and ignored rather than silently clamped to
-/// zero: zero would abandon every transaction the instant it parked, which is a
-/// footgun, not a configuration.
-pub fn resolve_txn_timeout(raw: Option<&str>) -> std::time::Duration {
+/// is process-global and racy under parallel tests. A non-numeric,
+/// non-positive, or non-finite value is reported and ignored rather than
+/// silently clamped to zero: zero would fail every transaction the instant it
+/// parked, which is a footgun, not a configuration.
+fn resolve_bound(
+    raw: Option<&str>,
+    env: &str,
+    default: std::time::Duration,
+) -> std::time::Duration {
     match raw {
         Some(value) => match value.trim().parse::<f64>() {
             Ok(secs) if secs.is_finite() && secs > 0.0 => std::time::Duration::from_secs_f64(secs),
             _ => {
                 tracing::warn!(
                     value = %value,
-                    env = TXN_TIMEOUT_ENV,
-                    "accord: ignoring invalid transaction timeout; using the default"
+                    env,
+                    "accord: ignoring invalid timeout; using the default"
                 );
-                crate::accord::handlers::DEFAULT_TXN_TIMEOUT
+                default
             }
         },
-        None => crate::accord::handlers::DEFAULT_TXN_TIMEOUT,
+        None => default,
     }
 }
 
-/// The process-wide transaction dependency-wait bound, resolved once from
-/// [`TXN_TIMEOUT_ENV`] and thereafter a lock-free atomic load.
+/// Parse [`TXN_TIMEOUT_ENV`] into the apply bound.
+pub fn resolve_txn_timeout(raw: Option<&str>) -> std::time::Duration {
+    resolve_bound(raw, TXN_TIMEOUT_ENV, DEFAULT_TXN_TIMEOUT)
+}
+
+/// Parse [`BARRIER_TIMEOUT_ENV`] into the barrier abstain bound.
+pub fn resolve_barrier_timeout(raw: Option<&str>) -> std::time::Duration {
+    resolve_bound(raw, BARRIER_TIMEOUT_ENV, DEFAULT_BARRIER_TIMEOUT)
+}
+
+/// A cached nanosecond bound: one relaxed load once resolved, `parse` on the
+/// first caller. First writer wins; a racing writer resolves the same
+/// environment, so the loser's value is identical and either store is correct.
 #[inline]
-pub fn configured_txn_timeout() -> std::time::Duration {
-    let cached = TXN_TIMEOUT_NANOS.load(std::sync::atomic::Ordering::Relaxed);
-    if cached != TXN_TIMEOUT_UNRESOLVED {
+fn cached_bound(
+    slot: &std::sync::atomic::AtomicU64,
+    env: &str,
+    parse: fn(Option<&str>) -> std::time::Duration,
+) -> std::time::Duration {
+    let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != TIMEOUT_UNRESOLVED {
         return std::time::Duration::from_nanos(cached);
     }
-    let resolved = resolve_txn_timeout(std::env::var(TXN_TIMEOUT_ENV).ok().as_deref());
+    let resolved = parse(std::env::var(env).ok().as_deref());
     let nanos = resolved.as_nanos().min(u64::MAX as u128) as u64;
-    // First writer wins. A racing writer resolves the same environment, so the
-    // loser's value is identical and either store is correct.
-    let _ = TXN_TIMEOUT_NANOS.compare_exchange(
-        TXN_TIMEOUT_UNRESOLVED,
+    let _ = slot.compare_exchange(
+        TIMEOUT_UNRESOLVED,
         nanos,
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
     );
     resolved
+}
+
+/// The process-wide **apply** bound (see [`TXN_TIMEOUT_ENV`]), a lock-free read.
+#[inline]
+pub fn configured_txn_timeout() -> std::time::Duration {
+    cached_bound(&TXN_TIMEOUT_NANOS, TXN_TIMEOUT_ENV, resolve_txn_timeout)
+}
+
+/// The process-wide **barrier abstain** bound (see [`BARRIER_TIMEOUT_ENV`]),
+/// a lock-free read.
+#[inline]
+pub fn configured_barrier_timeout() -> std::time::Duration {
+    cached_bound(
+        &BARRIER_TIMEOUT_NANOS,
+        BARRIER_TIMEOUT_ENV,
+        resolve_barrier_timeout,
+    )
 }
 
 /// `node_id` is the Accord node identifier, `sync_writer` the protocol-log
@@ -1277,14 +1375,45 @@ mod tests {
         }
     }
 
-    /// The cached read is stable: the first resolution wins and every later call
-    /// returns the identical value from the lock-free atomic, so two concurrent
-    /// waiters cannot disagree about the bound.
+    /// The apply bound and the barrier abstain bound are independent knobs, and
+    /// both resolve/reject the same way.
+    ///
+    /// The apply bound buys a slow transaction time to finish; the barrier bound
+    /// only paces a *failing* transaction, so it must be tunable separately and
+    /// must never silently inherit the apply value.
     #[test]
-    fn configured_txn_timeout_is_stable_across_calls() {
+    fn the_apply_and_barrier_bounds_are_independently_tunable() {
+        assert_eq!(resolve_barrier_timeout(None), DEFAULT_BARRIER_TIMEOUT);
+        assert_eq!(
+            resolve_barrier_timeout(Some("12")),
+            std::time::Duration::from_secs(12)
+        );
+        for bad in ["", "nope", "0", "-3", "inf", "NaN"] {
+            assert_eq!(
+                resolve_barrier_timeout(Some(bad)),
+                DEFAULT_BARRIER_TIMEOUT,
+                "{bad:?} must fall back to the barrier default"
+            );
+        }
+        // A malformed value for one knob must not move the other.
+        assert_eq!(resolve_txn_timeout(Some("nope")), DEFAULT_TXN_TIMEOUT);
+        assert_ne!(
+            DEFAULT_BARRIER_TIMEOUT, DEFAULT_TXN_TIMEOUT,
+            "the defaults are deliberately different: an abstain has nothing to wait longer for"
+        );
+    }
+
+    /// Both cached reads are stable: the first resolution wins and every later
+    /// call returns the identical value from the lock-free atomic, so two
+    /// concurrent waiters cannot disagree about either bound.
+    #[test]
+    fn configured_bounds_are_stable_across_calls() {
         let first = configured_txn_timeout();
         assert_eq!(first, configured_txn_timeout());
         assert!(first > std::time::Duration::ZERO);
+        let barrier = configured_barrier_timeout();
+        assert_eq!(barrier, configured_barrier_timeout());
+        assert!(barrier > std::time::Duration::ZERO);
     }
 
     // -----------------------------------------------------------------------

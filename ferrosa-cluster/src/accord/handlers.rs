@@ -129,21 +129,9 @@ pub struct AccordHandler {
     local_node_id: u64,
 }
 
-/// Default upper bound on how long a transaction may wait for its ordered
-/// dependencies to reach `Applied` before it is abandoned.
-///
-/// When the bound expires the transaction is **not** left as a permanent
-/// blocker: it is rolled back (never applied) and the client is told it was not
-/// committed so it can retry.
-///
-/// Single-sourced from [`crate::accord::epoch_drain::DEFAULT_TXN_TIMEOUT`] on
-/// purpose. The two are one policy: the epoch drain period is sized as
-/// `SkewMax + DEFAULT_TXN_TIMEOUT` so an in-flight transaction is never cut off
-/// by a drain shorter than the transaction bound. An operator who raises the
-/// bound via `FERROSA_ACCORD_TXN_TIMEOUT_SECS` (config `[accord]
-/// txn_timeout_secs`) must raise the drain with it.
-pub const DEFAULT_TXN_TIMEOUT: std::time::Duration =
-    crate::accord::epoch_drain::DEFAULT_TXN_TIMEOUT;
+/// Re-exported from [`crate::accord::state_machine`], where both Accord bounds
+/// and their resolvers live. Kept here as the operator-facing name.
+pub use crate::accord::state_machine::DEFAULT_TXN_TIMEOUT;
 
 /// Per-iteration cap on a single `notified()` wait. A coalesced/lost broadcast
 /// wake (the apply fired between our unlock and re-arming the notify) costs at
@@ -212,7 +200,7 @@ pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: 
         state,
         key,
         t,
-        crate::accord::state_machine::configured_txn_timeout(),
+        crate::accord::state_machine::configured_barrier_timeout(),
     )
     .await
 }
@@ -253,7 +241,16 @@ pub(crate) async fn await_conflicting_deps_applied_within(
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
+            // Name the poison. The bare timeout says only "dependencies were not
+            // applied locally"; without each stuck transaction's phase and agreed
+            // t, a PreAccepted orphan and a Committed-but-unapplied txn look the
+            // same from the log, and they need different fixes.
+            let owned_key = key.to_vec();
+            let stuck =
+                on_state_machine(state, move |sm| sm.pending_conflicts_detail(&owned_key, &t))
+                    .await;
             tracing::error!(
+                pending = ?stuck,
                 "accord: ReadVote dep-wait timed out after {:?} waiting for conflicting \
                  transactions to apply — abstaining (fail-loud)",
                 timeout
