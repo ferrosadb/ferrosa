@@ -48,7 +48,6 @@ use crate::mvcc::{
 use crate::result_stream::{open_stream, ResultStream};
 use crate::storage_provider::{load_table_with_overlay, LoadError, ScanFailure, SCAN_BUFFER_ROWS};
 use crate::synthetic_key::next_synthetic_key;
-use ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN;
 
 /// Build an `ErrorResponse` with the standard severity/code/message trio
 /// (`S=ERROR`, `C=<sqlstate>`, `M=<message>`).
@@ -3439,6 +3438,7 @@ mod tests {
 #[cfg(test)]
 mod txn_buffer_tests {
     use super::*;
+    use ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN;
     use ferrosa_schema::{
         AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
         EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
