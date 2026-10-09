@@ -151,6 +151,45 @@ the wire exclusions, and `ALTER TABLE ... ADD PRIMARY KEY` (not parsed at all to
 new statement type; where it names a column other than the synthetic key it becomes a
 secondary index, where it names nothing new it is a no-op).
 
+### Seeing the system columns: PG's own model beats a bespoke options table
+
+Decision: the synthetic key is `_sys_ck_`, a v1 TimeUUID, and its `node` field is a
+**random 48-bit value chosen once per process** (RFC 4122 permits exactly this — it is
+what v1 does with MAC addresses). No cluster plumbing, ~2^-48 collision odds. Plumbing the
+real node id from `main.rs:3252` or the engine's `node_id` stays available as an upgrade;
+`v1_timeuuid(time, clock_seq, node)` takes `node` as a parameter precisely so that swap
+touches one call site.
+
+The open question was how a user finds a column that `SELECT *` hides. Two facts settle
+most of it, both already true in this tree:
+
+1. **`pg_attribute` already lists every column, including a hidden one.**
+   `catalog.rs::pg_attribute` projects one row per column per table with `attname`,
+   `atttypid` and `attnum`. So `SELECT * FROM pg_catalog.pg_attribute` is *already* the
+   discovery path — no new machinery needed for "users can see the system columns".
+2. **Postgres has a native name for exactly this.** Its own system columns (`ctid`, `xmin`,
+   `xmax`, `cmin`, `cmax`) are hidden from `SELECT *`, are listed in `pg_attribute` with a
+   **negative `attnum`**, and *are* selectable when named explicitly
+   (`SELECT ctid FROM t` works). ferrosa currently gives every column a 1-based positive
+   `attnum` (`catalog.rs::attribute_row`).
+
+**Recommendation: model `_sys_ck_` as a system column the way Postgres models `ctid`.**
+Hidden from `SELECT *`; listed in `pg_attribute` with a negative `attnum`; selectable by
+name. That gives discoverability and explicit access with *no new concept* — every
+Postgres user already knows how `ctid` behaves, which is the least-surprise outcome by
+construction.
+
+**The options table is the alternative, and it is a real fork, not a detail.** A
+`_sys_*` relation the user `UPDATE`s to toggle visibility would let `SELECT *` include the
+system columns. Costs: a writable system relation (the existing virtual tables —
+`ferrosa-postgres/src/catalog.rs` projections, `ferrosa-cql/src/virtual_tables/` including
+`rrd_runtime_settings.rs` — are all **read-only projections**), plus somewhere to persist
+the setting, plus a session/global scope rule. Worth it only if the toggle is genuinely
+wanted; the `pg_attribute` + explicit-select path covers "let users see them" for free.
+
+Not yet decided, and needed before building: whether `SELECT *` should ever include
+`_sys_ck_`, and if the options table is wanted at all — the two are the same question.
+
 ### What execution needs
 
 `execute_insert` (`ferrosa-postgres/src/query.rs`) resolves, per row: the column values,
