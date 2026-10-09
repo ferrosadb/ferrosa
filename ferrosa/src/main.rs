@@ -549,7 +549,7 @@ fn resolve_postgres_bind(file_config: &toml::Value) -> std::net::SocketAddr {
 /// unqualified `CREATE TABLE`/DML/SELECT to resolve.
 const POSTGRES_DEFAULT_KEYSPACE: &str = "public";
 
-/// Ensure `[postgres]`'s default keyspace exists before the listener binds.
+/// Ensure `[postgres]`'s default keyspace exists.
 ///
 /// A fresh node has no `public` keyspace, so the PostgreSQL listener comes up
 /// advertising `current_schema = public` while every table statement fails —
@@ -560,12 +560,67 @@ const POSTGRES_DEFAULT_KEYSPACE: &str = "public";
 /// no wire statement can create it (`CREATE SCHEMA`/`CREATE DATABASE`/
 /// `CREATE KEYSPACE` are unsupported; the only DDL verb is `CREATE TABLE`).
 ///
-/// Idempotent and non-destructive: an existing `public` is left untouched, so a
-/// cluster-created `public` with its own replication is never downgraded.
-/// Returns whether the keyspace was created.
-fn ensure_postgres_default_keyspace(
-    schema: &ferrosa_schema::Schema,
-) -> ferrosa_schema::Result<bool> {
+/// The creation goes through the cluster DDL path (the async
+/// [`ensure_postgres_default_keyspace`] below is the driver) so every node
+/// agrees the keyspace exists; a local-only insert leaves PostgreSQL writes
+/// failing `Accord quorum unavailable`.
+///
+/// The action a boot-time ensure should take for a keyspace, given the keyspace
+/// is absent and the current DDL path kind. `Some(op)` means "create it through
+/// this DDL operation"; `None` means "wait" (the path cannot complete a creation).
+///
+/// Kept pure and total so the decision is unit-testable without a live cluster.
+/// `Forming` (buffers) and `Unavailable` (rejects) map to "wait" instead of
+/// "create": the operation would be swallowed, and since `Direct::execute` falls
+/// back to a local insert the node would report the keyspace while the cluster
+/// never learns of it — the exact divergence seen as `Accord quorum unavailable`
+/// on PostgreSQL writes.
+fn default_keyspace_boot_action(kind: &str) -> Option<ferrosa_cluster::pair::ddl::DdlOperation> {
+    if !ddl_path_kind_can_create_keyspace(kind) {
+        return None;
+    }
+    Some(ferrosa_cluster::pair::ddl::DdlOperation::CreateKeyspace(
+        ferrosa_schema::KeyspaceMetadata {
+            name: POSTGRES_DEFAULT_KEYSPACE.into(),
+            replication: ferrosa_schema::ReplicationParams {
+                strategy: "SimpleStrategy".into(),
+                options: [("replication_factor".into(), "1".into())]
+                    .into_iter()
+                    .collect(),
+            },
+            durable_writes: true,
+        },
+    ))
+}
+
+/// Whether a DDL path whose [`ferrosa_cluster::DdlPath::kind`] is `kind` can
+/// create a keyspace right now.
+///
+/// `Direct` (standalone) applies locally, `Pair` through the coordinator, and
+/// `Cluster` proposes through Raft — all three complete the creation. `Forming`
+/// *buffers* the operation and `Unavailable` *rejects* it, so a boot-time ensure
+/// that ran on either would report success while the keyspace never became
+/// creatable — which is exactly the cluster-divergence bug seen as
+/// `Accord quorum unavailable` on PostgreSQL writes. The boot-time ensure must
+/// therefore wait for an applicable path rather than fire once and forget.
+fn ddl_path_kind_can_create_keyspace(kind: &str) -> bool {
+    matches!(kind, "direct" | "pair" | "cluster")
+}
+
+/// Create the PostgreSQL listener's `public` keyspace through the active DDL
+/// path, so the creation is Raft-replicated in cluster mode and every node
+/// agrees the keyspace exists (a local-only insert makes PostgreSQL writes fail
+/// `Accord quorum unavailable`).
+///
+/// Waits for an applicable path (bounded) because at boot the path is briefly
+/// `Forming`/`Unavailable`; the PostgreSQL listener binds immediately at step
+/// 11b while the cluster forms later, so a fire-once ensure would be swallowed.
+/// Idempotent: returns `Ok(false)` when the keyspace already exists.
+async fn ensure_postgres_default_keyspace(
+    schema: &std::sync::Arc<ferrosa_schema::Schema>,
+    ddl_path: &std::sync::Arc<arc_swap::ArcSwap<ferrosa_cluster::DdlPath>>,
+) -> std::result::Result<bool, ferrosa_cluster::ClusterError> {
+    // Nothing to do once the keyspace exists (any prior ensure, or a cluster DDL).
     if schema
         .snapshot()
         .keyspaces
@@ -573,16 +628,52 @@ fn ensure_postgres_default_keyspace(
     {
         return Ok(false);
     }
-    schema.create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
-        name: POSTGRES_DEFAULT_KEYSPACE.into(),
-        replication: ferrosa_schema::ReplicationParams {
-            strategy: "SimpleStrategy".into(),
-            options: [("replication_factor".into(), "1".into())]
-                .into_iter()
-                .collect(),
-        },
-        durable_writes: true,
-    })?;
+
+    // Wait for a path that can actually complete the creation. The bound is
+    // generous but finite: if the cluster never becomes DDL-capable the node
+    // keeps serving; the keyspace is then created on the next restart instead
+    // of blocking startup forever.
+    let mut op = None;
+    for attempt in 0..180u32 {
+        let kind = {
+            let guard = ddl_path.load();
+            guard.kind()
+        };
+        if let Some(action) = default_keyspace_boot_action(kind) {
+            op = Some(action);
+            break;
+        }
+        if attempt == 0 || attempt % 30 == 0 {
+            tracing::info!(
+                keyspace = POSTGRES_DEFAULT_KEYSPACE,
+                ddl_path = kind,
+                "waiting for a DDL path that can create the PostgreSQL default keyspace"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let Some(op) = op else {
+        return Err(ferrosa_cluster::ClusterError::Internal(format!(
+            "DDL path never became applicable; keyspace `{POSTGRES_DEFAULT_KEYSPACE}` was not created"
+        )));
+    };
+
+    // Re-check under the DDL path: another ensure (or a racing client DDL) may
+    // have created it while we waited or while the operation was in flight.
+    if schema
+        .snapshot()
+        .keyspaces
+        .contains_key(POSTGRES_DEFAULT_KEYSPACE)
+    {
+        return Ok(false);
+    }
+
+    let guard = ddl_path.load();
+    guard.execute(op).await?;
+    tracing::info!(
+        keyspace = POSTGRES_DEFAULT_KEYSPACE,
+        "created the PostgreSQL default keyspace"
+    );
     Ok(true)
 }
 
@@ -3113,24 +3204,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (t_e1c819ad).
     {
         // The listener points every session at keyspace `public`
-        // (default_schema below); create it if this node has never had one, or
-        // no table statement can resolve. Idempotent and non-destructive — an
-        // existing `public` (e.g. one a cluster created with its own
-        // replication) is left untouched.
-        match ensure_postgres_default_keyspace(&schema) {
-            Ok(true) => tracing::info!(
-                keyspace = POSTGRES_DEFAULT_KEYSPACE,
-                "created the PostgreSQL default keyspace"
-            ),
-            Ok(false) => {}
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    keyspace = POSTGRES_DEFAULT_KEYSPACE,
-                    "could not ensure the PostgreSQL default keyspace; \
-                     PostgreSQL DDL/DML will fail until it exists"
-                );
-            }
+        // (default_schema below); ensure it exists through the DDL path so the
+        // creation is Raft-replicated in cluster mode. Spawned, not awaited: the
+        // listener must bind immediately, and the path is still `Forming` at
+        // boot — the ensure waits for an applicable path internally.
+        {
+            let schema = schema.clone();
+            let ddl_path = shared_state.ddl_path.clone();
+            runtimes.background.spawn(async move {
+                match ensure_postgres_default_keyspace(&schema, &ddl_path).await {
+                    Ok(true) | Ok(false) => {}
+                    Err(error) => tracing::error!(
+                        %error,
+                        keyspace = POSTGRES_DEFAULT_KEYSPACE,
+                        "could not create the PostgreSQL default keyspace; \
+                         PostgreSQL DDL/DML will fail until it exists"
+                    ),
+                }
+            });
         }
         let pg_bind = resolve_postgres_bind(&file_config);
         let pg_tls_config = &listener_tls_inputs.postgres;
@@ -3557,87 +3648,44 @@ mod tests {
 
     const SEGMENT_32_MIB: u64 = 32 * 1024 * 1024;
 
-    fn dev_schema() -> ferrosa_schema::Schema {
-        let config = ferrosa_schema::SchemaConfig {
-            hasher: ferrosa_schema::PasswordHasher::default(),
-            password_policy: ferrosa_schema::PasswordPolicy::permissive(),
-            auth_method: ferrosa_schema::AuthMethod::Password,
-            rate_limit: ferrosa_schema::RateLimitConfig::default(),
-            audit_sink: Box::new(ferrosa_schema::LogAuditSink),
-            secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
-            mode: ferrosa_schema::DeploymentMode::Development,
-        };
-        ferrosa_schema::Schema::new(config).expect("schema bootstraps")
-    }
-
-    fn keyspace_snapshot(
-        schema: &ferrosa_schema::Schema,
-        name: &str,
-    ) -> Option<ferrosa_schema::KeyspaceMetadata> {
-        schema.snapshot().keyspaces.get(name).cloned()
+    #[test]
+    fn postgres_default_keyspace_boot_action_creates_on_an_applicable_ddl_path() {
+        use ferrosa_cluster::pair::ddl::DdlOperation;
+        // Direct (standalone), Pair and Cluster all complete a keyspace creation.
+        for kind in ["direct", "pair", "cluster"] {
+            let action = default_keyspace_boot_action(kind)
+                .unwrap_or_else(|| panic!("{kind} must be able to create the keyspace"));
+            match action {
+                DdlOperation::CreateKeyspace(ks) => {
+                    assert_eq!(
+                        ks.name, POSTGRES_DEFAULT_KEYSPACE,
+                        "{kind}: must create the PostgreSQL default keyspace, not another"
+                    );
+                    assert_eq!(
+                        ks.replication
+                            .options
+                            .get("replication_factor")
+                            .map(String::as_str),
+                        Some("1"),
+                        "{kind}: a fresh keyspace is created RF=1"
+                    );
+                }
+                _ => panic!("{kind}: expected a CreateKeyspace operation"),
+            }
+        }
     }
 
     #[test]
-    fn postgres_default_keyspace_is_created_when_absent() {
-        // GIVEN a fresh node whose schema has no `public` keyspace
-        let schema = dev_schema();
-        assert!(
-            keyspace_snapshot(&schema, POSTGRES_DEFAULT_KEYSPACE).is_none(),
-            "fixture must start without `public` (or the test exercises nothing)"
-        );
-
-        // WHEN the PostgreSQL listener's default keyspace is ensured
-        let created = ensure_postgres_default_keyspace(&schema).unwrap();
-
-        // THEN `public` exists and the call reports that it created it
-        assert!(created, "first call must create the keyspace");
-        assert!(
-            keyspace_snapshot(&schema, POSTGRES_DEFAULT_KEYSPACE).is_some(),
-            "`public` must exist for the PostgreSQL listener to serve a statement"
-        );
-    }
-
-    #[test]
-    fn postgres_default_keyspace_creation_is_idempotent() {
-        let schema = dev_schema();
-        assert!(ensure_postgres_default_keyspace(&schema).unwrap());
-        // Second call must be a no-op reported as "nothing created", not an error.
-        assert!(!ensure_postgres_default_keyspace(&schema).unwrap());
-        assert!(keyspace_snapshot(&schema, POSTGRES_DEFAULT_KEYSPACE).is_some());
-    }
-
-    #[test]
-    fn postgres_default_keyspace_does_not_clobber_an_existing_cluster_keyspace() {
-        // GIVEN `public` already exists with a non-default replication (as a
-        // cluster-created keyspace would)
-        let schema = dev_schema();
-        schema
-            .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
-                name: POSTGRES_DEFAULT_KEYSPACE.into(),
-                replication: ferrosa_schema::ReplicationParams {
-                    strategy: "SimpleStrategy".into(),
-                    options: [("replication_factor".into(), "3".into())]
-                        .into_iter()
-                        .collect(),
-                },
-                durable_writes: true,
-            })
-            .unwrap();
-
-        // WHEN ensure runs
-        let created = ensure_postgres_default_keyspace(&schema).unwrap();
-
-        // THEN it reports no creation and the existing replication is intact
-        assert!(!created, "an existing keyspace must not be re-created");
-        let ks = keyspace_snapshot(&schema, POSTGRES_DEFAULT_KEYSPACE).unwrap();
-        assert_eq!(
-            ks.replication
-                .options
-                .get("replication_factor")
-                .map(String::as_str),
-            Some("3"),
-            "an existing `public` replication must never be downgraded"
-        );
+    fn postgres_default_keyspace_boot_action_waits_while_the_ddl_path_cannot_create() {
+        // Forming buffers the operation and Unavailable rejects it. Acting on
+        // either would report a keyspace the cluster never learns about — the
+        // divergence seen as `Accord quorum unavailable` on PostgreSQL writes.
+        for kind in ["forming", "unavailable"] {
+            assert!(
+                default_keyspace_boot_action(kind).is_none(),
+                "{kind} must wait, not attempt a creation the path cannot complete"
+            );
+        }
     }
 
     fn jsonb_toml(body: &str) -> toml::Value {
