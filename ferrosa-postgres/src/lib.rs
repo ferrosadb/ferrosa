@@ -16,6 +16,7 @@ pub(crate) mod authz;
 pub mod catalog;
 pub mod codec;
 pub mod connection;
+pub mod copy_decode;
 pub mod ddl;
 pub mod extended;
 pub mod handshake;
