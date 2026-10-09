@@ -75,13 +75,6 @@ pub struct CreateTableStmt {
     pub name: TableRef,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<String>,
-    /// True when PostgreSQL declared no PRIMARY KEY and ferrosa shadowed one on the
-    /// first column, because storage needs a partition key. Recorded rather than
-    /// silent: the caller can see that the key was inferred, not declared, and that
-    /// it therefore carries an assumption the statement did not make — that the first
-    /// column is unique. Two rows agreeing on it are the same row and the later write
-    /// wins.
-    pub synthesized_primary_key: bool,
 }
 
 /// One column of a `CREATE TABLE`.

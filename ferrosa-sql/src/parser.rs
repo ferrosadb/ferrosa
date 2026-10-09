@@ -2122,48 +2122,6 @@ mod tests {
 
     // ---- T-130: PG CREATE TABLE subset -------------------------------------
 
-    /// PostgreSQL allows a table with no PRIMARY KEY. Ferrosa's storage needs a
-    /// partition key, so ferrosa shadows one on the first column rather than refusing
-    /// the statement — and records that it did (`synthesized_primary_key`), so the
-    /// inference is visible rather than silent.
-    ///
-    /// The assumption this carries: the first column is unique. Two rows agreeing on it
-    /// are the same row and the later write wins. pgbench's
-    /// `pgbench_accounts (aid, ...)` satisfies it.
-    #[test]
-    fn create_table_without_primary_key_shadows_the_first_column() {
-        let stmt = create("CREATE TABLE t (aid int, bid int, abalance int, filler char(84))");
-        assert_eq!(stmt.primary_key, vec!["aid".to_string()]);
-        assert!(
-            stmt.synthesized_primary_key,
-            "the key was inferred and the AST must say so"
-        );
-        let aid = stmt.columns.iter().find(|c| c.name == "aid").unwrap();
-        assert!(aid.primary_key, "the shadow key column is the key");
-        assert!(aid.not_null, "a key column can never be NULL");
-        // The other columns must NOT be dragged into the key.
-        for other in ["bid", "abalance", "filler"] {
-            let col = stmt.columns.iter().find(|c| c.name == other).unwrap();
-            assert!(!col.primary_key, "{other} is not part of the shadow key");
-        }
-    }
-
-    /// A declared key is not synthesized, and the flag must not claim otherwise.
-    #[test]
-    fn create_table_with_a_declared_primary_key_is_not_synthesized() {
-        for sql in [
-            "CREATE TABLE t (a int PRIMARY KEY, b int)",
-            "CREATE TABLE t (a int, b int, PRIMARY KEY (a))",
-        ] {
-            let stmt = create(sql);
-            assert_eq!(stmt.primary_key, vec!["a".to_string()], "{sql}");
-            assert!(
-                !stmt.synthesized_primary_key,
-                "{sql}: declared, not inferred"
-            );
-        }
-    }
-
     fn create(sql: &str) -> crate::ast::CreateTableStmt {
         match parse_statement(sql) {
             Ok(Statement::CreateTable(c)) => *c,
@@ -2376,7 +2334,8 @@ mod tests {
 
     #[test]
     fn create_table_structural_errors_are_typed() {
-        let cases: [(&str, ParseError); 6] = [
+        let cases: [(&str, ParseError); 7] = [
+            ("CREATE TABLE t (a int)", ParseError::MissingPrimaryKey),
             (
                 "CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)",
                 ParseError::MultiplePrimaryKeys,

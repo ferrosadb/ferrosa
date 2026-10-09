@@ -378,18 +378,10 @@ fn finish_create_table(
         .filter(|c| c.primary_key)
         .map(|c| c.name.clone())
         .collect();
-    let (primary_key, synthesized_primary_key) = match (inline.len(), table_pk) {
-        (0, Some(cols)) => (cols, false),
-        // PostgreSQL allows a table with no PRIMARY KEY; ferrosa's storage needs a
-        // partition key. Shadow one on the first column rather than refusing the
-        // statement, and RECORD that the key was inferred rather than declared (see
-        // `CreateTableStmt::synthesized_primary_key`) so the inference is visible.
-        //
-        // The assumption this carries: the first column is unique — two rows agreeing
-        // on it are the same row and the later write wins. pgbench's
-        // `pgbench_accounts (aid, ...)` satisfies it.
-        (0, None) => (vec![columns[0].name.clone()], true),
-        (1, None) => (inline, false),
+    let primary_key = match (inline.len(), table_pk) {
+        (0, Some(cols)) => cols,
+        (0, None) => return Err(ParseError::MissingPrimaryKey),
+        (1, None) => inline,
         _ => return Err(ParseError::MultiplePrimaryKeys),
     };
     for key in &primary_key {
@@ -406,7 +398,6 @@ fn finish_create_table(
         name,
         columns,
         primary_key,
-        synthesized_primary_key,
     })))
 }
 
