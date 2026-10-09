@@ -421,6 +421,42 @@ impl AccordStateMachine {
             .collect()
     }
 
+    /// Diagnostic detail for a transaction's resolved dependency list: for each
+    /// dep, `(t0, node, phase)` where phase is `"absent"` when THIS replica never
+    /// registered it.
+    ///
+    /// Names the apply-side poison. `DepWaitApplier` gates on
+    /// `DepWaitGraph::is_applied`, which only knows transactions this replica
+    /// itself applied, so a dependency whose Apply never landed here parks its
+    /// waiter forever. From the bare "Apply timed out … refusing ApplyOK" line the
+    /// two causes are indistinguishable: a dep that is registered here but stuck
+    /// (needs re-driving) versus a dep that is `absent` here (nothing will ever
+    /// apply it locally).
+    pub fn dep_detail(&self, txn_id: &TxnId) -> Vec<(u64, u64, &'static str)> {
+        self.txn_states
+            .get(txn_id)
+            .map(|state| {
+                state
+                    .deps
+                    .iter()
+                    .map(|dep| match self.txn_states.get(dep) {
+                        Some(dep_state) => (
+                            dep.0.time,
+                            dep.0.node,
+                            match dep_state.phase {
+                                TxnPhase::PreAccepted => "PreAccepted",
+                                TxnPhase::Accepted => "Accepted",
+                                TxnPhase::Committed => "Committed",
+                                TxnPhase::Applied => "Applied",
+                            },
+                        ),
+                        None => (dep.0.time, dep.0.node, "absent"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Get the current state for a transaction (if any).
     pub fn get_state(&self, txn_id: &TxnId) -> Option<&TxnState> {
         self.txn_states.get(txn_id)
@@ -1414,6 +1450,52 @@ mod tests {
         let barrier = configured_barrier_timeout();
         assert_eq!(barrier, configured_barrier_timeout());
         assert!(barrier > std::time::Duration::ZERO);
+    }
+
+    /// `dep_detail` must separate a dependency this replica never registered
+    /// ("absent") from one it registered but never applied.
+    ///
+    /// They need different fixes, and the live log otherwise shows only a
+    /// dependency count — which is why the apply-side stall could not be
+    /// attributed from production.
+    #[test]
+    fn dep_detail_names_absent_dependencies_separately() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let applier = Arc::new(CapturingApplier::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer, applier);
+
+        let absent = txn(9, 900);
+        let stuck = txn(1, 1000);
+        let waiter = txn(2, 2000);
+        let key = b"dep-detail-key";
+
+        // `stuck` is registered here but never applied.
+        sm.handle_preaccept(stuck, ts(1000), key, BallotNumber(0), 0);
+        sm.handle_accept(stuck, ts(1000), ts(1001), vec![], BallotNumber(1));
+        sm.handle_commit(stuck, ts(1000), ts(1001), vec![]);
+        // `absent` is never registered on this replica at all; the waiter's
+        // dependency set is the union agreed across replicas, so it can name it.
+        sm.handle_preaccept(waiter, ts(2000), key, BallotNumber(0), 0);
+        sm.handle_accept(
+            waiter,
+            ts(2000),
+            ts(2001),
+            vec![stuck, absent],
+            BallotNumber(1),
+        );
+        sm.handle_commit(waiter, ts(2000), ts(2001), vec![stuck, absent]);
+
+        let detail = sm.dep_detail(&waiter);
+        assert_eq!(detail.len(), 2, "both deps must be reported: {detail:?}");
+        let phases: Vec<&str> = detail.iter().map(|(_, _, phase)| *phase).collect();
+        assert!(
+            phases.contains(&"Committed"),
+            "a registered-but-unapplied dep must show its phase: {detail:?}"
+        );
+        assert!(
+            phases.contains(&"absent"),
+            "a never-registered dep must read 'absent': {detail:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

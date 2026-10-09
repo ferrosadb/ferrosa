@@ -318,12 +318,17 @@ pub(crate) async fn await_txn_applied_within(
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
+            // Name the poison (see `AccordStateMachine::dep_detail`): a dep this
+            // replica never registered needs a different fix from one that is
+            // registered here but stuck.
+            let detail = on_state_machine(state, move |sm| sm.dep_detail(&txn_id)).await;
             let phase = Some(phase);
             tracing::error!(
                 txn_id = ?txn_id,
                 ?phase,
                 dependency_count,
                 result_bytes,
+                deps = ?detail,
                 "accord: Apply timed out after {:?} waiting for ordered dependencies — refusing ApplyOK",
                 timeout
             );
