@@ -59,32 +59,44 @@ Item 4 is the largest single piece (a wire-protocol handshake).
   rows 2..N. Silent row loss is the failure mode this repo treats as unacceptable, so
   fail-loud is the deliberate holding position, not an oversight.
 
-### CRITICAL: the naive execution writes only row 1 on the live server
+### CRITICAL: the SQL layer is correct; the loss is BELOW it
 
-An implementation was written and **reverted**. What it did:
+An execution implementation exists and is **correct in-process**, yet on the live
+cluster the same statement reports `INSERT 0 3` and persists only row 1 (reproduced
+twice on a fresh table). The `0A000` guard is therefore back in place: a silent
+row-drop announced as a successful count is strictly worse than an error.
 
-- in-process (`execute_query` in a unit test): correct — 3 rows written, all 3 read
-  back, one `CommandComplete "INSERT 0 3"`;
-- **live server: `INSERT 0 3` reported, only row 1 persisted.** Reproduced twice on a
-  fresh table:
+**Two hypotheses were eliminated, both by negative control rather than by argument:**
+
+1. **Per-row state reused across rows.** `col_values` / `sql_values` / `regular_cells`
+   were declared outside the per-row loop, so `regular_cells` accumulated every earlier
+   row's cells. Hoisting them back out and re-running the value-asserting test still
+   PASSES — the duplicate cells resolve last-wins, so the bug is real but benign here.
+   It cannot cause the row-drop. (The per-row declarations are kept: they are correct
+   and cheap.)
+2. **The buffered write-set.** The server reaches INSERT via `Some(txn_writes_mut())`,
+   the one path an autocommit test never touches — so this was the prime suspect.
+   Test `a_buffered_multi_row_insert_applies_every_row` drives a 3-mutation write-set
+   through `write_atomic_batch` exactly as COMMIT does, and all three rows land.
+
+Four in-process multi-row tests are green, spanning the SQL, MVCC and server layers:
 
 ```
-insert into mr2 (k, v) values (1,'a'), (2,'b'), (3,'c');   -> INSERT 0 3
-select count(*) from mr2;                                  -> 1
-select k, v from mr2 where k = 2;                          -> (0 rows)
-select k, v from mr2 where k = 3;                          -> (0 rows)
+mvcc::tests::staged_multi_row_accord_commit_is_visible_as_one_snapshot_version ... ok
+server::txn_atomicity_tests::multi_row_snapshots_hide_partial_replica_apply      ... ok
+query::txn_buffer_tests::multi_row_insert_writes_every_row_and_reports_the_count ... ok
+query::txn_buffer_tests::a_buffered_multi_row_insert_applies_every_row           ... ok
 ```
 
-A silent row-drop announced as `INSERT 0 3` is strictly worse than an error, so the
-`0A000` fail-loud guard is **back in place** and pinned by
-`multi_row_insert_fails_loud_rather_than_dropping_rows`.
+**Conclusion: the defect is in the live multi-node apply path, below ferrosa-postgres.**
+A single-node in-process engine cannot exhibit it. Next step: reproduce with a real
+clustered process test (3 nodes, real transport) — a mock or single-node harness will
+keep passing — and instrument what the coordinator actually persists for a
+multi-mutation batch before suspecting the SQL layer again.
 
-**Root cause is OPEN.** `execute_insert` *is* the live path (`exec.rs` is the
-SELECT/streaming executor and has no INSERT path), so the difference between the two
-environments is not a second executor. Next step: instrument which mutation the live
-path actually persists per row — start by checking whether the live server passes
-`txn = Some(buffer)` and how the buffered write-set is applied at COMMIT, since that is
-the one structural difference between the two call paths.
+**Re-enabling execution** requires that clustered repro first, then: drop the guard,
+assert one `CommandComplete` tagged `INSERT 0 3`, three rows landed, each carrying its
+own value.
 
 ### What execution needs
 

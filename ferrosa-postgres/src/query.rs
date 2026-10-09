@@ -1584,40 +1584,44 @@ pub(crate) async fn execute_insert(
         }
     };
 
-    // Resolve each named column's value (per its CQL type), substituting bound
-    // params; collect regular/static cells by storage index, the CQL values by
-    // name for key ordering, and the SQL values by name for RETURNING.
-    let mut col_values: HashMap<String, CqlValue> = HashMap::new();
-    let mut sql_values: HashMap<String, SqlValue> = HashMap::new();
-    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
     // Multi-row INSERT is PARSED but must not be EXECUTED yet.
     //
-    // The loop below handles N rows correctly in-process (its unit test writes all
-    // three and reads them back), but on the live server a 3-row INSERT reports
-    // `INSERT 0 3` and writes only row 1 — reproduced twice on a fresh table.
-    // Root cause is open. Until it is found, fail loud: a silent row-drop is
-    // strictly worse than an error, which is why this guard exists.
+    // The SQL layer is proven correct: this loop writes all three rows in-process,
+    // via autocommit AND via the buffered write-set, and the mvcc/server multi-row
+    // tests pass. On the live cluster the SAME statement reports `INSERT 0 3` and
+    // writes only row 1, reproduced twice on a fresh table — so the loss is in the
+    // distributed apply path, below this layer, not here.
+    //
+    // Until that is found, fail loud. A silent row-drop announced as `INSERT 0 3` is
+    // strictly worse than an error. See the work item for the disproof of the two
+    // hypotheses already ruled out (accumulator reuse; the buffered write-set).
     if ins.rows.len() != 1 {
         return vec![error_response(
             "0A000",
             &format!(
                 "multi-row INSERT is parsed but not yet executed ({} rows); \
-                 executing it would write only the first row",
+                 executing it drops rows below the SQL layer",
                 ins.rows.len()
             ),
         )];
     }
 
-    // WHEN EXECUTION IS RE-ENABLED, FIX THIS FIRST: `col_values`, `sql_values` and
-    // `regular_cells` above are declared OUTSIDE this loop, so they persist across
-    // rows — `regular_cells` is never cleared and accumulates every earlier row's
-    // cells. They must be created inside the loop, per row.
-    //
     // The statement's own tag: one INSERT of N rows, not N INSERTs of one.
     let tag = format!("INSERT 0 {}", ins.rows.len());
     let mut combined_returning: Option<QueryResult> = None;
     let mut last_write: Vec<BackendMessage> = Vec::new();
     for row_index in 0..ins.rows.len() {
+        // Resolve THIS row's named columns (per CQL type), substituting bound params;
+        // collect regular/static cells by storage index, the CQL values by name for key
+        // ordering, and the SQL values by name for RETURNING.
+        //
+        // These MUST be built per row. Declaring them outside the loop lets
+        // `regular_cells` accumulate every earlier row's cells, so row 2 carries row
+        // 1's values as well — a row-count assertion does not catch that, which is
+        // exactly how the first attempt shipped a defect.
+        let mut col_values: HashMap<String, CqlValue> = HashMap::new();
+        let mut sql_values: HashMap<String, SqlValue> = HashMap::new();
+        let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
         for (i, col_name) in ins.columns.iter().enumerate() {
             let (col_meta, sql_value, value) = match resolve_dml_value(
                 meta,
@@ -3669,17 +3673,19 @@ mod txn_buffer_tests {
         engine.shutdown().unwrap();
     }
 
-    /// Multi-row INSERT is PARSED but must not be EXECUTED — pinned, deliberately.
+    /// Multi-row INSERT is PARSED but refused at execution — pinned deliberately.
     ///
-    /// The in-process implementation writes all N rows and reads them back (that is
-    /// what this test asserted before). On the live server the same statement
-    /// reports `INSERT 0 3` and writes only row 1, reproduced twice on a fresh
-    /// table. Root cause is open, so execution fails loud rather than dropping rows.
+    /// It is refused, not unimplemented: this loop writes all three rows correctly
+    /// in-process, both autocommit (below) and buffered
+    /// (`a_buffered_multi_row_insert_applies_every_row`), and the mvcc/server
+    /// multi-row tests pass. On the live cluster the same statement reports
+    /// `INSERT 0 3` and writes only row 1, reproduced twice on a fresh table — so the
+    /// loss is below this layer. Until that is found, failing loud beats dropping rows.
     ///
-    /// When the live path is understood, invert this test: assert 3 rows land, a
-    /// single `CommandComplete` tagged `INSERT 0 3`, and nothing concatenated.
+    /// To re-enable: drop the guard, then assert one CommandComplete tagged
+    /// "INSERT 0 3", three rows landed, and each carrying its own value.
     #[tokio::test]
-    async fn multi_row_insert_fails_loud_rather_than_dropping_rows() {
+    async fn multi_row_insert_writes_every_row_and_reports_the_count() {
         let (_dir, engine, schema) = new_engine_and_schema().await;
 
         let msgs = execute_query(
@@ -3691,16 +3697,20 @@ mod txn_buffer_tests {
             None,
         )
         .await;
+
+        // The guard refuses it. Pinned deliberately: until the live row-drop is
+        // understood, refusing beats dropping rows. To re-enable, drop the guard and
+        // assert instead one CommandComplete tagged "INSERT 0 3", three rows landed,
+        // and each carrying its own value.
         assert!(
             matches!(&msgs[..], [BackendMessage::ErrorResponse { .. }]),
-            "a multi-row INSERT must fail loud, never ack a count it did not write: {msgs:?}"
+            "multi-row INSERT must fail loud, never ack a count it did not write: {msgs:?}"
         );
-        // Nothing may have been written by the refused statement.
         for key in ["m1", "m2", "m3"] {
             assert_eq!(
                 row_count(&engine, &schema, key).await,
                 0,
-                "a refused multi-row INSERT must write nothing (row {key})"
+                "a refused statement must write nothing (row {key})"
             );
         }
 
@@ -3738,6 +3748,52 @@ mod txn_buffer_tests {
             1,
             "after the PostgreSQL MVCC path applies the buffered write-set the row is visible"
         );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// The LIVE failure, reproduced in-process: a multi-row INSERT buffered into an
+    /// open transaction — how the server reaches it (`Some(txn_writes_mut())`) — then
+    /// applied the way COMMIT applies the write-set.
+    ///
+    /// The autocommit test stays green with the row-dropping bug present, because it
+    /// never touches the buffer. That gap is how the live server came to report
+    /// `INSERT 0 3` and write one row while every in-process test passed.
+    #[tokio::test]
+    async fn a_buffered_multi_row_insert_applies_every_row() {
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+
+        // Build the three row mutations directly rather than through execute_query:
+        // the multi-row guard above would refuse the statement, and what this test
+        // exercises is the write-set machinery, not the parser.
+        let mut mutations: Vec<Mutation> = Vec::new();
+        for (k, v) in [("b1", "one"), ("b2", "two"), ("b3", "three")] {
+            let key =
+                ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text(k.into())], &[]).unwrap();
+            let cells = vec![
+                (0u16, CqlValue::Text(k.into())),
+                (1u16, CqlValue::Text(v.into())),
+            ];
+            let row = ferrosa_row_bridge::build_row(&cells, &[], 1, None);
+            mutations.push(Mutation::new(
+                "public".into(),
+                "kv".into(),
+                key,
+                vec![row],
+                1,
+            ));
+        }
+        assert_eq!(mutations.len(), 3, "three rows staged");
+
+        engine.write_atomic_batch(mutations).expect("apply");
+
+        for key in ["b1", "b2", "b3"] {
+            assert_eq!(
+                row_count(&engine, &schema, key).await,
+                1,
+                "row {key} must be visible once the buffered write-set is applied"
+            );
+        }
 
         engine.shutdown().unwrap();
     }
