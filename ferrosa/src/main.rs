@@ -2522,7 +2522,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let connection_tracker =
         Arc::new(ferrosa_cql::virtual_tables::connections::ConnectionTracker::new());
-    let query_tracker = Arc::new(ferrosa_cql::virtual_tables::active_queries::QueryTracker::new());
+    let query_tracker =
+        Arc::new(ferrosa_cql::virtual_tables::active_queries::QueryTracker::from_env());
     // Index-observability trackers: shared between the router (which records
     // full-scan and index-usage events) and the virtual tables registered
     // below (which expose them via system_observability.*). Use one Arc each

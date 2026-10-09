@@ -3,6 +3,23 @@
 //! [`QueryTracker`] maintains a live map of currently executing queries.
 //! [`ActiveQueriesTable`] exposes that map as a [`VirtualTable`] readable
 //! via CQL `SELECT` from `system_observability.active_queries`.
+//!
+//! ## Cost model
+//!
+//! Registration happens on **every** routed statement, but the map is only
+//! ever read by a `SELECT` against `system_observability.active_queries` — a
+//! diagnostics surface nobody touches under load. Eagerly publishing each
+//! request therefore spends a sharded-map insert + remove, several owned
+//! `String`s, and two clock reads per operation to feed a table that is almost
+//! always empty *and* unread.
+//!
+//! [`QueryTracker::from_env`] therefore honours an explicit opt-out
+//! (`FERROSA_ACTIVE_QUERIES_TRACKING=0`); when disabled, [`begin_guarded`]
+//! returns `None` and does no work at all, while `total_executed` still counts
+//! completions. The default stays **on** so operators keep the table; the
+//! switch exists to take the cost off a measured hot path.
+//!
+//! [`begin_guarded`]: QueryTracker::begin_guarded
 
 use dashmap::DashMap;
 use ferrosa_common::{CellValue, DataType};
@@ -12,6 +29,18 @@ use ferrosa_schema::virtual_table::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Environment switch for the tracking cost. Absent or any value other than
+/// the explicit off-tokens leaves tracking **enabled**.
+pub const TRACKING_ENV: &str = "FERROSA_ACTIVE_QUERIES_TRACKING";
+
+/// Parse the [`TRACKING_ENV`] value. `None` (unset/unparseable) means enabled.
+fn tracking_enabled_from(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(v) => !matches!(v.trim(), "0" | "false" | "off" | "no"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // QueryInfo
@@ -29,7 +58,10 @@ pub struct QueryInfo {
     /// Wall-clock start in milliseconds since UNIX epoch, captured once on
     /// `begin()` so rows can report a stable `start_time` column.
     pub start_epoch_ms: i64,
-    pub state: String,
+    /// Always `"executing"` today. A `&'static str` rather than an owned
+    /// `String` so the per-request registration does not allocate for a
+    /// constant.
+    pub state: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -44,23 +76,45 @@ pub struct QueryTracker {
     active: DashMap<u64, QueryInfo>,
     next_id: AtomicU64,
     total_executed: AtomicU64,
+    /// When false, [`begin_guarded`](Self::begin_guarded) is a no-op: no id,
+    /// no insert, no clock reads. Set once at construction.
+    enabled: bool,
 }
 
 impl QueryTracker {
-    /// Create an empty tracker.
+    /// Create an empty tracker with tracking **enabled**.
     pub fn new() -> Self {
+        Self::new_gated(true)
+    }
+
+    /// Create an empty tracker with tracking explicitly on or off.
+    pub fn new_gated(enabled: bool) -> Self {
         Self {
             active: DashMap::new(),
             next_id: AtomicU64::new(1),
             total_executed: AtomicU64::new(0),
+            enabled,
         }
+    }
+
+    /// Create a tracker gated by [`TRACKING_ENV`] (default: enabled).
+    pub fn from_env() -> Self {
+        let raw = std::env::var(TRACKING_ENV).ok();
+        Self::new_gated(tracking_enabled_from(raw.as_deref()))
+    }
+
+    /// Whether per-request registration is enabled.
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Register a new query and return its opaque ID.
     ///
     /// The caller must call [`complete`](Self::complete) with the returned ID
     /// when the query finishes (or use [`begin_guarded`](Self::begin_guarded)
-    /// for automatic cleanup).
+    /// for automatic cleanup). Unlike `begin_guarded`, this raw entry point
+    /// always records, regardless of the `enabled` gate — it is the direct API
+    /// used by the tracker's own tests.
     pub fn begin(&self, query: &str, keyspace: &str, client: &str, username: &str) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let now_ms = SystemTime::now()
@@ -75,7 +129,7 @@ impl QueryTracker {
             keyspace: keyspace.to_string(),
             start_time: Instant::now(),
             start_epoch_ms: now_ms,
-            state: "executing".to_string(),
+            state: "executing",
         };
         self.active.insert(id, info);
         id
@@ -83,18 +137,24 @@ impl QueryTracker {
 
     /// Like [`begin`](Self::begin) but returns a [`QueryGuard`] that calls
     /// `complete` automatically when dropped.
+    ///
+    /// Returns `None` when tracking is disabled, so the hot path pays nothing
+    /// beyond a load of the gate.
     pub fn begin_guarded(
         self: &Arc<Self>,
         query: &str,
         keyspace: &str,
         client: &str,
         username: &str,
-    ) -> QueryGuard {
+    ) -> Option<QueryGuard> {
+        if !self.enabled {
+            return None;
+        }
         let id = self.begin(query, keyspace, client, username);
-        QueryGuard {
+        Some(QueryGuard {
             tracker: Arc::clone(self),
             id,
-        }
+        })
     }
 
     /// Mark a query as complete. If `id` is not found this is a no-op.
@@ -128,7 +188,7 @@ impl QueryTracker {
                 keyspace: info.keyspace.clone(),
                 start_epoch_ms: info.start_epoch_ms,
                 elapsed_ms: now.duration_since(info.start_time).as_millis() as i64,
-                state: info.state.clone(),
+                state: info.state,
             })
             .collect()
     }
@@ -149,7 +209,7 @@ struct ActiveQuerySnapshot {
     keyspace: String,
     start_epoch_ms: i64,
     elapsed_ms: i64,
-    state: String,
+    state: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +320,7 @@ impl VirtualTable for ActiveQueriesTable {
                 CellValue::live(s.keyspace.into_bytes(), 0),
                 CellValue::live(s.start_epoch_ms.to_be_bytes().to_vec(), 0),
                 CellValue::live(s.elapsed_ms.to_be_bytes().to_vec(), 0),
-                CellValue::live(s.state.into_bytes(), 0),
+                CellValue::live(s.state.as_bytes().to_vec(), 0),
             ];
             visit(VirtualRow { cells });
         }
@@ -306,7 +366,9 @@ mod tests {
     fn query_guard_auto_completes() {
         let tracker = Arc::new(QueryTracker::new());
         {
-            let _guard = tracker.begin_guarded("SELECT 1", "ks", "10.0.0.1", "admin");
+            let _guard = tracker
+                .begin_guarded("SELECT 1", "ks", "10.0.0.1", "admin")
+                .expect("tracking enabled by default");
             assert_eq!(tracker.active_count(), 1);
         }
         assert_eq!(tracker.active_count(), 0);
@@ -351,5 +413,45 @@ mod tests {
         assert_eq!(tracker.active_count(), 2);
         tracker.complete(id1);
         assert_eq!(tracker.active_count(), 1);
+    }
+
+    // ---- Gate: opt-out leaves the hot path free ---------------------------
+
+    #[test]
+    fn gated_off_begin_guarded_is_a_noop() {
+        let tracker = Arc::new(QueryTracker::new_gated(false));
+        let guard = tracker.begin_guarded("SELECT 1", "ks", "10.0.0.1", "admin");
+        assert!(
+            guard.is_none(),
+            "disabled tracker must not hand out a guard"
+        );
+        assert_eq!(tracker.active_count(), 0, "nothing may be registered");
+        assert_eq!(tracker.next_id.load(Ordering::Relaxed), 1, "no id burned");
+        drop(guard);
+        // No completion was recorded because nothing was ever inserted.
+        assert_eq!(tracker.total_executed(), 0);
+    }
+
+    #[test]
+    fn gated_on_begin_guarded_registers() {
+        let tracker = Arc::new(QueryTracker::new_gated(true));
+        let guard = tracker.begin_guarded("SELECT 1", "ks", "10.0.0.1", "admin");
+        assert!(guard.is_some());
+        assert_eq!(tracker.active_count(), 1);
+        drop(guard);
+        assert_eq!(tracker.active_count(), 0);
+    }
+
+    #[test]
+    fn env_tokens_map_to_gate() {
+        assert!(tracking_enabled_from(None), "unset means enabled");
+        assert!(tracking_enabled_from(Some("1")));
+        assert!(tracking_enabled_from(Some("true")));
+        assert!(tracking_enabled_from(Some("yes")));
+        assert!(tracking_enabled_from(Some(" on ")));
+        assert!(!tracking_enabled_from(Some("0")));
+        assert!(!tracking_enabled_from(Some("false")));
+        assert!(!tracking_enabled_from(Some("off")));
+        assert!(!tracking_enabled_from(Some("no")));
     }
 }

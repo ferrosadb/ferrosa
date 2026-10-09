@@ -30,6 +30,7 @@ use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
+use ferrosa_schema::auth::permission::BorrowedResource;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local_with_view, query_peers_with_view,
     query_role_members, query_role_permissions, query_tables, AuthContext,
@@ -3849,17 +3850,22 @@ pub async fn route(
     };
 
     // Track the query for observability; the guard calls complete() on drop.
-    // Keep this compact. Formatting the full substituted AST on every EXECUTE
-    // allocates and copies bound values on the hot path, while active_queries
-    // only needs a recognizable in-flight operation label.
-    let query_desc = statement_query_label(&stmt, opcode);
-    let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
-    let _guard = state.query_tracker.begin_guarded(
-        &query_desc,
-        keyspace,
-        &ctx.client_address,
-        &ctx.auth.role,
-    );
+    // When tracking is switched off, skip even the label so an opted-out node
+    // pays no per-statement allocation. When on, the label is a compact
+    // operation tag -- formatting the full substituted AST would allocate and
+    // copy bound values on the hot path.
+    let _guard = if state.query_tracker.enabled() {
+        let query_desc = statement_query_label(&stmt, opcode);
+        let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
+        state.query_tracker.begin_guarded(
+            &query_desc,
+            keyspace,
+            &ctx.client_address,
+            &ctx.auth.role,
+        )
+    } else {
+        None
+    };
 
     // Conditional statements need SELECT as well as MODIFY. Reject before the
     // Accord path can touch the row, a peer, or any cluster-state error that
@@ -3986,10 +3992,10 @@ pub async fn route(
                         .as_deref()
                         .or(ctx.current_keyspace.as_deref())
                         .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
-                    state.schema.check_permission(
+                    state.schema.check_permission_borrowed(
                         ctx.auth,
                         Permission::Select,
-                        &Resource::Table(ks.to_string(), s.table.clone()),
+                        BorrowedResource::Table(ks, &s.table),
                     )?;
                 }
                 _ => {
@@ -5332,20 +5338,24 @@ async fn route_prepared_select_fast_inner(
     }
 
     let opcode = CqlOpcode::Select;
-    let query_desc = format!("SELECT {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table);
-    let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
-    let _guard = state.query_tracker.begin_guarded(
-        &query_desc,
-        keyspace,
-        &ctx.client_address,
-        &ctx.auth.role,
-    );
+    let _guard = if state.query_tracker.enabled() {
+        let query_desc = format!("SELECT {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table);
+        let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
+        state.query_tracker.begin_guarded(
+            &query_desc,
+            keyspace,
+            &ctx.client_address,
+            &ctx.auth.role,
+        )
+    } else {
+        None
+    };
 
     let result = async {
-        state.schema.check_permission(
+        state.schema.check_permission_borrowed(
             ctx.auth,
             Permission::Select,
-            &Resource::Table(ks.to_string(), s.table.clone()),
+            BorrowedResource::Table(ks, &s.table),
         )?;
 
         let mut bind_idx = 0usize;
@@ -6100,10 +6110,10 @@ async fn route_select_user_table_inner(
     validate_keyspace_exists(&state.schema, ks)?;
 
     // Permission check (M8)
-    state.schema.check_permission(
+    state.schema.check_permission_borrowed(
         ctx.auth,
         Permission::Select,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+        BorrowedResource::Table(ks, &s.table),
     )?;
 
     let snap = state.schema.snapshot();
@@ -8897,23 +8907,27 @@ pub async fn route_prepared_insert_fast(
     }
 
     let opcode = CqlOpcode::Insert;
-    let query_desc = format!("INSERT {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table);
-    let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
-    let _guard = state.query_tracker.begin_guarded(
-        &query_desc,
-        keyspace,
-        &ctx.client_address,
-        &ctx.auth.role,
-    );
+    let _guard = if state.query_tracker.enabled() {
+        let query_desc = format!("INSERT {}.{}", s.keyspace.as_deref().unwrap_or(""), s.table);
+        let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
+        state.query_tracker.begin_guarded(
+            &query_desc,
+            keyspace,
+            &ctx.client_address,
+            &ctx.auth.role,
+        )
+    } else {
+        None
+    };
 
     let result = async {
         let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
         validate_keyspace_exists(&state.schema, ks)?;
 
-        state.schema.check_permission(
+        state.schema.check_permission_borrowed(
             ctx.auth,
             Permission::Modify,
-            &Resource::Table(ks.to_string(), s.table.clone()),
+            BorrowedResource::Table(ks, &s.table),
         )?;
 
         let snap = state.schema.snapshot();

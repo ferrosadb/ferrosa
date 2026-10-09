@@ -17,6 +17,7 @@
 //! - **M11**: Idle timeout of 300 seconds via `tokio::time::timeout()`.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -373,9 +374,7 @@ pub(crate) async fn handle_connection<S>(
     let mut subscription_state = SubscriptionState::new(8);
     // Per-connection BEGIN/COMMIT transaction buffer (shared across this
     // connection's concurrent in-flight requests; transactions are serialized).
-    let conn_txn = std::sync::Arc::new(tokio::sync::Mutex::new(
-        None::<crate::txn_registry::CqlTxnId>,
-    ));
+    let conn_txn = std::sync::Arc::new(ConnTxnShim::from_env());
     let mut pending_compression: Option<Compression> = None;
     let mut client_protocol_version: u8 = 4; // default; updated from STARTUP frame
     let mut response_version: u8 = VERSION_RESPONSE; // default v4 until negotiated
@@ -1238,7 +1237,7 @@ async fn handle_frame(
     pending_compression: &mut Option<Compression>,
     peer: SocketAddr,
     task_pool: TaskPool,
-    conn_txn: &tokio::sync::Mutex<Option<crate::txn_registry::CqlTxnId>>,
+    conn_txn: &ConnTxnShim,
 ) -> HandleResult {
     match phase {
         ConnectionPhase::AwaitingStartup => match frame.header.opcode {
@@ -1592,6 +1591,71 @@ fn redact_cql_secrets(query: &str) -> String {
 
 // ── QUERY ────────────────────────────────────────────────────────────────
 
+/// Fast, lock-free view of a connection's compat-shim transaction.
+///
+/// The compat shim binds a bare `BEGIN` (which returns an id) to the
+/// connection so a later bare `COMMIT`/`ROLLBACK` resolves to it. The
+/// overwhelming majority of connections never open one, yet the per-statement
+/// path used to take an async mutex just to read the slot. `active` publishes
+/// that fact with a single atomic load so the mutex is only touched when a
+/// transaction is actually in flight (or for transaction-control statements).
+struct ConnTxnShim {
+    inner: tokio::sync::Mutex<Option<crate::txn_registry::CqlTxnId>>,
+    active: AtomicBool,
+    /// When false the fast path is disabled and every statement takes the
+    /// mutex — the escape hatch below.
+    fast: bool,
+}
+
+impl ConnTxnShim {
+    /// `FERROSA_CQL_TXN_SHIM_FASTPATH=0|false|off|no` forces the always-lock
+    /// behaviour; anything else (including unset) keeps the lock-free fast
+    /// path. The switch changes no semantics, only whether the atomic hint is
+    /// consulted.
+    fn from_env() -> Self {
+        let fast = std::env::var("FERROSA_CQL_TXN_SHIM_FASTPATH")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true);
+        Self {
+            inner: tokio::sync::Mutex::new(None),
+            active: AtomicBool::new(false),
+            fast,
+        }
+    }
+
+    /// Whether a shim transaction may be open. Lock-free on the fast path.
+    fn active(&self) -> bool {
+        !self.fast || self.active.load(Ordering::Acquire)
+    }
+
+    /// Acquire the underlying slot. The caller MUST call [`refresh`] with the
+    /// guard once it has finished mutating it, because the mirror cannot be
+    /// updated here (the value can change between acquire and release).
+    ///
+    /// [`refresh`]: ConnTxnShim::refresh
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, Option<crate::txn_registry::CqlTxnId>> {
+        self.inner.lock().await
+    }
+
+    /// Publish the post-mutation state of the slot into the lock-free mirror.
+    fn refresh(&self, shim: &Option<crate::txn_registry::CqlTxnId>) {
+        self.active.store(shim.is_some(), Ordering::Release);
+    }
+}
+
+/// Transaction control that `route_transactional` must see even when no shim
+/// transaction is open. Anything else with no open shim resolves to `None`.
+fn is_txn_control_stmt(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::BeginTransaction { .. }
+            | Statement::TransactionBlock { .. }
+            | Statement::Commit { .. }
+            | Statement::Rollback { .. }
+            | Statement::InTransaction { .. }
+    )
+}
+
 async fn handle_query(
     auth_context: &mut Option<AuthContext>,
     current_keyspace: &mut Option<String>,
@@ -1599,7 +1663,7 @@ async fn handle_query(
     body: &Bytes,
     peer: SocketAddr,
     protocol_version: u8,
-    conn_txn: &tokio::sync::Mutex<Option<crate::txn_registry::CqlTxnId>>,
+    conn_txn: &ConnTxnShim,
 ) -> HandleResult {
     // Parse the query string: [int length][bytes query][short consistency][byte flags]...
     if body.len() < 4 {
@@ -1652,7 +1716,7 @@ async fn handle_query(
         // route) below, so semantics never change.
         Some(cache) => match cache.resolve(query, parser::parse).0 {
             crate::param_cache::Resolved::FastInsert { skeleton, values } => {
-                let eligible = cursor.remaining() == 0 && conn_txn.lock().await.is_none();
+                let eligible = cursor.remaining() == 0 && !conn_txn.active();
                 if eligible {
                     let ctx = build_request_context(
                         auth_context,
@@ -1742,10 +1806,26 @@ async fn handle_query(
     // Accord). The per-connection buffer is locked only for the duration of the
     // check/commit (transactions on a connection are inherently serial), then
     // released before normal routing; `None` falls through.
-    let txn_result = {
+    // A plain DML/DDL/SELECT with no shim transaction open cannot be handled
+    // by `route_transactional` (every arm needs an open txn or is transaction
+    // control), so the connection mutex is skipped entirely; transaction-control
+    // statements still take it.
+    let txn_result = if conn_txn.active() || is_txn_control_stmt(&stmt) {
         let mut shim = conn_txn.lock().await;
-        crate::router::route_transactional(state, &ctx, &stmt, &mut shim, std::time::Instant::now())
-            .await
+        let result = crate::router::route_transactional(
+            state,
+            &ctx,
+            &stmt,
+            &mut shim,
+            std::time::Instant::now(),
+        )
+        .await;
+        // `route_transactional` may have opened/closed the shim; publish the
+        // post-call state before the guard drops.
+        conn_txn.refresh(&shim);
+        result
+    } else {
+        None
     };
     if let Some(result) = txn_result {
         return match result {

@@ -129,6 +129,52 @@ pub fn check_permission(
     }
 }
 
+/// Borrowed form of [`Resource`] for the permission-check hot path.
+///
+/// Only the resource shapes a data-path statement needs; a hot path uses this
+/// so it does not build an owned [`Resource`] (two `String`s) for a check that
+/// a superuser — or an auth-disabled node — answers without inspecting any
+/// grant at all.
+pub enum BorrowedResource<'a> {
+    /// All keyspaces (global scope).
+    AllKeyspaces,
+    /// A single keyspace.
+    Keyspace(&'a str),
+    /// A table (keyspace, table).
+    Table(&'a str, &'a str),
+}
+
+impl BorrowedResource<'_> {
+    /// Materialise the owned [`Resource`] (used only on the granted check).
+    fn to_owned_resource(&self) -> Resource {
+        match self {
+            BorrowedResource::AllKeyspaces => Resource::AllKeyspaces,
+            BorrowedResource::Keyspace(ks) => Resource::Keyspace((*ks).to_string()),
+            BorrowedResource::Table(ks, table) => {
+                Resource::Table((*ks).to_string(), (*table).to_string())
+            }
+        }
+    }
+}
+
+/// Borrowed-target variant of [`check_permission`].
+///
+/// Identical outcome; the only difference is that the target resource is
+/// described by borrowed `&str`s, so a superuser (or any caller that will be
+/// allowed without consulting grants) never pays for the owned [`Resource`]
+/// allocation. A denied non-superuser still builds it, once, for the error.
+pub fn check_permission_borrowed(
+    snap: &SchemaSnapshot,
+    auth: &AuthContext,
+    perm: Permission,
+    resource: BorrowedResource<'_>,
+) -> crate::Result<()> {
+    if auth.is_superuser {
+        return Ok(());
+    }
+    check_permission(snap, auth, perm, &resource.to_owned_resource())
+}
+
 /// Recursively check grants for `role_name`, walking up the role hierarchy.
 fn has_permission_recursive(
     snap: &SchemaSnapshot,
