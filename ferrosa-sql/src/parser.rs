@@ -32,6 +32,10 @@ pub enum ParseError {
     DuplicateColumn(String),
     /// An `ALTER TABLE` form outside the supported subset, described by the caller.
     UnsupportedAlter(String),
+    /// A select-list expression form outside the supported subset, named. `||`
+    /// is supported only in a no-`FROM` expression select; any other use is
+    /// refused by name rather than mis-parsed.
+    UnsupportedSelectExpr(&'static str),
     /// `CREATE TABLE` declares more than one primary key.
     MultiplePrimaryKeys,
     /// `CREATE TABLE` declares no primary key.
@@ -64,6 +68,9 @@ impl fmt::Display for ParseError {
             ParseError::DuplicateColumn(c) => write!(f, "column `{c}` is declared twice"),
             ParseError::UnsupportedAlter(form) => {
                 write!(f, "ALTER TABLE form is not supported: {form}")
+            }
+            ParseError::UnsupportedSelectExpr(form) => {
+                write!(f, "{form} is not supported in a select list")
             }
             ParseError::MultiplePrimaryKeys => write!(f, "multiple primary keys defined"),
             ParseError::MissingPrimaryKey => write!(f, "table has no PRIMARY KEY"),
@@ -176,6 +183,19 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
         Some(Tok::Select) => {
             if p.is_expr_select() {
                 let items = p.parse_scalar_select()?;
+                // `SELECT 'a' || 'b' FROM t`: the expression select list parsed,
+                // but a `FROM` means the user meant a table query — and `||` over
+                // a relation is not evaluable (see `parse_select_item`). Name it
+                // instead of reporting a bare "expected end of statement".
+                if matches!(p.peek(), Some(Tok::From))
+                    && items
+                        .iter()
+                        .any(|item| matches!(item.value, ScalarValue::Concat { .. }))
+                {
+                    return Err(ParseError::UnsupportedSelectExpr(
+                        "`||` concatenation over a FROM relation",
+                    ));
+                }
                 p.expect_end()?;
                 Ok(Statement::SelectExprs(items))
             } else {
@@ -248,6 +268,8 @@ enum Tok {
     Dot,
     LParen,
     RParen,
+    /// The `||` string-concatenation operator (one token, not two pipes).
+    Concat,
     Eq,
     Ne,
     Lt,
@@ -301,6 +323,13 @@ fn lex_mode(sql: &str, lenient: bool) -> Result<Vec<Tok>, ParseError> {
             ')' => {
                 toks.push(Tok::RParen);
                 i += 1;
+            }
+            '|' if chars.get(i + 1) == Some(&'|') => {
+                // `||`: the string-concatenation operator, one token. A lone `|`
+                // falls through to the `other` arm below and stays a loud
+                // `bad token: |` — never silently accepted.
+                toks.push(Tok::Concat);
+                i += 2;
             }
             '=' => {
                 toks.push(Tok::Eq);
@@ -601,12 +630,29 @@ impl Parser {
     }
 
     /// One scalar select item: a `$N` param, a zero-arg function call, or a
-    /// literal — with an optional `AS`/bare alias.
+    /// literal — optionally concatenated with `||` — with an optional `AS`/bare
+    /// alias. `a || b || c` nests left-associatively: `(a || b) || c`.
     fn parse_scalar_item(&mut self) -> Result<ScalarItem, ParseError> {
-        let value = if let Some(Tok::Param(n)) = self.peek() {
+        let mut value = self.parse_scalar_primary()?;
+        while matches!(self.peek(), Some(Tok::Concat)) {
+            self.next(); // `||`
+            let right = self.parse_scalar_primary()?;
+            value = ScalarValue::Concat {
+                left: Box::new(value),
+                right: Box::new(right),
+            };
+        }
+        let alias = self.parse_optional_alias()?;
+        Ok(ScalarItem { value, alias })
+    }
+
+    /// The operand of a `||` (or a lone select item): a `$N` param, a zero-arg
+    /// function call, or a literal.
+    fn parse_scalar_primary(&mut self) -> Result<ScalarValue, ParseError> {
+        if let Some(Tok::Param(n)) = self.peek() {
             let n = *n;
             self.next();
-            ScalarValue::Param(n)
+            Ok(ScalarValue::Param(n))
         } else if matches!(self.peek(), Some(Tok::Ident(_)))
             && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
         {
@@ -615,12 +661,10 @@ impl Parser {
             };
             self.expect(&Tok::LParen, "(")?;
             self.expect(&Tok::RParen, ")")?;
-            ScalarValue::Func(w.to_ascii_uppercase())
+            Ok(ScalarValue::Func(w.to_ascii_uppercase()))
         } else {
-            ScalarValue::Literal(self.parse_value()?)
-        };
-        let alias = self.parse_optional_alias()?;
-        Ok(ScalarItem { value, alias })
+            Ok(ScalarValue::Literal(self.parse_value()?))
+        }
     }
 
     /// An optional output alias: `AS name` or a bare `name`.
@@ -956,7 +1000,22 @@ impl Parser {
     /// A single SELECT-list entry: an aggregate `FUNC(...)` if an identifier
     /// whose uppercase name is a known aggregate is immediately followed by
     /// `(`, otherwise a plain column reference.
+    ///
+    /// Concatenation is refused **by name** here: evaluating `col || 'x'` over a
+    /// `FROM` relation would need a select-list expression the planner does not
+    /// have (its projection is column indices, not computed cells), so a `||`
+    /// that follows an item is a named refusal rather than a token mismatch.
     fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
+        let item = self.parse_select_item_primary()?;
+        if matches!(self.peek(), Some(Tok::Concat)) {
+            return Err(ParseError::UnsupportedSelectExpr(
+                "`||` concatenation over a FROM relation",
+            ));
+        }
+        Ok(item)
+    }
+
+    fn parse_select_item_primary(&mut self) -> Result<SelectItem, ParseError> {
         if let Some(Tok::Ident(word)) = self.peek() {
             if is_aggregate_name(word) && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen)) {
                 let raw = word.clone();
@@ -2711,5 +2770,79 @@ mod tests {
     fn multi_row_insert_with_mismatched_arity_fails_loud() {
         // Every row must supply one value per named column; a short row is an error.
         assert!(parse_statement("INSERT INTO t (a, b) VALUES (1, 2), (3)").is_err());
+    }
+
+    // ---- `||` string concatenation in the SELECT list (pgbench init / census) ----
+
+    fn scalar_items(sql: &str) -> Vec<ScalarItem> {
+        match parse_statement(sql) {
+            Ok(Statement::SelectExprs(items)) => items,
+            other => panic!("expected an expression select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_double_pipe_concatenation_parses_in_an_expression_select() {
+        // RED before the token existed: the lexer had no token for `|`, so this
+        // died with `bad token: |` before the parser ever ran.
+        let items = scalar_items("SELECT 'a' || 'b' AS greeting");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].alias.as_deref(), Some("greeting"));
+        assert_eq!(
+            items[0].value,
+            ScalarValue::Concat {
+                left: Box::new(ScalarValue::Literal(Value::Text("a".into()))),
+                right: Box::new(ScalarValue::Literal(Value::Text("b".into()))),
+            }
+        );
+    }
+
+    #[test]
+    fn concatenation_nests_left_associatively_and_mixes_operands() {
+        // `a || b || c` is `(a || b) || c`; operands may be literals, `$N` params
+        // and zero-arg function calls. No `FROM`, so no ambiguous alias.
+        let items = scalar_items("SELECT 'a' || $1 || current_database()");
+        let ScalarValue::Concat { left, right } = &items[0].value else {
+            panic!("expected a top-level concat, got {:?}", items[0].value);
+        };
+        assert_eq!(
+            **left,
+            ScalarValue::Concat {
+                left: Box::new(ScalarValue::Literal(Value::Text("a".into()))),
+                right: Box::new(ScalarValue::Param(1)),
+            }
+        );
+        assert_eq!(**right, ScalarValue::Func("CURRENT_DATABASE".into()));
+    }
+
+    #[test]
+    fn a_lone_pipe_is_still_a_bad_token() {
+        // Negative control: `||` becomes one token, but a single `|` is still a
+        // character the lexer has no token for and must keep failing loudly.
+        let error = parse_statement("SELECT 'a' | 'b'").expect_err("a lone `|` must be refused");
+        assert_eq!(
+            error.to_string(),
+            "bad token: |",
+            "a lone pipe must still be `bad token: |`, not silently accepted"
+        );
+    }
+
+    #[test]
+    fn concatenation_over_a_from_relation_is_refused_by_name() {
+        // `||` over a `FROM` relation needs a computed select-list expression the
+        // planner does not have. Both spellings must be refused by NAME (0A000),
+        // never mis-parsed as a column list or reported as a token mismatch.
+        for sql in [
+            "SELECT name || '!' FROM t",
+            "SELECT 'a' || 'b' FROM t",
+            "SELECT count(*) || 'x' FROM t",
+        ] {
+            match parse_statement(sql) {
+                Err(ParseError::UnsupportedSelectExpr(form)) => {
+                    assert_eq!(form, "`||` concatenation over a FROM relation");
+                }
+                other => panic!("`{sql}` must be refused by name, got {other:?}"),
+            }
+        }
     }
 }

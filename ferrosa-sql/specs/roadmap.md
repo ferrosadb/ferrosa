@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sql
 doc: roadmap
-last_updated: 2026-09-15
+last_updated: 2026-10-09
 ---
 
 # ferrosa-sql — Roadmap
@@ -12,6 +12,21 @@ the `ferrosa-postgres` consumer needs. The engine is intentionally an M1 slice
 toward the Postgres queries real clients send.
 
 ## Now (highest value)
+
+- **(narrowly done) `||` string concatenation in the no-`FROM` select list.**
+  `SELECT 'a' || 'b'` parses (one `Concat` token; a lone `|` is still
+  `bad token: |`), evaluates left-associatively over scalars, propagates NULL
+  (either side NULL gives NULL, not the empty string) and reports text (OID
+  25). A non-text operand is coerced through the existing PG text renderer.
+
+  **NOT supported, and refused by name (`0A000`)**: `||` over a `FROM` relation
+  (`SELECT name || '!' FROM t`) and every other select-list expression form
+  (arithmetic, function calls over columns, `CASE`). The reason is structural,
+  not an omission: the planner's projection is a `Vec<usize>` of column indices
+  (`plan.rs::simple_projection` + `exec::try_project`), not computed cells, so
+  expressions over a relation need a real select-list expression tree, a new
+  projection operator, an aggregate-mode `Slot` variant, authz walking, and a
+  `Value`-to-text renderer. `WHERE`/DML grammar untouched.
 
 - **(done) Stream the result to the wire** (FMEA SQL-12, `t_f348ba0b`).
   `execute_streaming` + `RowSink` deliver rows as the pipeline yields them and

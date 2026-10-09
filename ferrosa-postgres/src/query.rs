@@ -896,7 +896,8 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
     match error {
         ParseError::UnsupportedClause(_)
         | ParseError::MissingPrimaryKey
-        | ParseError::UnsupportedAlter(_) => "0A000",
+        | ParseError::UnsupportedAlter(_)
+        | ParseError::UnsupportedSelectExpr(_) => "0A000",
         ParseError::UnknownType(_) => "42704",
         ParseError::DuplicateColumn(_) => "42701",
         ParseError::MultiplePrimaryKeys => "42P16",
@@ -1410,7 +1411,9 @@ pub(crate) fn prepare_row_changes(
 /// passes through; a `$N` indexes `params`. FAILS LOUD (`08P01`,
 /// protocol_violation) when `$N` has no bound value — never a silent default, so
 /// a parameter the client failed to bind can never become NULL. Function calls
-/// in DML values are unsupported (`0A000`).
+/// in DML values are unsupported (`0A000`). A `||` is concatenated the same way a
+/// select-list one is (the DML value grammar never produces it today; the arm
+/// keeps the semantics uniform rather than unreachable).
 fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, BackendMessage> {
     match sv {
         ScalarValue::Literal(v) => Ok(v.clone()),
@@ -1427,6 +1430,11 @@ fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, B
             "0A000",
             "function calls in DML values are not supported",
         )),
+        ScalarValue::Concat { left, right } => {
+            let left = substitute_param(left, params)?;
+            let right = substitute_param(right, params)?;
+            concat_text(&left, &right)
+        }
     }
 }
 
@@ -2419,9 +2427,10 @@ pub(crate) async fn execute_delete(
 }
 
 /// Evaluate a no-`FROM` expression SELECT (`SELECT 1`, `SELECT version()`,
-/// `SELECT current_database()`) into a one-row [`QueryResult`]. Literals are
-/// returned as-is; a small set of info/session functions are evaluated from the
-/// connection's context.
+/// `SELECT current_database()`, `SELECT 'a' || 'b'`) into a one-row
+/// [`QueryResult`]. Literals are returned as-is; a small set of info/session
+/// functions are evaluated from the connection's context; `||` concatenates its
+/// operands as text.
 pub(crate) fn execute_scalar_select(
     items: &[ScalarItem],
     default_schema: &str,
@@ -2429,17 +2438,11 @@ pub(crate) fn execute_scalar_select(
     let mut columns = Vec::with_capacity(items.len());
     let mut values = Vec::with_capacity(items.len());
     for item in items {
-        let value = match &item.value {
-            ScalarValue::Literal(v) => v.clone(),
-            ScalarValue::Func(name) => eval_scalar_func(name, default_schema)?,
-            ScalarValue::Param(_) => {
-                return Err(error_response(
-                    "0A000",
-                    "$N parameters require the extended-query protocol",
-                ))
-            }
-        };
-        let ty = value_column_type(&value);
+        let value = eval_scalar_value(&item.value, default_schema)?;
+        // Type from the EXPRESSION, not from the value: a concatenation is `text`
+        // even when it evaluates to SQL NULL, so the `RowDescription` advertises
+        // OID 25 either way and the client decodes the value correctly.
+        let ty = scalar_expr_type(&item.value);
         let name = item
             .alias
             .clone()
@@ -2451,6 +2454,67 @@ pub(crate) fn execute_scalar_select(
         columns,
         rows: vec![Row(values)],
     })
+}
+
+/// Evaluate one scalar select value, recursing through `||`.
+///
+/// A `$N` placeholder is only bound on the extended-query path, which routes
+/// expression selects through `Parse` (where such a value is refused) — so it is
+/// a fail-loud error here, never a guess.
+fn eval_scalar_value(
+    value: &ScalarValue,
+    default_schema: &str,
+) -> Result<SqlValue, BackendMessage> {
+    match value {
+        ScalarValue::Literal(v) => Ok(v.clone()),
+        ScalarValue::Func(name) => eval_scalar_func(name, default_schema),
+        ScalarValue::Param(_) => Err(error_response(
+            "0A000",
+            "$N parameters require the extended-query protocol",
+        )),
+        ScalarValue::Concat { left, right } => {
+            let left = eval_scalar_value(left, default_schema)?;
+            let right = eval_scalar_value(right, default_schema)?;
+            concat_text(&left, &right)
+        }
+    }
+}
+
+/// PostgreSQL's `||` text concatenation over already-evaluated operands.
+///
+/// NULL on either side yields NULL — the real behaviour difference from an empty
+/// string, so it is decided here rather than by rendering. A non-text operand is
+/// rendered with its Postgres text output form (`1 || '2'` is `'12'`), which is
+/// exactly what the wire encoder would send for it; an operand with no text
+/// rendering (jsonpath, `text[]`) fails loud instead of being dropped.
+fn concat_text(left: &SqlValue, right: &SqlValue) -> Result<SqlValue, BackendMessage> {
+    let (Some(left), Some(right)) = (
+        render_value(left).map_err(|e| encode_error_response(&e))?,
+        render_value(right).map_err(|e| encode_error_response(&e))?,
+    ) else {
+        return Ok(SqlValue::Null);
+    };
+    let mut bytes = left;
+    bytes.extend_from_slice(&right);
+    let text = String::from_utf8(bytes).map_err(|_| {
+        error_response(
+            "0A000",
+            "concatenation produced bytes with no text representation",
+        )
+    })?;
+    Ok(SqlValue::Text(text))
+}
+
+/// The Postgres result type of a scalar select expression, independent of the
+/// value it evaluates to. A concatenation is always `text` (OID 25): `'a' || NULL`
+/// is a text column holding NULL, not an untyped null.
+fn scalar_expr_type(value: &ScalarValue) -> ColumnType {
+    match value {
+        ScalarValue::Literal(v) => value_column_type(v),
+        ScalarValue::Func(_) | ScalarValue::Param(_) | ScalarValue::Concat { .. } => {
+            ColumnType::Text
+        }
+    }
 }
 
 /// Evaluate a zero-arg info/session function. Unsupported names fail loud
@@ -3535,6 +3599,96 @@ mod tests {
             alias: None,
         }];
         assert!(execute_scalar_select(&items, "ks").is_err());
+    }
+
+    // ---- `||` string concatenation in the SELECT list (pgbench init / census) ----
+
+    /// Parse a no-`FROM` expression select the way the wire path does.
+    fn parsed_scalar_items(sql: &str) -> Vec<ScalarItem> {
+        match parse_statement(sql) {
+            Ok(Statement::SelectExprs(items)) => items,
+            other => panic!("`{sql}` must be an expression select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_select_concatenation_parses_evaluates_and_advertises_text() {
+        // End to end: the statement dies as `bad token: |` before the `||` token
+        // exists; afterwards it must parse, evaluate, and report OID 25 on the wire.
+        let items = parsed_scalar_items("SELECT 'a' || 'b' AS greeting");
+        let result = execute_scalar_select(&items, "ks").expect("evaluate concatenation");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.columns[0].name, "greeting");
+        // A wrong OID here makes the client mis-decode an otherwise correct value.
+        assert_eq!(column_type_oid(result.columns[0].ty), 25);
+        assert_eq!(result.rows[0].0[0], SqlValue::Text("ab".into()));
+
+        // Rendered: the RowDescription the Describe path advertises, then (on the
+        // Execute path, which omits it) a DataRow carrying "ab".
+        let fields = row_description_fields(&result.columns, &[]);
+        assert_eq!(fields[0].type_oid, 25);
+        let messages = render_execute_result(Ok(result), &[]);
+        assert!(matches!(
+            &messages[0],
+            BackendMessage::DataRow { columns } if columns == &vec![Some(b"ab".to_vec())]
+        ));
+    }
+
+    #[test]
+    fn scalar_select_concatenation_propagates_null_not_an_empty_string() {
+        // PostgreSQL: NULL on either side yields NULL. That is NOT the same as
+        // concatenating an empty string, and the two must stay distinguishable.
+        for sql in [
+            "SELECT 'a' || NULL",
+            "SELECT NULL || 'a'",
+            "SELECT NULL || NULL",
+        ] {
+            let items = parsed_scalar_items(sql);
+            let result = execute_scalar_select(&items, "ks").expect("evaluate concatenation");
+            // The column is text even though the value is NULL.
+            assert_eq!(column_type_oid(result.columns[0].ty), 25, "{sql}");
+            assert_eq!(result.rows[0].0[0], SqlValue::Null, "{sql}");
+            assert_ne!(result.rows[0].0[0], SqlValue::Text(String::new()), "{sql}");
+        }
+        // Control: an empty string really is an empty string.
+        let items = parsed_scalar_items("SELECT '' || ''");
+        let result = execute_scalar_select(&items, "ks").expect("evaluate");
+        assert_eq!(result.rows[0].0[0], SqlValue::Text(String::new()));
+    }
+
+    #[test]
+    fn scalar_select_concatenation_renders_a_non_text_operand_as_text() {
+        // PostgreSQL coerces the non-text operand with its text output function:
+        // `1 || '2'` is '12' (not integer addition, not a type error), and
+        // `TRUE || 'x'` is 'tx'.
+        let items = parsed_scalar_items("SELECT 1 || '2', TRUE || 'x', 'x' || 1.5");
+        let result = execute_scalar_select(&items, "ks").expect("evaluate concatenation");
+        let row = &result.rows[0].0;
+        assert_eq!(row[0], SqlValue::Text("12".into()));
+        assert_eq!(row[1], SqlValue::Text("tx".into()));
+        assert_eq!(row[2], SqlValue::Text("x1.5".into()));
+        for column in &result.columns {
+            assert_eq!(column_type_oid(column.ty), 25);
+        }
+    }
+
+    #[test]
+    fn substitute_param_concatenates_a_double_pipe() {
+        // The DML value grammar never produces a `||` today, but the arm exists in
+        // `substitute_param`; it must concatenate rather than fall back.
+        let concat = ScalarValue::Concat {
+            left: Box::new(ScalarValue::Param(1)),
+            right: Box::new(ScalarValue::Literal(SqlValue::Text("!".into()))),
+        };
+        assert_eq!(
+            substitute_param(&concat, &[SqlValue::Text("hi".into())]).unwrap(),
+            SqlValue::Text("hi!".into())
+        );
+        // NULL still propagates through the substitution path.
+        assert_eq!(
+            substitute_param(&concat, &[SqlValue::Null]).unwrap(),
+            SqlValue::Null
+        );
     }
 }
 

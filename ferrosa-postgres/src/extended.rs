@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_sql::{
-    parse_statement, DeleteStmt, InsertStmt, ScalarItem, ScalarValue, SelectStmt, Statement,
-    UpdateStmt, Value as SqlValue,
+    parse_statement, DeleteStmt, InsertStmt, ScalarItem, SelectStmt, Statement, UpdateStmt,
+    Value as SqlValue,
 };
 
 use crate::messages::{BackendMessage, TransactionStatus};
@@ -398,11 +398,9 @@ impl Session {
             Ok(Statement::SelectExprs(items)) => {
                 // Parameterized expression selects need $N type inference with no
                 // column to infer from — not supported via the extended protocol
-                // yet. Fail loud rather than guess.
-                if items
-                    .iter()
-                    .any(|it| matches!(it.value, ScalarValue::Param(_)))
-                {
+                // yet. Fail loud rather than guess. The check walks a `||`
+                // concatenation, which can carry a `$N` below its top level.
+                if items.iter().any(|it| it.value.references_param()) {
                     self.error_pending = true;
                     return error_response(
                         "0A000",

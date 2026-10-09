@@ -1,7 +1,13 @@
 //! Logical AST for the SQL subset: `SELECT [DISTINCT] <list|*> FROM t [alias]
 //! [INNER JOIN t2 [alias] ON a.x = b.y] [WHERE <bool-expr>]
 //! [GROUP BY ...] [HAVING <bool-expr>] [ORDER BY ... [ASC|DESC]]
-//! [LIMIT n] [OFFSET m]`.
+//! [LIMIT n] [OFFSET m]`, plus the no-`FROM` expression select
+//! `SELECT <scalar> [, <scalar>]*` (see [`ScalarItem`]).
+//!
+//! The `SELECT` list itself is deliberately NOT an expression grammar. It holds
+//! columns and aggregates (a table query) or [`ScalarValue`]s (an expression
+//! query), and the ONE operator either will accept is `||` string concatenation.
+//! Every other select-list expression form is refused by name at parse time.
 
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -27,7 +33,7 @@ pub enum Statement {
     /// than the other variants.
     Select(Box<SelectStmt>),
     /// A no-`FROM` expression query (`SELECT 1`, `SELECT version()`,
-    /// `SELECT $1`) — yields exactly one row.
+    /// `SELECT $1`, `SELECT 'a' || 'b'`) — yields exactly one row.
     SelectExprs(Vec<ScalarItem>),
     /// `BEGIN` / `START TRANSACTION`, preserving an explicitly requested
     /// isolation level. `None` means the session default.
@@ -308,6 +314,34 @@ pub enum ScalarValue {
     Func(String),
     /// A `$N` parameter placeholder (extended-query path).
     Param(usize),
+    /// `<operand> || <operand>` — the SQL string-concatenation operator.
+    ///
+    /// Boxed to keep [`ScalarValue`] small (it is one variant of [`Statement`]'s
+    /// largest arm). Each operand is itself a [`ScalarValue`], so `a || b || c`
+    /// nests left-associatively. Concatenation is a **select-list** operator
+    /// only: the WHERE/DML grammars never produce this variant, and `||` over a
+    /// `FROM` relation is refused by name at parse time.
+    Concat {
+        left: Box<ScalarValue>,
+        right: Box<ScalarValue>,
+    },
+}
+
+impl ScalarValue {
+    /// Whether this value references a `$N` parameter, at any depth.
+    ///
+    /// The extended-protocol `Parse` path refuses expression selects that carry
+    /// a parameter (no column to infer its type from), so the check has to walk
+    /// a concatenation rather than only looking at the top level.
+    pub fn references_param(&self) -> bool {
+        match self {
+            ScalarValue::Param(_) => true,
+            ScalarValue::Concat { left, right } => {
+                left.references_param() || right.references_param()
+            }
+            ScalarValue::Literal(_) | ScalarValue::Func(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
