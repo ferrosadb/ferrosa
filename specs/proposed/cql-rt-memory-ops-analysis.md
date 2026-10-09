@@ -284,7 +284,34 @@ two negative controls that fail if the guard loses its teeth),
 and the staleness pin inside `memtable_read_does_not_block_writes.rs` is the
 measurement behind §2.
 
-### 7. Follow-ups (not in this PR)
+### 8. Driver Smoke flake (CI, merge commit) — investigated, not ours
+
+`Driver Smoke (ubuntu-latest)` failed once on the merge commit `74ab6c10`, then
+**passed on rerun of the identical commit** — intermittent, not deterministic.
+
+The failure was in the range-scan producer:
+
+```
+storage: invalid data: range scan producer failed: task 15694 panicked with
+message "scheduler blocking task must not be cancelled: JoinError::Panic(Id(15695),
+"A Tokio 1.x context was found, but IO is disabled. Call `enable_io` on the runtime
+builder to enable IO.")"
+```
+
+Cause: `ferrosa-sched/src/lib.rs:650 scan_carrier()` builds the scan-carrier runtime
+with `.enable_time()` and **no `.enable_io()`** (pre-existing on `origin/main`, not
+changed here). Any code reached from a scan producer that touches Tokio IO panics
+with exactly that message. The panic is surfaced as a fail-loud
+`range scan producer failed` error rather than a silent empty result, so the
+diagnosis is in the error text, not in a missing row.
+
+Why this is not this PR's change: the diff against `origin/main` has no hunks below
+`store.rs:5272` and touches neither `ferrosa-sched` nor the producer at
+`store.rs:2295-2360`. Recorded here because it is a real latent bug and it will
+recur; the fix is to give the carrier `enable_io()` (or ensure nothing on a scan
+producer path does Tokio IO), which is a scheduler change with its own review.
+
+### 9. Follow-ups (not in this PR)
 
 - **Same defect class, same-class sweep DONE.** `store.rs` had four more read-only
   scans of the **active** memtable through `range_iter(..)` — `read_token_range_once`,
