@@ -139,9 +139,11 @@ through `TruncateExecutor`; the production `ClusterTruncate` calls
 router's `route_truncate` uses — so every node removes the rows (never a
 node-local `StorageEngine::truncate`, which would desync the replicas).
 `QueryContext.truncate` carries the executor into `ReadEnv` beside `ddl`; with no
-executor the statement is refused `0A000`. `Statement::Vacuum`/`Statement::Analyze`
-are answered as successful no-ops (`CommandComplete "VACUUM"`/`"ANALYZE"`) — an
-accept-and-report, since ferrosa has no heap to vacuum and collects no statistics.
+executor the statement is refused `0A000`. `Statement::Vacuum` flushes the
+named table's memtables and submits compaction (`force_compact_all`, all tables)
+before answering `CommandComplete "VACUUM"` — asynchronous, and reclamation depends
+on the purge policy, so the tag does not mean "space reclaimed". `Statement::Analyze`
+is answered `"ANALYZE"` and collects no statistics.
 
 `query` renders/parses each `ferrosa_sql::Value` to/from its exact Postgres text
 form and (for most) the binary form, with OIDs/sizes advertised in

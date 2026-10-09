@@ -93,12 +93,13 @@ pub struct TruncateStatement {
 /// as routine maintenance and expects success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VacuumStmt {
-    /// `FULL` was written. Accepted; it does not change the no-op.
+    /// `FULL` was written. Accepted; it does not change what runs (the storage engine has
+    /// one compaction path, with no separate "full" mode).
     pub full: bool,
     /// `ANALYZE`/`ANALYSE` was written. Accepted; no statistics are collected.
     pub analyze: bool,
-    /// The table named, if any. Recorded for fidelity; execution ignores it (the
-    /// no-op touches nothing).
+    /// The table named, if any. Execution flushes this table (or every table when absent) and
+    /// submits compaction — see the `Statement::Vacuum` arm in `ferrosa-postgres`.
     pub table: Option<TableRef>,
 }
 

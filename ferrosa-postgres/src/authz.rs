@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn vacuum_and_analyze_touch_no_table() {
+    fn vacuum_and_analyze_require_no_table_permission() {
         for sql in [
             "VACUUM",
             "VACUUM FULL",

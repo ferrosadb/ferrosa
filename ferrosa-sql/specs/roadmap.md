@@ -16,7 +16,8 @@ toward the Postgres queries real clients send.
 - **(done) Parse the maintenance statements** (pgbench `-i`/reset). `TRUNCATE
   [TABLE] t [, …]`, `VACUUM [FULL] [ANALYZE|ANALYSE] [t]` and `ANALYZE|ANALYSE
   [t]` now parse to `Statement::{Truncate,Vacuum,Analyze}`; the Postgres front
-  end executes them (replicated `TRUNCATE`; `VACUUM`/`ANALYZE` accepted no-ops).
+  end executes them (replicated `TRUNCATE`; `VACUUM` flushes and submits
+  compaction; `ANALYZE` is an accepted no-op).
   `TRUNCATE … CASCADE` / `… RESTART IDENTITY` are refused by name.
 
 - **(done) Stream the result to the wire** (FMEA SQL-12, `t_f348ba0b`).

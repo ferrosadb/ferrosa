@@ -60,8 +60,8 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   `Schema::check_permission`, the CQL router's model: `SELECT` needs `SELECT` on
   each table read, `INSERT`/`UPDATE`/`DELETE` need `MODIFY`, `RETURNING` also
   needs `SELECT`, `TRUNCATE` needs `MODIFY` on each named table (the CQL
-  router's `route_truncate` rule), `VACUUM`/`ANALYZE` are no-ops and need
-  nothing, table-free statements need nothing. Checked on simple query,
+  router's `route_truncate` rule), `VACUUM`/`ANALYZE` are maintenance and need
+  no table permission, table-free statements need nothing. Checked on simple query,
   extended `Describe`, and `Execute`; a denial is `42501`
   `insufficient_privilege`. The mapping is an exhaustive match, so a new
   statement kind cannot compile without a rule.
@@ -131,12 +131,19 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   when the front-end has no write path, `25001` inside a transaction block (it
   cannot be rolled back), `42P01` for a missing table (checked before the write).
   `TRUNCATE … CASCADE`/`RESTART IDENTITY` are refused at parse time.
-- **`VACUUM` / `ANALYZE` — deliberate accepted no-ops** — `VACUUM [FULL]
+- **`VACUUM` (flush + compact) / `ANALYZE` (accepted no-op)** — `VACUUM [FULL]
   [ANALYZE|ANALYSE]` answers `CommandComplete "VACUUM"` and `ANALYZE|ANALYSE`
-  answers `"ANALYZE"`, so routine maintenance (e.g. `pgbench -i`) succeeds. This
-  is an **accept-and-report**: ferrosa has no dead-tuple heap to reclaim and
-  collects no statistics, so nothing is freed and nothing is measured. It does
-  not error and it does not claim work was done.
+  answers `"ANALYZE"`, so routine maintenance (e.g. `pgbench -i`) succeeds.
+  `VACUUM` is **not** a no-op: in an LSM/SSTable store, flushing the memtables
+  down and submitting compaction IS the vacuum, so it calls
+  `StorageEngine::flush` for the named table (every table when none is named) and
+  then `force_compact_all`. Three things it does not do, stated plainly: it does
+  not **wait** for compaction (`force_compact_all` submits and returns, so the
+  tag means "flushed and submitted", not "space reclaimed"); it does not promise
+  reclamation, which depends on the purge policy gated by
+  `compaction_purge_enabled()`; and because that engine entry point is
+  all-tables, a named `VACUUM t` flushes only `t` but submits compaction
+  cluster-wide. `ANALYZE` really is a no-op — no statistics are collected.
 - **TCP server** — `serve` / `QueryContext`: one spawned task per connection over
   a tokio `TcpListener`, sharing the auth store and the storage+schema context.
 
@@ -265,7 +272,7 @@ keyspace is `3F000`; DDL in a transaction block is `25001`; a context without a
 `CREATE TABLE` requires `CREATE` on the target keyspace, checked at dispatch
 in `authz::statement_permissions` before the executor reads the schema (42501). `DROP`/`ALTER` are T-132b; extended-protocol `Parse` of DDL is refused.
 
-**`TRUNCATE` (replicated) and `VACUUM`/`ANALYZE` (accepted no-ops).** `TRUNCATE
+**`TRUNCATE` (replicated) and `VACUUM` (flush + compact) / `ANALYZE` (no-op).** `TRUNCATE
 [TABLE] t [, …]` executes in `truncate.rs`: each named table (resolved in the
 default schema) is truncated through `QueryContext.truncate` — a
 `TruncateExecutor` whose production implementation (`ClusterTruncate`) calls the
@@ -274,10 +281,10 @@ uses (coordinator fan-out to every node in cluster mode, the local engine
 standalone). It is **never** the local `StorageEngine::truncate`, which would
 empty one replica and leave the cluster disagreeing about the table. No
 executor → `0A000`; in a transaction block → `25001`; missing table → `42P01`.
-`VACUUM [FULL] [ANALYZE|ANALYSE]` and `ANALYZE|ANALYSE` are answered as
-successful no-ops (`CommandComplete "VACUUM"` / `"ANALYZE"`): there is no heap to
-vacuum and no statistics are collected, so they report success and change
-nothing. Unlike DDL they are also accepted inside a transaction block.
+`VACUUM [FULL] [ANALYZE|ANALYSE]` flushes the named table (all tables when none
+is named) and submits compaction, then answers `CommandComplete "VACUUM"`;
+`ANALYZE|ANALYSE` is answered `"ANALYZE"` and collects nothing. Unlike DDL they
+are also accepted inside a transaction block — neither is rolled back.
 
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +

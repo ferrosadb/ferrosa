@@ -1195,13 +1195,56 @@ async fn execute_statement(
             )
             .await
         }
-        // VACUUM [FULL] [ANALYZE]: DELIBERATELY accepted and answered as a successful
-        // no-op. ferrosa stores rows in an LSM tree with no dead-tuple heap to reclaim
-        // and collects no statistics, so nothing is freed and nothing is measured; the
-        // `VACUUM` tag is the completion a client (e.g. `pgbench -i`) expects.
-        Statement::Vacuum(_) => vec![BackendMessage::CommandComplete {
-            tag: "VACUUM".to_string(),
-        }],
+        // VACUUM: flush the table's memtables down and submit compaction. In an LSM/SSTable
+        // store that IS what VACUUM means — it is not a no-op, and calling it one would be a lie
+        // about a maintenance operation that really does run.
+        //
+        // What it does NOT do, stated plainly:
+        //
+        //   * It does not WAIT for compaction. `force_compact_all` submits tasks and returns, so
+        //     the `VACUUM` tag means "flushed and compaction submitted", not "space reclaimed".
+        //     (Real VACUUM likewise returns before all cleanup is guaranteed.)
+        //   * It does not promise reclamation. Whether tombstoned data is actually dropped depends
+        //     on the purge policy, gated by `compaction_purge_enabled()` in ferrosa-storage; this
+        //     statement neither forces purge on nor claims a specific outcome.
+        //   * `force_compact_all` is the storage engine's only force entry point and it considers
+        //     EVERY table, so a named `VACUUM t` flushes only `t` but submits compaction for all
+        //     tables with at least two SSTables. Maintenance either way, but a real difference
+        //     from PostgreSQL, where `VACUUM t` touches only `t`.
+        Statement::Vacuum(vacuum) => {
+            let targets: Vec<ferrosa_storage::TableId> = match &vacuum.table {
+                Some(named) => {
+                    let found: Vec<ferrosa_storage::TableId> = engine
+                        .registered_table_ids()
+                        .into_iter()
+                        .filter(|id| {
+                            engine
+                                .table_schema(id)
+                                .is_some_and(|schema| schema.table == named.table)
+                        })
+                        .collect();
+                    if found.is_empty() {
+                        return vec![error_response(
+                            "42P01",
+                            &format!("relation \"{}\" does not exist", named.table),
+                        )];
+                    }
+                    found
+                }
+                None => engine.registered_table_ids(),
+            };
+            // Flush first: compaction operates on SSTables, so anything still in memory has to be
+            // pushed down before there is anything to compact.
+            for id in &targets {
+                if let Err(error) = engine.flush(id) {
+                    return vec![write_error_response(&error)];
+                }
+            }
+            engine.force_compact_all();
+            vec![BackendMessage::CommandComplete {
+                tag: "VACUUM".to_string(),
+            }]
+        }
         // ANALYZE: likewise a deliberate successful no-op — no statistics are collected.
         Statement::Analyze(_) => vec![BackendMessage::CommandComplete {
             tag: "ANALYZE".to_string(),

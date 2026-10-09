@@ -2018,10 +2018,12 @@ mod txn_atomicity_tests {
         execute_simple(&ctx, &mut session, "ROLLBACK").await;
     }
 
-    /// VACUUM / VACUUM FULL / VACUUM ANALYZE / ANALYZE are accepted and answered
-    /// with the tag a client expects, changing nothing.
+    /// VACUUM / VACUUM FULL / VACUUM ANALYZE are accepted and answered with the tag a client
+    /// expects; the rows survive, because flushing and compacting is not destructive. ANALYZE
+    /// really is a no-op: no statistics are collected, and that is stated in the dispatch arm
+    /// rather than being hidden here.
     #[tokio::test]
-    async fn vacuum_and_analyze_are_accepted_as_successful_noops() {
+    async fn vacuum_flushes_and_submits_compaction_without_touching_rows() {
         let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new(superuser());
         execute_simple(
@@ -2045,7 +2047,25 @@ mod txn_atomicity_tests {
             );
             assert_eq!(command_tag(&messages).as_deref(), Some(tag), "`{sql}` tag");
         }
-        assert_eq!(row_count(&ctx, "k1").await, 1, "the no-op changed nothing");
+        assert_eq!(
+            row_count(&ctx, "k1").await,
+            1,
+            "VACUUM flushes and compacts; it must not drop a live row"
+        );
+    }
+
+    /// VACUUM resolves the table it names. Accept-and-report ignored the table entirely, so a
+    /// `VACUUM` against a relation that does not exist used to succeed; now it is refused, which
+    /// is the assertion that the statement executes rather than only answering.
+    #[tokio::test]
+    async fn vacuum_on_a_missing_table_is_refused() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let messages = execute_simple(&ctx, &mut session, "VACUUM nope").await;
+        assert!(
+            format!("{messages:?}").contains("42P01"),
+            "VACUUM must resolve the relation it names; got {messages:?}"
+        );
     }
 
     /// At the suspended-portal limit, a fresh portal executed with `max_rows`

@@ -13,16 +13,18 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
-- **`TRUNCATE` (replicated) + `VACUUM`/`ANALYZE` (accepted no-ops)** (pgbench
+- **`TRUNCATE` (replicated) + `VACUUM` (flush + compact) / `ANALYZE` (no-op)** (pgbench
   `-i`/reset and routine maintenance). `TRUNCATE [TABLE] t [, …]` routes through
   `truncate::TruncateExecutor` — `ClusterTruncate` over the SAME
   `ferrosa_cluster::WritePath` the CQL router's `route_truncate` uses — so the
   truncation is replicated to every node, never a node-local
   `StorageEngine::truncate` that would leave the replicas disagreeing. No write
   path → `0A000`; in a transaction block → `25001`; missing table → `42P01`.
-  `VACUUM [FULL] [ANALYZE|ANALYSE]` and `ANALYZE|ANALYSE` answer `CommandComplete`
-  `"VACUUM"`/`"ANALYZE"` and change nothing (no heap to vacuum, no statistics
-  collected) — a deliberate accept-and-report so `pgbench -i` succeeds.
+  `VACUUM [FULL] [ANALYZE|ANALYSE]` flushes and submits compaction — in an LSM
+  store that is the vacuum, so it is NOT a no-op — then answers `CommandComplete
+  "VACUUM"`. Asynchronous: it does not wait for compaction, and reclamation
+  depends on the purge policy. `ANALYZE|ANALYSE` answers `"ANALYZE"` and collects
+  no statistics, which is a real no-op.
   `QueryContext` carries the executor in `ReadEnv` beside `ddl`.
 
 - **PK-less `CREATE TABLE` end to end.** A table that declares no `PRIMARY KEY` gets a
