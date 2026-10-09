@@ -3772,6 +3772,79 @@ mod txn_buffer_tests {
         engine.shutdown().unwrap();
     }
 
+    /// `SELECT *` must not hand the client ferrosa's own column — that invisibility is the
+    /// whole design. Naming it explicitly still returns it, which is how Postgres exposes
+    /// `ctid`: hidden from `*`, reachable by name.
+    #[tokio::test]
+    async fn select_star_hides_the_synthetic_key_but_naming_it_returns_it() {
+        let (_dir, engine, schema) = new_engine_with_synthetic_key().await;
+        let limits = crate::jsonb_wire::test_limits();
+        execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO sk (v) VALUES ('hello')",
+            "public",
+            &limits,
+            None,
+        )
+        .await;
+
+        let cells = |msgs: &[BackendMessage]| -> Vec<Vec<String>> {
+            msgs.iter()
+                .filter_map(|m| match m {
+                    BackendMessage::DataRow { columns } => Some(
+                        columns
+                            .iter()
+                            .map(|c| {
+                                String::from_utf8_lossy(c.as_deref().unwrap_or_default())
+                                    .into_owned()
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // `*` → exactly one cell, and it is the user's value. If the key leaked, the row
+        // would carry two cells; if the wrong column were dropped, this would be a uuid.
+        let star = execute_query(
+            &engine,
+            &schema,
+            "SELECT * FROM sk",
+            "public",
+            &limits,
+            None,
+        )
+        .await;
+        assert_eq!(
+            cells(&star),
+            vec![vec!["hello".to_string()]],
+            "`SELECT *` must expose only the user's column: {star:?}"
+        );
+
+        // Named explicitly → returned, and it is the minted uuid.
+        let keyed = execute_query(
+            &engine,
+            &schema,
+            "SELECT _sys_ck_ FROM sk",
+            "public",
+            &limits,
+            None,
+        )
+        .await;
+        let got = cells(&keyed);
+        assert_eq!(
+            got.len(),
+            1,
+            "naming the column must return its row: {keyed:?}"
+        );
+        assert_eq!(got[0].len(), 1, "one cell: {keyed:?}");
+        Uuid::parse_str(&got[0][0]).expect("the named column returns the minted uuid");
+
+        engine.shutdown().unwrap();
+    }
+
     #[tokio::test]
     async fn buffered_insert_is_not_applied_until_mvcc_commit() {
         // An INSERT with `txn = Some(buffer)` is BUFFERED, never written to

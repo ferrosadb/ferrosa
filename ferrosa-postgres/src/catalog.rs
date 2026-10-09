@@ -27,6 +27,8 @@
 //! scheme is pure (no counters, no insertion-order dependence), so the same
 //! schema always projects the same OIDs.
 
+use ferrosa_common::timeuuid::is_reserved_column_name;
+
 use crate::pg_types::{pg_type_of_column, PgType, PgTypeError};
 use ferrosa_schema::{ColumnMetadata, Schema, SchemaSnapshot};
 use ferrosa_sql::{Column, ColumnType, InMemoryTable, RelSchema, Row, Value};
@@ -166,9 +168,22 @@ pub fn pg_attribute(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
         let relid = relation_oid(&ks, &table);
         // IndexMap preserves the table's declared column order; attnum is the
         // 1-based position in that order, matching Postgres semantics.
-        for (idx, col) in meta.columns.values().enumerate() {
+        // Postgres numbers a table's own columns 1..n, and its SYSTEM columns with NEGATIVE
+        // attnums (`ctid` is -1). A reserved `_sys_` column is exactly that: it must not
+        // consume a positive ordinal, or every ordinary column would be off by one to a
+        // client reading this catalog.
+        let mut ordinal = 0i64;
+        let mut system = 0i64;
+        for col in meta.columns.values() {
             let pg = pg_type_of_column(&col.column_type, &ks, schema)?;
-            rows.push(attribute_row(relid, col, idx, pg));
+            let attnum = if is_reserved_column_name(&col.name) {
+                system -= 1;
+                system
+            } else {
+                ordinal += 1;
+                ordinal
+            };
+            rows.push(attribute_row(relid, col, attnum, pg));
         }
     }
 
@@ -176,8 +191,7 @@ pub fn pg_attribute(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
 }
 
 /// Build a single `pg_attribute` row for `col` at 0-based `idx`.
-fn attribute_row(relid: u32, col: &ColumnMetadata, idx: usize, pg: PgType) -> Row {
-    let attnum = i64::try_from(idx + 1).unwrap_or(i64::MAX);
+fn attribute_row(relid: u32, col: &ColumnMetadata, attnum: i64, pg: PgType) -> Row {
     Row::new(vec![
         oid_val(relid),
         Value::Text(col.name.clone()),
@@ -452,6 +466,35 @@ mod tests {
         assert_eq!(tbl_row.get(3).clone(), Value::Text("r".to_string()));
         // oid == relation oid
         assert_eq!(tbl_row.get(0).clone(), oid_val(relation_oid("ks", "tbl")));
+    }
+
+    /// A reserved `_sys_` column is a SYSTEM column to a Postgres client: it takes a NEGATIVE
+    /// attnum, exactly as `ctid` does, and must not consume a positive ordinal — otherwise
+    /// every ordinary column reads one too high to a client that introspects this catalog.
+    /// It stays LISTED, which is the whole discovery story for a column `SELECT *` hides.
+    #[test]
+    fn pg_attribute_numbers_a_reserved_sys_column_negatively() {
+        let schema = schema_with_ks_tbl_extra(&[("_sys_ck_", "uuid")]);
+        let rows = rows_of(&pg_attribute(&schema).expect("pg_attribute projects"));
+
+        let attnum = |name: &str| -> i64 {
+            rows.iter()
+                .find(|r| matches!(r.get(1), Value::Text(s) if s == name))
+                .map(|r| match r.get(3) {
+                    Value::Int(n) => *n,
+                    other => panic!("{name}: attnum is not an int: {other:?}"),
+                })
+                .unwrap_or_else(|| panic!("{name} must be listed in pg_attribute"))
+        };
+
+        assert_eq!(
+            attnum("_sys_ck_"),
+            -1,
+            "a reserved column is a system column and takes a negative attnum"
+        );
+        // The user's own columns are unaffected: still 1-based, still contiguous.
+        assert_eq!(attnum("id"), 1);
+        assert_eq!(attnum("name"), 2);
     }
 
     #[test]

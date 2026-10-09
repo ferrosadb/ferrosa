@@ -80,17 +80,15 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   `SELECT ctid FROM t` works in Postgres. `_sys_` is reserved in any casing
   (`ferrosa_common::timeuuid::is_reserved_column_name`), so a future system column
   cannot collide with a user's table.
-  **Done:** the reserved-name rule and the v1 TimeUUID mint (`ferrosa-common`); synthesis
-  in `plan_create_table` and per-row minting on `INSERT`
-  (`ferrosa-postgres/src/synthetic_key.rs`). **Not yet done:** minting on `COPY`, the
-  `SELECT *` filter, `pg_attribute` projecting the column with a negative `attnum`
-  (`catalog.rs::attribute_row` still numbers every column 1-based), and
+  **Done:** the reserved-name rule and the v1 TimeUUID mint (`ferrosa-common`); synthesis in
+  `plan_create_table`; per-row minting on `INSERT` (`ferrosa-postgres/src/synthetic_key.rs`),
+  proven end to end against a synthetic-key fixture; `SELECT *` hiding the column
+  (`result_stream.rs`, filtered only for a star projection, so naming the column still
+  returns it); and `pg_attribute` giving it a **negative `attnum`** with the user's columns
+  still 1..n (`catalog.rs`). **Not yet done:** minting on `COPY`, and
   `ALTER TABLE ... ADD PRIMARY KEY` (not parsed at all today — a later `ADD PRIMARY KEY`
   naming some other column should become a secondary index; naming the synthetic key is a
-  no-op). **No end-to-end test yet** for the INSERT minting: it needs a test fixture for a
-  schema whose partition key is `_sys_ck_` (the existing `schema_with_kv` fixture has a
-  `text` key `k`), so the wiring is gated by compilation and the mint's own unit tests
-  only. See `ferrosa-common`'s README section "Reserved `_sys_` columns".
+  no-op). See `ferrosa-common`'s README section "Reserved `_sys_` columns"
 - **Binary `numeric`** result/param encoding (FMEA PG-7), removing the
   text-bytes fallback.
 - **Real query cancellation** (FMEA PG-8) — mint a real `BackendKeyData`
