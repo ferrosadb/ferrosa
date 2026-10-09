@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::RngExt;
 use tokio::sync::watch;
@@ -99,17 +99,17 @@ pub fn slow_retry_interval() -> Duration {
 }
 
 /// Default number of consecutive send failures on a lane before the lane is
-/// treated as dead.  See [`lane_failure_threshold`].
+/// suspected wedged and probed.  See [`lane_failure_threshold`].
 pub const DEFAULT_LANE_FAILURE_THRESHOLD: u32 = 3;
 
 /// Environment variable overriding [`DEFAULT_LANE_FAILURE_THRESHOLD`]
 /// (positive integer).
 pub const ENV_LANE_FAILURE_THRESHOLD: &str = "FERROSA_NET_LANE_FAILURE_THRESHOLD";
 
-/// Consecutive send failures before a lane is condemned as dead:
+/// Consecutive failures before a lane is suspected wedged:
 /// [`ENV_LANE_FAILURE_THRESHOLD`] or [`DEFAULT_LANE_FAILURE_THRESHOLD`].
 ///
-/// `1` is the footgun setting: it tears a lane down on a single slow request.
+/// `1` is the footgun setting: it probes a lane on a single slow request.
 pub fn lane_failure_threshold() -> u32 {
     static WARNED: AtomicBool = AtomicBool::new(false);
     let n = env_positive(
@@ -120,67 +120,166 @@ pub fn lane_failure_threshold() -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+/// Default span (milliseconds) within which consecutive failures must occur to
+/// count toward the threshold.  See [`lane_failure_window`].
+pub const DEFAULT_LANE_FAILURE_WINDOW_MS: u64 = 30_000;
+
+/// Environment variable overriding [`DEFAULT_LANE_FAILURE_WINDOW_MS`], in
+/// milliseconds (positive integer).
+pub const ENV_LANE_FAILURE_WINDOW_MS: &str = "FERROSA_NET_LANE_FAILURE_WINDOW_MS";
+
+/// Window within which lane send failures accumulate:
+/// [`ENV_LANE_FAILURE_WINDOW_MS`] or [`DEFAULT_LANE_FAILURE_WINDOW_MS`].
+pub fn lane_failure_window() -> Duration {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    Duration::from_millis(env_positive(
+        ENV_LANE_FAILURE_WINDOW_MS,
+        DEFAULT_LANE_FAILURE_WINDOW_MS,
+        &WARNED,
+    ))
+}
+
+/// Default timeout for a lane health probe, in milliseconds.
+pub const DEFAULT_LANE_PROBE_TIMEOUT_MS: u64 = 2_000;
+
+/// Environment variable overriding [`DEFAULT_LANE_PROBE_TIMEOUT_MS`], in
+/// milliseconds (positive integer).
+pub const ENV_LANE_PROBE_TIMEOUT_MS: &str = "FERROSA_NET_LANE_PROBE_TIMEOUT_MS";
+
+/// How long a health probe waits for a reply before calling the peer
+/// unreachable: [`ENV_LANE_PROBE_TIMEOUT_MS`] or
+/// [`DEFAULT_LANE_PROBE_TIMEOUT_MS`].
+pub fn lane_probe_timeout() -> Duration {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    Duration::from_millis(env_positive(
+        ENV_LANE_PROBE_TIMEOUT_MS,
+        DEFAULT_LANE_PROBE_TIMEOUT_MS,
+        &WARNED,
+    ))
+}
+
+/// What the actor must do about a lane, as decided by [`LaneHealth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneAction {
+    /// Nothing to do: the lane is within its failure budget, or a probe or a
+    /// reconnect it already asked for is still running.
+    None,
+    /// Probe the existing connection before disconnecting it. A peer that is
+    /// slow rather than gone answers and keeps its connection.
+    Probe,
+    /// The probe failed: the connection is dead. Perform the `ConnectionLost`
+    /// transition so the backoff/dormant ladder takes over.
+    Reconnect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneVerdict {
+    Healthy,
+    /// A probe is in flight; the lane's fate is undecided.
+    Probing,
+    /// The probe failed. The ladder owns recovery from here.
+    Condemned,
+}
+
 /// Whether a lane's connection is still worth using.
 ///
 /// A half-open connection never produces a clean close, so the alive watcher
 /// never fires and the lane stays `Connected` while **every** RPC times out —
 /// the peer silently receives nothing and the local side never reconnects.
-/// Feeding per-RPC outcomes back in makes that observable: a run of consecutive
-/// failures condemns the lane, and the actor then performs the same transition
-/// `ConnectionLost` would, so the existing backoff/dormant ladder takes over.
+/// Feeding per-RPC outcomes back in makes that observable.
 ///
-/// Only *consecutive* failures condemn. A peer that answers between timeouts is
-/// slow — a GC pause, host contention — not gone, and must not be disconnected.
+/// Detection is deliberately two-stage. A run of consecutive failures *within
+/// the window* only suspends trust: the lane is probed, and a peer that answers
+/// keeps its connection. Only a probe that fails condemns the lane. A peer that
+/// is merely slow — a GC pause, host contention — must not be disconnected, and
+/// only *consecutive* failures count: a trickle of timeouts spread over time
+/// never accumulates into a wedge.
+///
+/// The policy reads no clock of its own; callers pass the observation time, so
+/// the window behaviour is testable.
 #[derive(Debug, Clone)]
 pub struct LaneHealth {
     threshold: u32,
-    consecutive_failures: u32,
-    condemned: bool,
+    /// Failures must fall within this span of the run's first failure to count.
+    /// `Duration::ZERO` disables the time limit (counts indefinitely).
+    window: Duration,
+    failures: u32,
+    first_failure: Option<Instant>,
+    verdict: LaneVerdict,
 }
 
 impl Default for LaneHealth {
     fn default() -> Self {
-        Self::new(lane_failure_threshold())
+        Self::new(lane_failure_threshold(), lane_failure_window())
     }
 }
 
 impl LaneHealth {
-    /// A threshold of `0` would condemn on no evidence at all; treat it as `1`.
-    pub fn new(threshold: u32) -> Self {
+    /// A threshold of `0` would act on no evidence at all; treat it as `1`.
+    pub fn new(threshold: u32, window: Duration) -> Self {
         Self {
             threshold: threshold.max(1),
-            consecutive_failures: 0,
-            condemned: false,
+            window,
+            failures: 0,
+            first_failure: None,
+            verdict: LaneVerdict::Healthy,
         }
     }
 
     /// Record a successful round trip: the connection demonstrably works, so
-    /// clear both the verdict and the run of failures.
-    pub fn record_success(&mut self) {
-        self.consecutive_failures = 0;
-        self.condemned = false;
+    /// clear both the run of failures and any verdict. A successful probe
+    /// resolves the same way, which is what keeps a slow peer connected.
+    pub fn record_success(&mut self, _now: Instant) {
+        self.failures = 0;
+        self.first_failure = None;
+        self.verdict = LaneVerdict::Healthy;
     }
 
-    /// Record a send failure or timeout.
-    ///
-    /// Returns `true` exactly once per condemnation — on the crossing failure —
-    /// so the actor reconnects once rather than once per failing request while a
-    /// dial is already in flight.
-    pub fn record_failure(&mut self) -> bool {
-        if self.condemned {
-            return false;
+    /// Record a send failure or timeout observed at `now`.
+    pub fn record_failure(&mut self, now: Instant) -> LaneAction {
+        if self.verdict != LaneVerdict::Healthy {
+            // A probe or a reconnect is already under way. Starting another
+            // would multiply dials against a peer that is already down.
+            return LaneAction::None;
         }
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        if self.consecutive_failures >= self.threshold {
-            self.condemned = true;
-            return true;
+        if let Some(first) = self.first_failure {
+            if !self.window.is_zero() && now.duration_since(first) > self.window {
+                // The earlier failures are too old to belong to this outage, so
+                // a slow trickle cannot accumulate into a false positive.
+                self.failures = 0;
+                self.first_failure = None;
+            }
         }
-        false
+        if self.first_failure.is_none() {
+            self.first_failure = Some(now);
+        }
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= self.threshold {
+            self.verdict = LaneVerdict::Probing;
+            return LaneAction::Probe;
+        }
+        LaneAction::None
     }
 
-    /// Whether the lane has been condemned as dead and needs a fresh dial.
+    /// Record the outcome of a health probe. Returns [`LaneAction::Reconnect`]
+    /// when this probe's failure condemns the lane, and [`LaneAction::None`] for
+    /// a stale result arriving after the verdict was already resolved.
+    pub fn probe_failed(&mut self) -> LaneAction {
+        if self.verdict == LaneVerdict::Probing {
+            self.verdict = LaneVerdict::Condemned;
+            return LaneAction::Reconnect;
+        }
+        LaneAction::None
+    }
+
+    /// Whether a probe is in flight and the lane's fate is undecided.
+    pub fn is_probing(&self) -> bool {
+        self.verdict == LaneVerdict::Probing
+    }
+
+    /// Whether the probe failed and the lane needs a fresh dial.
     pub fn is_condemned(&self) -> bool {
-        self.condemned
+        self.verdict == LaneVerdict::Condemned
     }
 }
 

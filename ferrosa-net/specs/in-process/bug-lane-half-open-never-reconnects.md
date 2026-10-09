@@ -5,7 +5,8 @@ with no lane-loss event, until the *local* node restarts.
 **Discovered:** 2026-10-09
 **Component:** `ferrosa-net` — `lane_actor.rs` (actor loop + alive watcher),
 `reconnect.rs` (`spawn_alive_watcher`), `pool.rs` / `peer.rs` (pool ownership)
-**Status:** in-process — TDD not started
+**Status:** in-process — probe-first detection implemented and unit-tested;
+**live verification still pending**
 
 ## Symptom
 
@@ -63,36 +64,56 @@ Pure-logic first, following the `seeds_to_connect` precedent: extract the
 decision into a function that takes state and returns a decision, so the actor
 loop's policy is testable without I/O.
 
-- [ ] `LaneHealth::record_success` clears the consecutive-failure run
-- [ ] `LaneHealth::record_timeout` below the threshold does not condemn the lane
-- [ ] reaching the threshold condemns the lane exactly once (not on every later failure)
-- [ ] a success after a condemned-but-unswapped lane re-arms it
-- [ ] interleaved successes and timeouts never condemn (only *consecutive* failures do)
-- [ ] threshold is read from `FERROSA_NET_LANE_FAILURE_THRESHOLD`; unset ⇒ default
-- [ ] malformed / zero / negative threshold falls back to the default and warns once
-- [ ] the new knobs are independent: setting one malformed must not move the other
-- [ ] control: the existing clean-close path still transitions via `ConnectionLost`
-- [ ] control: `mark_failed_transitions_through_exhaustion_to_dormant` stays green (ordering unchanged)
+Done (10 tests, pure logic, no sockets):
+
+- [x] below the threshold takes no action
+- [x] reaching the threshold asks for a **probe**, not a disconnect
+- [x] a failed probe returns `Reconnect` and condemns the lane
+- [x] a probe that answers keeps a slow peer connected and re-arms the counter
+- [x] never re-probes or re-reconnects while one is already in flight (a stale probe result is ignored)
+- [x] only *consecutive* failures count — a success clears the run
+- [x] interleaved successes never probe
+- [x] failures spread beyond the window do not accumulate
+- [x] failures inside the window do accumulate
+- [x] a zero window means no time limit (the guard is not permanently disarmed)
+- [x] control: `mark_failed_transitions_through_exhaustion_to_dormant` stays green
+
+Still to do:
+
+- [ ] threshold is read from `FERROSA_NET_LANE_FAILURE_THRESHOLD`; a malformed / zero /
+      negative value falls back to the default and warns once (needs an
+      env-mutating test guarded by a process-wide mutex)
+- [ ] the three knobs are independent: setting one malformed must not move the others
+- [ ] **live verification**: wedge a lane on a real cluster and watch it probe,
+      condemn, reconnect, and re-drive the dropped Applies
 
 ## Config surface (user directive: sizing values are tunables, not constants)
 
 Follow the existing `parse_positive` / `env_positive` pattern in `reconnect.rs`
 so a malformed value warns once and falls back rather than panicking.
 
-- `FERROSA_NET_LANE_FAILURE_THRESHOLD` — consecutive send failures before the
-  lane is condemned as dead (default 3; `1` is the footgun setting that makes a
-  single slow request tear the lane down).
-- `FERROSA_NET_LANE_FAILURE_WINDOW_MS` — optional: only count failures within
-  this window, so a slow trickle of timeouts hours apart never accumulates into
-  a false positive.
+All three follow the existing `parse_positive` / `env_positive` pattern, so an
+unusable value warns once and falls back rather than panicking.
 
-## Open question for the operator
+- `FERROSA_NET_LANE_FAILURE_THRESHOLD` — consecutive send failures within the
+  window before the lane is probed (default 3; `1` is the footgun setting that
+  probes on a single slow request).
+- `FERROSA_NET_LANE_FAILURE_WINDOW_MS` — span within which consecutive failures
+  must occur to count (default 30000), so a trickle of timeouts minutes apart
+  never accumulates into a false positive.
+- `FERROSA_NET_LANE_PROBE_TIMEOUT_MS` — how long a probe waits for a reply before
+  calling the peer unreachable (default 2000).
 
-Should the recovery action be a full re-dial (current `ConnectionLost`
-semantics) or a **health probe** first, so a peer that is merely slow (rather
-than gone) is not disconnected? Re-dial is simpler and matches the existing
-ladder; probing is kinder under GC pauses or host contention. This changes the
-shape of the fix and should be decided before implementation.
+## Decision: probe first
+
+A wedged lane is **probed before it is disconnected**. A peer that is merely slow
+— a GC pause, host contention — answers the probe and keeps its connection; only
+a probe that fails hands the lane to the ladder. Detection is therefore
+two-stage, and the pure value exposes it as `LaneAction::{None, Probe,
+Reconnect}` rather than a bool.
+
+Lane RPC and per-host pooling stay **separate**: they carry different priorities,
+so routing lane RPCs through `PriorityPool` is explicitly not part of this fix.
 
 ## Not the cause (ruled out with evidence)
 
