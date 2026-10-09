@@ -165,6 +165,19 @@ impl AccordStateMachine {
         self.apply_engine.register_postgres_mvcc_observer(observer)
     }
 
+    /// Prune the dep-wait graph so a test can reproduce the hole where an applied
+    /// transaction is evicted while a later transaction still names it.
+    #[cfg(test)]
+    pub fn prune_graph_for_test(&self, max_age: std::time::Duration) -> usize {
+        self.apply_engine.prune_graph_for_test(max_age)
+    }
+
+    /// How many transactions the dep-wait graph believes are applied.
+    #[cfg(test)]
+    pub fn applied_count_for_test(&self) -> usize {
+        self.apply_engine.applied_count_for_test()
+    }
+
     /// Create a new state machine for the given node.
     ///
     /// Uses a [`NoopStorageApplier`]: the apply seam records `(txn_id, t)` but
@@ -907,9 +920,25 @@ impl AccordStateMachine {
         // Wait only for dependencies that execute BEFORE this transaction. The
         // dependency set was computed from `t0`, so it can name a transaction
         // whose final `t` was bumped past ours; that one waits for us (CL-28).
+        //
+        // Also drop every dependency this replica holds no live state for. Such a
+        // dependency can never become applied here: it was either applied and then
+        // pruned (`prune_applied` forgets the `TxnState` and leaves only a
+        // `finalized` tombstone) or it never registered at all. The dep-wait graph
+        // forgets the same transaction on its own retention timer, so
+        // `graph.is_applied(dep)` stays false forever and nothing can ever resolve
+        // it — the waiter then parks until its bound expires and is abandoned.
+        // Measured live: ~30% of explicit transactions hit the bound and 4 of 4
+        // retries never committed.
+        //
+        // The read path already refuses to wait on such a dependency
+        // (`unapplied_conflicts_before`: "Applied / pruned: already applied — never
+        // waited on"); the apply path must not be stricter than the read path.
+        // Filtering before the graph sees the set is the whole fix: no extra lock,
+        // no clone of any state, and the existing allocation is reused.
         let deps: Vec<TxnId> = deps
             .into_iter()
-            .filter(|dep| !self.executes_after(dep, &t))
+            .filter(|dep| !self.executes_after(dep, &t) && self.txn_states.contains_key(dep))
             .collect();
 
         // Drop no-write entries (empty payloads): a key the replica owns but for
@@ -1498,6 +1527,65 @@ mod tests {
         );
     }
 
+    /// A dependency this replica holds no live state for must not park its waiter.
+    ///
+    /// `prune_applied` forgets an applied transaction's `TxnState` and leaves only a
+    /// `finalized` tombstone; the dep-wait graph separately evicts the same
+    /// transaction from its `applied` set on a retention timer. Once both have
+    /// forgotten it, `graph.is_applied(dep)` is false forever and nothing can ever
+    /// resolve it — so the waiter parks until its bound expires and is then
+    /// abandoned. Measured live: ~30% of explicit transactions hit the bound and 4
+    /// of 4 retries never committed.
+    ///
+    /// The read path already refuses to wait on such a dependency
+    /// (`unapplied_conflicts_before`: "Applied / pruned: already applied — never
+    /// waited on"). The apply path must not be stricter than the read path.
+    #[test]
+    fn a_dependency_forgotten_by_both_state_and_graph_does_not_park_the_waiter() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let applier = Arc::new(CapturingApplier::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer, applier.clone());
+
+        let forgotten = txn(9, 900);
+        let waiter = txn(2, 2000);
+        let key = b"forgotten-dep-key";
+
+        sm.handle_preaccept(forgotten, ts(900), key, BallotNumber(0), 0);
+        sm.handle_accept(forgotten, ts(900), ts(901), vec![], BallotNumber(1));
+        sm.handle_commit(forgotten, ts(900), ts(901), vec![]);
+        sm.handle_apply_writeset(forgotten, Vec::new());
+        assert_eq!(
+            sm.get_state(&forgotten).unwrap().phase,
+            TxnPhase::Applied,
+            "precondition: it applied here"
+        );
+
+        sm.prune_applied();
+        assert!(
+            sm.get_state(&forgotten).is_none(),
+            "prune_applied must forget the state"
+        );
+        sm.prune_graph_for_test(std::time::Duration::ZERO);
+        assert_eq!(
+            sm.applied_count_for_test(),
+            0,
+            "the graph must have forgotten it too, or this test proves nothing"
+        );
+
+        sm.handle_preaccept(waiter, ts(2000), key, BallotNumber(0), 0);
+        sm.handle_accept(waiter, ts(2000), ts(2001), vec![forgotten], BallotNumber(1));
+        sm.handle_commit(waiter, ts(2000), ts(2001), vec![forgotten]);
+
+        sm.handle_apply_writeset(waiter, vec![b"write-waiter".to_vec()]);
+
+        let ids: Vec<_> = applier.captured().iter().map(|(id, _, _)| *id).collect();
+        assert!(
+            ids.contains(&waiter),
+            "a dependency forgotten by both the state machine and the graph can never be \
+             applied here, so it must not park the waiter; got {ids:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
@@ -1776,12 +1864,18 @@ mod tests {
         let writer = Arc::new(MockSyncWriter::new());
         let mut sm = AccordStateMachine::with_applier(1, writer, capturing.clone());
 
-        let absent_dependency = txn(2, 1000);
+        // The dependency the waiter parks on must be REGISTERED here. A
+        // transaction this replica holds no state for can never be applied here,
+        // so it is not something the waiter can or should wait on — see
+        // `a_dependency_forgotten_by_both_state_and_graph_does_not_park_the_waiter`.
+        // Registering it is what makes this a genuine park.
+        let registered_dependency = txn(2, 1000);
         let waiting_txn = txn(1, 1001);
         let t0 = ts(1001);
         let mutation = b"dependent-write".to_vec();
+        sm.handle_preaccept(registered_dependency, ts(1000), b"key", BallotNumber(0), 0);
         sm.handle_preaccept(waiting_txn, t0, b"key", BallotNumber(0), 0);
-        sm.handle_commit(waiting_txn, t0, ts(1002), vec![absent_dependency]);
+        sm.handle_commit(waiting_txn, t0, ts(1002), vec![registered_dependency]);
 
         sm.handle_apply_writeset(waiting_txn, vec![mutation.clone()]);
         assert_eq!(
@@ -1791,25 +1885,32 @@ mod tests {
         );
         assert!(capturing.captured().is_empty());
 
-        assert!(matches!(
-            sm.handle_apply_writeset(absent_dependency, vec![b"unexpected-write".to_vec()]),
-            SmResponse::None
-        ));
-        assert_eq!(
-            sm.get_state(&waiting_txn).unwrap().phase,
-            TxnPhase::Committed,
-            "a missing dependency with mutation bytes must not be treated as a no-write"
+        // The no-state arm's own contract is separate from the park: a real write
+        // for a transaction this replica never registered must NOT be acknowledged
+        // (an ApplyOK would claim durability it does not have), and an explicit
+        // no-write finalize for it is terminal.
+        let unregistered = txn(9, 999);
+        assert!(
+            matches!(
+                sm.handle_apply_writeset(unregistered, vec![b"unexpected-write".to_vec()]),
+                SmResponse::None
+            ),
+            "a write for a transaction this replica never registered must not be acknowledged"
         );
-
         assert!(matches!(
-            sm.handle_apply_writeset(absent_dependency, Vec::new()),
+            sm.handle_apply_writeset(unregistered, Vec::new()),
             SmResponse::NoWriteFinalized
         ));
+
+        // The registered dependency resolves — an empty Apply carries no write for
+        // it — and releases its waiter. Its wire variant differs from the no-state
+        // arm's (pinned above); what this test is about is that the park is released.
+        sm.handle_apply_writeset(registered_dependency, Vec::new());
 
         assert_eq!(
             sm.get_state(&waiting_txn).unwrap().phase,
             TxnPhase::Applied,
-            "an absent dependency finalized as no-write must release dependent writes"
+            "a dependency finalized as no-write must release dependent writes"
         );
         assert_eq!(capturing.captured(), [(waiting_txn, mutation, ts(1002))]);
     }

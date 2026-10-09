@@ -4341,6 +4341,9 @@ mod tests {
         let dependency = TxnId::new(3, Timestamp::synthetic(1));
         let commit_t = Timestamp::synthetic(2);
         crate::accord::handlers::on_state_machine(&local_state, move |sm| {
+            // Register the dependency: a transaction this replica holds no state
+            // for can never be applied here, so it would not create a park at all.
+            sm.handle_preaccept(dependency, dependency.0, b"key", BallotNumber(0), 0);
             sm.handle_preaccept(txn_id, txn_id.0, b"key", BallotNumber(0), 0);
             sm.handle_commit(txn_id, txn_id.0, commit_t, vec![dependency]);
         })
@@ -4424,6 +4427,9 @@ mod tests {
         let dependency = TxnId::new(3, Timestamp::synthetic(1));
         let commit_t = Timestamp::synthetic(2);
         crate::accord::handlers::on_state_machine(&local_state, move |sm| {
+            // Register the dependency: a transaction this replica holds no state
+            // for can never be applied here, so it would not create a park at all.
+            sm.handle_preaccept(dependency, dependency.0, b"key", BallotNumber(0), 0);
             sm.handle_preaccept(txn_id, txn_id.0, b"key", BallotNumber(0), 0);
             sm.handle_commit(txn_id, txn_id.0, commit_t, vec![dependency]);
         })

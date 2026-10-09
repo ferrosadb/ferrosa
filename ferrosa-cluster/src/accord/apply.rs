@@ -692,6 +692,19 @@ impl DepWaitApplier {
 
     /// Install the PostgreSQL MVCC observer on the storage applier that this
     /// replica actually uses for Accord Apply.
+    /// Prune the dep-wait graph's `applied`/`aborted` sets. Test-only: production
+    /// prunes the graph from its maintenance loop.
+    #[cfg(test)]
+    pub fn prune_graph_for_test(&self, max_age: std::time::Duration) -> usize {
+        self.graph.lock().prune(max_age)
+    }
+
+    /// Number of transactions the graph currently believes are applied.
+    #[cfg(test)]
+    pub fn applied_count_for_test(&self) -> usize {
+        self.graph.lock().applied_count()
+    }
+
     pub fn register_postgres_mvcc_observer(
         &self,
         observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
