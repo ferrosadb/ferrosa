@@ -32,7 +32,13 @@ in-memory table in tests and by Ferrosa storage in production.
   [WHERE <bool-expr>] [GROUP BY ...] [HAVING <bool-expr>]
   [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET m]` — one inner equi-join only.
 - No-`FROM` scalar selects: `SELECT 1`, `SELECT version()` (zero-arg func),
-  `SELECT $1`, `SELECT TRUE`.
+  `SELECT $1`, `SELECT TRUE`, and `||` string concatenation over those scalars
+  (`SELECT 'a' || 'b'`, `SELECT 'a' || $1 || current_database()`). `||` is
+  left-associative, evaluates to `text`, and propagates NULL (NULL on either
+  side ⇒ NULL, which is *not* the empty string). The `SELECT` list is still not a
+  general expression grammar: `||` over a `FROM` relation
+  (`SELECT name || '!' FROM t`) and every other select-list expression form is
+  refused by name (`ParseError::UnsupportedSelectExpr`).
 - DML (single-row, key-equality WHERE): `INSERT INTO t (cols) VALUES (...)`,
   `UPDATE t SET ... WHERE k = v [AND ...]`, `DELETE FROM t WHERE k = v [AND ...]`.
 - PG DDL (T-130, D10), **parsed only** (no execution or schema creation yet; the
