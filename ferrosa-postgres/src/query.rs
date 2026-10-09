@@ -1430,6 +1430,20 @@ fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, B
     }
 }
 
+/// Coerce numeric text (`[-]ddd[.ddd][e[+-]dd]`) into a [`CqlValue::Decimal`],
+/// reusing [`parse_numeric_text`] — the SAME parser the numeric text-parameter
+/// path and the jsonb text-input path use. A value that is not a valid numeric
+/// fails loud (`22P02`, invalid_text_representation) rather than guessing one.
+fn decimal_from_numeric_text(text: &str) -> Result<CqlValue, BackendMessage> {
+    match parse_numeric_text(text) {
+        Some(SqlValue::Numeric { unscaled, scale }) => Ok(CqlValue::Decimal { scale, unscaled }),
+        _ => Err(error_response(
+            "22P02",
+            &format!("invalid input syntax for type numeric: \"{text}\""),
+        )),
+    }
+}
+
 /// Convert a SQL [`SqlValue`] literal to the [`CqlValue`] the engine stores,
 /// driven by the target column's [`CqlType`]. The inverse of
 /// `storage_provider::cql_to_value`; `Null` maps to a tombstone for any type,
@@ -1478,6 +1492,23 @@ pub(crate) fn value_to_cql(
             scale: *scale,
             unscaled: unscaled.clone(),
         },
+        // A numeric/decimal column takes an integer literal widened exactly, at
+        // scale 0 — PostgreSQL coerces an untyped integer literal to `numeric`.
+        (CqlType::Decimal, SqlValue::Int(i)) => CqlValue::Decimal {
+            scale: 0,
+            unscaled: (*i).into(),
+        },
+        // A decimal literal is lowered by the SQL front-end to `f64`. Recover its
+        // shortest round-trip decimal text and parse it with the SAME routine the
+        // numeric text-parameter and jsonb text-input paths use, so `1.5` binds as
+        // unscaled 15 / scale 1 rather than being refused.
+        (CqlType::Decimal, SqlValue::Float(f)) => {
+            decimal_from_numeric_text(&f.into_inner().to_string())?
+        }
+        // A value that arrives as TEXT — an untyped string literal, or a COPY FROM
+        // STDIN payload cell — is parsed into a decimal exactly like a numeric
+        // parameter. A non-numeric string fails loud (22P02), never a silent guess.
+        (CqlType::Decimal, SqlValue::Text(s)) => decimal_from_numeric_text(s)?,
         (CqlType::Varint, SqlValue::Numeric { unscaled, scale }) if *scale == 0 => {
             CqlValue::Varint(unscaled.clone())
         }
@@ -3444,6 +3475,58 @@ mod tests {
         .is_err());
     }
 
+    /// A numeric/decimal column must take the literals PostgreSQL widens to
+    /// `numeric`: an integer literal (exact, scale 0) and a decimal literal
+    /// (`1.5` → unscaled 15, scale 1). A value that reaches the binder as TEXT —
+    /// an untyped string literal, or a COPY FROM STDIN payload cell — parses the
+    /// same way. This is a WIDENING of the accepted set, not a loosening of the
+    /// type check: a non-numeric string and an unrelated scalar are still refused.
+    #[test]
+    fn value_to_cql_widens_integer_and_decimal_literals_to_decimal() {
+        use ferrosa_common::CqlValue as C;
+        let limits = crate::jsonb_wire::test_limits();
+        let dec = |v: &SqlValue| value_to_cql(v, &CqlType::Decimal, &limits);
+
+        // An integer literal widens exactly, at scale 0.
+        assert_eq!(
+            dec(&SqlValue::Int(1)).unwrap(),
+            C::Decimal {
+                scale: 0,
+                unscaled: 1.into()
+            }
+        );
+        // A decimal literal keeps its fraction (`1.5` → unscaled 15, scale 1).
+        assert_eq!(
+            dec(&SqlValue::float(1.5)).unwrap(),
+            C::Decimal {
+                scale: 1,
+                unscaled: 15.into()
+            }
+        );
+        // A negative decimal literal round-trips through f64 exactly.
+        assert_eq!(
+            dec(&SqlValue::float(-2.25)).unwrap(),
+            C::Decimal {
+                scale: 2,
+                unscaled: (-225).into()
+            }
+        );
+        // A value arriving as TEXT parses the same way (COPY path, string literal).
+        assert_eq!(
+            dec(&SqlValue::Text("2.25".into())).unwrap(),
+            C::Decimal {
+                scale: 2,
+                unscaled: 225.into()
+            }
+        );
+
+        // Negative control: a non-numeric string must STILL be refused, loudly.
+        assert!(dec(&SqlValue::Text("abc".into())).is_err());
+        // And a scalar of an unrelated type for a numeric column is still a mismatch.
+        assert!(dec(&SqlValue::Bool(true)).is_err());
+        assert!(dec(&SqlValue::Text("1.2.3".into())).is_err());
+    }
+
     #[test]
     fn scalar_select_unsupported_function_fails_loud() {
         // An unmodeled function errors (0A000) rather than guessing a value.
@@ -3702,6 +3785,83 @@ mod txn_buffer_tests {
         let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
         engine.register_table(kv_storage_schema()).unwrap();
         let schema = schema_with_kv();
+        (dir, engine, schema)
+    }
+
+    /// The Cassandra marshal name a PostgreSQL `numeric`/`decimal` column stores.
+    fn decimal_marshal() -> &'static str {
+        "org.apache.cassandra.db.marshal.DecimalType"
+    }
+
+    fn num_storage_schema() -> ferrosa_common::schema::TableSchema {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        TableSchema {
+            keyspace: "public".to_string(),
+            table: "num".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "n".to_string(),
+                type_name: decimal_marshal().to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// Schema with keyspace `public` and table `num(k text PK, n decimal)` — the shape a
+    /// PostgreSQL `numeric` column takes, so a literal INSERT is coerced end to end.
+    fn schema_with_decimal() -> Schema {
+        let schema = Schema::new(schema_config()).expect("schema bootstraps");
+        let auth = superuser();
+        schema
+            .create_keyspace(
+                KeyspaceMetadata {
+                    name: "public".to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: {
+                            let mut o = HashMap::new();
+                            o.insert("replication_factor".to_string(), "1".to_string());
+                            o
+                        },
+                    },
+                },
+                &auth,
+            )
+            .expect("create keyspace public");
+        let mut cols = IndexMap::new();
+        cols.insert(
+            "k".to_string(),
+            column("k", ColumnKind::PartitionKey, "text"),
+        );
+        cols.insert("n".to_string(), column("n", ColumnKind::Regular, "decimal"));
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "num".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: cols,
+                    partition_key: vec!["k".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .expect("create table num");
+        schema
+    }
+
+    async fn new_engine_with_decimal() -> (tempfile::TempDir, Arc<StorageEngine>, Schema) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine.register_table(num_storage_schema()).unwrap();
+        let schema = schema_with_decimal();
         (dir, engine, schema)
     }
 
@@ -4044,6 +4204,84 @@ mod txn_buffer_tests {
         for key in &keys {
             Uuid::parse_str(key).unwrap_or_else(|e| panic!("{key} is not a uuid: {e}"));
         }
+
+        engine.shutdown().unwrap();
+    }
+
+    /// The bug: `INSERT INTO t (k, n) VALUES ('a', 1)` into a `numeric` column failed
+    /// `42804 value does not match column type Decimal`. PostgreSQL widens an integer
+    /// literal to `numeric`, parses a decimal literal (`1.5`) into it, and coerces its
+    /// text form — the shape a COPY FROM STDIN payload cell arrives in. This exercises
+    /// the whole path: parse → `resolve_dml_value` → `value_to_cql` → engine write.
+    #[tokio::test]
+    async fn inserting_integer_and_decimal_literals_into_a_numeric_column_works() {
+        let (_dir, engine, schema) = new_engine_with_decimal().await;
+        let limits = crate::jsonb_wire::test_limits();
+
+        // Integer literal, decimal literal, negative decimal, and the TEXT form.
+        for (k, n) in [("a", "1"), ("b", "1.5"), ("c", "-2.25"), ("d", "'3.0'")] {
+            let msgs = execute_query(
+                &engine,
+                &schema,
+                &format!("INSERT INTO num (k, n) VALUES ('{k}', {n})"),
+                "public",
+                &limits,
+                None,
+            )
+            .await;
+            assert!(
+                !msgs
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+                "INSERT of numeric literal {n} must succeed: {msgs:?}"
+            );
+        }
+
+        // The decimal round-trips: read back the row keyed 'b' and see `1.5`.
+        let read = execute_query(
+            &engine,
+            &schema,
+            "SELECT n FROM num WHERE k = 'b'",
+            "public",
+            &limits,
+            None,
+        )
+        .await;
+        let cell = read
+            .iter()
+            .find_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(
+                    String::from_utf8_lossy(columns[0].as_deref().unwrap_or_default()).into_owned(),
+                ),
+                _ => None,
+            })
+            .expect("a row must come back");
+        assert_eq!(cell, "1.5", "the decimal must round-trip: {read:?}");
+
+        engine.shutdown().unwrap();
+    }
+
+    /// Negative control: widening `numeric` to accept integer/decimal literals must NOT
+    /// accept a non-numeric string. `'abc'` into a `numeric` column is refused, loudly.
+    #[tokio::test]
+    async fn inserting_a_non_numeric_string_into_a_numeric_column_is_refused() {
+        let (_dir, engine, schema) = new_engine_with_decimal().await;
+        let limits = crate::jsonb_wire::test_limits();
+
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO num (k, n) VALUES ('x', 'abc')",
+            "public",
+            &limits,
+            None,
+        )
+        .await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "a non-numeric string into a numeric column must be refused: {msgs:?}"
+        );
 
         engine.shutdown().unwrap();
     }

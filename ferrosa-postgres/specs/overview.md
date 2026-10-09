@@ -146,6 +146,14 @@ OID 0 (unspecified) is taken as UTF-8 text; nothing becomes NULL on error.
 The storage value bridge (`cql_to_value`) maps supported CQL scalars onto this
 model and reports a scan error for values without a representation.
 
+DML literals bind through `query::value_to_cql`, coercing each value to its target
+column's CQL type. A `numeric` column accepts an integer literal (widened at scale
+0) and a decimal literal (recovered from its shortest round-trip text, `1.5` →
+unscaled 15 / scale 1), plus a value arriving as TEXT — an untyped string literal or
+a COPY FROM STDIN payload cell — via the same `parse_numeric_text` the numeric
+text-parameter path uses. The accepted set is widened, not loosened: a non-numeric
+string into `numeric` is `22P02`, and any other type mismatch is `42804`.
+
 ## Key invariants
 
 ## PostgreSQL MVCC resource bounds

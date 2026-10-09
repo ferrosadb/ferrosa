@@ -119,6 +119,15 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   UPDATE/DELETE are Cassandra-style blind
   upserts/tombstones keyed by a full-primary-key equality `WHERE` (reported as
   `UPDATE 1` / `DELETE 1`).
+- **Literal → column coercion (`query::value_to_cql`)** — a DML value is coerced
+  to its target column's CQL type. A `numeric`/`decimal` column takes an integer
+  literal, widened exactly at scale 0 (`1`), and a decimal literal, recovered from
+  its shortest round-trip text (`1.5` → unscaled 15, scale 1); a value that arrives
+  as TEXT — an untyped string literal, or a COPY FROM STDIN payload cell — parses
+  through the SAME routine the numeric text-parameter path uses. Widening is never
+  loosening: a non-numeric string into `numeric` is refused `22P02`
+  (`invalid_text_representation`) and any other type mismatch `42804`, never a
+  silent guess.
 - **`pg_catalog` projection** — `catalog` projects `pg_namespace`/`pg_class`/
   `pg_attribute`/`pg_type` from live schema metadata with deterministic OIDs.
 - **TCP server** — `serve` / `QueryContext`: one spawned task per connection over

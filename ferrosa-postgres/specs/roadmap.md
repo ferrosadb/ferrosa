@@ -13,6 +13,15 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
+- **Numeric/decimal literal binding in DML.** `INSERT INTO t (a, b) VALUES (1, 1.5)`
+  into a `numeric` column failed `42804 value does not match column type Decimal`,
+  which blocked `pgbench -i` and the PostgreSQL smoke check. `query::value_to_cql`
+  now widens an integer literal (scale 0) and a decimal literal (recovered from its
+  shortest round-trip text) to `CqlValue::Decimal`, and parses a TEXT value — an
+  untyped string literal, or a COPY FROM STDIN payload cell — with the same
+  `parse_numeric_text` the numeric text-parameter path uses. A non-numeric string is
+  still refused `22P02`; the type check is widened, not loosened.
+
 - **PK-less `CREATE TABLE` end to end.** A table that declares no `PRIMARY KEY` gets a
   synthetic `_sys_ck_` column (a v1 TimeUUID, reported as `uuid`) as its partition key, so
   every row is unique by construction. The front end mints a key per row on `INSERT`; the
