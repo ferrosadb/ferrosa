@@ -29,6 +29,7 @@ pub mod key;
 pub mod murmur3;
 pub mod schema;
 pub mod task_pool;
+pub mod timeuuid;
 pub mod token;
 
 #[cfg(feature = "test-generators")]
