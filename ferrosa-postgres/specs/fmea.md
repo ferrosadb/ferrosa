@@ -17,7 +17,9 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 - **DML/DQL:** `SELECT` (single `JOIN`, `WHERE`, `GROUP BY`, `ORDER BY`,
   `LIMIT`, aggregates), no-`FROM` scalar selects, and **single-row** `INSERT` /
   `UPDATE` / `DELETE` (key-equality `WHERE`, Cassandra-style blind
-  upsert/tombstone).
+  upsert/tombstone). A `numeric`/`decimal` target takes an integer literal, a
+  decimal literal, and a TEXT value (untyped string literal / COPY FROM STDIN
+  cell); a non-numeric string is refused `22P02`, any other mismatch `42804`.
 - **Protocols:** simple (`Q`) and extended (`Parse`/`Bind`/`Describe`/`Execute`/
   `Sync`/`Close`); prepared `SELECT` **and parameterized `INSERT`/`UPDATE`/
   `DELETE`**; text + binary param/result formats; `$N` type inference for
