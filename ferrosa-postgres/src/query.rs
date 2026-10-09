@@ -1590,10 +1590,6 @@ pub(crate) async fn execute_insert(
     let mut col_values: HashMap<String, CqlValue> = HashMap::new();
     let mut sql_values: HashMap<String, SqlValue> = HashMap::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    // Multi-row INSERT: every row must be written, and the statement announces
-    // ONE result. A partial implementation that wrote row 1 and dropped rows 2..N
-    // would be worse than failing, which is why this was a hard `0A000` guard
-    // until the loop below existed.
     // Multi-row INSERT is PARSED but must not be EXECUTED yet.
     //
     // The loop below handles N rows correctly in-process (its unit test writes all
@@ -1612,6 +1608,11 @@ pub(crate) async fn execute_insert(
         )];
     }
 
+    // WHEN EXECUTION IS RE-ENABLED, FIX THIS FIRST: `col_values`, `sql_values` and
+    // `regular_cells` above are declared OUTSIDE this loop, so they persist across
+    // rows — `regular_cells` is never cleared and accumulates every earlier row's
+    // cells. They must be created inside the loop, per row.
+    //
     // The statement's own tag: one INSERT of N rows, not N INSERTs of one.
     let tag = format!("INSERT 0 {}", ins.rows.len());
     let mut combined_returning: Option<QueryResult> = None;
