@@ -303,12 +303,21 @@ impl AccordCoordinator {
             return CoordinatorDecision::Pending;
         }
 
-        assert_eq!(
-            self.phase,
-            CoordinatorPhase::PreAccepting,
-            "handle_preaccept_ok called in wrong phase: {:?}",
-            self.phase
-        );
+        // The round has already left PreAccepting. That happens when a slow
+        // quorum answered and `finalize_preaccept` advanced to Accepting while a
+        // third replica's PreAcceptOK was still in flight — a replica can answer
+        // late under load or retries. Such a vote may no longer influence this
+        // round's decision, so it is IGNORED rather than panicked on. Panicking
+        // here killed the writer task, which surfaced as `Accord apply quorum
+        // unavailable` and a lost PostgreSQL connection on a healthy cluster.
+        if self.phase != CoordinatorPhase::PreAccepting {
+            tracing::debug!(
+                from = response.from,
+                phase = ?self.phase,
+                "accord: ignoring a late PreAcceptOK after the round left PreAccepting"
+            );
+            return CoordinatorDecision::Pending;
+        }
 
         // Networks and transports may retry a response. A replica can only
         // contribute one vote to this phase, and retries must not influence
@@ -2991,6 +3000,54 @@ mod tests {
         );
         assert_eq!(coord.rtt_count(), 1);
         assert_eq!(coord.phase, CoordinatorPhase::FastPathCommit);
+    }
+
+    #[test]
+    fn late_preaccept_ok_after_the_round_left_preaccepting_is_ignored_not_panicked() {
+        // RF=3, coordinator node 1, non-leaseholder. Two replicas answer (a slow
+        // quorum), both agreeing on t0, so the round cannot complete on the fast
+        // path and `finalize_preaccept` moves it to Accepting.
+        let t0 = make_ts(1000);
+        let txn_id = make_txn_id(1, 1000);
+        let mut coord = AccordCoordinator::new(txn_id, t0, b"key1".to_vec(), 1, 3, false);
+
+        assert_eq!(
+            coord.handle_preaccept_ok(PreAcceptResponse {
+                from: 1,
+                t: t0,
+                deps: vec![]
+            }),
+            CoordinatorDecision::Pending
+        );
+        assert_eq!(
+            coord.handle_preaccept_ok(PreAcceptResponse {
+                from: 2,
+                t: t0,
+                deps: vec![]
+            }),
+            CoordinatorDecision::Pending
+        );
+        assert!(matches!(
+            coord.finalize_preaccept(),
+            CoordinatorDecision::NeedAccept { .. }
+        ));
+        assert_eq!(coord.phase, CoordinatorPhase::Accepting);
+
+        // A late PreAcceptOK now arrives from a replica that had not voted. The
+        // round has left PreAccepting, so this vote may no longer influence the
+        // decision. It must be IGNORED, not panic the coordinator thread — the
+        // panic (`handle_preaccept_ok called in wrong phase`) killed the writer
+        // task, which surfaced as `Accord apply quorum unavailable` and a lost
+        // PostgreSQL connection.
+        assert_eq!(
+            coord.handle_preaccept_ok(PreAcceptResponse {
+                from: 3,
+                t: t0,
+                deps: vec![]
+            }),
+            CoordinatorDecision::Pending
+        );
+        assert_eq!(coord.phase, CoordinatorPhase::Accepting);
     }
 
     #[test]
