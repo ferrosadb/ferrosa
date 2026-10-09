@@ -359,7 +359,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   both legacy flat SSTable components and restored generation directories.
   Periodic sync publishes a generation only when all four required components
   (`Data.db`, `Partitions.db`, `Rows.db`, and `Filter.db`) are present; component
-  presence is the invariant, so a valid zero-byte `Rows.db` is uploaded.
+  presence is the invariant, so a valid zero-byte `Rows.db` is uploaded. `Rows.db`
+  is a MANDATORY BTI component (row index, listed in TOC.txt), so an absent one is
+  corruption, not an optional gap — the generation is withheld and never uploaded,
+  never worked around (ST-91).
   **Wired into the flush path.**
 - **Object-store backend** (`upload/config.rs`) — `ObjectStoreConfig` selects
   the durable backend. Default is S3-compatible (`AmazonS3Builder`, ETag CAS).

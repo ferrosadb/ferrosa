@@ -128,8 +128,10 @@ volume or changing query results.
    PR CI; a larger randomized sweep is in `mod slow`.
    Periodic S3 sync skips incomplete generations before upload or manifest
    publication: all four required components (`Data.db`, `Partitions.db`,
-   `Rows.db`, and `Filter.db`) must be present. This is a presence check;
-   zero-byte `Rows.db` is a valid component.
+   `Rows.db`, and `Filter.db`) must be present. This is a presence check; a
+   zero-byte `Rows.db` is valid, but an ABSENT one is corruption — `Rows.db` is a
+   mandatory BTI component (row index, listed in TOC.txt) — so the generation is
+   withheld and never uploaded, never synthesized or worked around.
    **Exception — local `file://` backend** (`FERROSA_LOCAL_STORE_PATH` /
    `[s3].local_path`): the local disk *is* the authoritative durable store, so
    `ObjectStoreConfig::is_local()` is threaded into `LocalCache` as `durable` and

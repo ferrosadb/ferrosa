@@ -1626,6 +1626,16 @@ pub struct StorageEngine {
     /// sync, compaction retry, and operator-triggered syncs can otherwise race
     /// from the same manifest snapshot and re-upload the same SSTables.
     s3_sync_running: AtomicBool,
+    /// Generations a prior sync pass found missing at least one
+    /// `REQUIRED_SSTABLE_COMPONENTS` file, mapped to exactly which components
+    /// were absent. Such a generation cannot be uploaded yet, so re-scanning and
+    /// re-warning about it on every pass is pure churn — one live node emitted
+    /// ~95 `skipping incomplete SSTable generation` WARNs every 30 s for 122 such
+    /// generations, 99 % of its log. Storing the missing set (not just the key)
+    /// lets a later pass re-verify only those few files, so a generation that
+    /// gains its missing component is still uploaded. Keyed by
+    /// `table_id/generation`; pruned once the generation leaves disk.
+    incomplete_generations: parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>,
     /// Edge state for the "hot tables alone keep the cache over its limit"
     /// warning: true while the last eviction pass was blocked by hot data.
     cache_hot_blocked: AtomicBool,
@@ -3361,6 +3371,7 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -3622,6 +3633,7 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -3868,6 +3880,7 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -14154,6 +14167,36 @@ impl StorageEngine {
         *self.s3_manifest_stats.write() = stats;
     }
 
+    /// Record `missing` as the components `key` lacks. Returns whether the
+    /// recorded set changed — i.e. whether this is worth warning about. A repeat
+    /// sighting of the same set is silent; that repetition was the measured churn.
+    fn mark_generation_incomplete(&self, key: String, missing: Vec<String>) -> bool {
+        let mut map = self.incomplete_generations.lock();
+        let changed = map.get(&key).map(|prev| prev != &missing).unwrap_or(true);
+        map.insert(key, missing);
+        changed
+    }
+
+    /// Whether this generation is recorded as incomplete (missing components not
+    /// since seen to appear). See [`Self::incomplete_generations`].
+    fn generation_is_known_incomplete(&self, key: &str) -> bool {
+        self.incomplete_generations.lock().contains_key(key)
+    }
+
+    /// The components a prior pass recorded as missing for `key`, or `None` if the
+    /// generation is not in the memo.
+    fn missing_components_for(&self, key: &str) -> Option<Vec<String>> {
+        self.incomplete_generations.lock().get(key).cloned()
+    }
+
+    /// Forget generations no longer present in `present` so the memo cannot grow
+    /// without bound and a vanished generation is re-examined if it returns.
+    fn prune_incomplete_generations(&self, present: &std::collections::HashSet<String>) {
+        self.incomplete_generations
+            .lock()
+            .retain(|key, _| present.contains(key));
+    }
+
     /// Sync all local SSTables to S3 and update the manifest.
     ///
     /// Scans each registered table's SSTable directory, collects component
@@ -14192,6 +14235,10 @@ impl StorageEngine {
         self.update_s3_manifest_stats(&manifest);
 
         let mut uploaded = 0usize;
+        // Generations seen on disk this pass, so the incomplete memo can be
+        // pruned to exactly what still exists (and cannot grow without bound).
+        let mut present_generation_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // Collect table IDs and directories under the lock, then release
         // before any .await (RwLockReadGuard is !Send).
@@ -14223,8 +14270,28 @@ impl StorageEngine {
 
             for gen in generations {
                 let gen_str = gen.to_string();
+                let memo_key = format!("{table_id_str}/{gen_str}");
+                present_generation_keys.insert(memo_key.clone());
                 if existing_ids.contains(&gen_str) {
                     continue;
+                }
+
+                // If a prior pass recorded this generation as missing components,
+                // re-verify only those files: if one has since appeared the
+                // generation is now complete and must fall through to upload.
+                // Otherwise skip silently — re-scanning and re-warning the same
+                // set every pass is pure churn (one live node logged ~95 of these
+                // every 30 s, 99 % of its log).
+                if self.generation_is_known_incomplete(&memo_key) {
+                    let missing = self.missing_components_for(&memo_key).unwrap_or_default();
+                    let still_missing = missing.iter().all(|component| {
+                        let required_name = format!("{gen_str}-{component}");
+                        !Self::sstable_file_exists(table_dir, &required_name)
+                    });
+                    if still_missing {
+                        continue;
+                    }
+                    self.incomplete_generations.lock().remove(&memo_key);
                 }
 
                 let files = Self::collect_sstable_files(table_dir, gen);
@@ -14241,12 +14308,18 @@ impl StorageEngine {
                     })
                     .collect();
                 if !missing_components.is_empty() {
-                    tracing::warn!(
-                        table = table_id_str,
-                        sstable = gen_str,
-                        ?missing_components,
-                        "s3-sync: skipping incomplete SSTable generation"
-                    );
+                    // Warn only when the missing set is new or has changed; a
+                    // repeat sighting is silent, which is what removes the churn.
+                    let missing_owned: Vec<String> =
+                        missing_components.iter().map(|c| (*c).to_string()).collect();
+                    if self.mark_generation_incomplete(memo_key, missing_owned) {
+                        tracing::warn!(
+                            table = table_id_str,
+                            sstable = gen_str,
+                            ?missing_components,
+                            "s3-sync: skipping incomplete SSTable generation"
+                        );
+                    }
                     continue;
                 }
 
@@ -14323,6 +14396,10 @@ impl StorageEngine {
                 }
             }
         }
+
+        // Prune the incomplete memo to generations still on disk: bounded memory,
+        // and a generation that reappears is re-examined rather than trusted stale.
+        self.prune_incomplete_generations(&present_generation_keys);
 
         self.upload_pending_index_sidecars(upload_mgr, &manifest)
             .await;
@@ -15756,6 +15833,19 @@ impl StorageEngine {
             })
             .collect()
     }
+
+    /// Whether a named component file exists for a generation, mirroring the
+    /// directory resolution used by [`Self::collect_sstable_files`]. Used by the
+    /// incomplete-generation memo to cheaply re-verify a handful of files instead
+    /// of re-scanning the whole generation.
+    fn sstable_file_exists(table_dir: &std::path::Path, file_name: &str) -> bool {
+        let dir = file_name
+            .split_once('-')
+            .and_then(|(gen, _)| gen.parse::<u64>().ok())
+            .and_then(|gen| Self::generation_dir_path(table_dir, gen))
+            .unwrap_or_else(|| table_dir.to_path_buf());
+        dir.join(file_name).exists()
+    }
 }
 
 struct CompactionResultInputClaim<'a> {
@@ -15898,6 +15988,7 @@ impl StorageEngine {
             object_store: Some(Arc::clone(&store)),
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -33646,6 +33737,157 @@ mod tests {
         (dir, engine, store, prefix, tid)
     }
 
+    /// The incomplete-generation memo must warn once per distinct missing set and
+    /// then stay silent, and must forget a generation once it leaves disk. Measured
+    /// churn this guards: a node holding 122 incomplete generations emitted ~95
+    /// `s3-sync: skipping incomplete SSTable generation` WARNs every 30 s, 99 % of
+    /// that node's log, because each pass re-reported the same unchanged set.
+    #[tokio::test]
+    async fn sync_warns_once_for_a_permanently_incomplete_generation() {
+        let (_dir, engine, _store, _prefix, tid) = s3_sync_fixture(
+            "test-sync-churn-memo",
+            &[("Data.db", b"legacy data"), ("Partitions.db", b"legacy partitions")],
+        );
+        let key = format!("{tid}/1");
+        let missing = vec!["Rows.db".to_string()];
+
+        // GIVEN a generation first seen missing a component
+        // THEN the first sighting is reported
+        assert!(
+            !engine.generation_is_known_incomplete(&key),
+            "a generation must not be pre-marked incomplete before it is seen"
+        );
+        assert!(
+            engine.mark_generation_incomplete(key.clone(), missing.clone()),
+            "the first sighting of an incomplete generation must warn"
+        );
+
+        // AND an identical repeat sighting must NOT warn again — the churn fix
+        assert!(
+            !engine.mark_generation_incomplete(key.clone(), missing.clone()),
+            "a repeat sighting of the same missing set must NOT warn again"
+        );
+
+        // AND a changed missing set (a different component vanished) is news again
+        assert!(
+            engine.mark_generation_incomplete(key.clone(), vec!["Filter.db".to_string()]),
+            "a changed missing set must be reported"
+        );
+
+        // AND pruning keeps only generations still on disk, so the memo is bounded
+        // and a vanished generation is re-examined if it returns
+        engine.prune_incomplete_generations(&std::collections::HashSet::new());
+        assert!(
+            !engine.generation_is_known_incomplete(&key),
+            "a generation no longer on disk must be forgotten"
+        );
+    }
+
+    /// A generation recorded incomplete must still be uploaded if its missing
+    /// component later appears — the churn fix must not permanently withhold a
+    /// now-complete generation (data-preservation invariant).
+    #[tokio::test]
+    async fn sync_re_examines_a_generation_after_its_missing_component_appears() {
+        let (_dir, engine, _store, _prefix, tid) = s3_sync_fixture(
+            "test-sync-memo-completes",
+            &[
+                ("Data.db", b"legacy data"),
+                ("Partitions.db", b"legacy partitions"),
+                ("Filter.db", b"legacy filter"),
+            ],
+        );
+        let key = format!("{tid}/1");
+        let table_dir = engine.table_sstable_dir(&tid);
+
+        // GIVEN a generation with Rows.db missing, already recorded as incomplete
+        assert!(engine.mark_generation_incomplete(key.clone(), vec!["Rows.db".to_string()]));
+
+        // WHEN Rows.db later appears on disk
+        std::fs::write(table_dir.join("1-Rows.db"), b"rows").unwrap();
+        assert!(
+            StorageEngine::sstable_file_exists(&table_dir, "1-Rows.db"),
+            "the memo's file check must see the newly written component"
+        );
+
+        // THEN the next sync uploads the now-complete generation rather than
+        // skipping it from a stale memo
+        let uploaded = engine.sync_sstables_to_s3().await.unwrap();
+        assert!(
+            uploaded >= 1,
+            "a generation whose missing component appeared must be uploaded, not skipped"
+        );
+        assert!(
+            !engine.generation_is_known_incomplete(&key),
+            "the memo must drop the entry once the generation is complete"
+        );
+    }
+
+    /// A generation that lost its `Rows.db` must FAIL LOUD and stay withheld — the
+    /// file is a mandatory component (BTI layout: Rows.db is the row index, listed
+    /// in TOC.txt, and the reader requires it). It must never be silently
+    /// synthesized: writing an empty placeholder would fabricate a component the
+    /// reader trusts for clustered lookups and would hide a real loss. This is the
+    /// measured s3-sync churn (121 of 122 incomplete generations on a live node
+    /// were missing only Rows.db), and corruption is exactly why they were
+    /// withheld and never uploaded — correct, not a bug to work around.
+    #[tokio::test]
+    async fn generation_missing_its_mandatory_row_index_fails_loud() {
+        // GIVEN a real flushed generation of a no-clustering table (whose writer
+        // emitted a zero-byte Rows.db, as it does for every generation).
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let mut schema = test_schema();
+        schema.clustering_columns.clear();
+        engine.register_table(schema).unwrap();
+        let tid = table_id();
+        for i in 0..200i64 {
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"v".to_vec(), 1_000 + i))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000 + i),
+            };
+            engine
+                .write(&tid, &make_key(&i.to_string()), row, 1_000 + i)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        let table_dir = engine.table_sstable_dir(&tid);
+        let gens = StorageEngine::list_generations_in_dir(&table_dir);
+        assert_eq!(gens.len(), 1, "the flush must leave exactly one generation: {gens:?}");
+        let gen = gens[0];
+        let gen_str = gen.to_string();
+        let rows_path =
+            StorageEngine::generation_component_path(&table_dir, &gen_str, "Rows.db").unwrap();
+
+        // The generation's own TOC.txt lists Rows.db, so it is mandatory for it.
+        let toc = std::fs::read_to_string(table_dir.join(format!("{gen_str}-TOC.txt"))).unwrap();
+        assert!(
+            toc.contains("Rows.db"),
+            "the writer must list Rows.db in TOC.txt: {toc:?}"
+        );
+        assert!(StorageEngine::open_sstable_from_dir(&table_dir, &gen_str).is_ok());
+
+        // WHEN the mandatory Rows.db is lost — the measured live failure
+        std::fs::remove_file(&rows_path).unwrap();
+
+        // THEN opening must fail loud (not fall back, not synthesize), so the
+        // generation is withheld from readers and never uploaded — surfacing the
+        // loss instead of hiding it.
+        assert!(
+            StorageEngine::open_sstable_from_dir(&table_dir, &gen_str).is_err(),
+            "a generation missing its mandatory Rows.db must fail loud, never fall back"
+        );
+        // AND nothing may recreate the file: the absence must persist so the loss
+        // stays visible to repair-from-replica and to the operator.
+        assert!(
+            !rows_path.exists(),
+            "the engine must not silently regenerate a mandatory component"
+        );
+    }
+
     /// Build an S3-backed engine over `dir` whose uploaded-SSTable cache is
     /// one byte, so every sync evicts what it uploaded, exactly as disk
     /// pressure did on the live cluster.
@@ -34916,6 +35158,12 @@ mod tests {
         );
     }
 
+    /// A generation that lost its `Rows.db` is NOT uploadable — the file is a
+    /// mandatory component (BTI row index, listed in TOC.txt), so publishing a
+    /// generation without it would produce an entry the download path then refuses
+    /// (`download_sstables_into` requires Rows.db): a permanently unrestorable
+    /// SSTable. The withheld generation is CORRECT — it is corrupt and must be
+    /// repaired from a replica, not worked around.
     #[tokio::test]
     async fn sync_s3_rejects_generation_missing_required_rows_component() {
         let (_dir, engine, store, prefix, tid) = s3_sync_fixture(
