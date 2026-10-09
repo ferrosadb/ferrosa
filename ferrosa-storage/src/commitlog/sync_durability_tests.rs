@@ -67,21 +67,48 @@ fn batch_with_deadline(deadline: Duration) -> CommitLogBatchConfig {
     }
 }
 
+/// A flush callback whose first call blocks until the test sends on the
+/// returned channel, then panics; later calls count into `flushes`.
+///
+/// `on_write` wakes the sync thread before it checks `admit`, so a thread
+/// armed to panic at once can die before the triggering write is admitted,
+/// and that write is then refused, correctly. The gate orders the death after
+/// the ack, so a test can assert the ack (t_260afd25: this raced 4/200 under
+/// a CPU stressor when it used `inject_panic`).
+fn panic_on_released_first_flush(
+    flushes: Arc<AtomicUsize>,
+) -> (FlushCallback, std::sync::mpsc::Sender<()>) {
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Mutex::new(Some(gate));
+    let callback: FlushCallback = Arc::new(move || {
+        let first = gate.lock().take();
+        if let Some(gate) = first {
+            gate.recv_timeout(Duration::from_secs(10))
+                .expect("the test releases the first flush");
+            panic!("injected commit-log sync panic");
+        }
+        flushes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    (callback, release)
+}
+
 #[test]
 fn periodic_refuses_writes_once_its_sync_thread_panics() {
     let dir = tempfile::tempdir().unwrap();
     let (segment, offset) = write_mutation(dir.path());
+    let (callback, release) = panic_on_released_first_flush(Arc::new(AtomicUsize::new(0)));
     let sync = PeriodicSync::with_batch(
         Duration::from_millis(5),
         batch_with_deadline(Duration::from_secs(3600)),
-        Arc::new(|| Ok(())),
+        callback,
     );
     sync.start().unwrap();
 
-    sync.inject_panic();
-    // This write wakes the thread, which panics at its sync attempt.
+    // This write wakes the thread, whose first sync panics once released.
     sync.on_write(&segment, offset, 128, AckPolicy::Durable)
         .expect("the thread was alive when this write arrived");
+    release.send(()).expect("the sync thread holds the gate");
     wait_until("the sync thread to die", Duration::from_secs(10), || {
         sync.health().dead
     });
@@ -111,21 +138,18 @@ fn restart_replaces_a_dead_periodic_thread_and_syncs_what_it_left() {
     let dir = tempfile::tempdir().unwrap();
     let (segment, offset) = write_mutation(dir.path());
     let flushes = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&flushes);
+    let (callback, release) = panic_on_released_first_flush(Arc::clone(&flushes));
     let sync = PeriodicSync::with_batch(
         Duration::from_millis(5),
         batch_with_deadline(Duration::from_secs(3600)),
-        Arc::new(move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }),
+        callback,
     );
     sync.start().unwrap();
     assert!(!sync.restart().unwrap(), "a live thread is not restarted");
 
-    sync.inject_panic();
     sync.on_write(&segment, offset, 128, AckPolicy::Durable)
-        .unwrap();
+        .expect("the thread was alive when this write arrived");
+    release.send(()).expect("the sync thread holds the gate");
     wait_until("the sync thread to die", Duration::from_secs(10), || {
         sync.health().dead
     });

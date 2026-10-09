@@ -744,17 +744,53 @@ impl TestCluster {
     /// and "call it", and the call fails with `NotLeader`. Explicit leadership moves
     /// (a leader transfer, a removed leader) are unaffected. A test that needs a real
     /// failover calls [`Self::unpin_leadership`] first.
+    ///
+    /// Stopping ticks does not stop an election a follower had ALREADY started:
+    /// its vote requests still depose the leader the voters just agreed on, and
+    /// with ticks off nobody may campaign again, leaving the cluster leaderless
+    /// (`NotLeader { leader_node_id: None }` on the next membership call). So after
+    /// stopping ticks this waits out one maximum election timeout and requires a
+    /// settled leader — every voter names it, in one term, and it reports itself
+    /// Leader. If an in-flight election broke it, ticks are restored and it tries
+    /// again, a bounded number of times.
     pub async fn pin_leadership(&self, timeout: Duration) -> u64 {
-        let leader = self
-            .wait_for_all_voters_leader(timeout)
-            .await
-            .expect("voters did not agree on a leader in time");
-        self.leadership_pinned
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        for node in self.nodes().iter() {
-            node.raft.runtime_config().elect(false);
+        const ATTEMPTS: usize = 5;
+        for attempt in 1..=ATTEMPTS {
+            let leader = self
+                .wait_for_all_voters_leader(timeout)
+                .await
+                .expect("voters did not agree on a leader in time");
+            self.leadership_pinned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            for node in self.nodes().iter() {
+                node.raft.runtime_config().elect(false);
+            }
+            // One maximum election timeout (election_timeout_max above) plus margin.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Some(settled) = self.settled_leader_id() {
+                return settled;
+            }
+            eprintln!(
+                "pin_leadership: attempt {attempt}/{ATTEMPTS}: leader {leader} was deposed by an \
+                 election already in flight when ticks stopped; restoring elections and retrying"
+            );
+            self.unpin_leadership();
         }
-        leader
+        panic!("pin_leadership: no settled leader after {ATTEMPTS} attempts")
+    }
+
+    /// The leader every voter names in one shared term, if that node also
+    /// reports itself Leader; `None` while an election is unsettled.
+    fn settled_leader_id(&self) -> Option<u64> {
+        let leader = self.all_voters_leader_id()?;
+        let terms: BTreeSet<u64> = self
+            .nodes
+            .iter()
+            .map(|n| n.raft.metrics().borrow().current_term)
+            .collect();
+        let leader_node = self.nodes.iter().find(|n| n.node_id == leader)?;
+        let is_leader = leader_node.raft.metrics().borrow().state == openraft::ServerState::Leader;
+        (terms.len() == 1 && is_leader).then_some(leader)
     }
 
     /// Undo [`Self::pin_leadership`]: tick-driven elections run again on every node.

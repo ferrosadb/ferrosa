@@ -8755,10 +8755,28 @@ fn resolve_fulltext_index_name(
 // integer with a clear error if substitution was missed or the literal is
 // out of range.
 
+/// Refuse a client `USING TIMESTAMP` at or above 1e18 (t_cf637b6e).
+///
+/// Cell timestamps are microseconds, and values in `[1e18, i64::MAX)` are how
+/// a pre-fix build stored Accord nanosecond stamps: storage reads every such
+/// value as `value / 1000`. A client stamp up there (the year 33658 in
+/// microseconds) would be silently divided, so it is refused instead. This is a
+/// documented Cassandra-compatibility cost: Cassandra accepts any `long`.
+fn checked_using_timestamp(n: i64) -> Result<i64, CqlError> {
+    if n >= ferrosa_common::LEGACY_NS_THRESHOLD {
+        return Err(CqlError::Invalid(format!(
+            "USING TIMESTAMP {n} is out of range: timestamps are microseconds since the \
+             epoch and must be below {}",
+            ferrosa_common::LEGACY_NS_THRESHOLD
+        )));
+    }
+    Ok(n)
+}
+
 fn using_timestamp_as_i64(t: &Option<Term>) -> Result<Option<i64>, CqlError> {
     match t {
         None => Ok(None),
-        Some(Term::IntegerLiteral(n)) => Ok(Some(*n)),
+        Some(Term::IntegerLiteral(n)) => checked_using_timestamp(*n).map(Some),
         Some(Term::BindMarker(_)) => Err(CqlError::Protocol(
             "USING TIMESTAMP bind marker was not substituted before execution".into(),
         )),
@@ -8827,7 +8845,7 @@ fn prepared_insert_term_fast_supported(term: &Term) -> bool {
 fn using_timestamp_term_as_i64(t: Option<&Term>) -> Result<Option<i64>, CqlError> {
     match t {
         None => Ok(None),
-        Some(Term::IntegerLiteral(n)) => Ok(Some(*n)),
+        Some(Term::IntegerLiteral(n)) => checked_using_timestamp(*n).map(Some),
         Some(Term::BindMarker(_)) => Err(CqlError::Protocol(
             "USING TIMESTAMP bind marker was not substituted before execution".into(),
         )),
@@ -16751,6 +16769,9 @@ mod tests {
 
     /// Result cursors: ORDER BY / DISTINCT / function-projection paging.
     mod streaming_results;
+
+    /// Rows written with legacy nanosecond Accord stamps (t_cf637b6e).
+    mod legacy_ns;
 
     // ── select_accord_replicas: live-path replica selection ───────────────────
 
@@ -34493,7 +34514,8 @@ mod tests {
         // bytes and persists. The agreed `t` is deliberately a tiny value
         // (777), far below the wall-clock micros the router stamped cells with,
         // so a successful read at ts==777 proves the applier re-stamped to `t`.
-        let agreed = Timestamp::synthetic(777);
+        // 777 µs after the epoch, as the HLC states it: in nanoseconds.
+        let agreed = Timestamp::synthetic(777_000);
         let applier = EngineStorageApplier::new(state.engine.clone());
         applier
             .apply(

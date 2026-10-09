@@ -32,6 +32,10 @@ pub mod fulltext_observability;
 pub mod fulltext_scratch;
 pub(crate) mod generation_guard;
 pub mod index;
+#[cfg(test)]
+mod legacy_ns_compat_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod legacy_ns_fixtures;
 pub(crate) mod lockfree;
 pub mod manifest;
 pub mod memtable;

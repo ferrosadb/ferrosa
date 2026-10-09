@@ -99,6 +99,24 @@ The crate root (`lib.rs`) re-exports the headline types so downstream code
 writes `ferrosa_common::{DecoratedKey, CqlValue, Error}` rather than reaching
 into modules.
 
+## Legacy nanosecond cell timestamps (t_cf637b6e)
+
+Cell timestamps are microseconds. Accord used to stamp cells, liveness and
+deletions with the HLC's `t.time`, which is nanoseconds, so those values
+(~1.8e18) are on disk and in flight from older builds. `cell_ts` maps them
+back:
+
+- `normalize_cell_ts(raw)`: `raw / 1000` iff `1e18 <= raw < i64::MAX`;
+  everything else, sentinels included, is unchanged. A real microsecond stamp
+  reaches 1e18 in the year 33658, and CQL refuses `USING TIMESTAMP` there.
+- `normalize_timestamp_bounds(min, max)`: an SSTable's header bounds after
+  normalisation. ns-only files normalise exactly; a mixed file, or one whose
+  maximum is unknown, widens to `[min(min, 1e15), i64::MAX]`.
+- `record_legacy_ns_normalised` / `legacy_ns_normalised_total` back the
+  `legacy_ns_timestamps_normalised_total{source}` counter (sources `sstable`,
+  `mutation`, `memtable_write`). It reading zero on every node after a full
+  compaction is the signal to remove the shim.
+
 ## Public API (key entry points)
 
 | Area | Types / functions |

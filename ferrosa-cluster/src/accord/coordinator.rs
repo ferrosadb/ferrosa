@@ -701,8 +701,15 @@ fn agreed_row(reads: &[Vec<u8>], quorum: usize) -> Option<Vec<u8>> {
     // exactly the majority property the caller relies on for linearizability.
     // So the first value to reach it is the only one, and returning it is
     // unambiguous.
+    //
+    // Votes are compared in canonical form (t_b986c335): the same row can be
+    // encoded differently by replicas on different builds — an old one sends
+    // its stored nanosecond stamps, an upgraded one the same stamps normalised
+    // to microseconds (t_cf637b6e) — and byte equality would fail F+1 on every
+    // LWT touching a legacy row until the roll completes.
+    let canonical: Vec<Vec<u8>> = reads.iter().map(|r| canonical_read_vote(r)).collect();
     let mut counts: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
-    for read in reads {
+    for read in &canonical {
         let n = counts.entry(read.as_slice()).or_insert(0);
         *n += 1;
         if *n >= quorum {
@@ -710,6 +717,29 @@ fn agreed_row(reads: &[Vec<u8>], quorum: usize) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// The canonical encoding of one read vote: decoded as a
+/// [`ferrosa_storage::Mutation`] (which normalises legacy nanosecond
+/// timestamps) and re-encoded. An empty vote (row absent) stays empty. Bytes
+/// that do not decode are compared as they are: the coordinator decodes the
+/// agreed row again before evaluating the condition and fails loud there, so
+/// a corrupt vote is never silently treated as agreement.
+fn canonical_read_vote(read: &[u8]) -> Vec<u8> {
+    if read.is_empty() {
+        return Vec::new();
+    }
+    match ferrosa_storage::Mutation::deserialize_from(read) {
+        Ok(m) => {
+            let mut buf = vec![0u8; m.serialized_size()];
+            m.serialize_into(&mut buf);
+            buf
+        }
+        Err(e) => {
+            tracing::debug!(%e, bytes = read.len(), "read vote does not decode; compared raw");
+            read.to_vec()
+        }
+    }
 }
 
 async fn collect_until_decided<Fut, Response>(
@@ -2726,6 +2756,50 @@ mod tests {
         let a = b"row".to_vec();
         assert_eq!(agreed_row(std::slice::from_ref(&a), 2), None);
         assert_eq!(agreed_row(&[], 1), None);
+    }
+
+    /// t_b986c335: during a rolling upgrade an old replica votes the row with
+    /// its stored nanosecond stamps and an upgraded one with the same stamps
+    /// normalised to microseconds. Same row, different bytes: agreement must
+    /// compare the decoded row, not the encoding, or every LWT on a legacy row
+    /// fails F+1 until the roll finishes.
+    #[test]
+    fn two_encodings_of_the_same_row_agree() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        use ferrosa_storage::Mutation;
+
+        let vote = |cell_ts: i64, mutation_ts: i64| {
+            let m = Mutation {
+                mutation_id: [0u8; 16],
+                keyspace: "ks".to_string(),
+                table: "t".to_string(),
+                key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(b"v".to_vec(), cell_ts))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(cell_ts),
+                }],
+                timestamp: mutation_ts,
+            };
+            let mut buf = vec![0u8; m.serialized_size()];
+            m.serialize_into(&mut buf);
+            buf
+        };
+        let (cell_us, t_ns) = (1_791_437_153_001_234_i64, 1_791_437_160_000_000_456_i64);
+        let old_replica = vote(cell_us * 1_000 + 789, t_ns);
+        let new_replica = vote(cell_us, t_ns / 1_000);
+        assert_ne!(old_replica, new_replica, "the encodings differ");
+
+        let agreed = agreed_row(&[old_replica, new_replica.clone()], 2)
+            .expect("the same row from both replicas is F+1 agreement");
+        let m = Mutation::deserialize_from(&agreed).unwrap();
+        assert_eq!(m.rows[0].cells[0].1.timestamp, cell_us);
+        assert_eq!(
+            agreed, new_replica,
+            "the agreed row is the canonical encoding"
+        );
     }
 
     /// An empty row (the key does not exist) is a legitimate agreed VALUE, not

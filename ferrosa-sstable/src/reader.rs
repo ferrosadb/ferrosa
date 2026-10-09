@@ -485,6 +485,10 @@ pub struct SSTableReader<R: ReadAt> {
     index_bounds_are_byte_comparable: bool,
     bloom_filter: BloomFilter,
     compression_info: Option<CompressionInfo>,
+    /// As stored: the delta base every [`DataReader`] decodes against.
+    stored: SerializationHeader,
+    /// `stored` with its timestamp bounds normalised (t_cf637b6e); what
+    /// [`Self::header`] returns.
     header: SerializationHeader,
     data: R,
     /// Bounded cache of decompressed compressed Data.db chunks. Point reads use
@@ -543,6 +547,14 @@ impl<R: ReadAt> SSTableReader<R> {
 
         let stats = read_statistics(&components.statistics)?;
         let header = stats.header;
+        let mut normalised_header = header.clone();
+        (
+            normalised_header.min_timestamp,
+            normalised_header.max_timestamp,
+        ) = ferrosa_common::cell_ts::normalize_timestamp_bounds(
+            header.min_timestamp,
+            header.max_timestamp,
+        );
 
         let partition_index = PartitionIndex::open(CachedReadAt::new(components.partitions)?)?;
         let index_bounds_are_byte_comparable =
@@ -556,7 +568,8 @@ impl<R: ReadAt> SSTableReader<R> {
             index_bounds_are_byte_comparable,
             bloom_filter,
             compression_info,
-            header,
+            stored: header,
+            header: normalised_header,
             data: components.data,
             decompressed_chunks: Mutex::new(ChunkCache::new(cache_config)),
             crc_table: None,
@@ -841,7 +854,7 @@ impl<R: ReadAt> SSTableReader<R> {
         // chunks; for uncompressed tables with a loaded CRC.db, verify each
         // chunk as it is read.
         let source = self.data_source()?;
-        let mut data_reader = DataReader::new(&source, &self.header, data_position);
+        let mut data_reader = DataReader::new(&source, &self.stored, data_position);
         if row_limit > 0 {
             data_reader.read_partition_prefix_rows(row_limit)
         } else {
@@ -869,8 +882,8 @@ impl<R: ReadAt> SSTableReader<R> {
             PartitionLookup::NotFound => return Ok(None),
         };
         let source = self.data_source()?;
-        DataReader::new(&source, &self.header, data_position)
-            .read_partition_suffix_rows(start_clustering, row_limit)
+        let mut reader = DataReader::new(&source, &self.stored, data_position);
+        reader.read_partition_suffix_rows(start_clustering, row_limit)
     }
 
     /// Return whether a point read should probe this SSTable for `key`.
@@ -930,13 +943,13 @@ impl<R: ReadAt> SSTableReader<R> {
 
         if let Some(entry) = row_index_position {
             let source = self.data_source()?;
-            let mut header_reader = DataReader::new(&source, &self.header, entry.data_position);
+            let mut header_reader = DataReader::new(&source, &self.stored, entry.data_position);
             let Some((partition_key, deletion, static_row)) =
                 header_reader.read_partition_header_only()?
             else {
                 return Ok(None);
             };
-            let mut row_reader = DataReader::new(&source, &self.header, data_position);
+            let mut row_reader = DataReader::new(&source, &self.stored, data_position);
             let Some(row) = row_reader.read_next_clustered_row()? else {
                 return Ok(None);
             };
@@ -961,7 +974,7 @@ impl<R: ReadAt> SSTableReader<R> {
         data_position: u64,
         clustering: &[u8],
     ) -> Result<Option<Partition>> {
-        let mut data_reader = DataReader::new(data, &self.header, data_position);
+        let mut data_reader = DataReader::new(data, &self.stored, data_position);
         let Some((partition_key, deletion, static_row)) =
             data_reader.read_partition_header_only()?
         else {
@@ -994,9 +1007,29 @@ impl<R: ReadAt> SSTableReader<R> {
         &self.bloom_filter
     }
 
-    /// Returns a reference to the serialization header.
+    /// The serialization header with its timestamp bounds in the microsecond
+    /// domain every decoded cell is in (see
+    /// [`ferrosa_common::cell_ts::normalize_timestamp_bounds`]). Use this for
+    /// anything that reasons about the cells: compaction output headers, purge,
+    /// metadata.
     pub fn header(&self) -> &SerializationHeader {
         &self.header
+    }
+
+    /// The serialization header exactly as Statistics.db stores it. Its
+    /// `min_timestamp` is the delta base of Data.db, so a [`DataReader`] must be
+    /// built from this, never from [`Self::header`].
+    pub fn stored_header(&self) -> &SerializationHeader {
+        &self.stored
+    }
+
+    /// Whether this SSTable's stored bounds show legacy nanosecond timestamps
+    /// (t_cf637b6e). A file with an unknown maximum may still hold some; its
+    /// [`Self::header`] bounds are widened for that case.
+    pub fn may_hold_legacy_ns_timestamps(&self) -> bool {
+        let h = &self.stored;
+        ferrosa_common::is_legacy_ns(h.min_timestamp)
+            || ferrosa_common::is_legacy_ns(h.max_timestamp)
     }
 
     /// Returns a reference to the compression info, if present.
@@ -1117,7 +1150,7 @@ impl<R: ReadAt> SSTableReader<R> {
             return Ok(partitions);
         }
         let source = self.data_source()?;
-        let mut reader = crate::data::DataReader::new(&source, &self.header, 0);
+        let mut reader = crate::data::DataReader::new(&source, &self.stored, 0);
         while partitions.len() < limit {
             let is_final_requested_partition = row_limit > 0 && partitions.len() + 1 == limit;
             let partition = if is_final_requested_partition {
@@ -1131,6 +1164,17 @@ impl<R: ReadAt> SSTableReader<R> {
             partitions.push(partition);
         }
         Ok(partitions)
+    }
+
+    /// How many legacy nanosecond timestamps (t_cf637b6e) Data.db holds,
+    /// counted by decoding every partition once. Zero for a file written by a
+    /// fixed build or rewritten by compaction. Memory is bounded to one
+    /// partition.
+    pub fn count_legacy_ns_timestamps(&self) -> Result<u64> {
+        let source = self.data_source()?;
+        let mut reader = crate::data::DataReader::new(&source, &self.stored, 0);
+        while reader.read_partition()?.is_some() {}
+        Ok(reader.legacy_ns_normalised())
     }
 
     /// Best-effort salvage of every partition, recovering each partition's
@@ -1152,7 +1196,7 @@ impl<R: ReadAt> SSTableReader<R> {
         let mut stats = SalvageStats::default();
         let source = self.data_source()?;
         for &off in offsets.iter() {
-            Self::salvage_one(&source, &self.header, off, &mut stats, &mut on_partition);
+            Self::salvage_one(&source, &self.stored, off, &mut stats, &mut on_partition);
         }
         Ok(stats)
     }
@@ -1334,7 +1378,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
             Option<crate::types::Row>,
         )>,
     > {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.read_partition_header_only()?;
         self.pos = reader.position();
@@ -1354,7 +1398,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// clustering key controls the pull rate, holding at most
     /// one row per source in flight at any moment.
     pub fn next_clustered_row(&mut self) -> Result<Option<crate::types::Row>> {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.read_next_clustered_row()?;
         self.pos = reader.position();
@@ -1369,7 +1413,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         &mut self,
         wanted: &[u16],
     ) -> Result<Option<crate::types::Row>> {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.read_next_clustered_row_projected(wanted)?;
         self.pos = reader.position();
@@ -1415,7 +1459,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     where
         F: FnMut(&crate::types::Row) -> Result<()>,
     {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         reader.stream_clustered_rows(on_row)?;
         self.pos = reader.position();
@@ -1446,7 +1490,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     where
         F: FnMut(&crate::types::Row) -> Result<()>,
     {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.read_partition_streaming(on_row)?;
         self.pos = reader.position();
@@ -1454,7 +1498,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     }
 
     pub fn next_partition(&mut self) -> Result<Option<crate::types::Partition>> {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.read_partition()?;
         self.pos = reader.position();
@@ -1469,7 +1513,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     pub fn next_partition_count(
         &mut self,
     ) -> Result<Option<(ferrosa_common::key::DecoratedKey, u64)>> {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.read_partition_count()?;
         self.pos = reader.position();
@@ -1493,7 +1537,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         &mut self,
         wanted: &[u16],
     ) -> Result<Option<crate::types::Partition>> {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.read_partition_projected(wanted)?;
         self.pos = reader.position();
@@ -1615,7 +1659,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     ///
     /// Returns `Ok(None)` at EOF.
     pub fn peek_partition_key(&mut self) -> Result<Option<ferrosa_common::key::DecoratedKey>> {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.peek_partition_key()?;
         // peek does not advance pos
@@ -1630,7 +1674,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// dedup via `merge::merge_partitions` but doesn't need cell
     /// data. Returns `Ok(None)` at EOF.
     pub fn next_partition_metadata(&mut self) -> Result<Option<crate::types::Partition>> {
-        let header = &self.sst.header;
+        let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.read_partition_metadata()?;
         self.pos = reader.position();

@@ -71,6 +71,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   durable or the stall deadline passes, so a node the supervisor restarted
   acknowledges writes again instead of refusing them for as long as
   scheduling takes.
+  Both sync threads re-check the stop flag under their wake lock before an
+  idle wait, so a `stop()` that lands between the loop's own check and the
+  wait is never lost (FMEA ST-90; it used to leave `stop()` in `join()` for
+  the whole idle interval).
   **The sync call is a runtime setting** (FMEA ST-87):
   `FERROSA_COMMITLOG_SYNC_MODE` = `full` (default, `F_FULLFSYNC`, power-loss
   durable) | `barrier` (`F_BARRIERFSYNC`) | `fsync` (`fsync(2)`). The weaker
@@ -911,6 +915,31 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   therefore holds no thread. A run told to yield its slot at a budget
   boundary returns the same way and is re-admitted by the supervisor; no
   producer waits on its thread for anything.
+
+## Legacy nanosecond timestamps (t_cf637b6e)
+
+Timestamps a pre-fix build stamped in nanoseconds are normalised to
+microseconds at every entry point, so no comparison (LWW merge, purge, repair,
+PITR, the Accord read-at-`t`) sees one:
+
+- `Mutation` decode (commit-log replay, batchlog, internode forwards, hints,
+  Accord apply and read votes, PITR) normalises every stamp;
+  `deserialize_from_counting_legacy_ns` also returns the count. The commit-log
+  reader logs once per segment that held any; a CRC-valid entry that fails to
+  decode is logged at ERROR, and a CRC-mismatch skip to the next sync marker at
+  WARN (both used to be silent).
+- `TableStore::write` normalises each row before the indexes and the
+  memtable, whatever produced it.
+- SSTables are normalised by `ferrosa-sstable` at decode; compaction rewrites
+  them in microseconds, which is how legacy values leave disk.
+- `ferrosa_storage_legacy_ns_timestamps_normalised_total{source}` is exported
+  by `metrics::render_prometheus`; a node also logs a WARN once per SSTable
+  that holds legacy stamps when it registers it.
+
+`legacy_ns_fixtures` (feature `test-support`) builds the old on-disk state for
+tests: `write_raw_sstable` writes an SSTable with raw stamps straight into a
+table directory, and `seed_legacy` seeds an engine through a raw SSTable, a
+replayed commit log or in-process writes.
 
 ## Public API (key entry points)
 

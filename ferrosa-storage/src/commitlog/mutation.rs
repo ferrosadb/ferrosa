@@ -572,7 +572,18 @@ impl Mutation {
     /// a flagged payload, so this default decode never encounters the flag.
     ///
     /// [`deserialize_from_rebinding_list_paths`]: Self::deserialize_from_rebinding_list_paths
+    ///
+    /// Every timestamp is normalised with
+    /// [`ferrosa_common::normalize_cell_ts`]: bytes written by a build that
+    /// stamped Accord cells in nanoseconds decode to microseconds (t_cf637b6e).
     pub fn deserialize_from(buf: &[u8]) -> Result<Self> {
+        Self::deserialize_inner(buf, None).map(|(m, _)| m)
+    }
+
+    /// [`Self::deserialize_from`], also returning how many legacy nanosecond
+    /// timestamps were normalised, so a caller decoding a whole unit (a
+    /// commit-log segment) can report it once for the unit.
+    pub fn deserialize_from_counting_legacy_ns(buf: &[u8]) -> Result<(Self, u64)> {
         Self::deserialize_inner(buf, None)
     }
 
@@ -590,10 +601,24 @@ impl Mutation {
     /// stripped-clean column index is stored, so the flag never reaches the
     /// SSTable. Fails loud if a flagged cell lacks a 16-byte path.
     pub fn deserialize_from_rebinding_list_paths(buf: &[u8], t: AccordTimestamp) -> Result<Self> {
-        Self::deserialize_inner(buf, Some(t))
+        Self::deserialize_inner(buf, Some(t)).map(|(m, _)| m)
     }
 
-    fn deserialize_inner(buf: &[u8], rebind_t: Option<AccordTimestamp>) -> Result<Self> {
+    /// Decode, normalising every timestamp; returns the mutation and the
+    /// number of legacy nanosecond timestamps normalised, which is also added
+    /// to `legacy_ns_timestamps_normalised_total{source="mutation"}`.
+    fn deserialize_inner(buf: &[u8], rebind_t: Option<AccordTimestamp>) -> Result<(Self, u64)> {
+        let mut legacy = LegacyNsTally::default();
+        let mutation = Self::decode_fields(buf, rebind_t, &mut legacy)?;
+        legacy.report();
+        Ok((mutation, legacy.count))
+    }
+
+    fn decode_fields(
+        buf: &[u8],
+        rebind_t: Option<AccordTimestamp>,
+        legacy: &mut LegacyNsTally,
+    ) -> Result<Self> {
         let mut r = ReadCursor::new(buf);
 
         // mutation_id: 16 raw bytes (UUID v4, or all-zeros for legacy entries)
@@ -605,7 +630,7 @@ impl Mutation {
         let table = r.read_string("table")?;
         let key_bytes = r.read_byte_vec("key")?;
         let token_val = r.read_i64("token")?;
-        let timestamp = r.read_i64("timestamp")?;
+        let timestamp = legacy.normalise(r.read_i64("timestamp")?);
         let row_count = r.read_u16("row_count")? as usize;
 
         let key = DecoratedKey {
@@ -615,7 +640,7 @@ impl Mutation {
 
         let mut rows = Vec::with_capacity(row_count);
         for _ in 0..row_count {
-            rows.push(Self::deserialize_row(&mut r, rebind_t)?);
+            rows.push(Self::deserialize_row(&mut r, rebind_t, legacy)?);
         }
 
         Ok(Mutation {
@@ -628,14 +653,18 @@ impl Mutation {
         })
     }
 
-    fn deserialize_row(r: &mut ReadCursor<'_>, rebind_t: Option<AccordTimestamp>) -> Result<Row> {
+    fn deserialize_row(
+        r: &mut ReadCursor<'_>,
+        rebind_t: Option<AccordTimestamp>,
+        legacy: &mut LegacyNsTally,
+    ) -> Result<Row> {
         let clustering = r.read_byte_vec("clustering")?;
 
-        let marked_for_delete_at = r.read_i64("deletion.marked_for_delete_at")?;
+        let marked_for_delete_at = legacy.normalise(r.read_i64("deletion.marked_for_delete_at")?);
         let deletion_ldt = r.read_u32("deletion.local_deletion_time")?;
         let deletion = DeletionTime::new(marked_for_delete_at, deletion_ldt);
 
-        let liveness_ts = r.read_i64("liveness.timestamp")?;
+        let liveness_ts = legacy.normalise(r.read_i64("liveness.timestamp")?);
         let liveness_ttl = r.read_i32("liveness.ttl")?;
         let liveness_ldt = r.read_i32("liveness.local_deletion_time")?;
         let primary_key_liveness = LivenessInfo {
@@ -647,7 +676,7 @@ impl Mutation {
         let cell_count = r.read_u16("cell_count")? as usize;
         let mut cells = Vec::with_capacity(cell_count);
         for _ in 0..cell_count {
-            cells.push(Self::deserialize_cell(r, rebind_t)?);
+            cells.push(Self::deserialize_cell(r, rebind_t, legacy)?);
         }
 
         Ok(Row {
@@ -661,6 +690,7 @@ impl Mutation {
     fn deserialize_cell(
         r: &mut ReadCursor<'_>,
         rebind_t: Option<AccordTimestamp>,
+        legacy: &mut LegacyNsTally,
     ) -> Result<(u16, CellValue)> {
         let tagged = r.read_u16("cell.column_index")?;
         let has_path = tagged & CELL_HAS_PATH_FLAG != 0;
@@ -668,7 +698,7 @@ impl Mutation {
         // The clean column index — both transient flags stripped, so the stored
         // index (and thus the SSTable) never carries them.
         let column_index = tagged & CELL_COLUMN_INDEX_MASK;
-        let timestamp = r.read_i64("cell.timestamp")?;
+        let timestamp = legacy.normalise(r.read_i64("cell.timestamp")?);
         let ttl = r.read_i32("cell.ttl")?;
         let local_deletion_time = r.read_i32("cell.local_deletion_time")?;
         let value_len = r.read_i32("cell.value_len")?;
@@ -716,11 +746,150 @@ impl Mutation {
     }
 }
 
+/// Counts the legacy nanosecond timestamps one decode normalised (t_cf637b6e).
+#[derive(Default)]
+struct LegacyNsTally {
+    count: u64,
+}
+
+/// Set once the first legacy-stamped mutation of this process has been
+/// logged. Later ones are only counted: mutations arrive per write, so a line
+/// each would bury everything else. Commit-log replay reports per segment.
+static LEGACY_NS_MUTATION_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+impl LegacyNsTally {
+    #[inline]
+    fn normalise(&mut self, raw: i64) -> i64 {
+        if ferrosa_common::is_legacy_ns(raw) {
+            self.count += 1;
+        }
+        ferrosa_common::normalize_cell_ts(raw)
+    }
+
+    fn report(&self) {
+        if self.count == 0 {
+            return;
+        }
+        ferrosa_common::cell_ts::record_legacy_ns_normalised(
+            ferrosa_common::cell_ts::LegacyNsSource::Mutation,
+            self.count,
+        );
+        if !LEGACY_NS_MUTATION_SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                normalised = self.count,
+                "decoded a mutation carrying legacy nanosecond timestamps; they are read as \
+                 microseconds (t_cf637b6e). Further ones are counted in \
+                 legacy_ns_timestamps_normalised_total{{source=\"mutation\"}}, not logged"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+    /// A mutation as a pre-t_cf637b6e build encoded an Accord write: every LWW
+    /// stamp in nanoseconds. The same bytes arrive by commit-log replay,
+    /// batchlog replay, an internode `MutationForward`, a hint, repair
+    /// streaming and the Accord apply/read-vote paths — all through
+    /// `deserialize_inner`.
+    fn legacy_ns_mutation_bytes(micros: i64) -> Vec<u8> {
+        let ns = micros * 1_000 + 789;
+        let m = Mutation {
+            mutation_id: [3u8; 16],
+            keyspace: "ks".to_string(),
+            table: "t".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
+            rows: vec![Row {
+                clustering: vec![0, 0, 0, 1],
+                cells: vec![
+                    (0, CellValue::live(b"v".to_vec(), ns)),
+                    (1, CellValue::tombstone(ns - 2_000, 1_700_000_000)),
+                ],
+                deletion: DeletionTime::new(ns - 5_000, 1_700_000_000),
+                primary_key_liveness: LivenessInfo::with_timestamp(ns),
+            }],
+            timestamp: ns,
+        };
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        buf
+    }
+
+    /// Test 11: every timestamp of a legacy mutation decodes in micros.
+    #[test]
+    fn legacy_nanosecond_mutation_decodes_in_microseconds() {
+        let micros = 1_791_437_153_001_234;
+        let bytes = legacy_ns_mutation_bytes(micros);
+        let check = |m: &Mutation, path: &str| {
+            assert_eq!(m.timestamp, micros, "{path}: mutation stamp");
+            let row = &m.rows[0];
+            assert_eq!(
+                row.primary_key_liveness.timestamp, micros,
+                "{path}: liveness"
+            );
+            assert_eq!(
+                row.deletion.marked_for_delete_at,
+                micros - 5,
+                "{path}: row deletion"
+            );
+            assert_eq!(
+                row.deletion.local_deletion_time, 1_700_000_000,
+                "{path}: ldt"
+            );
+            assert_eq!(row.cells[0].1.timestamp, micros, "{path}: cell");
+            assert_eq!(
+                row.cells[1].1.timestamp,
+                micros - 2,
+                "{path}: cell tombstone"
+            );
+            assert_eq!(row.cells[1].1.local_deletion_time, 1_700_000_000, "{path}");
+        };
+        check(
+            &Mutation::deserialize_from(&bytes).unwrap(),
+            "deserialize_from",
+        );
+        check(
+            &Mutation::deserialize_from_rebinding_list_paths(
+                &bytes,
+                AccordTimestamp::synthetic(micros as u64 * 1_000),
+            )
+            .unwrap(),
+            "deserialize_from_rebinding_list_paths",
+        );
+        let (m, count) = Mutation::deserialize_from_counting_legacy_ns(&bytes).unwrap();
+        check(&m, "deserialize_from_counting_legacy_ns");
+        assert_eq!(count, 5, "mutation, liveness, row deletion and two cells");
+    }
+
+    /// A microsecond mutation decodes byte-for-byte as before, sentinels too.
+    #[test]
+    fn legacy_ns_decoding_leaves_microsecond_mutations_alone() {
+        let m = Mutation {
+            mutation_id: [4u8; 16],
+            keyspace: "ks".to_string(),
+            table: "t".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
+            rows: vec![Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"v".to_vec(), 1_791_437_153_001_234))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::NONE,
+            }],
+            timestamp: 1_791_437_153_001_234,
+        };
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        let (d, count) = Mutation::deserialize_from_counting_legacy_ns(&buf).unwrap();
+        assert_eq!(count, 0);
+        let mut again = vec![0u8; d.serialized_size()];
+        d.serialize_into(&mut again);
+        assert_eq!(again, buf);
+    }
 
     /// Helper to create a simple mutation for testing.
     fn simple_mutation() -> Mutation {
