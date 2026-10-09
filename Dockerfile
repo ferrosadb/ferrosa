@@ -53,7 +53,40 @@ RUN cargo build --release -p ferrosa 2>&1 || true
 COPY . .
 # Touch all lib.rs/main.rs so cargo sees them as newer than the stub artifacts
 RUN find . -name "lib.rs" -o -name "main.rs" | xargs touch
-RUN cargo build --release -p ferrosa
+
+# --------------------------------------------------------------------------
+# Profile-guided optimization (opt-in).
+#
+#   docker build --build-arg PGO=1 ...
+#
+# The profile is collected here, in the builder, by running an instrumented
+# build of the training workload (scripts/pgo-build.sh). That is only sound
+# because the workload needs no database and no network — it drives the real
+# StorageEngine in-process. Training the CQL/RPC/TLS paths is a different,
+# release-time pass against a live cluster; see specs/pgo-release-build.md.
+#
+# Why PGO is off by default:
+#   * it roughly doubles build time (instrumented build + optimized build);
+#   * the workload costs real wall-clock in the builder;
+#   * a profile trained on a hermetic workload is the wrong input for the
+#     I/O-bound and network paths, so it should be a deliberate choice.
+#
+# Why the PGO path does NOT set LLVM_PROFILE_FILE: an instrumented process that
+# is killed instead of exiting cleanly writes either nothing or a zero-count
+# profraw. A zero-count profile is accepted by the compiler while optimizing
+# nothing, so scripts/pgo-build.sh asserts the merged profile has non-zero
+# counts and fails the build otherwise.
+#
+# With PGO=0 the command is the plain release build, exactly as before.
+# --------------------------------------------------------------------------
+ARG PGO=0
+RUN if [ "$PGO" = "1" ]; then \
+      bash scripts/pgo-build.sh --baseline; \
+    else \
+      cargo build --release -p ferrosa; \
+    fi
+# Fail here if the artifact is missing, rather than three layers later in COPY.
+RUN test -x target/release/ferrosa
 
 FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 # gdb + procps available in the runtime image so crashes produce readable backtraces

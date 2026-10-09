@@ -8,6 +8,14 @@ description = "Ferrosa — distributed database with CQL and Cypher"
 name = "ferrosa"
 path = "src/main.rs"
 
+# PGO training runner. `required-features` keeps it out of the default build
+# and out of every shipped artifact: without `pgo-bench`, cargo does not even
+# compile it. See src/bin/pgo-workload.rs for why it lives in this package.
+[[bin]]
+name = "pgo-workload"
+path = "src/bin/pgo-workload.rs"
+required-features = ["pgo-bench"]
+
 [dependencies]
 arc-swap = "1.7"
 axum = { version = "0.8", features = ["ws"] }
@@ -81,6 +89,14 @@ full = ["otel", "flight", "ferrosa-cql/asc-udf"]
 # Enables jemalloc's heap profiler with libunwind, which avoids the default
 # unwinder crash on Linux musl. Profiling remains off until MALLOC_CONF opts in.
 profiling = ["tikv-jemallocator/profiling_libunwind"]
+# PGO profiling harness: builds the deterministic `pgo-workload` trainer bin.
+#
+# Off by default, and inert on the serving path — enabling it adds a bin target
+# and nothing else, so the `ferrosa` lib/bin do not link any training code. A
+# profiling build (scripts/pgo-build.sh) turns it on for BOTH the instrumented
+# and the profile-use build, so their `-C metadata` agree; enabling it on one
+# side only is the defect that silently un-optimizes a build.
+pgo-bench = []
 
 # Optional OTel dependencies, gated behind the `otel` feature.
 [dependencies.tracing-opentelemetry]
