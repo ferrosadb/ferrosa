@@ -39,6 +39,16 @@ pub fn of(meta: &TableMetadata) -> Vec<String> {
     if let Some(recorded) = recorded(meta) {
         return recorded;
     }
+    storage_key_columns(meta)
+}
+
+/// The columns ferrosa actually keys rows by: partition then clustering, with ferrosa's own
+/// reserved `_sys_` columns filtered out.
+///
+/// An `ALTER TABLE ... ADD PRIMARY KEY` compares the key it was given against this to decide
+/// whether a secondary index would add anything: a key that already *is* the storage key is
+/// served by the primary structure, so indexing it again would be pure write overhead.
+pub fn storage_key_columns(meta: &TableMetadata) -> Vec<String> {
     meta.partition_key
         .iter()
         .chain(meta.clustering_key.iter().map(|(name, _)| name))

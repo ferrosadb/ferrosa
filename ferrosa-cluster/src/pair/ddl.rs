@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::raft::NodeInfo;
 use ferrosa_common::CqlType;
+use ferrosa_index::IndexType;
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
@@ -114,6 +115,31 @@ pub enum DdlOperation {
     /// so the `PairDdlForward` RPC path (which `ClusterDdlForwardHandler`
     /// already handles) can carry it without a new message type.
     JoinNode(NodeInfo),
+}
+
+/// Build the `IndexMetadata` for a secondary index covering `columns`.
+///
+/// Lives here, beside [`DdlOperation::CreateIndex`], so a caller holding only the pieces —
+/// keyspace, table, name, columns — can request an index without depending on `ferrosa-index`
+/// for its `IndexType`. That is what lets the Postgres front-end build the index a declared
+/// primary key needs without taking on a new dependency.
+pub fn secondary_index(
+    keyspace: &str,
+    table: &str,
+    name: &str,
+    columns: &[String],
+) -> IndexMetadata {
+    IndexMetadata {
+        keyspace: keyspace.to_string(),
+        table: table.to_string(),
+        name: name.to_string(),
+        // A plain ordered index: it serves equality and range lookups on the key columns,
+        // which is what a declared primary key is for.
+        index_type: IndexType::BTree,
+        target_columns: columns.to_vec(),
+        filter_predicate: None,
+        options: std::collections::HashMap::new(),
+    }
 }
 
 impl DdlOperation {

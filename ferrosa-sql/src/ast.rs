@@ -54,6 +54,8 @@ pub enum Statement {
     /// client-side schema reset drop several tables in one statement; each
     /// named table is dropped by the front-end. Boxed for size parity.
     DropTable(Box<DropTableStatement>),
+    /// `ALTER TABLE t ADD [CONSTRAINT name] PRIMARY KEY (col, ...)`.
+    AddPrimaryKey(Box<AddPrimaryKeyStmt>),
 }
 
 /// `DROP TABLE [IF EXISTS] a [, b, ...]`. `tables` is non-empty; every entry
@@ -62,6 +64,21 @@ pub enum Statement {
 pub struct DropTableStatement {
     pub if_exists: bool,
     pub tables: Vec<TableRef>,
+}
+
+/// `ALTER TABLE <table> ADD [CONSTRAINT <name>] PRIMARY KEY (<cols>)`.
+///
+/// The only `ALTER TABLE` form ferrosa accepts — and the one `pgbench -i` runs immediately
+/// after creating its tables without a key. Other forms are refused *by name* rather than
+/// parsed loosely: a change we do not implement must not look like it took effect.
+///
+/// The key named here is the **PostgreSQL** primary key, which is not necessarily the storage
+/// partition key: a table created without one has a synthetic `_sys_ck_` storage key and no
+/// PostgreSQL key at all until this runs. See `ferrosa-postgres`'s `pg_key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPrimaryKeyStmt {
+    pub table: TableRef,
+    pub columns: Vec<String>,
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] [public.]name (col type [NOT NULL]..., PRIMARY KEY (...))`.

@@ -894,7 +894,9 @@ pub async fn execute_query(
 pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static str {
     use ferrosa_sql::ParseError;
     match error {
-        ParseError::UnsupportedClause(_) | ParseError::MissingPrimaryKey => "0A000",
+        ParseError::UnsupportedClause(_)
+        | ParseError::MissingPrimaryKey
+        | ParseError::UnsupportedAlter(_) => "0A000",
         ParseError::UnknownType(_) => "42704",
         ParseError::DuplicateColumn(_) => "42701",
         ParseError::MultiplePrimaryKeys => "42P16",
@@ -1146,6 +1148,20 @@ async fn execute_statement(
                     in_txn: txn.is_some(),
                 },
                 &drop,
+            )
+            .await
+        }
+        // ALTER TABLE ... ADD PRIMARY KEY: the step pgbench -i runs right after creating its
+        // tables without a key. Same schema-change path.
+        Statement::AddPrimaryKey(apk) => {
+            crate::ddl::execute_add_primary_key(
+                crate::ddl::DdlEnv {
+                    executor: ddl,
+                    schema,
+                    default_schema,
+                    in_txn: txn.is_some(),
+                },
+                &apk,
             )
             .await
         }
@@ -3554,6 +3570,12 @@ mod txn_buffer_tests {
             })
             .unwrap();
 
+        (dir, engine, schema_with_synthetic_key())
+    }
+
+    /// A schema holding only `public.sk`, whose partition key is the synthetic `_sys_ck_`
+    /// column of type `uuid` — the shape `plan_create_table` produces for a PK-less table.
+    fn schema_with_synthetic_key() -> Schema {
         let schema = Schema::new(schema_config()).expect("schema bootstraps");
         let auth = superuser();
         schema
@@ -3596,7 +3618,7 @@ mod txn_buffer_tests {
                 &auth,
             )
             .expect("create table sk");
-        (dir, engine, schema)
+        schema
     }
 
     fn engine_config(dir: &Path) -> StorageEngineConfig {
@@ -3697,6 +3719,170 @@ mod txn_buffer_tests {
     /// The client never supplies the synthetic key — it cannot see the column — so the
     /// front-end must mint one per row. Before the mint existed this INSERT failed `23502`,
     /// naming a column the user has no way to know about.
+    /// Records what a DDL statement asked for, so the executor's own decisions can be asserted
+    /// without a cluster.
+    /// `(keyspace, table, updates)` per `alter_table` call.
+    type AlteredCalls = Vec<(String, String, ferrosa_schema::TableUpdates)>;
+    /// `(keyspace, table, index name, columns)` per `create_index` call.
+    type IndexCalls = Vec<(String, String, String, Vec<String>)>;
+
+    #[derive(Default)]
+    struct RecordingDdl {
+        altered: std::sync::Mutex<AlteredCalls>,
+        indexed: std::sync::Mutex<IndexCalls>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ddl::DdlExecutor for RecordingDdl {
+        async fn create_table(&self, _table: TableMetadata) -> Result<(), String> {
+            Ok(())
+        }
+        async fn drop_table(&self, _keyspace: &str, _table: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn alter_table(
+            &self,
+            keyspace: &str,
+            table: &str,
+            updates: ferrosa_schema::TableUpdates,
+        ) -> Result<(), String> {
+            self.altered
+                .lock()
+                .unwrap()
+                .push((keyspace.to_string(), table.to_string(), updates));
+            Ok(())
+        }
+        async fn create_index(
+            &self,
+            keyspace: &str,
+            table: &str,
+            name: &str,
+            columns: &[String],
+        ) -> Result<(), String> {
+            self.indexed.lock().unwrap().push((
+                keyspace.to_string(),
+                table.to_string(),
+                name.to_string(),
+                columns.to_vec(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn add_primary_key(sql: &str) -> ferrosa_sql::AddPrimaryKeyStmt {
+        match parse_statement(sql) {
+            Ok(Statement::AddPrimaryKey(a)) => *a,
+            other => panic!("expected AddPrimaryKey, got {other:?}"),
+        }
+    }
+
+    /// Run `ALTER TABLE ... ADD PRIMARY KEY` against a recording executor.
+    async fn add_key(schema: &Schema, ddl: &RecordingDdl, sql: &str) -> Vec<BackendMessage> {
+        let stmt = add_primary_key(sql);
+        crate::ddl::execute_add_primary_key(
+            crate::ddl::DdlEnv {
+                executor: Some(ddl),
+                schema,
+                default_schema: "public",
+                in_txn: false,
+            },
+            &stmt,
+        )
+        .await
+    }
+
+    /// The declared key is recorded, and — because it is NOT the storage key (that is the
+    /// synthetic `_sys_ck_`) — a secondary index is built over it. Without the index a lookup
+    /// by the declared key degrades to a full scan, which is what pgbench hammers.
+    #[tokio::test]
+    async fn adding_a_primary_key_records_it_and_indexes_a_column_that_is_not_the_storage_key() {
+        let schema = schema_with_synthetic_key();
+        let ddl = RecordingDdl::default();
+
+        let msgs = add_key(&schema, &ddl, "ALTER TABLE sk ADD PRIMARY KEY (v)").await;
+        assert!(
+            matches!(
+                &msgs[..],
+                [BackendMessage::CommandComplete { tag }] if tag == "ALTER TABLE"
+            ),
+            "reply must be a single ALTER TABLE completion: {msgs:?}"
+        );
+
+        let altered = ddl.altered.lock().unwrap();
+        assert_eq!(altered.len(), 1, "one alter");
+        assert_eq!(altered[0].0, "public");
+        assert_eq!(altered[0].1, "sk");
+        assert_eq!(
+            altered[0]
+                .2
+                .extensions
+                .as_ref()
+                .and_then(|e| e.get(crate::pg_key::PRIMARY_KEY_EXTENSION)),
+            Some(&"v".to_string()),
+            "the DECLARED key must be recorded — introspection reports this, not `_sys_ck_`"
+        );
+
+        let indexed = ddl.indexed.lock().unwrap();
+        assert_eq!(
+            *indexed,
+            vec![(
+                "public".to_string(),
+                "sk".to_string(),
+                "sk_pkey".to_string(),
+                vec!["v".to_string()]
+            )],
+            "a key that is not the storage key must be indexed"
+        );
+    }
+
+    /// The index is created only when it ADDs something. A key that already is the storage key
+    /// is served by the primary structure; indexing it again would be pure write overhead.
+    #[tokio::test]
+    async fn adding_a_primary_key_that_is_already_the_storage_key_is_not_indexed() {
+        let (_dir, _engine, schema) = new_engine_and_schema().await;
+        let ddl = RecordingDdl::default();
+
+        let msgs = add_key(&schema, &ddl, "ALTER TABLE kv ADD PRIMARY KEY (k)").await;
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { .. }]),
+            "must succeed: {msgs:?}"
+        );
+        assert_eq!(
+            ddl.altered.lock().unwrap().len(),
+            1,
+            "the key is still recorded"
+        );
+        assert!(
+            ddl.indexed.lock().unwrap().is_empty(),
+            "the storage key must not be indexed twice"
+        );
+    }
+
+    /// Refusals: a missing table, an unknown key column, ferrosa's own reserved column, and an
+    /// empty key. Each is refused before anything is applied.
+    #[tokio::test]
+    async fn adding_a_primary_key_refuses_bad_input_without_applying_anything() {
+        let schema = schema_with_synthetic_key();
+        for (sql, expected) in [
+            ("ALTER TABLE nope ADD PRIMARY KEY (v)", "42P01"),
+            ("ALTER TABLE sk ADD PRIMARY KEY (nope)", "42703"),
+            ("ALTER TABLE sk ADD PRIMARY KEY (_sys_other)", "42P16"),
+        ] {
+            let ddl = RecordingDdl::default();
+            let msgs = add_key(&schema, &ddl, sql).await;
+            let got = format!("{msgs:?}");
+            assert!(got.contains(expected), "{sql} must be {expected}: {got}");
+            assert!(
+                ddl.altered.lock().unwrap().is_empty(),
+                "{sql} must not have applied anything"
+            );
+            assert!(
+                ddl.indexed.lock().unwrap().is_empty(),
+                "{sql} must not index"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn inserting_into_a_table_with_a_synthetic_key_mints_a_key_per_row() {
         let (_dir, engine, schema) = new_engine_with_synthetic_key().await;

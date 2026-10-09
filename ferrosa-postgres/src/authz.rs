@@ -92,6 +92,11 @@ pub(crate) fn statement_permissions(
             .iter()
             .map(|t| (Permission::Drop, table(t, default_schema)))
             .collect(),
+        // ADD PRIMARY KEY alters the table — and may create an index over the new key — so it
+        // needs ALTER, the same permission CQL's ALTER TABLE requires.
+        Statement::AddPrimaryKey(apk) => {
+            vec![(Permission::Alter, table(&apk.table, default_schema))]
+        }
         Statement::SelectExprs(_)
         | Statement::Begin { .. }
         | Statement::Commit

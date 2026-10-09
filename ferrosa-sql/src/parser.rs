@@ -30,6 +30,8 @@ pub enum ParseError {
     UnknownType(String),
     /// `CREATE TABLE` declares the same column twice.
     DuplicateColumn(String),
+    /// An `ALTER TABLE` form outside the supported subset, described by the caller.
+    UnsupportedAlter(String),
     /// `CREATE TABLE` declares more than one primary key.
     MultiplePrimaryKeys,
     /// `CREATE TABLE` declares no primary key.
@@ -60,6 +62,9 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnknownType(t) => write!(f, "unknown column type `{t}`"),
             ParseError::DuplicateColumn(c) => write!(f, "column `{c}` is declared twice"),
+            ParseError::UnsupportedAlter(form) => {
+                write!(f, "ALTER TABLE form is not supported: {form}")
+            }
             ParseError::MultiplePrimaryKeys => write!(f, "multiple primary keys defined"),
             ParseError::MissingPrimaryKey => write!(f, "table has no PRIMARY KEY"),
             ParseError::UnknownPrimaryKeyColumn(c) => {
@@ -190,6 +195,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "UPDATE" => p.parse_update(),
             "DELETE" => p.parse_delete(),
             "CREATE" => p.parse_create(),
+            "ALTER" => p.parse_alter_table(),
             "DROP" => p.parse_drop(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
@@ -2138,6 +2144,55 @@ mod tests {
             stmt.columns.iter().all(|c| !c.primary_key),
             "no column is marked as a key when none was declared"
         );
+    }
+
+    /// `ALTER TABLE ... ADD PRIMARY KEY (...)`: the one ALTER form ferrosa accepts, and the
+    /// step `pgbench -i` runs right after creating its tables without a key.
+    #[test]
+    fn alter_table_add_primary_key_parses() {
+        let apk = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::AddPrimaryKey(a)) => *a,
+            other => panic!("expected AddPrimaryKey for `{sql}`, got {other:?}"),
+        };
+
+        let one = apk("ALTER TABLE t ADD PRIMARY KEY (a)");
+        assert_eq!(one.table.table, "t");
+        assert_eq!(one.table.schema, None);
+        assert_eq!(one.columns, vec!["a".to_string()]);
+
+        // Schema-qualified, a constraint name, multiple key columns, and ONLY: all accepted,
+        // because all are things a client actually writes.
+        let many = apk("ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a, b)");
+        assert_eq!(many.table.schema.as_deref(), Some("public"));
+        assert_eq!(many.table.table, "t");
+        assert_eq!(many.columns, vec!["a".to_string(), "b".to_string()]);
+
+        assert_eq!(
+            apk("ALTER TABLE ONLY t ADD PRIMARY KEY (a)").columns,
+            vec!["a".to_string()]
+        );
+    }
+
+    /// Every other `ALTER TABLE` is refused BY NAME. Parsing one loosely would let a client
+    /// believe a change took effect that never ran.
+    #[test]
+    fn other_alter_forms_are_refused_by_name() {
+        for sql in [
+            "ALTER TABLE t DROP COLUMN c",
+            "ALTER TABLE t RENAME TO u",
+            "ALTER TABLE t ADD COLUMN c int",
+            "ALTER INDEX i RENAME TO j",
+        ] {
+            match parse_statement(sql) {
+                Err(ParseError::UnsupportedAlter(form)) => {
+                    assert!(
+                        !form.is_empty(),
+                        "{sql}: the refusal must say what is unsupported"
+                    );
+                }
+                other => panic!("{sql} must be refused as an unsupported ALTER, got {other:?}"),
+            }
+        }
     }
 
     fn create(sql: &str) -> crate::ast::CreateTableStmt {

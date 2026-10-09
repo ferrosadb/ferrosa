@@ -10,7 +10,8 @@
 
 use super::{ParseError, Parser, Tok};
 use crate::ast::{
-    ColumnDef, CreateTableStmt, DropTableStatement, PgType, Statement, TableRef, UnsupportedClause,
+    AddPrimaryKeyStmt, ColumnDef, CreateTableStmt, DropTableStatement, PgType, Statement, TableRef,
+    UnsupportedClause,
 };
 
 /// The one schema a table may be qualified with. Other schemas are refused
@@ -112,6 +113,50 @@ impl Parser {
                 found: word,
             }),
         }
+    }
+
+    /// `ALTER TABLE <name> ADD [CONSTRAINT <name>] PRIMARY KEY (<cols>)`.
+    ///
+    /// Only this form is accepted; every other `ALTER TABLE` is refused by name rather than
+    /// parsed loosely, so a change ferrosa does not implement can never look like it applied.
+    pub(super) fn parse_alter_table(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("ALTER")?;
+        if !self.peek_is_kw("TABLE") {
+            return Err(ParseError::UnsupportedAlter(
+                "only ALTER TABLE is supported".into(),
+            ));
+        }
+        self.next(); // TABLE
+                     // `ONLY` restricts the change to the named table and not its descendants. ferrosa
+                     // has no inheritance, so accepting it is exact rather than approximate.
+        if self.peek_is_kw("ONLY") {
+            self.next();
+        }
+        let table = self.parse_qualified_table()?;
+        if !self.peek_is_kw("ADD") {
+            return Err(ParseError::UnsupportedAlter(
+                "only ADD PRIMARY KEY is supported".into(),
+            ));
+        }
+        self.next(); // ADD
+                     // `CONSTRAINT <name>` is accepted and ignored: Postgres does not require the name to
+                     // mean anything, and the key is described by its columns.
+        if self.peek_is_kw("CONSTRAINT") {
+            self.next();
+            self.ident()?; // the constraint name
+        }
+        if !self.peek_is_kw("PRIMARY") {
+            return Err(ParseError::UnsupportedAlter(
+                "only ADD PRIMARY KEY is supported".into(),
+            ));
+        }
+        self.next(); // PRIMARY
+        self.expect_ident_kw("KEY")?;
+        let columns = self.parse_paren_ident_list()?;
+        Ok(Statement::AddPrimaryKey(Box::new(AddPrimaryKeyStmt {
+            table,
+            columns,
+        })))
     }
 
     /// `( ident [, ident]* )` — the column list of a table-level PRIMARY KEY.

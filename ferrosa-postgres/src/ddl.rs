@@ -24,9 +24,9 @@ use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_common::cql_type::CqlType;
 use ferrosa_common::timeuuid::{is_reserved_column_name, SYNTHETIC_KEY_COLUMN};
 use ferrosa_schema::{
-    ClusteringOrder, ColumnKind, ColumnMetadata, Schema, TableMetadata, TableParams,
+    ClusteringOrder, ColumnKind, ColumnMetadata, Schema, TableMetadata, TableParams, TableUpdates,
 };
-use ferrosa_sql::{ColumnDef, CreateTableStmt, DropTableStatement, PgType};
+use ferrosa_sql::{AddPrimaryKeyStmt, ColumnDef, CreateTableStmt, DropTableStatement, PgType};
 use indexmap::IndexMap;
 
 use crate::messages::BackendMessage;
@@ -45,6 +45,24 @@ pub trait DdlExecutor: Send + Sync {
     /// caller's concern (it checks existence first); this reports only apply
     /// failures.
     async fn drop_table(&self, keyspace: &str, table: &str) -> Result<(), String>;
+    /// Apply `updates` to `keyspace.table` through the same path.
+    async fn alter_table(
+        &self,
+        keyspace: &str,
+        table: &str,
+        updates: TableUpdates,
+    ) -> Result<(), String>;
+    /// Create a secondary index over `columns` through the same path.
+    ///
+    /// Takes the pieces rather than an `IndexMetadata` so the front-end needs no dependency on
+    /// `ferrosa-index`; the construction lives beside `DdlOperation::CreateIndex`.
+    async fn create_index(
+        &self,
+        keyspace: &str,
+        table: &str,
+        name: &str,
+        columns: &[String],
+    ) -> Result<(), String>;
 }
 
 /// [`DdlExecutor`] over the shared, atomically swappable [`DdlPath`] that the
@@ -77,6 +95,36 @@ impl DdlExecutor for ClusterDdl {
         .await
         .map_err(|e| e.to_string())
     }
+
+    async fn alter_table(
+        &self,
+        keyspace: &str,
+        table: &str,
+        updates: TableUpdates,
+    ) -> Result<(), String> {
+        let path = self.path.load_full();
+        path.execute(DdlOperation::AlterTable {
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            updates: Box::new(updates),
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    async fn create_index(
+        &self,
+        keyspace: &str,
+        table: &str,
+        name: &str,
+        columns: &[String],
+    ) -> Result<(), String> {
+        let path = self.path.load_full();
+        let index = ferrosa_cluster::pair::ddl::secondary_index(keyspace, table, name, columns);
+        path.execute(DdlOperation::CreateIndex(index))
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// What a `CREATE TABLE` runs against: the schema registry it checks for
@@ -94,9 +142,104 @@ fn refuse(code: &str, message: &str) -> Vec<BackendMessage> {
 }
 
 fn complete() -> Vec<BackendMessage> {
+    complete_with("CREATE TABLE")
+}
+
+/// The same, for a statement whose completion tag differs.
+fn complete_with(tag: &str) -> Vec<BackendMessage> {
     vec![BackendMessage::CommandComplete {
-        tag: "CREATE TABLE".to_string(),
+        tag: tag.to_string(),
     }]
+}
+
+/// Execute `ALTER TABLE ... ADD PRIMARY KEY (...)`, the only `ALTER TABLE` form ferrosa accepts
+/// and the one `pgbench -i` runs immediately after creating tables without a key.
+///
+/// Two effects, and the second is why the first exists:
+///
+/// 1. the **declared** key is recorded ([`crate::pg_key`]), so a client introspecting the
+///    catalog reports the key the user asked for — never the synthetic `_sys_ck_` a PK-less
+///    table was given;
+/// 2. when that key is not the storage key, a secondary index is built over it. On a table
+///    whose storage key is the synthetic column this is always the case, and without the index
+///    a lookup by the declared key degrades to a full scan.
+///
+/// The record is applied first, so a failure to index still leaves the declared key correct
+/// rather than losing it. The reply distinguishes the two: `58000` names which step failed.
+pub(crate) async fn execute_add_primary_key(
+    env: DdlEnv<'_>,
+    stmt: &AddPrimaryKeyStmt,
+) -> Vec<BackendMessage> {
+    if env.in_txn {
+        return refuse(
+            "25001",
+            "ALTER TABLE cannot run inside a transaction block: DDL is not transactional here",
+        );
+    }
+    let Some(executor) = env.executor else {
+        return refuse(
+            "0A000",
+            "ALTER TABLE is not available: this server has no schema-change path",
+        );
+    };
+    let keyspace = stmt.table.schema.as_deref().unwrap_or(env.default_schema);
+    let key = (keyspace.to_string(), stmt.table.table.clone());
+    let Some(meta) = env.schema.snapshot().tables.get(&key).cloned() else {
+        return refuse(
+            "42P01",
+            &format!("relation \"{}\" does not exist", stmt.table.table),
+        );
+    };
+    if stmt.columns.is_empty() {
+        return refuse("42601", "a PRIMARY KEY must name at least one column");
+    }
+    for name in &stmt.columns {
+        if is_reserved_column_name(name) {
+            return refuse(
+                "42P16",
+                &format!(
+                    "column name \"{name}\" is reserved: the `_sys_` prefix belongs to ferrosa"
+                ),
+            );
+        }
+        if !meta.columns.contains_key(name) {
+            return refuse(
+                "42703",
+                &format!("column \"{name}\" named in the PRIMARY KEY does not exist"),
+            );
+        }
+    }
+
+    let updates = TableUpdates {
+        params: None,
+        add_columns: Vec::new(),
+        drop_columns: Vec::new(),
+        extensions: Some(HashMap::from([(
+            crate::pg_key::PRIMARY_KEY_EXTENSION.to_string(),
+            crate::pg_key::encode(&stmt.columns),
+        )])),
+    };
+    if let Err(error) = executor
+        .alter_table(keyspace, &stmt.table.table, updates)
+        .await
+    {
+        return refuse("58000", &format!("ALTER TABLE failed: {error}"));
+    }
+
+    if stmt.columns != crate::pg_key::storage_key_columns(&meta) {
+        let name = format!("{}_pkey", stmt.table.table);
+        if let Err(error) = executor
+            .create_index(keyspace, &stmt.table.table, &name, &stmt.columns)
+            .await
+        {
+            return refuse(
+                "58000",
+                &format!("the key was recorded but indexing it failed: {error}"),
+            );
+        }
+    }
+
+    complete_with("ALTER TABLE")
 }
 
 /// Execute `CREATE TABLE [IF NOT EXISTS]` (FMEA PG-T132a-01..05).

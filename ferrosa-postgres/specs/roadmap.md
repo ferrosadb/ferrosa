@@ -89,14 +89,16 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   (`ferrosa_common::timeuuid::is_reserved_column_name`), so a future system column
   cannot collide with a user's table.
   **Done:** the reserved-name rule and the v1 TimeUUID mint (`ferrosa-common`); synthesis in
-  `plan_create_table`; per-row minting on `INSERT` (`ferrosa-postgres/src/synthetic_key.rs`),
-  proven end to end against a synthetic-key fixture; `SELECT *` hiding the column
-  (`result_stream.rs`, filtered only for a star projection, so naming the column still
-  returns it); and `pg_attribute` giving it a **negative `attnum`** with the user's columns
-  still 1..n (`catalog.rs`). **Not yet done:** minting on `COPY`, and
-  `ALTER TABLE ... ADD PRIMARY KEY` (not parsed at all today — a later `ADD PRIMARY KEY`
-  naming some other column should become a secondary index; naming the synthetic key is a
-  no-op). See `ferrosa-common`'s README section "Reserved `_sys_` columns"
+  `plan_create_table`; per-row minting on `INSERT` (`synthetic_key.rs`), proven end to end;
+  `SELECT *` hiding the column (`result_stream.rs`, filtered only for a star projection, so
+  naming the column still returns it); `pg_attribute` giving it a **negative `attnum`**
+  (`catalog.rs`); and `ALTER TABLE ... ADD PRIMARY KEY` (`ddl.rs::execute_add_primary_key`),
+  which records the declared key and builds a secondary index when that key is not the
+  storage key.
+  **Not yet done:** minting on `COPY`, and any projection that *reads* `pg_key` — psql's
+  describe-table wants `pg_index` (`indisprimary`) plus index rows in `pg_class`, neither of
+  which exists yet, so the recorded key is written but not yet visible to a client. See
+  `ferrosa-common`'s README section "Reserved `_sys_` columns"
 - **Binary `numeric`** result/param encoding (FMEA PG-7), removing the
   text-bytes fallback.
 - **Real query cancellation** (FMEA PG-8) — mint a real `BackendKeyData`
