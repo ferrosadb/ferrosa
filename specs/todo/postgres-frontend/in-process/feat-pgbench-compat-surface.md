@@ -89,6 +89,19 @@ query::txn_buffer_tests::a_buffered_multi_row_insert_applies_every_row          
 ```
 
 **Conclusion: the defect is in the live multi-node apply path, below ferrosa-postgres.**
+There is deliberately NO in-process test for it, because none can bite. Six
+combinations were run and all six are green with the bug present:
+
+| path | with bug | correct |
+|---|---|---|
+| autocommit, values asserted | pass | pass |
+| buffered, mutations built directly | pass | pass |
+| buffered, driven through execute_insert | pass | pass |
+
+A single-process engine simply cannot exhibit the loss, so any test written here would
+pass and prove nothing. The test that matters must drive a real wire connection into a
+real multi-node cluster and assert the read-back — which is what the probe does. Do not
+add an in-process "regression test" for this; it would be false assurance.
 A single-node in-process engine cannot exhibit it. Next step: reproduce with a real
 clustered process test (3 nodes, real transport) — a mock or single-node harness will
 keep passing — and instrument what the coordinator actually persists for a
