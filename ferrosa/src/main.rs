@@ -542,6 +542,50 @@ fn resolve_postgres_bind(file_config: &toml::Value) -> std::net::SocketAddr {
     parse_bind_addr("Postgres", "FERROSA_POSTGRES_BIND", &postgres_bind)
 }
 
+/// The keyspace the PostgreSQL listener points every session at.
+///
+/// `[postgres]` has no `keyspace` key; the listener is constructed with
+/// `default_schema: "public"` (see step 11b), so this name must exist for any
+/// unqualified `CREATE TABLE`/DML/SELECT to resolve.
+const POSTGRES_DEFAULT_KEYSPACE: &str = "public";
+
+/// Ensure `[postgres]`'s default keyspace exists before the listener binds.
+///
+/// A fresh node has no `public` keyspace, so the PostgreSQL listener comes up
+/// advertising `current_schema = public` while every table statement fails —
+/// `CREATE TABLE public.x` with `schema "public" does not exist`, and SELECT/DML
+/// with `Accord network error: no replicas resolved for a key in keyspace
+/// 'public' (cluster mode required)` (the per-key replica resolver only knows
+/// keyspaces that exist). The listener is not usable until `public` exists, and
+/// no wire statement can create it (`CREATE SCHEMA`/`CREATE DATABASE`/
+/// `CREATE KEYSPACE` are unsupported; the only DDL verb is `CREATE TABLE`).
+///
+/// Idempotent and non-destructive: an existing `public` is left untouched, so a
+/// cluster-created `public` with its own replication is never downgraded.
+/// Returns whether the keyspace was created.
+fn ensure_postgres_default_keyspace(
+    schema: &ferrosa_schema::Schema,
+) -> ferrosa_schema::Result<bool> {
+    if schema
+        .snapshot()
+        .keyspaces
+        .contains_key(POSTGRES_DEFAULT_KEYSPACE)
+    {
+        return Ok(false);
+    }
+    schema.create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+        name: POSTGRES_DEFAULT_KEYSPACE.into(),
+        replication: ferrosa_schema::ReplicationParams {
+            strategy: "SimpleStrategy".into(),
+            options: [("replication_factor".into(), "1".into())]
+                .into_iter()
+                .collect(),
+        },
+        durable_writes: true,
+    })?;
+    Ok(true)
+}
+
 /// Apply TOML `[internode]` overrides to a `NetConfig`.
 ///
 /// Precedence is **TOML wins** over env (see [`config_val`]): the base
@@ -3068,6 +3112,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // model, and negotiates TLS from `[postgres] tls_cert/tls_key/require_tls`
     // (t_e1c819ad).
     {
+        // The listener points every session at keyspace `public`
+        // (default_schema below); create it if this node has never had one, or
+        // no table statement can resolve. Idempotent and non-destructive — an
+        // existing `public` (e.g. one a cluster created with its own
+        // replication) is left untouched.
+        match ensure_postgres_default_keyspace(&schema) {
+            Ok(true) => tracing::info!(
+                keyspace = POSTGRES_DEFAULT_KEYSPACE,
+                "created the PostgreSQL default keyspace"
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    keyspace = POSTGRES_DEFAULT_KEYSPACE,
+                    "could not ensure the PostgreSQL default keyspace; \
+                     PostgreSQL DDL/DML will fail until it exists"
+                );
+            }
+        }
         let pg_bind = resolve_postgres_bind(&file_config);
         let pg_tls_config = &listener_tls_inputs.postgres;
         let pg_tls = match ferrosa_postgres::PgTls::from_pem(
@@ -3492,6 +3556,89 @@ mod tests {
     }
 
     const SEGMENT_32_MIB: u64 = 32 * 1024 * 1024;
+
+    fn dev_schema() -> ferrosa_schema::Schema {
+        let config = ferrosa_schema::SchemaConfig {
+            hasher: ferrosa_schema::PasswordHasher::default(),
+            password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+            auth_method: ferrosa_schema::AuthMethod::Password,
+            rate_limit: ferrosa_schema::RateLimitConfig::default(),
+            audit_sink: Box::new(ferrosa_schema::LogAuditSink),
+            secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+            mode: ferrosa_schema::DeploymentMode::Development,
+        };
+        ferrosa_schema::Schema::new(config).expect("schema bootstraps")
+    }
+
+    fn keyspace_snapshot(
+        schema: &ferrosa_schema::Schema,
+        name: &str,
+    ) -> Option<ferrosa_schema::KeyspaceMetadata> {
+        schema.snapshot().keyspaces.get(name).cloned()
+    }
+
+    #[test]
+    fn postgres_default_keyspace_is_created_when_absent() {
+        // GIVEN a fresh node whose schema has no `public` keyspace
+        let schema = dev_schema();
+        assert!(
+            keyspace_snapshot(&schema, POSTGRES_DEFAULT_KEYSPACE).is_none(),
+            "fixture must start without `public` (or the test exercises nothing)"
+        );
+
+        // WHEN the PostgreSQL listener's default keyspace is ensured
+        let created = ensure_postgres_default_keyspace(&schema).unwrap();
+
+        // THEN `public` exists and the call reports that it created it
+        assert!(created, "first call must create the keyspace");
+        assert!(
+            keyspace_snapshot(&schema, POSTGRES_DEFAULT_KEYSPACE).is_some(),
+            "`public` must exist for the PostgreSQL listener to serve a statement"
+        );
+    }
+
+    #[test]
+    fn postgres_default_keyspace_creation_is_idempotent() {
+        let schema = dev_schema();
+        assert!(ensure_postgres_default_keyspace(&schema).unwrap());
+        // Second call must be a no-op reported as "nothing created", not an error.
+        assert!(!ensure_postgres_default_keyspace(&schema).unwrap());
+        assert!(keyspace_snapshot(&schema, POSTGRES_DEFAULT_KEYSPACE).is_some());
+    }
+
+    #[test]
+    fn postgres_default_keyspace_does_not_clobber_an_existing_cluster_keyspace() {
+        // GIVEN `public` already exists with a non-default replication (as a
+        // cluster-created keyspace would)
+        let schema = dev_schema();
+        schema
+            .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+                name: POSTGRES_DEFAULT_KEYSPACE.into(),
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "SimpleStrategy".into(),
+                    options: [("replication_factor".into(), "3".into())]
+                        .into_iter()
+                        .collect(),
+                },
+                durable_writes: true,
+            })
+            .unwrap();
+
+        // WHEN ensure runs
+        let created = ensure_postgres_default_keyspace(&schema).unwrap();
+
+        // THEN it reports no creation and the existing replication is intact
+        assert!(!created, "an existing keyspace must not be re-created");
+        let ks = keyspace_snapshot(&schema, POSTGRES_DEFAULT_KEYSPACE).unwrap();
+        assert_eq!(
+            ks.replication
+                .options
+                .get("replication_factor")
+                .map(String::as_str),
+            Some("3"),
+            "an existing `public` replication must never be downgraded"
+        );
+    }
 
     fn jsonb_toml(body: &str) -> toml::Value {
         format!("[jsonb]\n{body}\n").parse().unwrap()
