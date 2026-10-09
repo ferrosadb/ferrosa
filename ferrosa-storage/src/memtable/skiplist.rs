@@ -63,6 +63,9 @@ pub struct SkipListMemtable {
     count: AtomicUsize,
     /// Smallest timestamp of anything accepted by `put` (`i64::MAX` when empty).
     min_ts: AtomicI64,
+    /// Every accepted `put`, so a reader can tell in O(1) whether anything was
+    /// written since it looked (see [`Memtable::write_epoch`]).
+    write_epoch: AtomicUsize,
 }
 
 impl SkipListMemtable {
@@ -72,6 +75,7 @@ impl SkipListMemtable {
             size: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
             min_ts: AtomicI64::new(i64::MAX),
+            write_epoch: AtomicUsize::new(0),
         }
     }
 }
@@ -126,6 +130,11 @@ impl Memtable for SkipListMemtable {
 
         let partition = Arc::make_mut(&mut guard);
         super::sharded::merge_row_into_partition(partition, row, schema)?;
+
+        // Record the write only after it is in the partition, so a rejected row
+        // cannot make a reader believe something landed (I-1: the epoch must be
+        // exact in the conservative direction — never skip a real late write).
+        self.write_epoch.fetch_add(1, Ordering::Release);
 
         let new_size = estimate_partition_size(partition);
         if new_size >= old_size {
@@ -199,9 +208,108 @@ impl Memtable for SkipListMemtable {
     fn size_bytes(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }
-
     fn partition_count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    /// Borrowed read-only scan: the fix for the t512 regression.
+    ///
+    /// `range_iter` hands the consumer an owned `Arc<Partition>`. A consumer
+    /// that *holds* it (the fulltext build, the flush late-writer drain) raises
+    /// the partition's strong count to > 1, so the next `put` on that partition
+    /// finds `Arc::make_mut` with refcount > 1 and deep-clones the whole
+    /// partition before merging — O(rows-in-partition) per write, i.e. the
+    /// O(N^2) fill pathology `e440b60f` removed. Pinned by
+    /// `a_held_arc_makes_the_next_write_copy_on_write_and_stale`: a holder keeps
+    /// the pre-write image while the memtable owns the post-write one.
+    ///
+    /// Here the guard is held for the callback and the value is borrowed, never
+    /// cloned out, so the memtable stays the sole owner of each partition and
+    /// concurrent writes keep merging in place.
+    fn for_each_partition(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        f: &mut dyn FnMut(&Partition) -> bool,
+    ) {
+        // Bounds are compared, not cloned: `DecoratedKey`'s clone allocates.
+        let in_range =
+            |key: &DecoratedKey| start.is_none_or(|s| key >= s) && end.is_none_or(|e| key <= e);
+        for entry in self.map.iter() {
+            if !in_range(entry.key()) {
+                continue;
+            }
+            // Hold this partition's read lock across the callback. The `Arc` is
+            // borrowed — no clone, so no refcount inflation and no COW for a
+            // concurrent writer (I-2). The lock is released when this iteration
+            // step ends, so a writer waits at most one callback (I-5).
+            let guard = entry.value().read();
+            if !f(&guard) {
+                return;
+            }
+        }
+    }
+
+    /// Bounded-hold variant for callbacks that do real work per row.
+    ///
+    /// Clones the partition under the read guard, **releases it**, then calls
+    /// `f` with the owned copy. A concurrent writer to that partition therefore
+    /// waits for one memcpy rather than for the whole analysis — which is what
+    /// the fulltext index build needs (it analyzes text and folds a
+    /// term-frequency map per row). The `Arc` is never cloned out, so the
+    /// memtable keeps sole ownership and writes still merge in place.
+    fn for_each_partition_cloned(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        f: &mut dyn FnMut(&Partition),
+    ) {
+        let in_range =
+            |key: &DecoratedKey| start.is_none_or(|s| key >= s) && end.is_none_or(|e| key <= e);
+        for entry in self.map.iter() {
+            if !in_range(entry.key()) {
+                continue;
+            }
+            // Scope the guard so it is dropped before `f` runs.
+            //
+            // `(**guard).clone()` — a DEEP `Partition` clone, deliberately not
+            // `guard.clone()`. `entry.value()` is `RwLock<Arc<Partition>>`, so
+            // `guard.clone()` would resolve through `Deref` to `Arc::clone`: a
+            // refcount bump, not a copy. That would leave an extra strong
+            // reference alive for the duration of `f`, so a concurrent `put`
+            // would find `Arc::make_mut` with refcount > 1 and copy-on-write the
+            // whole partition — re-introducing the very regression this exists to
+            // fix, and doing it silently (an Arc clone is correct-looking and
+            // cheap, and `f(&owned)` still compiles through `Deref`).
+            let guard = entry.value().read();
+            // Pin the shape: taking the clone must not add a reference. Compared
+            // against the count *with this guard held*, so any legitimate
+            // external holder (another reader's `get`) is included on both sides
+            // and does not produce a false positive.
+            //
+            // NOT `#[cfg(debug_assertions)]`-gated, even though the assertion is
+            // debug-only: `debug_assert_eq!` expands to
+            // `if cfg!(debug_assertions) { assert_eq!(..) }` — a *runtime* `if`
+            // — so its arguments are still name-resolved in a release build. Gating
+            // the binding away makes release compilation fail with E0425. The cost
+            // of keeping it is one relaxed atomic load per cloned partition.
+            let refs_before = std::sync::Arc::strong_count(&guard);
+            let owned = (**guard).clone();
+            debug_assert_eq!(
+                std::sync::Arc::strong_count(&guard),
+                refs_before,
+                "the cloned visit must deep-clone the partition, not bump the \
+                 memtable's Arc: the strong count rose by taking the clone, so a \
+                 concurrent write would copy-on-write instead of merging in place"
+            );
+            drop(guard);
+            f(&owned);
+        }
+    }
+
+    /// Every accepted `put` on this memtable; see [`Memtable::write_epoch`].
+    fn write_epoch(&self) -> u64 {
+        self.write_epoch.load(Ordering::Acquire) as u64
     }
 
     fn min_timestamp(&self) -> i64 {
@@ -415,6 +523,36 @@ mod tests {
             "a scanned Arc had refcount 1 while two scans held it — it was not \
              the stored Arc"
         );
+    }
+
+    /// The read-path consumers that only *read* partitions (the fulltext index
+    /// build and the flush late-writer check) scan through `range_iter` rather
+    /// than `snapshot`. That substitution is only sound while the two agree
+    /// exactly, so pin it: same partitions, same order, same content. A
+    /// divergence would silently drop or reorder a user's partitions.
+    #[test]
+    fn range_iter_and_snapshot_agree_exactly() {
+        let mem = SkipListMemtable::new();
+        let schema = test_schema();
+        for i in 0..20 {
+            let key = make_key(&format!("key_{i:02}"));
+            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
+                .unwrap();
+        }
+
+        let snapshot = mem.snapshot();
+        let scanned: Vec<Arc<Partition>> = mem.range_iter(None, None).collect();
+        assert_eq!(snapshot.len(), scanned.len());
+        for (from_snapshot, from_scan) in snapshot.iter().zip(scanned.iter()) {
+            // Same key order...
+            assert_eq!(from_snapshot.key, from_scan.key);
+            // ...and the same bytes, so a reader cannot tell them apart.
+            assert_eq!(from_snapshot.rows.len(), from_scan.rows.len());
+            for (a, b) in from_snapshot.rows.iter().zip(from_scan.rows.iter()) {
+                assert_eq!(a.clustering, b.clustering);
+                assert_eq!(a.cells, b.cells);
+            }
+        }
     }
 
     #[test]

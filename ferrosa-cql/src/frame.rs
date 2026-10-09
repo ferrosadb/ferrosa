@@ -798,15 +798,28 @@ fn v5_reassembly_target(buf: &[u8]) -> Option<usize> {
 /// Produces: [3-byte LE header][3-byte CRC24][payload][4-byte CRC32]
 /// where payload = 9-byte envelope header + envelope body.
 pub fn encode_v5_frame(envelope_header: &FrameHeader, body: &[u8], dst: &mut BytesMut) {
-    // Build the envelope (9-byte header + body), then emit it as one or more
-    // frames depending on whether it fits the 17-bit payload length field.
+    // The envelope header is a fixed 9 bytes, so the payload length is known
+    // before any byte moves.
     let payload_len = HEADER_SIZE + body.len();
 
     if payload_len <= V5_MAX_PAYLOAD {
-        let mut envelope = BytesMut::with_capacity(payload_len);
-        envelope_header.encode(&mut envelope);
-        envelope.put_slice(body);
-        put_v5_frame(&envelope, true, dst);
+        // Emit straight into `dst`: reserve once, leave a 9-byte hole for the
+        // envelope header, write header + `body`, then fill that hole and the
+        // trailing CRC32 by index. The previous form materialised the whole
+        // envelope in a scratch `BytesMut` and then copied it again through
+        // `put_v5_frame`, so every response body was memcpy'd twice.
+        let frame_start = dst.len();
+        dst.reserve(V5_FRAME_HEADER_SIZE + payload_len + V5_CRC32_SIZE);
+        dst.resize(frame_start + V5_FRAME_HEADER_SIZE, 0);
+        // The payload — envelope header then body — begins immediately after
+        // the 6-byte frame header, so capture that offset before writing.
+        let payload_start = dst.len();
+        debug_assert_eq!(payload_start - frame_start, V5_FRAME_HEADER_SIZE);
+        envelope_header.encode(dst);
+        dst.put_slice(body);
+        debug_assert_eq!(dst.len() - payload_start, payload_len);
+        dst.resize(dst.len() + V5_CRC32_SIZE, 0);
+        write_v5_frame_fields(payload_start, payload_len, true, dst);
         return;
     }
 
@@ -818,6 +831,10 @@ pub fn encode_v5_frame(envelope_header: &FrameHeader, body: &[u8], dst: &mut Byt
     //
     // Previously this asserted, which panicked the CQL runtime thread and
     // dropped the connection for any response page over 128 KiB.
+    //
+    // Kept on the scratch-envelope form: putting each slice's 6-byte header
+    // contiguously ahead of it in `dst` would mean re-shifting the tail once
+    // per slice. Pages this large are rare, so the simpler form wins there.
     let mut envelope = BytesMut::with_capacity(payload_len);
     envelope_header.encode(&mut envelope);
     envelope.put_slice(body);
@@ -825,6 +842,33 @@ pub fn encode_v5_frame(envelope_header: &FrameHeader, body: &[u8], dst: &mut Byt
     for slice in envelope.chunks(V5_MAX_PAYLOAD) {
         put_v5_frame(slice, false, dst);
     }
+}
+
+/// Fill the 3-byte length/flags header, its CRC24, and the trailing CRC32 of a
+/// single v5 frame whose `len`-byte payload already sits at `payload_start`.
+///
+/// The header slot and the trailing CRC32 slot must already be reserved in
+/// `dst` (the caller does this with `resize`), so nothing moves here.
+fn write_v5_frame_fields(
+    payload_start: usize,
+    len: usize,
+    self_contained: bool,
+    dst: &mut BytesMut,
+) {
+    debug_assert!(len <= V5_MAX_PAYLOAD);
+    let mut header_bits: u32 = len as u32;
+    if self_contained {
+        header_bits |= 1 << 17;
+    }
+    let h_bytes = header_bits.to_le_bytes();
+    let crc24_bytes = crc24(&h_bytes[..3]).to_le_bytes();
+    let crc32 = crc32_ieee_v5(&dst[payload_start..payload_start + len]);
+
+    let header_start = payload_start - V5_FRAME_HEADER_SIZE;
+    dst[header_start..header_start + 3].copy_from_slice(&h_bytes[..3]);
+    dst[header_start + 3..header_start + V5_FRAME_HEADER_SIZE].copy_from_slice(&crc24_bytes[..3]);
+    let crc_start = payload_start + len;
+    dst[crc_start..crc_start + V5_CRC32_SIZE].copy_from_slice(&crc32.to_le_bytes());
 }
 
 /// Append exactly one v5 frame wrapping `payload`.
@@ -1721,5 +1765,102 @@ mod tests {
         let result = decoder.decode_eof(&mut buf);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    /// The staging form `encode_v5_frame` used before it wrote in place: build
+    /// the whole envelope, then append it as one self-contained frame. Kept
+    /// **only** as a test oracle so the in-place writer is pinned to
+    /// byte-identical output.
+    fn legacy_encode_v5_frame(envelope_header: &FrameHeader, body: &[u8], dst: &mut BytesMut) {
+        let payload_len = HEADER_SIZE + body.len();
+        if payload_len <= V5_MAX_PAYLOAD {
+            let mut envelope = BytesMut::with_capacity(payload_len);
+            envelope_header.encode(&mut envelope);
+            envelope.put_slice(body);
+            put_v5_frame(&envelope, true, dst);
+            return;
+        }
+        let mut envelope = BytesMut::with_capacity(payload_len);
+        envelope_header.encode(&mut envelope);
+        envelope.put_slice(body);
+        for slice in envelope.chunks(V5_MAX_PAYLOAD) {
+            put_v5_frame(slice, false, dst);
+        }
+    }
+
+    fn v5_header(opcode: Opcode, length: u32) -> FrameHeader {
+        FrameHeader {
+            version: 0x05,
+            flags: 0,
+            stream_id: 7,
+            opcode,
+            length,
+        }
+    }
+
+    /// I-2: the in-place writer must produce byte-identical frames to the
+    /// staging writer it replaced — header bits, CRC24, payload and CRC32.
+    #[test]
+    fn encode_v5_frame_is_byte_identical_to_the_staging_writer() {
+        let bodies: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![1],
+            b"a short result body".to_vec(),
+            // Spans the 16 KiB and 64 KiB region so the crc32 fast paths are hit.
+            (0..20_000u32).map(|i| (i % 251) as u8).collect(),
+            vec![0xAB; 100_000],
+        ];
+        for body in bodies {
+            for opcode in [Opcode::Result, Opcode::Error, Opcode::Ready] {
+                let header = v5_header(opcode, body.len() as u32);
+                let mut got = BytesMut::new();
+                encode_v5_frame(&header, &body, &mut got);
+                let mut want = BytesMut::new();
+                legacy_encode_v5_frame(&header, &body, &mut want);
+                assert_eq!(
+                    got.as_ref(),
+                    want.as_ref(),
+                    "encode_v5_frame diverged for {} body bytes, opcode {opcode:?}",
+                    body.len()
+                );
+            }
+        }
+    }
+
+    /// The frame is appended, not written at offset 0: `dst` may already hold
+    /// earlier frames on the same connection, and the header/CRC patches are
+    /// index-based.
+    #[test]
+    fn encode_v5_frame_appends_at_a_nonzero_offset() {
+        let header = v5_header(Opcode::Result, 5);
+        let mut dst = BytesMut::from(&b"earlier"[..]);
+        let prefix_len = dst.len();
+        encode_v5_frame(&header, b"hello", &mut dst);
+
+        let mut expected_tail = BytesMut::new();
+        legacy_encode_v5_frame(&header, b"hello", &mut expected_tail);
+
+        assert_eq!(&dst[..prefix_len], b"earlier");
+        assert_eq!(&dst[prefix_len..], expected_tail.as_ref());
+    }
+
+    /// The oversize branch stays on the staging form; pin it so a later
+    /// "cleanup" cannot silently change the segmented framing.
+    #[test]
+    fn encode_v5_frame_oversize_matches_the_staging_writer() {
+        let body = vec![0x5A; V5_MAX_PAYLOAD + 4096];
+        let header = v5_header(Opcode::Result, body.len() as u32);
+        let mut got = BytesMut::new();
+        encode_v5_frame(&header, &body, &mut got);
+        let mut want = BytesMut::new();
+        legacy_encode_v5_frame(&header, &body, &mut want);
+        assert_eq!(got.as_ref(), want.as_ref());
+        // More than one slice, none of them self-contained.
+        let frames = split_v5_frames(&got);
+        assert!(frames.len() > 1, "oversize envelope must segment");
+        assert!(
+            frames.iter().all(|(_, self_contained)| !self_contained),
+            "every slice of an oversize envelope carries isSelfContained=0"
+        );
     }
 }

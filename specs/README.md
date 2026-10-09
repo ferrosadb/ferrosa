@@ -23,6 +23,7 @@ specs/
   implemented/   Specs whose feature/fix is implemented in code (KEEP + audit MOVE→implemented)
   reference/     Living architecture, DSM, (reliability) FMEA, hazard, and process docs
   todo/          Genuinely open + partial work with remaining implementation
+  proposed/      Design/proposals not yet implemented
   decisions/     Architecture Decision Records (ADRs), carried over wholesale
   security/      Threat models — re-status against code before citing as evidence
   crates.md          Crate-centric index → every crate's README + per-crate specs/
@@ -45,6 +46,7 @@ specs/
 | [`implemented/`](implemented/) | Implementation present in code; some still need a live-infra verification run | see `find specs/implemented -type f` |
 | [`reference/`](reference/) | Descriptive, living docs: ARCHITECTURE, components, data-flow, storage, sstable, cql, DSMs, reliability FMEAs, raft invariants, *-architecture, hazards, release-process, roadmap | — |
 | [`todo/`](todo/) | Open bugs and features with real remaining work, including audit PARTIAL and VERIFY-RUN-with-no-locatable-fix items | — |
+| [`proposed/`](proposed/) | Design/proposal specs with no implementation yet — e.g. [`cql-rt-copy-analysis.md`](proposed/cql-rt-copy-analysis.md), [`cql-rt-memory-ops-analysis.md`](proposed/cql-rt-memory-ops-analysis.md) | — |
 | [`decisions/`](decisions/) | ADRs 001–020 + role-auth rollout | — |
 | [`security/`](security/) | STRIDE threat models. Flagged optimistic by the audit — see `SECURITY-STATUS.md` | — |
 

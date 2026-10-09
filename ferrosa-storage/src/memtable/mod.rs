@@ -668,6 +668,11 @@ pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Re
 /// Implementations must be thread-safe for concurrent reads and writes.
 /// All methods take `&self` — internal synchronization is the implementor's
 /// responsibility.
+/// `write_epoch` value meaning "this backing does not track writes", so a caller
+/// must rescan rather than conclude nothing was written (see
+/// [`Memtable::write_epoch`]).
+pub const UNTRACKED_WRITE_EPOCH: u64 = u64::MAX;
+
 pub trait Memtable: Send + Sync {
     /// Insert or update a row. Merges with existing data by timestamp
     /// (cell-level last-write-wins).
@@ -727,6 +732,111 @@ pub trait Memtable: Send + Sync {
 
     /// Number of partitions stored. Wait-free (`AtomicUsize`).
     fn partition_count(&self) -> usize;
+
+    /// Visit every partition in token order within the optional `[start, end]`
+    /// bounds, one at a time, **borrowed**.
+    ///
+    /// This is the read-only scan. Unlike [`Memtable::range_iter`] it never
+    /// hands out an owned `Arc<Partition>`: the reference is borrowed for the
+    /// duration of the callback, so the memtable's per-partition refcount stays
+    /// at 1 and a concurrent `put`'s `Arc::make_mut` merges **in place**
+    /// instead of copy-on-writing the whole partition.
+    ///
+    /// That is not a micro-optimisation. `Arc::make_mut` deep-clones its target
+    /// whenever the refcount is > 1, so a consumer that *holds* a yielded `Arc`
+    /// across its work makes every concurrent write to that partition pay an
+    /// O(rows-in-partition) clone — the O(N^2) fill pathology this memtable was
+    /// explicitly fixed to remove (see `memtable_write_alloc_bound.rs` and the
+    /// `skiplist` module docs). Read-only consumers that only need to *look* at
+    /// rows — the fulltext index build, the flush late-writer drain — must use
+    /// this method, not `range_iter`.
+    ///
+    /// The callback returns `true` to continue and `false` to stop, so a bounded
+    /// consumer (`LIMIT k`, a resume cursor) does not walk the rest of the table.
+    ///
+    /// Still non-materializing: neither the whole table nor any partition is
+    /// collected into a `Vec`, so this stays within the streaming rule (ADR-020).
+    ///
+    /// The callback runs while this partition's read lock is held, so a write to
+    /// *that* partition waits for the call to return. Callbacks must therefore be
+    /// short and must not call back into this memtable (that would deadlock or
+    /// self-contend). Writers to other partitions are unaffected.
+    fn for_each_partition(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        f: &mut dyn FnMut(&Partition) -> bool,
+    ) {
+        // Default for backings that have not overridden: borrow each partition
+        // in turn off the lazy iterator. Correct, but the yielded `Arc` raises
+        // the refcount for the duration of `f`, so production backings override
+        // this with an implementation that holds a read guard instead (I-2).
+        for partition in self.range_iter(start, end) {
+            if !f(&partition) {
+                break;
+            }
+        }
+    }
+
+    /// Monotonic count of rows accepted by [`Memtable::put`] on this memtable.
+    ///
+    /// Lets a caller answer "did anything get written since I looked?" in O(1)
+    /// instead of rescanning the table. The flush's late-writer drain records
+    /// this immediately after snapshotting the sealed memtable; if it is
+    /// unchanged when the drain runs, no write landed after the snapshot and the
+    /// whole-table rescan is skipped (invariant I-1: the counter must be exact,
+    /// so a write can never leave it unchanged).
+    ///
+    /// `u64::MAX` means "not tracked" — a caller must then rescan rather than
+    /// conclude there were no late writes. That conservative default keeps an
+    /// implementation which forgets to override this from silently dropping a
+    /// late write (I-1).
+    fn write_epoch(&self) -> u64 {
+        UNTRACKED_WRITE_EPOCH
+    }
+
+    /// Visit every partition in token order, handing the callback an **owned
+    /// clone** of each partition, one at a time, with no lock held during the
+    /// callback.
+    ///
+    /// Use this when the callback does real work per row (the fulltext index
+    /// build analyzes text and folds a term-frequency map). The partition's read
+    /// guard is held only for the clone — a bounded memcpy — so a concurrent
+    /// writer to that partition waits for a copy, not for the whole analysis
+    /// (I-5). The callback then runs with no lock held.
+    ///
+    /// Why not chunk by row range instead: rows are merged into a partition in
+    /// clustering order, so a concurrent `put` shifts row indices. A range
+    /// cursor held across lock releases would skip or duplicate rows (violating
+    /// I-1/I-3). An owned clone is stable and has no such hazard.
+    ///
+    /// Still non-materializing for the memtable: exactly one partition is
+    /// cloned at a time and dropped before the next, so peak extra memory is one
+    /// partition, never the whole table (I-4).
+    ///
+    /// Note the clone does NOT inflate the memtable's `Arc` refcount (it is a
+    /// deep clone producing a new owned `Partition`), so concurrent writes still
+    /// merge in place (I-2) — unlike [`Memtable::range_iter`], which hands out a
+    /// refcounted clone.
+    fn for_each_partition_cloned(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        f: &mut dyn FnMut(&Partition),
+    ) {
+        // Default: clone-then-call inside the borrowed visitor. The clone is
+        // built while the read guard is held, then `f` runs against the clone —
+        // still inside the visitor, because that is the only way a default impl
+        // can see every partition. Backings override this so the guard is
+        // released BEFORE `f` (see the skiplist impl), which is what bounds a
+        // writer's wait to the copy. Semantics here are correct either way; only
+        // the hold time differs.
+        self.for_each_partition(start, end, &mut |p| {
+            let owned = p.clone();
+            f(&owned);
+            true
+        });
+    }
 
     /// The smallest timestamp (microseconds) of any cell, liveness or deletion ever
     /// written to this memtable, or `i64::MAX` when nothing has been written.

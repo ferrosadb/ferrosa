@@ -61,9 +61,23 @@ pub fn cql_to_marshal_type(cql_type: &str) -> String {
 }
 
 /// Strip a wrapper type prefix like `set<...>` and return the inner type.
+///
+/// Compares `prefix` case-insensitively and requires a literal `<` after it,
+/// **without** building an intermediate `String`. The previous form used
+/// `format!("{prefix}<")` per call, and `cql_to_marshal_type` is invoked once
+/// per column per request on the CQL insert fast path
+/// (`router::storage_column_is_multicell`), so that allocation showed up as a
+/// flat leaf in the profile. `str::get` keeps this panic-free for a
+/// non-boundary byte index.
 fn strip_wrapper<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    let rest = strip_prefix_ci(s, &format!("{prefix}<"))?;
-    rest.strip_suffix('>')
+    let n = prefix.len();
+    if s.as_bytes().get(n) != Some(&b'<') {
+        return None;
+    }
+    if !s.get(..n)?.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    s.get(n + 1..)?.strip_suffix('>')
 }
 
 /// Case-insensitive prefix stripping.
@@ -411,6 +425,48 @@ mod tests {
             cql_to_marshal_type("frozen<set<text>>"),
             "org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.UTF8Type))"
         );
+    }
+
+    /// The CQL insert fast path asks "is this column a non-frozen collection?"
+    /// from the column's CQL type name instead of building the marshal class
+    /// name with `cql_to_marshal_type` (one `String` per column per insert).
+    /// This pins the two answers together: a divergence would either expand a
+    /// frozen value or emit a path-less whole-value cell on a complex column,
+    /// which the SSTable writer rejects.
+    #[test]
+    fn cql_name_multicell_agrees_with_marshal_class() {
+        let cases = [
+            "text",
+            "varchar",
+            "int",
+            "bigint",
+            "boolean",
+            "uuid",
+            "timestamp",
+            "my_udt",
+            "list<int>",
+            "set<text>",
+            "map<text, int>",
+            "frozen<set<text>>",
+            "frozen<map<text, int>>",
+            "frozen<list<int>>",
+            "FROZEN<SET<TEXT>>",
+            "  list<int>  ",
+            "frozen< frozen<list<int>> >",
+            "tuple<int, text>",
+            "vector<float, 3>",
+            "<int>",
+            "",
+        ];
+        for name in cases {
+            let expected =
+                ferrosa_sstable::marshal::is_multicell_collection(&cql_to_marshal_type(name));
+            let got = ferrosa_sstable::marshal::cql_name_is_multicell_collection(name);
+            assert_eq!(
+                got, expected,
+                "multicell classification diverged for {name:?}"
+            );
+        }
     }
 
     #[test]

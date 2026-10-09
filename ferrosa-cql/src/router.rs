@@ -9050,12 +9050,19 @@ pub async fn route_prepared_insert_fast(
 /// non-frozen `list`/`set`/`map`. A `frozen<..>` wrapper is a single whole-value
 /// cell (`FrozenType`) and must NOT be expanded, or the writer would reject the
 /// resulting cell paths on a simple column.
+///
+/// Answered from the column's CQL type name directly. The previous form built
+/// the Cassandra marshal class name with `cql_to_marshal_type` — one `String`
+/// allocation per column — only to ask this one yes/no question, and this runs
+/// once per regular/static column of every prepared INSERT
+/// (`route_prepared_insert_fast`), so the allocation was a measurable leaf in a
+/// 512-thread write profile. The classification is identical; see
+/// `ferrosa_sstable::marshal::cql_name_is_multicell_collection`.
 fn storage_column_is_multicell(table_meta: &TableMetadata, column: &str) -> bool {
     table_meta
         .columns
         .get(column)
-        .map(|c| ferrosa_schema::cql_to_marshal_type(&c.column_type))
-        .is_some_and(|marshal| ferrosa_sstable::marshal::is_multicell_collection(&marshal))
+        .is_some_and(|c| ferrosa_sstable::marshal::cql_name_is_multicell_collection(&c.column_type))
 }
 
 /// Expand a whole-value collection value into the per-element cells every other

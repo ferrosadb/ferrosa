@@ -106,6 +106,56 @@ pub fn is_multicell_collection(type_name: &str) -> bool {
     )
 }
 
+/// True if a **CQL** type name denotes a non-frozen collection.
+///
+/// The mirror of [`is_multicell_collection`] for the schema-side name (e.g.
+/// `"list<int>"`, `"map<text, int>"`, `"frozen<set<text>>"`). `cql_to_marshal_type`
+/// is called once per column per request on the CQL insert fast path, and its
+/// only caller there asks a single yes/no question about the type's marshal
+/// class. Answering it from the name directly avoids building the
+/// `org.apache.cassandra.db.marshal.…` `String` — which is a heap allocation per
+/// column per insert, and was visible in a CPU profile as a flat leaf under
+/// `router::storage_column_is_multicell`.
+///
+/// It must stay in exact agreement with
+/// `is_multicell_collection(&cql_to_marshal_type(name))`; a false here would let
+/// a whole-value collection cell reach the flush as a path-less cell on a
+/// complex column, which the SSTable writer rejects.
+///
+/// A `frozen<…>` wrapper is stripped once first, so `frozen<set<text>>` and its
+/// whitespace-padded spellings are reported as single-value cells, matching
+/// `FrozenType(...)`.
+pub fn cql_name_is_multicell_collection(cql_type: &str) -> bool {
+    let mut t = cql_type.trim();
+    loop {
+        match split_wrapper_name(t) {
+            Some((kw, inner)) if kw.eq_ignore_ascii_case("frozen") => t = inner.trim(),
+            Some((kw, _)) => {
+                return kw.eq_ignore_ascii_case("list")
+                    || kw.eq_ignore_ascii_case("set")
+                    || kw.eq_ignore_ascii_case("map");
+            }
+            None => return false,
+        }
+    }
+}
+
+/// If `s` is `<name><inner>` — a type name immediately followed by a matching
+/// angle-bracket pair — return the name and the inner text.
+fn split_wrapper_name(s: &str) -> Option<(&str, &str)> {
+    let open = s.find('<')?;
+    let name = s[..open].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let inner = s[open + 1..].strip_suffix('>')?;
+    // Guard against a stray `>` inside the inner text (`a<b>c>`).
+    if inner.contains('>') {
+        return None;
+    }
+    Some((name, inner))
+}
+
 /// True if `type_name` is a **non-frozen (multicell) UDT** (`UserType(...)`).
 /// A non-frozen UDT is also a complex column: each field is a cell whose cell
 /// path is a 2-byte big-endian field position. `FrozenType(UserType(..))` is a
