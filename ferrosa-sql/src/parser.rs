@@ -190,6 +190,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "UPDATE" => p.parse_update(),
             "DELETE" => p.parse_delete(),
             "CREATE" => p.parse_create(),
+            "DROP" => p.parse_drop(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),
@@ -730,20 +731,51 @@ impl Parser {
         Ok(Statement::Begin { isolation })
     }
 
-    /// A scalar value in a `VALUES` list: a `$N` parameter or a literal.
+    /// A scalar value in a `VALUES` list: a `$N` parameter, a literal, or a
+    /// zero-arg value function (`now()`). A bare keyword with no parentheses
+    /// (`CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_USER`, …)
+    /// is also a function value — pg_dump emits these unparenthesized.
     fn parse_scalar_value(&mut self) -> Result<ScalarValue, ParseError> {
         if let Some(Tok::Param(n)) = self.peek() {
             let n = *n;
             self.next();
-            Ok(ScalarValue::Param(n))
-        } else {
-            Ok(ScalarValue::Literal(self.parse_value()?))
+            return Ok(ScalarValue::Param(n));
         }
+        // `ident (...)` → a zero-arg function value. `now()` is the one pgbench
+        // uses for pgbench_history.mtime.
+        if let Some(Tok::Ident(w)) = self.peek() {
+            if matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+                && matches!(self.toks.get(self.pos + 2), Some(Tok::RParen))
+            {
+                let name = w.to_ascii_uppercase();
+                self.next(); // ident
+                self.next(); // (
+                self.next(); // )
+                return Ok(ScalarValue::Func(name));
+            }
+        }
+        // A bare value keyword: a literal, or a paren-less function like
+        // CURRENT_TIMESTAMP. Anything else falls through to `parse_value`,
+        // which fails loud on an unknown identifier.
+        if let Some(Tok::Ident(w)) = self.peek() {
+            let upper = w.to_ascii_uppercase();
+            match upper.as_str() {
+                "TRUE" | "FALSE" | "NULL" => {}
+                _ if bare_value_function(&upper) => {
+                    self.next();
+                    return Ok(ScalarValue::Func(upper));
+                }
+                _ => {}
+            }
+        }
+        Ok(ScalarValue::Literal(self.parse_value()?))
     }
 
-    /// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...)`. Assumes
-    /// `self.pos` is at the `INSERT` ident. Single-row; values are literals or
-    /// `$N` parameters, one per named column.
+    /// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...) [, (val, ...)]*`.
+    /// Assumes `self.pos` is at the `INSERT` ident. Multi-row (one entry per
+    /// parenthesised tuple) — pgbench and pg_dump both batch rows this way.
+    /// Values are literals, `$N` parameters, or zero-arg value functions, one
+    /// per named column in every row.
     fn parse_insert(&mut self) -> Result<Statement, ParseError> {
         self.next(); // INSERT
         self.expect_ident_kw("INTO")?;
@@ -758,13 +790,11 @@ impl Parser {
         self.expect(&Tok::RParen, ")")?;
 
         self.expect_ident_kw("VALUES")?;
-        self.expect(&Tok::LParen, "(")?;
-        let mut values = vec![self.parse_scalar_value()?];
+        let mut rows = vec![self.parse_values_row(&columns)?];
         while matches!(self.peek(), Some(Tok::Comma)) {
             self.next();
-            values.push(self.parse_scalar_value()?);
+            rows.push(self.parse_values_row(&columns)?);
         }
-        self.expect(&Tok::RParen, ")")?;
 
         // ON CONFLICT is recognized to fail loud (out of scope), never silently
         // ignored — a client that relies on upsert semantics must learn it.
@@ -772,18 +802,31 @@ impl Parser {
         let returning = self.parse_returning()?;
         self.expect_end()?;
 
-        if columns.len() != values.len() {
+        Ok(Statement::Insert(Box::new(InsertStmt {
+            table,
+            columns,
+            rows,
+            returning,
+        })))
+    }
+
+    /// One `(val, ...)` tuple of an INSERT `VALUES` list. Every row must supply
+    /// exactly one value per named column; a short or long row fails loud.
+    fn parse_values_row(&mut self, columns: &[String]) -> Result<Vec<ScalarValue>, ParseError> {
+        self.expect(&Tok::LParen, "(")?;
+        let mut values = vec![self.parse_scalar_value()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            values.push(self.parse_scalar_value()?);
+        }
+        self.expect(&Tok::RParen, ")")?;
+        if values.len() != columns.len() {
             return Err(ParseError::Unexpected {
                 expected: "matching column and value counts",
                 found: format!("{} columns, {} values", columns.len(), values.len()),
             });
         }
-        Ok(Statement::Insert(Box::new(InsertStmt {
-            table,
-            columns,
-            values,
-            returning,
-        })))
+        Ok(values)
     }
 
     /// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]`.
@@ -1192,6 +1235,14 @@ impl Parser {
             None => Err(ParseError::UnexpectedEnd),
         }
     }
+}
+
+/// A keyword that names a zero-argument value function which PostgreSQL accepts
+/// **without** parentheses (`CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`).
+/// pg_dump and pgbench emit these bare. `now()` is spelled with parentheses and
+/// is handled separately; both map to the same function name here.
+fn bare_value_function(upper: &str) -> bool {
+    matches!(upper, "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME")
 }
 
 /// The kind of typed literal a leading keyword introduces (`TIMESTAMP '...'` etc).
@@ -1876,11 +1927,11 @@ mod tests {
                 assert_eq!(ins.table.table, "t");
                 assert_eq!(ins.columns, vec!["id".to_string(), "v".to_string()]);
                 assert_eq!(
-                    ins.values,
-                    vec![
+                    ins.rows,
+                    vec![vec![
                         ScalarValue::Literal(Value::Int(1)),
                         ScalarValue::Literal(Value::Text("x".into())),
-                    ]
+                    ]]
                 );
             }
             other => panic!("expected Insert, got {other:?}"),
@@ -1894,10 +1945,7 @@ mod tests {
             Statement::Insert(ins) => {
                 assert_eq!(ins.table.schema, None);
                 assert_eq!(ins.table.table, "t");
-                assert_eq!(
-                    ins.values,
-                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
-                );
+                assert_eq!(ins.rows, vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]);
             }
             other => panic!("expected Insert, got {other:?}"),
         }
@@ -1978,10 +2026,7 @@ mod tests {
             parse_statement("INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, v").unwrap();
         match stmt {
             Statement::Insert(ins) => {
-                assert_eq!(
-                    ins.values,
-                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
-                );
+                assert_eq!(ins.rows, vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]);
                 assert_eq!(
                     ins.returning,
                     Some(Returning::Columns(vec!["id".to_string(), "v".to_string()]))
@@ -2338,5 +2383,132 @@ mod tests {
         let c = create(r#"CREATE TABLE "Users" ("Id" int, "primary" text, PRIMARY KEY ("Id"))"#);
         assert_eq!(c.name.table, "Users");
         assert_eq!(c.columns[1].name, "primary");
+    }
+
+    // ---- DROP TABLE (pgbench -i / client reset) ----
+
+    fn drop_tables(sql: &str) -> (bool, Vec<String>) {
+        match parse_statement(sql) {
+            Ok(Statement::DropTable(d)) => (
+                d.if_exists,
+                d.tables.iter().map(|t| t.table.clone()).collect(),
+            ),
+            other => panic!("expected DROP TABLE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_drop_table_if_exists_single() {
+        let (if_exists, tables) = drop_tables("DROP TABLE IF EXISTS fprobe");
+        assert!(if_exists);
+        assert_eq!(tables, ["fprobe"]);
+    }
+
+    #[test]
+    fn parses_drop_table_lists_every_named_table() {
+        // pgbench -i emits exactly this: drop all four tables in one statement.
+        let (if_exists, tables) = drop_tables(
+            "DROP TABLE IF EXISTS pgbench_accounts, pgbench_branches, \
+             pgbench_history, pgbench_tellers",
+        );
+        assert!(if_exists);
+        assert_eq!(
+            tables,
+            [
+                "pgbench_accounts",
+                "pgbench_branches",
+                "pgbench_history",
+                "pgbench_tellers"
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_table_without_if_exists_is_accepted_and_reports_it() {
+        let (if_exists, tables) = drop_tables("drop table t");
+        assert!(!if_exists, "IF EXISTS must not be assumed");
+        assert_eq!(tables, ["t"]);
+    }
+
+    #[test]
+    fn drop_table_preserves_schema_qualifier_when_present() {
+        match parse_statement("DROP TABLE IF EXISTS public.t") {
+            Ok(Statement::DropTable(d)) => {
+                assert_eq!(d.tables[0].schema.as_deref(), Some("public"));
+                assert_eq!(d.tables[0].table, "t");
+            }
+            other => panic!("expected DROP TABLE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_table_with_no_table_is_a_parse_error() {
+        for sql in ["DROP TABLE", "DROP TABLE IF EXISTS", "DROP TABLE IF EXISTS a,"] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "must reject `{sql}` rather than silently dropping nothing"
+            );
+        }
+    }
+
+    // ---- multi-row INSERT + value functions (pg_dump / pgbench history) ----
+
+    fn insert_rows(sql: &str) -> Vec<Vec<ScalarValue>> {
+        match parse_statement(sql) {
+            Ok(Statement::Insert(i)) => i.rows,
+            other => panic!("expected INSERT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_row_insert_is_one_row() {
+        let rows = insert_rows("INSERT INTO t (a, b) VALUES (1, 'x')");
+        assert_eq!(
+            rows,
+            vec![vec![
+                ScalarValue::Literal(Value::Int(1)),
+                ScalarValue::Literal(Value::Text("x".into()))
+            ]]
+        );
+    }
+
+    #[test]
+    fn multi_row_insert_yields_every_row() {
+        // pgbench's history load batches many rows in one statement.
+        let rows = insert_rows("INSERT INTO t (a, b) VALUES (1, 2), (3, 4), (5, 6)");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[2],
+            vec![
+                ScalarValue::Literal(Value::Int(5)),
+                ScalarValue::Literal(Value::Int(6))
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_values_accept_now_function() {
+        // pgbench_history.mtime is populated with now().
+        let rows = insert_rows("INSERT INTO h (t, m) VALUES (1, now())");
+        assert_eq!(
+            rows[0],
+            vec![
+                ScalarValue::Literal(Value::Int(1)),
+                ScalarValue::Func("NOW".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_values_accept_bare_current_timestamp() {
+        // pg_dump writes CURRENT_TIMESTAMP with no parentheses.
+        let rows = insert_rows("INSERT INTO h (m) VALUES (CURRENT_TIMESTAMP)");
+        assert_eq!(rows[0], vec![ScalarValue::Func("CURRENT_TIMESTAMP".into())]);
+    }
+
+    #[test]
+    fn multi_row_insert_with_mismatched_arity_fails_loud() {
+        // Every row must supply one value per named column; a short row is an error.
+        assert!(parse_statement("INSERT INTO t (a, b) VALUES (1, 2), (3)").is_err());
     }
 }

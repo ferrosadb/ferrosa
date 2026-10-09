@@ -1134,6 +1134,19 @@ async fn execute_statement(
             )
             .await
         }
+        // DROP TABLE: pgbench -i's reset step. Same schema-change path.
+        Statement::DropTable(drop) => {
+            crate::ddl::execute_drop_table(
+                crate::ddl::DdlEnv {
+                    executor: ddl,
+                    schema,
+                    default_schema,
+                    in_txn: txn.is_some(),
+                },
+                &drop,
+            )
+            .await
+        }
         // DML: single-row INSERT / UPDATE / DELETE. The simple-query path has no
         // bound parameters (`&[]`); a `$N` in simple SQL is therefore a fail-loud
         // error (no value to bind). With `txn = Some(buffer)` (an open
@@ -1573,6 +1586,18 @@ pub(crate) async fn execute_insert(
     let mut col_values: HashMap<String, CqlValue> = HashMap::new();
     let mut sql_values: HashMap<String, SqlValue> = HashMap::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    // Multi-row INSERT is parsed but not yet executed. Fail loud rather than
+    // silently writing only the first row — dropping writes is exactly the
+    // failure mode this repo treats as unacceptable.
+    if ins.rows.len() != 1 {
+        return vec![error_response(
+            "0A000",
+            &format!(
+                "multi-row INSERT is not implemented yet ({} rows)",
+                ins.rows.len()
+            ),
+        )];
+    }
     for (i, col_name) in ins.columns.iter().enumerate() {
         let (col_meta, sql_value, value) = match resolve_dml_value(
             meta,
@@ -1580,7 +1605,7 @@ pub(crate) async fn execute_insert(
             ks,
             &ins.table.table,
             col_name,
-            &ins.values[i],
+            &ins.rows[0][i],
             ParamCtx {
                 params,
                 jsonb_limits,
@@ -1754,7 +1779,7 @@ pub(crate) fn dml_param_oids(
 
 /// Collect the `$N` placeholder indices referenced by an `INSERT`'s VALUES.
 pub(crate) fn insert_placeholders(ins: &InsertStmt) -> Vec<usize> {
-    ins.values.iter().filter_map(scalar_param_index).collect()
+    ins.rows.iter().flatten().filter_map(scalar_param_index).collect()
 }
 
 /// Collect the `$N` placeholder indices referenced by an `UPDATE` (SET + WHERE).
@@ -1785,9 +1810,9 @@ fn scalar_param_index(sv: &ScalarValue) -> Option<usize> {
 /// `(placeholder index, target column name)` pairs for an `INSERT`: each `$N` in
 /// VALUES is bound to the column at the same position in the column list.
 fn insert_param_targets(ins: &InsertStmt) -> Vec<(usize, &str)> {
-    ins.columns
+    ins.rows
         .iter()
-        .zip(ins.values.iter())
+        .flat_map(|row| ins.columns.iter().zip(row.iter()))
         .filter_map(|(col, sv)| scalar_param_index(sv).map(|n| (n, col.as_str())))
         .collect()
 }

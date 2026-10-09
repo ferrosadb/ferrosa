@@ -25,7 +25,7 @@ use ferrosa_common::cql_type::CqlType;
 use ferrosa_schema::{
     ClusteringOrder, ColumnKind, ColumnMetadata, Schema, TableMetadata, TableParams,
 };
-use ferrosa_sql::{ColumnDef, CreateTableStmt, PgType};
+use ferrosa_sql::{ColumnDef, CreateTableStmt, DropTableStatement, PgType};
 use indexmap::IndexMap;
 
 use crate::messages::BackendMessage;
@@ -40,6 +40,10 @@ use crate::query::error_response;
 pub trait DdlExecutor: Send + Sync {
     /// Create `table` through the deployment's schema-change path.
     async fn create_table(&self, table: TableMetadata) -> Result<(), String>;
+    /// Drop `keyspace.table` through the same path. A missing table is the
+    /// caller's concern (it checks existence first); this reports only apply
+    /// failures.
+    async fn drop_table(&self, keyspace: &str, table: &str) -> Result<(), String>;
 }
 
 /// [`DdlExecutor`] over the shared, atomically swappable [`DdlPath`] that the
@@ -61,6 +65,16 @@ impl DdlExecutor for ClusterDdl {
         path.execute(DdlOperation::CreateTable(Box::new(table)))
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn drop_table(&self, keyspace: &str, table: &str) -> Result<(), String> {
+        let path = self.path.load_full();
+        path.execute(DdlOperation::DropTable {
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+        })
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -127,6 +141,55 @@ pub(crate) async fn execute_create_table(
         Err(error) => existing_table_reply(env.schema, keyspace, stmt)
             .unwrap_or_else(|| refuse("58000", &format!("CREATE TABLE failed: {error}"))),
     }
+}
+
+/// Execute `DROP TABLE [IF EXISTS] a [, b, ...]` (pgbench -i's drop-all step).
+///
+/// Each named table is resolved in its schema (defaulting to `env.default_schema`)
+/// and dropped through the SAME schema-change path `CREATE TABLE` uses. A table
+/// that does not exist is an error (`42P01`) unless `IF EXISTS` was given, in
+/// which case it is skipped — mirroring PostgreSQL. Reply is `DROP TABLE` on
+/// success. Every refusal is one `ErrorResponse` with a typed SQLSTATE.
+pub(crate) async fn execute_drop_table(
+    env: DdlEnv<'_>,
+    stmt: &DropTableStatement,
+) -> Vec<BackendMessage> {
+    if env.in_txn {
+        return refuse(
+            "25001",
+            "DROP TABLE cannot run inside a transaction block: DDL is not transactional here",
+        );
+    }
+    let Some(executor) = env.executor else {
+        return refuse(
+            "0A000",
+            "DROP TABLE is not available: this server has no schema-change path",
+        );
+    };
+    // Drop in the order given. Existence is checked per table so the reply is
+    // exact about which name failed; the executor reports only apply failures.
+    for target in &stmt.tables {
+        let keyspace = target.schema.as_deref().unwrap_or(env.default_schema);
+        let key = (keyspace.to_string(), target.table.clone());
+        if !env.schema.snapshot().tables.contains_key(&key) {
+            if stmt.if_exists {
+                continue; // PostgreSQL: missing table is a no-op under IF EXISTS.
+            }
+            return refuse(
+                "42P01",
+                &format!("relation \"{}\" does not exist", target.table),
+            );
+        }
+        if let Err(error) = executor.drop_table(keyspace, &target.table).await {
+            return refuse(
+                "58000",
+                &format!("DROP TABLE failed for \"{}\": {error}", target.table),
+            );
+        }
+    }
+    vec![BackendMessage::CommandComplete {
+        tag: "DROP TABLE".to_string(),
+    }]
 }
 
 /// `Some(reply)` when the table already exists: success under `IF NOT EXISTS`,
