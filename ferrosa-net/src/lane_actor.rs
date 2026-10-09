@@ -50,8 +50,8 @@ use crate::message::Message;
 use crate::metrics;
 use crate::reconnect::{
     connect_once_cancelable, connect_with_retry_cancelable, dec_dormant_peer_count,
-    inc_dormant_peer_count, slow_retry_interval, spawn_alive_watcher, with_jitter, LaneState,
-    DORMANT_AFTER_EXHAUSTIONS,
+    inc_dormant_peer_count, slow_retry_interval, spawn_alive_watcher, with_jitter, LaneHealth,
+    LaneState, DORMANT_AFTER_EXHAUSTIONS,
 };
 use crate::rpc::client::RpcClient;
 use crate::task_pool::TaskPool;
@@ -629,6 +629,10 @@ async fn lane_actor_loop(
     let mut in_flight_streams = 0usize;
     let mut pending_streams = VecDeque::new();
     let mut dispatch_retry_scheduled = false;
+    // Per-RPC outcomes fed back into connection health. A half-open socket has
+    // no clean close for the alive watcher to observe, so this is the only
+    // signal that the peer has stopped answering.
+    let mut health = LaneHealth::default();
 
     // The node this lane was opened to. Every later reconnect must reach the
     // same node: a different one that took over the address (container IP
@@ -746,7 +750,11 @@ async fn lane_actor_loop(
             }
             LaneCommand::SendComplete { result, reply } => {
                 in_flight_streams = in_flight_streams.saturating_sub(1);
+                note_lane_outcome(&mut health, &result, lane, &ctx.peer_host);
                 let _ = reply.send(result);
+                if health.is_condemned() {
+                    begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host);
+                }
                 dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
@@ -759,7 +767,11 @@ async fn lane_actor_loop(
             }
             LaneCommand::FireComplete { result, reply } => {
                 in_flight_streams = in_flight_streams.saturating_sub(1);
+                note_lane_outcome(&mut health, &result, lane, &ctx.peer_host);
                 let _ = reply.send(result);
+                if health.is_condemned() {
+                    begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host);
+                }
                 dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
@@ -812,6 +824,7 @@ async fn lane_actor_loop(
                     }
                 }
                 identity_refusal_logged = false;
+                health.record_success();
                 if matches!(state, LaneState::Dormant) {
                     dec_dormant_peer_count();
                     tracing::info!(
@@ -845,16 +858,7 @@ async fn lane_actor_loop(
             }
             LaneCommand::ConnectionLost => {
                 if matches!(state, LaneState::Connected(_)) {
-                    tracing::warn!(
-                        ?lane,
-                        peer = %ctx.peer_host,
-                        "lane connection lost; entering reconnecting state"
-                    );
-                    state = LaneState::Reconnecting {
-                        attempt: 0,
-                        exhaustion_count: 0,
-                    };
-                    fail_pending_streams_reconnecting(&mut pending_streams);
+                    begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host);
                 }
             }
             LaneCommand::MarkFailed { exhaustion_count } => {
@@ -1102,6 +1106,47 @@ fn schedule_dispatch_retry(ctx: &ActorReconnectContext) {
         tokio::time::sleep(DATA_LANE_CAP_RETRY_DELAY).await;
         let _ = tx.send(LaneCommand::DispatchPending).await;
     });
+}
+
+/// Feed one RPC outcome into the lane's health.
+///
+/// Logs on the condemning edge only — one line per wedged connection, never one
+/// per failing request.
+fn note_lane_outcome<T>(health: &mut LaneHealth, result: &Result<T>, lane: Lane, peer: &str) {
+    if result.is_ok() {
+        health.record_success();
+    } else if health.record_failure() {
+        tracing::warn!(
+            ?lane,
+            peer = %peer,
+            "lane condemned after consecutive send failures; treating the connection as dead — \
+             a half-open socket never signals its own death, so the alive watcher cannot fire \
+             and every RPC would otherwise time out forever"
+        );
+    }
+}
+
+/// Move a connected lane to `Reconnecting` and fail its queued work.
+///
+/// Shared by the alive watcher (`ConnectionLost`) and the consecutive-failure
+/// path, so a wedged lane enters exactly the same backoff/dormant ladder a clean
+/// close would have taken it into.
+fn begin_reconnect(
+    state: &mut LaneState,
+    pending_streams: &mut VecDeque<PendingLaneCommand>,
+    lane: Lane,
+    peer: &str,
+) {
+    tracing::warn!(
+        ?lane,
+        peer = %peer,
+        "lane connection lost; entering reconnecting state"
+    );
+    *state = LaneState::Reconnecting {
+        attempt: 0,
+        exhaustion_count: 0,
+    };
+    fail_pending_streams_reconnecting(pending_streams);
 }
 
 fn fail_pending_streams_reconnecting(pending_streams: &mut VecDeque<PendingLaneCommand>) {
@@ -1387,5 +1432,97 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Half-open lane detection
+    //
+    // A half-open connection produces no clean close, so the alive watcher
+    // never fires and the lane stays `Connected` while every RPC times out.
+    // Per-RPC timeouts therefore have to feed back into lane health. The
+    // decision is extracted as a pure value so the policy is testable without
+    // sockets — the actor loop only performs the transition the decision names.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lane_health_default_threshold_tolerates_a_single_timeout() {
+        let mut h = LaneHealth::default();
+        assert!(
+            !h.record_failure(),
+            "one slow request must not condemn a healthy lane"
+        );
+        assert!(!h.is_condemned());
+    }
+
+    #[test]
+    fn lane_health_condemns_only_on_reaching_the_threshold() {
+        let mut h = LaneHealth::new(3);
+        assert!(!h.record_failure(), "failure 1 of 3");
+        assert!(!h.record_failure(), "failure 2 of 3");
+        assert!(
+            !h.is_condemned(),
+            "must still trust the lane below the threshold"
+        );
+        assert!(h.record_failure(), "failure 3 of 3 crosses the threshold");
+        assert!(h.is_condemned());
+    }
+
+    #[test]
+    fn lane_health_condemns_exactly_once() {
+        let mut h = LaneHealth::new(2);
+        assert!(!h.record_failure());
+        assert!(h.record_failure(), "the crossing failure condemns");
+        assert!(
+            !h.record_failure(),
+            "later failures must not re-report: the actor would reconnect again mid-dial"
+        );
+    }
+
+    #[test]
+    fn lane_health_success_clears_the_run() {
+        let mut h = LaneHealth::new(3);
+        h.record_failure();
+        h.record_failure();
+        h.record_success();
+        assert!(
+            !h.record_failure(),
+            "a success re-arms the counter; only CONSECUTIVE failures condemn"
+        );
+        assert!(!h.is_condemned());
+    }
+
+    #[test]
+    fn lane_health_success_after_condemnation_re_arms_the_lane() {
+        let mut h = LaneHealth::new(2);
+        h.record_failure();
+        assert!(h.record_failure());
+        assert!(h.is_condemned());
+        h.record_success();
+        assert!(
+            !h.is_condemned(),
+            "a working connection must clear the verdict"
+        );
+        assert!(
+            !h.record_failure(),
+            "the re-armed lane must need the full threshold again"
+        );
+        assert!(
+            h.record_failure(),
+            "and must still be condemnable once it has"
+        );
+    }
+
+    #[test]
+    fn lane_health_interleaved_successes_never_condemn() {
+        let mut h = LaneHealth::new(3);
+        for _ in 0..10 {
+            h.record_failure();
+            h.record_failure();
+            h.record_success();
+            assert!(
+                !h.is_condemned(),
+                "a lane that answers between failures is slow, not dead"
+            );
+        }
     }
 }

@@ -98,6 +98,92 @@ pub fn slow_retry_interval() -> Duration {
     Duration::from_millis(env_positive(ENV_SLOW_INTERVAL_MS, default_ms, &WARNED))
 }
 
+/// Default number of consecutive send failures on a lane before the lane is
+/// treated as dead.  See [`lane_failure_threshold`].
+pub const DEFAULT_LANE_FAILURE_THRESHOLD: u32 = 3;
+
+/// Environment variable overriding [`DEFAULT_LANE_FAILURE_THRESHOLD`]
+/// (positive integer).
+pub const ENV_LANE_FAILURE_THRESHOLD: &str = "FERROSA_NET_LANE_FAILURE_THRESHOLD";
+
+/// Consecutive send failures before a lane is condemned as dead:
+/// [`ENV_LANE_FAILURE_THRESHOLD`] or [`DEFAULT_LANE_FAILURE_THRESHOLD`].
+///
+/// `1` is the footgun setting: it tears a lane down on a single slow request.
+pub fn lane_failure_threshold() -> u32 {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let n = env_positive(
+        ENV_LANE_FAILURE_THRESHOLD,
+        u64::from(DEFAULT_LANE_FAILURE_THRESHOLD),
+        &WARNED,
+    );
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Whether a lane's connection is still worth using.
+///
+/// A half-open connection never produces a clean close, so the alive watcher
+/// never fires and the lane stays `Connected` while **every** RPC times out —
+/// the peer silently receives nothing and the local side never reconnects.
+/// Feeding per-RPC outcomes back in makes that observable: a run of consecutive
+/// failures condemns the lane, and the actor then performs the same transition
+/// `ConnectionLost` would, so the existing backoff/dormant ladder takes over.
+///
+/// Only *consecutive* failures condemn. A peer that answers between timeouts is
+/// slow — a GC pause, host contention — not gone, and must not be disconnected.
+#[derive(Debug, Clone)]
+pub struct LaneHealth {
+    threshold: u32,
+    consecutive_failures: u32,
+    condemned: bool,
+}
+
+impl Default for LaneHealth {
+    fn default() -> Self {
+        Self::new(lane_failure_threshold())
+    }
+}
+
+impl LaneHealth {
+    /// A threshold of `0` would condemn on no evidence at all; treat it as `1`.
+    pub fn new(threshold: u32) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            consecutive_failures: 0,
+            condemned: false,
+        }
+    }
+
+    /// Record a successful round trip: the connection demonstrably works, so
+    /// clear both the verdict and the run of failures.
+    pub fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.condemned = false;
+    }
+
+    /// Record a send failure or timeout.
+    ///
+    /// Returns `true` exactly once per condemnation — on the crossing failure —
+    /// so the actor reconnects once rather than once per failing request while a
+    /// dial is already in flight.
+    pub fn record_failure(&mut self) -> bool {
+        if self.condemned {
+            return false;
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= self.threshold {
+            self.condemned = true;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the lane has been condemned as dead and needs a fresh dial.
+    pub fn is_condemned(&self) -> bool {
+        self.condemned
+    }
+}
+
 /// `base` plus 0-25% random jitter.
 pub(crate) fn with_jitter(base: Duration) -> Duration {
     let jitter_range = base.as_millis() as u64 / 4;
