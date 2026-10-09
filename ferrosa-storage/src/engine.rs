@@ -14310,8 +14310,10 @@ impl StorageEngine {
                 if !missing_components.is_empty() {
                     // Warn only when the missing set is new or has changed; a
                     // repeat sighting is silent, which is what removes the churn.
-                    let missing_owned: Vec<String> =
-                        missing_components.iter().map(|c| (*c).to_string()).collect();
+                    let missing_owned: Vec<String> = missing_components
+                        .iter()
+                        .map(|c| (*c).to_string())
+                        .collect();
                     if self.mark_generation_incomplete(memo_key, missing_owned) {
                         tracing::warn!(
                             table = table_id_str,
@@ -33746,7 +33748,10 @@ mod tests {
     async fn sync_warns_once_for_a_permanently_incomplete_generation() {
         let (_dir, engine, _store, _prefix, tid) = s3_sync_fixture(
             "test-sync-churn-memo",
-            &[("Data.db", b"legacy data"), ("Partitions.db", b"legacy partitions")],
+            &[
+                ("Data.db", b"legacy data"),
+                ("Partitions.db", b"legacy partitions"),
+            ],
         );
         let key = format!("{tid}/1");
         let missing = vec!["Rows.db".to_string()];
@@ -33856,7 +33861,11 @@ mod tests {
 
         let table_dir = engine.table_sstable_dir(&tid);
         let gens = StorageEngine::list_generations_in_dir(&table_dir);
-        assert_eq!(gens.len(), 1, "the flush must leave exactly one generation: {gens:?}");
+        assert_eq!(
+            gens.len(),
+            1,
+            "the flush must leave exactly one generation: {gens:?}"
+        );
         let gen = gens[0];
         let gen_str = gen.to_string();
         let rows_path =
