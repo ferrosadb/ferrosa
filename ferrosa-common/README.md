@@ -226,8 +226,11 @@ addresses), so no cluster identity has to be plumbed to the Postgres front-end.
 
 > The Postgres front-end synthesises the column on a PK-less `CREATE TABLE`, mints a key
 > per row on `INSERT` (`ferrosa-postgres/src/synthetic_key.rs`), keeps it out of `SELECT *`,
-> and lists it in `pg_attribute` with a negative `attnum`. Still open: minting on `COPY`,
-> and `ALTER TABLE ... ADD PRIMARY KEY`. Tracked in
+> and lists it in `pg_attribute` with a negative `attnum`. `ALTER TABLE ... ADD PRIMARY KEY`
+> records a **declared** key and indexes it, and `catalog` now projects `pg_index` /
+> `pg_constraint` (plus a `<table>_pkey` row in `pg_class`) from that declared key — never
+> from this synthesized one — so a client sees no primary key for a PK-less table. Still
+> open: minting on `COPY`. Tracked in
 > [ferrosa-postgres/specs/roadmap.md](../ferrosa-postgres/specs/roadmap.md).
 
 ## Specs
