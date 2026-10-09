@@ -410,8 +410,20 @@ early acknowledgement.
   dependency set is computed from `t0`, so a dependency committed with a later
   `t` is waived (at apply time, or when that dependency's commit lands). Without
   this, two transactions whose PreAccepts crossed each waited on the other until
-  the 5 s dependency wait failed both, with every replica live (FMEA CL-28). A
+  the dependency wait failed both, with every replica live (FMEA CL-28). A
   dependency cycle among parked transactions is refused loudly, never dropped.
+  The wait is **bounded and operator-tunable**: `FERROSA_ACCORD_TXN_TIMEOUT_SECS`
+  (config `[accord] txn_timeout_secs`), defaulting to
+  `epoch_drain::DEFAULT_TXN_TIMEOUT` (10 s, single-sourced so the drain that must
+  exceed it cannot drift) and read on the hot path through a lock-free atomic —
+  no state lock, no blocking-pool hop, no allocation per RPC. When the bound
+  expires the coordinator **abandons** the transaction: it finalizes it as a
+  no-write — rolled back, never applied, which also releases every successor
+  parked behind it — and returns `AccordDriverError::TxnAbandoned`. A stuck apply
+  therefore cannot poison a key permanently, and the client is told the
+  transaction did not commit and may retry: the PostgreSQL front end maps the
+  `abandoned:` reason to SQLSTATE 40001 (serialization failure) and the CQL
+  router to a retryable server error.
   A PreAccept for a transaction the replica already knows is decided is
   refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)
   and registers nothing; otherwise a PreAccept queued behind a no-write

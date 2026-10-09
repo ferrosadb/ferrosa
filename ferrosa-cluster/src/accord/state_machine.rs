@@ -1123,6 +1123,70 @@ impl AccordStateMachine {
 /// (`bug-accord-lwt-acks-phantom-write.md`), where a replica recorded
 /// `(txn_id, t)` and returned `ApplyOK` while nothing was persisted.
 ///
+/// Environment variable an operator sets to tune the Accord transaction
+/// dependency-wait bound, in seconds (see
+/// [`DEFAULT_TXN_TIMEOUT`](crate::accord::handlers::DEFAULT_TXN_TIMEOUT)).
+pub const TXN_TIMEOUT_ENV: &str = "FERROSA_ACCORD_TXN_TIMEOUT_SECS";
+
+/// Sentinel meaning "not yet resolved".
+const TXN_TIMEOUT_UNRESOLVED: u64 = u64::MAX;
+
+/// The operator-configured bound, cached as nanoseconds.
+///
+/// Read on the hot path — every inbound Apply/ReadVote and every abandoned
+/// transaction — so it is a single relaxed atomic load: no lock, no allocation,
+/// no `spawn_blocking` hop, no repeated `getenv`. An operator setting is
+/// process-wide by nature (it comes from the environment at startup), so one
+/// atomic is the whole store; there is deliberately no per-instance copy to
+/// drift out of sync.
+static TXN_TIMEOUT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(TXN_TIMEOUT_UNRESOLVED);
+
+/// Parse the operator setting into a bound.
+///
+/// Pure, so it is testable without touching the process environment — `set_var`
+/// is process-global and racy under parallel tests. A non-numeric, non-positive,
+/// or non-finite value is reported and ignored rather than silently clamped to
+/// zero: zero would abandon every transaction the instant it parked, which is a
+/// footgun, not a configuration.
+pub fn resolve_txn_timeout(raw: Option<&str>) -> std::time::Duration {
+    match raw {
+        Some(value) => match value.trim().parse::<f64>() {
+            Ok(secs) if secs.is_finite() && secs > 0.0 => std::time::Duration::from_secs_f64(secs),
+            _ => {
+                tracing::warn!(
+                    value = %value,
+                    env = TXN_TIMEOUT_ENV,
+                    "accord: ignoring invalid transaction timeout; using the default"
+                );
+                crate::accord::handlers::DEFAULT_TXN_TIMEOUT
+            }
+        },
+        None => crate::accord::handlers::DEFAULT_TXN_TIMEOUT,
+    }
+}
+
+/// The process-wide transaction dependency-wait bound, resolved once from
+/// [`TXN_TIMEOUT_ENV`] and thereafter a lock-free atomic load.
+#[inline]
+pub fn configured_txn_timeout() -> std::time::Duration {
+    let cached = TXN_TIMEOUT_NANOS.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != TXN_TIMEOUT_UNRESOLVED {
+        return std::time::Duration::from_nanos(cached);
+    }
+    let resolved = resolve_txn_timeout(std::env::var(TXN_TIMEOUT_ENV).ok().as_deref());
+    let nanos = resolved.as_nanos().min(u64::MAX as u128) as u64;
+    // First writer wins. A racing writer resolves the same environment, so the
+    // loser's value is identical and either store is correct.
+    let _ = TXN_TIMEOUT_NANOS.compare_exchange(
+        TXN_TIMEOUT_UNRESOLVED,
+        nanos,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    resolved
+}
+
 /// `node_id` is the Accord node identifier, `sync_writer` the protocol-log
 /// fsync writer, and `storage` the live engine handle whose write/batch path
 /// the applier persists through.
@@ -1185,8 +1249,43 @@ impl TxnPhaseExt for TxnPhase {
 mod tests {
     use super::*;
     use crate::accord::apply::{ApplyError, ApplyMutation, StorageApplier};
+    use crate::accord::handlers::DEFAULT_TXN_TIMEOUT;
     use ferrosa_storage::accord::sync_writer::{MockSyncWriter, SyncWriteCall};
     use parking_lot::Mutex;
+
+    /// The operator tunable resolves to the bound the operator asked for, and every
+    /// malformed or nonsensical value falls back to the default rather than silently
+    /// disabling the bound — a 0 s bound would abandon every transaction the instant
+    /// it parked, turning a config typo into an outage.
+    #[test]
+    fn txn_timeout_resolver_honours_valid_values_and_rejects_the_rest() {
+        assert_eq!(resolve_txn_timeout(None), DEFAULT_TXN_TIMEOUT);
+        assert_eq!(
+            resolve_txn_timeout(Some("30")),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            resolve_txn_timeout(Some(" 2.5 ")),
+            std::time::Duration::from_secs_f64(2.5)
+        );
+        for bad in ["", "   ", "abc", "0", "-1", "0.0", "inf", "-inf", "NaN"] {
+            assert_eq!(
+                resolve_txn_timeout(Some(bad)),
+                DEFAULT_TXN_TIMEOUT,
+                "{bad:?} must fall back to the default, never disable the bound"
+            );
+        }
+    }
+
+    /// The cached read is stable: the first resolution wins and every later call
+    /// returns the identical value from the lock-free atomic, so two concurrent
+    /// waiters cannot disagree about the bound.
+    #[test]
+    fn configured_txn_timeout_is_stable_across_calls() {
+        let first = configured_txn_timeout();
+        assert_eq!(first, configured_txn_timeout());
+        assert!(first > std::time::Duration::ZERO);
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers

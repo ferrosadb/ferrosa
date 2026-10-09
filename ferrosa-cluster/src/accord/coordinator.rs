@@ -502,8 +502,18 @@ pub enum AccordDriverError {
     /// A PostgreSQL transaction's Accord replicas have observed a newer
     /// conflicting marker timestamp than its captured MVCC snapshot.
     SnapshotStale,
-    /// F+1 apply acknowledgements were not received within the timeout.
-    ApplyQuorumUnavailable,
+    /// The transaction exceeded the operator-configured dependency-wait bound
+    /// and was **abandoned**: it was never applied (rolled back) and was finalized
+    /// so it no longer blocks later transactions on its keys. The transaction is
+    /// NOT committed — the client is told so explicitly and may safely retry.
+    ///
+    /// This subsumes the former `ApplyQuorumUnavailable`: when the apply quorum
+    /// could not be reached within the bound, the transaction is now abandoned
+    /// rather than left as a permanently blocking `Committed` entry.
+    TxnAbandoned {
+        /// The bound that expired.
+        timeout: std::time::Duration,
+    },
 }
 
 impl std::fmt::Display for AccordDriverError {
@@ -514,7 +524,18 @@ impl std::fmt::Display for AccordDriverError {
             Self::Codec(e) => write!(f, "Accord codec error: {e}"),
             Self::ConditionNotMet { .. } => write!(f, "Accord LWT condition not met"),
             Self::SnapshotStale => write!(f, "PostgreSQL MVCC snapshot is stale"),
-            Self::ApplyQuorumUnavailable => write!(f, "Accord apply quorum unavailable"),
+            // The `abandoned:` prefix is load-bearing. The committer erases this
+            // typed error to a `reason: String` before it reaches the PostgreSQL
+            // front end, which classifies it by prefix — the same convention
+            // `is_backpressure()` uses for `overloaded:`. It is what turns an
+            // abandoned transaction into a RETRYABLE 40001 (serialization
+            // failure) instead of an opaque 58000 fault, so keep it stable.
+            Self::TxnAbandoned { timeout } => write!(
+                f,
+                "abandoned: transaction exceeded the {}s dependency-wait bound and was \
+                 rolled back (NOT committed); safe to retry",
+                timeout.as_secs_f64()
+            ),
         }
     }
 }
@@ -2386,12 +2407,24 @@ impl AccordCoordinatorDriver {
         }
         let apply_ok = apply_result?;
         if !apply_ok {
+            // The bounded dependency wait expired: abandon the transaction.
+            //
+            // Every replica that parked refused its ApplyOK — it never applied —
+            // so nothing durable exists and rolling the transaction back is the
+            // true outcome. Finalizing it as a no-write additionally releases any
+            // successor parked behind it, so one slow apply can never poison the
+            // key the way an un-finalized Committed entry did. The client is told
+            // it did not commit and may retry.
+            let timeout = crate::accord::state_machine::configured_txn_timeout();
             tracing::error!(
                 txn_id = ?txn_id,
                 unmet = ?participant.shards.len(),
-                "accord: Apply quorum not reached — LWT result may not be durable"
+                ?timeout,
+                "accord: Apply quorum not reached within the dependency-wait bound — \
+                 abandoning the transaction (NOT committed; safe to retry)"
             );
-            return Err(AccordDriverError::ApplyQuorumUnavailable);
+            self.finalize_no_write().await;
+            return Err(AccordDriverError::TxnAbandoned { timeout });
         }
 
         tracing::debug!(
@@ -2632,6 +2665,44 @@ pub(crate) async fn deliver_no_write_finalize(
 
 #[cfg(test)]
 mod tests {
+
+    /// The abandoned-transaction error must be distinguishable BY THE CLIENT.
+    ///
+    /// The committer erases this typed error to a `reason: String` before the
+    /// PostgreSQL front end sees it, so the front end classifies by prefix. If the
+    /// prefix drifts, an abandoned (retryable) transaction is reported as an
+    /// opaque 58000 fault and a client cannot tell "retry me" from "broken".
+    #[test]
+    fn an_abandoned_transaction_carries_the_client_signal() {
+        let rendered = AccordDriverError::TxnAbandoned {
+            timeout: std::time::Duration::from_secs(5),
+        }
+        .to_string();
+        assert!(
+            rendered.starts_with("abandoned:"),
+            "the `abandoned:` prefix is the client contract; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("NOT committed"),
+            "the client must be told the transaction did not commit; got {rendered:?}"
+        );
+    }
+
+    /// Control: no OTHER apply failure may carry the retryable prefix, or every
+    /// quorum error would be reported to the client as safe to retry — the exact
+    /// opposite of telling it the truth.
+    #[test]
+    fn other_driver_errors_do_not_carry_the_abandoned_prefix() {
+        for error in [
+            AccordDriverError::QuorumUnavailable,
+            AccordDriverError::SnapshotStale,
+        ] {
+            assert!(
+                !error.to_string().starts_with("abandoned:"),
+                "{error} must not be advertised as retryable"
+            );
+        }
+    }
 
     /// A replica that answers without voting must be counted, not skipped.
     ///
